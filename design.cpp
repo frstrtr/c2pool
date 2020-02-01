@@ -43,3 +43,15 @@
 # Long polling is a method used by some Bitcoin pools by which notifications are sent to all miners when a valid block has been generated and added to the blockchain. This serves the purpose of stopping work on the old block and beginning to work on a fresh block, thus reducing the production of stale shares.
 
 # Without long polling, if a miner was in the middle of an assigned workload when a new block was discovered by someone else, it would continue working on the old obsolete block solution until it was finished - thus wasting effort.
+
+# Lightning P2Pool proposal
+# The existing p2pool has issues with dust. As more miners join the pool each individual miners payout becomes smaller, so eventually the cost to spend such outputs become significant. Lightning p2pool is an idea which would result in p2pool share payouts being sent over payment channels[3][4].
+
+
+# Links:
+# https://bitcointalk.org/index.php?topic=18313.0 [1500 TH] p2pool: Decentralized, DoS-resistant, Hop-Proof pool
+# https://www.coindesk.com/hub-and-spoke-could-bitcoins-lightning-network-decentralize-mining Lightning’s Next Act: Decentralizing Bitcoin Mining?
+# https://en.bitcoin.it/wiki/P2Pool P2Pool wiki
+# https://www.bitcoinminer.com/p2pool-decentralized-pool/ P2Pool Decentralized Pool
+# https://bitcointalk.org/index.php?topic=2135429.msg21352028#msg21352028 Payment Channel Payouts: An Idea for Improving P2Pool Scalability
+# https://docs.google.com/document/d/1fbc6yfMJMFAZzVG6zYOwZJvYU0AhM4cvd4bUShL-ScU/edit?usp=sharing P2Pool - Ideas for Promoting Growth and Decreasing Dust
