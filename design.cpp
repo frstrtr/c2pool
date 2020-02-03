@@ -26,6 +26,8 @@
 # p2pool protocol emulator
 # crypto module for popular algos
 # merged mining
+# wallet address generator
+# webminer for infoshares
 
 
 # Unlike Bitcoin, nodes do not know the entire chain - instead they only hold the last 8640 shares (the last 3 day's worth). In order to prevent an attacker from working on a chain in secret and then releasing it, overriding the existing chain, chains are judged by how much work they have since a point in the past. To ascertain that the work has been done since that point, nodes look at the Bitcoin blocks that the shares reference, establishing a provable timestamp. (If a share points to a block, it was definitely made after that block was made.)
