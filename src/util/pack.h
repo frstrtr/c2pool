@@ -3,9 +3,12 @@
 
 #include <iostream>
 #include <typeinfo>
-
+#include <sstream>
+#include <cmath>
 //TODO: remove all auto;
+//TODO: add 3 types pack from data.py
 
+template <typename T>
 class Type{
 public:
     Type(){
@@ -15,16 +18,62 @@ public:
     friend bool operator==(const Type& A, const Type& B);
     friend bool operator!=(const Type& A, const Type& B);
 
+    virtual void write(std::stringstream file, T item);
+    virtual T read(std::stringstream file);
+
 
 };
 
-class VarIntType:Type{
+class VarIntType:Type<int>{
 
-    auto read(auto file) {
-        //TODO:
+    int read(std::stringstream file) {
+        char data;
+        file.read(&data, 1);
+        int first = (int) data;
+
+        if (first < 0xfd) {
+            return first;
+        }
+
+        std::string desc;
+        int length;
+        int minimum;
+
+        switch (first) {
+            case 0xfd:
+                desc = "<H";
+                length = 2;
+                minimum = 0xfd;
+                break;
+            case 0xfe:
+                desc = "<I";
+                length = 4;
+                minimum = pow(2,16);
+                break;
+            case 0xff:
+                desc = "<Q";
+                length = 8;
+                minimum = pow(2,32);
+                break;
+            default:
+                return 0;
+                //raise
+        }
+
+        char *data2;
+        file.read(data2, length);
+
+        auto res = struct.unpack(desc, data2); //TODO:???
+
+        if (res < minimum){
+            //raise AssertionError('VarInt not canonically packed')
+        }
+
+        return res;
     }
 
-    auto write(auto file, auto item){
+    //TODO: NEED RETURN???
+    void write(auto file, auto item){
         //TODO
     }
 
@@ -38,8 +87,11 @@ public:
         return file.read(length);
     }
 
-    void write(auto file, auto item){
+    void write(auto file, auto item)  override {
         _inner_size.write(file, length(item));
+        std::stringstream ss;
+        ss << file;
+
         file.write(item);
     }
 };
