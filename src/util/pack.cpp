@@ -1,17 +1,23 @@
 #include "pack.h"
+#include <typeinfo>
 #include <iostream>
+#include <cstring>
 using namespace std;
 
-Type::Type(int A, int B) {
-    a = A;
-    b = B;
+bool operator==(const Type& A, const Type& B){
+    if (typeid(A).name() != typeid(B).name()) return false;
+    return (memcmp(&A, &B, sizeof(A)) == 0);
 }
 
-int Type::getB() const {
-    return b;
+bool operator!=(const Type& A, const Type& B) {
+    return (!(A == B));
 }
 
-int Type::getA() const {
-    return a;
+auto ListType::read(auto file) {
+    auto length = _inner_size.read(file);
+    length *= mul;
+    //TODO: generate res from type.read(file)
+
 }
+
 
