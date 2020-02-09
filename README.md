@@ -1,4 +1,5 @@
-# cp2pool (started 02.20.2020)
+# cp2pool
+(started 02.20.2020)
 
 based on Forrest Voight concept and python code (https://github.com/p2pool/p2pool)
 
