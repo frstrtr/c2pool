@@ -1,4 +1,4 @@
-# cpool
+# cp2pool
 p2pool exchange/pool written in c++ and LMDB.
 
 Donations accepted:
