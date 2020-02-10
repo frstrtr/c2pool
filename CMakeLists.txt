@@ -5,7 +5,13 @@ set(CMAKE_CXX_STANDARD 20)
 
 set(SOURCE_FILES src/main.cpp)
 set(UTILS src/util)
+
+
+find_package(Python3 #[[Libs]] REQUIRED Development)
+
 add_executable(cpool ${SOURCE_FILES})
+
+
 
 include_directories(${UTILS})
 
