@@ -16,7 +16,7 @@ public:
 
     void unpack(std::string types, std::string vars);
 
-    void pack(std::string, std::string vars);
+    std::string pack(std::string, std::string vars);
 };
 
 
