@@ -5,6 +5,7 @@
 #include <typeinfo>
 #include <sstream>
 #include <cmath>
+#include <pystruct.h>
 //TODO: remove all auto;
 //TODO: add 3 types pack from data.py
 
@@ -63,7 +64,7 @@ class VarIntType:Type<int>{
         char *data2;
         file.read(data2, length);
 
-        auto res = struct.unpack(desc, data2); //TODO:???
+        auto res = pystruct.unpack(desc, data2); //TODO:???
 
         if (res < minimum){
             //raise AssertionError('VarInt not canonically packed')
@@ -154,7 +155,7 @@ public:
 
     auto read(auto file){
         auto data = file.read(length);
-        //TODO: return struct.unpack(desc, data)[0]
+        //TODO: return pystruct.unpack(desc, data)[0]
     }
 
     void write(auto file, auto item){
