@@ -5,18 +5,25 @@
 #include <tuple>
 #include "pystruct.h"
 #include "Python.h"
-void pystruct::read() {
-    //Py_Initialize();
-    PyRun_SimpleString("from time import time,ctime\n"
-                       "print('Today is', ctime(time()))\n");
-    //Py_Finalize();
-}
+using namespace std;
 
-std::string pystruct::pack(std::string types, std::string vars) {
+
+char* pystruct::pack(char* types, char* vars) {
 
     char *ret = NULL;
 
-    // Загрузка func.py
+
+
+    // Загрузка модуля sys
+    auto sys = PyImport_ImportModule("sys");
+    auto sys_path = PyObject_GetAttrString(sys, "path");
+    // Путь до наших исходников Python
+    auto folder_path = PyUnicode_FromString((const char*) "F:/cpool/src/util"); //TODO: HARD PATH!
+    PyList_Append(sys_path, folder_path);
+
+
+
+    // Загрузка struc.py
     auto pName = PyUnicode_FromString("struc");
     if (!pName) {
         return ret;
@@ -34,8 +41,7 @@ std::string pystruct::pack(std::string types, std::string vars) {
         return ret;
     }
 
-    // Загрузка объекта get_value из func.py
-    auto pObjct = PyDict_GetItemString(pDict, (const char *) "get_value");
+    auto pObjct = PyDict_GetItemString(pDict, (const char *) "pack");
     if (!pObjct) {
         return ret;
     }
@@ -46,7 +52,7 @@ std::string pystruct::pack(std::string types, std::string vars) {
         return ret;
     }
 
-    auto pVal = PyObject_CallFunction(pObjct, (char *) "(s)", val);
+    auto pVal = PyObject_CallFunction(pObjct, (char *) "(ss)", types, vars);
     if (pVal != NULL) {
         PyObject* pResultRepr = PyObject_Repr(pVal);
 
@@ -57,7 +63,7 @@ std::string pystruct::pack(std::string types, std::string vars) {
         Py_XDECREF(pResultRepr);
         Py_XDECREF(pVal);
     }
-
+    return ret;
 }
 
 void pystruct::unpack(std::string types, std::string vars) {
