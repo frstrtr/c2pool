@@ -75,7 +75,20 @@ class VarIntType:Type<int>{
 
     //TODO: NEED RETURN???
     void write(auto file, auto item){
-        //TODO
+        auto pack_value;
+        if (item < 0xfd)
+            pack_value = pystruct.pack('<B', item);
+        else if (item <= 0xffff)
+            pack_value = pystruct.pack('<BH', 0xfd, item);
+        else if (item <= 0xffffffff)
+            pack_value = pystruct.pack('<BI', 0xfe, item);
+        else if (item <= 0xffffffffffffffff)
+            pack_value = pystruct.pack('<BI', 0xff, item);
+        else
+            //TODO:RAISE
+            return;
+
+        file.write(pack_value); //TODO
     }
 
 };
@@ -159,7 +172,7 @@ public:
     }
 
     void write(auto file, auto item){
-        //TODO: file.write(struct.pack(self.desc, item))
+         file.write(pystruct.pack(self.desc, item)); //TODO
     }
 };
 

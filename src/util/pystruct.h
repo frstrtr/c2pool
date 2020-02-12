@@ -11,12 +11,9 @@
 
 class pystruct{
 public:
-
-    void read();
-
     void unpack(std::string types, std::string vars);
 
-    std::string pack(std::string, std::string vars);
+    char* pack(char* types, char* vars);
 };
 
 
