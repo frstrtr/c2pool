@@ -1,4 +1,4 @@
-# cp2pool
+# c2pool
 (started 02.20.2020)
 
 based on Forrest Voight concept and python code (https://github.com/p2pool/p2pool)
@@ -15,6 +15,6 @@ p2pool exchange/pool and more... written in c++ and LMDB.
 
 Telegram:
 
-t.me/cp2pool
+t.me/c2pool
 
 Forrest Voight donation address: 1HNeqi3pJRNvXybNX4FKzZgYJsdTSqJTbk
