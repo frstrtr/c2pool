@@ -9,13 +9,12 @@ Bitcointalk forum thread - https://bitcointalk.org/index.php?topic=18313
 
 p2pool exchange/pool and more... written in c++ and LMDB.
 
-Donations accepted:
+## Donations towards further development in BTC:
 
-in BTC 
-
-1iisciGA846aUNAxrMzeWbdxeoj9hK6ht
-
+### 1iisciGA846aUNAxrMzeWbdxeoj9hK6ht
 
 Telegram:
 
 t.me/cp2pool
+
+Forrest Voight donation address: 1HNeqi3pJRNvXybNX4FKzZgYJsdTSqJTbk
