@@ -6,6 +6,7 @@
 #include <sstream>
 #include <cmath>
 #include <pystruct.h>
+#include <file.h>
 //TODO: remove all auto;
 //TODO: add 3 types pack from data.py
 
@@ -27,9 +28,8 @@ public:
 
 class VarIntType:Type<int>{
 
-    int read(std::stringstream file) {
-        char data;
-        file.read(&data, 1);
+    int read(file f) {
+        char data = f.read(1);
         int first = (int) data;
 
         if (first < 0xfd) {
@@ -61,8 +61,7 @@ class VarIntType:Type<int>{
                 //raise
         }
 
-        char *data2;
-        file.read(data2, length);
+        char *data2 = f.read(length);
 
         auto res = pystruct.unpack(desc, data2); //TODO:???
 
@@ -74,7 +73,7 @@ class VarIntType:Type<int>{
     }
 
     //TODO: NEED RETURN???
-    void write(auto file, auto item){
+    void write(file f, auto item){
         auto pack_value;
         if (item < 0xfd)
             pack_value = pystruct.pack('<B', item);
@@ -88,7 +87,7 @@ class VarIntType:Type<int>{
             //TODO:RAISE
             return;
 
-        file.write(pack_value); //TODO
+        f.write(pack_value); //TODO
     }
 
 };
@@ -96,17 +95,17 @@ class VarIntType:Type<int>{
 class VarStrType:Type{
     VarIntType _inner_size;
 public:
-    auto read(auto file){
+    auto read(file f){
         auto length = _inner_size.read(file);
-        return file.read(length);
+        return f.read(length);
     }
 
-    void write(auto file, auto item)  override {
+    void write(file f, auto item)  override {
         _inner_size.write(file, length(item));
         std::stringstream ss;
         ss << file;
 
-        file.write(item);
+        f.write(item);
     }
 };
 
@@ -166,13 +165,13 @@ public:
         //TODO: length = struct.calcsize(desc);
     }
 
-    auto read(auto file){
-        auto data = file.read(length);
+    auto read(file f){
+        auto data = f.read(length);
         //TODO: return pystruct.unpack(desc, data)[0]
     }
 
-    void write(auto file, auto item){
-         file.write(pystruct.pack(self.desc, item)); //TODO
+    void write(file f, auto item){
+         f.write(pystruct.pack(self.desc, item)); //TODO
     }
 };
 
@@ -248,13 +247,13 @@ class FixedStrType:Type{
         length = _length;
     }
 
-    auto read(auto file){
-        return file.read(length);
+    auto read(file f){
+        return f.read(length);
     }
 
-    void write(auto file, auto item){
+    void write(file f, auto item){
         //TODO: if ... raise
-        file.write(item);
+        f.write(item);
     }
 };
 
