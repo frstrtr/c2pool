@@ -1,8 +1,8 @@
 project(util)
 
-set(HEADER_FILES #[[pack.h]] pystruct.h)
+set(HEADER_FILES #[[pack.h]] pystruct.h file.h)
 
-set(SOURCE_FILES #[[pack.cpp]] pystruct.cpp)
+set(SOURCE_FILES #[[pack.cpp]] pystruct.cpp file.cpp )
 
 add_library(util STATIC ${SOURCE_FILES} ${HEADER_FILES})
 
