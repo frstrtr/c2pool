@@ -2,7 +2,9 @@
 // Created by vasil on 14.02.2020.
 //
 
-#include "file.h"
+#include "filesys.h"
+#include <cstring>
+#include <string>
 
 file::file(string nameFile) {
     f.open(nameFile); //TODO: Open only while read/write?
@@ -30,4 +32,23 @@ int file::write(string text) {
 
 file::~file() {
     f.close();
+}
+
+string FileSystem::getProjectDir() {
+    return RESOURCES_DIR;
+}
+
+const char *FileSystem::getProjectDir_c() {
+    return RESOURCES_DIR;
+}
+
+string FileSystem::getSubDir(string path) {
+    return getProjectDir() + path;
+}
+
+const char *FileSystem::getSubDir_c(string path) {
+    string str = FileSystem::getSubDir(path);
+    char* cstr = new char [str.length()+1];
+    std::strcpy (cstr, str.c_str());
+    return cstr;
 }

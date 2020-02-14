@@ -5,6 +5,10 @@
 #include <tuple>
 #include "pystruct.h"
 #include "Python.h"
+#include <filesys.h>
+#include<iostream>
+
+
 using namespace std;
 
 
@@ -13,12 +17,11 @@ char* pystruct::pack(char* types, char* vars) {
     char *ret = NULL;
 
 
-
     // Загрузка модуля sys
     auto sys = PyImport_ImportModule("sys");
     auto sys_path = PyObject_GetAttrString(sys, "path");
     // Путь до наших исходников Python
-    auto folder_path = PyUnicode_FromString((const char*) "F:/cpool/src/util"); //TODO: HARD PATH!
+    auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
     PyList_Append(sys_path, folder_path);
 
 
