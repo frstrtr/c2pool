@@ -25,15 +25,10 @@ TEST(PyCode, PyStruct){
     Py_Initialize();
     //strct.read();
 
-//    std::stringstream ss;
-//    ss << 1 << 2 << 3 << "112asdsda";
-//    std::string s;
-//    ss >> s;
-//    std::cout << s;
     pystruct strct;
 
+    cout << strct.pack("<II", "123, 13371488");
 
-    std::cout << strct.pack("<II", "123, 13371488");
 
 
     Py_Finalize();

@@ -19,5 +19,5 @@ add_subdirectory(${UTILS})
 add_subdirectory(lib/googletest)
 add_subdirectory(test)
 
-
-target_link_libraries(cpool ${UTILS})
+target_compile_definitions(cpool PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
+#target_link_libraries(cpool ${UTILS})
