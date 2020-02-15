@@ -20,15 +20,45 @@ public:
     friend bool operator==(const Type& A, const Type& B);
     friend bool operator!=(const Type& A, const Type& B);
 
-    virtual void write(std::stringstream file, T item);
-    virtual T read(std::stringstream file);
+    virtual void write(BaseFile file, T item);
+    virtual T read(BaseFile file);
 
+    T _unpack(BaseFile data, bool ignore_trailing = false){
+        auto obj = read(data);
+        if (!ignore_trailing && remaining(data)){
+            //TODO: raise LateEnd();
+        }
+        return obj;
+    }
+
+    string _pack(T obj){
+        auto f = MemoryFile();
+        write(f, obj);
+        return f.getvalue();
+    }
+
+    T unpack(auto data, bool ignore_trailing = false){
+        //TODO:
+        //if not type(data) == StringIO.InputType:
+        //  data = StringIO.StringIO(data)
+        auto obj = _unpack(data, ignore_trailing);
+
+        //TODO: DEBUG!
+
+        return obj;
+    }
+
+    string pack(T obj){
+        return _pack(obj);
+    }
+
+    //TODO???: auto packed_size(auto obj);
 
 };
 
 class VarIntType:Type<int>{
 
-    int read(file f) {
+    int read(BaseFile f) {
         char data = f.read(1);
         int first = (int) data;
 

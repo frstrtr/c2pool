@@ -7,19 +7,55 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 using namespace std;
 
-class file {
+class BaseFile {
+private:
+
+public:
+    virtual string read(int length = -1) = 0;
+
+    virtual string getvalue() = 0;
+
+    virtual int write(string text) = 0;
+
+    virtual int write(int num) = 0;
+};
+
+class File : BaseFile{
 private:
     fstream f;
 public:
-    file(string nameFile);
+    File(string nameFile = "", string buffer = "");
 
-    string read(int length = -1);
+    ~File();
 
-    int write(string text);
+    string read(int length = -1) override;
 
-    ~file();
+    string getvalue() override;
+
+    int write(string text) override;
+
+    int write(int num) override;
+};
+
+class MemoryFile : BaseFile{
+private:
+    stringstream f;
+public:
+
+    MemoryFile(string buffer = "");
+
+    ~MemoryFile();
+
+    string read(int length = -1) override;
+
+    string getvalue() override;
+
+    int write(string text) override;
+
+    int write(int num) override;
 };
 
 class FileSystem{
