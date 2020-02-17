@@ -59,7 +59,7 @@ public:
 class VarIntType:Type<int>{
 
     int read(BaseFile f) {
-        char data = f.read(1);
+        char data = f.read()[0];
         int first = (int) data;
 
         if (first < 0xfd) {
@@ -91,7 +91,7 @@ class VarIntType:Type<int>{
                 //raise
         }
 
-        char *data2 = f.read(length);
+        char* data2 = f.read_c(length);
 
         auto res = pystruct.unpack(desc, data2); //TODO:???
 
@@ -103,7 +103,7 @@ class VarIntType:Type<int>{
     }
 
     //TODO: NEED RETURN???
-    void write(file f, auto item){
+    void write(File f, auto item){
         auto pack_value;
         if (item < 0xfd)
             pack_value = pystruct.pack('<B', item);
@@ -122,11 +122,11 @@ class VarIntType:Type<int>{
 
 };
 
-class VarStrType:Type{
+class VarStrType:Type<string>{
     VarIntType _inner_size;
 public:
-    auto read(file f){
-        auto length = _inner_size.read(file);
+    auto read(File f){
+        auto length = _inner_size.read(f);
         return f.read(length);
     }
 
