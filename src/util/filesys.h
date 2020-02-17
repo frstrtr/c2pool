@@ -8,6 +8,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <cstring>
 using namespace std;
 
 class BaseFile {
@@ -16,7 +17,11 @@ private:
 public:
     virtual string read(int length = -1) = 0;
 
+    char* read_c(int length = -1);;
+
     virtual string getvalue() = 0;
+
+    char* getvalue_c();
 
     virtual int write(string text) = 0;
 
