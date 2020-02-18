@@ -31,7 +31,7 @@ public:
 
 class pystruct{
 public:
-    static stringstream unpack(std::string types, std::string vars);
+    static stringstream unpack(char* types, char* vars);
 
     static char* pack(char* types, char* vars);
 
