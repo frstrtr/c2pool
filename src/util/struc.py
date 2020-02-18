@@ -23,8 +23,6 @@ def pack(types, args):
     :return: type = bytes
     """
 
-    print(args)
-
     buff = str()
     res = str()
     for i in types:
@@ -53,13 +51,18 @@ def unpack(types, var_bytes):
     :return: type = str stream [tuple]
     """
 
+    var = re.sub("b'", '', var_bytes)
+    var = var[:-1]
 
-    res = str(struct.unpack(types, var_bytes))
-    res = re.sub('[,()]', '', res)
+    _var = bytes(var, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')
+    res = str(struct.unpack(types, _var))
+    res = re.sub("b'", '', res)
+    res = re.sub("[,()']", ' ', res)
+
     return res
 
 
-# def Test():
-#     print(pack('<IIQ3s', '1, 2,3, asd'))
+#def Test():
+#    print(unpack('<II', r"b'A\x01\x00\x009\x05\x00\x00'"))
 #
-# Test()
+#Test()
