@@ -7,13 +7,35 @@
 
 #include <string>
 #include "Python.h"
+#include <sstream>
+using namespace std;
 
+
+class Py {
+public:
+    static bool _ready;
+    static void Initialize() {
+        if (!_ready) {
+            Py_Initialize();
+            _ready = true;
+        }
+    }
+
+    static void Finalize(){
+        if (_ready){
+            Py_Finalize();
+            _ready = false;
+        }
+    }
+};
 
 class pystruct{
 public:
-    void unpack(std::string types, std::string vars);
+    static stringstream unpack(std::string types, std::string vars);
 
-    char* pack(char* types, char* vars);
+    static char* pack(char* types, char* vars);
+
+    static char* pack(char* types, stringstream &vars);
 };
 
 

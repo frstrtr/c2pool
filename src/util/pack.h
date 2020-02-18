@@ -126,7 +126,7 @@ class VarStrType:Type<string>{
     VarIntType _inner_size;
 public:
     auto read(File f){
-        auto length = _inner_size.read(f);
+        auto length = _inner_size.read(f );
         return f.read(length);
     }
 

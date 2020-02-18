@@ -7,12 +7,16 @@
 #include "Python.h"
 #include <filesys.h>
 #include<iostream>
+#include <sstream>
 
 
 using namespace std;
 
+bool Py::_ready = false;
 
 char* pystruct::pack(char* types, char* vars) {
+
+    Py::Initialize();
 
     char *ret = NULL;
 
@@ -69,15 +73,26 @@ char* pystruct::pack(char* types, char* vars) {
     return ret;
 }
 
-void pystruct::unpack(std::string types, std::string vars) {
-    //Py_Initialize();
-    //PyRun_SimpleString("import struct\n" "print(type(struct.unpack('<i', struct.pack('<i', 1488))))\n");
+char* pystruct::pack(char *types, stringstream& vars) {
+    string s;
+    string buff;
+    while (vars >> buff){
+        s += buff;
+    }
 
+    char* res = new char[s.length() + 1];
+    std::strcpy(res, s.c_str());
 
-
-
-    //Py_Finalize();
+    return pystruct::pack(types, res);
 }
+
+stringstream pystruct::unpack(std::string types, std::string vars) {
+    Py::Initialize();
+
+
+}
+
+
 
 
 #include "pystruct.h"
