@@ -22,21 +22,41 @@ def pack(types, args):
     :param args: variables for pack, str
     :return: type = bytes
     """
-    _t = re.sub('[@=<>!1234567890]','', types)
+
+    print(args)
+
+    buff = str()
+    res = str()
+    for i in types:
+        if i.isnumeric():
+            buff += i
+        else:
+            if not i in _bytes:
+                if buff:
+                    res += int(buff)*i
+                else:
+                    res += i
+            else:
+                res += buff+i
+            buff = ''
+
+
+    _t = re.sub('[@=<>!1234567890]','', res)
     vars = re.sub('[ ]', '', args).split(',')
-    print(_t)
-    print(vars)
     res = tuple(convert(type,var) for type, var in zip(_t,vars))
-    print(res)
     return struct.pack(types, *res)
 
 def unpack(types, var_bytes):
     """
     :param types: str, example: '<II'
     :param var_bytes: pack(types, <...>)
-    :return: type = tuple
+    :return: type = str stream [tuple]
     """
-    return  struct.unpack(types, var_bytes)
+
+
+    res = str(struct.unpack(types, var_bytes))
+    res = re.sub('[,()]', '', res)
+    return res
 
 
 # def Test():

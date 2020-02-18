@@ -2,14 +2,14 @@
 #include <cstring>
 #include <string>
 
-const char *BaseFile::read_c(int length) {
+char *BaseFile::read_c(int length) {
     string buff = read(length);
     char* res = new char[buff.length() + 1];
     std::strcpy(res, buff.c_str());
     return res;
 }
 
-const char *BaseFile::getvalue_c() {
+char *BaseFile::getvalue_c() {
     string buff = getvalue();
     char* res = new char[buff.length() + 1];
     std::strcpy(res, buff.c_str());
