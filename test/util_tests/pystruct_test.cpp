@@ -19,18 +19,33 @@ TEST(PyCode, PyStructPack){
 }
 
 TEST(PyCode, PyStructUnpack){
-    Py::Initialize();
-
     string r;
     int a, b;
     stringstream s = pystruct::unpack("<3sII", "b\'bzz9\\x05\\x00\\x00A\\x01\\x00\\x00\'");
 
     s >> r >> a >> b;
-    cout << r << endl << a << endl << b;
     ASSERT_EQ(r, "bzz");
     ASSERT_EQ(a, 1337);
     ASSERT_EQ(b, 321);
+}
 
+TEST(PyCode, PyStructPackUnpack){
+    char* types = "<I2I10s";
+    int i11 = 1, i12 = 12, i13 = 31;
+    string s1 = "zerone.bit";
 
-    Py::Finalize();
+    stringstream _pack;
+
+    _pack << i11 << ", " << i12 << ", " << i13 << ", " << s1;
+    char* res = pystruct::pack(types, _pack);
+
+    stringstream _unpack = pystruct::unpack(types, res);
+
+    int i21, i22, i23;
+    string s2;
+    _unpack >> i21 >> i22 >> i23 >> s2;
+    ASSERT_EQ(i21, i11);
+    ASSERT_EQ(i22, i12);
+    ASSERT_EQ(i23, i13);
+    ASSERT_EQ(s2, s1);
 }
