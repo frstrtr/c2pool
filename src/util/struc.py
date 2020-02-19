@@ -1,7 +1,7 @@
 import struct
 import re
 
-_bytes = ['c', 's', 'p']
+_bytes = ['c', 's', 'p'] #string N-size must be have only N-size
 _int = ['b', 'B', 'h', 'H', 'i', 'I', 'l', 'L', 'q', 'Q', 'n', 'N', 'P']
 _bool = ['?']
 _float = ['e', 'f', 'd']
