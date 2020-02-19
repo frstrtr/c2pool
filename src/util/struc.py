@@ -57,7 +57,7 @@ def unpack(types, var_bytes):
     _var = bytes(var, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')
     res = str(struct.unpack(types, _var))
     res = re.sub("b'", '', res)
-    res = re.sub("[,()']", ' ', res)
+    res = re.sub("[,()']", '', res)
 
     return res
 
