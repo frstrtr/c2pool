@@ -138,11 +138,12 @@ stringstream pystruct::unpack(char* types, char* vars) {
 
         // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
         // Для начала pResultRepr нужно привести к массиву байтов.
-        ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "unicode-escape", "ERROR")));
-        cout << ret;
+        ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
         Py_XDECREF(pResultRepr);
         Py_XDECREF(pVal);
     }
+    ret++; //remove first element ['] in string
+    ret[strlen(ret)-1] = 0; //remove last element ['] in string
 
     res << ret;
     return res;

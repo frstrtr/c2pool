@@ -25,19 +25,12 @@ TEST(PyCode, PyStructUnpack){
     int a, b;
     stringstream s = pystruct::unpack("<3sII", "b\'bzz9\\x05\\x00\\x00A\\x01\\x00\\x00\'");
 
-    /*s >> r >> a >> b;
+    s >> r >> a >> b;
     cout << r << endl << a << endl << b;
     ASSERT_EQ(r, "bzz");
     ASSERT_EQ(a, 1337);
-    ASSERT_EQ(b, 321);*/
+    ASSERT_EQ(b, 321);
 
-    while (s >> r){
-        cout << r << endl;
-    }
-/*
-    while (getline(s, r)){
-        cout << r;
-    }*/
 
     Py::Finalize();
 }
