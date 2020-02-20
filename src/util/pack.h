@@ -7,6 +7,7 @@
 #include <cmath>
 #include <pystruct.h>
 #include <filesys.h>
+#include <vector>
 //TODO: remove all auto;
 //TODO: add 3 types pack from data.py
 
@@ -20,53 +21,55 @@ public:
     friend bool operator==(const Type& A, const Type& B);
     friend bool operator!=(const Type& A, const Type& B);
 
-    virtual void write(BaseFile file, T item);
-    virtual T read(BaseFile file);
+    virtual void write(MemoryFile &f, T item) = 0;
+    virtual T read(MemoryFile &f) = 0;
 
     T _unpack(BaseFile data, bool ignore_trailing = false){
-        auto obj = read(data);
+        T obj = read(data);
         if (!ignore_trailing && remaining(data)){
             //TODO: raise LateEnd();
         }
         return obj;
     }
 
-    string _pack(T obj){
+    char* _pack(T obj){
         auto f = MemoryFile();
         write(f, obj);
-        return f.getvalue();
+        return f.getvalue_c();
     }
 
     T unpack(auto data, bool ignore_trailing = false){
-        //TODO:
+        //TODO: ???
         //if not type(data) == StringIO.InputType:
         //  data = StringIO.StringIO(data)
         auto obj = _unpack(data, ignore_trailing);
-
         //TODO: DEBUG!
 
         return obj;
     }
 
-    string pack(T obj){
+    char* pack(T obj){
         return _pack(obj);
     }
 
-    //TODO???: auto packed_size(auto obj);
+    int packed_size(T obj){
+        int _packed_size = pack(obj).length();
+        return _packed_size;
+    }
 
 };
 
-class VarIntType:Type<int>{
-
-    int read(BaseFile f) {
-        char data = f.read()[0];
+class VarIntType: public Type<int> {
+public:
+    int read(MemoryFile &f) {
+        char data = f.read_str()[0];
         int first = (int) data;
 
         if (first < 0xfd) {
             return first;
         }
 
-        std::string desc;
+        char *desc;
         int length;
         int minimum;
 
@@ -79,67 +82,71 @@ class VarIntType:Type<int>{
             case 0xfe:
                 desc = "<I";
                 length = 4;
-                minimum = pow(2,16);
+                minimum = pow(2, 16);
                 break;
             case 0xff:
                 desc = "<Q";
                 length = 8;
-                minimum = pow(2,32);
+                minimum = pow(2, 32);
                 break;
             default:
                 return 0;
                 //raise
         }
 
-        char* data2 = f.read_c(length);
+        char *data2 = f.read_c(length);
 
-        auto res = pystruct.unpack(desc, data2); //TODO:???
-
-        if (res < minimum){
+        int res;
+        pystruct::unpack(desc, data2) >> res;
+        if (res < minimum) {
             //raise AssertionError('VarInt not canonically packed')
         }
-
         return res;
     }
 
     //TODO: NEED RETURN???
-    void write(File f, auto item){
-        auto pack_value;
-        if (item < 0xfd)
-            pack_value = pystruct.pack('<B', item);
-        else if (item <= 0xffff)
-            pack_value = pystruct.pack('<BH', 0xfd, item);
-        else if (item <= 0xffffffff)
-            pack_value = pystruct.pack('<BI', 0xfe, item);
-        else if (item <= 0xffffffffffffffff)
-            pack_value = pystruct.pack('<BI', 0xff, item);
-        else
+    void write(MemoryFile &f, int item) {
+        char *pack_value = "";
+        stringstream ss;
+        if (item < 0xfd) {
+            ss << item;
+            pack_value = pystruct::pack("<B", ss);
+        } else if (item <= 0xffff) {
+            ss << 0xfd << ", " << item;
+            pack_value = pystruct::pack("<BH", ss);
+        } else if (item <= 0xffffffff) {
+            ss << 0xfe << ", " << item;
+            pack_value = pystruct::pack("<BI", ss);
+        } else if (item <= 0xffffffffffffffff) {
+            ss << 0xff << ", " << item;
+            pack_value = pystruct::pack("<BI", ss);
+        } else
             //TODO:RAISE
             return;
-
         f.write(pack_value); //TODO
     }
 
 };
 
-class VarStrType:Type<string>{
+class VarStrType: public Type<string>{
     VarIntType _inner_size;
 public:
-    auto read(File f){
-        auto length = _inner_size.read(f );
-        return f.read(length);
+    string read(MemoryFile& f){
+        auto length = _inner_size.read(f);
+        string res;
+        f.read(length) >> res;
+        return res;
     }
 
-    void write(file f, auto item)  override {
-        _inner_size.write(file, length(item));
-        std::stringstream ss;
-        ss << file;
-
+    void write(MemoryFile &f, string item) override {
+        _inner_size.write(f, item.length());
         f.write(item);
     }
 };
 
-class EnumType:Type{
+//TODO:? remake
+template <typename _type>
+class EnumType: public Type<_type>{
     auto inner;
     auto pack_to_unpack;
     auto unpack_to_pack;
@@ -150,66 +157,77 @@ public:
         //TODO: UNPACK!!!
     }
 
-    auto read(auto file){
-        auto data = inner.read(file);
+    _type read(MemoryFile& f){
+        auto data = inner.read(f);
         //TODO: CHECK DATA IN PACK_TO_UNPACK!
         return pack_to_unpack[data];
     }
 
-    void write(auto file, auto item){
+    void write(MemoryFile &f, string item){
         //TODO: CHECK DATA IN PACK_TO_UNPACK!
-        inner.write(file, unpack_to_pack[item]);
+        inner.write(f, unpack_to_pack[item]);
     }
 };
 
-class ListType:Type{
+//TODO: call methods from type
+template <typename type>
+class ListType: public Type <vector<type>>{
     VarIntType _inner_size;
-
-    auto type;
-    auto mul;
+    int mul = 1;
 
 public:
 
-    ListType(auto _type, auto _mul = 1){
-        type = _type;
+    ListType(int _mul = 1){
         mul = _mul;
     }
 
-    auto read(auto file);
+    vector<type> read(MemoryFile& f){
+        int length = _inner_size.read(f);
+        length *= mul;
+        type buff[] = new type[length];
+        for (int i = 0; i < length; i++){
+            //TODO: self.type.read(file)
+        }
+        vector<type> res = vector<type>(buff);
+    }
 
-    void write(auto file, auto item){
+    void write(MemoryFile &f, string item){
         //TODO: assert len(item) % self.mul == 0
 
-        _inner_size.write(file, length(item)/mul)
+        _inner_size.write(f, item.length()/mul);
 
         //TODO: foreach(subitem in item){type.write(file, subitem)}
     }
 };
 
-class StructType:Type{
-    auto desc;
-    auto length;
+template <typename type>
+class StructType: public Type<type>{
+    auto desc; //TODO:?
+    int length;
 public:
     StructType(auto _desc){
         desc = _desc;
         //TODO: length = struct.calcsize(desc);
     }
 
-    auto read(file f){
+    auto read(MemoryFile& f){
         auto data = f.read(length);
-        //TODO: return pystruct.unpack(desc, data)[0]
+        string res; //TODO: string?
+        res >> pystruct::unpack(desc, data)[0];
+        return res;
     }
 
-    void write(file f, auto item){
-         f.write(pystruct.pack(self.desc, item)); //TODO
+    void write(MemoryFile &f, string item){
+         f.write(pystruct::pack(desc, item));
     }
 };
 
-class IntType:Type{
-    //TODO: CREATE
-};
 
-class IPV6AddressType:Type{
+/*class IntType: public Type{
+    //TODO: CREATE with memoize
+};*/
+
+class IPV6AddressType: public Type{
 public:
     auto read(auto file){
         //TODO
@@ -220,7 +238,7 @@ public:
     }
 };
 
-class ComposedType:Type{
+class ComposedType: public Type{
     list<auto> fields;
     set<auto> fields_names;
     auto record_type;
@@ -244,7 +262,7 @@ public:
     }
 };
 
-class PossiblyNoneType:Type {
+class PossiblyNoneType: public Type {
     auto none_value;
     auto inner;
 public:
@@ -270,7 +288,7 @@ public:
     }
 };
 
-class FixedStrType:Type{
+class FixedStrType: public Type{
     auto length;
 
     FixedStrType(auto _length){

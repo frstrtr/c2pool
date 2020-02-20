@@ -3,7 +3,7 @@
 #include <string>
 
 char *BaseFile::read_c(int length) {
-    string buff = read(length);
+    string buff = read_str(length);
     char* res = new char[buff.length() + 1];
     std::strcpy(res, buff.c_str());
     return res;
@@ -33,24 +33,34 @@ string File::getvalue() {
     while (f >> buff){
         res += buff;
     }
+    f.seekg(0, ios::beg); //return stream to begin
     return res;
 }
 
-string File::read(int length) {
+string File::read_str(int length) {
     string res;
+    string buff;
     if (f.is_open()) {
-        while (getline (f,res))
+        while (getline (f,buff))
         {
-            //? res += buff;
+            res += buff;
             //TODO: output in DEBUG_MODE
         }
         if (length != -1) {
             res = res.substr(0,length);
         }
+        f.seekg(0, ios::beg); //return stream to begin
         return res;
     }
     //TODO:raise
     return "";
+}
+
+stringstream File::read(int length) {
+    stringstream res;
+    res << f.rdbuf();
+    f.seekg(0, ios::beg); //return stream to begin
+    return res;
 }
 
 int File::write(string text) {
@@ -88,19 +98,28 @@ MemoryFile::~MemoryFile() {
 
 }
 
-string MemoryFile::read(int length) { //TODO: rework
+string MemoryFile::read_str(int length) {
     string res;
-
-    while (getline(f, res)) {
+    string buff;
+    while (getline(f, buff)) {
+        res += buff;
         //TODO: output in DEBUG_MODE
     }
     if (length != -1) {
         res = res.substr(0, length);
     }
+    f.seekg(0, ios::beg); //return stream to begin
     return res;
 
     //TODO:raise
     return "";
+}
+
+stringstream MemoryFile::read(int length) {
+    stringstream res;
+    res << f.rdbuf();
+    f.seekg(0, ios::beg); //return stream to begin
+    return res;
 }
 
 string MemoryFile::getvalue() {
