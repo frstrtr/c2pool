@@ -12,12 +12,12 @@
 using namespace std;
 
 class BaseFile {
-private:
-
 public:
-    virtual string read(int length = -1) = 0;
+    virtual string read_str(int length = -1) = 0;
 
-    char* read_c(int length = -1);;
+    virtual stringstream read(int length = -1) = 0;
+
+    char* read_c(int length = -1);
 
     virtual string getvalue() = 0;
 
@@ -28,7 +28,7 @@ public:
     virtual int write(int num) = 0;
 };
 
-class File : BaseFile{
+class File : public BaseFile{
 private:
     fstream f;
 public:
@@ -36,7 +36,9 @@ public:
 
     ~File();
 
-    string read(int length = -1) override;
+    stringstream read(int length = -1) override;
+
+    string read_str(int length = -1) override;
 
     string getvalue() override;
 
@@ -45,7 +47,7 @@ public:
     int write(int num) override;
 };
 
-class MemoryFile : BaseFile{
+class MemoryFile : public BaseFile{
 private:
     stringstream f;
 public:
@@ -54,7 +56,9 @@ public:
 
     ~MemoryFile();
 
-    string read(int length = -1) override;
+    stringstream read(int length = -1) override;
+
+    string read_str(int length = -1) override;
 
     string getvalue() override;
 
