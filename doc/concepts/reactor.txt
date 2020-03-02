@@ -1,0 +1,82 @@
+main.py
+
+line 89
+line.connectTCP(args.bitcoind_address, args.bitcoind_p2p_port, factory)
+# connect to bitcoind over bitcoin-p2p port test
+params: bitcoind_address = IP of bitcoind, bitcoind_p2p_port = bitcoind port, factory = ClientFactory calss in p2p.py
+
+line 92
+long_dc = reactor.callLater(5, long)
+# ...taking a while. Common reasons for this include all of bitcoind's connection slots being used...
+# wait until at least one slot becomes available
+params: 5 = delay in seconds, long = function to display warning
+
+line 93
+yield factory.getProtocol() # waits until handshake is successful
+# getProtocol from calss ClientFactory in p2p.py
+
+line 97
+defer.returnValue(factory)
+# ???
+
+line 100
+factory = yield connect_p2p()
+# testnet connection if selected
+
+line 112
+bitcoind_getinfo_var.set((yield deferral.retry('Error while calling getinfo:')(bitcoind.rpc_getnetworkinfo)()))
+# bitcoind getnetworkinfo RPC call to start getting initial getmempool
+
+line 114
+deferral.RobustLoopingCall(poll_warnings).start(20*60)
+# class RobustLoopingCall from deferral.py
+
+line 138
+res = yield deferral.retry('Error validating cached address:', 5, 1)(lambda: bitcoind.rpc_getaddressinfo(address))()# rpc_validateaddress(address))()
+# getaddressinfo bitcoind RPC call for check of provided address validity and owner
+
+line 154
+address = yield deferral.retry('Error getting payout address from bitcoind:', 5, 1)(lambda: bitcoind.rpc_getaccountaddress('p2pool'))()
+# getaccountaddress bitcoind RPC call to check if 'p2pool' labeled address persists in the core wallet to set it as default mining address for the node
+
+line 181
+address = yield deferral.retry('Error getting a dynamic address from bitcoind:', 5)(lambda: bitcoind.rpc_getnewaddress('p2pool'))()
+# getnewaddress with 'p2pool' label - create 'p2pool' labeled address in the core wallet to set it as default mining address
+
+line 244
+defer.returnValue(((yield reactor.resolve(host)), port))
+# check and resolve ip addresses of peer hosts
+
+line 317
+deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], serverfactory, interface=worker_endpoint[0])
+# listenTCP workers stratum
+
+line 340
+signal.signal(signal.SIGALRM, lambda signum, frame: reactor.callFromThread(sys.stderr.write, 'Watchdog timer went off at:\n' + ''.join(traceback.format_stack())))
+# Watchdog alarm restart process?
+
+line 396
+reactor.connectTCP("irc.freenode.net", 6667, IRCClientFactory(), bindAddress=(worker_endpoint[0], 0))
+# connect to IRC channel for announcements
+
+line 406
+this_str = 'P2Pool: %i shares in chain (%i verified/%i total) Peers: %i (%i incoming)' % (
+                        height,
+                        len(node.tracker.verified.items),
+                        len(node.tracker.items),
+                        len(node.p2p_node.peers),
+                        sum(1 for peer in node.p2p_node.peers.itervalues() if peer.incoming),
+                    ) + (' FDs: %i R/%i W' % (len(reactor.getReaders()), len(reactor.getWriters())) if p2pool.DEBUG else '')
+# Periodical status message to console
+
+line 465
+reactor.stop()
+# halt main loop if some uncatchable errors occurs
+
+line 726
+reactor.callWhenRunning(main, args, net, datadir_path, merged_urls, worker_endpoint)
+# async execution order of main loop
+
+line 727
+reactor.run()
+#reactor execution
