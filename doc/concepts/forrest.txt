@@ -1,0 +1,15 @@
+Forrest Voight donation addresses:
+
+from official p2pool/prool.git repository on github:
+
+1HNeqi3pJRNvXybNX4FKzZgYJsdTSqJTbk
+
+or donation addresses from original p2pool donation script:
+
+1Kz5QaUPDtKrj5SqW5tFkn7WZh8LmQaQi4
+
+3HW5FVVo3TpKD1rPpsHX2VeJNmfE4Lqe91
+
+and from his PGP message on bitcoin talk:
+
+1KxvX5Hx8nh36ig2gT5bpeEcqLQcwJsZGB
