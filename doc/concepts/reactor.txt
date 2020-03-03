@@ -80,3 +80,51 @@ reactor.callWhenRunning(main, args, net, datadir_path, merged_urls, worker_endpo
 line 727
 reactor.run()
 #reactor execution
+
+p2pool/p2p.py
+
+line 68
+self.get_shares = deferral.GenericDeferrer(
+# Converts query with identifier/got response interface to deferred interface
+
+line 183
+self._stop_thread = deferral.run_repeatedly(lambda: [self.send_ping(), random.expovariate(1/100)][-1])
+# Protocol/handle_version
+
+line 187
+if self.node.advertise_ip:
+    self._stop_thread2 = deferral.run_repeatedly(lambda: [self.sendAdvertisement(), random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
+# Protocol/handle_version
+
+line 574
+def start(self):
+        assert not self.running
+        self.running = True
+    def attempt_listen():
+        if self.running:
+            self.listen_port = reactor.listenTCP(self.node.port, self)
+    deferral.retry('Error binding to P2P port:', traceback=False)(attempt_listen)()
+# ServerFactory/start
+
+line 632
+def start(self):
+    assert not self.running
+    self.running = True
+    self._stop_thinking = deferral.run_repeatedly(self._think)
+# ClientFactory
+
+line 701
+def start(self):
+    if self.running:
+        raise ValueError('already running')
+    
+    self.clientfactory.start()
+    self.serverfactory.start()
+    self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
+    
+    self.running = True
+    
+    self._stop_thinking = deferral.run_repeatedly(self._think)
+    self.forgiveness_task = task.LoopingCall(self.forgive_transgressions)
+    self.forgiveness_task.start(3600.)
+# Node/start
