@@ -128,3 +128,190 @@ def start(self):
     self.forgiveness_task = task.LoopingCall(self.forgive_transgressions)
     self.forgiveness_task.start(3600.)
 # Node/start
+
+p2pool/node.py
+
+line 147
+@self.node.tracker.verified.added.watch
+def _(share):
+    if not (share.pow_hash <= share.header['bits'].target):
+        return
+    
+    def spread():
+        if (self.node.get_height_rel_highest(share.header['previous_block']) > -5 or
+            self.node.bitcoind_work.value['previous_block'] in [share.header['previous_block'], share.header_hash]):
+            self.broadcast_share(share.hash)
+    spread()
+    reactor.callLater(5, spread) # so get_height_rel_highest can update
+# so get_height_rel_highest can update
+#P2PNode/start
+
+p2pool/p2p.py
+
+line 66
+self.timeout_delayed = reactor.callLater(10, self._connect_timeout)
+# Protocol/connectionMade
+
+line 172
+self.timeout_delayed = reactor.callLater(100, self._timeout)
+# Protocol/handle_version
+
+line 205
+def remove_from_remote_view_of_my_known_txs(removed):
+    if removed:
+        self.send_losing_tx(tx_hashes=list(removed.keys()))
+        
+        # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
+        key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
+        self.known_txs_cache[key] = removed #dict((h, before[h]) for h in removed)
+        reactor.callLater(20, self.known_txs_cache.pop, key)
+# Protocol/handle_version/
+
+line 216
+def update_remote_view_of_my_known_txs(before, after):
+    t0 = time.time()
+    added = set(after) - set(before)
+    removed = set(before) - set(after)
+    if added:
+        self.send_have_tx(tx_hashes=list(added))
+    if removed:
+        self.send_losing_tx(tx_hashes=list(removed))
+        
+        # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
+        key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
+        self.known_txs_cache[key] = dict((h, before[h]) for h in removed)
+        reactor.callLater(20, self.known_txs_cache.pop, key)
+    t1 = time.time()
+    if p2pool.BENCH and (t1-t0) > .01: print "%8.3f ms for update_remote_view_of_my_known_txs" % ((t1-t0)*1000.)
+# Protocol/handle_version
+
+line 529
+@defer.inlineCallbacks
+def do_ping(self):
+    start = reactor.seconds()
+    yield self.get_shares(hashes=[0], parents=0, stops=[])
+    end = reactor.seconds()
+    defer.returnValue(end - start)
+# Protocol
+
+line 574
+def start(self):
+    assert not self.running
+    self.running = True
+    
+    def attempt_listen():
+        if self.running:
+            self.listen_port = reactor.listenTCP(self.node.port, self)
+    deferral.retry('Error binding to P2P port:', traceback=False)(attempt_listen)()
+# ServerFactory/start
+
+line 641
+def _think(self):
+    try:
+        if len(self.conns) < self.desired_conns and len(self.attempts) < self.max_attempts and self.node.addr_store:
+            (host, port), = self.node.get_good_peers(1)
+            
+            if self._host_to_ident(host) in self.attempts:
+                pass
+            elif host in self.node.bans and self.node.bans[host] > time.time():
+                pass
+            else:
+                #print 'Trying to connect to', host, port
+                reactor.connectTCP(host, port, self, timeout=5)
+    except:
+        log.err()
+    
+    return random.expovariate(1/1)
+# ClientFactory
+
+line 701
+def start(self):
+    if self.running:
+        raise ValueError('already running')
+    
+    self.clientfactory.start()
+    self.serverfactory.start()
+    self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
+    
+    self.running = True
+    
+    self._stop_thinking = deferral.run_repeatedly(self._think)
+    self.forgiveness_task = task.LoopingCall(self.forgive_transgressions)
+    self.forgiveness_task.start(3600.)
+# Node/start
+
+p2pool/web.py
+
+line 427
+@wb.share_received.watch
+def _(work, dead, share_hash):
+    t = time.time()
+    if not dead:
+        hd.datastreams['local_share_hash_rates'].add_datum(t, dict(good=work))
+    else:
+        hd.datastreams['local_share_hash_rates'].add_datum(t, dict(dead=work))
+    def later():
+        res = node.tracker.is_child_of(share_hash, node.best_share_var.value)
+        if res is None: res = False # share isn't connected to sharechain? assume orphaned
+        if res and dead: # share was DOA, but is now in sharechain
+            # move from dead to good
+            hd.datastreams['local_share_hash_rates'].add_datum(t, dict(dead=-work, good=work))
+        elif not res and not dead: # share wasn't DOA, and isn't in sharechain
+            # move from good to orphan
+            hd.datastreams['local_share_hash_rates'].add_datum(t, dict(good=-work, orphan=work))
+    reactor.callLater(200, later)
+# get_web_root
+
+p2pool/work.py
+
+line 78
+@defer.inlineCallbacks
+def set_merged_work(merged_url, merged_userpass):
+    merged_proxy = jsonrpc.HTTPProxy(merged_url, dict(Authorization='Basic ' + base64.b64encode(merged_userpass)))
+    while self.running:
+        auxblock = yield deferral.retry('Error while calling merged getauxblock on %s:' % (merged_url,), 30)(merged_proxy.rpc_getauxblock)()
+        target = auxblock['target'] if 'target' in auxblock else auxblock['_target']
+        self.merged_work.set(math.merge_dicts(self.merged_work.value, {auxblock['chainid']: dict(
+            hash=int(auxblock['hash'], 16),
+            target='p2pool' if target == 'p2pool' else pack.IntType(256).unpack(target.decode('hex')),
+            merged_proxy=merged_proxy,
+        )}))
+        yield deferral.sleep(1)
+# WorkerBridge/_init_
+
+line 154
+@defer.inlineCallbacks
+def freshen_addresses(self, c):
+    self.cur_address_throttle = time.time()
+    if self.cur_address_throttle - self.address_throttle < 30:
+        return
+    self.address_throttle=time.time()
+    print "ATTEMPTING TO FRESHEN ADDRESS."
+    self.address = yield deferral.retry('Error getting a dynamic address from bitcoind:', 5)(lambda: self.bitcoind.rpc_getnewaddress('p2pool'))()
+    self.pubkeys.popleft()
+    self.pubkeys.addkey({'address': self.address})
+    print " Updated payout pool:"
+    for i in range(len(self.pubkeys.keys)):
+        print('    ...payout %d: %s(%f)' %
+                (i, self.address, self.pubkeys.keyweights[i]))
+    self.pubkeys.updatestamp(c)
+    print " Next address rotation in : %fs" % (time.time()-c+self.args.timeaddresses)
+# WorkerBridge
+
+line 465
+df = deferral.retry('Error submitting merged block: (will retry)', 10, 10)(aux_work['merged_proxy'].rpc_getauxblock)(
+    pack.IntType(256, 'big').pack(aux_work['hash']).encode('hex'),
+    bitcoin_data.aux_pow_type.pack(dict(
+        merkle_tx=dict(
+            tx=new_gentx,
+            block_hash=header_hash,
+            merkle_link=merkle_link,
+        ),
+        merkle_link=bitcoin_data.calculate_merkle_link(hashes, index),
+        parent_block_header=header,
+    )).encode('hex'),
+)
+# WorkerBridge/get_work/get_response
+
+
+
