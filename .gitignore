@@ -38,3 +38,4 @@
 /.idea
 
 *.pyc
+.vscode/settings.json
