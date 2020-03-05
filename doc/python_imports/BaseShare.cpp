@@ -8,7 +8,7 @@ class BaseShare {
     // None/SegwitMiningShare
     int* SUCCESSOR = nullptr; //None
 
-    newType1 small_block_header_type = packFunc(); /*pack.ComposedType([
+    ??? small_block_header_type = packFunc(); /*pack.ComposedType([
         ('version', pack.VarIntType()),
         ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
         ('timestamp', pack.IntType(32)),
@@ -31,12 +31,12 @@ class BaseShare {
     //conservative estimate, will be overwritten during execution
     float gentx_size = 50000;
     float gentx_weight = 200000;
-    newType2* cached_types = nullptr;//None
+    ???* cached_types = nullptr;//None
 
-    //@classmethod
+    /*@classmethod
     public:
     newType3 get_dynamic_types(cls, net) {
-    /* def get_dynamic_types(cls, net):
+    def get_dynamic_types(cls, net):
         if not cls.cached_types == None:
             return cls.cached_types
         t = dict(share_info_type=None, share_type=None, ref_type=None)
@@ -91,13 +91,13 @@ class BaseShare {
             ('share_info', t['share_info_type']),
         ])
         cls.cached_types = t
-        return t*/
-    }
+        return t
+    } */
 
 
     //@classmethod
     public:
-    newType3 generate_transaction(cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None){
+    ??? generate_transaction(cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None){
     /*
     def generate_transaction(cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None):
         t0 = time.time()
@@ -369,7 +369,7 @@ class BaseShare {
 
     //@classmethod
     public:
-    newType4 get_ref_hash(cls, net, share_info, ref_merkle_link){
+    ??? get_ref_hash(cls, net, share_info, ref_merkle_link){
     /*
     def get_ref_hash(cls, net, share_info, ref_merkle_link):
         return pack.IntType(256).pack(bitcoin_data.check_merkle_link(bitcoin_data.hash256(cls.get_dynamic_types(net)['ref_type'].pack(dict(
@@ -482,7 +482,7 @@ class BaseShare {
     }
     
     private:
-    newType5 __repr__(self){
+    ??? __repr__(self){
         /*
         def __repr__(self):
         return 'Share' + repr((self.net, self.peer_addr, self.contents))
@@ -490,14 +490,14 @@ class BaseShare {
     }
     
 
-    newType5 as_share(self){
+    ??? as_share(self){
         /*
         def as_share(self):
         return dict(type=self.VERSION, contents=self.share_type.pack(self.contents))
         */
     }
     
-    newType6 iter_transaction_hash_refs(self){
+    ??? iter_transaction_hash_refs(self){
         /*
             def iter_transaction_hash_refs(self):
         try:
@@ -509,7 +509,7 @@ class BaseShare {
         */
     }
 
-    newType7 check(self, tracker, known_txs=None, block_abs_height_func=None, feecache=None){
+    ??? check(self, tracker, known_txs=None, block_abs_height_func=None, feecache=None){
         /*
         def check(self, tracker, known_txs=None, block_abs_height_func=None, feecache=None):
         from p2pool import p2p
@@ -613,7 +613,7 @@ class BaseShare {
         */
     }
 
-    newType8 get_other_tx_hashes(self, tracker){
+    ??? get_other_tx_hashes(self, tracker){
         /*
         def get_other_tx_hashes(self, tracker):
         parents_needed = max(share_count for share_count, tx_count in self.iter_transaction_hash_refs(
@@ -634,7 +634,7 @@ class BaseShare {
     }
 
     private:
-    newType9 _get_other_txs(self, tracker, known_txs){
+    ??? _get_other_txs(self, tracker, known_txs){
         /*
         def _get_other_txs(self, tracker, known_txs):
         other_tx_hashes = self.get_other_tx_hashes(tracker)
@@ -648,7 +648,7 @@ class BaseShare {
         */
     }
 
-    newType10 should_punish_reason(self, previous_block, bits, tracker, known_txs){
+    ??? should_punish_reason(self, previous_block, bits, tracker, known_txs){
         /*
         def should_punish_reason(self, previous_block, bits, tracker, known_txs): #TODO
         if self.pow_hash <= self.header['bits'].target:
@@ -678,7 +678,7 @@ class BaseShare {
         */
     }
 
-    newType11 as_block(self, tracker, known_txs){
+    ??? as_block(self, tracker, known_txs){
         /*
         def as_block(self, tracker, known_txs):
         other_txs = self._get_other_txs(tracker, known_txs)
