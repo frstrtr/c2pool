@@ -38,3 +38,6 @@
 /.idea
 
 *.pyc
+.vscode/settings.json
+build/CMakeCache.txt
+build/CMakeFiles/cmake.check_cache
