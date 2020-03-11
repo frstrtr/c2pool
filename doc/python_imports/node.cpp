@@ -12,7 +12,7 @@
 
 
 class P2PNode(p2p.Node){
-    // def __init__(self, node, **kwargs):
+    ??? __init__(self, node, **kwargs){
     //     self.node = node
     //     p2p.Node.__init__(self,
     //         best_share_hash_func=lambda: node.best_share_var.value,
@@ -21,8 +21,9 @@ class P2PNode(p2p.Node){
     //         mining_txs_var=node.mining_txs_var,   # transactions from getblocktemplate
     //         mining2_txs_var=node.mining2_txs_var, # transactions sent to miners
     //     **kwargs)
-    
-    // def handle_shares(self, shares, peer):
+    }
+
+    ??? handle_shares(self, shares, peer){
     //     if len(shares) > 5:
     //         print 'Processing %i shares from %s...' % (len(shares), '%s:%i' % peer.addr if peer is not None else None)
         
@@ -49,9 +50,10 @@ class P2PNode(p2p.Node){
         
     //     if len(shares) > 5:
     //         print '... done processing %i shares. New: %i Have: %i/~%i' % (len(shares), new_count, len(self.node.tracker.items), 2*self.node.net.CHAIN_LENGTH)
-    
+    }
+
     // @defer.inlineCallbacks
-    // def handle_share_hashes(self, hashes, peer):
+    ??? handle_share_hashes(self, hashes, peer){
     //     new_hashes = [x for x in hashes if x not in self.node.tracker.items]
     //     if not new_hashes:
     //         return
@@ -66,8 +68,9 @@ class P2PNode(p2p.Node){
     //         peer.badPeerHappened(30)
     //     else:
     //         self.handle_shares([(share, []) for share in shares], peer)
-    
-    // def handle_get_shares(self, hashes, parents, stops, peer):
+    }
+
+    ??? handle_get_shares(self, hashes, parents, stops, peer){
     //     parents = min(parents, 1000//len(hashes))
     //     stops = set(stops)
     //     shares = []
@@ -79,13 +82,15 @@ class P2PNode(p2p.Node){
     //     if len(shares) > 0:
     //         print 'Sending %i shares to %s:%i' % (len(shares), peer.addr[0], peer.addr[1])
     //     return shares
-    
-    // def handle_bestblock(self, header, peer):
+    }
+
+    ??? handle_bestblock(self, header, peer){}
     //     if self.node.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(header)) > header['bits'].target:
     //         raise p2p.PeerMisbehavingError('received block header fails PoW test')
     //     self.node.handle_header(header)
-    
-    // def broadcast_share(self, share_hash):
+    }
+
+    ??? broadcast_share(self, share_hash){
     //     shares = []
     //     for share in self.node.tracker.get_chain(share_hash, min(5, self.node.tracker.get_height(share_hash))):
     //         if share.hash in self.shared_share_hashes:
@@ -95,8 +100,9 @@ class P2PNode(p2p.Node){
         
     //     for peer in self.peers.itervalues():
     //         peer.sendShares([share for share in shares if share.peer_addr != peer.addr], self.node.tracker, self.node.known_txs_var.value, include_txs_with=[share_hash])
-    
-    // def start(self):
+    }
+
+    ??? start(self){
     //     p2p.Node.start(self)
         
     //     self.shared_share_hashes = set(self.node.tracker.items)
@@ -104,7 +110,7 @@ class P2PNode(p2p.Node){
         
     //     @apply
     //     @defer.inlineCallbacks
-    //     def download_shares():
+           ??? download_shares(){
     //         while True:
     //             desired = yield self.node.desired_var.get_when_satisfies(lambda val: len(val) != 0)
     //             peer_addr, share_hash = random.choice(desired)
@@ -135,31 +141,36 @@ class P2PNode(p2p.Node){
     //                 yield deferral.sleep(1) # sleep so we don't keep rerequesting the same share nobody has
     //                 continue
     //             self.handle_shares([(share, []) for share in shares], peer)
-        
+           }
         
     //     @self.node.best_block_header.changed.watch
-    //     def _(header):
+           ??? _(header){
     //         for peer in self.peers.itervalues():
     //             peer.send_bestblock(header=header)
-        
+           }
+
     //     # send share when the chain changes to their chain
     //     self.node.best_share_var.changed.watch(self.broadcast_share)
         
     //     @self.node.tracker.verified.added.watch
-    //     def _(share):
+           ??? _(share){
     //         if not (share.pow_hash <= share.header['bits'].target):
     //             return
-            
-    //         def spread():
+           }
+
+                ??? spread() {
     //             if (self.node.get_height_rel_highest(share.header['previous_block']) > -5 or
     //                 self.node.bitcoind_work.value['previous_block'] in [share.header['previous_block'], share.header_hash]):
     //                 self.broadcast_share(share.hash)
+                }
+
     //         spread()
     //         reactor.callLater(5, spread) # so get_height_rel_highest can update
+    }
 }
 
 class Node(object){
-    // def __init__(self, factory, bitcoind, shares, known_verified_share_hashes, net):
+    ??? __init__(self, factory, bitcoind, shares, known_verified_share_hashes, net){
     //     self.factory = factory
     //     self.bitcoind = bitcoind
     //     self.net = net
@@ -186,8 +197,9 @@ class Node(object){
     //             self.tracker.verified.add(self.tracker.items[share_hash])
         
     //     self.p2p_node = None # overwritten externally
+    }
 
-    // def check_and_purge_txs(self):
+    ??? check_and_purge_txs(self){
     //     if self.cur_share_ver < 34:
     //         return
     //     best_share = self.tracker.items.get(
@@ -197,9 +209,10 @@ class Node(object){
     //     prev_block = best_share.header['previous_block']
     //     if prev_block != self.bitcoind_work.value['previous_block']:
     //         self.known_txs_var.set({})
+    }
 
     // @defer.inlineCallbacks
-    // def start(self):
+    ??? start(self){
     //     stop_signal = variable.Event()
     //     self.stop = stop_signal.happened
         
@@ -208,7 +221,7 @@ class Node(object){
     //     self.bitcoind_work = variable.Variable((yield helper.getwork(self.bitcoind)))
 
     //     @defer.inlineCallbacks
-    //     def work_poller():
+        ??? work_poller(){
     //         while stop_signal.times == 0:
     //             flag = self.factory.new_block.get_deferred()
     //             try:
@@ -217,12 +230,14 @@ class Node(object){
     //             except:
     //                 log.err()
     //             yield defer.DeferredList([flag, deferral.sleep(15)], fireOnOneCallback=True)
+        }
+
     //     work_poller()
         
     //     # PEER WORK
         
     //     self.best_block_header = variable.Variable(None)
-    //     def handle_header(new_header):
+        ??? handle_header(new_header){
     //         # check that header matches current target
     //         if not (self.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(new_header)) <= self.bitcoind_work.value['bits'].target):
     //             return
@@ -237,16 +252,19 @@ class Node(object){
     //                 self.best_block_header.value['previous_block'] != bitcoind_best_block
     //             )): # new is current and previous is not a child of current
     //             self.best_block_header.set(new_header)
+        }
+
     //     self.handle_header = handle_header
 
     //     @defer.inlineCallbacks
-    //     def poll_header():
+        ??? poll_header(){
     //         if self.factory.conn.value is None:
     //             return
     //         handle_header((yield self.factory.conn.value.get_block_header(self.bitcoind_work.value['previous_block'])))
     //     self.bitcoind_work.changed.watch(lambda _: poll_header())
     //     yield deferral.retry('Error while requesting best block header:')(poll_header)()
-        
+        }
+
     //     # BEST SHARE
         
     //     self.get_height_rel_highest, self.get_height = yield height_tracker.get_height_funcs(self.bitcoind, self.factory, lambda: self.bitcoind_work.value['previous_block'], self.net)
@@ -257,40 +275,43 @@ class Node(object){
         
     //     # update mining_txs according to getwork results
     //     @self.bitcoind_work.changed.run_and_watch
-    //     def _(_=None):
+        ??? _(_=None){
     //         new_mining_txs = dict(zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']))
     //         added_known_txs = {hsh:tx for hsh,tx in new_mining_txs.iteritems() if not hsh in self.known_txs_var.value}
     //         self.mining_txs_var.set(new_mining_txs)
     //         self.known_txs_var.add(added_known_txs)
+        }
     //     # add p2p transactions from bitcoind to known_txs
     //     @self.factory.new_tx.watch
-    //     def _(tx):
+        ??? _(tx){
     //         self.known_txs_var.add({
     //             bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx)): tx,
     //         })
+        }
 
     //     if self.cur_share_ver < 34:
     //         # forward transactions seen to bitcoind
     //         @self.known_txs_var.transitioned.watch
     //         @defer.inlineCallbacks
-    //         def _(before, after):
+                ??? _(before, after){
     //             yield deferral.sleep(random.expovariate(1/1))
     //             if self.factory.conn.value is None:
     //                 return
     //             for tx_hash in set(after) - set(before):
     //                 self.factory.conn.value.send_tx(tx=after[tx_hash])
-        
+                }
+
     //     @self.tracker.verified.added.watch
-    //     def _(share):
+            ??? _(share){
     //         if not (share.pow_hash <= share.header['bits'].target):
     //             return
-            
     //         if share.VERSION >= 34:
     //             print 'GOT BLOCK FROM PEER! %s %s%064x' % (
     //                     p2pool_data.format_hash(share.hash),
     //                     self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX,
     //                     share.header_hash)
     //             return
+
     //         block = share.as_block(self.tracker, self.known_txs_var.value)
     //         if block is None:
     //             print >>sys.stderr, 'GOT INCOMPLETE BLOCK FROM PEER! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
@@ -299,8 +320,9 @@ class Node(object){
     //         print
     //         print 'GOT BLOCK FROM PEER! Passing to bitcoind! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
     //         print
+            }
 
-    //     def forget_old_txs():
+            ??? forget_old_txs(){
     //         new_known_txs = {}
     //         if self.p2p_node is not None:
     //             for peer in self.p2p_node.peers.itervalues():
@@ -314,6 +336,8 @@ class Node(object){
     //                 if tx_hash in self.known_txs_var.value:
     //                     new_known_txs[tx_hash] = self.known_txs_var.value[tx_hash]
     //         self.known_txs_var.set(new_known_txs)
+            }
+            
     //     if self.cur_share_ver < 34:
     //         t = deferral.RobustLoopingCall(forget_old_txs)
     //         t.start(10)
@@ -322,8 +346,9 @@ class Node(object){
     //     t = deferral.RobustLoopingCall(self.clean_tracker)
     //     t.start(5)
     //     stop_signal.watch(t.stop)
-    
-    // def set_best_share(self):
+    }
+
+    ??? set_best_share(self){
     //     oldpunish = self.punish
     //     best, desired, decorated_heads, bad_peer_addresses, self.punish= self.tracker.think(self.get_height_rel_highest, self.get_height, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value, self.feecache)
     //     if self.punish and not oldpunish and best == self.best_share_var.value: # need to reissue work with lower difficulty
@@ -342,11 +367,13 @@ class Node(object){
     //                 if peer.addr == bad_peer_address:
     //                     peer.badPeerHappened()
     //                     break
-    
-    // def get_current_txouts(self):
+    }
+
+    ??? get_current_txouts(self){
     //     return p2pool_data.get_expected_payouts(self.tracker, self.best_share_var.value, self.bitcoind_work.value['bits'].target, self.bitcoind_work.value['subsidy'], self.net)
-    
-    // def clean_tracker(self):
+    }
+
+    ??? clean_tracker(self){
     //     best, desired, decorated_heads, bad_peer_addresses, self.punish = self.tracker.think(self.get_height_rel_highest, self.get_height, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value, self.feecache)
         
     //     # eat away at heads
@@ -394,4 +421,5 @@ class Node(object){
     //         #print "removed! %i %f" % (len(to_remove), (end - start)/len(to_remove))
         
     //     self.set_best_share()
+    }
 }
