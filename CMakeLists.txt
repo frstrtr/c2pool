@@ -3,16 +3,21 @@ project(cpool)
 
 set(CMAKE_CXX_STANDARD 20)
 
-set(SOURCE_FILES src/main.cpp)
+#c2pool variables
+set(SOURCE_FILE src/main.cpp)
+#c2pool LIBS
+set(CPOOL_P2P src/p2p/factory.cpp src/p2p/factory.h src/p2p/protocol.cpp src/p2p/protocol.h src/p2p/node.cpp src/p2p/node.h)
+set(CPOOL_CONFIGS src/networks/config.cpp)
+add_library(SOURCE_LIBS ${CPOOL_P2P} ${CPOOL_CONFIGS})
 set(UTILS src/util)
-
+#BOOST
 FIND_PACKAGE(Boost 1.72.0 REQUIRED)
 include_directories(${Boost_INCLUDE_DIRS})
-
+#PYTHON
 find_package(Python3 #[[Libs]] REQUIRED Development)
 
-add_executable(cpool ${SOURCE_FILES})
-
+add_executable(cpool ${SOURCE_FILE})
+target_link_libraries(cpool ${SOURCE_LIBS})
 
 
 include_directories(${UTILS})

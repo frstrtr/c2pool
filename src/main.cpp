@@ -158,7 +158,7 @@ private:
     void start_write()
     {
         if (stopped_)
-            return;
+                return;
 
         // Start an asynchronous operation to send a heartbeat message.
         boost::asio::async_write(socket_, boost::asio::buffer("\n", 1),
@@ -241,7 +241,7 @@ public:
     }
 
     void start() {
-        message_ =  boost::asio::ip::host_name() +" _____ "+ socket_.remote_endpoint().address().to_string() + "________" + socket_.local_endpoint().address().to_string() + " _____ " + make_daytime_string() ;
+        message_ =  boost::asio::ip::host_name() +" _____ "+ socket_.remote_endpoint().address().to_string() + "________" + socket_.local_endpoint().address().to_string() + " _____ " ;
 
         boost::asio::async_write(socket_, boost::asio::buffer(message_),
                                  boost::bind(&tcp_connection::handle_write, shared_from_this(),
