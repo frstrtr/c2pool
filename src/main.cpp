@@ -306,7 +306,6 @@ int main(int argc, char* argv[])
 
         c.start(r.resolve(host, port));
 
-
         io_context.run();
     }
     catch (std::exception& e)

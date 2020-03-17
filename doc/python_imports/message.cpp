@@ -1,3 +1,16 @@
+namespace c2pool::messages{
+
+    enum MESSAGES{
+        version
+    };
+
+    MESSAGES fromStr(string str){
+        switch (str){
+            case "version":
+                return MESSAGES::version;
+        }
+    }
+
 struct message_version {
     //= pack.ComposedType([
     //     ('version', pack.IntType(32)),
@@ -116,4 +129,5 @@ struct message_forget_tx{
     //     ('tx_hashes', pack.ListType(pack.IntType(256))),
     pack.ListType(pack.IntType(256)) tx_hashes;
     // ])
+}
 }
