@@ -16,7 +16,7 @@ namespace c2pool::p2p {
             _node = node;
         }
 
-        Protocol protocolBuild(string addrs) = 0;
+        virtual Protocol protocolBuild(string addrs) = 0;
 
     protected:
         Node* _node;

@@ -3,6 +3,6 @@
 using namespace std;
 
 namespace c2pool::config{
-    vector<string> BOOTSTRAP_ADDRS {"asd", "asd"};
-    string PREFIX = "";
+    vector<string> BOOTSTRAP_ADDRS {"127.0.0.1"};
+    string PREFIX = "1234567890";
 }
