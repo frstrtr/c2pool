@@ -6,9 +6,11 @@
 #include "node.h"
 #include <stdio>
 #include <string>
-#include <pystruct.h>
+#include "pystruct.h"
 #include <sstream>
 #include "config.cpp"
+#include "messages.h"
+
 using namespace std;
 
 namespace c2pool::p2p {
@@ -17,31 +19,18 @@ namespace c2pool::p2p {
 
         Protocol(boost::asio::io_context io, unsigned long _max_payload_length);
 
+        Protocol(boost::asio::io_context io);
+
         void sendVersion(){
             //TODO: init struct Version
         }
     private:
-        Protocol(boost::asio::io_context io);
-
         ///called, when start connection
         void connectionMade(){
 
         }
 
-        void sendPacket(baseMessage payload2){
-            if (payload.command.length() > 12){
-                //TODO: raise ValueError('command too long')
-            }
-            char* payload = payload2.pack();
-            if ((int)strlen(payload) > max_payload_length){
-                //TODO: raise TooLong('payload too long')
-            }
-
-            stringstream ss;
-            ss << payload.command << ", " << (int)strlen(payload);
-            string data = c2pool::config::PREFIX + pystruct::pack("<12sI", ss) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload; //TODO: cstring + cstring; sha256
-            //TODO: self.transport.write(data)
-        }
+        void sendPacket(c2pool::messages::message* payload2);
 
         void disconnect(){
             //TODO: ec check??
@@ -75,14 +64,24 @@ namespace c2pool::p2p {
             if (hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum){
                 //TODO: Debug_log: invalid hash
                 disconnect();
+                //return; //todo:
             }
+
+            message* msg = c2pool::messages::fromStr(command);
+
+            if (msg->command == "error"){
+                //TODO: Debug_log: no type for
+                //return
+            }
+
+            packetReceived(msg);
 
 
 
         }
 
-        void packetReceived(){
-
+        void packetReceived(message* msg){
+            msg->handle();
         }
 
 
