@@ -53,6 +53,24 @@ namespace c2pool::messages{
         }
     };
 
+    class share_type{ //TODO: move to data.cpp
+    public:
+        /*
+            ('type', pack.VarIntType()),
+            ('contents', pack.VarStrType()),
+        */
+        int type;
+        string contents;
+
+        string ToString(){
+            stringstream ss;
+            ss << "[" << type << ";" << contents << "]";
+            string res;
+            ss >> res;
+            return res;
+        }
+    };
+
     class message_version: public message{
     public:
 
@@ -107,102 +125,342 @@ namespace c2pool::messages{
         // ])
     };
 
-    struct message_ping{
+    class message_ping: public message{
+    public:
+        message_ping(){}
+        
+        
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         // message_ping = pack.ComposedType([])
+
     };
 
-    struct message_addrme{
+    class message_addrme: public message{
+    public:
+
+        message_addrme(int prt, const string cmd = "addrme"):message(cmd){
+            port = prt;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("port", PackTypes::IntType, "16", port);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //= pack.ComposedType([
         //    ('port', pack.IntType(16)),
-        //])
-        pack.IntType(16) port;
+        int port;
+        //])        
     };
 
-    struct message_addrs{
+    class message_getaddrs: public message{
+    public:
+
+        message_getaddr(int cnt, const string cmd = "getaddr"):message(cmd){
+            count = cnt;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("count", PackTypes::IntType, "32", count);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
+        //     = pack.ComposedType([
+        //     ('count', pack.IntType(32)),
+        int count;
+        // ])
+    };
+
+    class message_addrs: public message{
+    public:
+
+        message_addrs(??? addrss, address_type  const string cmd = "addrs"):message(cmd){
+            addrs = addrss;
+            timestamp = tmstmp;
+            address = addresss;        
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("addrs", PackTypes::???);
+            ???;
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+        
         // = pack.ComposedType([
+        ???;
         //     ('addrs', pack.ListType(pack.ComposedType([
         //         ('timestamp', pack.IntType(64)),
         //         ('address', bitcoin_data.address_type),
         //     ]))),
         // ])
-        struct addrs{
-            pack.IntType(64) timestamp;
-            bitcoin_data.address_type address;
+        
+    };
+
+    class message_shares: public message{
+    public:
+
+        message_shares(share_type shrs, const string cmd = "version"):message(cmd){
+            shares = shrs;
         }
-    };
 
-    struct message_getaddrs{
-        //     = pack.ComposedType([
-        //     ('count', pack.IntType(32)),
-        // ])
-        pack.IntType(32) count;
-    };
+        void unpack(string item) override {
 
-    struct message_shares{
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("shares", PackTypes::P2PoolDataShareType, shares.ToString());
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('shares', pack.ListType(p2pool_data.share_type)),
+        share_type shares;
         // ])
-        pack.ListType(p2pool_data.share_type) shares;
     };
 
-    struct message_sharereq{
+    class message_sharereq: public message{// TODO переделать ListType.
+    public:
+
+        message_sharereq(int idd, ???ListType_Int256 hshs, int prnts, ???ListType_Int256 stps, const string cmd = "version"):message(cmd){
+            id = idd;
+            hashes = hshs;
+            parents = prnts;
+            stops = stps;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("id", PackTypes::IntType, "256", id);
+            ct.add("hashes", PackTypes::ListType_Int256, hashes.ToString());
+            ct.add("parents", PackTypes::IntType, "", parents);
+            ct.add("stops", PackTypes::ListType_Int256, stops.ToString());
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('id', pack.IntType(256)),
-        pack.IntType(256) id;
+        int id;
         //     ('hashes', pack.ListType(pack.IntType(256))),
-        pack.ListType(pack.IntType(256)) hashes;
+        ListType_Int256 hashes;
         //     ('parents', pack.VarIntType()),
-        pack.VarIntType() parents;
+        int parents;
         //     ('stops', pack.ListType(pack.IntType(256))),
-        pack.ListType(pack.IntType(256)) stops;
+        ListType_Int256 stops;
         // ])
     };
 
-    struct message_sharereply{
+    class message_sharereply: public message{// TODO Enum и ListTypeShareType
+    public:
+
+        message_sharereply(int idd, enum rslt, ListTypeShareType shrs, const string cmd = "version"):message(cmd){
+            id = idd;
+            result = rslt;
+            shares = shrs;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("id", PackTypes::IntType, "256", id);
+            ct.add("result", PackTypes::enum, "", result);
+            ct.add("shares", PackTypes::ListTypeShareType, "", shares);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+        
         //     = pack.ComposedType([
         //     ('id', pack.IntType(256)),
-        pack.IntType(256) id;
+        int id;
         //     ('result', pack.EnumType(pack.VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),
-        pack.EnumType(pack.VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'}) result;
+        enum result;// TODO enum?
         //     ('shares', pack.ListType(p2pool_data.share_type)),
-        pack.ListType(p2pool_data.share_type) shares;
+        ListTypeShareType shares;// TODO ListType
         // ])
     };
 
-    struct message_bestblock{
+    class message_bestblock: public message{// TODO BitcoinDataBlockHeaderType
+    public:
+
+        message_bestblock(BitcoinDataBlockHeaderType hdr, const string cmd = "version"):message(cmd){
+            header = hdr;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("header", PackTypes::BitcoinDataBlockHeaderType, "", header.ToString());
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('header', bitcoin_data.block_header_type),
-        bitcoin_data.block_header_type header;
+        BitcoinDataBlockHeaderType header;
         // ])
     };
 
-    struct message_have_tx{
+    class message_have_tx: public message{
+    public:
+
+        message_have_tx(int tx_hshs, const string cmd = "version"):message(cmd){
+            tx_hashes = tx_hshs;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("tx_hashes", PackTypes::IntType, "256", tx_hashes);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('tx_hashes', pack.ListType(pack.IntType(256))),
-        pack.ListType(pack.IntType(256) tx_hashes;
+        int tx_hashes;
         // ])
     };
 
-    struct message_losing_tx{
+    class message_losing_tx: public message{// TODO ListTypeInt256
+    public:
+
+        message_losing_tx(ListTypeInt256 tx_hshs, const string cmd = "version"):message(cmd){
+            tx_hashes = tx_hshs;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("tx_hashes", PackTypes::ListTypeInt256, "256", tx_hashes);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('tx_hashes', pack.ListType(pack.IntType(256))),
-        pack.ListType(pack.IntType(256) tx_hashes;
+        ListTypeInt256 tx_hashes;
         // ])
     };
 
-    struct message_remember_tx{
+    class message_remember_tx: message{// TODO ListTypeInt256, ListTypeTX
+    public:
+
+        message_remember_tx(ListTypeInt256 tx_hshs, ListTypeTX txss, const string cmd = "version"):message(cmd){
+            tx_hashes = tx_hshs;
+            txs = txss;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("tx_hashes", PackTypes::ListTypeInt256,"256", tx_hashes);
+            ct.add("txs", PackTypes::ListTypeTX,"",txs);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('tx_hashes', pack.ListType(pack.IntType(256))),
-        pack.ListType(pack.IntType(256)) tx_hashes;
+        ListTypeInt256 tx_hashes;
         //     ('txs', pack.ListType(bitcoin_data.tx_type)),
-        pack.ListType(bitcoin_data.tx_type) txs;
+        ListTypeTX txs;
         // ])
     };
 
-    struct message_forget_tx{
+    class message_forget_tx: message {// TODO ListTypeInt256
+    public:
+
+        message_forget_tx(ListTypeInt256 tx_hshs, const string cmd = "version"):message(cmd){
+            tx_hashes = tx_hshs;
+        }
+
+        void unpack(string item) override {
+
+        }
+
+        string pack() override{
+            ComposedType ct;
+            ct.add("tx_hashes", PackTypes::ListTypeInt256, "256". tx_hashes);
+        }
+
+        void handle(Protocol* protocol){
+
+        }
+
         //     = pack.ComposedType([
         //     ('tx_hashes', pack.ListType(pack.IntType(256))),
-        pack.ListType(pack.IntType(256)) tx_hashes;
+        ListTypeInt256 tx_hashes;
         // ])
     }
 }
