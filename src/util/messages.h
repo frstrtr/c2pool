@@ -7,6 +7,7 @@
 
 
 #include <iostream>
+#include "pack.h"
 class Protocol;
 using namespace std;
 
@@ -18,12 +19,11 @@ namespace c2pool::messages{
             command = cmd;
         }
         string command;
-        virtual void unpack();
+        virtual void unpack(string item);
         virtual string pack();
         virtual void handle(Protocol* protocol); //TODO: Protocol: https://ru.stackoverflow.com/questions/482813/Два-заголовочных-файла-содержащих-друг-друга?rq=1
     };
-
-
+    
     message* fromStr(string str);
 
     class message_error: public message{
@@ -34,6 +34,7 @@ namespace c2pool::messages{
     };
 
     class address_type{ //TODO: move to data.cpp
+    public:
         /*
             ('services', pack.IntType(64)),
             ('address', pack.IPV6AddressType()),
@@ -43,20 +44,46 @@ namespace c2pool::messages{
         string address; //TODO: change to boost::ip?
         int port;
 
+        string ToString(){
+            stringstream ss;
+            ss << "[" << services << ";" << address << ";" << port << "]";
+            string res;
+            ss >> res;
+            return res;
+        }
     };
 
     class message_version: public message{
     public:
 
-        message_version(const string cmd = "version"):message(cmd){
-
+        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version"):message(cmd){
+            version = ver;
+            services = serv;
+            addr_to = to;
+            addr_from = from;
+            nonce = _nonce;
+            sub_version = sub_ver;
+            mode = _mode;
+            best_share_hash = best_hash;
         }
 
-        void unpack() override {
+        void unpack(string item) override {
 
         }
 
         string pack() override{
+            ComposedType ct;
+            ct.add("version", PackTypes::IntType, "32", version);
+            ct.add("services", PackTypes::IntType, "64", services);
+            ct.add("addr_to", PackTypes::BitcoinDataAddressType, addr_to.ToString());
+            ct.add("addr_from", PackTypes::BitcoinDataAddressType, addr_from.ToString());
+            ct.add("nonce", PackTypes::IntType, "64", nonce);
+            ct.add("sub_version", PackTypes::VarStrType, sub_version);
+            ct.add("mode", PackTypes::IntType, "32", mode);
+            ct.add("best_share_hash", PackTypes::PossiblyNoneType, "[0,IntType, 256]", best_share_hash); //TODO: Attr
+        }
+
+        void handle(Protocol* protocol){
 
         }
 

@@ -238,25 +238,50 @@ public:
     }
 };
 
-class ComposedType: public Type{
-    list<auto> fields;
-    set<auto> fields_names;
-    auto record_type;
+enum PackTypes{
+    IntType,
+    BitcoinDataAddressType, //value = [services; address; port]
+    VarStrType,
+    PossiblyNoneType
+};
+
+class ComposedType: public Type<string>{
+    //list<auto> fields;
+    //set<auto> fields_names;
+    //auto record_type;
+    stringstream fields;
+
 
 public:
+    ComposedType(){
+        fields.clear();
+    }
+
     ComposedType(auto _fields){
         fields = _fields; //TODO: list(fields)
         //TODO: field_names initialize
         //TODO: recorc_type = get_record(...)
     }
 
-    auto read(auto file){
-        auto item = record_type();
+    template <typename T>
+    ComposedType& add(string field_name, PackTypes packType, const T& value){
+        fields << "(" << field_name << "," << packType << "," << value << ")";
+        return *this;
+    }
+
+    template <typename T>
+    ComposedType& add(string field_name, PackTypes packType, string PackAttr, const T& value){
+        fields << "(" << field_name << "," << packType << ",[" << PackAttr << "]," << value << ")";
+        return *this;
+    }
+
+    string read(MemoryFile &f){
+        //auto item = record_type();
         //TODO: foreach key, type in fileds
         return item;
     }
 
-    void write(auto file, auto item){
+    void write(MemoryFile &f, string item){
         //TODO: assert set(item.keys()) >= self.field_names
         //TODO: foreach
     }
