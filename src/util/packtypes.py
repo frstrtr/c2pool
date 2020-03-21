@@ -4,15 +4,6 @@ import io as StringIO
 from io import BytesIO
 import os
 
-EnumTypes = {
-    0:"IntType",
-    1:"BitcoinDataAddressType",
-    2:"VarStrType",
-    3:"PossiblyNoneType"
-}
-
-
-
 
 #------------------------------------------p2pool memoize------------------------------------------
 import itertools
@@ -245,7 +236,6 @@ class StructType(Type):
         return struct.unpack(self.desc, data)[0]
     
     def write(self, file, item):
-        print(item)
         file.write(struct.pack(self.desc, item))
 
 @fast_memoize_multiple_args
@@ -291,20 +281,25 @@ class IPV6AddressType(Type):
     def read(self, file):
         data = file.read(16)
         if data[:12] == codecs.decode('00000000000000000000ffff','hex'):
-            print(type(data[12:][2]))
-            return '.'.join(str(ord(x)) for x in data[12:])
+            return '.'.join(str(x) for x in data[12:])
         return ':'.join(data[i*2:(i+1)*2].encode('hex') for i in range(8))
     
     def write(self, file, item):
         if ':' in item:
-            print(item)
             data = codecs.decode(''.join(item.replace(':', '')),'hex')
         else:
             bits = list(map(int, item.split('.')))
             if len(bits) != 4:
                 raise ValueError('invalid address: %r' % (bits,))
-            data = codecs.decode('00000000000000000000ffff','hex') + (''.join(chr(x) for x in bits).encode()) #TODO: STR???
-            print(data)
+
+            dataA = bytes()
+            for x in [0,0,0,0,0,0,0,0,0,0,255,255]:
+                dataA += chr(x).encode('latin-1')
+            dataB = bytes()
+            for x in bits:
+                dataB += struct.pack('B',x)
+            data = dataA + dataB
+            print(type(data))
         assert len(data) == 16, len(data)
         file.write(data)
 
@@ -391,46 +386,73 @@ class FixedStrType(Type):
             raise ValueError('incorrect length item!')
         file.write(item)
 
-
 address_type = ComposedType([
-    ('services', IntType(64)),
-    ('address', IPV6AddressType()),
-    ('port', IntType(16, 'big')),
-])
-
-
-arrAddrs = [(1,1), (2,2), (3,3), (4,4), (5,5)]
-
-addrs=[
-    dict(
-        timestamp=int(host+port),
-            address=dict(
-                services=host,
-                address='12.18.0.1',
-                port=port,)
-            ,) for host, port in arrAddrs]
-
-test_message = ComposedType([
-        ('version', IntType(32)),
         ('services', IntType(64)),
-        ('sub_version', VarStrType()),
-        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
-        ('addrs', ListType(ComposedType([
-            ('timestamp', IntType(64)),
-            ('address', address_type),
-        ])))
+        ('address', IPV6AddressType()),
+        ('port', IntType(16, 'big')),
     ])
 
-dict_test_message = {'version':1,
-    'services':2, 
-    'sub_version': "STRING",
-    'best_share_hash':3,
-    'addrs':addrs
-    }
+#------------------------------------------packtypes-for-C------------------------------------------
+
+def c_IntType(value):
+    pass
+
+def c_AddressType(value):
+    pass
+
+EnumTypes = {
+    0:c_IntType, #IntType
+    1:c_AddressType, #BitcoinDataAddressType
+    2:'VarStrType',
+    3:'PossiblyNoneType',
+    4:'ComposedType'
+}
 
 
-packed = test_message.pack(dict_test_message)
-print(packed)
-unpacked = test_message.unpack(packed)
-print(unpacked)
-#print(packed.unpack())
+    
+
+def getValueFromType(num_type):
+    c_type = EnumTypes.get(num_type, 'ERROR')
+    assert not c_type is 'Error'
+    return c_type
+
+
+
+#------------------------------------------TESTS------------------------------------------
+def TEST():
+    arrAddrs = [(1,1), (2,2), (3,3), (4,4), (5,5)]
+
+    addrs=[
+        dict(
+            timestamp=int(host+port),
+                address=dict(
+                    services=host,
+                    address='192.168.1.1',
+                    port=port,)
+                ,) for host, port in arrAddrs]
+
+    test_message = ComposedType([
+            ('version', IntType(32)),
+            ('services', IntType(64)),
+            ('sub_version', VarStrType()),
+            ('best_share_hash', PossiblyNoneType(0, IntType(256))),
+            ('addrs', ListType(ComposedType([
+                ('timestamp', IntType(64)),
+                ('address', address_type),
+            ])))
+        ])
+
+    dict_test_message = {'version':1,
+        'services':2, 
+        'sub_version': "STRING",
+        'best_share_hash':3,
+        'addrs':addrs
+        }
+
+
+    packed = test_message.pack(dict_test_message)
+    print(packed)
+    unpacked = test_message.unpack(packed)
+    print(unpacked)
+
+#TEST()
