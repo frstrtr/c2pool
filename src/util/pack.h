@@ -242,7 +242,8 @@ enum PackTypes{
     IntType,
     BitcoinDataAddressType, //value = [services; address; port]
     VarStrType,
-    PossiblyNoneType
+    PossiblyNoneType,
+    ComposedType
 };
 
 class ComposedType: public Type<string>{
@@ -272,6 +273,13 @@ public:
     template <typename T>
     ComposedType& add(string field_name, PackTypes packType, string PackAttr, const T& value){
         fields << "(" << field_name << "," << packType << ",[" << PackAttr << "]," << value << ")";
+        return *this;
+    }
+
+    ComposedType& add(string field_name, ComposedType& value){
+        string _v;
+        value.fields >> _v;
+        fields << "(" << field_name << "," << PackTypes::ComposedType << "," << _v << ")";
         return *this;
     }
 
