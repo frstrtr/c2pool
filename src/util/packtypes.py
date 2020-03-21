@@ -1,6 +1,7 @@
 import binascii
 import struct
 import io as StringIO
+from io import BytesIO
 import os
 
 EnumTypes = {
@@ -70,6 +71,7 @@ def fast_memoize_multiple_args(func):
 
 
 #------------------------------------------p2pool pack-TYPES------------------------------------------
+import codecs
 #TODO: remove unnecessary
 class EarlyEnd(Exception):
     pass
@@ -110,13 +112,17 @@ class Type(object):
         return obj
     
     def _pack(self, obj):
-        f = StringIO.StringIO()
+        #print(obj)
+        #if isinstance(obj,bytes):
+        f = BytesIO()
+        #else:
+        #    f = StringIO.StringIO()
         self.write(f, obj)
         return f.getvalue()
     
     def unpack(self, data, ignore_trailing=False):
-        if not type(data) == StringIO.InputType:
-            data = StringIO.StringIO(data)
+        if isinstance(data,(str,bytes)):
+            data = StringIO.BytesIO(data)
         obj = self._unpack(data, ignore_trailing)
 
         return obj
@@ -179,7 +185,7 @@ class VarStrType(Type):
     
     def write(self, file, item):
         self._inner_size.write(file, len(item))
-        file.write(item)
+        file.write(item.encode())
 
 class EnumType(Type):
     def __init__(self, inner, pack_to_unpack):
@@ -225,6 +231,11 @@ class ListType(Type):
 class StructType(Type):
     __slots__ = 'desc length'.split(' ')
     
+    def _pack(self, obj):
+        f = BytesIO() #StringIO.StringIO()
+        self.write(f, obj)
+        return f.getvalue()
+    
     def __init__(self, desc):
         self.desc = desc
         self.length = struct.calcsize(self.desc)
@@ -234,12 +245,19 @@ class StructType(Type):
         return struct.unpack(self.desc, data)[0]
     
     def write(self, file, item):
+        print(item)
         file.write(struct.pack(self.desc, item))
 
 @fast_memoize_multiple_args
 class IntType(Type):
     __slots__ = 'bytes step format_str max'.split(' ')
     
+    def _pack(self, obj):
+        f = BytesIO() #StringIO.StringIO()
+        print('_pack int type')
+        self.write(f, obj)
+        return f.getvalue()
+
     def __new__(cls, bits, endianness='little'):
         assert bits % 8 == 0
         assert endianness in ['little', 'big']
@@ -272,18 +290,21 @@ class IntType(Type):
 class IPV6AddressType(Type):
     def read(self, file):
         data = file.read(16)
-        if data[:12] == '00000000000000000000ffff'.decode('hex'):
+        if data[:12] == codecs.decode('00000000000000000000ffff','hex'):
+            print(type(data[12:][2]))
             return '.'.join(str(ord(x)) for x in data[12:])
         return ':'.join(data[i*2:(i+1)*2].encode('hex') for i in range(8))
     
     def write(self, file, item):
         if ':' in item:
-            data = ''.join(item.replace(':', '')).decode('hex')
+            print(item)
+            data = codecs.decode(''.join(item.replace(':', '')),'hex')
         else:
-            bits = map(int, item.split('.'))
+            bits = list(map(int, item.split('.')))
             if len(bits) != 4:
                 raise ValueError('invalid address: %r' % (bits,))
-            data = '00000000000000000000ffff'.decode('hex') + ''.join(chr(x) for x in bits)
+            data = codecs.decode('00000000000000000000ffff','hex') + (''.join(chr(x) for x in bits).encode()) #TODO: STR???
+            print(data)
         assert len(data) == 16, len(data)
         file.write(data)
 
@@ -371,15 +392,45 @@ class FixedStrType(Type):
         file.write(item)
 
 
+address_type = ComposedType([
+    ('services', IntType(64)),
+    ('address', IPV6AddressType()),
+    ('port', IntType(16, 'big')),
+])
+
+
+arrAddrs = [(1,1), (2,2), (3,3), (4,4), (5,5)]
+
+addrs=[
+    dict(
+        timestamp=int(host+port),
+            address=dict(
+                services=host,
+                address='12.18.0.1',
+                port=port,)
+            ,) for host, port in arrAddrs]
+
 test_message = ComposedType([
         ('version', IntType(32)),
         ('services', IntType(64)),
-        #('sub_version', VarStrType()),
+        ('sub_version', VarStrType()),
         ('best_share_hash', PossiblyNoneType(0, IntType(256))),
+        ('addrs', ListType(ComposedType([
+            ('timestamp', IntType(64)),
+            ('address', address_type),
+        ])))
     ])
 
-dict_test_message = {'version':'1', 
-    'services':'2', 
-    'best_share_hash':'3'}
+dict_test_message = {'version':1,
+    'services':2, 
+    'sub_version': "STRING",
+    'best_share_hash':3,
+    'addrs':addrs
+    }
 
-print(test_message.pack(dict_test_message))
+
+packed = test_message.pack(dict_test_message)
+print(packed)
+unpacked = test_message.unpack(packed)
+print(unpacked)
+#print(packed.unpack())
