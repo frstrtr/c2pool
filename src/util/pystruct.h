@@ -29,6 +29,17 @@ public:
     }
 };
 
+namespace c2pool::python::message {
+    class pymessage {
+    public:
+        static stringstream unpack(char* command, char* data);
+
+        static char* pack(char* command, char* vars);
+
+        static char* pack(char* command, stringstream &vars);
+    };
+}
+
 class pystruct{
 public:
     static stringstream unpack(char* types, char* vars);

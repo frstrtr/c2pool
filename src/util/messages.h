@@ -13,6 +13,11 @@ using namespace std;
 
 namespace c2pool::messages{
 
+    enum Messages{
+        error = 9999,
+        message_version = 0
+    };
+
     class message{
     public:
         message(string cmd){

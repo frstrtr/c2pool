@@ -386,13 +386,56 @@ class FixedStrType(Type):
             raise ValueError('incorrect length item!')
         file.write(item)
 
+#------------------------------------------messages and types---------------------------------------
 address_type = ComposedType([
+    ('services', IntType(64)),
+    ('address', IPV6AddressType()),
+    ('port', IntType(16, 'big')),
+])
+def parseAddress_type(_data):
+    data = _data.split(',') #данные внутри других данных разделяются символом ","
+    return {'services':data[0], 'address':data[1], 'port':data[2]}
+
+class msg:
+
+    def pack(self, _data):
+        data = self.parseVars(_data)
+        return _pack(data)
+
+    def unpack(self, _data):
+        pass
+
+    def parseVars(self, vars):
+        res = vars.Split(';') #в c++ переменные в stringstream подаются с разделителим в виде символа ";".
+        return res #список переменных на упаковку.
+
+
+class messageVersion(msg):
+    self.message_version = ComposedType([
+        ('version', IntType(32)),
         ('services', IntType(64)),
-        ('address', IPV6AddressType()),
-        ('port', IntType(16, 'big')),
+        ('addr_to', address_type),
+        ('addr_from', address_type),
+        ('nonce', IntType(64)),
+        ('sub_version', VarStrType()),
+        ('mode', IntType(32)), # always 1 for legacy compatibility
+        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
     ])
 
-#------------------------------------------packtypes-for-C------------------------------------------
+    def _pack(self, data):
+        msg_dict = {'version': int(data[0]),
+                'services': int(data[1]),
+                'addr_to': parseAddress_type(data[2]),
+                'addr_from': parseAddress_type(data[3]),
+                'nonce': int(data[4]),
+                'sub_version': data[5],
+                'mode': int(data[6]),
+                'best_share_hash': int(data[7])} #int?
+
+        return self.message_version.pack(msg_dict)
+
+
+    #------------------------------------------packtypes-for-C------------------------------------------
 
 def c_IntType(value):
     pass
@@ -408,15 +451,16 @@ EnumTypes = {
     4:'ComposedType'
 }
 
-
-    
-
 def getValueFromType(num_type):
     c_type = EnumTypes.get(num_type, 'ERROR')
     assert not c_type is 'Error'
     return c_type
 
 
+EnumMessages = {
+    9999: messageError, #todo: create this class
+    0: messageVersion
+}
 
 #------------------------------------------TESTS------------------------------------------
 def TEST():
