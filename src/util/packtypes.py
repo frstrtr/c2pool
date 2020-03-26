@@ -410,8 +410,30 @@ class msg:
         return res #список переменных на упаковку.
 
 
+class messageError(msg):
+    command = 'error'
+
+    message_error = ComposedType([
+        ('issue', VarStrType())
+    ])
+
+    def __init__(self, text):
+        self.issue = text
+
+    def _pack(self, data):
+        if self.issue:
+            msg_dict = {'issue': self.issue}
+        else:
+            msg_dict = {'issue': data}
+        return self.message_error.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
+
 class messageVersion(msg):
-    self.message_version = ComposedType([
+    command = 'version'
+
+    message_version = ComposedType([
         ('version', IntType(32)),
         ('services', IntType(64)),
         ('addr_to', address_type),
@@ -434,33 +456,27 @@ class messageVersion(msg):
 
         return self.message_version.pack(msg_dict)
 
+    def _unpack(self, data):
+        pass
 
-    #------------------------------------------packtypes-for-C------------------------------------------
-
-def c_IntType(value):
-    pass
-
-def c_AddressType(value):
-    pass
-
-EnumTypes = {
-    0:c_IntType, #IntType
-    1:c_AddressType, #BitcoinDataAddressType
-    2:'VarStrType',
-    3:'PossiblyNoneType',
-    4:'ComposedType'
-}
-
-def getValueFromType(num_type):
-    c_type = EnumTypes.get(num_type, 'ERROR')
-    assert not c_type is 'Error'
-    return c_type
-
+#------------------------------------------packtypes-for-C---------------------------------
 
 EnumMessages = {
     9999: messageError, #todo: create this class
     0: messageVersion
 }
+
+def message_from_str(strcmd):
+    for (k, v) in EnumMessages:
+        if v.command == strcmd:
+            return v
+    return messageError('error str message')
+
+def message_pack(command, vars):
+    pass
+
+def message_unpack(command, data):
+    pass
 
 #------------------------------------------TESTS------------------------------------------
 def TEST():

@@ -15,7 +15,7 @@ namespace c2pool::messages{
 
     enum Messages{
         error = 9999,
-        message_version = 0
+        version = 0
     };
 
     class message{
