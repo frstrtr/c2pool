@@ -16,7 +16,7 @@ namespace c2pool::p2p {
             _node = node;
         }
 
-        virtual Protocol protocolBuild(string addrs) = 0;
+        virtual BaseProtocol protocolBuild(string addrs) = 0;
 
     protected:
         Node* _node;
@@ -29,9 +29,9 @@ namespace c2pool::p2p {
 
         }
 
-        Protocol protocolBuild(string addrs){ //TODO: string or tcp::endpoint addrs?
+        BaseProtocol protocolBuild(string addrs){ //TODO: string or tcp::endpoint addrs?
             //TODO: check connections
-            Protocol* p = new Protocol(_node);
+            BaseProtocol* p = new BaseProtocol(_node);
             p->_factory = this;
             //TODO: Debug mode {"Got peer connection from:"}
             return p;
@@ -46,8 +46,8 @@ namespace c2pool::p2p {
 
         }
 
-        Protocol protocolBuild(string addrs){ //TODO: string or tcp::endpoint?
-            Protocol* p = new Protocol(_node);
+        BaseProtocol protocolBuild(string addrs){ //TODO: string or tcp::endpoint?
+            BaseProtocol* p = new BaseProtocol(_node);
             p->_factory = this;
             //TODO: Debug mode {"Got peer connection from:"}
             return p;

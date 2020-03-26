@@ -9,28 +9,29 @@
 #include "pystruct.h"
 #include <sstream>
 #include "config.cpp"
-#include "messages.h"
 
+class c2pool::messages::message;
 using namespace std;
 
 namespace c2pool::p2p {
-    class Protocol {
+    class BaseProtocol {
     public:
 
-        Protocol(boost::asio::io_context io, unsigned long _max_payload_length);
+        BaseProtocol(boost::asio::io_context io, unsigned long _max_payload_length);
 
-        Protocol(boost::asio::io_context io);
+        BaseProtocol(boost::asio::io_context io);
 
         void sendVersion(){
             //TODO: init struct Version
         }
+        void sendPacket(c2pool::messages::message *payload2);
     private:
         ///called, when start connection
         void connectionMade(){
 
         }
 
-        void sendPacket(c2pool::messages::message* payload2);
+
 
         void disconnect(){
             //TODO: ec check??
@@ -60,7 +61,7 @@ namespace c2pool::p2p {
             string checksum = data.substr(?,?); //TODO
             string payload = data.substr(?,?); //TODO:
 
-            //TODO: HASH
+            //TODO: HASH, check for hash function btc-core
             if (hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum){
                 //TODO: Debug_log: invalid hash
                 disconnect();
@@ -97,6 +98,8 @@ namespace c2pool::p2p {
         boost::asio::steady_timer timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
 
         friend class Factory;
+
+
     };
 }
 
