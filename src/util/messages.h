@@ -26,7 +26,7 @@ namespace c2pool::messages{
         string command;
         virtual void unpack(string item);
         virtual string pack();
-        virtual void handle(Protocol* protocol); //TODO: Protocol: https://ru.stackoverflow.com/questions/482813/Два-заголовочных-файла-содержащих-друг-друга?rq=1
+        virtual void handle(Protocol* protocol);
     };
     
     message* fromStr(string str);
@@ -79,16 +79,7 @@ namespace c2pool::messages{
     class message_version: public message{
     public:
 
-        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version"):message(cmd){
-            version = ver;
-            services = serv;
-            addr_to = to;
-            addr_from = from;
-            nonce = _nonce;
-            sub_version = sub_ver;
-            mode = _mode;
-            best_share_hash = best_hash;
-        }
+        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version");
 
         void unpack(string item) override {
 
@@ -109,6 +100,7 @@ namespace c2pool::messages{
         void handle(Protocol* protocol){
 
         }
+
 
         //= pack.ComposedType([
         //     ('version', pack.IntType(32)),
