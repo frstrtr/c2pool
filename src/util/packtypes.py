@@ -406,7 +406,7 @@ class msg:
         pass
 
     def parseVars(self, vars):
-        res = vars.Split(';') #в c++ переменные в stringstream подаются с разделителим в виде символа ";".
+        res = vars.split(';') #в c++ переменные в stringstream подаются с разделителим в виде символа ";".
         return res #список переменных на упаковку.
 
 
