@@ -3,29 +3,32 @@
 
 #include "boost/asio.hpp"
 #include "protocol.h"
-#include "node.h"
 #include <vector>
 
+namespace c2pool::p2p {
+    class Node;
+}
 
 using namespace std;
 
 namespace c2pool::p2p {
     class Factory {
     public:
-        Factory(Node* node){
+        Factory(c2pool::p2p::Node* node){
             _node = node;
         }
 
+        virtual void start() = 0;
         virtual BaseProtocol protocolBuild(string addrs) = 0;
 
     protected:
-        Node* _node;
+        c2pool::p2p::Node* _node;
         vector<boost::asio::ip::tcp::endpoint> connections; //Список текущих подключений.
     };
 
     class Server : Factory {
     public:
-        Server(Node* node):Factory(node){
+        Server(c2pool::p2p::Node* node):Factory(node){
 
         }
 
@@ -37,12 +40,16 @@ namespace c2pool::p2p {
             return p;
         }
 
+        void start(){
+
+        }
+
     private:
     };
 
     class Client : Factory {
     public:
-        Client(Node* node):Factory(node){
+        Client(c2pool::p2p::Node* node):Factory(node){
 
         }
 
@@ -51,6 +58,10 @@ namespace c2pool::p2p {
             p->_factory = this;
             //TODO: Debug mode {"Got peer connection from:"}
             return p;
+        }
+
+        void start(){
+
         }
 
     private:

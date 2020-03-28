@@ -3,3 +3,4 @@
 //
 
 #include "node.h"
+#include "factory.h"
