@@ -5,7 +5,7 @@
 #ifndef BITCOIN_CRYPTO_CHACHA_POLY_AEAD_H
 #define BITCOIN_CRYPTO_CHACHA_POLY_AEAD_H
 
-#include <crypto/chacha20.h>
+#include <chacha20.h>
 
 #include <cmath>
 

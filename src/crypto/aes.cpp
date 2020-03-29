@@ -2,12 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <crypto/aes.h>
+#include <aes.h>
 
 #include <string.h>
 
 extern "C" {
-#include <crypto/ctaes/ctaes.c>
+#include <ctaes/ctaes.c>
 }
 
 AES256Encrypt::AES256Encrypt(const unsigned char key[32])
