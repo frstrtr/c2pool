@@ -5,8 +5,8 @@
 // Based on the public domain implementation by Andrew Moon
 // poly1305-donna-unrolled.c from https://github.com/floodyberry/poly1305-donna
 
-#include <crypto/common.h>
-#include <crypto/poly1305.h>
+#include <common.h>
+#include <poly1305.h>
 
 #include <string.h>
 

@@ -479,7 +479,7 @@ def message_unpack(command, data):
     pass
 
 #------------------------------------------TESTS------------------------------------------
-def TEST():
+def TEST_PACK_UNPACK():
     arrAddrs = [(1,1), (2,2), (3,3), (4,4), (5,5)]
 
     addrs=[
@@ -515,4 +515,11 @@ def TEST():
     unpacked = test_message.unpack(packed)
     print(unpacked)
 
-#TEST()
+
+def TEST_SHA256():
+    import hashlib
+    data = 'As Bitcoin relies on 80 byte header hashes, we want to have an example for that.'.encode('utf-8')
+    print(hashlib.sha256(data).hexdigest() == '7406e8de7d6e4fffc573daef05aefb8806e7790f55eab5576f31349743cca743')
+
+#TEST_SHA256()
+#TEST_PACK_UNPACK()
