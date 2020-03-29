@@ -459,6 +459,29 @@ class messageVersion(msg):
     def _unpack(self, data):
         pass
 
+class messagePing(msg):
+    command = 'ping'
+
+    message_ping = ComposedType([])
+
+    def _pack(self, data):
+        msg_dict = {}
+        return self.message_ping.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
+
+class messageAddrme(msg):
+    command = 'addrme'
+
+    message_addrme = ComposedType([('port':IntType(16))])
+
+    def _pack(self, data):
+        msg_dict = {'port':int(data[0])}
+
+    def _unpack(self,data):
+        pass
+    
 #------------------------------------------packtypes-for-C---------------------------------
 
 EnumMessages = {
