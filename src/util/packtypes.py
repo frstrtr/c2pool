@@ -482,13 +482,93 @@ class messageAddrme(msg):
     def _unpack(self, data):
         pass
     
+class messageAddrs(msg):
+    command = 'addrs'
+
+    message_addrs = ComposedType([
+        ('addrs',ComposedType([
+            ('timestamp',IntType(64)),
+            ('address',address_type), # TODO nested - need to check
+        ])))
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'addrs':000
+            # 'timestamp':
+            # 'address':
+            } # TODO nested
+        return self.message_addrs.pack(msg_dict)
+    
+    def _unpack(self, data):
+        pass
+
+class messageGetAddrs(msg):
+    command = 'getaddrs'
+
+    message_getaddrs = ComposedType([
+        ('count', IntType(32)),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'count': int(data[0]),
+        }
+        return self.message_getaddrs.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
+
+class messageShares(msg):
+    command = 'shares'
+
+    message_shares = ComposedType([
+        ('shares', ListType(p2pool_data.share_type)),# todo check ('shares', pack.ListType(p2pool_data.share_type))
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'shares':ListType(data[0]),
+        }
+        return self.message_shares.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
+
+class messageShareReq(msg):
+    command = 'sharereq'
+
+    message_shrereq = ComposedType([
+        ('id', IntType(256)),
+        ('hashes', ListType(IntType(256)))# todo check ('hashes', pack.ListType(pack.IntType(256)))
+        ('parents', VarIntType()),
+        ('stops', ListType(IntType(256)))# todo check ('stops', pack.ListType(pack.IntType(256)))
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'id': int(data[0]),
+            'hashes': ListType(data[1]),
+            'parents': VarIntType(data[2]),
+            'stops': ListType(data[3]),
+        }
+        return self.message_shrereq.pack(msg_dict)\
+    
+    def _unpack(self,data):
+        pass
+
 #------------------------------------------packtypes-for-C---------------------------------
 
 EnumMessages = {
     9999: messageError, #todo: create this class
     0: messageVersion,
     1: messagePing,
-    2: messageAddrme
+    2: messageAddrme,
+    3: messageAddrs,
+    4: messageGetAddrs,
+    5: messageShares,
+    6: messageShareReq,
+
 }
 
 def message_from_str(strcmd):
