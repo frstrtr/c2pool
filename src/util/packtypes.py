@@ -609,8 +609,55 @@ class messageHaveTX(msg):
     def unpack(self, data):
         pass
 
+class messageLosingTX(msg):
+    command = 'losing_tx'
 
+    message_losing_tx = ComposedType([
+        ('tx_hashes', ListType(pack.IntType(256))),
+    ])
 
+    def _pack(self, data):
+        msg_dict = {
+            'tx_hashes':[IntType(256)],
+        }
+        return self.message_losing_tx.pack(msg_dict)
+    
+    def _unpack(self, data):
+        pass
+
+class messageRememberTX(msg):
+    command = 'remember_tx'
+
+    message_remember_tx = ComposedType([
+        ('tx_hashes', ListType(pack.IntType(256))),
+        ('txs', ListType(bitcoin_data.tx_type)),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'tx_hashes': [int(data[0])],
+            'txs': [parseTX_type(data[1])],
+        }
+        return self.message_remember_tx.pack(msg_dict)
+
+    def _unpack(self,data):
+        pass
+
+class messageForgetTX(msg):
+    command = 'forget_tx'
+
+    message_forget_tx = ComposedType([
+        ('tx_hashes', ListType(pack.IntType(256))),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            [int(data[0])],
+        }
+        return self.message_forget_tx.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
 #------------------------------------------packtypes-for-C---------------------------------
 
 EnumMessages = {
@@ -625,8 +672,9 @@ EnumMessages = {
     7: messageShareReply,
     8: messageBestBlock,
     9: messageHaveTX,
-
-
+    10:messageLosingTX,
+    11:messageRememberTX,
+    12:messageForgetTX,
 }
 
 def message_from_str(strcmd):
