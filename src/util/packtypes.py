@@ -486,18 +486,18 @@ class messageAddrs(msg):
     command = 'addrs'
 
     message_addrs = ComposedType([
-        ('addrs',ComposedType([
-            ('timestamp',IntType(64)),
-            ('address',address_type), # TODO nested - need to check
-        ])))
+        ('addrs', ListType(ComposedType([
+            ('timestamp', IntType(64)),
+            ('address', bitcoin_data.address_type),# todo check it out
+        ]))),
     ])
 
     def _pack(self, data):
         msg_dict = {
-            'addrs':000
-            # 'timestamp':
-            # 'address':
-            } # TODO nested
+            'addrs':[{
+                'timestamp': int(data[0]),
+                'address': bitcoin_data.address_type,
+            }]}
         return self.message_addrs.pack(msg_dict)
     
     def _unpack(self, data):
@@ -557,6 +557,60 @@ class messageShareReq(msg):
     def _unpack(self,data):
         pass
 
+class messageShareReply(msg):
+    command = 'sharereply'
+
+    message_sharereply = ComposedType([
+        ('id', IntType(256)),
+        ('result', EnumType(pack.VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),
+        ('shares', ListType(p2pool_data.share_type)),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'id': int(data[0]),
+            'result': EnumType(VarIntType(data[1]), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})#todo chackout this
+            'shares': {parseShareType(data[2])}, # todo checkout this
+        }
+        return self.message_sharereply.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
+
+class messageBestBlock(msg):
+    command = 'bestblock'
+    
+    message_bestblock = ComposedType([
+        ('header', block_header_type),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'header': parseBlock_header_type(data[0]),# todo check this out
+        }
+        return self.message_bestblock.pack(msg_dict)
+
+    def _unpack(self, data):
+        pass
+
+class messageHaveTX(msg):
+    command = 'have_tx'
+
+    message_have_tx = ComposedType([
+        ('tx_hashes', ListType(IntType(256))),
+    ])
+
+    def pack(self, data):
+        msg_dict = {
+            'tx_hashes': [IntType(256)] # todo check this out
+        }
+        return self.message_have_tx.pack(msg_dict)
+    
+    def unpack(self, data):
+        pass
+
+
+
 #------------------------------------------packtypes-for-C---------------------------------
 
 EnumMessages = {
@@ -568,6 +622,10 @@ EnumMessages = {
     4: messageGetAddrs,
     5: messageShares,
     6: messageShareReq,
+    7: messageShareReply,
+    8: messageBestBlock,
+    9: messageHaveTX,
+
 
 }
 
