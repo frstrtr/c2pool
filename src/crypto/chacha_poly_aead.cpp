@@ -5,7 +5,7 @@
 #include <chacha_poly_aead.h>
 
 #include <poly1305.h>
-#include <support/cleanse.h> //TODO:
+#include <cleanse.h> //TODO:
 
 #include <assert.h>
 #include <string.h>
