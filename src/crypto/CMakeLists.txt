@@ -13,7 +13,17 @@ set(HEADER_FILES
         sha1.h
         sha256.h
         sha512.h
-        siphash.h)
+        siphash.h
+        #---------
+        cleanse.h
+        endian.h
+        byteswap.h
+        cpuid.h
+        uint256.h
+        strencodings.h
+        string.h
+        tinyformat.h
+        attributes.h)
 set(SOURCE_FILES
         aes.cpp
         chacha20.cpp
@@ -29,6 +39,11 @@ set(SOURCE_FILES
         sha256_shani.cpp sha256_sse4.cpp
         sha256_sse41.cpp
         sha512.cpp
-        siphash.cpp)
+        siphash.cpp
+        #-------------
+        cleanse.cpp
+        uint256.cpp
+        strencodings.cpp
+        string.cpp)
 
 add_library(crypto STATIC ${SOURCE_FILES} ${HEADER_FILES})
