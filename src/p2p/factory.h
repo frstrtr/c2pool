@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace c2pool::p2p {
-    class Node;
+    class P2PNode;
 }
 
 using namespace std;
@@ -14,7 +14,7 @@ using namespace std;
 namespace c2pool::p2p {
     class Factory {
     public:
-        Factory(c2pool::p2p::Node* node){
+        Factory(c2pool::p2p::P2PNode* node){
             _node = node;
         }
 
@@ -22,13 +22,13 @@ namespace c2pool::p2p {
         virtual BaseProtocol protocolBuild(string addrs) = 0;
 
     protected:
-        c2pool::p2p::Node* _node;
+        c2pool::p2p::P2PNode* _node;
         vector<boost::asio::ip::tcp::endpoint> connections; //Список текущих подключений.
     };
 
     class Server : Factory {
     public:
-        Server(c2pool::p2p::Node* node):Factory(node){
+        Server(c2pool::p2p::P2PNode* node): Factory(node){
 
         }
 
@@ -49,7 +49,7 @@ namespace c2pool::p2p {
 
     class Client : Factory {
     public:
-        Client(c2pool::p2p::Node* node):Factory(node){
+        Client(c2pool::p2p::P2PNode* node): Factory(node){
 
         }
 

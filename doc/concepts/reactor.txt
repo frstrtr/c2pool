@@ -127,7 +127,7 @@ def start(self):
     self._stop_thinking = deferral.run_repeatedly(self._think)
     self.forgiveness_task = task.LoopingCall(self.forgive_transgressions)
     self.forgiveness_task.start(3600.)
-# Node/start
+# P2PNode/start
 
 p2pool/node.py
 
@@ -238,7 +238,7 @@ def start(self):
     self._stop_thinking = deferral.run_repeatedly(self._think)
     self.forgiveness_task = task.LoopingCall(self.forgive_transgressions)
     self.forgiveness_task.start(3600.)
-# Node/start
+# P2PNode/start
 
 p2pool/web.py
 

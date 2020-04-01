@@ -21,7 +21,7 @@ set(HEADER_FILES
         cpuid.h
         uint256.h
         strencodings.h
-        string.h
+        str.h
         tinyformat.h
         attributes.h)
 set(SOURCE_FILES
@@ -44,6 +44,6 @@ set(SOURCE_FILES
         cleanse.cpp
         uint256.cpp
         strencodings.cpp
-        string.cpp)
+        str.cpp)
 
 add_library(crypto STATIC ${SOURCE_FILES} ${HEADER_FILES})
