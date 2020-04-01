@@ -4,7 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <strencodings.h>
-#include <string.h>
+#include <str.h>
 
 #include <tinyformat.h>
 

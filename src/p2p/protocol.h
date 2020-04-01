@@ -88,7 +88,7 @@ namespace c2pool::p2p {
 
 
     private:
-        Node*_node;
+        P2PNode*_node;
         Factory* factory;
         tcp::socket socket;
         const unsigned int version = 3301;
