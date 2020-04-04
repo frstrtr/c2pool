@@ -396,6 +396,21 @@ def parseAddress_type(_data):
     data = _data.split(',') #данные внутри других данных разделяются символом ","
     return {'services':data[0], 'address':data[1], 'port':data[2]}
 
+class UnpackResult:
+    def __init__(self):
+        self.res = ''
+    
+    def __iadd__(self, other):
+        #TODO: for bytes -> .decode("utf-8") 
+        self.res += str(other) + ' '
+        return self
+    
+    def __add__(self, other):
+        self.res += other.res
+
+    def __str__(self):
+        return self.res
+
 class msg:
 
     def pack(self, _data):
@@ -457,7 +472,19 @@ class messageVersion(msg):
         return self.message_version.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = self.message_version.unpack(data)
+        res += t['version']
+        res += t['services']
+
+        res += t['addr_to'] #todo
+        res += t['addr_from'] #todo
+
+        res += t['nonce']
+        res += t['sub_version']
+        res += t['mode']
+        res += t['best_share_hash']
+
 
 class messagePing(msg):
     command = 'ping'
@@ -684,10 +711,12 @@ def message_from_str(strcmd):
     return messageError('error str message')
 
 def message_pack(command, vars):
-    pass
+    t = EnumMessages[command]
+    return t.pack(vars)
 
 def message_unpack(command, data):
     pass
+
 
 #------------------------------------------TESTS------------------------------------------
 def TEST_PACK_UNPACK():
@@ -725,6 +754,7 @@ def TEST_PACK_UNPACK():
     print(packed)
     unpacked = test_message.unpack(packed)
     print(unpacked)
+    print(dict(unpacked).values())
 
 
 def TEST_SHA256():
@@ -732,5 +762,16 @@ def TEST_SHA256():
     data = 'As Bitcoin relies on 80 byte header hashes, we want to have an example for that.'.encode('utf-8')
     print(hashlib.sha256(data).hexdigest() == '7406e8de7d6e4fffc573daef05aefb8806e7790f55eab5576f31349743cca743')
 
+def TEST_UNPACKRES():
+    t = UnpackResult()
+
+    t += 123
+    t += 'test123test'
+    t += (123,'asd')
+    t += {1:'23', '23':1}
+
+    print(t)
+
 #TEST_SHA256()
 #TEST_PACK_UNPACK()
+TEST_UNPACKRES()
