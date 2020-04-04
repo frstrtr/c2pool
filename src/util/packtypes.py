@@ -473,7 +473,7 @@ class messageVersion(msg):
 
     def _unpack(self, data):
         res = UnpackResult()
-        t = self.message_version.unpack(data)
+        t = dict(self.message_version.unpack(data))
         res += t['version']
         res += t['services']
 
