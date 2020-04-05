@@ -485,7 +485,6 @@ class messageVersion(msg):
         res += t['mode']
         res += t['best_share_hash']
 
-
 class messagePing(msg):
     command = 'ping'
 
