@@ -484,6 +484,7 @@ class messageVersion(msg):
         res += t['sub_version']
         res += t['mode']
         res += t['best_share_hash']
+        return res
 
 class messagePing(msg):
     command = 'ping'
@@ -494,7 +495,10 @@ class messagePing(msg):
         return self.message_ping.pack({})
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_ping.unpack(data))
+        res = ''
+        return res
 
 class messageAddrme(msg):
     command = 'addrme'
@@ -506,7 +510,10 @@ class messageAddrme(msg):
         return self.message_addrme.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_addrme.unpack(data))
+        res = t['port']
+        return res
     
 class messageAddrs(msg):
     command = 'addrs'
@@ -527,7 +534,11 @@ class messageAddrs(msg):
         return self.message_addrs.pack(msg_dict)
     
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_addrs.unpack(data))
+        res += t['timestamp']
+        res += t['address']# todo check nested
+        return res
 
 class messageGetAddrs(msg):
     command = 'getaddrs'
@@ -543,7 +554,10 @@ class messageGetAddrs(msg):
         return self.message_getaddrs.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_getaddrs.unpack(data))
+        res = t['count']
+        return res
 
 class messageShares(msg):
     command = 'shares'
@@ -559,7 +573,10 @@ class messageShares(msg):
         return self.message_shares.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_shares.unpack(data))
+        res = t['shares']
+        return res
 
 class messageShareReq(msg):
     command = 'sharereq'
@@ -567,7 +584,7 @@ class messageShareReq(msg):
     message_shrereq = ComposedType([
         ('id', IntType(256)),
         ('hashes', ListType(IntType(256)))# todo check ('hashes', pack.ListType(pack.IntType(256)))
-        ('parents', VarIntType()),
+        ('parents', VarIntType()),# todo Var int type check
         ('stops', ListType(IntType(256)))# todo check ('stops', pack.ListType(pack.IntType(256)))
     ])
 
@@ -581,33 +598,44 @@ class messageShareReq(msg):
         return self.message_shrereq.pack(msg_dict)\
     
     def _unpack(self,data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_sharereq.unpack(data))
+        res += t['id']
+        res += t['hashes']
+        res += t['parents']
+        res += t['stops']
+        return res
 
 class messageShareReply(msg):
     command = 'sharereply'
 
     message_sharereply = ComposedType([
         ('id', IntType(256)),
-        ('result', EnumType(pack.VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),
-        ('shares', ListType(p2pool_data.share_type)),
+        ('result', EnumType(VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),# todo enum & Var int type
+        ('shares', ListType(p2pool_data.share_type)),# todo share_type
     ])
 
     def _pack(self, data):
         msg_dict = {
             'id': int(data[0]),
-            'result': EnumType(VarIntType(data[1]), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})#todo chackout this
+            'result': EnumType(VarIntType(data[1]), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'}),#todo chackout this
             'shares': {parseShareType(data[2])}, # todo checkout this
         }
         return self.message_sharereply.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_sharereply.unpack(data))
+        res += t['id']
+        res += t['result']
+        res += t['shares']
+        return res
 
 class messageBestBlock(msg):
     command = 'bestblock'
     
     message_bestblock = ComposedType([
-        ('header', block_header_type),
+        ('header', block_header_type),# todo block header type
     ])
 
     def _pack(self, data):
@@ -617,7 +645,10 @@ class messageBestBlock(msg):
         return self.message_bestblock.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_bestblock.unpack(data))
+        res = t['header']
+        return res
 
 class messageHaveTX(msg):
     command = 'have_tx'
@@ -633,13 +664,16 @@ class messageHaveTX(msg):
         return self.message_have_tx.pack(msg_dict)
     
     def unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_have_tx.unpack(data))
+        res += t['tx_hashes']
+        return res
 
 class messageLosingTX(msg):
     command = 'losing_tx'
 
     message_losing_tx = ComposedType([
-        ('tx_hashes', ListType(pack.IntType(256))),
+        ('tx_hashes', ListType(IntType(256))),# todo check pack.
     ])
 
     def _pack(self, data):
@@ -649,13 +683,16 @@ class messageLosingTX(msg):
         return self.message_losing_tx.pack(msg_dict)
     
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_losing_tx.unpack(data))
+        res += t['tx_hashes']
+        return res
 
 class messageRememberTX(msg):
     command = 'remember_tx'
 
     message_remember_tx = ComposedType([
-        ('tx_hashes', ListType(pack.IntType(256))),
+        ('tx_hashes', ListType(IntType(256))),
         ('txs', ListType(bitcoin_data.tx_type)),
     ])
 
@@ -667,23 +704,30 @@ class messageRememberTX(msg):
         return self.message_remember_tx.pack(msg_dict)
 
     def _unpack(self,data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_remember_tx.unpack(data))
+        res += t['tx_hashes']
+        res += t['txs']
+        return res
 
 class messageForgetTX(msg):
     command = 'forget_tx'
 
     message_forget_tx = ComposedType([
-        ('tx_hashes', ListType(pack.IntType(256))),
+        ('tx_hashes', ListType(IntType(256))),
     ])
 
     def _pack(self, data):
         msg_dict = {
-            [int(data[0])],
+            [int(data[0])],# todo check list key
         }
         return self.message_forget_tx.pack(msg_dict)
 
     def _unpack(self, data):
-        pass
+        res = UnpackResult()
+        t = dict(self.message_forget_tx.unpack(data))
+        res += t['tx_hashes']
+        return res
 #------------------------------------------packtypes-for-C---------------------------------
 
 EnumMessages = {
