@@ -392,16 +392,28 @@ address_type = ComposedType([
     ('address', IPV6AddressType()),
     ('port', IntType(16, 'big')),
 ])
-def parseAddress_type(_data):
-    data = _data.split(',') #данные внутри других данных разделяются символом ","
-    return {'services':data[0], 'address':data[1], 'port':data[2]}
+class Address_Type():
+
+    def parseIn(_data):
+        data = _data.split(',') #данные внутри других данных разделяются символом ","
+        return {'services':data[0], 'address':data[1], 'port':data[2]}
+
+    def parseOut(_data):
+        return str(_data['services']) + ' ' + str(_data['address']) + ' ' + str(_data['port'])
+        
+
+
+
+def parseAddress_type(_data): #todo: remove
+    pass
 
 class UnpackResult:
     def __init__(self):
         self.res = ''
     
     def __iadd__(self, other):
-        #TODO: for bytes -> .decode("utf-8") 
+        if isinstance(other, bytes):
+            other = other.decode('utf-8')
         self.res += str(other) + ' '
         return self
     
@@ -415,10 +427,13 @@ class msg:
 
     def pack(self, _data):
         data = self.parseVars(_data)
-        return _pack(data)
+        return self._pack(data)
 
     def unpack(self, _data):
-        pass
+        data = _data
+        if isinstance(_data, str):
+            data = _data.encode('utf-8')
+        return self._unpack(data)
 
     def parseVars(self, vars):
         res = vars.split(';') #в c++ переменные в stringstream подаются с разделителим в виде символа ";".
@@ -477,8 +492,8 @@ class messageVersion(msg):
         res += t['version']
         res += t['services']
 
-        res += t['addr_to'] #todo
-        res += t['addr_from'] #todo
+        res += Address_Type.parseOut(t['addr_to']) #todo: test
+        res += Address_Type.parseOut(t['addr_from']) #todo: test
 
         res += t['nonce']
         res += t['sub_version']
@@ -817,4 +832,4 @@ def TEST_UNPACKRES():
 
 #TEST_SHA256()
 #TEST_PACK_UNPACK()
-TEST_UNPACKRES()
+#TEST_UNPACKRES()
