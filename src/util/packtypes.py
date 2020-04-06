@@ -401,7 +401,10 @@ class Address_Type():
     def parseOut(_data):
         return str(_data['services']) + ' ' + str(_data['address']) + ' ' + str(_data['port'])
 
+
+
 class UnpackResult:
+
     def __init__(self):
         self.res = ''
     
@@ -471,8 +474,8 @@ class messageVersion(msg):
     def _pack(self, data):
         msg_dict = {'version': int(data[0]),
                 'services': int(data[1]),
-                'addr_to': parseAddress_type(data[2]),
-                'addr_from': parseAddress_type(data[3]),
+                'addr_to': Address_Type.parseIn(data[2]),
+                'addr_from': Address_Type.parseIn(data[3]),
                 'nonce': int(data[4]),
                 'sub_version': data[5],
                 'mode': int(data[6]),
