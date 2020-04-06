@@ -400,12 +400,6 @@ class Address_Type():
 
     def parseOut(_data):
         return str(_data['services']) + ' ' + str(_data['address']) + ' ' + str(_data['port'])
-        
-
-
-
-def parseAddress_type(_data): #todo: remove
-    pass
 
 class UnpackResult:
     def __init__(self):
