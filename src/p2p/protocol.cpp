@@ -11,7 +11,7 @@ BaseProtocol::BaseProtocol(boost::asio::io_context io) : timeout_delayed(io), so
 
 }
 
-void BaseProtocol::sendPacket(c2pool::messages::message* payload2){ //todo error definition
+void BaseProtocol::sendPacket(c2pool::messages::message *payload2){ //todo error definition
     if (payload2.command.length() > 12){
         //TODO: raise ValueError('command too long')
     }
