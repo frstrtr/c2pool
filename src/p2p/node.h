@@ -3,10 +3,12 @@
 
 #include "boost/asio.hpp"
 #include "factory.h"
+#include "protocol.h"
 
 namespace c2pool::p2p {
     class Server;
     class Client;
+    class Protocol;
 }
 
 namespace c2pool::p2p {
@@ -70,7 +72,7 @@ namespace c2pool::p2p {
              */
         }
 
-        void got_conn(auto conn){ //TODO: type for conn
+        void got_conn(Protocol* conn){ //TODO: type for conn
             /*
              if conn.nonce in self.peers:
             raise ValueError('already have peer')
@@ -80,7 +82,7 @@ namespace c2pool::p2p {
              */
         }
 
-        void lost_conn(auto conn, auto reason){ //TODO: type for conn, reason
+        void lost_conn(Protocol* conn, auto reason){ //TODO: type for conn, reason
             /*
              if conn.nonce not in self.peers:
             raise ValueError('''don't have peer''')

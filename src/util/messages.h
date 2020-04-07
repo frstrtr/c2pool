@@ -8,8 +8,11 @@
 
 #include <iostream>
 #include "pack.h"
-class Protocol;
+namespace c2pool::p2p {
+    class Protocol;
+}
 using namespace std;
+using namespace c2pool::p2p;
 
 namespace c2pool::messages{
 
@@ -26,7 +29,7 @@ namespace c2pool::messages{
         string command;
         virtual void unpack(string item);
         virtual string pack();
-        virtual void handle(Protocol* protocol);
+        virtual void handle(p2p::Protocol* protocol);
     };
     
     message* fromStr(string str);
@@ -97,8 +100,8 @@ namespace c2pool::messages{
             ct.add("best_share_hash", PackTypes::PossiblyNoneType, "[0,IntType, 256]", best_share_hash); //TODO: Attr
         }
 
-        void handle(Protocol* protocol){
-
+        void handle(p2p::Protocol* protocol){
+            protocol->handle_version(/*TODO*/)
         }
 
 

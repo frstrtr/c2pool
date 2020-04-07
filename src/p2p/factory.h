@@ -10,11 +10,13 @@
 
 namespace c2pool::p2p {
     class P2PNode;
+    class Protocol;
 }
 
 using namespace std;
 
 namespace c2pool::p2p {
+
     class Factory {
     public:
         Factory(c2pool::p2p::P2PNode* _node){
@@ -22,7 +24,7 @@ namespace c2pool::p2p {
         }
 
         virtual void start() = 0;
-        virtual BaseProtocol buildProtocol(string addrs) = 0;
+        virtual Protocol* buildProtocol(string addrs) = 0;
 
     protected:
         bool running = false;
@@ -47,15 +49,15 @@ namespace c2pool::p2p {
             max_conns = _max_conns;
         }
 
-        BaseProtocol buildProtocol(string addrs){ //TODO: string or tcp::endpoint addrs?
+        Protocol* buildProtocol(string addrs){ //TODO: string or tcp::endpoint addrs?
             //TODO: check connections
-            BaseProtocol* p = new BaseProtocol(_node);
+            Protocol* p = new Protocol(_node);
             p->_factory = this;
             //TODO: Debug mode {"Got peer connection from:"}
             return p;
         }
 
-        void proto_made_connection(auto proto){ //todo: proto
+        void proto_made_connection(Protocol* proto){ //todo: proto
             string ident = _host_to_ident(/*proto.[...].host*/); //TODO: get ip host
             if (connections.find(ident) != connections.end()){
                 connections[ident] += 1;
@@ -64,7 +66,7 @@ namespace c2pool::p2p {
             }
         }
 
-        void proto_lost_connection(auto proto, auto reason) { //todo: proto, reason
+        void proto_lost_connection(Protocol* proto, auto reason) { //todo: proto, reason
             string ident = _host_to_ident(/*proto.[...].host*/); //TODO: get ip host
             if (connections.find(ident) != connections.end()){
                 connections[ident] -= 1;
@@ -73,11 +75,11 @@ namespace c2pool::p2p {
             }
         }
 
-        void proto_connected(auto proto){ //todo: proto
+        void proto_connected(Protocol* proto){ //todo: proto
             node->got_conn(proto);
         }
 
-        void proto_disconnected(auto proto, auto reason){ //todo: proto, reason
+        void proto_disconnected(Protocol* proto, auto reason){ //todo: proto, reason
             node->lost_conn(proto, reason);
         }
 
@@ -113,14 +115,14 @@ namespace c2pool::p2p {
             max_attempts = _max_attempts;
         }
 
-        BaseProtocol buildProtocol(string addrs){ //TODO: string or tcp::endpoint?
-            BaseProtocol* p = new BaseProtocol(_node);
+        Protocol buildProtocol(string addrs){ //TODO: string or tcp::endpoint?
+            Protocol* p = new Protocol(_node);
             p->_factory = this;
             //TODO: Debug mode {"Got peer connection from:"}
             return p;
         }
 
-        void startedConnecting(auto connector) { //todo: type connector
+        void startedConnecting(auto connector) { //todo: type connector: https://twistedmatrix.com/documents/8.2.0/api/twisted.internet.tcp.Connector.html
             string ident = _host_to_ident(/*connector.[...].host*/); //TODO: get ip host
             if (find(attempts.begin(), attempts.end(), ident) != attempts.end()){
                 //todo: debug raise AssertionError('already have attempt')
@@ -150,12 +152,12 @@ namespace c2pool::p2p {
         pass
          */
 
-        void proto_connected(auto proto){ //todo: proto
-            connections.inster(connections.begin(), proto);
+        void proto_connected(Protocol* proto){ //todo: proto
+            connections.insert(connections.begin(), proto);
             node->got_conn(proto);
         }
 
-        void proto_disconnected(auto proto, auto reason){ //todo: proto, reason
+        void proto_disconnected(Protocol* proto, auto reason){ //todo: proto, reason
             auto find_pos = find(connections.begin(), connections.end(), ident);
             if (find_pos != connections.end()){
                 connections.erase(find_pos);
