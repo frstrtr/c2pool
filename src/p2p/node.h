@@ -145,7 +145,8 @@ namespace c2pool::p2p {
         return random.expovariate(1/20)
          */
 
-    private:
+    //private:
+    public:
         Node* node;
         bool running;
 

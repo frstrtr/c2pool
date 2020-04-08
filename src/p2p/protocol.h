@@ -90,7 +90,6 @@ namespace c2pool::p2p {
 
 
     private:
-        P2PNode*_node;
         Factory* factory;
         tcp::socket socket;
         const unsigned long max_remembered_txs_size = 25000000;
@@ -164,52 +163,65 @@ namespace c2pool::p2p {
 
             cout << "Peer " << from.address << ":" << from.port << " says protocol version is " << ver << ", client version " << sub_ver;
 
-            /*
-             
-        if self.other_version is not None:
-            raise PeerMisbehavingError('more than one version message')
-        if version < getattr(self.node.net, 'MINIMUM_PROTOCOL_VERSION', 1400):
-            raise PeerMisbehavingError('peer too old')
+            if (other_version != -1) {
+                //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
+            }
+            if (ver < c2pool::config::MINIMUM_PROTOCOL_VERSION){
+                //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
+            }
 
-        self.other_version = version
-        self.other_sub_version = sub_version[:512]
-        self.other_services = services
+            other_version = ver;
+            other_sub_version = sub_ver;
+            other_services = serv;
 
-        if nonce == self.node.nonce:
-            raise PeerMisbehavingError('was connected to self')
-        if nonce in self.node.peers:
-            if p2pool.DEBUG:
-                print 'Detected duplicate connection, disconnecting from %s:%i' % self.addr
-            self.disconnect()
-            return
+            if (_nonce == node->nonce){ //TODO: add nonce in Node
+                //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
+            }
 
-        self.nonce = nonce
-        self.connected2 = True
+            if ([_nonce in node->peers]){ //TODO: detect duplicate in node->peers
+                /* TODO: DEBUG:
+                 * if p2pool.DEBUG:
+                    print 'Detected duplicate connection, disconnecting from %s:%i' % self.addr
+                 */
+                disconnect();
+                //return; //TODO: remove comment, when fix: [_nonce in node->peers]
+            }
 
-        self.timeout_delayed.cancel()
-        self.timeout_delayed = reactor.callLater(100, self._timeout)
+            nonce = _nonce;
+            connected2 = true;
 
-        old_dataReceived = self.dataReceived
+            /* TODO: BOOST TIMER
+                self.timeout_delayed.cancel()
+                self.timeout_delayed = reactor.callLater(100, self._timeout)
+             */
+
+            /* TODO: TIMER + DELEGATE
+             old_dataReceived = self.dataReceived
         def new_dataReceived(data):
             if self.timeout_delayed is not None:
                 self.timeout_delayed.reset(100)
             old_dataReceived(data)
         self.dataReceived = new_dataReceived
+             */
 
-        self.factory.proto_connected(self)
+            factory->proto_connected(this);
 
-        self._stop_thread = deferral.run_repeatedly(lambda: [
+            /* TODO: thread (coroutine?):
+             self._stop_thread = deferral.run_repeatedly(lambda: [
             self.send_ping(),
         random.expovariate(1/100)][-1])
 
-        if self.node.advertise_ip:
+             if self.node.advertise_ip:
             self._stop_thread2 = deferral.run_repeatedly(lambda: [
                 self.sendAdvertisement(),
             random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
+             */
 
-        if best_share_hash is not None:
-            self.node.handle_share_hashes([best_share_hash], self)
+            if (best_hash != -1){ // -1 = None
+                node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
+            }
 
+            /* TODO: create delegates
         def add_to_remote_view_of_my_known_txs(added):
             if added:
                 self.send_have_tx(tx_hashes=list(added.keys()))
@@ -270,9 +282,17 @@ namespace c2pool::p2p {
         fragment(self.send_remember_tx, tx_hashes=[], txs=self.node.mining_txs_var.value.values())
              */
         }
+
+        void sendAdvertisement(){
+            if (node->server->listen_port /*is not None*/){
+
+            }
+        }
     private:
+        P2PNode*_node;
+
         const unsigned int version;
-        unsigned int other_version;
+        unsigned int other_version = -1;
         string other_sub_version;
         int other_services; //TODO: int64? IntType(64)
 
