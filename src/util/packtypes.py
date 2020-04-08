@@ -392,16 +392,42 @@ address_type = ComposedType([
     ('address', IPV6AddressType()),
     ('port', IntType(16, 'big')),
 ])
+
 class Address_Type():
 
-    def parseIn(_data):
+    def parseIn(self, _data):
         data = _data.split(',') #данные внутри других данных разделяются символом ","
         return {'services':data[0], 'address':data[1], 'port':data[2]}
 
-    def parseOut(_data):
+    def parseOut(self, _data):
         return str(_data['services']) + ' ' + str(_data['address']) + ' ' + str(_data['port'])
 
+class Share_Type():
 
+    def parseIn(self, _data):
+        data = _data.split(',') #данные внутри других данных разделяются символом ","
+        pass
+
+    def parseOut(self, _data):
+        pass
+
+class Block_Header_Type():
+
+    def parseIn(self, _data):
+        data = _data.split(',') #данные внутри других данных разделяются символом ","
+        pass
+
+    def parseOut(self, _data):
+        pass
+
+class TX_Type():
+
+    def parseIn(self, _data):
+        data = _data.split(',') #данные внутри других данных разделяются символом ","
+        pass
+
+    def parseOut(self, _data):
+        pass
 
 class UnpackResult:
 
