@@ -436,7 +436,6 @@ class msg:
         res = vars.split(';') #в c++ переменные в stringstream подаются с разделителим в виде символа ";".
         return res #список переменных на упаковку.
 
-
 class messageError(msg):
     command = 'error'
 
