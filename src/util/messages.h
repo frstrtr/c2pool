@@ -48,6 +48,13 @@ namespace c2pool::messages{
             ('address', pack.IPV6AddressType()),
             ('port', pack.IntType(16, 'big')),
          */
+
+        address_type(int _services, string _address, int _port){
+            services = _services;
+            address = _address;
+            port = _port;
+        }
+
         int services;
         string address; //TODO: change to boost::ip?
         int port;
@@ -149,8 +156,8 @@ namespace c2pool::messages{
     class message_addrme: public message{
     public:
 
-        message_addrme(int prt, const string cmd = "addrme"):message(cmd){
-            port = prt;
+        message_addrme(int _port, const string cmd = "addrme"):message(cmd){
+            port = _port;
         }
 
         void unpack(string item) override {
@@ -175,7 +182,7 @@ namespace c2pool::messages{
     class message_getaddrs: public message{
     public:
 
-        message_getaddr(int cnt, const string cmd = "getaddr"):message(cmd){
+        message_getaddrs(int cnt, const string cmd = "getaddr"):message(cmd){
             count = cnt;
         }
 
@@ -201,10 +208,9 @@ namespace c2pool::messages{
     class message_addrs: public message{
     public:
 
-        message_addrs(??? addrss, address_type  const string cmd = "addrs"):message(cmd){
-            addrs = addrss;
-            timestamp = tmstmp;
-            address = addresss;        
+        message_addrs(vector<address_type> _addrs, int _timestamp, const string cmd = "addrs"):message(cmd){
+            addrs = _addrs;
+            timestamp = _timestamp;
         }
 
         void unpack(string item) override {
@@ -221,8 +227,11 @@ namespace c2pool::messages{
 
         }
         
+
+        vector<address_type> addrs;
+        int timestamp;
+
         // = pack.ComposedType([
-        ???;
         //     ('addrs', pack.ListType(pack.ComposedType([
         //         ('timestamp', pack.IntType(64)),
         //         ('address', bitcoin_data.address_type),
