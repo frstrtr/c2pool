@@ -11,6 +11,7 @@
 #include "config.cpp"
 #include <map>
 #include <iostream>
+#include <boost/algorithm/string.hpp>
 
 namespace c2pool::messages{
     class message;
@@ -284,9 +285,78 @@ namespace c2pool::p2p {
         }
 
         void sendAdvertisement(){
-            if (node->server->listen_port /*is not None*/){
+            if (node->server->listen_port /*TODO: is not None*/){
+                string host = node->external_ip; //todo: add node.external_ip
+                int port = node->server->listen_port(/*???*/); //TODO
+                if (host != ""){
+                    if (host.find(":") != string::npos){
+                        vector<string> res;
 
+                        boost::split(res, host, [](char c){return c == ':';});
+                        host = res[0];
+
+                        //TODO: create global method for convert str to int
+                        stringstream ss;
+                        ss << res[1];
+                        ss >> port;
+                        //____________
+                    }
+
+                    /* TODO DEBUG:
+                        if p2pool.DEBUG:
+                            print 'Advertising for incoming connections: %s:%i' % (host, port)
+                     */
+
+                    vector<c2pool::messages::address_type> adr = {c2pool::messages::address_type(other_services, host, port)};
+                    int timestamp = ;//TODO: INIT
+                    c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
+                    sendPacket(msg);
+                } else {
+                    if (/*p2pool.DEBUG*/) {
+                        /* TODO DEBUG:
+                                print 'Advertising for incoming connections'
+                                    # Ask peer to advertise what it believes our IP address to be
+                            self.send_addrme(port=port)
+                     */
+                        c2pool::messages::message_addrme msg = c2pool::messages::message_addrme(port); //in if from todo debug
+                    }
+                }
             }
+        }
+
+        void handle_addrme(int port){
+            string host = ; //TODO: self.transport.getPeer().host
+            if (host == "127.0.0.1"){
+                /* TODO: random
+                    if random.random() < .8 and self.node.peers:
+                        random.choice(self.node.peers.values()).send_addrme(port=port) # services...
+                 */
+            } else {
+                /* TODO: random
+                    self.node.got_addr((self.transport.getPeer().host, port), self.other_services, int(time.time()))
+            if random.random() < .8 and self.node.peers:
+                random.choice(self.node.peers.values()).send_addrs(addrs=[
+                    dict(
+                        address=dict(
+                            services=self.other_services,
+                            address=host,
+                            port=port,
+                        ),
+                        timestamp=int(time.time()),
+                    ),
+                ])
+                 */
+            }
+        }
+
+        void handle_getaddrs(int count){
+            if (count > 100){
+                count = 100;
+            }
+            for ()
+            vector<c2pool::messages::address_type> adr = {c2pool::messages::address_type(other_services, host, port)};
+            int timestamp = ;//TODO: INIT
+            c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
         }
     private:
         P2PNode*_node;

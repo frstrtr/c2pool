@@ -131,16 +131,18 @@ namespace c2pool::p2p {
         }
 
         void clientConnectionFailed(auto connector, auto reason){ //todo: connector, reason
+            string ident = _host_to_ident(/*connector.[...].host*/); //TODO: get ip host
             auto find_pos = find(attempts.begin(), attempts.end(), ident);
             if (find_pos != attempts.end()){
-                attempts.erase(find_pos);
+                attempts.erase(find_pos); //remove <ident> from attempts
             }
         }
 
         void clientConnectionLost(auto connector, auto reason){ //todo: connector, reason
+            string ident = _host_to_ident(/*connector.[...].host*/); //TODO: get ip host
             auto find_pos = find(attempts.begin(), attempts.end(), ident);
             if (find_pos != attempts.end()){
-                attempts.erase(find_pos);
+                attempts.erase(find_pos); //remove <ident> from attempts
             }
         }
 
