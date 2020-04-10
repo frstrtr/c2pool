@@ -134,7 +134,7 @@ namespace c2pool::messages{
 
     class message_ping: public message{
     public:
-        message_ping(){}
+        message_ping(string cmd) : message(cmd) {}
         
         
         void unpack(string item) override {
@@ -229,7 +229,7 @@ namespace c2pool::messages{
         
 
         vector<address_type> addrs;
-        int timestamp;
+        int timestamp; //TODO: timestamp - part of element in addrs list!
 
         // = pack.ComposedType([
         //     ('addrs', pack.ListType(pack.ComposedType([
