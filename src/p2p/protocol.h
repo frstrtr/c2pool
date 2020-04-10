@@ -12,6 +12,8 @@
 #include <map>
 #include <iostream>
 #include <boost/algorithm/string.hpp>
+#include "log.cpp"
+#include "converter.cpp"
 
 namespace c2pool::messages{
     class message;
@@ -74,8 +76,8 @@ namespace c2pool::p2p {
             message* msg = c2pool::messages::fromStr(command);
 
             if (msg->command == "error"){
-                //TODO: Debug_log: no type for
-                //return
+                Log::Debug("no type for ", false);
+                Log::Debug(command);
             }
 
             packetReceived(msg);
@@ -111,6 +113,8 @@ namespace c2pool::p2p {
 
         void connectionMade(){
             factory->proto_made_connection(this);
+
+            addr = make_tuple(self.transport.getPeer().host, self.transport.getPeer().port); //todo: self.transoprt = socket?
 
             /*self.connection_lost_event = variable.Event()
 
@@ -180,10 +184,8 @@ namespace c2pool::p2p {
             }
 
             if ([_nonce in node->peers]){ //TODO: detect duplicate in node->peers
-                /* TODO: DEBUG:
-                 * if p2pool.DEBUG:
-                    print 'Detected duplicate connection, disconnecting from %s:%i' % self.addr
-                 */
+                string err = "Detected duplicate connection, disconnecting from " + addr.get<0>() + ":" + to_string(addr.get<1>());
+                Log::Debug(err);
                 disconnect();
                 //return; //TODO: remove comment, when fix: [_nonce in node->peers]
             }
@@ -294,31 +296,21 @@ namespace c2pool::p2p {
 
                         boost::split(res, host, [](char c){return c == ':';});
                         host = res[0];
-
-                        //TODO: create global method for convert str to int
-                        stringstream ss;
-                        ss << res[1];
-                        ss >> port;
-                        //____________
+                        port = Converter::StrToInt(res[1]);
                     }
 
-                    /* TODO DEBUG:
-                        if p2pool.DEBUG:
-                            print 'Advertising for incoming connections: %s:%i' % (host, port)
-                     */
+                    string err = "Advertising for incoming connections: " + host + ":" + to_string(port);
+                    Log::Debug(err);
 
                     vector<c2pool::messages::address_type> adr = {c2pool::messages::address_type(other_services, host, port)};
                     int timestamp = ;//TODO: INIT
                     c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
                     sendPacket(msg);
                 } else {
-                    if (/*p2pool.DEBUG*/) {
-                        /* TODO DEBUG:
-                                print 'Advertising for incoming connections'
-                                    # Ask peer to advertise what it believes our IP address to be
-                            self.send_addrme(port=port)
-                     */
+                    if (Log::DEBUG) {
+                        Log::Debug("Advertising for incoming connections");
                         c2pool::messages::message_addrme msg = c2pool::messages::message_addrme(port); //in if from todo debug
+                        sendPacket(msg);
                     }
                 }
             }
@@ -367,7 +359,7 @@ namespace c2pool::p2p {
         int other_services; //TODO: int64? IntType(64)
 
         bool connected2 = false;
-        string addr[2] = {self.transport.getPeer().host, self.transport.getPeer().port}; //TODO
+        tuple<string, int> addr; //TODO
         boost::asio::steady_timer timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
         //TODO???: remote_tx_hashes = set() # view of peer's known_txs # not actually initially empty, but sending txs instead of tx hashes won't hurt
         int remote_remembered_txs_size = 0; //todo: remove?
