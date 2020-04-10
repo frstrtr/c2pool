@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "messages.h"
 #include "boost/asio.hpp"
+#include "log.cpp"
 
 using namespace c2pool::p2p;
 BaseProtocol::BaseProtocol(boost::asio::io_context io, unsigned long _max_payload_length = 8000000) : timeout_delayed(io), socket(io) {
