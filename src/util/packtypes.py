@@ -468,13 +468,13 @@ class TransactionType(pack.Type):
         if marker == 0:
             next = self._wtx_type.read(file)
             witness = [None]*len(next['tx_ins'])
-            for i in xrange(len(next['tx_ins'])):
+            for i in xrange(len(next['tx_ins'])):  # todo replace by py3 range()
                 witness[i] = self._witness_type.read(file)
             locktime = self._int_type.read(file)
             return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
         else:
             tx_ins = [None]*marker
-            for i in xrange(marker):
+            for i in xrange(marker):  # todo replace by py3 range()
                 tx_ins[i] = tx_in_type.read(file)
             next = self._ntx_type.read(file)
             return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
