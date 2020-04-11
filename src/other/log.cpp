@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <cassert> // для assert()
 using namespace std;
 
 class Log{
@@ -30,6 +31,11 @@ public:
             cout << endl;
             logFile << endl;
         }
+    }
+
+    inline void Assert(bool value, char message[]){
+        //if value = false -> called assertion
+        assert(value && message);
     }
 
     //todo: create write from delegate
