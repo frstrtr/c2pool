@@ -265,6 +265,15 @@ public:
     }
 
     template <typename T>
+    ComposedType& add(const T& value){
+        if (fields.rdbuf()->in_avail() != 0){ //проверка на то, что в fields уже есть какие-то данные.
+            fields << ";";
+        }
+        fields << value;
+        return *this;
+    }
+
+    template <typename T>
     ComposedType& add(string field_name, PackTypes packType, const T& value){
         fields << "(" << field_name << "," << packType << "," << value << ")";
         return *this;
@@ -281,6 +290,13 @@ public:
         value.fields >> _v;
         fields << "(" << field_name << "," << PackTypes::ComposedType << "," << _v << ")";
         return *this;
+    }
+
+    string read(){//TODO: this is real read, remove other
+        string buff;
+        fields >> buff;
+        string res = "|" + buff + "|";
+        return res;
     }
 
     string read(MemoryFile &f){

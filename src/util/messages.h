@@ -27,8 +27,18 @@ namespace c2pool::messages{
             command = cmd;
         }
         string command;
-        virtual void unpack(string item);
-        virtual string pack();
+        void unpack(string item){
+            stringstream ss;
+            ss << item;
+            _unpack(ss);
+        }
+
+        string pack(){
+            //TODO:
+        }
+
+        virtual void _unpack(stringstream& ss);
+        virtual string _pack();
         virtual void handle(p2p::Protocol* protocol);
     };
     
@@ -91,20 +101,23 @@ namespace c2pool::messages{
 
         message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version");
 
-        void unpack(string item) override {
+        void _unpack(stringstream& ss) override {
+            ss >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
 
+            //TODO: override operator >> for address_type;
         }
 
-        string pack() override{
+        string _pack() override{
             ComposedType ct;
-            ct.add("version", PackTypes::IntType, "32", version);
-            ct.add("services", PackTypes::IntType, "64", services);
-            ct.add("addr_to", PackTypes::BitcoinDataAddressType, addr_to.ToString());
-            ct.add("addr_from", PackTypes::BitcoinDataAddressType, addr_from.ToString());
-            ct.add("nonce", PackTypes::IntType, "64", nonce);
-            ct.add("sub_version", PackTypes::VarStrType, sub_version);
-            ct.add("mode", PackTypes::IntType, "32", mode);
-            ct.add("best_share_hash", PackTypes::PossiblyNoneType, "[0,IntType, 256]", best_share_hash); //TODO: Attr
+            ct.add(version);
+            ct.add(services);
+            ct.add(addr_to.ToString());
+            ct.add(addr_from.ToString());
+            ct.add(nonce);
+            ct.add(sub_version);
+            ct.add(mode);
+            ct.add(best_share_hash);
+            return ct.read();
         }
 
         void handle(p2p::Protocol* protocol){
