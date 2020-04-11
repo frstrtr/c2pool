@@ -33,6 +33,7 @@ public:
     }
 
     //todo: create write from delegate
+    //todo: инкапсуляция DEBUG.
 };
 
 bool Log::DEBUG{false};
