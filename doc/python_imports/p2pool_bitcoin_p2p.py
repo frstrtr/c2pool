@@ -35,7 +35,7 @@ class Protocol(p2protocol.Protocol):
             sub_version_num='/P2Pool:%s/' % (p2pool.__version__,),
             start_height=0,
         )
-    
+    # todo
     message_version = pack.ComposedType([
         ('version', pack.IntType(32)),
         ('services', pack.IntType(64)),
@@ -48,7 +48,7 @@ class Protocol(p2protocol.Protocol):
     ])
     def handle_version(self, version, services, time, addr_to, addr_from, nonce, sub_version_num, start_height):
         self.send_verack()
-    
+    # todo
     message_verack = pack.ComposedType([])
     def handle_verack(self):
         self.get_block = deferral.ReplyMatcher(lambda hash: self.send_getdata(requests=[dict(type='block', hash=hash)]))
@@ -61,7 +61,7 @@ class Protocol(p2protocol.Protocol):
         
         self.pinger = deferral.RobustLoopingCall(self.send_ping, nonce=1234)
         self.pinger.start(30)
-    
+    # todo
     message_inv = pack.ComposedType([
         ('invs', pack.ListType(pack.ComposedType([
             ('type', pack.EnumType(pack.IntType(32), {1: 'tx', 2: 'block'})),
@@ -76,25 +76,28 @@ class Protocol(p2protocol.Protocol):
                 self.factory.new_block.happened(inv['hash'])
             else:
                 print 'Unknown inv type', inv
-    
+    # todo
     message_getdata = pack.ComposedType([
         ('requests', pack.ListType(pack.ComposedType([
             ('type', pack.EnumType(pack.IntType(32), {1: 'tx', 2: 'block'})),
             ('hash', pack.IntType(256)),
         ]))),
     ])
+    # todo
     message_getblocks = pack.ComposedType([
         ('version', pack.IntType(32)),
         ('have', pack.ListType(pack.IntType(256))),
         ('last', pack.PossiblyNoneType(0, pack.IntType(256))),
     ])
+    # todo
     message_getheaders = pack.ComposedType([
         ('version', pack.IntType(32)),
         ('have', pack.ListType(pack.IntType(256))),
         ('last', pack.PossiblyNoneType(0, pack.IntType(256))),
     ])
+    # todo
     message_getaddr = pack.ComposedType([])
-    
+    # todo
     message_addr = pack.ComposedType([
         ('addrs', pack.ListType(pack.ComposedType([
             ('timestamp', pack.IntType(32)),
@@ -104,13 +107,13 @@ class Protocol(p2protocol.Protocol):
     def handle_addr(self, addrs):
         for addr in addrs:
             pass
-    
+    # todo
     message_tx = pack.ComposedType([
         ('tx', bitcoin_data.tx_type),
     ])
     def handle_tx(self, tx):
         self.factory.new_tx.happened(tx)
-    
+    # todo
     message_block = pack.ComposedType([
         ('block', bitcoin_data.block_type),
     ])
@@ -118,7 +121,7 @@ class Protocol(p2protocol.Protocol):
         block_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header']))
         self.get_block.got_response(block_hash, block)
         self.get_block_header.got_response(block_hash, block['header'])
-    
+    # todo
     message_headers = pack.ComposedType([
         ('headers', pack.ListType(bitcoin_data.block_type)),
     ])
@@ -127,26 +130,26 @@ class Protocol(p2protocol.Protocol):
             header = header['header']
             self.get_block_header.got_response(bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header)), header)
         self.factory.new_headers.happened([header['header'] for header in headers])
-    
+    # todo
     message_ping = pack.ComposedType([
         ('nonce', pack.IntType(64)),
     ])
     def handle_ping(self, nonce):
         self.send_pong(nonce=nonce)
-    
+    # todo
     message_pong = pack.ComposedType([
         ('nonce', pack.IntType(64)),
     ])
     def handle_pong(self, nonce):
         pass
-    
+    # todo
     message_alert = pack.ComposedType([
         ('message', pack.VarStrType()),
         ('signature', pack.VarStrType()),
     ])
     def handle_alert(self, message, signature):
         pass # print 'ALERT:', (message, signature)
-
+    # todo
     message_reject = pack.ComposedType([
         ('message', pack.VarStrType()),
         ('ccode', pack.IntType(8)),
