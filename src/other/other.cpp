@@ -1,6 +1,7 @@
 #include <iostream>
 #include <boost/random.hpp>
 #include <vector>
+#include <ctime>
 
 namespace c2pool::random{
     using namespace boost::random;
@@ -27,6 +28,14 @@ namespace c2pool::random{
     T RandomChoice(std::vector<T> list){
         int pos = RandomInt(0, list.size());
         return list[pos];
+    }
+
+}
+
+namespace c2pool::time{
+
+    int timestamp(){
+        return std::time(nullptr);
     }
 
 }

@@ -7,7 +7,9 @@
 
 
 #include <iostream>
+#include "types.h"
 #include "pack.h"
+
 namespace c2pool::p2p {
     class Protocol;
 }
@@ -51,82 +53,11 @@ namespace c2pool::messages{
         }
     };
 
-    class address_type{ //TODO: move to data.cpp
-    public:
-        /*
-            ('services', pack.IntType(64)),
-            ('address', pack.IPV6AddressType()),
-            ('port', pack.IntType(16, 'big')),
-         */
-
-        address_type(){
-            services = 0;
-            address = "";
-            port = 0;
-        }
-
-        address_type(int _services, string _address, int _port){
-            services = _services;
-            address = _address;
-            port = _port;
-        }
-
-        int services;
-        string address; //TODO: change to boost::ip?
-        int port;
-
-        string ToString(){
-            stringstream ss;
-            ss << "[" << services << ";" << address << ";" << port << "]";
-            string res;
-            ss >> res;
-            return res;
-        }
-    };
-
-    class share_type{ //TODO: move to data.cpp
-    public:
-        /*
-            ('type', pack.VarIntType()),
-            ('contents', pack.VarStrType()),
-        */
-        int type;
-        string contents;
-
-        string ToString(){
-            stringstream ss;
-            ss << "[" << type << ";" << contents << "]";
-            string res;
-            ss >> res;
-            return res;
-        }
-    };
-
-    class addrs{
-    public:
-        addrs(){
-            address = address_type();
-            timestamp = 0;
-        }
-
-        addrs(address_type a, int t){
-            address = a;
-            timestamp = t;
-        }
-
-        ostream& operator<<(ostream& os, const addrs& a){
-                os << address << ";" << timestamp;
-        }
-
-        address_type address;
-        int timestamp;
-
-    };
-
     class message_version: public message{
     public:
 
-        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version"):message(cmd){
+        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version")
+        :message(cmd){
             //todo what should be here?
             //like version = ver???
             //services = serv???
@@ -142,8 +73,8 @@ namespace c2pool::messages{
             ComposedType ct;
             ct.add(version);
             ct.add(services);
-            ct.add(addr_to.ToString());
-            ct.add(addr_from.ToString());
+            ct.add(addr_to);
+            ct.add(addr_from);
             ct.add(nonce);
             ct.add(sub_version);
             ct.add(mode);
@@ -189,7 +120,7 @@ namespace c2pool::messages{
 
         string _pack() override{
             ComposedType ct;
-            ct.add(cmd);
+            ct.add(command);
             return ct.read();
 
         }
@@ -260,16 +191,21 @@ namespace c2pool::messages{
     class message_addrs: public message{
     public:
 
-        message_addrs(vector<address_type> _addrs, int _timestamp, const string cmd = "addrs"):message(cmd){
+        message_addrs(vector<addr> _addrs, const string cmd = "addrs"): message(cmd){
             addrs = _addrs;
-            timestamp = _timestamp;
         }
 
         void _unpack(stringstream& ss) override {
-            ss >> addrs >> timestamp;
+            int count;
+            addr addrBuff;
+            ss >> count;
+            for (int i = 0; i < count; i++) {
+                ss >> addrBuff;
+                addrs.push_back(addrBuff);
+            }
         }
 
-        string pack() override{
+        string _pack() override{
             ComposedType ct;
             ct.add(addrs); //TODO: override operator << for this
             return ct.read();
@@ -280,7 +216,7 @@ namespace c2pool::messages{
         }
         
 
-        vector<addrs> addrs;
+        vector<addr> addrs;
 
         // = pack.ComposedType([
         //     ('addrs', pack.ListType(pack.ComposedType([
