@@ -14,7 +14,7 @@
 #include <boost/algorithm/string.hpp>
 #include "log.cpp"
 #include "converter.cpp"
-#include <random>
+#include "other/other.cpp"
 
 namespace c2pool::messages{
     class message;
@@ -310,32 +310,32 @@ namespace c2pool::p2p {
                 } else {
                     if (Log::DEBUG) {
                         Log::Debug("Advertising for incoming connections");
-                        c2pool::messages::message_addrme msg = c2pool::messages::message_addrme(port); //in if from todo debug
-                        sendPacket(msg);
+                        send_addrme(port);
                     }
                 }
             }
         }
 
+        void send_addrme(int port){
+            c2pool::messages::message_addrme msg = c2pool::messages::message_addrme(port); //in if from todo debug
+            sendPacket(msg);
+        }
+
         void handle_addrme(int port){
             string host = ; //TODO: self.transport.getPeer().host
 
-            //TODO: replace to other files in random func
-            float r = ((float) rand()) / (float) RAND_MAX;
-            float r_range = max - min;
-            r = (random*range) + min;
-            //_____________________________
             if (host == "127.0.0.1"){
                 /* TODO: random
                     if random.random() < .8 and self.node.peers:
                         random.choice(self.node.peers.values()).send_addrme(port=port) # services...
                  */
-                if (rand() < )
+                if ((c2pool::random::RandomFloat(0, 1) < 0.8) && node->peers != null){ // TODO: вместо != null, size() == 0???
+                    c2pool::random::RandomChoice(node->peers).send_addrme(port);
+                }
             } else {
-                /* TODO: random
-                    self.node.got_addr((self.transport.getPeer().host, port), self.other_services, int(time.time()))
-            if random.random() < .8 and self.node.peers:
-                random.choice(self.node.peers.values()).send_addrs(addrs=[
+                //self.node.got_addr((self.transport.getPeer().host, port), self.other_services, int(time.time()))
+                if ((c2pool::random::RandomFloat(0, 1) < 0.8) && node->peers != null){ // TODO: вместо != null, size() == 0???
+                    /*random.choice(self.node.peers.values()).send_addrs(addrs=[
                     dict(
                         address=dict(
                             services=self.other_services,
@@ -346,6 +346,8 @@ namespace c2pool::p2p {
                     ),
                 ])
                  */
+                    c2pool::random::RandomChoice(node->peers).send_addrs(/*todo*/);
+                }
             }
         }
 

@@ -59,6 +59,12 @@ namespace c2pool::messages{
             ('port', pack.IntType(16, 'big')),
          */
 
+        address_type(){
+            services = 0;
+            address = "";
+            port = 0;
+        }
+
         address_type(int _services, string _address, int _port){
             services = _services;
             address = _address;
@@ -94,6 +100,27 @@ namespace c2pool::messages{
             ss >> res;
             return res;
         }
+    };
+
+    class addrs{
+    public:
+        addrs(){
+            address = address_type();
+            timestamp = 0;
+        }
+
+        addrs(address_type a, int t){
+            address = a;
+            timestamp = t;
+        }
+
+        ostream& operator<<(ostream& os, const addrs& a){
+                os << address << ";" << timestamp;
+        }
+
+        address_type address;
+        int timestamp;
+
     };
 
     class message_version: public message{
@@ -244,10 +271,7 @@ namespace c2pool::messages{
 
         string pack() override{
             ComposedType ct;
-            // ct.add("addrs", PackTypes::???);
-            ct.add(addrs);
-            // ???;
-            ct.add(timestamp);
+            ct.add(addrs); //TODO: override operator << for this
             return ct.read();
         }
 
@@ -256,8 +280,7 @@ namespace c2pool::messages{
         }
         
 
-        vector<address_type> addrs;
-        int timestamp; //TODO: timestamp - part of element in addrs list!
+        vector<addrs> addrs;
 
         // = pack.ComposedType([
         //     ('addrs', pack.ListType(pack.ComposedType([
