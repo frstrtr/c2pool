@@ -1,8 +1,8 @@
 project(util)
 
-set(HEADER_FILES #[[pack.h]] pystruct.h filesys.h messages.h)
+set(HEADER_FILES #[[pack.h]] pystruct.h filesys.h messages.h types.h)
 
-set(SOURCE_FILES #[[pack.cpp]] pystruct.cpp filesys.cpp messages.cpp)
+set(SOURCE_FILES #[[pack.cpp]] pystruct.cpp filesys.cpp messages.cpp types.cpp)
 
 add_library(util STATIC ${SOURCE_FILES} ${HEADER_FILES})
 

@@ -303,10 +303,9 @@ namespace c2pool::p2p {
                     string err = "Advertising for incoming connections: " + host + ":" + to_string(port);
                     Log::Debug(err);
 
-                    vector<c2pool::messages::address_type> adr = {c2pool::messages::address_type(other_services, host, port)};
-                    int timestamp = ;//TODO: INIT
-                    c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
-                    sendPacket(msg);
+
+                    int timestamp = c2pool::time::timestamp();
+                    vector<c2pool::messages::addrs> adr = {c2pool::messages::addrs(c2pool::messages::address_type(other_services, host, port), timestamp)};
                 } else {
                     if (Log::DEBUG) {
                         Log::Debug("Advertising for incoming connections");
@@ -351,6 +350,11 @@ namespace c2pool::p2p {
             }
         }
 
+        void send_addrs(vector<addrs> _addrs){
+            c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(_addrs);
+            sendPacket(msg);
+        }
+
         void handle_getaddrs(int count){
             if (count > 100){
                 count = 100;
@@ -359,6 +363,10 @@ namespace c2pool::p2p {
             vector<c2pool::messages::address_type> adr = {c2pool::messages::address_type(other_services, host, port)};
             int timestamp = ;//TODO: INIT
             c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
+        }
+
+        void handle_version(/*TODO*/){
+            //TODO;
         }
     private:
         P2PNode*_node;
