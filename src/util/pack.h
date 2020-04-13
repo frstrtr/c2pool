@@ -252,6 +252,12 @@ class ComposedType: public Type<string>{
     //auto record_type;
     stringstream fields;
 
+private:
+    void Space(){ // проверка и разделение переменных в потоке.
+        if (fields.rdbuf()->in_avail() != 0){ //проверка на то, что в fields уже есть какие-то данные.
+            fields << ";";
+        }
+    }
 
 public:
     ComposedType(){
@@ -266,13 +272,32 @@ public:
 
     template <typename T>
     ComposedType& add(const T& value){
-        if (fields.rdbuf()->in_avail() != 0){ //проверка на то, что в fields уже есть какие-то данные.
-            fields << ";";
-        }
+        Space();
         fields << value;
         return *this;
     }
 
+    template <typename T>
+    ComposedType& add(const vector<T> value){
+        Space();
+        fields << "[";
+        for (int i = 0; i < value.size(); i++){
+            if (i != 0) {
+                fields << ","; //элементы массива разделяются запятой!// s
+            }
+            fields << value[i];
+        }
+        fields << "]";
+        return *this;
+    }
+
+    string read(){//TODO: this is real read, remove other
+        string buff;
+        fields >> buff;
+        string res = "|" + buff + "|";
+        return res;
+    }
+    //___________________________________
     template <typename T>
     ComposedType& add(string field_name, PackTypes packType, const T& value){
         fields << "(" << field_name << "," << packType << "," << value << ")";
@@ -290,13 +315,6 @@ public:
         value.fields >> _v;
         fields << "(" << field_name << "," << PackTypes::ComposedType << "," << _v << ")";
         return *this;
-    }
-
-    string read(){//TODO: this is real read, remove other
-        string buff;
-        fields >> buff;
-        string res = "|" + buff + "|";
-        return res;
     }
 
     string read(MemoryFile &f){
