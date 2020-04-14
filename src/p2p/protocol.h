@@ -160,9 +160,9 @@ namespace c2pool::p2p {
         //todo: connect_timeout
 
 
-
-        void send_version(){
-            //TODO: init struct Version
+        void send_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash){
+            c2pool::messages::message_version msg = c2pool::messages::message_version(ver, serv, to, from, _nonce, sub_ver, _mode, best_hash);
+            sendPacket(msg);
         }
 
         void handle_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash) {
@@ -306,6 +306,7 @@ namespace c2pool::p2p {
 
                     int timestamp = c2pool::time::timestamp();
                     vector<c2pool::messages::addrs> adr = {c2pool::messages::addrs(c2pool::messages::address_type(other_services, host, port), timestamp)};
+                    send_addrs(adr);
                 } else {
                     if (Log::DEBUG) {
                         Log::Debug("Advertising for incoming connections");
@@ -313,6 +314,15 @@ namespace c2pool::p2p {
                     }
                 }
             }
+        }
+
+        void send_addrs(vector<addrs> _addrs){
+            c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(_addrs);
+            sendPacket(msg);
+        }
+
+        void handle_addrs(){
+            //todo
         }
 
         void send_addrme(int port){
@@ -350,8 +360,18 @@ namespace c2pool::p2p {
             }
         }
 
-        void send_addrs(vector<addrs> _addrs){
-            c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(_addrs);
+
+        void send_ping(){
+            c2pool::messages::message_ping msg = c2pool::messages::message_ping();
+            sendPacket(msg);
+        }
+
+        void handle_ping(long long _nonce){
+            //pass
+        }
+
+        void send_getaddrs(int _count){
+            c2pool::messages::message_getaddrs msg = c2pool::messages::message_getaddrs(_count);
             sendPacket(msg);
         }
 
@@ -359,14 +379,21 @@ namespace c2pool::p2p {
             if (count > 100){
                 count = 100;
             }
-            for ()
+            vector<string> good_peers = node->get_good_peers(count);
+            vector<c2pool::messages::addr> addrs;
+            for (i = 0; i < count; i++){ //todo: доделать
+                c2pool::messages::addr buff_addr = c2pool::messages::addr(
+                        c2pool::messages::address_type(
+                                node->addr_store[good_peers[i]][0], //todo: array index
+                                host,
+                                port
+                                ),
+                        node->addr_store[host, port][2]//todo: array index
+                        );
+            }
             vector<c2pool::messages::address_type> adr = {c2pool::messages::address_type(other_services, host, port)};
             int timestamp = ;//TODO: INIT
             c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
-        }
-
-        void handle_version(/*TODO*/){
-            //TODO;
         }
     private:
         P2PNode*_node;
