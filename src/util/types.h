@@ -85,6 +85,12 @@ namespace c2pool::messages{
             timestamp = t;
         }
 
+        addr(int _services, string _address, int _port, int t){
+            address_type a = address_type(_services,_address, _port);
+            address = a;
+            timestamp = t;
+        }
+
         friend istream& operator>>(istream& is, addr& value){
             is >> value.address >> value.timestamp;
             return is;

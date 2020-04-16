@@ -4,6 +4,7 @@
 #include "boost/asio.hpp"
 #include "factory.h"
 #include "protocol.h"
+#include "other/other.cpp"
 
 namespace c2pool::p2p {
     class Server;
@@ -132,6 +133,16 @@ namespace c2pool::p2p {
             -math.log(max(3600, last_seen - first_seen))/math.log(max(3600, t - last_seen))*random.expovariate(1)
         )][:max_count]
              */
+
+            int t = c2pool::time::timestamp;
+
+            for(map<string, string>::iterator it = addr_store.begin(); it != addr_store.end(); ++it) { //TODO ++it; iterator type
+                /* TODO:
+            -math.log(max(3600, last_seen - first_seen))/math.log(max(3600, t - last_seen))*random.expovariate(1)
+        )][:max_count]
+                 */
+            }
+
         }
 
         /*
@@ -157,7 +168,7 @@ namespace c2pool::p2p {
 
         //p2p.py
         int port;
-        map<string, string> addr_store;
+        map<string, string> addr_store; //TODO: change type
         set<string> connect_addrs;
         bool advertise_ip
     };

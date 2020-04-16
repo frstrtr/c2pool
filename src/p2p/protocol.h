@@ -115,33 +115,19 @@ namespace c2pool::p2p {
         void connectionMade(){
             factory->proto_made_connection(this);
 
-            addr = make_tuple(self.transport.getPeer().host, self.transport.getPeer().port); //todo: self.transoprt = socket?
+            //self.connection_lost_event = variable.Event()
 
-            /*self.connection_lost_event = variable.Event()
+            //TODO: getPeer() and getHost()
+            addr = make_tuple(socket.remote_endpoint().address().to_string(), socket.remote_endpoint().port().to_string()); //todo: move remote_endpoint to method
 
-        self.addr = self.transport.getPeer().host, self.transport.getPeer().port
+            send_version(version, 0, c2pool::messages::address_type(0, socket.remote_endpoint().address(), socket.remote_endpoint().port()),
+                         c2pool::messages::address_type(0, gethost, gethost), node->nonce, /*todo: p2pool.__version__*/, 1, /*node->best_share_hash_func*/)
+            //_____________
 
-        self.send_version(
-            version=self.VERSION,
-            services=0,
-            addr_to=dict(
-                services=0,
-                address=self.transport.getPeer().host,
-                port=self.transport.getPeer().port,
-            ),
-            addr_from=dict(
-                services=0,
-                address=self.transport.getHost().host,
-                port=self.transport.getHost().port,
-            ),
-            nonce=self.node.nonce,
-            sub_version=p2pool.__version__,
-            mode=1,
-            best_share_hash=self.node.best_share_hash_func(),
-        )
+            //todo: self.timeout_delayed = reactor.callLater(10, self._connect_timeout)
 
-        self.timeout_delayed = reactor.callLater(10, self._connect_timeout)
 
+            /*
         self.get_shares = deferral.GenericDeferrer(
             max_id=2**256,
             func=lambda id, hashes, parents, stops: self.send_sharereq(id=id, hashes=hashes, parents=parents, stops=stops),
@@ -158,6 +144,12 @@ namespace c2pool::p2p {
         }
 
         //todo: connect_timeout
+
+        auto connect_timeout(){
+            timeout_delayed = null; //todo: ?
+            //TODO: Log.Write(Handshake timed out, disconnecting from %s:%i) /  print 'Handshake timed out, disconnecting from %s:%i' % self.addr
+            disconnect();
+        }
 
 
         void send_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash){
@@ -316,13 +308,18 @@ namespace c2pool::p2p {
             }
         }
 
-        void send_addrs(vector<addrs> _addrs){
+        void send_addrs(vector<c2pool::messages::addrs> _addrs){
             c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(_addrs);
             sendPacket(msg);
         }
 
-        void handle_addrs(){
-            //todo
+        void handle_addrs(vector<c2pool::messages::addr> addrs){
+            for (auto data : addrs){
+                node->got_addr(data, c2pool::time::timestamp());
+                if ((c2pool::random::RandomFloat(0,1) < 0.8) && node->peers != nullptr){ // TODO: вместо != null, size() == 0???
+                    c2pool::random::RandomChoice(*node->peers).send_addrs(vector<c2pool::messages::addrs> buff{data});
+                }
+            }
         }
 
         void send_addrme(int port){
@@ -334,28 +331,14 @@ namespace c2pool::p2p {
             string host = ; //TODO: self.transport.getPeer().host
 
             if (host == "127.0.0.1"){
-                /* TODO: random
-                    if random.random() < .8 and self.node.peers:
-                        random.choice(self.node.peers.values()).send_addrme(port=port) # services...
-                 */
                 if ((c2pool::random::RandomFloat(0, 1) < 0.8) && node->peers != null){ // TODO: вместо != null, size() == 0???
-                    c2pool::random::RandomChoice(node->peers).send_addrme(port);
+                    c2pool::random::RandomChoice(*node->peers).send_addrme(port);
                 }
             } else {
-                //self.node.got_addr((self.transport.getPeer().host, port), self.other_services, int(time.time()))
+                c2pool::messages::addr _addr(other_services, socket.remote_endpoint().address().to_string(), port, c2pool::time::timestamp()) //TODO: move remote_endpoint to method
                 if ((c2pool::random::RandomFloat(0, 1) < 0.8) && node->peers != null){ // TODO: вместо != null, size() == 0???
-                    /*random.choice(self.node.peers.values()).send_addrs(addrs=[
-                    dict(
-                        address=dict(
-                            services=self.other_services,
-                            address=host,
-                            port=port,
-                        ),
-                        timestamp=int(time.time()),
-                    ),
-                ])
-                 */
-                    c2pool::random::RandomChoice(node->peers).send_addrs(/*todo*/);
+                    vector<c2pool::messages::addr _addr2(other_services, host, port, c2pool::time::timestamp())
+                    c2pool::random::RandomChoice(node->peers).send_addrs(_addr2);
                 }
             }
         }
@@ -379,7 +362,7 @@ namespace c2pool::p2p {
             if (count > 100){
                 count = 100;
             }
-            vector<string> good_peers = node->get_good_peers(count);
+            vector<string> good_peers = node->get_good_peers(count); //TODO: type for vector
             vector<c2pool::messages::addr> addrs;
             for (i = 0; i < count; i++){ //todo: доделать
                 c2pool::messages::addr buff_addr = c2pool::messages::addr(
