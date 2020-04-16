@@ -138,6 +138,7 @@ namespace c2pool::p2p {
 
             for(map<string, string>::iterator it = addr_store.begin(); it != addr_store.end(); ++it) { //TODO ++it; iterator type
                 /* TODO:
+                 return [x[0] for x in sorted(self.addr_store.iteritems(), key=lambda (k, (services, first_seen, last_seen)):
             -math.log(max(3600, last_seen - first_seen))/math.log(max(3600, t - last_seen))*random.expovariate(1)
         )][:max_count]
                  */
