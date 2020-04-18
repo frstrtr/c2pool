@@ -2,6 +2,7 @@
 #include <boost/random.hpp>
 #include <vector>
 #include <ctime>
+#include <cmath>
 
 namespace c2pool::random{
     using namespace boost::random;
@@ -28,6 +29,12 @@ namespace c2pool::random{
     T RandomChoice(std::vector<T> list){
         int pos = RandomInt(0, list.size());
         return list[pos];
+    }
+
+    ///l = 1.0/<среднее желаемое число>
+    float Expovariate(float l){
+
+        return (log(RandomInt(1, RAND_MAX)+1)-log(RAND_MAX))/(-l);
     }
 
 }

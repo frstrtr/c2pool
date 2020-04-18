@@ -216,67 +216,6 @@ namespace c2pool::p2p {
             if (best_hash != -1){ // -1 = None
                 node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
             }
-
-            /* TODO: create delegates
-        def add_to_remote_view_of_my_known_txs(added):
-            if added:
-                self.send_have_tx(tx_hashes=list(added.keys()))
-
-        watch_id0 = self.node.known_txs_var.added.watch(add_to_remote_view_of_my_known_txs)
-        self.connection_lost_event.watch(lambda: self.node.known_txs_var.added.unwatch(watch_id0))
-
-        def remove_from_remote_view_of_my_known_txs(removed):
-            if removed:
-                self.send_losing_tx(tx_hashes=list(removed.keys()))
-
-                # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
-                key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
-                self.known_txs_cache[key] = removed #dict((h, before[h]) for h in removed)
-                reactor.callLater(20, self.known_txs_cache.pop, key)
-        watch_id1 = self.node.known_txs_var.removed.watch(remove_from_remote_view_of_my_known_txs)
-        self.connection_lost_event.watch(lambda: self.node.known_txs_var.removed.unwatch(watch_id1))
-
-        def update_remote_view_of_my_known_txs(before, after):
-            t0 = time.time()
-            added = set(after) - set(before)
-            removed = set(before) - set(after)
-            if added:
-                self.send_have_tx(tx_hashes=list(added))
-            if removed:
-                self.send_losing_tx(tx_hashes=list(removed))
-
-                # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
-                key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
-                self.known_txs_cache[key] = dict((h, before[h]) for h in removed)
-                reactor.callLater(20, self.known_txs_cache.pop, key)
-            t1 = time.time()
-            if p2pool.BENCH and (t1-t0) > .01: print "%8.3f ms for update_remote_view_of_my_known_txs" % ((t1-t0)*1000.)
-        watch_id2 = self.node.known_txs_var.transitioned.watch(update_remote_view_of_my_known_txs)
-        self.connection_lost_event.watch(lambda: self.node.known_txs_var.transitioned.unwatch(watch_id2))
-
-        self.send_have_tx(tx_hashes=self.node.known_txs_var.value.keys())
-
-        def update_remote_view_of_my_mining_txs(before, after):
-            t0 = time.time()
-            added = set(after) - set(before)
-            removed = set(before) - set(after)
-            if removed:
-                self.send_forget_tx(tx_hashes=list(removed))
-                self.remote_remembered_txs_size -= sum(100 + bitcoin_data.tx_type.packed_size(before[x]) for x in removed)
-            if added:
-                self.remote_remembered_txs_size += sum(100 + bitcoin_data.tx_type.packed_size(after[x]) for x in added)
-                assert self.remote_remembered_txs_size <= self.max_remembered_txs_size
-                fragment(self.send_remember_tx, tx_hashes=[x for x in added if x in self.remote_tx_hashes], txs=[after[x] for x in added if x not in self.remote_tx_hashes])
-            t1 = time.time()
-            if p2pool.BENCH and (t1-t0) > .01: print "%8.3f ms for update_remote_view_of_my_mining_txs" % ((t1-t0)*1000.)
-
-        watch_id2 = self.node.mining_txs_var.transitioned.watch(update_remote_view_of_my_mining_txs)
-        self.connection_lost_event.watch(lambda: self.node.mining_txs_var.transitioned.unwatch(watch_id2))
-
-        self.remote_remembered_txs_size += sum(100 + bitcoin_data.tx_type.packed_size(x) for x in self.node.mining_txs_var.value.values())
-        assert self.remote_remembered_txs_size <= self.max_remembered_txs_size
-        fragment(self.send_remember_tx, tx_hashes=[], txs=self.node.mining_txs_var.value.values())
-             */
         }
 
         void sendAdvertisement(){
@@ -358,7 +297,7 @@ namespace c2pool::p2p {
             sendPacket(msg);
         }
 
-        void handle_getaddrs(int count){
+        void handle_getaddrs(int count){//todo: доделать
             if (count > 100){
                 count = 100;
             }
