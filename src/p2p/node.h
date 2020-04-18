@@ -5,6 +5,7 @@
 #include "factory.h"
 #include "protocol.h"
 #include "other/other.cpp"
+#include "log.cpp"
 
 namespace c2pool::p2p {
     class Server;
@@ -18,13 +19,13 @@ namespace c2pool::p2p {
         /*,*/
         P2PNode(Node* _node, /*,best_share_hash_func*/ int _port, auto _addr_store,
                 auto _connect_addrs, int des_out_cons = 10, int max_out_attempts = 30,
-                int max_in_conns=50, int pref_storage=1000 /*, known_txs_va*/
-                /*,mining_txs_var*/ /*,mining2_txs_var*/, bool _advertise_ip = true
+                int max_in_conns=50, int pref_storage=1000, bool _advertise_ip = true
                 , auto external_ip = nullptr){
             node = _node;
             port = _port;
             addr_store = _addr_store;
             connect_addrs = _connect_addrs;
+            preferred_storage = pref_storage;
             advertise_ip = _advertise_ip;
 
             //bans?
@@ -37,33 +38,38 @@ namespace c2pool::p2p {
             if (running){
                 //TODO: DEBUG raise already running
             }
-            client.start();
-            server.start();
-            //self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
+            client->start();
+            server->start();
+            //todo: [bost.asio connection] self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
             running = true;
-            //self._stop_thinking = deferral.run_repeatedly(self._think)
+            //todo: self._stop_thinking = deferral.run_repeatedly(self._think)
+
+
+            //Ниже node.py::P2PNode.start()
+            //
+            //
         }
 
-        /*
-         def _think(self):
-        try:
-            if len(self.addr_store) < self.preferred_storage and self.peers:
-                random.choice(self.peers.values()).send_getaddrs(count=8)
-        except:
-            log.err()
-
-        return random.expovariate(1/20)
-         */
+        float _think(){
+            try {
+                if ((addr_store.size() < preferred_storage) && (peers != nullptr)){ //TODO: peers != null && peers.size != 0
+                    c2pool::random::RandomChoice(*peers).send_getaddrs(8);
+                }
+            } catch (/*todo*/...) {
+                //todo: except: log.err()
+            }
+            return c2pool::random::Expovariate(1.0/20);
+        }
 
         //TODO: @defer.inlineCallbacks ???
         void stop(){
-            /*
-             if not self.running:
-            raise ValueError('already stopped')
+            if (!running){
+                //TODO: DEBUG raise ValueError('already stopped')
+            }
+            running = false;
+            //_stop_thinking(); //TODO: from twister.reactor.CallLater to BoostAsio
 
-        self.running = False
-
-        self._stop_thinking()
+            /* TODO:
         yield self.clientfactory.stop()
         yield self.serverfactory.stop()
         for singleclientconnector in self.singleclientconnectors:
@@ -73,28 +79,27 @@ namespace c2pool::p2p {
              */
         }
 
-        void got_conn(Protocol* conn){ //TODO: type for conn
-            /*
-             if conn.nonce in self.peers:
-            raise ValueError('already have peer')
-        self.peers[conn.nonce] = conn
-
-        print '%s peer %s:%i established. p2pool version: %i %r' % ('Incoming connection from' if conn.incoming else 'Outgoing connection to', conn.addr[0], conn.addr[1], conn.other_version, conn.other_sub_version)
-             */
+        void got_conn(Protocol* conn){
+            if (peers.count(conn->nonce) != 0){
+                //TODO: raise ValueError('already have peer')
+            }
+            peers.insert(pair<int, Protocol*>(conn->nonce, conn));
+            Log::Write('%s peer %s:%i established. p2pool version: %i %r' % ('Incoming connection from' if conn.incoming else 'Outgoing connection to', conn.addr[0], conn.addr[1], conn.other_version, conn
+                .other_sub_version)); //TODO: format str
         }
 
-        void lost_conn(Protocol* conn, auto reason){ //TODO: type for conn, reason
-            /*
-             if conn.nonce not in self.peers:
-            raise ValueError('''don't have peer''')
-        if conn is not self.peers[conn.nonce]:
-            raise ValueError('wrong conn')
-        del self.peers[conn.nonce]
+        void lost_conn(Protocol* conn, auto reason){ //TODO: type for reason
+            if (peers.count(conn->nonce) == 0){
+                //TODO: raise ValueError('''don't have peer''')
+            }
+            if (conn != peers.at(conn->nonce)){
+                //TODO: raise ValueError('wrong conn')
+            }
+            peers.erase(conn->nonce);
+            delete conn; //TODO: remove or change??
 
-        self.lost_updated_conn(conn, reason) #проверка и удаление обновленного пира.
-
-        print 'Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage())
-             */
+            Log::Write('Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage()))
+            //TODO: format str in log
         }
 
         void got_addr((host, port), services, timestamp){
@@ -107,24 +112,6 @@ namespace c2pool::p2p {
                 self.addr_store[host, port] = services, timestamp, timestamp
              */
         }
-
-        /*
-
-         virtual methods:
-
-         def handle_shares(self, shares, peer):
-        print 'handle_shares', (shares, peer)
-
-    def handle_share_hashes(self, hashes, peer):
-        print 'handle_share_hashes', (hashes, peer)
-
-    def handle_get_shares(self, hashes, parents, stops, peer):
-        print 'handle_get_shares', (hashes, parents, stops, peer)
-
-    def handle_bestblock(self, header, peer):
-        print 'handle_bestblock', header
-
-         */
 
         auto get_good_peers(auto max_count){
             /*
@@ -145,18 +132,6 @@ namespace c2pool::p2p {
             }
 
         }
-
-        /*
-         def _think(self):
-        try:
-            if len(self.addr_store) < self.preferred_storage and self.peers:
-                random.choice(self.peers.values()).send_getaddrs(count=8)
-        except:
-            log.err()
-
-        return random.expovariate(1/20)
-         */
-
     //private:
     public:
         Node* node;
@@ -171,8 +146,11 @@ namespace c2pool::p2p {
         int port;
         map<string, string> addr_store; //TODO: change type
         set<string> connect_addrs;
-        bool advertise_ip
+        int preferred_storage;
+        map<int, Protocol*> peers; //TODO: type???
+        bool advertise_ip;
     };
+
 
     class Node{
         //node.py, Node
@@ -180,15 +158,9 @@ namespace c2pool::p2p {
         P2PNode* p2p_node;
         Client* factory;
         //TODO: <type?> bitcoind;
-        //TODO: tracker
 
-        //TODO:
-        /*self.known_txs_var = variable.VariableDict({}) # hash -> tx
-        self.mining_txs_var = variable.Variable({}) # hash -> tx
-        self.mining2_txs_var = variable.Variable({}) # hash -> tx
-        self.best_share_var = variable.Variable(None)
-        self.desired_var = variable.Variable(None)
-        self.txidcache = {} */
+        //TODO: self.best_share_var = variable.Variable(None)
+
 
         Node(Client* _factory /*, bitcoind*/ /*,shares */ /*,known_verified_share_hashes*/ ){ //net in global config
             factory = _factory;
@@ -200,14 +172,6 @@ namespace c2pool::p2p {
 
         void set_best_share(){
             //TODO:
-        }
-
-        void clean_tracker(){
-            //TODO:
-        }
-
-        auto get_current_txouts(){
-            //TODO: return
         }
     };
 }
