@@ -227,6 +227,15 @@ namespace c2pool::messages{
         
     };
 
+
+
+
+
+
+
+
+
+    //__________________________
     class message_shares: public message{
     public:
 
@@ -479,6 +488,8 @@ namespace c2pool::messages{
         ListTypeInt256 tx_hashes;
         // ])
     }
+
+    //__________________________
 }
 
 

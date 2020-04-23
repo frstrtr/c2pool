@@ -28,9 +28,9 @@ namespace c2pool::p2p {
     class BaseProtocol {
     public:
 
-        BaseProtocol(boost::asio::io_context io, unsigned long _max_payload_length, unsigned int _version) : version(_version);
+        BaseProtocol(boost::asio::io_context& _io, unsigned long _max_payload_length, unsigned int _version) : version(_version), io(_io);
 
-        BaseProtocol(boost::asio::io_context io);
+        BaseProtocol(boost::asio::io_context& _io):io(_io);
 
         void sendPacket(c2pool::messages::message *payload2);
 
@@ -93,7 +93,8 @@ namespace c2pool::p2p {
 
 
 
-    private:
+    protected:
+        boost::asio::io_context& io;
         Factory* factory;
         tcp::socket socket;
         const unsigned long max_remembered_txs_size = 25000000;
@@ -124,32 +125,24 @@ namespace c2pool::p2p {
                          c2pool::messages::address_type(0, gethost, gethost), node->nonce, /*todo: p2pool.__version__*/, 1, /*node->best_share_hash_func*/)
             //_____________
 
-            //todo: self.timeout_delayed = reactor.callLater(10, self._connect_timeout)
-
-
-            /*
-        self.get_shares = deferral.GenericDeferrer(
-            max_id=2**256,
-            func=lambda id, hashes, parents, stops: self.send_sharereq(id=id, hashes=hashes, parents=parents, stops=stops),
-            timeout=15,
-            on_timeout=self.disconnect,
-        )
-
-        self.remote_tx_hashes = set() # view of peer's known_txs # not actually initially empty, but sending txs instead of tx hashes won't hurt
-        self.remote_remembered_txs_size = 0
-
-        self.remembered_txs = {} # view of peer's mining_txs
-        self.remembered_txs_size = 0
-        self.known_txs_cache = {}*/
+            timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(10));
+            timeout_delayed->async_wait(boost::bind(_connect_timeout, boost::asio::placeholders::error)); //todo: thread
         }
 
         //todo: connect_timeout
 
-        auto connect_timeout(){
-            timeout_delayed = null; //todo: ?
+        void connect_timeout(const boost::system::error_code& /*e*/){
+            delete timeout_delayed; //todo: ?
             //TODO: Log.Write(Handshake timed out, disconnecting from %s:%i) /  print 'Handshake timed out, disconnecting from %s:%i' % self.addr
             disconnect();
         }
+
+        void _timeout(const boost::system::error_code& /*e*/){
+            delete timeout_delayed;
+            //TODO: Log.Write()/print 'Connection timed out, disconnecting from %s:%i' % self.addr
+            disconnect();
+        }
+
 
 
         void send_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash){
@@ -185,6 +178,12 @@ namespace c2pool::p2p {
 
             nonce = _nonce;
             connected2 = true;
+
+            //TODO: safe thrade cancel
+            timeout_delayed.cancel();
+            timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100));
+            timeout_delayed->async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
+            //_____________
 
             /* TODO: BOOST TIMER
                 self.timeout_delayed.cancel()
@@ -327,7 +326,7 @@ namespace c2pool::p2p {
 
         bool connected2 = false;
         tuple<string, int> addr; //TODO
-        boost::asio::steady_timer timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
+        boost::asio::steady_timer* timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
         //TODO???: remote_tx_hashes = set() # view of peer's known_txs # not actually initially empty, but sending txs instead of tx hashes won't hurt
         int remote_remembered_txs_size = 0; //todo: remove?
 
@@ -336,7 +335,6 @@ namespace c2pool::p2p {
         map<string, /*TODO*/> known_txs_cache = null; //TODO: type of key+vakue
 
         int nonce; //TODO: int64? IntType(64)
-
     };
 }
 

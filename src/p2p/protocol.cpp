@@ -4,11 +4,12 @@
 #include "log.cpp"
 
 using namespace c2pool::p2p;
-BaseProtocol::BaseProtocol(boost::asio::io_context io, unsigned long _max_payload_length = 8000000) : timeout_delayed(io), socket(io) {
+BaseProtocol::BaseProtocol(boost::asio::io_context* _io, unsigned long _max_payload_length = 8000000) : timeout_delayed(_io), socket(_io), io(_io) {
+    io = _io;
     max_payload_length = _max_payload_length;
 }
 
-BaseProtocol::BaseProtocol(boost::asio::io_context io) : timeout_delayed(io), socket(io){
+BaseProtocol::BaseProtocol(boost::asio::io_context io) : timeout_delayed(_io), socket(_io), io(_io){
 
 }
 
