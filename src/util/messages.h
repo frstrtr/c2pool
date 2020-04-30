@@ -25,19 +25,13 @@ namespace c2pool::messages{
 
     class message{
     public:
-        message(string cmd){
-            command = cmd;
-        }
-        string command;
-        void unpack(string item){
-            stringstream ss;
-            ss << item;
-            _unpack(ss);
-        }
+        std::string command;
 
-        string pack(){
-            //TODO:
-        }
+        message(std::string cmd);
+
+        void unpack(std::string item);
+
+        string pack();
 
         virtual void _unpack(stringstream& ss);
         virtual string _pack();
@@ -48,20 +42,13 @@ namespace c2pool::messages{
 
     class message_error: public message{
     public:
-        message_error(const string cmd = "error"):message(cmd){
-
-        }
+        message_error(const string cmd = "error");
     };
 
     class message_version: public message{
     public:
 
-        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version")
-        :message(cmd){
-            //todo what should be here?
-            //like version = ver???
-            //services = serv???
-        };
+        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const string cmd = "version");
 
         void _unpack(stringstream& ss) override {
             ss >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;

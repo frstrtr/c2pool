@@ -40,9 +40,7 @@ namespace c2pool::random{
 }
 
 namespace c2pool::time{
-
     int timestamp(){
         return std::time(nullptr);
     }
-
 }

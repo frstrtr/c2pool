@@ -38,18 +38,10 @@
 /.idea
 
 *.pyc
-.vscode/settings.json
-build/CMakeCache.txt
-build/CMakeFiles/cmake.check_cache
-build/.cmake/api/v1/query/client-vscode/query.json
-build/CMakeFiles/3.16.19112601-MSVC_2/CMakeCCompiler.cmake
-build/CMakeFiles/3.16.19112601-MSVC_2/CMakeCXXCompiler.cmake
-build/CMakeFiles/3.16.19112601-MSVC_2/CMakeDetermineCompilerABI_C.bin
-build/CMakeFiles/3.16.19112601-MSVC_2/CMakeDetermineCompilerABI_CXX.bin
-build/CMakeFiles/3.16.19112601-MSVC_2/CMakeRCCompiler.cmake
-build/CMakeFiles/3.16.19112601-MSVC_2/CMakeSystem.cmake
-build/CMakeFiles/3.16.19112601-MSVC_2/CompilerIdC/CMakeCCompilerId.c
-build/CMakeFiles/3.16.19112601-MSVC_2/CompilerIdCXX/CMakeCXXCompilerId.cpp
-build/CMakeFiles/CMakeOutput.log
-build/CMakeFiles/ShowIncludes/foo.h
-build/CMakeFiles/ShowIncludes/main.c
+/build
+/.vscode
+
+#Visual Studio
+/.vs
+/out
+CMakeSettings.json

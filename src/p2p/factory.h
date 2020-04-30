@@ -2,7 +2,6 @@
 #define CPOOL_FACTORY_H
 
 #include "boost/asio.hpp"
-#include "protocol.h"
 #include <vector>
 #include <algorithm>
 #include <map>

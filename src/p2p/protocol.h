@@ -4,7 +4,7 @@
 #include "boost/asio.hpp"
 #include "factory.h"
 #include "node.h"
-#include <stdio>
+//#include <stdio>
 #include <string>
 #include "pystruct.h"
 #include <sstream>
@@ -14,7 +14,7 @@
 #include <boost/algorithm/string.hpp>
 #include "log.cpp"
 #include "converter.cpp"
-#include "other/other.cpp"
+#include "other.h"
 
 namespace c2pool::messages{
     class message;
@@ -28,7 +28,7 @@ namespace c2pool::p2p {
     class BaseProtocol {
     public:
 
-        BaseProtocol(boost::asio::io_context& _io, unsigned long _max_payload_length, unsigned int _version) : version(_version), io(_io);
+        BaseProtocol(boost::asio::io_context& _io, unsigned int _version, unsigned long _max_payload_length) : version(_version), io(_io);
 
         BaseProtocol(boost::asio::io_context& _io):io(_io);
 
@@ -39,57 +39,11 @@ namespace c2pool::p2p {
 
     private:
 
-        void disconnect(){
-            //TODO: ec check??
-            boost::system::error_code ec;
-            socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
-            socket.close(ec);
-        }
+        void disconnect();
 
-        void dataReceived(string data){
-            size_t prefix_pos = data.find(c2pool::config::PREFIX);
-            if (prefix_pos != std::string::npos){
-                data = data.substr(prefix_pos + c2pool::config::PREFIX.length());
-            } else {
-                //TODO: Debug_log: PREFIX NOT FOUND
-                return;
-            }
-            string command = data.substr(0, 12); //TODO: check for '\0'???
+        void dataReceived(string data);
 
-            string lengthPacked; //TODO: value?
-            int length;
-            stringstream ss = pystruct::unpack("<I", lengthPacked);
-            ss >> length;
-            if (length > max_payload_length){
-                //TODO: Debug_log: length too large
-            }
-
-            string checksum = data.substr(?,?); //TODO
-            string payload = data.substr(?,?); //TODO:
-
-            //TODO: HASH, check for hash function btc-core
-            if (hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum){
-                //TODO: Debug_log: invalid hash
-                disconnect();
-                //return; //todo:
-            }
-
-            message* msg = c2pool::messages::fromStr(command);
-
-            if (msg->command == "error"){
-                Log::Debug("no type for ", false);
-                Log::Debug(command);
-            }
-
-            packetReceived(msg);
-
-
-
-        }
-
-        void packetReceived(message* msg){
-            msg->handle(this);
-        }
+        void packetReceived(message* msg);
 
 
 
@@ -99,35 +53,18 @@ namespace c2pool::p2p {
         tcp::socket socket;
         const unsigned long max_remembered_txs_size = 25000000;
         unsigned long max_payload_length;
+        streambuf buff;
 
         friend class Factory;
     };
 
     class Protocol:public BaseProtocol{
     public:
-        Protocol(boost::asio::io_context io, ) : BaseProtocol(io, _max_payload_length, 3301){ //TODO: base constructor
+        Protocol(boost::asio::io_context io);
 
-        }
+        Protocol(boost::asio::io_context io, unsigned long _max_payload_length);
 
-        Protocol(boost::asio::io_context io) : BaseProtocol(io, 3301){ //TODO: base constructor
-
-        }
-
-        void connectionMade(){
-            factory->proto_made_connection(this);
-
-            //self.connection_lost_event = variable.Event()
-
-            //TODO: getPeer() and getHost()
-            addr = make_tuple(socket.remote_endpoint().address().to_string(), socket.remote_endpoint().port().to_string()); //todo: move remote_endpoint to method
-
-            send_version(version, 0, c2pool::messages::address_type(0, socket.remote_endpoint().address(), socket.remote_endpoint().port()),
-                         c2pool::messages::address_type(0, gethost, gethost), node->nonce, /*todo: p2pool.__version__*/, 1, /*node->best_share_hash_func*/)
-            //_____________
-
-            timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(10));
-            timeout_delayed->async_wait(boost::bind(_connect_timeout, boost::asio::placeholders::error)); //todo: thread
-        }
+        void connectionMade();
 
         //todo: connect_timeout
 
@@ -184,11 +121,6 @@ namespace c2pool::p2p {
             timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100));
             timeout_delayed->async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
             //_____________
-
-            /* TODO: BOOST TIMER
-                self.timeout_delayed.cancel()
-                self.timeout_delayed = reactor.callLater(100, self._timeout)
-             */
 
             /* TODO: TIMER + DELEGATE
              old_dataReceived = self.dataReceived
