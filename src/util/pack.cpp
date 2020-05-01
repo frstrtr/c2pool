@@ -1,23 +1,29 @@
 #include "pack.h"
-#include <typeinfo>
 #include <iostream>
-#include <cstring>
 using namespace std;
 
-bool operator==(const Type& A, const Type& B){
-    if (typeid(A).name() != typeid(B).name()) return false;
-    return (memcmp(&A, &B, sizeof(A)) == 0);
-}
+namespace c2pool::pack
+{
 
-bool operator!=(const Type& A, const Type& B) {
-    return (!(A == B));
-}
+    void ComposedType::Space()
+    { // проверка и разделение переменных в потоке.
+        if (fields.rdbuf()->in_avail() != 0)
+        { //проверка на то, что в fields уже есть какие-то данные.
+            fields << ";";
+        }
+    }
 
-auto ListType::read(auto file) {
-    auto length = _inner_size.read(file);
-    length *= mul;
-    //TODO: generate res from type.read(file)
+    ComposedType::ComposedType()
+    {
+        fields.clear();
+    }
 
-}
+    string ComposedType::read()
+    {
+        string buff;
+        fields >> buff;
+        string res = buff;
+        return res;
+    }
 
-
+} // namespace p2pool::pack
