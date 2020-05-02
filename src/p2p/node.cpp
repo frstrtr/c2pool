@@ -10,6 +10,7 @@
 #include "protocol.h"
 #include "other.h"
 #include "log.cpp"
+#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 
 namespace c2pool::p2p
 {
@@ -104,11 +105,12 @@ namespace c2pool::p2p
             //TODO: raise ValueError('already have peer')
         }
         peers.insert(pair<int, Protocol *>(conn->nonce, conn));
-        Log::Write('%s peer %s:%i established. p2pool version: %i %r' % ('Incoming connection from' if conn.incoming else 'Outgoing connection to', conn.addr[0], conn.addr[1], conn.other_version, conn.other_sub_version)); //TODO: format str
+        //TODO: printf()
+        //Log::Write('%s peer %s:%i established. p2pool version: %i %r' % ('Incoming connection from' if conn.incoming else 'Outgoing connection to', conn.addr[0], conn.addr[1], conn.other_version, conn.other_sub_version)); //TODO: format str
     }
 
-    void P2PNode::lost_conn(Protocol *conn, auto reason)
-    { //TODO: type for reason
+    void P2PNode::lost_conn(Protocol *conn, boost::exception& reason)
+    { 
         if (peers.count(conn->nonce) == 0)
         {
             //TODO: raise ValueError('''don't have peer''')
@@ -120,7 +122,9 @@ namespace c2pool::p2p
         peers.erase(conn->nonce);
         delete conn; //TODO: remove or change??
 
-        Log::Write('Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage()))
+
+        //TODO: printf()
+        //Log::Write('Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage()))
         //TODO: format str in log
     }
 

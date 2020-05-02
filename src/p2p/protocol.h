@@ -248,8 +248,17 @@ namespace c2pool::p2p {
             int timestamp = ;//TODO: INIT
             c2pool::messages::message_addrs msg = c2pool::messages::message_addrs(adr, timestamp);
         }
+
+        void setFactory(Factory* _factory){
+            factory = _factory;
+        }
+
+        string getHost(){
+            return ""; //TODO: return ip for host [python ex: _host_to_ident(proto.host)]
+        }
+
     private:
-        P2PNode*_node;
+        P2PNode* node;
 
         const unsigned int version;
         unsigned int other_version = -1;

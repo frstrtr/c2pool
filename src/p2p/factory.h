@@ -6,144 +6,71 @@
 #include <algorithm>
 #include <map>
 #include <boost/algorithm/string.hpp>
+#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 
-namespace c2pool::p2p {
+namespace c2pool::p2p
+{
     class P2PNode;
     class Protocol;
-}
+} // namespace c2pool::p2p
 
-using namespace std;
+namespace c2pool::p2p
+{
 
-namespace c2pool::p2p {
-
-    class Factory {
+    class Factory
+    {
     public:
-        Factory(c2pool::p2p::P2PNode* _node){
-            node = _node;
-        }
+        Factory(c2pool::p2p::P2PNode *_node);
 
         virtual void start() = 0;
-        virtual Protocol* buildProtocol(string addrs) = 0;
+        virtual Protocol *buildProtocol(std::string addrs) = 0;
 
     protected:
         bool running = false;
-        c2pool::p2p::P2PNode* node;
+        c2pool::p2p::P2PNode *node;
 
-
-        string _host_to_ident(string host){
-            vector<string> res;
-            boost::split(res, host, [](char c){return c == '.'});
-            if (res.size() == 4) {
-                return res[0]+res[1];
-            } else {
-                //TODO: debug error, ip is not xxx.xxx.xxx.xxx
-            }
-        }
-
+        //argument host = just ip, without port
+        //return <string>: {1}+{2} from ip: {1}.{2}.{3}.{4}
+        std::string _host_to_ident(std::string host);
     };
 
-    class Server : Factory {
+    class Server : public Factory
+    {
     public:
-        Server(c2pool::p2p::P2PNode* _node, int _max_conns): Factory(_node){
-            max_conns = _max_conns;
-        }
+        Server(c2pool::p2p::P2PNode *_node, int _max_conns);
 
-        Protocol* buildProtocol(string addrs){ //TODO: string or tcp::endpoint addrs?
-            //TODO: check connections
-            Protocol* p = new Protocol(_node);
-            p->_factory = this;
-            //TODO: Debug mode {"Got peer connection from:"}
-            return p;
-        }
+        Protocol *buildProtocol(std::string addrs);
 
-        void proto_made_connection(Protocol* proto){ //todo: proto
-            string ident = _host_to_ident(/*proto.[...].host*/); //TODO: get ip host
-            if (connections.find(ident) != connections.end()){
-                connections[ident] += 1;
-            } else {
-                connections[ident] = 1;
-            }
-        }
+        void proto_made_connection(Protocol *proto);
 
-        void proto_lost_connection(Protocol* proto, auto reason) { //todo: proto, reason
-            string ident = _host_to_ident(/*proto.[...].host*/); //TODO: get ip host
-            if (connections.find(ident) != connections.end()){
-                connections[ident] -= 1;
-            } else {
-                //todo: debug not found connection
-            }
-        }
+        void proto_lost_connection(Protocol *proto, boost::exception& reason);
 
-        void proto_connected(Protocol* proto){ //todo: proto
-            node->got_conn(proto);
-        }
+        void proto_connected(Protocol *proto);
 
-        void proto_disconnected(Protocol* proto, auto reason){ //todo: proto, reason
-            node->lost_conn(proto, reason);
-        }
+        void proto_disconnected(Protocol *proto, boost::exception& reason);
 
-        void start(){
-            //TODO: assert not self.running
-            running = true;
+        void start();
 
-            //TODO: boost::asio listen tcp port
-            /*
-             def attempt_listen():
-            if self.running:
-                self.listen_port = reactor.listenTCP(self.node.port, self)
-        deferral.retry('Error binding to P2P port:', traceback=False)(attempt_listen)()
-             */
-        }
-
-        void stop(){
-            //todo: debug assert self.running
-            running = false;
-            //todo: return self.listen_port.stopListening()
-            int max_conns;
-            auto listen_port; //TODO: type
-        }
+        void stop();
 
     private:
-        map<boost::asio::ip::tcp::endpoint, int> connections; //Список текущих подключений.
+        int max_conns;
+        int listen_port; //TODO: type <int>?
+        std::map<std::string, int> connections; //Список текущих подключений.
     };
 
-    class Client : Factory {
+    class Client : Factory
+    {
     public:
-        Client(c2pool::p2p::P2PNode* node, int _desired_conns, int _max_attempts): Factory(node){
-            desired_conns = _desired_conns;
-            max_attempts = _max_attempts;
-        }
+        Client(c2pool::p2p::P2PNode *node, int _desired_conns, int _max_attempts);
 
-        Protocol buildProtocol(string addrs){ //TODO: string or tcp::endpoint?
-            Protocol* p = new Protocol(_node);
-            p->_factory = this;
-            //TODO: Debug mode {"Got peer connection from:"}
-            return p;
-        }
+        Protocol *buildProtocol(std::string addrs);
 
-        void startedConnecting(auto connector) { //todo: type connector: https://twistedmatrix.com/documents/8.2.0/api/twisted.internet.tcp.Connector.html
-            string ident = _host_to_ident(/*connector.[...].host*/); //TODO: get ip host
-            if (find(attempts.begin(), attempts.end(), ident) != attempts.end()){
-                //todo: debug raise AssertionError('already have attempt')
-            }
-            attempts.insert(atteempts.begin(), ident);
-        }
+        void startedConnecting(auto connector);
 
-        void clientConnectionFailed(auto connector, auto reason){ //todo: connector, reason
-            string ident = _host_to_ident(/*connector.[...].host*/); //TODO: get ip host
-            auto find_pos = find(attempts.begin(), attempts.end(), ident);
-            if (find_pos != attempts.end()){
-                attempts.erase(find_pos); //remove <ident> from attempts
-            }
-        }
+        void clientConnectionFailed(auto connector, boost::exception& reason); //todo: connector, reason
 
-        void clientConnectionLost(auto connector, auto reason){ //todo: connector, reason
-            string ident = _host_to_ident(/*connector.[...].host*/); //TODO: get ip host
-            auto find_pos = find(attempts.begin(), attempts.end(), ident);
-            if (find_pos != attempts.end()){
-                attempts.erase(find_pos); //remove <ident> from attempts
-            }
-        }
+        void clientConnectionLost(auto connector, boost::exception& reason); //todo: connector, reason
 
         /*
          * ???
@@ -153,30 +80,13 @@ namespace c2pool::p2p {
         pass
          */
 
-        void proto_connected(Protocol* proto){ //todo: proto
-            connections.insert(connections.begin(), proto);
-            node->got_conn(proto);
-        }
+        void proto_connected(Protocol *proto);
 
-        void proto_disconnected(Protocol* proto, auto reason){ //todo: proto, reason
-            auto find_pos = find(connections.begin(), connections.end(), ident);
-            if (find_pos != connections.end()){
-                connections.erase(find_pos);
-            }
-            node->lost_conn(proto, reason);
-        }
+        void proto_disconnected(Protocol *proto, boost::exception& reason);
 
-        void start(){
-            //TODO: assert not self.running
-            running = true;
-            //todo: self._stop_thinking = deferral.run_repeatedly(self._think)
-        }
+        void start();
 
-        void stop(){
-            //TODO: assert self.running
-            running = false;
-            //todo: self._stop_thinking()
-        }
+        void stop();
 
         /* todo:???
          def _think(self):
@@ -198,11 +108,11 @@ namespace c2pool::p2p {
          */
 
     private:
-        vector<boost::asio::ip::tcp::endpoint> connections; //Список текущих подключений.
-        vector<string> attempts;
+        std::vector<boost::asio::ip::tcp::endpoint> connections; //Список текущих подключений.
+        std::vector<std::string> attempts;
         int desired_conns;
         int max_attempts;
     };
-}
+} // namespace c2pool::p2p
 
 #endif //CPOOL_FACTORY_H
