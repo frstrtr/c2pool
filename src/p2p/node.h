@@ -3,6 +3,7 @@
 
 #include <map>
 #include <set>
+#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 
 namespace c2pool::p2p
 {
@@ -50,7 +51,7 @@ namespace c2pool::p2p
 
         void got_conn(Protocol *conn);
 
-        void lost_conn(Protocol *conn, auto reason); //TODO: type for reason
+        void lost_conn(Protocol *conn, boost::exception& reason);
 
         void got_addr((host, port), services, timestamp); //TODO
 

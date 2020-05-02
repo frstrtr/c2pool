@@ -75,7 +75,7 @@ namespace c2pool::messages
         protocol->handle_ping(/*todo*/);
     }
 
-    void message_addrme::_unpack(std::`stringstream &ss)
+    void message_addrme::_unpack(std::stringstream &ss)
     {
         ss >> port;
     }
