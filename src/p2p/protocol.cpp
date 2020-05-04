@@ -11,15 +11,20 @@ namespace c2pool::p2p
         int cmd;
         ss >> cmd;
         c2pool::messages::message *res;
+
         switch (cmd)
         {
         case c2pool::messages::commands::cmd_addrs:
             res = new c2pool::messages::message_addrs();
             break;
+        case c2pool::messages::commands::cmd_version:
+            res = new c2pool::messages::message_version();
+            break;
         default:
             res = new c2pool::messages::message_error();
             break;
         }
+
         res->unpack(ss);
         res->handle(this);
         return res;

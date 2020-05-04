@@ -21,7 +21,8 @@ namespace c2pool::messages
     {
         cmd_error = 9999,
         cmd_version = 0,
-        cmd_addrs
+        cmd_addrs,
+        cmd_getaddrs
     };
 
     class message
@@ -55,7 +56,9 @@ namespace c2pool::messages
     class message_version : public message
     {
     public:
-        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash, const std::string cmd = "version") : message(cmd)
+        message_version() : message("version") {}
+
+        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash) : message("version")
         {
             version = ver;
             services = serv;
