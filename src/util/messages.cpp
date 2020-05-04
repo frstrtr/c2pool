@@ -9,6 +9,18 @@ using namespace c2pool::messages;
 
 namespace c2pool::messages
 {
+    message *fromStr(std::string str)
+    {
+        if (str == "version")
+        {
+            return new message_version();
+        }
+
+        return new message_error();
+    }
+
+    //message
+
     void message::unpack(std::string item)
     {
         std::stringstream ss;
@@ -22,21 +34,11 @@ namespace c2pool::messages
         return _pack();
     }
 
-    message *fromStr(std::string str)
-    {
-        if (str == "version")
-        {
-            return new message_version();
-        }
-
-        return new message_error();
-    }
+    //message_version
 
     void message_version::_unpack(std::stringstream &ss)
     {
         ss >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
-
-        //TODO: override operator >> for address_type;
     }
 
     string message_version::_pack()
@@ -58,6 +60,8 @@ namespace c2pool::messages
         protocol->handle_version(/*todo*/);
     }
 
+    //message_ping
+
     void message_ping::_unpack(std::stringstream &ss)
     {
         //todo: Empty variables list
@@ -75,6 +79,8 @@ namespace c2pool::messages
         protocol->handle_ping(/*todo*/);
     }
 
+    //message_addrme
+
     void message_addrme::_unpack(std::stringstream &ss)
     {
         ss >> port;
@@ -87,7 +93,7 @@ namespace c2pool::messages
         return ct.read();
     }
 
-    void handle(p2p::Protocol *protocol)
+    void message_addrme::handle(p2p::Protocol *protocol)
     {
         protocol->handle_addrme(/*todo*/);
     }
@@ -124,7 +130,7 @@ namespace c2pool::messages
     std::string message_addrs::_pack()
     {
         c2pool::pack::ComposedType ct;
-        ct.add(addrs); //TODO: override operator << for this
+        ct.add(addrs);
         return ct.read();
     }
 
