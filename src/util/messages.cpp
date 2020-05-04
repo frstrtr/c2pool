@@ -9,22 +9,17 @@ using namespace c2pool::messages;
 
 namespace c2pool::messages
 {
-    message *fromStr(std::string str)
-    {
-        if (str == "version")
-        {
-            return new message_version();
-        }
-
-        return new message_error();
-    }
-
     //message
 
     void message::unpack(std::string item)
     {
         std::stringstream ss;
         ss << item;
+        _unpack(ss);
+    }
+
+    void message::unpack(std::stringstream &ss)
+    {
         _unpack(ss);
     }
 
@@ -98,6 +93,8 @@ namespace c2pool::messages
         protocol->handle_addrme(/*todo*/);
     }
 
+    //message_getaddrs
+
     void message_getaddrs::_unpack(std::stringstream &ss)
     {
         ss >> count;
@@ -115,8 +112,11 @@ namespace c2pool::messages
         protocol->handle_getaddrs(/*todo*/);
     }
 
+    //message_addrs
+
     void message_addrs::_unpack(std::stringstream &ss)
     {
+        //перед массивом идёт int(длина массива)
         int count;
         addr addrBuff;
         ss >> count;
@@ -136,7 +136,7 @@ namespace c2pool::messages
 
     void message_addrs::handle(p2p::Protocol *protocol)
     {
-        protocol->handle_addrs(/*todo*/);
+        protocol->handle_addrs(addrs);
     }
 
 } // namespace c2pool::messages

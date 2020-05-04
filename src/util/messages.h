@@ -17,23 +17,22 @@ namespace c2pool::p2p
 namespace c2pool::messages
 {
 
-    enum Messages
+    enum commands
     {
-        error = 9999,
-        version = 0
+        cmd_error = 9999,
+        cmd_version = 0,
+        cmd_addrs
     };
 
     class message
     {
     public:
-        std::string command;
+        const std::string command;
 
-        message(std::string cmd)
-        {
-            command = cmd;
-        }
+        message(std::string cmd) : command(cmd){}
 
         void unpack(std::string item);
+        void unpack(std::stringstream& ss);
         string pack();
 
         virtual void _unpack(std::stringstream &ss) = 0;
@@ -41,12 +40,16 @@ namespace c2pool::messages
         virtual void handle(p2p::Protocol *protocol) = 0;
     };
 
-    message *fromStr(std::string str);
-
     class message_error : public message
     {
     public:
-        message_error(const std::string cmd = "error") : message(cmd) {}
+        void _unpack(std::stringstream &ss) override; //TODO
+
+        std::string _pack() override; //TODO
+
+        void handle(p2p::Protocol *protocol) override; //TODO
+
+        message_error() : message("error") {}
     };
 
     class message_version : public message
@@ -148,7 +151,11 @@ namespace c2pool::messages
     class message_addrs : public message
     {
     public:
-        message_addrs(vector<addr> _addrs, const string cmd = "addrs") : message(cmd)
+        vector<addr> addrs;
+
+        message_addrs():message("addrs"){};
+
+        message_addrs(vector<addr> _addrs) : message("addrs")
         {
             addrs = _addrs;
         }
@@ -158,15 +165,6 @@ namespace c2pool::messages
         string _pack() override;
 
         void handle(p2p::Protocol *protocol) override;
-
-        vector<addr> addrs;
-
-        // = pack.ComposedType([
-        //     ('addrs', pack.ListType(pack.ComposedType([
-        //         ('timestamp', pack.IntType(64)),
-        //         ('address', bitcoin_data.address_type),
-        //     ]))),
-        // ])
     };
 
     //__________________________
