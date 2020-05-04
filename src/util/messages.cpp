@@ -52,7 +52,7 @@ namespace c2pool::messages
 
     void message_version::handle(p2p::Protocol *protocol)
     {
-        protocol->handle_version(/*todo*/);
+        protocol->handle_version(version, services, addr_to, addr_from, nonce, sub_version, mode, best_share_hash);
     }
 
     //message_ping
