@@ -71,7 +71,7 @@ namespace c2pool::messages
 
     void message_ping::handle(p2p::Protocol *protocol)
     {
-        protocol->handle_ping(/*todo*/);
+        protocol->handle_ping(/*todo:Empty variables list*/);//todo:Empty variables list
     }
 
     //message_addrme
@@ -90,7 +90,7 @@ namespace c2pool::messages
 
     void message_addrme::handle(p2p::Protocol *protocol)
     {
-        protocol->handle_addrme(/*todo*/);
+        protocol->handle_addrme(port);
     }
 
     //message_getaddrs
@@ -109,7 +109,7 @@ namespace c2pool::messages
 
     void message_getaddrs::handle(p2p::Protocol *protocol)
     {
-        protocol->handle_getaddrs(/*todo*/);
+        protocol->handle_getaddrs(count);
     }
 
     //message_addrs
