@@ -53,10 +53,15 @@ namespace c2pool::p2p
 
         void stop();
 
+        int getListenPort(){ return listen_port; }
+
+
+    public:
+        std::map<std::string, int> connections; //Список текущих подключений.
     private:
         int max_conns;
         int listen_port; //TODO: type <int>?
-        std::map<std::string, int> connections; //Список текущих подключений.
+        
     };
 
     class Client : Factory
