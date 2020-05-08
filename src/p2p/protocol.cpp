@@ -34,6 +34,15 @@ namespace c2pool::p2p
         case c2pool::messages::commands::cmd_version:
             res = new c2pool::messages::message_version();
             break;
+        case c2pool::messages::commands::cmd_ping:
+            res = new c2pool::messages::message_ping();
+            break;
+        case c2pool::messages::commands::cmd_addrme:
+            res = new c2pool::messages::message_addrme();
+            break;
+        case c2pool::messages::commands::cmd_getaddrs:
+            res = new c2pool::messages::message_getaddrs();
+            break;
         default:
             res = new c2pool::messages::message_error();
             break;

@@ -22,7 +22,9 @@ namespace c2pool::messages
         cmd_error = 9999,
         cmd_version = 0,
         cmd_addrs,
-        cmd_getaddrs
+        cmd_getaddrs,
+        cmd_ping,
+        cmd_addrme
     };
 
     class message
@@ -99,7 +101,13 @@ namespace c2pool::messages
     class message_ping : public message
     {
     public:
-        message_ping(const std::string cmd = "ping") : message(cmd) {}
+        message_ping() : message("ping") {}
+        // message_ping(const std::string cmd = "ping") : message(cmd) {}
+
+        message_ping() : message("ping")//todo:Empty var list
+        {
+
+        }
 
         void _unpack(stringstream &ss) override;
 
@@ -114,9 +122,14 @@ namespace c2pool::messages
     class message_addrme : public message
     {
     public:
-        message_addrme(int _port, const string cmd = "addrme") : message(cmd)
+        message_addrme() : message('addrme') {}
+        // message_addrme(int _port, const string cmd = "addrme") : message(cmd)
+        // {
+        //     port = _port;
+        // }
+        message_addrme(int prt) : message("addrme")
         {
-            port = _port;
+            port=prt;
         }
 
         void _unpack(stringstream &ss) override;
@@ -134,7 +147,12 @@ namespace c2pool::messages
     class message_getaddrs : public message
     {
     public:
-        message_getaddrs(int cnt, const string cmd = "getaddr") : message(cmd)
+        message_getaddrs() : message("getaddrs") {}
+        // message_getaddrs(int cnt, const string cmd = "getaddr") : message(cmd)
+        // {
+        //     count = cnt;
+        // }
+        message_getaddrs(int cnt)
         {
             count = cnt;
         }
@@ -156,7 +174,7 @@ namespace c2pool::messages
     public:
         vector<addr> addrs;
 
-        message_addrs():message("addrs"){};
+        message_addrs():message("addrs") {}
 
         message_addrs(vector<addr> _addrs) : message("addrs")
         {
