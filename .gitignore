@@ -45,3 +45,6 @@
 /.vs
 /out
 CMakeSettings.json
+doc/concepts/TestIdeaProtocolWithMessages.pdb
+doc/concepts/TestIdeaProtocolWithMessages.ilk
+vc140.pdb
