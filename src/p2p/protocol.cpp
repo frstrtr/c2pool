@@ -148,7 +148,7 @@ namespace c2pool::p2p
 
     void Protocol::connectionMade()
     {
-        factory->proto_made_connection(this);
+        factory->proto_made_connection(this); //TODO
 
         //self.connection_lost_event = variable.Event()
 
@@ -212,7 +212,7 @@ namespace c2pool::p2p
             //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
         }
 
-        //detect duplicate in node->peers1
+        //detect duplicate in node->peers
         for (auto _peer : node->peers)
         {
             if (_peer.first == _nonce)
