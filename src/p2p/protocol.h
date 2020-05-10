@@ -58,7 +58,6 @@ namespace c2pool::p2p
         const int version;
         Factory *factory;
         boost::asio::ip::tcp::socket socket;
-        const long max_remembered_txs_size = 25000000;
         long max_payload_length;
         boost::asio::streambuf buff;
 
@@ -118,8 +117,10 @@ namespace c2pool::p2p
         }
 
         boost::asio::io_context& getIOcontext(){
-            return socket.get_executor().context();
+            return socket.get_executor().context(); //TODO
         }
+    public:
+        int nonce; //TODO: int64? IntType(64)
 
     private:
         c2pool::p2p::P2PNode *node;
@@ -131,14 +132,17 @@ namespace c2pool::p2p
         bool connected2 = false;
         std::tuple<std::string, int> addr;                    //TODO
         boost::asio::steady_timer timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
-        //TODO???: remote_tx_hashes = set() # view of peer's known_txs # not actually initially empty, but sending txs instead of tx hashes won't hurt
-        //int remote_remembered_txs_size = 0; //todo: remove?
-
-        //std::map<string, /*TODO*/> remembered_txs = null;                                     ////TODO: type of key+vakue;  view of peer's mining_txs [78]
-        //int = remembered_txs_size = 0 [79] map<string, /*TODO*/> known_txs_cache = null; //TODO: type of key+vakue
-
-        int nonce; //TODO: int64? IntType(64)
     };
+
+
+    class ClientProtocol :  {
+        
+    };
+    
+    class ServerProtocol {
+
+    };
+
 }
 
 #endif //CPOOL_PROTOCOL_H

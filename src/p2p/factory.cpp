@@ -20,7 +20,7 @@ namespace c2pool::p2p
 
     std::string Factory::_host_to_ident(std::string host)
     {
-        vector<string> res;
+        std::vector<std::string> res;
         boost::split(res, host, [](char c) { return c == '.'; });
         if (res.size() == 4)
         {
@@ -71,7 +71,7 @@ namespace c2pool::p2p
 
     void Server::proto_lost_connection(Protocol *proto, boost::exception &reason) //todo: proto
     {
-        string ident = _host_to_ident(proto->getHost());
+        std::string ident = _host_to_ident(proto->getHost());
         if (connections.find(ident) != connections.end())
         {
             connections[ident] -= 1;

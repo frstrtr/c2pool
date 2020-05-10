@@ -27,9 +27,9 @@ namespace c2pool::p2p
 
         //TODO: self.best_share_var = variable.Variable(None)
 
-        Node(Client *_factory /*, bitcoind*/ /*,shares */ /*,known_verified_share_hashes*/);
+        Node(Client *_factory /*, bitcoind, shares, known_verified_share_hashes*/);
 
-        void start(); //coroutine
+        void start(); //TODO: coroutine
 
         void set_best_share();
     };

@@ -20,10 +20,16 @@ namespace c2pool::p2p
     class Factory
     {
     public:
+        
         Factory(c2pool::p2p::P2PNode *_node);
 
         virtual void start() = 0;
+        //TODO: add destructor
         virtual Protocol *buildProtocol(std::string addrs) = 0;
+
+        virtual void proto_connected(Protocol *proto) = 0;
+
+        virtual void proto_disconnected(Protocol *proto, boost::exception &reason) = 0;
 
     protected:
         bool running = false;
@@ -43,25 +49,23 @@ namespace c2pool::p2p
 
         void proto_made_connection(Protocol *proto);
 
-        void proto_lost_connection(Protocol *proto, boost::exception& reason);
+        void proto_lost_connection(Protocol *proto, boost::exception &reason);
 
-        void proto_connected(Protocol *proto);
+        void proto_connected(Protocol *proto) override;
 
-        void proto_disconnected(Protocol *proto, boost::exception& reason);
+        void proto_disconnected(Protocol *proto, boost::exception &reason) override;
 
         void start();
 
         void stop();
 
-        int getListenPort(){ return listen_port; }
-
+        int getListenPort() { return listen_port; }
 
     public:
         std::map<std::string, int> connections; //Список текущих подключений.
     private:
         int max_conns;
         int listen_port; //TODO: type <int>?
-        
     };
 
     class Client : Factory
@@ -73,9 +77,9 @@ namespace c2pool::p2p
 
         void startedConnecting(auto connector);
 
-        void clientConnectionFailed(auto connector, boost::exception& reason); //todo: connector, reason
+        void clientConnectionFailed(auto connector, boost::exception &reason); //todo: connector, reason
 
-        void clientConnectionLost(auto connector, boost::exception& reason); //todo: connector, reason
+        void clientConnectionLost(auto connector, boost::exception &reason); //todo: connector, reason
 
         /*
          * ???
@@ -85,9 +89,9 @@ namespace c2pool::p2p
         pass
          */
 
-        void proto_connected(Protocol *proto);
+        void proto_connected(Protocol *proto) override;
 
-        void proto_disconnected(Protocol *proto, boost::exception& reason);
+        void proto_disconnected(Protocol *proto, boost::exception &reason) override;
 
         void start();
 

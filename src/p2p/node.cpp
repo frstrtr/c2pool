@@ -109,8 +109,8 @@ namespace c2pool::p2p
         //Log::Write('%s peer %s:%i established. p2pool version: %i %r' % ('Incoming connection from' if conn.incoming else 'Outgoing connection to', conn.addr[0], conn.addr[1], conn.other_version, conn.other_sub_version)); //TODO: format str
     }
 
-    void P2PNode::lost_conn(Protocol *conn, boost::exception& reason)
-    { 
+    void P2PNode::lost_conn(Protocol *conn, boost::exception &reason)
+    {
         if (peers.count(conn->nonce) == 0)
         {
             //TODO: raise ValueError('''don't have peer''')
@@ -121,7 +121,6 @@ namespace c2pool::p2p
         }
         peers.erase(conn->nonce);
         delete conn; //TODO: remove or change??
-
 
         //TODO: printf()
         //Log::Write('Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage()))
