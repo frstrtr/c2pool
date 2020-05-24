@@ -1,183 +1,186 @@
 #ifndef CPOOL_FACTORY_H
 #define CPOOL_FACTORY_H
 
-#include "boost/asio.hpp"
-#include <vector>
-#include <algorithm>
-#include <map>
-#include <boost/algorithm/string.hpp>
-#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
+// #include "boost/asio.hpp"
+// #include <vector>
+// #include <algorithm>
+// #include <map>
+// #include <boost/algorithm/string.hpp>
+// #include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 
-namespace c2pool::p2p
+#include <cstdlib>
+#include <iostream>
+#include <thread>
+#include <boost/asio.hpp>
+#include <deque>
+#include <list>
+#include <memory>
+#include <set>
+#include <utility>
+
+#include "Protocol.h"
+
+using boost::asio::ip::tcp;
+
+class Node;
+class Protocol;
+class ClientProtocol;
+class ServerProtocol;
+
+namespace c2pool::messages
 {
-    class P2PNode;
-    class Protocol;
-} // namespace c2pool::p2p
+    class message;
+}
 
+//____________________________________________________________________
 namespace c2pool::p2p
 {
     class Factory
     {
     public:
-        Factory(boost::asio::io_context &context) : io_context(context)
-        {
-        }
+        Factory(boost::asio::io_context &context);
+
+    public:
+        boost::asio::io_context &io_context;
 
     protected:
-        boost::asio::io_context &io_context;
         Node *node;
         std::list<Protocol *> conns; //todo: shared_ptr
     };
 
-    class Client : Factory
+    class Client : public Factory
     {
     public:
-        Client(boost::asio::io_context &io_context_, int _desired_conns, int _max_attempts) : resolver(io_context_), Factory(io_context_)
-        {
-            desired_conns = _desired_conns;
-            max_attempts = _max_attempts;
-        }
+        Client(boost::asio::io_context &io_context_, int _desired_conns, int _max_attempts);
+
+        //todo: void -> bool
+        void connect(std::string ip, std::string port);
 
     protected:
         tcp::resolver resolver;
+
         int desired_conns, max_attempts;
     };
 
     class Server : public Factory
     {
     public:
-        Server(boost::asio::io_context &io_context_,
-               const tcp::endpoint &endpoint, int _max_conns)
-            : acceptor_(io_context, endpoint), Factory(io_context_)
-        {
-            max_conns = _max_conns;
-            accept();
-        }
+        Server(boost::asio::io_context &io_context_, const tcp::endpoint &endpoint, int _max_conns);
 
-        void accept()
-        {
-            acceptor_.async_accept(
-                [this](boost::system::error_code ec, tcp::socket socket) {
-                    if (!ec)
-                    {
-                        auto p = std::make_shared<ServerProtocol>(std::move(socket));
-                        conns.push_back(p.get());
-                    }
-
-                    accept();
-                });
-        }
+        void accept();
 
     protected:
         boost::asio::ip::tcp::acceptor acceptor_;
         int max_conns;
     };
+} // namespace c2pool::p2p
 
-    // class Factory
-    // {
-    // public:
 
-    //     Factory(c2pool::p2p::P2PNode *_node);
+// class Factory
+// {
+// public:
 
-    //     virtual void start() = 0;
-    //     //TODO: add destructor
-    //     virtual Protocol *buildProtocol(std::string addrs) = 0;
+//     Factory(c2pool::p2p::P2PNode *_node);
 
-    //     virtual void proto_connected(Protocol *proto) = 0;
+//     virtual void start() = 0;
+//     //TODO: add destructor
+//     virtual Protocol *buildProtocol(std::string addrs) = 0;
 
-    //     virtual void proto_disconnected(Protocol *proto, boost::exception &reason) = 0;
+//     virtual void proto_connected(Protocol *proto) = 0;
 
-    // protected:
-    //     bool running = false;
-    //     c2pool::p2p::P2PNode *node;
+//     virtual void proto_disconnected(Protocol *proto, boost::exception &reason) = 0;
 
-    //     //argument host = just ip, without port
-    //     //return <string>: {1}+{2} from ip: {1}.{2}.{3}.{4}
-    //     std::string _host_to_ident(std::string host);
-    // };
+// protected:
+//     bool running = false;
+//     c2pool::p2p::P2PNode *node;
 
-    // class Server : public Factory
-    // {
-    // public:
-    //     Server(c2pool::p2p::P2PNode *_node, int _max_conns);
+//     //argument host = just ip, without port
+//     //return <string>: {1}+{2} from ip: {1}.{2}.{3}.{4}
+//     std::string _host_to_ident(std::string host);
+// };
 
-    //     Protocol *buildProtocol(std::string addrs);
+// class Server : public Factory
+// {
+// public:
+//     Server(c2pool::p2p::P2PNode *_node, int _max_conns);
 
-    //     void proto_made_connection(Protocol *proto);
+//     Protocol *buildProtocol(std::string addrs);
 
-    //     void proto_lost_connection(Protocol *proto, boost::exception &reason);
+//     void proto_made_connection(Protocol *proto);
 
-    //     void proto_connected(Protocol *proto) override;
+//     void proto_lost_connection(Protocol *proto, boost::exception &reason);
 
-    //     void proto_disconnected(Protocol *proto, boost::exception &reason) override;
+//     void proto_connected(Protocol *proto) override;
 
-    //     void start();
+//     void proto_disconnected(Protocol *proto, boost::exception &reason) override;
 
-    //     void stop();
+//     void start();
 
-    //     int getListenPort() { return listen_port; }
+//     void stop();
 
-    // public:
-    //     std::map<std::string, int> connections; //Список текущих подключений.
-    // private:
-    //     int max_conns;
-    //     int listen_port; //TODO: type <int>?
-    // };
+//     int getListenPort() { return listen_port; }
 
-    // class Client : Factory
-    // {
-    // public:
-    //     Client(c2pool::p2p::P2PNode *node, int _desired_conns, int _max_attempts);
+// public:
+//     std::map<std::string, int> connections; //Список текущих подключений.
+// private:
+//     int max_conns;
+//     int listen_port; //TODO: type <int>?
+// };
 
-    //     Protocol *buildProtocol(std::string addrs);
+// class Client : Factory
+// {
+// public:
+//     Client(c2pool::p2p::P2PNode *node, int _desired_conns, int _max_attempts);
 
-    //     void startedConnecting(auto connector);
+//     Protocol *buildProtocol(std::string addrs);
 
-    //     void clientConnectionFailed(auto connector, boost::exception &reason); //todo: connector, reason
+//     void startedConnecting(auto connector);
 
-    //     void clientConnectionLost(auto connector, boost::exception &reason); //todo: connector, reason
+//     void clientConnectionFailed(auto connector, boost::exception &reason); //todo: connector, reason
 
-    //     /*
-    //      * ???
-    //      * def proto_made_connection(self, proto):
-    //     pass
-    // def proto_lost_connection(self, proto, reason):
-    //     pass
-    //      */
+//     void clientConnectionLost(auto connector, boost::exception &reason); //todo: connector, reason
 
-    //     void proto_connected(Protocol *proto) override;
+//     /*
+//      * ???
+//      * def proto_made_connection(self, proto):
+//     pass
+// def proto_lost_connection(self, proto, reason):
+//     pass
+//      */
 
-    //     void proto_disconnected(Protocol *proto, boost::exception &reason) override;
+//     void proto_connected(Protocol *proto) override;
 
-    //     void start();
+//     void proto_disconnected(Protocol *proto, boost::exception &reason) override;
 
-    //     void stop();
+//     void start();
 
-    //     /* todo:???
-    //      def _think(self):
-    //     try:
-    //         if len(self.conns) < self.desired_conns and len(self.attempts) < self.max_attempts and self.node.addr_store:
-    //             (host, port), = self.node.get_good_peers(1)
+//     void stop();
 
-    //             if self._host_to_ident(host) in self.attempts:
-    //                 pass
-    //             elif host in self.node.bans and self.node.bans[host] > time.time():
-    //                 pass
-    //             else:
-    //                 #print 'Trying to connect to', host, port
-    //                 reactor.connectTCP(host, port, self, timeout=5)
-    //     except:
-    //         log.err()
+//     /* todo:???
+//      def _think(self):
+//     try:
+//         if len(self.conns) < self.desired_conns and len(self.attempts) < self.max_attempts and self.node.addr_store:
+//             (host, port), = self.node.get_good_peers(1)
 
-    //     return random.expovariate(1/1)
-    //      */
+//             if self._host_to_ident(host) in self.attempts:
+//                 pass
+//             elif host in self.node.bans and self.node.bans[host] > time.time():
+//                 pass
+//             else:
+//                 #print 'Trying to connect to', host, port
+//                 reactor.connectTCP(host, port, self, timeout=5)
+//     except:
+//         log.err()
 
-    // private:
-    //     std::vector<boost::asio::ip::tcp::endpoint> connections; //Список текущих подключений.
-    //     std::vector<std::string> attempts;
-    //     int desired_conns;
-    //     int max_attempts;
-    // };
+//     return random.expovariate(1/1)
+//      */
+
+// private:
+//     std::vector<boost::asio::ip::tcp::endpoint> connections; //Список текущих подключений.
+//     std::vector<std::string> attempts;
+//     int desired_conns;
+//     int max_attempts;
+// };
 } // namespace c2pool::p2p
 
 #endif //CPOOL_FACTORY_H

@@ -18,40 +18,39 @@
 // #include "converter.cpp"
 // #include "other.h"
 
+#include <cstdlib>
+#include <iostream>
+#include <thread>
+#include <boost/asio.hpp>
+#include <deque>
+#include <list>
+#include <memory>
+#include <set>
+#include <utility>
+using boost::asio::ip::tcp;
+
+//-----------------------------------------------------------
+
+class Node;
+class Factory;
 namespace c2pool::messages
 {
     class message;
 }
-
+//-----------------------------------------------------------
 namespace c2pool::p2p
 {
-    class Factory;
-}
-
-namespace c2pool::p2p
-{
-
     class Protocol
     {
     public:
-        Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
-        {
-            factory = _factory;
-        }
+        Protocol(boost::asio::ip::tcp::socket _socket, Factory *_factory);
 
     protected:
         //py: dataReceived(self, data)
-        virtual void handlePacket() = 0;
-        virtual void sendPacket(c2pool::messages::message *payload) = 0;
-        virtual void connectionMade() = 0;
-        virtual void disconnect()
-        {
-            //TODO: disconnect socket
-            /*
-        boost::system::error_code ignored_error;
-        socket_.close(ignored_error);
-        */
-        }
+        //virtual void handlePacket() = 0;
+        //virtual void sendPacket(c2pool::messages::message *payload) = 0;
+        //virtual void connectionMade() = 0;
+        virtual void disconnect();
 
         //TODO: Friend class: Message for handle_<command>
     protected:
@@ -59,125 +58,128 @@ namespace c2pool::p2p
         boost::asio::ip::tcp::socket socket;
         long max_payload_length;
         Node *node;
-        c2pool::p2p::Factory *factory;
+        Factory *factory;
     };
 
     class ClientProtocol : public Protocol
     {
+    public:
+        ClientProtocol(boost::asio::ip::tcp::socket _socket, Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints);
+
+        void do_connect(const boost::asio::ip::tcp::resolver::results_type endpoint);
     };
 
     class ServerProtocol : public Protocol
     {
-        ServerProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : Protocol(std::move(_socket), _factory)
-        {
-        }
+    public:
+        ServerProtocol(boost::asio::ip::tcp::socket _socket, Factory *_factory);
+
+        void start();
     };
-
-    //________________________________OLD___________________________________
-    // class BaseProtocol
-    // {
-    // public:
-    //     BaseProtocol(boost::asio::io_context &_io, int _version);
-
-    //     BaseProtocol(boost::asio::io_context &_io, int _version, long _max_payload_length);
-
-    //     void sendPacket(c2pool::messages::message *payload2);
-
-    //     ///called, when start connection
-    //     virtual void connectionMade() = 0;
-
-    // protected:
-    //     void disconnect();
-
-    //     void dataReceived(std::string data);
-
-    //     virtual void packetReceived(c2pool::messages::message *msg) = 0;
-
-    // protected:
-    //     const int version;
-    //     Factory *factory;
-    //     boost::asio::ip::tcp::socket socket;
-    //     long max_payload_length;
-    //     boost::asio::streambuf buff;
-
-    //     friend class Factory;
-    // };
-
-    // class Protocol : public BaseProtocol
-    // {
-    // public:
-    //     Protocol(boost::asio::io_context& io);
-
-    //     Protocol(boost::asio::io_context& io, unsigned long _max_payload_length);
-
-    //     //Parse msg for handle in protocol
-    //     c2pool::messages::message *fromStr(std::stringstream ss);
-
-    //     void connectionMade() override;
-
-    //     void packetReceived(c2pool::messages::message *msg) override;
-
-    //     //todo: connect_timeout
-
-    //     void connect_timeout(const boost::system::error_code & /*e*/);
-
-    //     void _timeout(const boost::system::error_code & /*e*/);
-
-    //     void sendAdvertisement();
-
-    //     void setFactory(Factory *_factory)
-    //     {
-    //         factory = _factory;
-    //     }
-
-    //     std::string getHost()
-    //     {
-    //         return ""; //TODO: return ip for host [python ex: _host_to_ident(proto.host)]
-    //     }
-
-    //     boost::asio::io_context& getIOcontext(){
-    //         return socket.get_executor().context(); //TODO
-    //     }
-    // public:
-    //     int nonce; //TODO: int64? IntType(64)
-
-    // protected:
-    //     c2pool::p2p::P2PNode *node;
-
-    //     unsigned int other_version = -1;
-    //     std::string other_sub_version;
-    //     int other_services; //TODO: int64? IntType(64)
-
-    //     bool connected2 = false;
-    //     std::tuple<std::string, int> addr;                    //TODO
-    //     boost::asio::steady_timer timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
-    // };
-
-    // class ClientProtocol : public Protocol{
-    //     void send_version(int ver, int serv, c2pool::messages::address_type to, c2pool::messages::address_type from, long _nonce, std::string sub_ver, int _mode, long best_hash);
-
-    //     void send_addrs(std::vector<c2pool::messages::addr> _addrs);
-
-    //     void send_addrme(int port);
-
-    //     void send_ping();
-
-    //     void send_getaddrs(int _count);
-
-    // };
-
-    // class ServerProtocol : public Protocol {
-    //     void handle_version(int ver, int serv, c2pool::messages::address_type to, c2pool::messages::address_type from, long _nonce, std::string sub_ver, int _mode, long best_hash);
-
-    //     void handle_addrs(std::vector<c2pool::messages::addr> addrs);
-
-    //     void handle_addrme(int port);
-
-    //     void handle_ping(long long _nonce);
-
-    //     void handle_getaddrs(int count);
-    // };
-
 } // namespace c2pool::p2p
+//________________________________OLD___________________________________
+// class BaseProtocol
+// {
+// public:
+//     BaseProtocol(boost::asio::io_context &_io, int _version);
+
+//     BaseProtocol(boost::asio::io_context &_io, int _version, long _max_payload_length);
+
+//     void sendPacket(c2pool::messages::message *payload2);
+
+//     ///called, when start connection
+//     virtual void connectionMade() = 0;
+
+// protected:
+//     void disconnect();
+
+//     void dataReceived(std::string data);
+
+//     virtual void packetReceived(c2pool::messages::message *msg) = 0;
+
+// protected:
+//     const int version;
+//     Factory *factory;
+//     boost::asio::ip::tcp::socket socket;
+//     long max_payload_length;
+//     boost::asio::streambuf buff;
+
+//     friend class Factory;
+// };
+
+// class Protocol : public BaseProtocol
+// {
+// public:
+//     Protocol(boost::asio::io_context& io);
+
+//     Protocol(boost::asio::io_context& io, unsigned long _max_payload_length);
+
+//     //Parse msg for handle in protocol
+//     c2pool::messages::message *fromStr(std::stringstream ss);
+
+//     void connectionMade() override;
+
+//     void packetReceived(c2pool::messages::message *msg) override;
+
+//     //todo: connect_timeout
+
+//     void connect_timeout(const boost::system::error_code & /*e*/);
+
+//     void _timeout(const boost::system::error_code & /*e*/);
+
+//     void sendAdvertisement();
+
+//     void setFactory(Factory *_factory)
+//     {
+//         factory = _factory;
+//     }
+
+//     std::string getHost()
+//     {
+//         return ""; //TODO: return ip for host [python ex: _host_to_ident(proto.host)]
+//     }
+
+//     boost::asio::io_context& getIOcontext(){
+//         return socket.get_executor().context(); //TODO
+//     }
+// public:
+//     int nonce; //TODO: int64? IntType(64)
+
+// protected:
+//     c2pool::p2p::P2PNode *node;
+
+//     unsigned int other_version = -1;
+//     std::string other_sub_version;
+//     int other_services; //TODO: int64? IntType(64)
+
+//     bool connected2 = false;
+//     std::tuple<std::string, int> addr;                    //TODO
+//     boost::asio::steady_timer timeout_delayed; //Таймер для автодисконнекта, если нет никакого ответа в течении работы таймера. Сбрасывается каждый раз, как получает какие-то пакеты.
+// };
+
+// class ClientProtocol : public Protocol{
+//     void send_version(int ver, int serv, c2pool::messages::address_type to, c2pool::messages::address_type from, long _nonce, std::string sub_ver, int _mode, long best_hash);
+
+//     void send_addrs(std::vector<c2pool::messages::addr> _addrs);
+
+//     void send_addrme(int port);
+
+//     void send_ping();
+
+//     void send_getaddrs(int _count);
+
+// };
+
+// class ServerProtocol : public Protocol {
+//     void handle_version(int ver, int serv, c2pool::messages::address_type to, c2pool::messages::address_type from, long _nonce, std::string sub_ver, int _mode, long best_hash);
+
+//     void handle_addrs(std::vector<c2pool::messages::addr> addrs);
+
+//     void handle_addrme(int port);
+
+//     void handle_ping(long long _nonce);
+
+//     void handle_getaddrs(int count);
+// };
 
 #endif //CPOOL_PROTOCOL_H
