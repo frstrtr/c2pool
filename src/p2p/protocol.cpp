@@ -9,13 +9,12 @@
 #include <utility>
 using boost::asio::ip::tcp;
 
-#include "Protocol.h"
-#include "Factory.h"
+#include "protocol.h"
+#include "factory.h"
 
 //-----------------------------------------------------------
 
 class Node;
-class Factory;
 namespace c2pool::messages
 {
     class message;
@@ -24,7 +23,9 @@ namespace c2pool::messages
 
 namespace c2pool::p2p
 {
-    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, Factory *_factory) : socket(std::move(_socket)), version(3301)
+
+    //Protocol
+    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
     {
         factory = _factory;
     }
@@ -34,7 +35,71 @@ namespace c2pool::p2p
         boost::asio::post(factory->io_context, [this]() { socket.close(); });
     }
 
-    ClientProtocol::ClientProtocol(boost::asio::ip::tcp::socket _socket, Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints) : Protocol(std::move(_socket), _factory)
+    //OLD: fromStr
+    void Protocol::handle(std::stringstream ss)
+    {
+        //В Python скрипте, команда передается, как int, эквивалентный c2pool::messages::commands
+        int cmd;
+        ss >> cmd;
+        c2pool::messages::message *res;
+
+        switch (cmd)
+        {
+        case c2pool::messages::commands::cmd_addrs:
+            handle(GenerateMsg<c2pool::messages::message_addrs>(ss));
+            break;
+        case c2pool::messages::commands::cmd_version:
+            handle(GenerateMsg<c2pool::messages::message_version>(ss));
+            break;
+        case c2pool::messages::commands::cmd_ping:
+            handle(GenerateMsg<c2pool::messages::message_ping>(ss));
+            break;
+        case c2pool::messages::commands::cmd_addrme:
+            handle(GenerateMsg<c2pool::messages::message_addrme>(ss));
+            break;
+        case c2pool::messages::commands::cmd_getaddrs:
+            handle(GenerateMsg<c2pool::messages::message_getaddrs>(ss));
+            break;
+        default:
+            handle(GenerateMsg<c2pool::messages::message_error>(ss));
+            break;
+        }
+    }
+
+    template <class MsgType>
+    MsgType *Protocol::GenerateMsg(std::stringstream &ss)
+    {
+        MsgType *msg = new MsgType();
+        msg->unpack(ss);
+        return msg;
+    }
+
+    void Protocol::handle(c2pool::messages::message_version *msg)
+    {
+    }
+
+    void Protocol::handle(c2pool::messages::message_addrs *msg)
+    {
+    }
+
+    void Protocol::handle(c2pool::messages::message_addrme *msg)
+    {
+    }
+
+    void Protocol::handle(c2pool::messages::message_ping *msg)
+    {
+    }
+
+    void Protocol::handle(c2pool::messages::message_getaddrs *msg)
+    {
+    }
+
+    void Protocol::handle(c2pool::messages::message_error *msg)
+    {
+    }
+    //end_Protocol
+
+    ClientProtocol::ClientProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints) : Protocol(std::move(_socket), _factory)
     {
         do_connect(endpoints);
     }
@@ -43,7 +108,7 @@ namespace c2pool::p2p
     {
     }
 
-    ServerProtocol::ServerProtocol(boost::asio::ip::tcp::socket _socket, Factory *_factory) : Protocol(std::move(_socket), _factory)
+    ServerProtocol::ServerProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : Protocol(std::move(_socket), _factory)
     {
         start();
     }
