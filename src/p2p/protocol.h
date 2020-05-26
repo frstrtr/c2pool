@@ -17,7 +17,7 @@
 // #include "log.cpp"
 // #include "converter.cpp"
 // #include "other.h"
-
+#include <sstream>
 #include <cstdlib>
 #include <iostream>
 #include <thread>
@@ -27,12 +27,16 @@
 #include <memory>
 #include <set>
 #include <utility>
+#include "messages.h"
 using boost::asio::ip::tcp;
 
 //-----------------------------------------------------------
 
 class Node;
-class Factory;
+namespace c2pool::p2p
+{
+    class Factory;
+}
 namespace c2pool::messages
 {
     class message;
@@ -43,14 +47,32 @@ namespace c2pool::p2p
     class Protocol
     {
     public:
-        Protocol(boost::asio::ip::tcp::socket _socket, Factory *_factory);
+        Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory);
+
+        //OLD: fromStr
+        virtual void handle(std::stringstream ss);
 
     protected:
         //py: dataReceived(self, data)
         //virtual void handlePacket() = 0;
         //virtual void sendPacket(c2pool::messages::message *payload) = 0;
         //virtual void connectionMade() = 0;
-        virtual void disconnect();
+        virtual void disconnect() = 0;
+
+        template <class MsgType>
+        MsgType *GenerateMsg(std::stringstream &ss);
+
+        virtual void handle(c2pool::messages::message_version *msg);
+
+        virtual void handle(c2pool::messages::message_addrs *msg);
+
+        virtual void handle(c2pool::messages::message_addrme *msg);
+
+        virtual void handle(c2pool::messages::message_ping *msg);
+
+        virtual void handle(c2pool::messages::message_getaddrs *msg);
+
+        virtual void handle(c2pool::messages::message_error *msg);
 
         //TODO: Friend class: Message for handle_<command>
     protected:
@@ -58,13 +80,13 @@ namespace c2pool::p2p
         boost::asio::ip::tcp::socket socket;
         long max_payload_length;
         Node *node;
-        Factory *factory;
+        c2pool::p2p::Factory *factory;
     };
 
     class ClientProtocol : public Protocol
     {
     public:
-        ClientProtocol(boost::asio::ip::tcp::socket _socket, Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints);
+        ClientProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints);
 
         void do_connect(const boost::asio::ip::tcp::resolver::results_type endpoint);
     };
@@ -72,7 +94,7 @@ namespace c2pool::p2p
     class ServerProtocol : public Protocol
     {
     public:
-        ServerProtocol(boost::asio::ip::tcp::socket _socket, Factory *_factory);
+        ServerProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory);
 
         void start();
     };

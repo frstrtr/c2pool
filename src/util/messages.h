@@ -40,7 +40,6 @@ namespace c2pool::messages
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual string _pack() = 0;
-        virtual void handle(p2p::Protocol *protocol) = 0;
     };
 
     class message_error : public message
@@ -49,8 +48,6 @@ namespace c2pool::messages
         void _unpack(std::stringstream &ss) override; //TODO
 
         std::string _pack() override; //TODO
-
-        void handle(p2p::Protocol *protocol) override; //TODO
 
         message_error() : message("error") {}
     };
@@ -75,8 +72,6 @@ namespace c2pool::messages
         void _unpack(std::stringstream &ss) override;
 
         std::string _pack() override;
-
-        void handle(p2p::Protocol *protocol) override;
 
         //= pack.ComposedType([
         //     ('version', pack.IntType(32)),
@@ -104,16 +99,9 @@ namespace c2pool::messages
         message_ping() : message("ping") {}
         // message_ping(const std::string cmd = "ping") : message(cmd) {}
 
-        message_ping() : message("ping")//todo:Empty var list
-        {
-
-        }
-
-        void _unpack(stringstream &ss) override;
+        void _unpack(std::stringstream &ss) override;
 
         std::string _pack() override;
-
-        void handle(p2p::Protocol *protocol) override;
 
         // message_ping = pack.ComposedType([])
         //todo Empty list
@@ -122,7 +110,7 @@ namespace c2pool::messages
     class message_addrme : public message
     {
     public:
-        message_addrme() : message('addrme') {}
+        message_addrme() : message("addrme") {}
         // message_addrme(int _port, const string cmd = "addrme") : message(cmd)
         // {
         //     port = _port;
@@ -135,8 +123,6 @@ namespace c2pool::messages
         void _unpack(stringstream &ss) override;
 
         string _pack() override;
-
-        void handle(p2p::Protocol *protocol) override;
 
         //= pack.ComposedType([
         //    ('port', pack.IntType(16)),
@@ -152,7 +138,7 @@ namespace c2pool::messages
         // {
         //     count = cnt;
         // }
-        message_getaddrs(int cnt)
+        message_getaddrs(int cnt) : message("getaddrs")
         {
             count = cnt;
         }
@@ -160,8 +146,6 @@ namespace c2pool::messages
         void _unpack(stringstream &ss) override;
 
         string _pack() override;
-
-        void handle(p2p::Protocol *protocol) override;
 
         //     = pack.ComposedType([
         //     ('count', pack.IntType(32)),
@@ -184,8 +168,6 @@ namespace c2pool::messages
         void _unpack(stringstream &ss) override;
 
         string _pack() override;
-
-        void handle(p2p::Protocol *protocol) override;
     };
 
     //__________________________

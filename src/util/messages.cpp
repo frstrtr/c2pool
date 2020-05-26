@@ -50,11 +50,6 @@ namespace c2pool::messages
         return ct.read();
     }
 
-    void message_version::handle(p2p::Protocol *protocol)
-    {
-        protocol->handle_version(version, services, addr_to, addr_from, nonce, sub_version, mode, best_share_hash);
-    }
-
     //message_ping
 
     void message_ping::_unpack(std::stringstream &ss)
@@ -67,11 +62,6 @@ namespace c2pool::messages
         c2pool::pack::ComposedType ct;
         ct.add(command);
         return ct.read();
-    }
-
-    void message_ping::handle(p2p::Protocol *protocol)
-    {
-        protocol->handle_ping(/*todo:Empty variables list*/);//todo:Empty variables list
     }
 
     //message_addrme
@@ -88,11 +78,6 @@ namespace c2pool::messages
         return ct.read();
     }
 
-    void message_addrme::handle(p2p::Protocol *protocol)
-    {
-        protocol->handle_addrme(port);
-    }
-
     //message_getaddrs
 
     void message_getaddrs::_unpack(std::stringstream &ss)
@@ -105,11 +90,6 @@ namespace c2pool::messages
         c2pool::pack::ComposedType ct;
         ct.add(count);
         return ct.read();
-    }
-
-    void message_getaddrs::handle(p2p::Protocol *protocol)
-    {
-        protocol->handle_getaddrs(count);
     }
 
     //message_addrs
@@ -132,11 +112,6 @@ namespace c2pool::messages
         c2pool::pack::ComposedType ct;
         ct.add(addrs);
         return ct.read();
-    }
-
-    void message_addrs::handle(p2p::Protocol *protocol)
-    {
-        protocol->handle_addrs(addrs);
     }
 
 } // namespace c2pool::messages
