@@ -3,8 +3,6 @@ project(util)
 find_package(Python REQUIRED Development) #[[Libs]] #cmake --help-module FindPython
 message("
     Python_INCLUDE_DIRS=${Python_INCLUDE_DIRS}
-    Python_INCLUDE_DIR=${Python_INCLUDE_DIR}
-    Python_ROOT_DIR=${Python_ROOT_DIR}
 ")
 
 
