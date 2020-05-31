@@ -53,6 +53,16 @@ namespace c2pool::p2p
         virtual void handle(std::stringstream ss);
 
     protected:
+
+        //used for write message
+        virtual void write(char* msg, size_t length);
+
+        //get body length
+        virtual void read_header(c2pool::messages::IMessageReader& msg);
+
+        //receive message with length from read_header()
+        virtual void read_body();
+        
         //py: dataReceived(self, data)
         //virtual void handlePacket() = 0;
         //virtual void sendPacket(c2pool::messages::message *payload) = 0;
@@ -77,6 +87,11 @@ namespace c2pool::p2p
         //TODO: Friend class: Message for handle_<command>
     protected:
         const int version;
+
+        unsigned int other_version = -1;
+        std::string other_sub_version;
+        int other_services; //TODO: int64? IntType(64)
+
         boost::asio::ip::tcp::socket socket;
         long max_payload_length;
         Node *node;

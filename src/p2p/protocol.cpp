@@ -30,6 +30,42 @@ namespace c2pool::p2p
         factory = _factory;
     }
 
+    //msg.data(), msg.length()
+    void Protocol::write(char *msg, size_t length)
+    {
+        boost::asio::async_write(socket,
+                                 boost::asio::buffer(msg, length),
+                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
+                                     if (!ec)
+                                     {
+                                     }
+                                     else
+                                     {
+                                         disconnect();
+                                     }
+                                 });
+    }
+
+    void Protocol::read_header(c2pool::messages::IMessageReader& msg)
+    {
+        boost::asio::async_read(socket,
+                            boost::asio::buffer(read_msg_.data(), 12/*todo:header_length*/),
+                            [this](boost::system::error_code ec, std::size_t /*length*/) {
+                              if (!ec && read_msg_.decode_header())
+                              {
+                                do_read_body();
+                              }
+                              else
+                              {
+                                socket_.close();
+                              }
+                            });
+    }
+
+    void Protocol::read_body()
+    {
+    }
+
     void Protocol::disconnect()
     {
         boost::asio::post(factory->io_context, [this]() { socket.close(); });

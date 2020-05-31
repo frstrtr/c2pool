@@ -18,15 +18,15 @@
 #include <set>
 #include <utility>
 
-#include "Protocol.h"
-
 using boost::asio::ip::tcp;
 
 class Node;
-class Protocol;
-class ClientProtocol;
-class ServerProtocol;
-
+namespace c2pool::p2p
+{
+    class Protocol;
+    class ClientProtocol;
+    class ServerProtocol;
+} 
 namespace c2pool::messages
 {
     class message;
@@ -74,7 +74,6 @@ namespace c2pool::p2p
         int max_conns;
     };
 } // namespace c2pool::p2p
-
 
 // class Factory
 // {
@@ -181,6 +180,6 @@ namespace c2pool::p2p
 //     int desired_conns;
 //     int max_attempts;
 // };
-} // namespace c2pool::p2p
+//} // namespace c2pool::p2p
 
 #endif //CPOOL_FACTORY_H

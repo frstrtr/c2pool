@@ -13,18 +13,11 @@ using boost::asio::ip::tcp;
 #include "factory.h"
 
 class Node;
-class Protocol;
-class ClientProtocol;
-class ServerProtocol;
-
-namespace c2pool::messages //TODO
-{
-    class message;
-}
 
 //____________________________________________________________________
 namespace c2pool::p2p
 {
+    //--------------------------Factory
     Factory::Factory(boost::asio::io_context &context) : io_context(context)
     {
     }

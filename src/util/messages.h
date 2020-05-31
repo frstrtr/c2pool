@@ -27,16 +27,34 @@ namespace c2pool::messages
         cmd_addrme
     };
 
-    class message
+    class IMessageReader
+    {
+    public:
+        virtual char *data() = 0;
+
+        virtual std::size_t length() = 0;
+    };
+
+    class message : public IMessageReader
     {
     public:
         const std::string command;
 
-        message(std::string cmd) : command(cmd){}
+        message(std::string cmd) : command(cmd) {}
 
         void unpack(std::string item);
-        void unpack(std::stringstream& ss);
+        void unpack(std::stringstream &ss);
         string pack();
+
+        char *data() override
+        {
+            //TODO:
+        }
+
+        std::size_t length() override
+        {
+            //TODO:
+        }
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual string _pack() = 0;
@@ -117,7 +135,7 @@ namespace c2pool::messages
         // }
         message_addrme(int prt) : message("addrme")
         {
-            port=prt;
+            port = prt;
         }
 
         void _unpack(stringstream &ss) override;
@@ -158,7 +176,7 @@ namespace c2pool::messages
     public:
         vector<addr> addrs;
 
-        message_addrs():message("addrs") {}
+        message_addrs() : message("addrs") {}
 
         message_addrs(vector<addr> _addrs) : message("addrs")
         {
