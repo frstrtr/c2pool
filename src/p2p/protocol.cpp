@@ -46,24 +46,38 @@ namespace c2pool::p2p
                                  });
     }
 
-    void Protocol::read_header(c2pool::messages::IMessageReader& msg)
+    void Protocol::read_header(c2pool::messages::IMessageReader &msg)
     {
         boost::asio::async_read(socket,
-                            boost::asio::buffer(read_msg_.data(), 12/*todo:header_length*/),
-                            [this](boost::system::error_code ec, std::size_t /*length*/) {
-                              if (!ec && read_msg_.decode_header())
-                              {
-                                do_read_body();
-                              }
-                              else
-                              {
-                                socket_.close();
-                              }
-                            });
+                                boost::asio::buffer(msg.data(), 12 /*todo:header_length*/),
+                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) { //TODO: check: &msg in lambda
+                                    if (!ec && msg.decode_header())
+                                    {
+                                        read_body();
+                                    }
+                                    else
+                                    {
+                                        disconnect();
+                                    }
+                                });
     }
 
     void Protocol::read_body()
     {
+        boost::asio::async_read(socket,
+                                boost::asio::buffer(msg.data(), read_msg_.body_length()),
+                                [this](boost::system::error_code ec, std::size_t /*length*/) {
+                                    if (!ec)
+                                    {
+                                        std::cout.write(read_msg_.body(), read_msg_.body_length());
+                                        std::cout << "\n";
+                                        do_read_header();
+                                    }
+                                    else
+                                    {
+                                        socket_.close();
+                                    }
+                                });
     }
 
     void Protocol::disconnect()

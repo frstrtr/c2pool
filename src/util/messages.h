@@ -29,10 +29,35 @@ namespace c2pool::messages
 
     class IMessageReader
     {
+        enum
+        {
+            header_length = 12
+        };
+        enum
+        {
+            max_body_length = 800
+        };
+
     public:
         virtual char *data() = 0;
 
         virtual std::size_t length() = 0;
+
+        virtual bool decode_header()
+        {
+            char header[header_length + 1] = "";
+            std::strncat(header, data_, header_length);
+            body_length_ = std::atoi(header);
+            if (body_length_ > max_body_length)
+            {
+                body_length_ = 0;
+                return false;
+            }
+            return true;
+        };
+
+        char data_[header_length + max_body_length];
+        std::size_t body_length_;
     };
 
     class message : public IMessageReader
