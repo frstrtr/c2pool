@@ -3,6 +3,7 @@ import binascii
 import struct
 import io as StringIO
 from io import BytesIO
+import hashlib #remove
 import os
 
 
@@ -955,7 +956,23 @@ def message_pack(command, vars):
 
 def message_unpack(command, data):
     pass
+ 
+def Receive(msg):
+    command, checksum, payload = msg.split(' ')
+    
+    #remove
+    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+        return '-1'
+    #------------
 
+
+    type_ = EnumMessages[int(command)]
+    if type_ is None:
+        return '-2'
+    
+    return type_.unpack(payload)
+
+    #self.packetReceived(command, type_.unpack(payload, self.ignore_trailing_payload))
 
 # ------------------------------------------TESTS------------------------------------------
 def TEST_PACK_UNPACK():
