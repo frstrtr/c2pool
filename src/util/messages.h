@@ -29,19 +29,43 @@ namespace c2pool::messages
 
     class IMessageReader
     {
+    protected:
         enum
         {
-            header_length = 12
+            command_length = 12
         };
         enum
         {
-            max_body_length = 800
+            payload_length = 4 //len(payload)
+        };
+        enum
+        {
+            checksum_length = 4 //sha256(sha256(payload))[:4]
+        };
+        enum
+        {
+            max_body_length = 8000000
         };
 
     public:
-        virtual char *data() = 0;
+        IMessageReader() {}
 
-        virtual std::size_t length() = 0;
+        IMessageReader(IMessageReader &msgData);
+
+        const char *data() const
+        {
+            return data_;
+        }
+
+        char *data()
+        {
+            return data_;
+        }
+
+        std::size_t length() const
+        {
+            return header_length + body_length_;
+        }
 
         virtual bool decode_header()
         {
@@ -56,8 +80,19 @@ namespace c2pool::messages
             return true;
         };
 
-        char data_[header_length + max_body_length];
+    protected:
+        char data[command_length + payload_length + checksum_length + max_body_length];
         std::size_t body_length_;
+    };
+
+    class raw_message : public IMessageReader
+    {
+        //info = command + payload_length + checksum
+        //data = payload
+        char command[command_length];
+        char header[payload_length];
+        char checksum[checksum_length];
+        char payload[max_body_length]
     };
 
     class message : public IMessageReader

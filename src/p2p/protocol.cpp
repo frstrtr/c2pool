@@ -71,11 +71,11 @@ namespace c2pool::p2p
                                     {
                                         std::cout.write(read_msg_.body(), read_msg_.body_length());
                                         std::cout << "\n";
-                                        do_read_header();
+                                        read_header();
                                     }
                                     else
                                     {
-                                        socket_.close();
+                                        socket.close();
                                     }
                                 });
     }

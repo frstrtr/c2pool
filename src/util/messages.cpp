@@ -5,10 +5,17 @@
 #include "pack.h"
 #include <sstream>
 #include <string>
+#include <cstring>
 using namespace c2pool::messages;
 
 namespace c2pool::messages
 {
+    //IMessageReader
+
+    IMessageReader::IMessageReader(IMessageReader& msgData){
+        strcpy(data_, msgData.data_);
+    }
+
     //message
 
     void message::unpack(std::string item)
