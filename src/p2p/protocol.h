@@ -44,7 +44,7 @@ namespace c2pool::messages
 //-----------------------------------------------------------
 namespace c2pool::p2p
 {
-    class Protocol
+    class Protocol : public std::enable_shared_from_this<Protocol>
     {
     public:
         Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory);
@@ -57,11 +57,15 @@ namespace c2pool::p2p
         //used for write message
         virtual void write(char* msg, size_t length);
 
-        //get body length
-        virtual void read_header(c2pool::messages::IMessageReader& msg);
+        void read_prefix();
 
-        //receive message with length from read_header()
-        virtual void read_body();
+        void read_command();
+
+        void read_length();
+
+        void read_checksum();
+
+        void read_payload();
         
         //py: dataReceived(self, data)
         //virtual void handlePacket() = 0;

@@ -27,7 +27,7 @@ namespace c2pool::messages
         cmd_addrme
     };
 
-    class IMessageReader
+    /*class IMessage
     {
     protected:
         enum
@@ -48,9 +48,9 @@ namespace c2pool::messages
         };
 
     public:
-        IMessageReader() {}
+        IMessage() {}
 
-        IMessageReader(IMessageReader &msgData);
+        IMessage(IMessage &msgData);
 
         const char *data() const
         {
@@ -83,19 +83,60 @@ namespace c2pool::messages
     protected:
         char data[command_length + payload_length + checksum_length + max_body_length];
         std::size_t body_length_;
+    }; */
+
+    class IMessage
+    {
+    public:
+        enum
+        {
+            command_length = 12
+        };
+        enum
+        {
+            payload_length = 4 //len(payload)
+        };
+        enum
+        {
+            checksum_length = 32 //sha256(sha256(payload))[:4]
+        };
+        enum
+        {
+            max_payload_length = 8000000 //max len payload
+        };
+
+    private:
+        char command[command_length + 1];
+        char length[payload_length + 1];
+        char checksum[checksum_length + 1];
+        char payload[max_payload_length + 1];
+        char data[command_length + payload_length + checksum_length + max_payload_length]; //full message without prefix
+    public:
+        IMessage() {}
+
+        IMessage(char* data_){
+            
+        }
+
+        IMessage(IMessage &msgData);
+
+        //from data to command, length, checksum, payload
+        void encode_data();
+
+        //from command, length, checksum, payload to data
+        void decode_data();
     };
 
-    class raw_message : public IMessageReader
+    class raw_message : public IMessage
     {
         //info = command + payload_length + checksum
-        //data = payload
         char command[command_length];
         char header[payload_length];
         char checksum[checksum_length];
         char payload[max_body_length]
     };
 
-    class message : public IMessageReader
+    class message : public IMessage
     {
     public:
         const std::string command;

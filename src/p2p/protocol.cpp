@@ -46,14 +46,15 @@ namespace c2pool::p2p
                                  });
     }
 
-    void Protocol::read_header(c2pool::messages::IMessageReader &msg)
+    void Protocol::read_prefix()
     {
+        c2pool::messages::IMessage *msg = new c2pool::messages::IMessage();
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg.data(), 12 /*todo:header_length*/),
-                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) { //TODO: check: &msg in lambda
-                                    if (!ec && msg.decode_header())
+                                boost::asio::buffer(msg->prefix, /*todo:prefix_length*/),
+                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                    if (!ec /*&& <сравнение размеров prefix>*/)
                                     {
-                                        read_body();
+                                        read_command();
                                     }
                                     else
                                     {
@@ -62,20 +63,66 @@ namespace c2pool::p2p
                                 });
     }
 
-    void Protocol::read_body()
+    void Protocol::read_command()
     {
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg.data(), read_msg_.body_length()),
-                                [this](boost::system::error_code ec, std::size_t /*length*/) {
+                                boost::asio::buffer(msg->command, msg->command_length),
+                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        std::cout.write(read_msg_.body(), read_msg_.body_length());
-                                        std::cout << "\n";
-                                        read_header();
+                                        read_length();
                                     }
                                     else
                                     {
-                                        socket.close();
+                                        disconnect();
+                                    }
+                                });
+    }
+
+    void read_length()
+    {
+        boost::asio::async_read(socket,
+                                boost::asio::buffer(msg->length, msg->payload_length),
+                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                    if (!ec)
+                                    {
+                                        read_checksum();
+                                    }
+                                    else
+                                    {
+                                        disconnect();
+                                    }
+                                });
+    }
+
+    void Protocol::read_checksum()
+    {
+        boost::asio::async_read(socket,
+                                boost::asio::buffer(msg->checksum, msg->checksum_length),
+                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                    if (!ec)
+                                    {
+                                        read_checksum();
+                                    }
+                                    else
+                                    {
+                                        disconnect();
+                                    }
+                                });
+    }
+
+    void Protocol::read_payload()
+    {
+        boost::asio::async_read(socket,
+                                boost::asio::buffer(msg->payload, msg->length),
+                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                    if (!ec)
+                                    {
+                                        read_prefix();
+                                    }
+                                    else
+                                    {
+                                        disconnect();
                                     }
                                 });
     }
@@ -93,7 +140,7 @@ namespace c2pool::p2p
         ss >> cmd;
         c2pool::messages::message *res;
 
-        switch (cmd)
+        switch (cmd) //todo: switch -> if (" " == cmd)
         {
         case c2pool::messages::commands::cmd_addrs:
             handle(GenerateMsg<c2pool::messages::message_addrs>(ss));
@@ -165,9 +212,7 @@ namespace c2pool::p2p
 
     void ServerProtocol::start()
     {
-        boost::asio::async_write(socket, boost::asio::buffer("TEST DATA", 9), [](const boost::system::error_code &error, std::size_t bytes_transferred) {
-
-        });
+        read_prefix();
     }
 } // namespace c2pool::p2p
 
