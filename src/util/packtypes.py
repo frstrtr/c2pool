@@ -970,7 +970,7 @@ def Receive(msg):
     if type_ is None:
         return '-2'
     
-    return type_.unpack(payload)
+    return type_.unpack(payload) #todo: payload wanna bytes.
 
     #self.packetReceived(command, type_.unpack(payload, self.ignore_trailing_payload))
 

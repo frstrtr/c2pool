@@ -3,6 +3,7 @@
 #include <iostream>
 #include "types.h"
 #include "pack.h"
+#include "other.h"
 #include <sstream>
 #include <string>
 #include <cstring>
@@ -10,10 +11,24 @@ using namespace c2pool::messages;
 
 namespace c2pool::messages
 {
-    //IMessageReader
+    //IMessage
 
-    IMessageReader::IMessageReader(IMessageReader& msgData){
-        strcpy(data_, msgData.data_);
+    IMessage::IMessage(IMessage &msgData)
+    {
+        strcpy(data, msgData.data);
+    }
+
+    void IMessage::encode_data()
+    {
+        c2pool::str::substr(command, data, 0, command_length);
+        c2pool::str::substr(length, data, command_length, payload_length);
+        c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
+        c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, max_payload_length);
+    }
+
+    void IMessage::decode_data()
+    {
+        sprintf(data, "%s%s%s%s", command, length, checksum, payload);
     }
 
     //message
