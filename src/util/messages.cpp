@@ -13,11 +13,6 @@ namespace c2pool::messages
 {
     //IMessage
 
-    IMessage::IMessage(IMessage &msgData)
-    {
-        strcpy(data, msgData.data);
-    }
-
     void IMessage::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);

@@ -44,3 +44,12 @@ namespace c2pool::time{
         return std::time(nullptr);
     }
 }
+
+namespace c2pool::str
+{
+    void substr(char *dest, char *source, int from, int length)
+    {
+        strncpy(dest, source + from, length);
+        dest[length] = 0;
+    }
+} // namespace c2pool::str

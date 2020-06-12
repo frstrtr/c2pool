@@ -97,9 +97,10 @@ namespace c2pool::p2p
         int other_services; //TODO: int64? IntType(64)
 
         boost::asio::ip::tcp::socket socket;
-        long max_payload_length;
         Node *node;
         c2pool::p2p::Factory *factory;
+
+        unique_ptr<c2pool::messages::IMessage> tempMessage 
     };
 
     class ClientProtocol : public Protocol

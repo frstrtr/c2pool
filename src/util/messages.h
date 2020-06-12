@@ -88,6 +88,7 @@ namespace c2pool::messages
     class IMessage
     {
     public:
+        //TODO: enum -> macros in config file
         enum
         {
             command_length = 12
@@ -106,6 +107,13 @@ namespace c2pool::messages
         };
 
     private:
+        //TODO: add getter/setter for all fields
+        char *prefix;
+        size_t _prefix_length;
+        const size_t prefix_length() const
+        {
+            return _prefix_length;
+        }
         char command[command_length + 1];
         char length[payload_length + 1];
         char checksum[checksum_length + 1];
@@ -114,26 +122,21 @@ namespace c2pool::messages
     public:
         IMessage() {}
 
-        IMessage(char* data_){
-            
+        IMessage(const char *current_prefix)
+        {
+            _prefix_length = strlen(current_prefix);
+            prefix = new char[prefix_length()];
         }
 
-        IMessage(IMessage &msgData);
+        IMessage(char *data_)
+        {
+        }
 
         //from data to command, length, checksum, payload
         void encode_data();
 
         //from command, length, checksum, payload to data
         void decode_data();
-    };
-
-    class raw_message : public IMessage
-    {
-        //info = command + payload_length + checksum
-        char command[command_length];
-        char header[payload_length];
-        char checksum[checksum_length];
-        char payload[max_body_length]
     };
 
     class message : public IMessage
