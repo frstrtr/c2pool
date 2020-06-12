@@ -48,10 +48,10 @@ namespace c2pool::p2p
 
     void Protocol::read_prefix()
     {
-        c2pool::messages::IMessage *msg = new c2pool::messages::IMessage();
+        tempMessage = std::make_unique<c2pool::messages::IMessage>(/*TODO: net.PREFIX*/);
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg->prefix, /*todo:prefix_length*/),
-                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                boost::asio::buffer(tempMessage->prefix, /*todo:prefix_length*/),
+                                [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec /*&& <сравнение размеров prefix>*/)
                                     {
                                         read_command();
@@ -66,8 +66,8 @@ namespace c2pool::p2p
     void Protocol::read_command()
     {
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg->command, msg->command_length),
-                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                boost::asio::buffer(tempMessage->command, tempMessage->command_length),
+                                [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
                                         read_length();
@@ -82,8 +82,8 @@ namespace c2pool::p2p
     void read_length()
     {
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg->length, msg->payload_length),
-                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                boost::asio::buffer(tempMessage->length, tempMessage->payload_length),
+                                [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
                                         read_checksum();
@@ -98,8 +98,8 @@ namespace c2pool::p2p
     void Protocol::read_checksum()
     {
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg->checksum, msg->checksum_length),
-                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                boost::asio::buffer(tempMessage->checksum, tempMessage->checksum_length),
+                                [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
                                         read_checksum();
@@ -114,10 +114,11 @@ namespace c2pool::p2p
     void Protocol::read_payload()
     {
         boost::asio::async_read(socket,
-                                boost::asio::buffer(msg->payload, msg->length),
-                                [&msg, this](boost::system::error_code ec, std::size_t /*length*/) {
+                                boost::asio::buffer(tempMessage->payload, tempMessage->length),
+                                [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        //todo: move tempMesssage -> new message
                                         read_prefix();
                                     }
                                     else

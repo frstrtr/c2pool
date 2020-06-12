@@ -26,10 +26,17 @@ namespace c2pool::time
 
 namespace c2pool::str
 {
-    void substr(char *dest, char *source, int from, int length)
-    {
-        strncpy(dest, source + from, length);
-        dest[length] = 0;
-    }
+    void substr(char *dest, char *source, int from, int length);
 } // namespace c2pool::str
+
+namespace c2pool::smart_ptr
+{
+    template <typename Derived, typename Base, typename Del>
+    std::unique_ptr<Derived, Del>
+    static_unique_ptr_cast(std::unique_ptr<Base, Del> &&p)
+    {
+        auto d = static_cast<Derived *>(p.release());
+        return std::unique_ptr<Derived, Del>(d, std::move(p.get_deleter()));
+    }
+} // namespace c2pool::smart_ptr
 #endif //CPOOL_OTHER_H
