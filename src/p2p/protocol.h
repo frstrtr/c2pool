@@ -100,7 +100,7 @@ namespace c2pool::p2p
         Node *node;
         c2pool::p2p::Factory *factory;
 
-        unique_ptr<c2pool::messages::IMessage> tempMessage 
+        unique_ptr<c2pool::messages::IMessage> tempMessage; 
     };
 
     class ClientProtocol : public Protocol
