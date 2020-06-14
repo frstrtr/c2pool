@@ -2,7 +2,7 @@
 #define CPOOL_OTHER_H
 
 #include <vector>
-#include <cstring>
+#include <memory>
 
 namespace c2pool::random
 {
@@ -39,4 +39,10 @@ namespace c2pool::smart_ptr
         return std::unique_ptr<Derived, Del>(d, std::move(p.get_deleter()));
     }
 } // namespace c2pool::smart_ptr
+
+namespace c2pool::str
+{
+    void substr(char *dest, char *source, int from, int length);
+} // namespace c2pool::str
+
 #endif //CPOOL_OTHER_H

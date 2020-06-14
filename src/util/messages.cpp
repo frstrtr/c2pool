@@ -13,6 +13,13 @@ namespace c2pool::messages
 {
     //IMessage
 
+    IMessage::IMessage(const char *current_prefix)
+    {
+        _prefix_length = std::strlen(current_prefix);
+        prefix = new char[prefix_length()];
+        strcpy(prefix, current_prefix);
+    }
+
     void IMessage::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);

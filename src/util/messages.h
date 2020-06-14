@@ -106,27 +106,24 @@ namespace c2pool::messages
             max_payload_length = 8000000 //max len payload
         };
 
-    private:
-        //TODO: add getter/setter for all fields
-        char *prefix;
-        size_t _prefix_length;
         const size_t prefix_length() const
         {
             return _prefix_length;
         }
+
+        char *prefix;
         char command[command_length + 1];
         char length[payload_length + 1];
         char checksum[checksum_length + 1];
         char payload[max_payload_length + 1];
         char data[command_length + payload_length + checksum_length + max_payload_length]; //full message without prefix
+    private:
+        size_t _prefix_length;
+
     public:
         IMessage() {}
 
-        IMessage(const char *current_prefix)
-        {
-            _prefix_length = strlen(current_prefix);
-            prefix = new char[prefix_length()];
-        }
+        IMessage(const char *current_prefix);
 
         IMessage(char *data_)
         {
@@ -150,15 +147,15 @@ namespace c2pool::messages
         void unpack(std::stringstream &ss);
         string pack();
 
-        char *data() override
-        {
-            //TODO:
-        }
+        // char *data() override
+        // {
+        //     //TODO:
+        // }
 
-        std::size_t length() override
-        {
-            //TODO:
-        }
+        // std::size_t length() override
+        // {
+        //     //TODO:
+        // }
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual string _pack() = 0;

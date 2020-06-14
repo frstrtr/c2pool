@@ -1,8 +1,10 @@
+#include "other.h"
 #include <iostream>
 #include <boost/random.hpp>
 #include <vector>
 #include <ctime>
 #include <cmath>
+#include <cstring>
 
 namespace c2pool::random{
     using namespace boost::random;
