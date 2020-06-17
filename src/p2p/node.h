@@ -71,7 +71,7 @@ namespace c2pool::p2p
         //TODO: known_txs_var
         //TODO: mining_txs_var
         //TODO: mining2_txs_var
-        //TODO: best_share_var
+        //TODO: best_share_var //CAN BE NULL IN message_version
         //TODO: desired_var
         //TODO: txidcache
         //--------------------------------
@@ -99,10 +99,31 @@ namespace c2pool::p2p
         virtual handle_get_shares() = 0;
         virtual handle_bestblock() = 0;
 
+        /*
+        1. port
+        2. addr_store
+        3. connect_addrs
+        4. preffered_storage
+        5. advertise_ip
+        6. external_ip
+        7. nonce
+        8. peers
+        9. start()
+        10. _think???
+        11. stop()
+        12. got_conn()
+        13. lost_conn
+        14. got_addr
+        15. get_good_peers
+        */
     };
 
-    class P2PNode
+    class P2PNode : Node
     {
+        //TODO: known_txs_var = BitcoindNode.known_txs_var
+        //TODO: mining_txs_var = BitcoindNode.mining_txs_var
+        //TODO: mining2_txs_var = BitcoindNode.mining2_txs_var
+
     };
 } // namespace c2pool::p2p
 
