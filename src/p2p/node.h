@@ -53,6 +53,8 @@ namespace c2pool::p2p
         const NodesManager *nodes;
 
         virtual void start() = 0;
+        
+        virtual void stop() = 0;
     };
 } // namespace c2pool::p2p
 
@@ -80,6 +82,10 @@ namespace c2pool::p2p
             //TODO
         }
 
+        void stop() override {
+            //TODO:
+        }
+
     };
 } // namespace c2pool::p2p
 
@@ -94,28 +100,50 @@ namespace c2pool::p2p
             //TODO
         }
 
-        virtual handle_shares() = 0;
-        virtual handle_share_hashes() = 0;
-        virtual handle_get_shares() = 0;
-        virtual handle_bestblock() = 0;
+        void stop() override {
+            //TODO:
+        }
+
+        virtual void handle_shares() = 0;
+        virtual void handle_share_hashes() = 0;
+        virtual void handle_get_shares() = 0;
+        virtual void handle_bestblock() = 0;
+
+        void got_conn(){
+            //TODO
+        }
+
+        void lost_conn(){
+            //TODO
+        }
+
+        void got_addr(){
+            //TODO
+        }
+
+        void get_good_peers(){
+            //TODO
+        }
+
 
         /*
-        1. port
+        7. nonce
+        ______________
+
         2. addr_store
         3. connect_addrs
         4. preffered_storage
-        5. advertise_ip
-        6. external_ip
-        7. nonce
         8. peers
-        9. start()
         10. _think???
-        11. stop()
-        12. got_conn()
-        13. lost_conn
-        14. got_addr
-        15. get_good_peers
         */
+
+
+       std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
+       std::string port;
+       bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
+
+       //TODO: unsigned long long/unsigned long double/uint_fast64_t nonce; //TODO: random[0, 2^64) for this type
+       //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
     };
 
     class P2PNode : Node
