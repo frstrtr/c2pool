@@ -54,6 +54,10 @@ namespace c2pool::p2p
         //OLD: fromStr
         virtual void handle(std::stringstream ss);
 
+        unsigned long long nonce() const{
+            return _nonce;
+        }
+
     protected:
 
         //used for write message
@@ -97,6 +101,7 @@ namespace c2pool::p2p
         unsigned int other_version = -1;
         std::string other_sub_version;
         int other_services; //TODO: int64? IntType(64)
+        unsigned long long _nonce;
 
         boost::asio::ip::tcp::socket socket;
         Node *node;

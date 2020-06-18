@@ -53,7 +53,7 @@ namespace c2pool::p2p
         const NodesManager *nodes;
 
         virtual void start() = 0;
-        
+
         virtual void stop() = 0;
     };
 } // namespace c2pool::p2p
@@ -68,7 +68,6 @@ namespace c2pool::p2p
         //TODO: set_best_share()
         //TODO: get_current_txouts
 
-
         //--------------------------------
         //TODO: known_txs_var
         //TODO: mining_txs_var
@@ -78,14 +77,15 @@ namespace c2pool::p2p
         //TODO: txidcache
         //--------------------------------
 
-        void start() override{
+        void start() override
+        {
             //TODO
         }
 
-        void stop() override {
+        void stop() override
+        {
             //TODO:
         }
-
     };
 } // namespace c2pool::p2p
 
@@ -93,15 +93,42 @@ namespace c2pool::p2p
 {
     class Node : INode
     {
+        /*
+        10. _think???
+        */
+
         c2pool::p2p::Client client;
         c2pool::p2p::Server server;
 
-        void start() override{
-            //TODO
+        void start() override
+        {
+            if (running)
+            {
+                std::cout << "Node already running!" << std::endl; //todo: raise
+                return;
+            }
+
+            client.start();
+            server.start();
+
+            running = true;
+            //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
+
+            //todo?: self._stop_thinking = deferral.run_repeatedly(self._think)
         }
 
-        void stop() override {
-            //TODO:
+        void stop() override
+        {
+            if (!running)
+            {
+                std::cout << "Node already stopped!" << std::endl; //todo: raise
+                return;
+            }
+
+            running = false;
+
+            client.stop();
+            server.stop();
         }
 
         virtual void handle_shares() = 0;
@@ -109,41 +136,60 @@ namespace c2pool::p2p
         virtual void handle_get_shares() = 0;
         virtual void handle_bestblock() = 0;
 
-        void got_conn(){
+        void got_conn(Protocol *protocol)
+        {
+            if (peers.count(protocol->nonce()) != 0) //CHECK THIS
+            {
+                std::cout << "Already have peer!" << std::endl; //TODO: raise ValueError('already have peer')
+            }
+            peers.insert(pair<int, Protocol *>(protocol->nonce(), protocol));
+        }
+
+        void lost_conn(Protocol *protocol, boost::exception *reason)
+        {
+            if (peers.count(protocol->nonce()) == 0) //CHECK THIS
+            {
+                std::cout << "Don't have peer!" << std::endl; //TODO: raise ValueError('''don't have peer''')
+                return;
+            }
+
+            if (protocol != peers.at(protocol->nonce()))
+            {
+                std::cout << "Wrong conn!" << std::endl; //TODO: raise ValueError('wrong conn')
+                return;
+            }
+
+            delete protocol; //todo: delete for smart pointer
+
+            //todo: print 'Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage())
+        }
+
+        void got_addr()
+        {
             //TODO
         }
 
-        void lost_conn(){
+        void get_good_peers()
+        {
             //TODO
         }
 
-        void got_addr(){
-            //TODO
-        }
+        
 
-        void get_good_peers(){
-            //TODO
-        }
+        //TODO: connect_addrs
+        //TODO: addr_store //TODO: change type; net.BOOTSTRAP_ADDRS + saved addrs
+        int preffered_storage;
+        std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
+        std::string port;
+        std::map<unsigned long long, c2pool::p2p::Protocol *> peers;
+        bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
 
+        //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
+        //Ещё варианты типов для nonce: unsigned long double; uint_fast64_t
+        unsigned long long nonce; //TODO: random[0, 2^64) for this type
 
-        /*
-        7. nonce
-        ______________
-
-        2. addr_store
-        3. connect_addrs
-        4. preffered_storage
-        8. peers
-        10. _think???
-        */
-
-
-       std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
-       std::string port;
-       bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
-
-       //TODO: unsigned long long/unsigned long double/uint_fast64_t nonce; //TODO: random[0, 2^64) for this type
-       //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
+    private:
+        bool running = false; // true - Node running
     };
 
     class P2PNode : Node
@@ -151,7 +197,6 @@ namespace c2pool::p2p
         //TODO: known_txs_var = BitcoindNode.known_txs_var
         //TODO: mining_txs_var = BitcoindNode.mining_txs_var
         //TODO: mining2_txs_var = BitcoindNode.mining2_txs_var
-
     };
 } // namespace c2pool::p2p
 
