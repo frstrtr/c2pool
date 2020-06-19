@@ -20,9 +20,9 @@
 
 using boost::asio::ip::tcp;
 
-class Node;
 namespace c2pool::p2p
 {
+    class NodesManager;
     class Protocol;
     class ClientProtocol;
     class ServerProtocol;
@@ -44,8 +44,8 @@ namespace c2pool::p2p
         boost::asio::io_context &io_context;
 
     protected:
-        Node *node;
-        std::list<Protocol *> conns; //todo: shared_ptr
+        std::shared_ptr<NodesManager> nodes;
+        std::list<std::shared_ptr<Protocol>> conns; //todo: shared_ptr
     };
 
     class Client : public Factory
