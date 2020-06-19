@@ -51,10 +51,6 @@ namespace c2pool::p2p
 
     public:
         const NodesManager *nodes;
-
-        virtual void start() = 0;
-
-        virtual void stop() = 0;
     };
 } // namespace c2pool::p2p
 
@@ -76,16 +72,6 @@ namespace c2pool::p2p
         //TODO: desired_var
         //TODO: txidcache
         //--------------------------------
-
-        void start() override
-        {
-            //TODO
-        }
-
-        void stop() override
-        {
-            //TODO:
-        }
     };
 } // namespace c2pool::p2p
 
@@ -93,47 +79,24 @@ namespace c2pool::p2p
 {
     class Node : INode
     {
-        Node(){
-            nonce = c2pool::random::RandomNonce();
-        }
-
-        /*
-        10. _think???
-        */
-
-        c2pool::p2p::Client client;
-        c2pool::p2p::Server server;
-
-        void start() override
+    public:
+        Node(NodesManager *_nodes, std::string _port) : INodes(_nodes)
         {
-            if (running)
-            {
-                std::cout << "Node already running!" << std::endl; //todo: raise
-                return;
-            }
+            nonce = c2pool::random::RandomNonce();
+            port = _port;
 
-            client.start();
-            server.start();
+            client = std::make_shared<c2pool::p2p::Client>(); // client.start()
+            server = std::make_shared<c2pool::p2p::Server>(); // server.start()
 
-            running = true;
             //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
 
             //todo?: self._stop_thinking = deferral.run_repeatedly(self._think)
         }
 
-        void stop() override
-        {
-            if (!running)
-            {
-                std::cout << "Node already stopped!" << std::endl; //todo: raise
-                return;
-            }
+        //TODO_NOW: _THINK()
 
-            running = false;
-
-            client.stop();
-            server.stop();
-        }
+        std::shared_ptr<c2pool::p2p::Client> client;
+        std::shared_ptr<c2pool::p2p::Server> server;
 
         virtual void handle_shares() = 0;
         virtual void handle_share_hashes() = 0;
@@ -178,22 +141,18 @@ namespace c2pool::p2p
             //TODO
         }
 
-        
-
-        //TODO: connect_addrs
-        //TODO: addr_store //TODO: change type; net.BOOTSTRAP_ADDRS + saved addrs
-        int preffered_storage;
-        std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
-        std::string port;
-        std::map<unsigned long long, c2pool::p2p::Protocol *> peers;
-        bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
-
         //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
         //Ещё варианты типов для nonce: unsigned long double; uint_fast64_t
-        unsigned long long nonce; //TODO: random[0, 2^64) for this type
+        unsigned long long nonce;
+        std::string port;
+        std::map<unsigned long long, c2pool::p2p::Protocol *> peers;
 
     private:
-        bool running = false; // true - Node running
+        //TODO: int preffered_storage;
+        //TODO: connect_addrs
+        //TODO: addr_store //TODO: change type; net.BOOTSTRAP_ADDRS + saved addrs
+        //TODO: bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
+        //TODO: std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
     };
 
     class P2PNode : Node
