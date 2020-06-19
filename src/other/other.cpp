@@ -35,8 +35,12 @@ namespace c2pool::random{
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l){
-
         return (log(RandomInt(1, RAND_MAX)+1)-log(RAND_MAX))/(-l);
+    }
+
+    unsigned long long RandomNonce(){
+        boost::random::uniform_int_distribution<unsigned long long> rnd(0, 0xFFFFFFFFFFFFFFFF);
+        return rnd(generator);
     }
 
 }
