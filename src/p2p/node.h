@@ -142,16 +142,16 @@ namespace c2pool::p2p
 
         void got_conn(Protocol *protocol)
         {
-            if (peers.count(protocol->nonce()) != 0) //CHECK THIS
+            if (peers.count(protocol->nonce()) != 0)
             {
                 std::cout << "Already have peer!" << std::endl; //TODO: raise ValueError('already have peer')
             }
-            peers.insert(pair<int, Protocol *>(protocol->nonce(), protocol));
+            peers.insert(std::pair<int, Protocol *>(protocol->nonce(), protocol));
         }
 
         void lost_conn(Protocol *protocol, boost::exception *reason)
         {
-            if (peers.count(protocol->nonce()) == 0) //CHECK THIS
+            if (peers.count(protocol->nonce()) == 0)
             {
                 std::cout << "Don't have peer!" << std::endl; //TODO: raise ValueError('''don't have peer''')
                 return;
@@ -203,64 +203,5 @@ namespace c2pool::p2p
         //TODO: mining2_txs_var = BitcoindNode.mining2_txs_var
     };
 } // namespace c2pool::p2p
-
-// namespace c2pool::p2p
-// {
-//     class Node
-//     {
-//         //node.py, Node
-//     public:
-//         P2PNode *p2p_node;
-//         Client *factory;
-//         //TODO: <type?> bitcoind;
-
-//         //TODO: self.best_share_var = variable.Variable(None)
-
-//         Node(Client *_factory /*, bitcoind, shares, known_verified_share_hashes*/);
-
-//         void start(); //TODO: coroutine
-
-//         void set_best_share();
-//     };
-
-//     class P2PNode
-//     {
-//         //p2p.py::Node + node.py::P2PNode
-//         P2PNode(Node *_node, /*,best_share_hash_func*/ int _port, auto _addr_store,
-//                 auto _connect_addrs, int des_out_cons = 10, int max_out_attempts = 30,
-//                 int max_in_conns = 50, int pref_storage = 1000, bool _advertise_ip = true,
-//                 auto external_ip = nullptr);
-
-//         void start();
-//         //TODO: @defer.inlineCallbacks ???
-//         void stop();
-
-//         float _think();
-
-//         void got_conn(Protocol *conn);
-
-//         void lost_conn(Protocol *conn, boost::exception& reason);
-
-//         void got_addr((host, port), services, timestamp); //TODO
-
-//         auto get_good_peers(auto max_count);
-//         //private:
-//     public:
-//         Node *node;
-//         bool running;
-
-//         c2pool::p2p::Client *client;
-//         c2pool::p2p::Server *server;
-
-//         //p2p.py
-//         int port;
-//         std::map<std::string, std::string> addr_store; //TODO: change type
-//         std::set<std::string> connect_addrs;
-//         int preferred_storage;
-//         std::map<int, Protocol*> peers; //TODO: type???
-//         bool advertise_ip;
-//     };
-
-// } // namespace c2pool::p2p
 
 #endif //CPOOL_NODE_H
