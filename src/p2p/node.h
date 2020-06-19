@@ -93,6 +93,10 @@ namespace c2pool::p2p
 {
     class Node : INode
     {
+        Node(){
+            nonce = c2pool::random::RandomNonce();
+        }
+
         /*
         10. _think???
         */

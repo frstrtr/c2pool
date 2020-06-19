@@ -17,6 +17,8 @@ namespace c2pool::random
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l);
+
+    unsigned long long RandomNonce();
 } // namespace c2pool::random
 
 namespace c2pool::time
