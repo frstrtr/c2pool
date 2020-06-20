@@ -60,7 +60,7 @@ namespace c2pool::p2p
         {
             c2pool::random::RandomChoice(peers)->send_getaddrs(8); //TODO: add send_getaddrs to c2pool::p2p::Protocol
         }
-        boost::posix_time::seconds interval(static_cast<int>(c2pool::random::Expovariate(1.0 / 20)));
+        boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0 / 20)*1000));
         _think_timer.expires_at(_think_timer.expires_at() + interval);
         _think_timer.async_wait(_think);
     }
