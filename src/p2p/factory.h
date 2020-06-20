@@ -56,10 +56,12 @@ namespace c2pool::p2p
         //todo: void -> bool
         void connect(std::string ip, std::string port);
 
+        void _think(); //TODO: change name
+
     protected:
         tcp::resolver resolver;
-
         int desired_conns, max_attempts;
+        boost::asio::deadline_timer _think_timer;
     };
 
     class Server : public Factory
