@@ -33,6 +33,12 @@ namespace c2pool::random{
         return list[pos];
     }
 
+    template <typename K, typename V>
+    V RandomChoice(std::map<K, V> map){ //TODO: THIS WANNA TEST
+        int pos = RandomInt(0, map.size());
+        return std::advance(map.begin(), pos);
+    }
+
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l){
         return (log(RandomInt(1, RAND_MAX)+1)-log(RAND_MAX))/(-l);

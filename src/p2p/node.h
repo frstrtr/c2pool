@@ -102,7 +102,6 @@ namespace c2pool::p2p
         void _think(); //TODO: rename method
 
         //TODO: void got_addr();
-
         //TODO: void get_good_peers();
 
         

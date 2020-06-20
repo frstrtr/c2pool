@@ -2,6 +2,7 @@
 #define CPOOL_OTHER_H
 
 #include <vector>
+#include <map>
 #include <memory>
 
 namespace c2pool::random
@@ -14,6 +15,9 @@ namespace c2pool::random
 
     template <typename T>
     T RandomChoice(std::vector<T> list);
+
+    template <typename K, typename V>
+    V RandomChoice(std::map<K, V> map);
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l);
