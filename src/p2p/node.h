@@ -145,7 +145,7 @@ namespace c2pool::p2p
                 c2pool::random::RandomChoice(peers).send_getaddrs(8);
             }
             boost::posix_time::seconds interval(c2pool::random::Expovariate(1.0 / 20));
-            _think_timer.expires_at(_think_timer.expire_at() + interval);
+            _think_timer.expires_at(_think_timer.expires_at() + interval);
             _think_timer.async_wait(_think);
         }
 
