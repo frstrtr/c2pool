@@ -28,7 +28,7 @@ namespace c2pool::random{
     }
 
     template <typename T>
-    T RandomChoice(std::vector<T> list){
+    T RandomChoice(std::vector<T> &list){
         int pos = RandomInt(0, list.size());
         return list[pos];
     }

@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
+#include <boost/asio.hpp>
 #include <memory>
 #include "config.h"
 
@@ -21,6 +22,14 @@ namespace c2pool::p2p
     class NodesManager
     {
     public:
+        NodesManager(boost::asio::io_context& _io) : _io_context(_io){
+
+        }
+
+        boost::asio::io_context& io_context() const{ //todo: const?
+            return _io_context;
+        }
+
         //TODO: init in constructor
         c2pool::config::Network net() const
         {
@@ -28,6 +37,7 @@ namespace c2pool::p2p
         }
 
     private:
+        boost::asio::io_context& _io_context;
         c2pool::config::Network _net; //config class
         std::unique_ptr<c2pool::p2p::P2PNode> p2p_node;
         std::unique_ptr<c2pool::p2p::BitcoindNode> bitcoind_node;
@@ -80,7 +90,7 @@ namespace c2pool::p2p
     class Node : INode
     {
     public:
-        Node(NodesManager *_nodes, std::string _port) : INodes(_nodes)
+        Node(NodesManager *_nodes, std::string _port) : INode(_nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
         {
             nonce = c2pool::random::RandomNonce();
             port = _port;
@@ -90,10 +100,8 @@ namespace c2pool::p2p
 
             //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
 
-            //todo?: self._stop_thinking = deferral.run_repeatedly(self._think)
+            _think_timer.async_wait(_think);
         }
-
-        //TODO_NOW: _THINK()
 
         std::shared_ptr<c2pool::p2p::Client> client;
         std::shared_ptr<c2pool::p2p::Server> server;
@@ -131,21 +139,26 @@ namespace c2pool::p2p
             //todo: print 'Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage())
         }
 
-        void got_addr()
-        {
-            //TODO
+        void _think(){ //TODO: rename method
+            if (peers.size() > 0)
+            {
+                c2pool::random::RandomChoice(peers).send_getaddrs(8);
+            }
+            boost::posix_time::seconds interval(c2pool::random::Expovariate(1.0 / 20));
+            _think_timer.expires_at(_think_timer.expire_at() + interval);
+            _think_timer.async_wait(_think);
         }
 
-        void get_good_peers()
-        {
-            //TODO
-        }
+        //TODO: void got_addr();
+
+        //TODO: void get_good_peers();
 
         //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
         //Ещё варианты типов для nonce: unsigned long double; uint_fast64_t
         unsigned long long nonce;
         std::string port;
         std::map<unsigned long long, c2pool::p2p::Protocol *> peers;
+        boost::asio::deadline_timer _think_timer;
 
     private:
         //TODO: int preffered_storage;
