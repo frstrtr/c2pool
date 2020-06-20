@@ -58,7 +58,7 @@ namespace c2pool::p2p
     { //TODO: rename method
         if (peers.size() > 0)
         {
-            c2pool::random::RandomChoice(peers).send_getaddrs(8); //fix map -> list
+            c2pool::random::RandomChoice(peers)->send_getaddrs(8); //TODO: add send_getaddrs to c2pool::p2p::Protocol
         }
         boost::posix_time::seconds interval(static_cast<int>(c2pool::random::Expovariate(1.0 / 20)));
         _think_timer.expires_at(_think_timer.expires_at() + interval);
