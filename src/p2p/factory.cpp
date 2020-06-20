@@ -11,6 +11,7 @@ using boost::asio::ip::tcp;
 
 #include "protocol.h"
 #include "factory.h"
+#include "other.h"
 
 class Node;
 
@@ -23,10 +24,11 @@ namespace c2pool::p2p
     }
 
     //--------------------------Client
-    Client::Client(boost::asio::io_context &io_context_, int _desired_conns, int _max_attempts) : resolver(io_context_), Factory(io_context_)
+    Client::Client(boost::asio::io_context &io_context_, int _desired_conns, int _max_attempts) : resolver(io_context_), Factory(io_context_),  _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
     {
         desired_conns = _desired_conns;
         max_attempts = _max_attempts;
+        _think_timer.async_wait(_think);
     }
 
     //todo: void -> bool
@@ -45,6 +47,14 @@ namespace c2pool::p2p
         {
             std::cerr << "Exception Client::connect(): " << e.what() << std::endl;
         }
+    }
+
+    void Client::_think()
+    {
+        //TODO: finish method
+        boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0)*1000));
+        _think_timer.expires_at(_think_timer.expires_at() + interval);
+        _think_timer.async_wait(_think);
     }
 
     //--------------------------Server
