@@ -3,8 +3,9 @@ import binascii
 import struct
 import io as StringIO
 from io import BytesIO
+import hashlib #remove
 import os
-import hashlib
+
 
 # ------------------------------------------p2pool memoize------------------------------------------
 import itertools
@@ -569,7 +570,7 @@ class UnpackResult:
 
     def __iadd__(self, other):
         if isinstance(other, bytes):
-            other = other.decode()
+            other = other.decode('utf-8')
         self.res += str(other) + ' '
         return self
 
@@ -577,7 +578,7 @@ class UnpackResult:
         self.res += other.res
 
     def __str__(self):
-        return self.res #todo: remove last ' '?
+        return self.res
 
 
 class msg:
@@ -589,7 +590,7 @@ class msg:
     def unpack(self, _data):
         data = _data
         if isinstance(_data, str):
-            data = _data.encode()
+            data = _data.encode('utf-8')
         return self._unpack(data)
 
     def parseVars(self, vars):
@@ -737,6 +738,189 @@ class messageGetAddrs(msg):
         res = t['count']
         return res
 
+
+class messageShares(msg):
+    command = 'shares'
+
+    message_shares = ComposedType([
+        # todo check ('shares', pack.ListType(p2pool_data.share_type))
+        ('shares', ListType(p2pool_data.share_type)),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'shares': ListType(data[0]),
+        }
+        return self.message_shares.pack(msg_dict)
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_shares.unpack(data))
+        res = t['shares']
+        return res
+
+
+class messageShareReq(msg):
+    command = 'sharereq'
+
+    message_shrereq = ComposedType([
+        ('id', IntType(256)),
+        # todo check ('hashes', pack.ListType(pack.IntType(256)))
+        ('hashes', ListType(IntType(256)))
+        ('parents', VarIntType()),  # todo Var int type check
+        # todo check ('stops', pack.ListType(pack.IntType(256)))
+        ('stops', ListType(IntType(256)))
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'id': int(data[0]),
+            'hashes': ListType(data[1]),
+            'parents': VarIntType(data[2]),
+            'stops': ListType(data[3]),
+        }
+        return self.message_shrereq.pack(msg_dict)\
+
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_sharereq.unpack(data))
+        res += t['id']
+        res += t['hashes']
+        res += t['parents']
+        res += t['stops']
+        return res
+
+
+class messageShareReply(msg):
+    command = 'sharereply'
+
+    message_sharereply = ComposedType([
+        ('id', IntType(256)),
+        ('result', EnumType(VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2',
+                                           3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),  # todo enum & Var int type
+        ('shares', ListType(p2pool_data.share_type)),  # todo share_type
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'id': int(data[0]),
+            # todo chackout this
+            'result': EnumType(VarIntType(data[1]), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'}),
+            'shares': {parseShareType(data[2])},  # todo checkout this
+        }
+        return self.message_sharereply.pack(msg_dict)
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_sharereply.unpack(data))
+        res += t['id']
+        res += t['result']
+        res += t['shares']
+        return res
+
+
+class messageBestBlock(msg):
+    command = 'bestblock'
+
+    message_bestblock = ComposedType([
+        ('header', block_header_type),  # todo block header type
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'header': parseBlock_header_type(data[0]),  # todo check this out
+        }
+        return self.message_bestblock.pack(msg_dict)
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_bestblock.unpack(data))
+        res = t['header']
+        return res
+
+
+class messageHaveTX(msg):
+    command = 'have_tx'
+
+    message_have_tx = ComposedType([
+        ('tx_hashes', ListType(IntType(256))),
+    ])
+
+    def pack(self, data):
+        msg_dict = {
+            'tx_hashes': [IntType(256)]  # todo check this out
+        }
+        return self.message_have_tx.pack(msg_dict)
+
+    def unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_have_tx.unpack(data))
+        res += t['tx_hashes']
+        return res
+
+
+class messageLosingTX(msg):
+    command = 'losing_tx'
+
+    message_losing_tx = ComposedType([
+        ('tx_hashes', ListType(IntType(256))),  # todo check pack.
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'tx_hashes': [IntType(256)],
+        }
+        return self.message_losing_tx.pack(msg_dict)
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_losing_tx.unpack(data))
+        res += t['tx_hashes']
+        return res
+
+
+class messageRememberTX(msg):
+    command = 'remember_tx'
+
+    message_remember_tx = ComposedType([
+        ('tx_hashes', ListType(IntType(256))),
+        ('txs', ListType(bitcoin_data.tx_type)),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            'tx_hashes': [int(data[0])],
+            'txs': [parseTX_type(data[1])],
+        }
+        return self.message_remember_tx.pack(msg_dict)
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_remember_tx.unpack(data))
+        res += t['tx_hashes']
+        res += t['txs']
+        return res
+
+
+class messageForgetTX(msg):
+    command = 'forget_tx'
+
+    message_forget_tx = ComposedType([
+        ('tx_hashes', ListType(IntType(256))),
+    ])
+
+    def _pack(self, data):
+        msg_dict = {
+            [int(data[0])],  # todo check list key
+        }
+        return self.message_forget_tx.pack(msg_dict)
+
+    def _unpack(self, data):
+        res = UnpackResult()
+        t = dict(self.message_forget_tx.unpack(data))
+        res += t['tx_hashes']
+        return res
 # ------------------------------------------packtypes-for-C---------------------------------
 
 
@@ -746,19 +930,23 @@ EnumMessages = {
     1: messagePing,
     2: messageAddrme,
     3: messageAddrs,
-    4: messageGetAddrs
+    4: messageGetAddrs,
+    5: messageShares,
+    6: messageShareReq,
+    7: messageShareReply,
+    8: messageBestBlock,
+    9: messageHaveTX,
+    10: messageLosingTX,
+    11: messageRememberTX,
+    12: messageForgetTX,
 }
 
 
 def message_from_str(strcmd):
-    '''
-        return message method without num; strcmd = <command>
-    '''
-
     for (k, v) in EnumMessages:
         if v.command == strcmd:
             return v
-    return messageError
+    return messageError('error str message')
 
 
 def message_pack(command, vars):
@@ -768,58 +956,25 @@ def message_pack(command, vars):
 
 def message_unpack(command, data):
     pass
-
-#----------------------
-
-def receive_length(msg):
-    length, = struct.unpack('<I', msg.encode())
-    return length
-
-def receive(_command, checksum, _payload):
-    """
-        called when we receive msg from p2pool to c2pool
-    """
-
-    print(_command) #remove after test
-    print(checksum) #remove after test
-    print(_payload) #remove after test
-    command = _command.rstrip('\0')
-    payload = _payload.encode()
+ 
+def Receive(msg):
+    command, checksum, payload = msg.split(' ')
     
-    #checksum check
+    #remove
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
         return '-1'
     #------------
 
 
-    type_ = message_from_str(command)
+    type_ = EnumMessages[int(command)]
     if type_ is None:
         return '-2'
     
-    return type_.unpack(payload)
+    return type_.unpack(payload) #todo: payload wanna bytes.
 
-
-def send(command, payload2):
-    """
-        called when we send msg from c2pool to p2pool
-    """
-
-    print(command) #remove after test
-    print(payload2) #remove after test
-
-    type_ = message_from_str(command)
-
-    #if error command
-    if type_ is None:
-        type_ = EnumMessages[9999]
-    
-    payload = type_.pack(payload2)
-
-    return struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-
+    #self.packetReceived(command, type_.unpack(payload, self.ignore_trailing_payload))
 
 # ------------------------------------------TESTS------------------------------------------
-"""
 def TEST_PACK_UNPACK():
     arrAddrs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
 
@@ -877,4 +1032,3 @@ def TEST_UNPACKRES():
 # TEST_SHA256()
 # TEST_PACK_UNPACK()
 # TEST_UNPACKRES()
-"""
