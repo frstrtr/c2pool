@@ -195,8 +195,8 @@ namespace c2pool::p2p
     void Protocol::handle(c2pool::messages::message_error *msg)
     {
     }
-    //end_Protocol
 
+    //ClientProtocol
     ClientProtocol::ClientProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints) : Protocol(std::move(_socket), _factory)
     {
         do_connect(endpoints);
@@ -206,6 +206,7 @@ namespace c2pool::p2p
     {
     }
 
+    //ServerProtocol
     ServerProtocol::ServerProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : Protocol(std::move(_socket), _factory)
     {
         start();

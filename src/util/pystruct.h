@@ -5,36 +5,40 @@
 #include <sstream>
 using namespace std;
 
-class Py
+namespace c2pool::python
 {
-public:
-    static bool _ready;
-    static void Initialize();
+    class Py
+    {
+    public:
+        static bool _ready;
+        static void Initialize();
 
-    static void Finalize();
-};
+        static void Finalize();
+    };
+} // namespace c2pool::python
 
-namespace c2pool::python::message
+namespace c2pool::messages::python
 {
     class pymessage
     {
     public:
-        static stringstream unpack(char *command, char *data);
+        static int receive_length(char *length_data); //TODO remove comment: rdy
 
-        static char *pack(char *command, char *vars);
+        //called, when get message from p2pool [unpacked]
+        static std::stringstream receive(char *command, char *checksum, char *payload);  //TODO remove comment: rdy
 
-        static char *pack(char *command, stringstream &vars);
+        //called, when send message to p2pool [packed]
+        static char *send(char *comamnd, char *payload2); 
     };
-} // namespace c2pool::python::message
+} // namespace c2pool::messages::python
 
-class pystruct
+namespace c2pool::messages::python::for_test
 {
-public:
-    static stringstream unpack(char *types, char *vars);
-
-    static char *pack(char *types, char *vars);
-
-    static char *pack(char *types, stringstream &vars);
-};
+    class pymessage
+    {
+    public:
+        static char *get_packed_int(int num); //todo: end this
+    };
+} // namespace c2pool::messages::python::for_test
 
 #endif //CPOOL_PYSTRUCT_H

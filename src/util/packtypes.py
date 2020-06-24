@@ -769,7 +769,7 @@ def message_pack(command, vars):
 def message_unpack(command, data):
     pass
 
-#----------------------
+#----------------------CPP COMMANDS
 
 def receive_length(msg):
     length, = struct.unpack('<I', msg.encode())
@@ -817,6 +817,13 @@ def send(command, payload2):
 
     return struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
 
+# ------------------------------------------FOR UNIT TESTS---------------------------------
+
+def get_packed_int(num):
+    print(type(num))
+    print(num)
+
+    return struct.pack('<I', num)
 
 # ------------------------------------------TESTS------------------------------------------
 """
