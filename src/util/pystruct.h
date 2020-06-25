@@ -28,7 +28,7 @@ namespace c2pool::messages::python
         static std::stringstream receive(char *command, char *checksum, char *payload);
 
         //called, when send message to p2pool [packed]
-        static char *send(char *comamnd, char *payload2); 
+        static char *send(char *comamnd, char *payload2);
     };
 } // namespace c2pool::messages::python
 
@@ -38,6 +38,10 @@ namespace c2pool::messages::python::for_test
     {
     public:
         static char *get_packed_int(int num);
+
+        static char *data_for_test_receive();
+
+        static char *checksum_for_test_receive();
     };
 } // namespace c2pool::messages::python::for_test
 

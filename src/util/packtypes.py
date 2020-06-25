@@ -317,7 +317,6 @@ class IPV6AddressType(Type):
             for x in bits:
                 dataB += struct.pack('B', x)
             data = dataA + dataB
-            print(type(data))
         assert len(data) == 16, len(data)
         file.write(data)
 
@@ -578,7 +577,7 @@ class UnpackResult:
         self.res += other.res
 
     def __str__(self):
-        return self.res #todo: remove last ' '?
+        return self.res.rstrip(' ') #todo: remove last ' '?
 
 
 class msg:
@@ -756,7 +755,7 @@ def message_from_str(strcmd):
         return message method without num; strcmd = <command>
     '''
 
-    for (k, v) in EnumMessages:
+    for (k, v) in EnumMessages.items():
         if v.command == strcmd:
             return v
     return messageError
@@ -773,9 +772,9 @@ def message_unpack(command, data):
 #----------------------CPP COMMANDS
 
 def receive_length(msg):
-    #print('receive_length get: {0}, type {1}'.format(msg, type(msg)))
+    #print('receive_length get: {0}, type {1}; after encoding {2}'.format(msg, type(msg), bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
     #print('when bytes {0}'.format(bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
-    length, = struct.unpack('<I', bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8'))
+    length, = struct.unpack('<I', bytes(msg, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1'))
     #print('length = {0}'.format(length))
     return str(length)
 
@@ -784,14 +783,13 @@ def receive(_command, checksum, _payload):
         called when we receive msg from p2pool to c2pool
     """
 
-    print(_command) #remove after test
-    print(checksum) #remove after test
-    print(_payload) #remove after test
     command = _command.rstrip('\0')
-    payload = _payload.encode()
-    
+    payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
+    checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
+
     #checksum check
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
         return '-1'
     #------------
 
@@ -799,17 +797,16 @@ def receive(_command, checksum, _payload):
     type_ = message_from_str(command)
     if type_ is None:
         return '-2'
+
+    obj = type_()
     
-    return type_.unpack(payload)
+    return str(obj.unpack(payload))
 
 
 def send(command, payload2):
     """
         called when we send msg from c2pool to p2pool
     """
-
-    print(command) #remove after test
-    print(payload2) #remove after test
 
     type_ = message_from_str(command)
 
@@ -824,9 +821,37 @@ def send(command, payload2):
 # ------------------------------------------FOR UNIT TESTS---------------------------------
 
 def get_packed_int(num):
-    #sprint('get_packed_int() get {0} '.format(num))
+    #print('get_packed_int() get {0}; packed: {1} '.format(num, struct.pack('<I', num)))
 
     return struct.pack('<I', num)
+
+def data_for_test_receive():
+    message_version = ComposedType([
+        ('version', IntType(32)),
+        ('services', IntType(64)),
+        ('addr_to', address_type),
+        ('addr_from', address_type),
+        ('nonce', IntType(64)),
+        ('sub_version', VarStrType()),
+        ('mode', IntType(32)),
+        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
+    ])
+
+    message_version_dict = {
+        'version':1,
+        'services':2,
+        'addr_to': {'services':3, 'address':'4.5.6.7', 'port':8},
+        'addr_from':{'services':9, 'address':'10.11.12.13', 'port':14},
+        'nonce':15,
+        'sub_version': '16',
+        'mode':17,
+        'best_share_hash':18
+        }
+    #---------------------
+    return message_version.pack(message_version_dict)
+
+def checksum_for_test_receive():
+    return hashlib.sha256(hashlib.sha256(data_for_test_receive()).digest()).digest()[:4]
 
 # ------------------------------------------TESTS------------------------------------------
 """
