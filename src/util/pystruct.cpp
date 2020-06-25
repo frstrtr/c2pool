@@ -195,7 +195,7 @@ namespace c2pool::messages::python
         auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
-        // Загрузка struc.py
+        // Загрузка py файла
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
@@ -262,7 +262,7 @@ namespace c2pool::messages::python
         auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
-        // Загрузка struc.py
+        // Загрузка py файла
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
@@ -327,7 +327,7 @@ namespace c2pool::messages::python
         auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
-        // Загрузка struc.py
+        // Загрузка py файла
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
@@ -391,7 +391,7 @@ namespace c2pool::messages::python::for_test
         auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
-        // Загрузка struc.py
+        // Загрузка py файла
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
@@ -402,6 +402,7 @@ namespace c2pool::messages::python::for_test
         auto pModule = PyImport_Import(pName);
         if (!pModule)
         {
+
             return ret;
         }
 
@@ -423,7 +424,6 @@ namespace c2pool::messages::python::for_test
         {
             return ret;
         }
-
         auto pVal = PyObject_CallFunction(pObjct, (char *)"(i)", num);
         if (pVal != NULL)
         {

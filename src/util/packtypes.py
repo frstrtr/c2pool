@@ -430,67 +430,68 @@ share_type = ComposedType([
     ('contents', VarStrType()),
 ])
 
-block_header_type = ComposedType([
-    ('version', IntType(32)),
-    ('previous_block', PossiblyNoneType(0, IntType(256))),
-    ('merkle_root', IntType(256)),
-    ('timestamp', IntType(32)),
-    ('bits', FloatingIntegerType()),  # todo Check this new type
-    ('nonce', IntType(32)),
-])
+#TODO:
+# block_header_type = ComposedType([
+#     ('version', IntType(32)),
+#     ('previous_block', PossiblyNoneType(0, IntType(256))),
+#     ('merkle_root', IntType(256)),
+#     ('timestamp', IntType(32)),
+#     ('bits', FloatingIntegerType()),  # todo Check this new type
+#     ('nonce', IntType(32)),
+# ])
 
 
 # todo check it from bitcoin/data/py derivated from pack.Type class
-class TransactionType(pack.Type):
-    _int_type = pack.IntType(32)
-    _varint_type = pack.VarIntType()
-    _witness_type = pack.ListType(pack.VarStrType())
-    _wtx_type = pack.ComposedType([
-        ('flag', pack.IntType(8)),
-        ('tx_ins', pack.ListType(tx_in_type)),
-        ('tx_outs', pack.ListType(tx_out_type))
-    ])
-    _ntx_type = pack.ComposedType([
-        ('tx_outs', pack.ListType(tx_out_type)),
-        ('lock_time', _int_type)
-    ])
-    _write_type = pack.ComposedType([
-        ('version', _int_type),
-        ('marker', pack.IntType(8)),
-        ('flag', pack.IntType(8)),
-        ('tx_ins', pack.ListType(tx_in_type)),
-        ('tx_outs', pack.ListType(tx_out_type))
-    ])
+# class TransactionType(pack.Type):
+#     _int_type = pack.IntType(32)
+#     _varint_type = pack.VarIntType()
+#     _witness_type = pack.ListType(pack.VarStrType())
+#     _wtx_type = pack.ComposedType([
+#         ('flag', pack.IntType(8)),
+#         ('tx_ins', pack.ListType(tx_in_type)),
+#         ('tx_outs', pack.ListType(tx_out_type))
+#     ])
+#     _ntx_type = pack.ComposedType([
+#         ('tx_outs', pack.ListType(tx_out_type)),
+#         ('lock_time', _int_type)
+#     ])
+#     _write_type = pack.ComposedType([
+#         ('version', _int_type),
+#         ('marker', pack.IntType(8)),
+#         ('flag', pack.IntType(8)),
+#         ('tx_ins', pack.ListType(tx_in_type)),
+#         ('tx_outs', pack.ListType(tx_out_type))
+#     ])
 
-    def read(self, file):
-        version = self._int_type.read(file)
-        marker = self._varint_type.read(file)
-        if marker == 0:
-            next = self._wtx_type.read(file)
-            witness = [None]*len(next['tx_ins'])
-            for i in xrange(len(next['tx_ins'])):  # todo replace by py3 range()
-                witness[i] = self._witness_type.read(file)
-            locktime = self._int_type.read(file)
-            return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
-        else:
-            tx_ins = [None]*marker
-            for i in xrange(marker):  # todo replace by py3 range()
-                tx_ins[i] = tx_in_type.read(file)
-            next = self._ntx_type.read(file)
-            return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
+#     def read(self, file):
+#         version = self._int_type.read(file)
+#         marker = self._varint_type.read(file)
+#         if marker == 0:
+#             next = self._wtx_type.read(file)
+#             witness = [None]*len(next['tx_ins'])
+#             for i in xrange(len(next['tx_ins'])):  # todo replace by py3 range()
+#                 witness[i] = self._witness_type.read(file)
+#             locktime = self._int_type.read(file)
+#             return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
+#         else:
+#             tx_ins = [None]*marker
+#             for i in xrange(marker):  # todo replace by py3 range()
+#                 tx_ins[i] = tx_in_type.read(file)
+#             next = self._ntx_type.read(file)
+#             return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
 
-    def write(self, file, item):
-        if is_segwit_tx(item):
-            assert len(item['tx_ins']) == len(item['witness'])
-            self._write_type.write(file, item)
-            for w in item['witness']:
-                self._witness_type.write(file, w)
-            self._int_type.write(file, item['lock_time'])
-            return
-        return tx_id_type.write(file, item)
+#     def write(self, file, item):
+#         if is_segwit_tx(item):
+#             assert len(item['tx_ins']) == len(item['witness'])
+#             self._write_type.write(file, item)
+#             for w in item['witness']:
+#                 self._witness_type.write(file, w)
+#             self._int_type.write(file, item['lock_time'])
+#             return
+#         return tx_id_type.write(file, item)
 
 
-tx_type = TransactionType()
+# tx_type = TransactionType()
 
 
 class Address_Type():
