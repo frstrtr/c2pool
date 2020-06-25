@@ -243,11 +243,11 @@ namespace c2pool::messages::python
         ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        std::cout << ret << std::endl;
+        //std::cout << ret << std::endl; //TODO: DEBUG_PYTHON
 
         res << ret;
         res >> result_method;
-        std::cout << result_method << std::endl;
+
         return result_method;
     }
 
@@ -444,7 +444,7 @@ namespace c2pool::messages::python::for_test
         ret += 2;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        std::cout << "get_packed_int return(without dot): ." << ret << std::endl;
+        //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
         return ret;
     }
 } // namespace c2pool::messages::python::for_test

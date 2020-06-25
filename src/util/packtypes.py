@@ -824,7 +824,7 @@ def send(command, payload2):
 # ------------------------------------------FOR UNIT TESTS---------------------------------
 
 def get_packed_int(num):
-    print('get_packed_int() get {0} '.format(num))
+    #sprint('get_packed_int() get {0} '.format(num))
 
     return struct.pack('<I', num)
 
@@ -888,7 +888,3 @@ def TEST_UNPACKRES():
 # TEST_PACK_UNPACK()
 # TEST_UNPACKRES()
 """
-
-# print(get_packed_int(10))
-
-# print(receive_length('\n\x00\x00\x00'))
