@@ -228,6 +228,7 @@ namespace c2pool::messages::python
             return result_method;
         }
 
+
         auto pVal = PyObject_CallFunction(pObjct, (char *)"(s)", length_data);
         if (pVal != NULL)
         {
@@ -239,11 +240,14 @@ namespace c2pool::messages::python
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
-        ret++;                    //remove first element ['] in string
+        ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
+        std::cout << ret << std::endl;
 
         res << ret;
         res >> result_method;
+        std::cout << result_method << std::endl;
         return result_method;
     }
 
@@ -436,6 +440,11 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
+
+        ret += 2;                 //remove first element ['] in string
+        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
+        std::cout << "get_packed_int return(without dot): ." << ret << std::endl;
         return ret;
     }
 } // namespace c2pool::messages::python::for_test
