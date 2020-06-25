@@ -773,8 +773,11 @@ def message_unpack(command, data):
 #----------------------CPP COMMANDS
 
 def receive_length(msg):
-    length, = struct.unpack('<I', msg.encode())
-    return length
+    #print('receive_length get: {0}, type {1}'.format(msg, type(msg)))
+    #print('when bytes {0}'.format(bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
+    length, = struct.unpack('<I', bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8'))
+    #print('length = {0}'.format(length))
+    return str(length)
 
 def receive(_command, checksum, _payload):
     """
@@ -821,8 +824,7 @@ def send(command, payload2):
 # ------------------------------------------FOR UNIT TESTS---------------------------------
 
 def get_packed_int(num):
-    print(type(num))
-    print(num)
+    print('get_packed_int() get {0} '.format(num))
 
     return struct.pack('<I', num)
 
@@ -886,3 +888,7 @@ def TEST_UNPACKRES():
 # TEST_PACK_UNPACK()
 # TEST_UNPACKRES()
 """
+
+# print(get_packed_int(10))
+
+# print(receive_length('\n\x00\x00\x00'))
