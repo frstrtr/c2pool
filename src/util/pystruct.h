@@ -42,6 +42,8 @@ namespace c2pool::messages::python::for_test
         static char *data_for_test_receive();
 
         static char *checksum_for_test_receive();
+
+        static char *data_for_test_send();
     };
 } // namespace c2pool::messages::python::for_test
 

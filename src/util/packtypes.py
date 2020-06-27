@@ -499,7 +499,7 @@ class Address_Type():
     def parseIn(_data):
         # данные внутри других данных разделяются символом ","
         data = _data.split(',')
-        return {'services': data[0], 'address': data[1], 'port': data[2]}
+        return {'services': int(data[0]), 'address': data[1], 'port': int(data[2])}
 
     @staticmethod
     def parseOut(_data):
@@ -642,6 +642,7 @@ class messageVersion(msg):
                     'sub_version': data[5],
                     'mode': int(data[6]),
                     'best_share_hash': int(data[7])}  # int?
+
 
         return self.message_version.pack(msg_dict)
 
@@ -808,13 +809,18 @@ def send(command, payload2):
         called when we send msg from c2pool to p2pool
     """
 
+    
+
     type_ = message_from_str(command)
 
     #if error command
     if type_ is None:
         type_ = EnumMessages[9999]
     
-    payload = type_.pack(payload2)
+    command = bytes(command, encoding = 'ISO-8859-1')
+    
+    msg = type_()
+    payload = msg.pack(payload2)
 
     return struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
 
@@ -853,6 +859,8 @@ def data_for_test_receive():
 def checksum_for_test_receive():
     return hashlib.sha256(hashlib.sha256(data_for_test_receive()).digest()).digest()[:4]
 
+def data_for_test_send():
+    return send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
 # ------------------------------------------TESTS------------------------------------------
 """
 def TEST_PACK_UNPACK():
@@ -913,3 +921,5 @@ def TEST_UNPACKRES():
 # TEST_PACK_UNPACK()
 # TEST_UNPACKRES()
 """
+
+#print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))

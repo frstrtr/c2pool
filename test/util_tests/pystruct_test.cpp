@@ -15,7 +15,6 @@ TEST(PyCode, PyReceiveLength)
     ASSERT_EQ(first_num, second_num);
 }
 
-
 TEST(PyCode, PyReceive)
 {
     char *payload = c2pool::messages::python::for_test::pymessage::data_for_test_receive();
@@ -31,6 +30,17 @@ TEST(PyCode, PyReceive)
     ASSERT_EQ(res, "1 2 3 4.5.6.7 8 9 10.11.12.13 14 15 16 17 18");
 }
 
+TEST(PyCode, PySend)
+{
+    char *command = "version";
+    char *payload2 = "1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18";
+
+    char *res = c2pool::messages::python::pymessage::send(command, payload2);
+
+    char* realRes = c2pool::messages::python::for_test::pymessage::data_for_test_send();
+    
+    ASSERT_EQ(*res, *realRes);
+}
 
 /* //WORK FOR MESSAGE_VERSION!
 TEST(PyCode, PyReceive)
