@@ -375,6 +375,10 @@ namespace c2pool::messages::python
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
+
+        ret += 2;                 //remove first element ['] in string
+        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
         return ret;
     }
 } // namespace c2pool::messages::python
@@ -549,6 +553,72 @@ namespace c2pool::messages::python::for_test
         }
 
         auto pObjct = PyDict_GetItemString(pDict, (const char *)"checksum_for_test_receive");
+        if (!pObjct)
+        {
+            return ret;
+        }
+
+        // Проверка pObjct на годность.
+        if (!PyCallable_Check(pObjct))
+        {
+            return ret;
+        }
+        auto pVal = PyObject_CallFunction(pObjct, "");
+        if (pVal != NULL)
+        {
+            PyObject *pResultRepr = PyObject_Repr(pVal);
+
+            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
+            // Для начала pResultRepr нужно привести к массиву байтов.
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
+
+            Py_XDECREF(pResultRepr);
+            Py_XDECREF(pVal);
+        }
+
+        ret += 2;                 //remove first 2 element [b'] in string
+        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
+        //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
+        return ret;
+    }
+
+    char *pymessage::data_for_test_send()
+    {
+        c2pool::python::Py::Initialize();
+
+        char *ret = NULL;
+
+        // Загрузка модуля sys
+        auto sys = PyImport_ImportModule("sys");
+        auto sys_path = PyObject_GetAttrString(sys, "path");
+        // Путь до наших исходников Python
+        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        PyList_Append(sys_path, folder_path);
+
+        // Загрузка py файла
+        auto pName = PyUnicode_FromString("packtypes");
+        if (!pName)
+        {
+            return ret;
+        }
+
+        // Загрузить объект модуля
+        auto pModule = PyImport_Import(pName);
+        if (!pModule)
+        {
+
+            return ret;
+        }
+
+        // Словарь объектов содержащихся в модуле
+        auto pDict = PyModule_GetDict(pModule);
+        if (!pDict)
+        {
+            return ret;
+        }
+
+        auto pObjct = PyDict_GetItemString(pDict, (const char *)"data_for_test_send");
         if (!pObjct)
         {
             return ret;
