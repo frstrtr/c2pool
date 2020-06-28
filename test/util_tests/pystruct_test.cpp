@@ -41,25 +41,3 @@ TEST(PyCode, PySend)
     
     ASSERT_EQ(*res, *realRes);
 }
-
-/* //WORK FOR MESSAGE_VERSION!
-TEST(PyCode, PyReceive)
-{
-    char *payload = c2pool::messages::python::for_test::pymessage::data_for_test_receive();
-    char *command = "version";
-    char *checksum = c2pool::messages::python::for_test::pymessage::checksum_for_test_receive();
-
-    std::stringstream received_data = c2pool::messages::python::pymessage::receive(command, checksum, payload);
-
-    c2pool::messages::message_version *msg = new c2pool::messages::message_version();
-    msg->unpack(received_data);
-
-    ASSERT_EQ(msg->nonce, 17);
-}
-*/
-
-/* for test messages:
-    c2pool::messages::address_type addr(1, "test", 1);
-    std::string s = "test";
-    c2pool::messages::message_version* msg = new c2pool::messages::message_version(1, 1, addr, addr, 1, s, 0, 0);
-*/

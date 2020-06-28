@@ -809,8 +809,6 @@ def send(command, payload2):
         called when we send msg from c2pool to p2pool
     """
 
-    
-
     type_ = message_from_str(command)
 
     #if error command
@@ -822,6 +820,7 @@ def send(command, payload2):
     msg = type_()
     payload = msg.pack(payload2)
 
+    print('first pack: {0}'.format(struct.pack('<12sI', command, len(payload))))
     return struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
 
 # ------------------------------------------FOR UNIT TESTS---------------------------------
