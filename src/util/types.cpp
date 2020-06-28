@@ -27,7 +27,7 @@ namespace c2pool::messages
 
     std::ostream &operator<<(std::ostream &os, const address_type &value)
     {
-        os << value.services << ";" << value.address << ";" << value.port;
+        os << value.services << "," << value.address << "," << value.port;
         return os;
     }
 
@@ -51,7 +51,7 @@ namespace c2pool::messages
 
     std::ostream &operator<<(std::ostream &os, const share_type &value)
     {
-        os << value.type << ";"
+        os << value.type << ","
            << "'" << value.contents << "'";
         return os;
     }
@@ -83,7 +83,7 @@ namespace c2pool::messages
 
     std::ostream &operator<<(std::ostream &os, const addr &value)
     {
-        os << value.address << ";" << value.timestamp;
+        os << value.address << "," << value.timestamp;
         return os;
     }
 

@@ -125,9 +125,7 @@ namespace c2pool::messages
 
         IMessage(const char *current_prefix);
 
-        IMessage(char *data_)
-        {
-        }
+        void get_data(char *data_);
 
         //from data to command, length, checksum, payload
         void encode_data();
@@ -146,6 +144,9 @@ namespace c2pool::messages
         void unpack(std::string item);
         void unpack(std::stringstream &ss);
         string pack();
+
+        //для упаковки нужно указать переменную типа char*, куда запишется результат упаковки.
+        char* pack_c_str(char* c_str);
 
         // char *data() override
         // {

@@ -20,6 +20,11 @@ namespace c2pool::messages
         strcpy(prefix, current_prefix);
     }
 
+    void IMessage::get_data(char *data_)
+    {
+        strcpy(data, data_);
+    }
+
     void IMessage::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);
@@ -51,6 +56,15 @@ namespace c2pool::messages
     {
         //TODO:
         return _pack();
+    }
+
+    char *message::pack_c_str(char *c_str)
+    {
+        std::string str = pack();
+        c_str = new char[str.length() + 1];
+        strcpy(c_str, str.c_str());
+        return c_str;
+        //TODO: delete[] c_str;
     }
 
     //message_version
