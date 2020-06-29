@@ -38,6 +38,6 @@ TEST(PyCode, PySend)
     char *res = c2pool::messages::python::pymessage::send(command, payload2);
 
     char* realRes = c2pool::messages::python::for_test::pymessage::data_for_test_send();
-    
+
     ASSERT_EQ(*res, *realRes);
 }
