@@ -770,6 +770,9 @@ def message_pack(command, vars):
 def message_unpack(command, data):
     pass
 
+def bytes_to_char_stringstream(_bytes):
+    chars = [str(byte) for byte in _bytes]
+    return ' '.join(chars)
 #----------------------CPP COMMANDS
 
 def receive_length(msg):
@@ -820,8 +823,11 @@ def send(command, payload2):
     msg = type_()
     payload = msg.pack(payload2)
 
-    print('first pack: {0}'.format(struct.pack('<12sI', command, len(payload))))
-    return struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
+    result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
+    print('py_send result: {0}, after convert: {1}'.format(result, bytes_to_char_stringstream(result)))
+    for i in range(len(result)):
+        print('{0}:{1}'.format(result[i], bytes_to_char_stringstream(result)[i]))
+    return bytes_to_char_stringstream(result)
 
 # ------------------------------------------FOR UNIT TESTS---------------------------------
 
@@ -860,6 +866,15 @@ def checksum_for_test_receive():
 
 def data_for_test_send():
     return send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
+
+def emulate_protocol_get_data(command, payload2):
+    res_send = send(command, payload2)
+    res = ''
+    for i in res_send:
+        res += '{0} '.format(i)
+    res.rstrip(' ')
+
+    
 # ------------------------------------------TESTS------------------------------------------
 """
 def TEST_PACK_UNPACK():
@@ -921,4 +936,4 @@ def TEST_UNPACKRES():
 # TEST_UNPACKRES()
 """
 
-#print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))
+send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')

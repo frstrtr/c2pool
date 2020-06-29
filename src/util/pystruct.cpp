@@ -4,6 +4,7 @@
 #include <filesys.h>
 #include <iostream>
 #include <sstream>
+#include "other.h"
 
 using namespace std;
 
@@ -376,10 +377,12 @@ namespace c2pool::messages::python
             Py_XDECREF(pVal);
         }
 
-        ret += 2;                 //remove first element ['] in string
+        ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        return ret;
+        
+        
+        return c2pool::str::from_bytes_to_strChar(ret);
     }
 } // namespace c2pool::messages::python
 
@@ -647,5 +650,71 @@ namespace c2pool::messages::python::for_test
 
         //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
         return ret;
+    }
+
+    std::stringstream pymessage::emulate_protocol_get_data(char *comamnd, char *payload2)
+    {
+        c2pool::python::Py::Initialize();
+
+        stringstream res;
+
+        char *ret = NULL;
+
+        // Загрузка модуля sys
+        auto sys = PyImport_ImportModule("sys");
+        auto sys_path = PyObject_GetAttrString(sys, "path");
+        // Путь до наших исходников Python
+        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        PyList_Append(sys_path, folder_path);
+
+        // Загрузка py файла
+        auto pName = PyUnicode_FromString("packtypes");
+        if (!pName)
+        {
+            return res;
+        }
+
+        // Загрузить объект модуля
+        auto pModule = PyImport_Import(pName);
+        if (!pModule)
+        {
+            return res;
+        }
+
+        // Словарь объектов содержащихся в модуле
+        auto pDict = PyModule_GetDict(pModule);
+        if (!pDict)
+        {
+            return res;
+        }
+
+        auto pObjct = PyDict_GetItemString(pDict, (const char *)"emulate_protocol_get_data");
+        if (!pObjct)
+        {
+            return res;
+        }
+
+        // Проверка pObjct на годность.
+        if (!PyCallable_Check(pObjct))
+        {
+            return res;
+        }
+
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", comamnd, payload2);
+        if (pVal != NULL)
+        {
+            PyObject *pResultRepr = PyObject_Repr(pVal);
+
+            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
+            // Для начала pResultRepr нужно привести к массиву байтов.
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
+            Py_XDECREF(pResultRepr);
+            Py_XDECREF(pVal);
+        }
+        ret++;                    //remove first element ['] in string
+        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
+        res << ret;
+        return res;
     }
 } // namespace c2pool::messages::python::for_test
