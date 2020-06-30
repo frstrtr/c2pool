@@ -48,60 +48,64 @@ TEST(TestMessages, message_version)
     secondMsg->get_data(data);
     secondMsg->encode_data();
 
-    //std::cout << "len: " << secondMsg->length << std::endl;
+    std::cout << "len: " << secondMsg->length << std::endl;
     //TODO: while(sstream >> int) {int -> char}
-    
-    std::cout << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131);
+
+    std::cout << "IN TEST: " << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131);
 }
 
-TEST(TestMessages, bytes_convert_test)
-{
-    // char *data1 = "a\0bcd\nefgs";
-    // boost::array<char, 100> arr = {'a', '\0', 'b', 'c', 'd', '\n', 'e', 'f', 'g'};
-    // auto buff = boost::asio::buffer(data1, 10);
-    // std::string str(data1, 10);
-    // std::cout << "test str: " << str << std::endl;
-    // std::cout << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data1) << std::endl;
-    // char *data2 = "a\\0b";
-    // std::cout << data1 << "with len: " << strlen(data1) << ", with sizeof: " << sizeof(data1)  << std::endl;
-    // ASSERT_EQ(*data1, *arr.data());
+// TEST(TestMessages, bytes_convert_test)
+// {
+//     // char *data1 = "a\0bcd\nefgs";
+//     // boost::array<char, 100> arr = {'a', '\0', 'b', 'c', 'd', '\n', 'e', 'f', 'g'};
+//     // auto buff = boost::asio::buffer(data1, 10);
+//     // std::string str(data1, 10);
+//     // std::cout << "test str: " << str << std::endl;
+//     // std::cout << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data1) << std::endl;
+//     // char *data2 = "a\\0b";
+//     // std::cout << data1 << "with len: " << strlen(data1) << ", with sizeof: " << sizeof(data1)  << std::endl;
+//     // ASSERT_EQ(*data1, *arr.data());
 
-    //____________________________________
-    // std::vector<char> vec(100);
-    // strncpy(&vec[0], "a\0bcd\nefgs", 100);
-    // std::string str(vec.begin(), vec.end());
-    // //std::string str = "a\0bcd\nefgs";
-    // std::cout << "str: " << str << std::endl;
-    // char *str_c = new char[str.length() + 1];
-    // strcpy(str_c, str.c_str());
-    // std::cout << "str_c: " << str_c << std::endl;
-    // for (int i = 0; i < str.length(); i++)
-    // {
-    //     std::cout << str_c[i];
-    // }
-    // std::cout << std::endl;
-    //__________________________
-    std::string x("pq\0rs", 5); // 5 Characters as the input is now a char array with 5 characters.
-    std::cout << x << std::endl;
-    std::cout << x.length() << std::endl;
+//     //____________________________________
+//     // std::vector<char> vec(100);
+//     // strncpy(&vec[0], "a\0bcd\nefgs", 100);
+//     // std::string str(vec.begin(), vec.end());
+//     // //std::string str = "a\0bcd\nefgs";
+//     // std::cout << "str: " << str << std::endl;
+//     // char *str_c = new char[str.length() + 1];
+//     // strcpy(str_c, str.c_str());
+//     // std::cout << "str_c: " << str_c << std::endl;
+//     // for (int i = 0; i < str.length(); i++)
+//     // {
+//     //     std::cout << str_c[i];
+//     // }
+//     // std::cout << std::endl;
+//     //__________________________
 
-    char *str_c = new char[x.length() + 1];
-    memcpy(str_c, x.c_str(), 5);
-    std::cout << "str_c: " << str_c << std::endl;
-    for (int i = 0; i < x.length(); i++)
-    {
-        std::cout << i << ":" << str_c[i] << std::endl;
-    }
-    std::cout << ((char*)boost::asio::buffer(str_c, 5).data())[3] << std::endl;
 
-    std::string x2("pq\0rss", 5);
-    std::string x3("qq\0rs", 5);
-    std::string x4("pq\0r", 4);
-    std::cout << std::memcmp(str_c, x.c_str(), 5) << std::endl; //0
-    std::cout << std::memcmp(str_c, x2.c_str(), 5) << std::endl; //0
-    std::cout << std::memcmp(str_c, x3.c_str(), 5) << std::endl; //-1
-    std::cout << std::memcmp(str_c, x4.c_str(), 5) << std::endl; //1
-}
+
+
+//     std::string x("pq\0rs", 5); // 5 Characters as the input is now a char array with 5 characters.
+//     std::cout << x << std::endl;
+//     std::cout << x.length() << std::endl;
+
+//     char *str_c = new char[x.length() + 1];
+//     memcpy(str_c, x.c_str(), 5);
+//     std::cout << "str_c: " << str_c << std::endl;
+//     for (int i = 0; i < x.length(); i++)
+//     {
+//         std::cout << i << ":" << str_c[i] << std::endl;
+//     }
+//     std::cout << ((char*)boost::asio::buffer(str_c, 5).data())[3] << std::endl;
+
+//     std::string x2("pq\0rss", 5);
+//     std::string x3("qq\0rs", 5);
+//     std::string x4("pq\0r", 4);
+//     std::cout << std::memcmp(str_c, x.c_str(), 5) << std::endl; //0
+//     std::cout << std::memcmp(str_c, x2.c_str(), 5) << std::endl; //0
+//     std::cout << std::memcmp(str_c, x3.c_str(), 5) << std::endl; //-1
+//     std::cout << std::memcmp(str_c, x4.c_str(), 5) << std::endl; //1
+// }
 
 /* //WORK FOR MESSAGE_VERSION!
 TEST(PyCode, PyReceive)

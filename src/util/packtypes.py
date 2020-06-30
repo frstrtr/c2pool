@@ -873,8 +873,8 @@ def emulate_protocol_get_data(command, payload2):
     res.rstrip(' ')
 
 def test_get_bytes_from_cpp(_bytes):
-    print('test_get_bytes_from_cpp: _bytes = {0}'.format(_bytes))
-    return bytes(_bytes, encoding = 'utf-8')
+    #print('test_get_bytes_from_cpp: _bytes = {0}'.format(_bytes))
+    return _bytes.decode('ISO-8859-1')
     
 # ------------------------------------------TESTS------------------------------------------
 """

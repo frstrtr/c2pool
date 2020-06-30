@@ -769,8 +769,8 @@ namespace c2pool::messages::python::for_test
 
             // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
             // Для начала pResultRepr нужно привести к массиву байтов.
-            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
-
+            //ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "ISO-8859-1", "ERROR")));
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
