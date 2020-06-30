@@ -47,6 +47,8 @@ namespace c2pool::messages::python::for_test
 
         //called, when send message to p2pool [packed]
         static std::stringstream emulate_protocol_get_data(char *comamnd, char *payload2);
+
+        static char *test_get_bytes_from_cpp(char *data, int len);
     };
 } // namespace c2pool::messages::python::for_test
 

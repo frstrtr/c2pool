@@ -84,19 +84,19 @@ namespace c2pool::str
         while (ss >> buff)
         {
             char bbuff = buff;
-            std::cout << "int:" << buff << ", char: '" << bbuff << "'" << std::endl;
             str_result += bbuff;
         }
-        std::cout << "lentgth ss: " << str_result.length() << std::endl;
-        std::cout << "str_result: " << str_result << std::endl;
-        std::cout << "str_result.c_str(): " << str_result.c_str() << std::endl;
+        // std::cout << "lentgth ss: " << str_result.length() << std::endl;
+        // std::cout << "str_result: " << str_result << std::endl;
+        // std::cout << "str_result.c_str(): " << str_result.c_str() << std::endl;
         char *result = new char[str_result.length() + 1];
-        strcpy(result, str_result.c_str());
-        std::cout << "result: " << result[17] << std::endl;
+        memcpy(result, str_result.c_str(), str_result.length());
         // for (int i = 0; i < str_result.length(); i++)
         // {
             
         // }
+
+        
         return result;
     }
 } // namespace c2pool::str

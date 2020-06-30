@@ -380,8 +380,6 @@ namespace c2pool::messages::python
         ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        
-        
         return c2pool::str::from_bytes_to_strChar(ret);
     }
 } // namespace c2pool::messages::python
@@ -716,5 +714,71 @@ namespace c2pool::messages::python::for_test
 
         res << ret;
         return res;
+    }
+
+    char *pymessage::test_get_bytes_from_cpp(char *data, int len)
+    {
+        c2pool::python::Py::Initialize();
+
+        char *ret = NULL;
+
+        // Загрузка модуля sys
+        auto sys = PyImport_ImportModule("sys");
+        auto sys_path = PyObject_GetAttrString(sys, "path");
+        // Путь до наших исходников Python
+        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        PyList_Append(sys_path, folder_path);
+
+        // Загрузка py файла
+        auto pName = PyUnicode_FromString("packtypes");
+        if (!pName)
+        {
+            return ret;
+        }
+
+        // Загрузить объект модуля
+        auto pModule = PyImport_Import(pName);
+        if (!pModule)
+        {
+
+            return ret;
+        }
+
+        // Словарь объектов содержащихся в модуле
+        auto pDict = PyModule_GetDict(pModule);
+        if (!pDict)
+        {
+            return ret;
+        }
+
+        auto pObjct = PyDict_GetItemString(pDict, (const char *)"test_get_bytes_from_cpp");
+        if (!pObjct)
+        {
+            return ret;
+        }
+
+        // Проверка pObjct на годность.
+        if (!PyCallable_Check(pObjct))
+        {
+            return ret;
+        }
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(y#)", data, len);
+        if (pVal != NULL)
+        {
+            PyObject *pResultRepr = PyObject_Repr(pVal);
+
+            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
+            // Для начала pResultRepr нужно привести к массиву байтов.
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
+
+            Py_XDECREF(pResultRepr);
+            Py_XDECREF(pVal);
+        }
+
+        ret += 2;                 //remove first 2 element [b'] in string
+        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
+        //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
+        return ret;
     }
 } // namespace c2pool::messages::python::for_test

@@ -824,9 +824,7 @@ def send(command, payload2):
     payload = msg.pack(payload2)
 
     result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-    print('py_send result: {0}, after convert: {1}'.format(result, bytes_to_char_stringstream(result)))
-    for i in range(len(result)):
-        print('{0}:{1}'.format(result[i], bytes_to_char_stringstream(result)[i]))
+    print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
 # ------------------------------------------FOR UNIT TESTS---------------------------------
@@ -874,6 +872,9 @@ def emulate_protocol_get_data(command, payload2):
         res += '{0} '.format(i)
     res.rstrip(' ')
 
+def test_get_bytes_from_cpp(_bytes):
+    print('test_get_bytes_from_cpp: _bytes = {0}'.format(_bytes))
+    return bytes(_bytes, encoding = 'utf-8')
     
 # ------------------------------------------TESTS------------------------------------------
 """
@@ -936,4 +937,4 @@ def TEST_UNPACKRES():
 # TEST_UNPACKRES()
 """
 
-send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
+#send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
