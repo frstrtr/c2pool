@@ -42,16 +42,35 @@ TEST(TestMessages, message_version)
 
     char *data = c2pool::messages::python::pymessage::send(command /*TODO:firstMsg->command*/, firstMsg->pack_c_str(packedFirstMsg));
 
-    std::cout << data << std::endl;
-
+    for (int i = 0; i < 120; i++)
+    {
+        std::cout << "DATA[ " << i << "]" << (int)data[i] << std::endl;
+    }
     c2pool::messages::message_version *secondMsg = new c2pool::messages::message_version();
     secondMsg->get_data(data);
     secondMsg->encode_data();
 
-    std::cout << "len: " << secondMsg->length << std::endl;
+    for (int i = 0; i < 50; i++)
+    {
+        std::cout << "sym[i]: " << secondMsg->payload[i] << std::endl;
+    }
     //TODO: while(sstream >> int) {int -> char}
 
-    std::cout << "IN TEST: " << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131);
+    std::cout << "IN TEST: " << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131) << std::endl;
+    ;
+
+    char *dest1 = new char[9];
+    char *source = "tes\0tdata";
+    strncpy(dest1, source + 3, 4);
+    dest1[4] = 0;
+    char *dest2;
+    memcpy(dest2, source + 3, 4);
+    dest2[4] = 0;
+
+    std::cout << "dest1: " << dest1 << std::endl;
+    std::cout << "dest2: " << dest2 << std::endl;
+
+    std::cout << memcmp(dest1, dest2, 4);
 }
 
 // TEST(TestMessages, bytes_convert_test)
@@ -81,9 +100,6 @@ TEST(TestMessages, message_version)
 //     // }
 //     // std::cout << std::endl;
 //     //__________________________
-
-
-
 
 //     std::string x("pq\0rs", 5); // 5 Characters as the input is now a char array with 5 characters.
 //     std::cout << x << std::endl;

@@ -27,64 +27,6 @@ namespace c2pool::messages
         cmd_addrme
     };
 
-    /*class IMessage
-    {
-    protected:
-        enum
-        {
-            command_length = 12
-        };
-        enum
-        {
-            payload_length = 4 //len(payload)
-        };
-        enum
-        {
-            checksum_length = 4 //sha256(sha256(payload))[:4]
-        };
-        enum
-        {
-            max_body_length = 8000000
-        };
-
-    public:
-        IMessage() {}
-
-        IMessage(IMessage &msgData);
-
-        const char *data() const
-        {
-            return data_;
-        }
-
-        char *data()
-        {
-            return data_;
-        }
-
-        std::size_t length() const
-        {
-            return header_length + body_length_;
-        }
-
-        virtual bool decode_header()
-        {
-            char header[header_length + 1] = "";
-            std::strncat(header, data_, header_length);
-            body_length_ = std::atoi(header);
-            if (body_length_ > max_body_length)
-            {
-                body_length_ = 0;
-                return false;
-            }
-            return true;
-        };
-
-    protected:
-        char data[command_length + payload_length + checksum_length + max_body_length];
-        std::size_t body_length_;
-    }; */
-
     class IMessage
     {
     public:
@@ -114,6 +56,7 @@ namespace c2pool::messages
         char *prefix;
         char command[command_length + 1];
         char length[payload_length + 1];
+        unsigned int unpacked_length;
         char checksum[checksum_length + 1];
         char payload[max_payload_length + 1];
         char data[command_length + payload_length + checksum_length + max_payload_length]; //full message without prefix
