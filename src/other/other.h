@@ -43,7 +43,9 @@ namespace c2pool::smart_ptr
 
 namespace c2pool::str
 {
-    void substr(char *dest, char *source, int from, int length);
+
+    //from [exclude]
+    void substr(char *dest, char *source, int from, unsigned int length);
 
     char* from_bytes_to_strChar(char* source);
 } // namespace c2pool::str

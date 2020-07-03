@@ -22,7 +22,7 @@ namespace c2pool::messages::python
     class pymessage
     {
     public:
-        static int receive_length(char *length_data);
+        static unsigned int receive_length(char *length_data);
 
         //called, when get message from p2pool [unpacked]
         static std::stringstream receive(char *command, char *checksum, char *payload);

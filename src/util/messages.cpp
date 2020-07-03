@@ -22,15 +22,17 @@ namespace c2pool::messages
 
     void IMessage::get_data(char *data_)
     {
-        strcpy(data, data_);
+        memcpy(data, data_, 131);
+        //strcpy(data, data_);
     }
 
     void IMessage::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);
         c2pool::str::substr(length, data, command_length, payload_length);
+        c2pool::messages::python::pymessage::receive_length(length);
         c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
-        c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, max_payload_length);
+        c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, unpacked_length);
     }
 
     void IMessage::decode_data()

@@ -69,9 +69,9 @@ namespace c2pool::time
 
 namespace c2pool::str
 {
-    void substr(char *dest, char *source, int from, int length)
+    void substr(char *dest, char *source, int from, unsigned int length)
     {
-        strncpy(dest, source + from, length);
+        memcpy(dest, source + from, length);
         dest[length] = 0;
     }
 

@@ -778,9 +778,10 @@ def bytes_to_char_stringstream(_bytes):
 def receive_length(msg):
     #print('receive_length get: {0}, type {1}; after encoding {2}'.format(msg, type(msg), bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
     #print('when bytes {0}'.format(bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
-    length, = struct.unpack('<I', bytes(msg, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1'))
+    #length, = struct.unpack('<I', bytes(msg, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1'))
+    length, = struct.unpack('<I', msg)
     #print('length = {0}'.format(length))
-    return str(length)
+    return length
 
 def receive(_command, checksum, _payload):
     """

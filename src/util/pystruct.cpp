@@ -179,11 +179,11 @@ stringstream pystruct::unpack(char *types, char *vars)
 namespace c2pool::messages::python
 {
 
-    int pymessage::receive_length(char *length_data)
+    unsigned int pymessage::receive_length(char *length_data)
     {
         c2pool::python::Py::Initialize();
 
-        int result_method = 0;
+        unsigned int result_method = 0;
 
         std::stringstream res;
 
@@ -229,14 +229,14 @@ namespace c2pool::messages::python
             return result_method;
         }
 
-        auto pVal = PyObject_CallFunction(pObjct, (char *)"(s)", length_data);
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(y#)", length_data, 4);
         if (pVal != NULL)
         {
             PyObject *pResultRepr = PyObject_Repr(pVal);
 
             // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
             // Для начала pResultRepr нужно привести к массиву байтов.
-            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "ISO-8859-1", "ERROR")));
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
@@ -775,7 +775,7 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pVal);
         }
 
-        ret += 2;                 //remove first 2 element [b'] in string
+        ret += 1;                 //remove first 2 element [b'] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
         //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
