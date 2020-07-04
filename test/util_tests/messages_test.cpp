@@ -57,20 +57,30 @@ TEST(TestMessages, message_version)
     //TODO: while(sstream >> int) {int -> char}
 
     std::cout << "IN TEST: " << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131) << std::endl;
-    ;
 
+    std::cout << "test" << std::endl;
     char *dest1 = new char[9];
     char *source = "tes\0tdata";
-    strncpy(dest1, source + 3, 4);
+    std::cout << "test" << std::endl;
+    strncpy(dest1, source + 4, 4);
     dest1[4] = 0;
-    char *dest2;
-    memcpy(dest2, source + 3, 4);
+    std::cout << "test" << std::endl;
+    char *dest2 = new char[4];
+    memcpy(dest2, source + 4, 4);
+    std::cout << "test" << std::endl;
+    dest2[3] = (char) 255;
     dest2[4] = 0;
 
     std::cout << "dest1: " << dest1 << std::endl;
-    std::cout << "dest2: " << dest2 << std::endl;
+    std::cout << "dest2: " << (int)(dest2)[3] << std::endl;
+
+    for(int i = 0; i <= 255; i++){
+        std::cout << "chr(" << i << "): " << (unsigned char)i << std::endl;
+    }
 
     std::cout << memcmp(dest1, dest2, 4);
+
+    //std::cout << ((char*)boost::asio::buffer(dest2, 4).data()) << std::endl;
 }
 
 // TEST(TestMessages, bytes_convert_test)
