@@ -783,14 +783,18 @@ def receive_length(msg):
     #print('length = {0}'.format(length))
     return length
 
-def receive(_command, checksum, _payload):
+def receive(_command, checksum, payload):
     """
         called when we receive msg from p2pool to c2pool
     """
+    
+    print('_command = {0}'.format(_command))
+    print('checksum = {0}'.format(checksum))
+    print('payload = {0}'.format(payload))
 
     command = _command.rstrip('\0')
-    payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
-    checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
+    # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
+    # checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
 
     #checksum check
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
@@ -825,7 +829,7 @@ def send(command, payload2):
     payload = msg.pack(payload2)
 
     result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-    print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
+    #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
 # ------------------------------------------FOR UNIT TESTS---------------------------------
@@ -833,9 +837,9 @@ def send(command, payload2):
 def get_packed_int(num):
     #print('get_packed_int() get {0}; packed: {1} '.format(num, struct.pack('<I', num)))
 
-    return struct.pack('<I', num)
+    return bytes_to_char_stringstream(struct.pack('<I', num))
 
-def data_for_test_receive():
+def data_for_test_receive(to_char = True):
     message_version = ComposedType([
         ('version', IntType(32)),
         ('services', IntType(64)),
@@ -858,10 +862,16 @@ def data_for_test_receive():
         'best_share_hash':18
         }
     #---------------------
-    return message_version.pack(message_version_dict)
+    if to_char:
+        return bytes_to_char_stringstream(message_version.pack(message_version_dict))
+    else:
+        return message_version.pack(message_version_dict)
+
+def length_for_test_receive():
+    return len(data_for_test_receive(False))
 
 def checksum_for_test_receive():
-    return hashlib.sha256(hashlib.sha256(data_for_test_receive()).digest()).digest()[:4]
+    return bytes_to_char_stringstream(hashlib.sha256(hashlib.sha256(data_for_test_receive(False)).digest()).digest()[:4])
 
 def data_for_test_send():
     return send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
@@ -939,3 +949,7 @@ def TEST_UNPACKRES():
 """
 
 #send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
+
+# print(data_for_test_receive())
+# print(checksum_for_test_receive())
+# print(length_for_test_receive())

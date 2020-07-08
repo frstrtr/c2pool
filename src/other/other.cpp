@@ -91,12 +91,7 @@ namespace c2pool::str
         // std::cout << "str_result.c_str(): " << str_result.c_str() << std::endl;
         unsigned char *result = new unsigned char[str_result.length() + 1];
         memcpy(result, str_result.c_str(), str_result.length());
-        // for (int i = 0; i < str_result.length(); i++)
-        // {
-            
-        // }
 
-        std:: cout << "TestFROMBYTES: " << (int)((unsigned char*)((char*)result))[50] << std::endl;
         return (char*)result;
     }
 } // namespace c2pool::str

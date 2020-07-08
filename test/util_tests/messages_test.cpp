@@ -42,18 +42,18 @@ TEST(TestMessages, message_version)
 
     char *data = c2pool::messages::python::pymessage::send(command /*TODO:firstMsg->command*/, firstMsg->pack_c_str(packedFirstMsg));
 
-    for (int i = 0; i < 120; i++)
-    {
-        std::cout << "DATA[ " << i << "]" << (int)data[i] << std::endl;
-    }
+    // for (int i = 0; i < 120; i++)
+    // {
+    //     std::cout << "DATA[ " << i << "]" << (int)data[i] << std::endl;
+    // }
     c2pool::messages::message_version *secondMsg = new c2pool::messages::message_version();
     secondMsg->get_data(data);
     secondMsg->encode_data();
 
-    for (int i = 0; i < 50; i++)
-    {
-        std::cout << "sym[i]: " << secondMsg->payload[i] << std::endl;
-    }
+    // for (int i = 0; i < 50; i++)
+    // {
+    //     std::cout << "sym[i]: " << secondMsg->payload[i] << std::endl;
+    // }
     //TODO: while(sstream >> int) {int -> char}
 
     std::cout << "IN TEST: " << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131) << std::endl;
@@ -74,9 +74,9 @@ TEST(TestMessages, message_version)
     std::cout << "dest1: " << dest1 << std::endl;
     std::cout << "dest2: " << (int)(dest2)[3] << std::endl;
 
-    for(int i = 0; i <= 255; i++){
-        std::cout << "chr(" << i << "): " << (unsigned char)i << std::endl;
-    }
+    // for(int i = 0; i <= 255; i++){
+    //     std::cout << "chr(" << i << "): " << (unsigned char)i << std::endl;
+    // }
 
     std::cout << memcmp(dest1, dest2, 4);
 

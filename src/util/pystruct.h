@@ -25,10 +25,11 @@ namespace c2pool::messages::python
         static unsigned int receive_length(char *length_data);
 
         //called, when get message from p2pool [unpacked]
-        static std::stringstream receive(char *command, char *checksum, char *payload);
+        static std::stringstream receive(char *command, char *checksum, char *payload, unsigned int length);
 
+        //TODO: prefix
         //called, when send message to p2pool [packed]
-        static char *send(char *comamnd, char *payload2);
+        static char *send(char *command, char *payload2);
     };
 } // namespace c2pool::messages::python
 
@@ -42,6 +43,8 @@ namespace c2pool::messages::python::for_test
         static char *data_for_test_receive();
 
         static char *checksum_for_test_receive();
+
+        static unsigned int length_for_test_receive();
 
         static char *data_for_test_send();
 
