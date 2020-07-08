@@ -19,9 +19,10 @@ TEST(PyCode, PyReceive)
 {
     char *payload = c2pool::messages::python::for_test::pymessage::data_for_test_receive();
     char *command = "version";
+    unsigned int length = c2pool::messages::python::for_test::pymessage::length_for_test_receive();
     char *checksum = c2pool::messages::python::for_test::pymessage::checksum_for_test_receive();
 
-    std::stringstream received_data = c2pool::messages::python::pymessage::receive(command, checksum, payload);
+    std::stringstream received_data = c2pool::messages::python::pymessage::receive(command, checksum, payload, length);
 
     std::string res;
 
@@ -37,7 +38,7 @@ TEST(PyCode, PySend)
 
     char *res = c2pool::messages::python::pymessage::send(command, payload2);
 
-    char* realRes = c2pool::messages::python::for_test::pymessage::data_for_test_send();
+    char *realRes = c2pool::messages::python::for_test::pymessage::data_for_test_send();
 
     ASSERT_EQ(*res, *realRes);
 }

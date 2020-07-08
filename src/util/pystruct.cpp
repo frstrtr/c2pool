@@ -240,10 +240,8 @@ namespace c2pool::messages::python
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
-        ret += 1;                 //remove first element ['] in string
-        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        //std::cout << ret << std::endl; //TODO: DEBUG_PYTHON
+        //std::cout << "ret: " << ret << std::endl; //TODO: DEBUG_PYTHON
 
         res << ret;
         res >> result_method;
@@ -251,7 +249,7 @@ namespace c2pool::messages::python
         return result_method;
     }
 
-    std::stringstream pymessage::receive(char *command, char *checksum, char *payload)
+    std::stringstream pymessage::receive(char *command, char *checksum, char *payload, unsigned int length)
     {
         c2pool::python::Py::Initialize();
 
@@ -299,7 +297,7 @@ namespace c2pool::messages::python
             return res;
         }
 
-        auto pVal = PyObject_CallFunction(pObjct, (char *)"(sss)", command, checksum, payload);
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(sy#y#)", command, checksum, 4, payload, length);
         if (pVal != NULL)
         {
             PyObject *pResultRepr = PyObject_Repr(pVal);
@@ -317,7 +315,7 @@ namespace c2pool::messages::python
         return res;
     }
 
-    char *pymessage::send(char *comamnd, char *payload2)
+    char *pymessage::send(char *command, char *payload2)
     {
 
         c2pool::python::Py::Initialize();
@@ -364,7 +362,7 @@ namespace c2pool::messages::python
             return ret;
         }
 
-        auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", comamnd, payload2);
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", command, payload2);
         if (pVal != NULL)
         {
             PyObject *pResultRepr = PyObject_Repr(pVal);
@@ -445,11 +443,11 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pVal);
         }
 
-        ret += 2;                 //remove first element ['] in string
+        ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
         //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
-        return ret;
+        return c2pool::str::from_bytes_to_strChar(ret);
     }
 
     char *pymessage::data_for_test_receive()
@@ -510,12 +508,12 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
+        //std::cout << "data_for_test_receive(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
 
-        ret += 2;                 //remove first element ['] in string
+        ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
-        return ret;
+        return c2pool::str::from_bytes_to_strChar(ret);
     }
 
     char *pymessage::checksum_for_test_receive()
@@ -577,11 +575,82 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pVal);
         }
 
-        ret += 2;                 //remove first 2 element [b'] in string
+        //std::cout << "checksum_for_test_receive(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
+
+        ret += 1;                 //remove first 2 element [b'] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
-        //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
-        return ret;
+        return c2pool::str::from_bytes_to_strChar(ret);
+    }
+
+    unsigned int pymessage::length_for_test_receive()
+    {
+        c2pool::python::Py::Initialize();
+
+        unsigned int result_method = 0;
+
+        std::stringstream res;
+
+        char *ret = NULL;
+
+        // Загрузка модуля sys
+        auto sys = PyImport_ImportModule("sys");
+        auto sys_path = PyObject_GetAttrString(sys, "path");
+        // Путь до наших исходников Python
+        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        PyList_Append(sys_path, folder_path);
+
+        // Загрузка py файла
+        auto pName = PyUnicode_FromString("packtypes");
+        if (!pName)
+        {
+            return result_method;
+        }
+
+        // Загрузить объект модуля
+        auto pModule = PyImport_Import(pName);
+        if (!pModule)
+        {
+            return result_method;
+        }
+
+        // Словарь объектов содержащихся в модуле
+        auto pDict = PyModule_GetDict(pModule);
+        if (!pDict)
+        {
+            return result_method;
+        }
+
+        auto pObjct = PyDict_GetItemString(pDict, (const char *)"length_for_test_receive");
+        if (!pObjct)
+        {
+            return result_method;
+        }
+
+        // Проверка pObjct на годность.
+        if (!PyCallable_Check(pObjct))
+        {
+            return result_method;
+        }
+
+        auto pVal = PyObject_CallFunction(pObjct, "");
+        if (pVal != NULL)
+        {
+            PyObject *pResultRepr = PyObject_Repr(pVal);
+
+            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
+            // Для начала pResultRepr нужно привести к массиву байтов.
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "ISO-8859-1", "ERROR")));
+            Py_XDECREF(pResultRepr);
+            Py_XDECREF(pVal);
+        }
+
+        //std::cout << "ret: " << ret << std::endl; //TODO: DEBUG_PYTHON
+
+        res << ret;
+        res >> result_method;
+
+        return result_method;
     }
 
     char *pymessage::data_for_test_send()
@@ -643,14 +712,16 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pVal);
         }
 
-        ret += 2;                 //remove first 2 element [b'] in string
+        //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
+
+        ret += 1;                 //remove first 2 element [b'] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
         //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
-        return ret;
+        return c2pool::str::from_bytes_to_strChar(ret);
     }
 
-    std::stringstream pymessage::emulate_protocol_get_data(char *comamnd, char *payload2)
+    std::stringstream pymessage::emulate_protocol_get_data(char *command, char *payload2)
     {
         c2pool::python::Py::Initialize();
 
@@ -698,7 +769,7 @@ namespace c2pool::messages::python::for_test
             return res;
         }
 
-        auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", comamnd, payload2);
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", command, payload2);
         if (pVal != NULL)
         {
             PyObject *pResultRepr = PyObject_Repr(pVal);
