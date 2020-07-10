@@ -80,9 +80,7 @@ namespace c2pool::messages
     class message : public IMessage
     {
     public:
-        const std::string command;
-
-        message(std::string cmd) : command(cmd) {}
+        message(const char* _cmd);
 
         void unpack(std::string item);
         void unpack(std::stringstream &ss);

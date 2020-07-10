@@ -42,6 +42,11 @@ namespace c2pool::messages
 
     //message
 
+    message::message(const char *_cmd)
+    {
+        strcpy(command, _cmd);
+    }
+
     void message::unpack(std::string item)
     {
         std::stringstream ss;
@@ -100,7 +105,7 @@ namespace c2pool::messages
     std::string message_ping::_pack()
     {
         c2pool::pack::ComposedType ct;
-        ct.add(command);
+        //TODO: ct.add(cmd);
         return ct.read();
     }
 
