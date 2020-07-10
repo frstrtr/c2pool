@@ -5,6 +5,7 @@
 #include <iostream>
 #include <sstream>
 #include "other.h"
+#include "messages.h"
 
 using namespace std;
 
@@ -379,6 +380,14 @@ namespace c2pool::messages::python
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 
         return c2pool::str::from_bytes_to_strChar(ret);
+    }
+
+    char *pymessage::send(c2pool::messages::message *msg)
+    {
+        char* payload2;
+        msg->pack_c_str(payload2);
+
+        return send(msg->command, payload2);
     }
 } // namespace c2pool::messages::python
 

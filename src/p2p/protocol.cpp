@@ -102,7 +102,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        read_checksum();
+                                        read_payload();
                                     }
                                     else
                                     {
@@ -174,6 +174,74 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_version *msg)
     {
+
+        std::cout << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version << ", client version " << msg->sub_version; //TODO: to Log system
+
+        if (other_version != -1)
+        {
+            //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
+        }
+        if (msg->version < c2pool::config::MINIMUM_PROTOCOL_VERSION)
+        {
+            //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
+        }
+
+        other_version = msg->version;
+        other_sub_version = msg->sub_version;
+        other_services = msg->services;
+
+        if (_nonce == node->nonce) //TODO: add nonce in Node
+        {
+            //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
+        }
+
+        //detect duplicate in node->peers
+        for (auto _peer : node->peers)
+        {
+            if (_peer.first == _nonce)
+            {
+                string err = "Detected duplicate connection, disconnecting from " + std::get<0>(addr) + ":" + to_string(std::get<1>(addr));
+                Log::Debug(err);
+                disconnect();
+                return;
+            }
+        }
+
+        nonce = _nonce;
+        connected2 = true;
+
+        //TODO: safe thrade cancel
+        timeout_delayed.cancel();
+        //timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100)); //todo: timer io from constructor
+        timeout_delayed.async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
+        //_____________
+
+        /* TODO: TIMER + DELEGATE
+             old_dataReceived = self.dataReceived
+        def new_dataReceived(data):
+            if self.timeout_delayed is not None:
+                self.timeout_delayed.reset(100)
+            old_dataReceived(data)
+        self.dataReceived = new_dataReceived
+             */
+
+        factory->proto_connected(this);
+
+        /* TODO: thread (coroutine?):
+             self._stop_thread = deferral.run_repeatedly(lambda: [
+            self.send_ping(),
+        random.expovariate(1/100)][-1])
+
+             if self.node.advertise_ip:
+            self._stop_thread2 = deferral.run_repeatedly(lambda: [
+                self.sendAdvertisement(),
+            random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
+             */
+
+        if (best_hash != -1)
+        {                                                 // -1 = None
+            node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
+        }
     }
 
     void Protocol::handle(c2pool::messages::message_addrs *msg)

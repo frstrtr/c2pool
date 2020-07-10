@@ -5,6 +5,10 @@
 #include <sstream>
 using namespace std;
 
+namespace c2pool::messages{
+    class message;
+}
+
 namespace c2pool::python
 {
     class Py
@@ -30,6 +34,8 @@ namespace c2pool::messages::python
         //TODO: prefix
         //called, when send message to p2pool [packed]
         static char *send(char *command, char *payload2);
+
+        static char *send(c2pool::messages::message* msg);
     };
 } // namespace c2pool::messages::python
 
