@@ -92,6 +92,13 @@ namespace c2pool::str
         unsigned char *result = new unsigned char[str_result.length() + 1];
         memcpy(result, str_result.c_str(), str_result.length());
 
-        return (char*)result;
+        return (char *)result;
+    }
+
+    bool compare_str(char *first_str, char *second_str, unsigned int length)
+    {
+        if (memcmp(first_str, second_str, length) == 0)
+            return true;
+        return false;
     }
 } // namespace c2pool::str

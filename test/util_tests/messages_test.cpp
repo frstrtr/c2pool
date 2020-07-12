@@ -4,6 +4,7 @@
 #include <string>
 #include "types.h"
 #include "other.h"
+#include <sstream>
 
 //____ remove
 #include <boost/asio.hpp>
@@ -21,136 +22,42 @@ TEST(TestMessages, IMessage)
 
 TEST(TestMessages, message_version)
 {
-    // char *payload = c2pool::messages::python::for_test::pymessage::data_for_test_receive();
-    // char *command = "version";
-    // char *checksum = c2pool::messages::python::for_test::pymessage::checksum_for_test_receive();
-
-    // std::stringstream received_data = c2pool::messages::python::pymessage::receive(command, checksum, payload);
-
-    // c2pool::messages::message_version *msg = new c2pool::messages::message_version();
-    // msg->unpack(received_data);
-
-    // ASSERT_EQ(msg->nonce, 17);
-
-    //______________________________
-    char *command = "version";
     c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
     c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
     c2pool::messages::message_version *firstMsg = new c2pool::messages::message_version(1, 2, addrs1, addrs2, 15, "16", 17, 18);
 
-    char *packedFirstMsg;
+    //packed bytes
+    char *data = c2pool::messages::python::pymessage::send(firstMsg);
+    char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 80 249 219 9 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 15 0 0 0 0 0 0 0 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
 
-    char *data = c2pool::messages::python::pymessage::send(command /*TODO:firstMsg->command*/, firstMsg->pack_c_str(packedFirstMsg));
+    ASSERT_EQ(*data, *expectedData);
 
-    // for (int i = 0; i < 120; i++)
-    // {
-    //     std::cout << "DATA[ " << i << "]" << (int)data[i] << std::endl;
-    // }
     c2pool::messages::message_version *secondMsg = new c2pool::messages::message_version();
     secondMsg->get_data(data);
     secondMsg->encode_data();
 
-    // for (int i = 0; i < 50; i++)
-    // {
-    //     std::cout << "sym[i]: " << secondMsg->payload[i] << std::endl;
-    // }
-    //TODO: while(sstream >> int) {int -> char}
+    std::stringstream ss = c2pool::messages::python::pymessage::receive(secondMsg->command, secondMsg->checksum, secondMsg->payload, secondMsg->unpacked_length);
 
-    std::cout << "IN TEST: " << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, 131) << std::endl;
+    std::cout << secondMsg->command << ", " <<  secondMsg->checksum << ", " <<  secondMsg->payload << ", " << secondMsg->unpacked_length << std::endl;
 
-    std::cout << "test" << std::endl;
-    char *dest1 = new char[9];
-    char *source = "tes\0tdata";
-    std::cout << "test" << std::endl;
-    strncpy(dest1, source + 4, 4);
-    dest1[4] = 0;
-    std::cout << "test" << std::endl;
-    char *dest2 = new char[4];
-    memcpy(dest2, source + 4, 4);
-    std::cout << "test" << std::endl;
-    dest2[3] = (char) 255;
-    dest2[4] = 0;
+    std::string s;
 
-    std::cout << "dest1: " << dest1 << std::endl;
-    std::cout << "dest2: " << (int)(dest2)[3] << std::endl;
+    while (ss >> s)
+    {
+        std::cout << "SS: " << s << std::endl;
+    }
 
-    // for(int i = 0; i <= 255; i++){
-    //     std::cout << "chr(" << i << "): " << (unsigned char)i << std::endl;
-    // }
+    // char* a1 = new char[4];
+    // a1[0] = '\0';
+    // a1[1] = (char) 255;
+    // a1[2] = (char) 253;
+    // a1[3] = (char) '\0';
 
-    std::cout << memcmp(dest1, dest2, 4);
+    // char a2[4];
+    // a2[0] = '\0';
+    // a2[1] = (char) 255;
+    // a2[2] = (char) 254;
+    // a2[3] = (char) '\0';
 
-    //std::cout << ((char*)boost::asio::buffer(dest2, 4).data()) << std::endl;
+    //std::cout << c2pool::str::compare_str(a1, a2, 4) << std::endl;
 }
-
-// TEST(TestMessages, bytes_convert_test)
-// {
-//     // char *data1 = "a\0bcd\nefgs";
-//     // boost::array<char, 100> arr = {'a', '\0', 'b', 'c', 'd', '\n', 'e', 'f', 'g'};
-//     // auto buff = boost::asio::buffer(data1, 10);
-//     // std::string str(data1, 10);
-//     // std::cout << "test str: " << str << std::endl;
-//     // std::cout << c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data1) << std::endl;
-//     // char *data2 = "a\\0b";
-//     // std::cout << data1 << "with len: " << strlen(data1) << ", with sizeof: " << sizeof(data1)  << std::endl;
-//     // ASSERT_EQ(*data1, *arr.data());
-
-//     //____________________________________
-//     // std::vector<char> vec(100);
-//     // strncpy(&vec[0], "a\0bcd\nefgs", 100);
-//     // std::string str(vec.begin(), vec.end());
-//     // //std::string str = "a\0bcd\nefgs";
-//     // std::cout << "str: " << str << std::endl;
-//     // char *str_c = new char[str.length() + 1];
-//     // strcpy(str_c, str.c_str());
-//     // std::cout << "str_c: " << str_c << std::endl;
-//     // for (int i = 0; i < str.length(); i++)
-//     // {
-//     //     std::cout << str_c[i];
-//     // }
-//     // std::cout << std::endl;
-//     //__________________________
-
-//     std::string x("pq\0rs", 5); // 5 Characters as the input is now a char array with 5 characters.
-//     std::cout << x << std::endl;
-//     std::cout << x.length() << std::endl;
-
-//     char *str_c = new char[x.length() + 1];
-//     memcpy(str_c, x.c_str(), 5);
-//     std::cout << "str_c: " << str_c << std::endl;
-//     for (int i = 0; i < x.length(); i++)
-//     {
-//         std::cout << i << ":" << str_c[i] << std::endl;
-//     }
-//     std::cout << ((char*)boost::asio::buffer(str_c, 5).data())[3] << std::endl;
-
-//     std::string x2("pq\0rss", 5);
-//     std::string x3("qq\0rs", 5);
-//     std::string x4("pq\0r", 4);
-//     std::cout << std::memcmp(str_c, x.c_str(), 5) << std::endl; //0
-//     std::cout << std::memcmp(str_c, x2.c_str(), 5) << std::endl; //0
-//     std::cout << std::memcmp(str_c, x3.c_str(), 5) << std::endl; //-1
-//     std::cout << std::memcmp(str_c, x4.c_str(), 5) << std::endl; //1
-// }
-
-/* //WORK FOR MESSAGE_VERSION!
-TEST(PyCode, PyReceive)
-{
-    char *payload = c2pool::messages::python::for_test::pymessage::data_for_test_receive();
-    char *command = "version";
-    char *checksum = c2pool::messages::python::for_test::pymessage::checksum_for_test_receive();
-
-    std::stringstream received_data = c2pool::messages::python::pymessage::receive(command, checksum, payload);
-
-    c2pool::messages::message_version *msg = new c2pool::messages::message_version();
-    msg->unpack(received_data);
-
-    ASSERT_EQ(msg->nonce, 17);
-}
-*/
-
-/* for test messages:
-    c2pool::messages::address_type addr(1, "test", 1);
-    std::string s = "test";
-    c2pool::messages::message_version* msg = new c2pool::messages::message_version(1, 1, addr, addr, 1, s, 0, 0);
-*/

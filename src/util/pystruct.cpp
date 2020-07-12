@@ -246,7 +246,7 @@ namespace c2pool::messages::python
 
         res << ret;
         res >> result_method;
-
+        //std::cout << "result_method: " << result_method << std::endl; //TODO: DEBUG_PYTHON
         return result_method;
     }
 
@@ -298,6 +298,7 @@ namespace c2pool::messages::python
             return res;
         }
 
+        //std::cout << "LEN: " << len << std::endl;
         auto pVal = PyObject_CallFunction(pObjct, (char *)"(sy#y#)", command, checksum, 4, payload, length);
         if (pVal != NULL)
         {
@@ -384,10 +385,9 @@ namespace c2pool::messages::python
 
     char *pymessage::send(c2pool::messages::message *msg)
     {
-        char* payload2;
-        msg->pack_c_str(payload2);
+        //std::cout << "SEND_PACK_C_STR: " << msg->command << ", " << msg->pack_c_str() << std::endl;
 
-        return send(msg->command, payload2);
+        return send(msg->command, msg->pack_c_str());
     }
 } // namespace c2pool::messages::python
 
