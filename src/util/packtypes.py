@@ -828,9 +828,10 @@ def send(command, payload2):
     msg = type_()
     payload = msg.pack(payload2)
 
-    print('SEND_PAYLOAD: {0}'.format(payload))
+    #print('SEND_PAYLOAD: {0}'.format(payload))
 
     result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
+    print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
     #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
@@ -886,8 +887,8 @@ def emulate_protocol_get_data(command, payload2):
     res.rstrip(' ')
 
 def test_get_bytes_from_cpp(_bytes):
-    #print('test_get_bytes_from_cpp: _bytes = {0}'.format(_bytes))
-    return _bytes.decode('ISO-8859-1')
+    print('FROM PYTHON: test_get_bytes_from_cpp: {0}, len: {1}'.format(_bytes, len(_bytes)))
+    
     
 # ------------------------------------------TESTS------------------------------------------
 """
@@ -950,7 +951,11 @@ def TEST_UNPACKRES():
 # TEST_UNPACKRES()
 """
 
-#print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))
+# print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))
+# res = b''
+# for i in send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18').split(' '):
+#     res += bytes(chr(int(i)), encoding = 'utf-8')
+# print(res)
 
 # print(data_for_test_receive())
 # print(checksum_for_test_receive())

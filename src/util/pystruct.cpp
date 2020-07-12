@@ -796,8 +796,9 @@ namespace c2pool::messages::python::for_test
         return res;
     }
 
-    char *pymessage::test_get_bytes_from_cpp(char *data, int len)
+    void pymessage::test_get_bytes_from_cpp(char *data, int len)
     {
+        std::cout << "DATA: " << data << ", LEN: " << len << std::endl;
         c2pool::python::Py::Initialize();
 
         char *ret = NULL;
@@ -813,7 +814,7 @@ namespace c2pool::messages::python::for_test
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
-            return ret;
+            return;
         }
 
         // Загрузить объект модуля
@@ -821,26 +822,26 @@ namespace c2pool::messages::python::for_test
         if (!pModule)
         {
 
-            return ret;
+            return;
         }
 
         // Словарь объектов содержащихся в модуле
         auto pDict = PyModule_GetDict(pModule);
         if (!pDict)
         {
-            return ret;
+            return;
         }
 
         auto pObjct = PyDict_GetItemString(pDict, (const char *)"test_get_bytes_from_cpp");
         if (!pObjct)
         {
-            return ret;
+            return;
         }
 
         // Проверка pObjct на годность.
         if (!PyCallable_Check(pObjct))
         {
-            return ret;
+            return;
         }
         auto pVal = PyObject_CallFunction(pObjct, (char *)"(y#)", data, len);
         if (pVal != NULL)
@@ -855,10 +856,6 @@ namespace c2pool::messages::python::for_test
             Py_XDECREF(pVal);
         }
 
-        ret += 1;                 //remove first 2 element [b'] in string
-        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
-
         //std::cout << "get_packed_int return(without dot): ." << ret << std::endl; //TODO: DEBUG_PYTHON
-        return ret;
     }
 } // namespace c2pool::messages::python::for_test
