@@ -41,7 +41,7 @@ namespace c2pool::messages
         };
         enum
         {
-            checksum_length = 32 //sha256(sha256(payload))[:4]
+            checksum_length = 4 //sha256(sha256(payload))[:4]
         };
         enum
         {
