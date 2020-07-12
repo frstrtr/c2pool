@@ -788,9 +788,9 @@ def receive(_command, checksum, payload):
         called when we receive msg from p2pool to c2pool
     """
     
-    print('_command = {0}'.format(_command))
-    print('checksum = {0}'.format(checksum))
-    print('payload = {0}'.format(payload))
+    # print('_command = {0}'.format(_command))
+    # print('checksum = {0}'.format(checksum))
+    # print('payload = {0}'.format(payload))
 
     command = _command.rstrip('\0')
     # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
@@ -831,7 +831,7 @@ def send(command, payload2):
     #print('SEND_PAYLOAD: {0}'.format(payload))
 
     result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-    print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
+    #print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
     #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
