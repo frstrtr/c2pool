@@ -31,19 +31,8 @@ namespace c2pool::messages
         c2pool::str::substr(command, data, 0, command_length);
         c2pool::str::substr(length, data, command_length, payload_length);
         unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
-        std::cout << "strLEN: " << length << ", intLEN: " << unpacked_length << std::endl;
         c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
         c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, unpacked_length);
-        std::cout << "data: " << std::endl;
-        c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(data, command_length+payload_length+checksum_length+unpacked_length);
-        std::cout << "command: " << std::endl;
-        c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(command, command_length);
-        std::cout << "length: " << std::endl;
-        c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(length, payload_length);
-        std::cout << "checksum: " << std::endl;
-        c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(checksum, checksum_length);
-        std::cout << "payload: " << std::endl;
-        c2pool::messages::python::for_test::pymessage::test_get_bytes_from_cpp(payload, unpacked_length);
     }
 
     void IMessage::decode_data()

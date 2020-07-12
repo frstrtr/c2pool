@@ -38,14 +38,19 @@ TEST(TestMessages, message_version)
 
     std::stringstream ss = c2pool::messages::python::pymessage::receive(secondMsg->command, secondMsg->checksum, secondMsg->payload, secondMsg->unpacked_length);
 
-    std::cout << secondMsg->command << ", " <<  secondMsg->checksum << ", " <<  secondMsg->payload << ", " << secondMsg->unpacked_length << std::endl;
+    secondMsg->unpack(ss);
 
-    std::string s;
+    std::cout << "version " << secondMsg->version << std::endl;
+    std::cout << "services " << secondMsg->services << std::endl;
+    std::cout << "addr_to " << secondMsg->addr_to << std::endl;
+    std::cout << "addr_from " << secondMsg->addr_from << std::endl;
+    std::cout << "nonce " << secondMsg->nonce << std::endl;
+    std::cout << "sub_version " << secondMsg->sub_version << std::endl;
+    std::cout << "mode " << secondMsg->mode << std::endl;
+    std::cout << "best_share_hash " << secondMsg->best_share_hash << std::endl;
 
-    while (ss >> s)
-    {
-        std::cout << "SS: " << s << std::endl;
-    }
+
+
 
     // char* a1 = new char[4];
     // a1[0] = '\0';
