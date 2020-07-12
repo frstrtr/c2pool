@@ -30,7 +30,8 @@ namespace c2pool::messages
     {
         c2pool::str::substr(command, data, 0, command_length);
         c2pool::str::substr(length, data, command_length, payload_length);
-        c2pool::messages::python::pymessage::receive_length(length);
+        unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        std::cout << "strLEN: " << length << ", intLEN: " << unpacked_length << std::endl;
         c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
         c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, unpacked_length);
     }
@@ -65,13 +66,12 @@ namespace c2pool::messages
         return _pack();
     }
 
-    char *message::pack_c_str(char *c_str)
+    char *message::pack_c_str()
     {
         std::string str = pack();
-        c_str = new char[str.length() + 1];
-        strcpy(c_str, str.c_str());
-        return c_str;
-        //TODO: delete[] c_str;
+        packed_c_str = new char[str.length() + 1];
+        memcpy(packed_c_str, str.c_str(), str.length()+1);
+        return packed_c_str;
     }
 
     //message_version

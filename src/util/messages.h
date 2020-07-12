@@ -82,12 +82,15 @@ namespace c2pool::messages
     public:
         message(const char* _cmd);
 
+        ~message(){
+            delete packed_c_str;
+        }
+
         void unpack(std::string item);
         void unpack(std::stringstream &ss);
         string pack();
 
-        //для упаковки нужно указать переменную типа char*, куда запишется результат упаковки.
-        char* pack_c_str(char* c_str);
+        char* pack_c_str();
 
         // char *data() override
         // {
@@ -101,6 +104,8 @@ namespace c2pool::messages
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual string _pack() = 0;
+    private:
+        char* packed_c_str;
     };
 
     class message_error : public message

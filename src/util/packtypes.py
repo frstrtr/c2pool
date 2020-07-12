@@ -828,6 +828,8 @@ def send(command, payload2):
     msg = type_()
     payload = msg.pack(payload2)
 
+    print('SEND_PAYLOAD: {0}'.format(payload))
+
     result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
     #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
@@ -948,7 +950,7 @@ def TEST_UNPACKRES():
 # TEST_UNPACKRES()
 """
 
-#send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
+#print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))
 
 # print(data_for_test_receive())
 # print(checksum_for_test_receive())
