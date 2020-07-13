@@ -40,29 +40,21 @@ TEST(TestMessages, message_version)
 
     secondMsg->unpack(ss);
 
-    std::cout << "version " << secondMsg->version << std::endl;
-    std::cout << "services " << secondMsg->services << std::endl;
-    std::cout << "addr_to " << secondMsg->addr_to << std::endl;
-    std::cout << "addr_from " << secondMsg->addr_from << std::endl;
-    std::cout << "nonce " << secondMsg->nonce << std::endl;
-    std::cout << "sub_version " << secondMsg->sub_version << std::endl;
-    std::cout << "mode " << secondMsg->mode << std::endl;
-    std::cout << "best_share_hash " << secondMsg->best_share_hash << std::endl;
+    // std::cout << "version " << secondMsg->version << std::endl;
+    // std::cout << "services " << secondMsg->services << std::endl;
+    // std::cout << "addr_to " << secondMsg->addr_to << std::endl;
+    // std::cout << "addr_from " << secondMsg->addr_from << std::endl;
+    // std::cout << "nonce " << secondMsg->nonce << std::endl;
+    // std::cout << "sub_version " << secondMsg->sub_version << std::endl;
+    // std::cout << "mode " << secondMsg->mode << std::endl;
+    // std::cout << "best_share_hash " << secondMsg->best_share_hash << std::endl;
 
-
-
-
-    // char* a1 = new char[4];
-    // a1[0] = '\0';
-    // a1[1] = (char) 255;
-    // a1[2] = (char) 253;
-    // a1[3] = (char) '\0';
-
-    // char a2[4];
-    // a2[0] = '\0';
-    // a2[1] = (char) 255;
-    // a2[2] = (char) 254;
-    // a2[3] = (char) '\0';
-
-    //std::cout << c2pool::str::compare_str(a1, a2, 4) << std::endl;
+    ASSERT_EQ(firstMsg->version, secondMsg->version); 
+    ASSERT_EQ(firstMsg->services, secondMsg->services); 
+    ASSERT_EQ(firstMsg->addr_to, secondMsg->addr_to);
+    ASSERT_EQ(firstMsg->addr_from, secondMsg->addr_from);
+    ASSERT_EQ(firstMsg->nonce, secondMsg->nonce);
+    ASSERT_EQ(firstMsg->sub_version, secondMsg->sub_version);
+    ASSERT_EQ(firstMsg->mode, secondMsg->mode);
+    ASSERT_EQ(firstMsg->best_share_hash, secondMsg->best_share_hash);
 }
