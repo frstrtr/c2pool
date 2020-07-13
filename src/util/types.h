@@ -26,6 +26,10 @@ namespace c2pool::messages
         friend std::istream &operator>>(std::istream &is, address_type &value);
 
         friend std::ostream &operator<<(std::ostream &os, const address_type &value);
+
+        friend bool operator==(const address_type &first, const address_type &second);
+
+        friend bool operator!=(const address_type &first, const address_type &second);
     };
 
     class share_type

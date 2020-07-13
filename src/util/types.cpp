@@ -21,7 +21,7 @@ namespace c2pool::messages
 
     std::istream &operator>>(std::istream &is, address_type &value)
     {
-        is >> value.services >> value.address >> value.port; //TODO: read string to address, from parse '<data>'
+        is >> value.services >> value.address >> value.port;
         return is;
     }
 
@@ -30,6 +30,23 @@ namespace c2pool::messages
         os << value.services << "," << value.address << "," << value.port;
         return os;
     }
+
+    bool operator==(const address_type &first, const address_type &second)
+    {
+        if (first.address != second.address)
+            return false;
+        if (first.port != second.port)
+            return false;
+        if (first.services != second.services)
+            return false;
+        return true;
+    }
+
+    bool operator!=(const address_type &first, const address_type &second)
+    {
+        return !(first == second);
+    }
+    //share_type:
 
     share_type::share_type()
     {
