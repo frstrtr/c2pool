@@ -20,7 +20,7 @@ namespace c2pool::messages
         strcpy(prefix, current_prefix);
     }
 
-    void IMessage::get_data(char *data_)
+    void IMessage::set_data(char *data_)
     {
         memcpy(data, data_, 131);
         //strcpy(data, data_);
@@ -47,6 +47,27 @@ namespace c2pool::messages
         strcpy(command, _cmd);
     }
 
+    void message::receive()
+    {
+        std::stringstream ss = c2pool::messages::python::pymessage::receive(command, checksum, payload, unpacked_length);
+        unpack(ss);
+    }
+
+    void message::receive_from_data(char *_set_data = nullptr)
+    {
+        if (_set_data != nullptr)
+        {
+            set_data(_set_data);
+        }
+        encode_data();
+        receive();
+    }
+
+    void message::send()
+    {
+        set_data(c2pool::messages::python::pymessage::send(this));
+    }
+
     void message::unpack(std::string item)
     {
         std::stringstream ss;
@@ -69,7 +90,7 @@ namespace c2pool::messages
     {
         std::string str = pack();
         packed_c_str = new char[str.length() + 1];
-        memcpy(packed_c_str, str.c_str(), str.length()+1);
+        memcpy(packed_c_str, str.c_str(), str.length() + 1);
         return packed_c_str;
     }
 

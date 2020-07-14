@@ -68,7 +68,7 @@ namespace c2pool::messages
 
         IMessage(const char *current_prefix);
 
-        void get_data(char *data_);
+        void set_data(char *data_);
 
         //from data to command, length, checksum, payload
         void encode_data();
@@ -80,17 +80,25 @@ namespace c2pool::messages
     class message : public IMessage
     {
     public:
-        message(const char* _cmd);
+        message(const char *_cmd);
 
-        ~message(){
+        ~message()
+        {
             delete packed_c_str;
         }
+
+        //receive message data from IMessage::command, IMessage::checksum, IMessage::payload, IMessage::unpacked_length;
+        void receive();
+        //receive message data from IMessage::data; use _set_data for init IMessage::data.
+        void receive_from_data(char *_set_data);
+        //
+        void send();
 
         void unpack(std::string item);
         void unpack(std::stringstream &ss);
         string pack();
 
-        char* pack_c_str();
+        char *pack_c_str();
 
         // char *data() override
         // {
@@ -104,8 +112,9 @@ namespace c2pool::messages
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual string _pack() = 0;
+
     private:
-        char* packed_c_str;
+        char *packed_c_str;
     };
 
     class message_error : public message
