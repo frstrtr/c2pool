@@ -58,10 +58,60 @@ TEST(TestMessages, message_version)
 
 TEST(TestMessages, message_addrme)
 {
+    int port = 80;
+    c2pool::messages::message_addrme *firstMsg = new c2pool::messages::message_addrme(port);
+    firstMsg->send();
+
+    //expected data for firstMsg->send() // todo check DATA
+    char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 80 249 219 9 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 15 0 0 0 0 0 0 0 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
+
+    ASSERT_EQ(*firstMsg->data, *expectedData);
+
+    //RECEIVE
+    c2pool::messages::message_addrme *secondMsg = new c2pool::messages::message_addrme();
+    secondMsg->receive_from_data(firstMsg->data); //todo
+
+    // std::cout << "port " << secondMsg->port << std::endl;
+
+    ASSERT_EQ(firstMsg->port, secondMsg->port);
 }
+
 TEST(TestMessages, message_getaddrs)
 {
+    int count = 80;
+    c2pool::messages::message_getaddrs *firstMsg = new c2pool::messages::message_getaddrs(count);
+    firstMsg->send();
+
+    //expected data for firstMsg->send() // todo check DATA
+    char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 80 249 219 9 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 15 0 0 0 0 0 0 0 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
+
+    ASSERT_EQ(*firstMsg->data, *expectedData);
+
+    //RECEIVE
+    c2pool::messages::message_getaddrs *secondMsg = new c2pool::messages::message_getaddrs();
+    secondMsg->receive_from_data(firstMsg->data); //todo
+
+    // std::cout << "count " << secondMsg->count << std::endl;
+
+    ASSERT_EQ(firstMsg->count, secondMsg->count);
 }
+
 TEST(TestMessages, message_addrs)
 {
+    vector<addr> addrs = [];
+    c2pool::messages::message_addrs *firstMsg = new c2pool::messages::message_addrs(addrs);
+    firstMsg->send();
+
+    // expected data for firstMsg->send() // todo check DATA
+    char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 80 249 219 9 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 15 0 0 0 0 0 0 0 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
+
+    ASSERT_EQ(*firstMsg->data, *expectedData);
+
+    //RECEIVE
+    c2pool::messages::message_addrs *secondMsg = new c2pool::messages::message_addrs();
+    secondMsg->receive_from_data(firstMsg->data); //todo
+
+    // std::cout << "addrs " << secondMsg->addrs << std::endl;
+
+    ASSERT_EQ(firstMsg->addrs, secondMsg->addrs);
 }
