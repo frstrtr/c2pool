@@ -18,3 +18,5 @@ in BTC:
 Telegram:
 
 ### t.me/c2pool
+
+http://zerone.bit
