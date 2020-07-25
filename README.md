@@ -19,4 +19,4 @@ Telegram:
 
 ### t.me/c2pool
 
-http://zerone.bit
+http://c2pool.bit
