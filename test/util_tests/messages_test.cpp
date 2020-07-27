@@ -47,7 +47,7 @@ TEST(TestMessages, message_version)
     // std::cout << "best_share_hash " << secondMsg->best_share_hash << std::endl;
 
     ASSERT_EQ(firstMsg->version, secondMsg->version);
-    ASSERT_EQ(firstMsg->services, secondMsg->services);
+    ASSERT_EQ(firstMsg->services, secondMsg->version);
     ASSERT_EQ(firstMsg->addr_to, secondMsg->addr_to);
     ASSERT_EQ(firstMsg->addr_from, secondMsg->addr_from);
     ASSERT_EQ(firstMsg->nonce, secondMsg->nonce);
@@ -59,9 +59,11 @@ TEST(TestMessages, message_version)
 TEST(TestMessages, message_addrme)
 {
 }
+
 TEST(TestMessages, message_getaddrs)
 {
 }
+
 TEST(TestMessages, message_addrs)
 {
 }
