@@ -59,7 +59,7 @@ namespace c2pool::messages
         unsigned int unpacked_length;
         char checksum[checksum_length + 1];
         char payload[max_payload_length + 1];
-        char data[command_length + payload_length + checksum_length + max_payload_length]; //full message without prefix
+        char data[command_length + payload_length + checksum_length + max_payload_length]; //full message without prefix //TODO
     private:
         size_t _prefix_length;
 
@@ -239,7 +239,7 @@ namespace c2pool::messages
         {
             addrs = _addrs;
         }
-
+        
         void _unpack(stringstream &ss) override;
 
         string _pack() override;

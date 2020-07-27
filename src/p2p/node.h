@@ -22,23 +22,22 @@ namespace c2pool::p2p
     class NodesManager
     {
     public:
-        NodesManager(boost::asio::io_context& _io, c2pool::config::Network _networkConfig) : _io_context(_io){
-            //TODO: init _net
+        NodesManager(boost::asio::io_context& _io, c2pool::config::Network* _networkConfig) : _io_context(_io){
+            _net = _networkConfig; //TODO
         }
 
         boost::asio::io_context& io_context() const{ //todo: const?
             return _io_context;
         }
 
-        //TODO: init in constructor
-        c2pool::config::Network net() const
+        c2pool::config::Network* net() const
         {
             return _net;
         }
 
     private:
         boost::asio::io_context& _io_context;
-        c2pool::config::Network _net; //config class
+        c2pool::config::Network* _net; //config class
         std::unique_ptr<c2pool::p2p::P2PNode> p2p_node;
         std::unique_ptr<c2pool::p2p::BitcoindNode> bitcoind_node;
     };
@@ -54,7 +53,7 @@ namespace c2pool::p2p
         }
 
         //getter for network [config class]
-        c2pool::config::Network net() const
+        c2pool::config::Network* net() const
         {
             return nodes->net();
         }
