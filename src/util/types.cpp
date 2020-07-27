@@ -39,6 +39,8 @@ namespace c2pool::messages
             return false;
         if (first.services != second.services)
             return false;
+        if (first.count != second.count) // todo double check property
+            return false;
         return true;
     }
 
