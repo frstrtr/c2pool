@@ -231,11 +231,11 @@ namespace c2pool::messages
     class message_addrs : public message
     {
     public:
-        vector<addr> addrs;
+        vector<c2pool::messages::addr> addrs;
 
         message_addrs() : message("addrs") {}
 
-        message_addrs(vector<addr> _addrs) : message("addrs")
+        message_addrs(vector<c2pool::messages::addr> _addrs) : message("addrs")
         {
             addrs = _addrs;
         }
