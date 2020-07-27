@@ -63,6 +63,10 @@ namespace c2pool::messages
         friend std::istream &operator>>(std::istream &is, addr &value);
         friend std::ostream &operator<<(std::ostream &os, const addr &value);
 
+        friend bool operator==(const addr &first, const addr &second);
+
+        friend bool operator!=(const addr &first, const addr &second);
+
         address_type address;
         int timestamp;
     };

@@ -39,8 +39,6 @@ namespace c2pool::messages
             return false;
         if (first.services != second.services)
             return false;
-        if (first.count != second.count) // todo double check property
-            return false;
         return true;
     }
 
@@ -104,6 +102,20 @@ namespace c2pool::messages
     {
         os << value.address << "," << value.timestamp;
         return os;
+    }
+
+    bool operator==(const addr &first, const addr &second)
+    {
+        if (first.address != second.address)
+            return false;
+        if (first.timestamp != second.timestamp)
+            return false;
+        return true;
+    }
+
+    bool operator!=(const addr &first, const addr &second)
+    {
+        return !(first == second);
     }
 
 } // namespace c2pool::messages

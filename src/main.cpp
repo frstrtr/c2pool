@@ -18,8 +18,5 @@ int main(int argc, char* argv[])
     std::unique_ptr<c2pool::p2p::Node> node = std::make_unique<c2pool::p2p::Node>(nodesManager, 3035);
     
     
-
-
-
     return 0;
 }
