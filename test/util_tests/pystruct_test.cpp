@@ -6,7 +6,6 @@ using namespace std;
 
 TEST(PyCode, PyReceiveLength)
 {
-    std::cout << "TEST" << std::endl;
     int first_num = 10;
 
     char *first_num_chr = c2pool::messages::python::for_test::pymessage::get_packed_int(first_num);
@@ -18,7 +17,6 @@ TEST(PyCode, PyReceiveLength)
 
 TEST(PyCode, PyReceive)
 {
-    std::cout << "TEST" << std::endl;
     char *payload = c2pool::messages::python::for_test::pymessage::data_for_test_receive();
     char *command = "version";
     unsigned int length = c2pool::messages::python::for_test::pymessage::length_for_test_receive();
@@ -35,7 +33,6 @@ TEST(PyCode, PyReceive)
 
 TEST(PyCode, PySend)
 {
-    std::cout << "TEST" << std::endl;
     char *command = "version";
     char *payload2 = "1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18";
 

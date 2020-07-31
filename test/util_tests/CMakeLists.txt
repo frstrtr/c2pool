@@ -2,7 +2,7 @@ include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
 
 #set(UTIL_TESTS_SOURCE pack_test.cpp pystruct_test.cpp)
-set(UTIL_TESTS_SOURCE messages_test.cpp pystruct_test.cpp)
+set(UTIL_TESTS_SOURCE messages_test.cpp pystruct_test.cpp python_test.cpp)
 add_executable(runUtilTests ${UTIL_TESTS_SOURCE})
 
 

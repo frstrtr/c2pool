@@ -593,7 +593,7 @@ class msg:
         return self._unpack(data)
 
     def parseVars(self, vars):
-        # в c++ переменные в stringstream подаются с разделителим в виде символа ";".
+        # в c++ переменные в stringstream подаются с разделителем в виде символа ";".
         res = vars.split(';')
         return res  # список переменных на упаковку.
 
@@ -706,17 +706,27 @@ class messageAddrs(msg):
     def _pack(self, data):
         msg_dict = {
             'addrs': [{
-                'timestamp': int(data[0]),
-                'address': Address_Type.parseIn(data[1]),
-            }]}
+                'timestamp': int(d[0]),
+                'address': Address_Type.parseIn(d[1]),
+            } for d in data]}
         return self.message_addrs.pack(msg_dict)
 
     def _unpack(self, data):
         res = UnpackResult()
         t = dict(self.message_addrs.unpack(data))
-        res += t['timestamp']
-        res += t['address']  # todo check nested
+        for addr in t['addrs']:
+            res += addr['timestamp']
+            res += Address_Type.parseOut(addr['address'])
         return res
+
+    def parseVars(self, vars):
+        res = None
+        # в с++ переменные массива в stringstream подаются с разделителем в виде символа "+"
+        res = []
+        buff = vars.split('+')
+        for r in buff:
+            res += [r.split(';')]
+        return res  # список переменных на упаковку.
 
 
 class messageGetAddrs(msg):
@@ -808,7 +818,6 @@ def receive(_command, checksum, payload):
         return '-2'
 
     obj = type_()
-    
     return str(obj.unpack(payload))
 
 
@@ -953,6 +962,8 @@ def TEST_UNPACKRES():
 
 # print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))
 # print(send('addrme','80'))
+# print(send('getaddrs','3'))
+# print(send('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))
 # res = b''
 # for i in send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18').split(' '):
 #     res += bytes(chr(int(i)), encoding = 'utf-8')

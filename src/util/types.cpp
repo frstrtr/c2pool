@@ -79,13 +79,13 @@ namespace c2pool::messages
         timestamp = 0;
     }
 
-    addr::addr(address_type a, int t)
+    addr::addr(int t, address_type a)
     {
         address = a;
         timestamp = t;
     }
 
-    addr::addr(int _services, std::string _address, int _port, int t)
+    addr::addr(int t, int _services, std::string _address, int _port)
     {
         address_type a = address_type(_services, _address, _port);
         address = a;
@@ -94,13 +94,13 @@ namespace c2pool::messages
 
     std::istream &operator>>(std::istream &is, addr &value)
     {
-        is >> value.address >> value.timestamp;
+        is >> value.timestamp >> value.address;
         return is;
     }
 
     std::ostream &operator<<(std::ostream &os, const addr &value)
     {
-        os << value.address << "," << value.timestamp;
+        os << value.timestamp << ";" <<  value.address;
         return os;
     }
 

@@ -162,12 +162,9 @@ namespace c2pool::messages
     void message_addrs::_unpack(std::stringstream &ss)
     {
         //перед массивом идёт int(длина массива)
-        int count;
         addr addrBuff;
-        ss >> count;
-        for (int i = 0; i < count; i++)
+        while (ss >> addrBuff)
         {
-            ss >> addrBuff;
             addrs.push_back(addrBuff);
         }
     }
