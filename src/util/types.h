@@ -56,9 +56,9 @@ namespace c2pool::messages
     public:
         addr();
 
-        addr(address_type a, int t);
+        addr(int t, address_type a);
 
-        addr(int _services, std::string _address, int _port, int t);
+        addr(int t, int _services, std::string _address, int _port);
 
         friend std::istream &operator>>(std::istream &is, addr &value);
         friend std::ostream &operator<<(std::ostream &os, const addr &value);
@@ -67,8 +67,8 @@ namespace c2pool::messages
 
         friend bool operator!=(const addr &first, const addr &second);
 
-        address_type address;
         int timestamp;
+        address_type address;
     };
 } // namespace c2pool::messages
 

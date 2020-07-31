@@ -42,16 +42,14 @@ namespace c2pool::pack
         ComposedType &add(const vector<T> value)
         {
             Space();
-            fields << "[";
             for (int i = 0; i < value.size(); i++)
             {
                 if (i != 0)
                 {
-                    fields << ","; //элементы массива разделяются запятой!
+                    fields << "+"; //элементы массива разделяются знаком "+"
                 }
                 fields << value[i];
             }
-            fields << "]";
             return *this;
         }
     };
