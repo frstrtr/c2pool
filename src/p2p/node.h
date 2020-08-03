@@ -86,7 +86,7 @@ namespace c2pool::p2p
 
 namespace c2pool::p2p
 {
-    class Node : INode
+    class Node : public INode
     {
     public:
         Node(c2pool::p2p::NodesManager *_nodes, std::string _port);
@@ -96,8 +96,8 @@ namespace c2pool::p2p
         virtual void handle_get_shares() = 0;
         virtual void handle_bestblock() = 0;
 
-        void got_conn(Protocol *protocol);
-        void lost_conn(Protocol *protocol, boost::exception *reason);
+        void got_conn(std::shared_ptr<Protocol> protocol);
+        void lost_conn(std::shared_ptr<Protocol> protocol, boost::exception *reason);
         void _think(); //TODO: rename method
 
         //TODO: void got_addr();
@@ -107,10 +107,10 @@ namespace c2pool::p2p
         //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
         //Ещё варианты типов для nonce: unsigned long double; uint_fast64_t
         unsigned long long nonce;
-        std::shared_ptr<c2pool::p2p::Client> client;
-        std::shared_ptr<c2pool::p2p::Server> server;
+        std::unique_ptr<c2pool::p2p::Client> client;
+        std::unique_ptr<c2pool::p2p::Server> server;
         std::string port;
-        std::map<unsigned long long, c2pool::p2p::Protocol *> peers;
+        std::map<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>> peers;
         boost::asio::deadline_timer _think_timer;
 
     private:

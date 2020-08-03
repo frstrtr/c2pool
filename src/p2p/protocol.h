@@ -3,8 +3,6 @@
 
 #include "boost/asio.hpp"
 #include "types.h"
-//#include "node.h"
-
 
 // #include "factory.h"
 // #include "node.h"
@@ -30,13 +28,14 @@
 #include <set>
 #include <utility>
 #include "messages.h"
+//#include "node.h"
 using boost::asio::ip::tcp;
 
 //-----------------------------------------------------------
 
-class Node;
 namespace c2pool::p2p
 {
+    class Node;
     class Factory;
 }
 namespace c2pool::messages
@@ -77,7 +76,7 @@ namespace c2pool::p2p
         //virtual void handlePacket() = 0;
         //virtual void sendPacket(c2pool::messages::message *payload) = 0;
         //virtual void connectionMade() = 0;
-        virtual void disconnect() = 0;
+        virtual void disconnect();
 
         template <class MsgType>
         MsgType *GenerateMsg(std::stringstream &ss);
@@ -103,8 +102,11 @@ namespace c2pool::p2p
         int other_services; //TODO: int64? IntType(64)
         unsigned long long _nonce;
 
+        //peer address
+        std::tuple<std::string, std::string> addr;
+
         boost::asio::ip::tcp::socket socket;
-        Node *node;
+        c2pool::p2p::Node *node;
         c2pool::p2p::Factory *factory;
 
         unique_ptr<c2pool::messages::IMessage> tempMessage; 
