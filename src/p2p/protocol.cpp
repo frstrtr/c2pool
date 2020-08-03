@@ -11,7 +11,7 @@ using boost::asio::ip::tcp;
 
 #include "protocol.h"
 #include "factory.h"
-
+#include "node.h"
 //-----------------------------------------------------------
 
 class Node;
@@ -28,6 +28,12 @@ namespace c2pool::p2p
     Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
     {
         factory = _factory;
+        
+        boost::asio::ip::tcp::endpoint ep = _socket.remote_endpoint();
+        
+        addr = std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
+
+        //addr;
     }
 
     //msg.data(), msg.length()
@@ -50,7 +56,7 @@ namespace c2pool::p2p
     {
         tempMessage = std::make_unique<c2pool::messages::IMessage>(/*TODO: net.PREFIX*/);
         boost::asio::async_read(socket,
-                                boost::asio::buffer(tempMessage->prefix, /*todo:prefix_length*/),
+                                boost::asio::buffer(tempMessage->prefix, node->net()->PREFIX.length()),
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec /*&& <сравнение размеров prefix>*/)
                                     {
@@ -79,7 +85,7 @@ namespace c2pool::p2p
                                 });
     }
 
-    void read_length()
+    void Protocol::read_length()
     {
         boost::asio::async_read(socket,
                                 boost::asio::buffer(tempMessage->length, tempMessage->payload_length),
@@ -114,7 +120,7 @@ namespace c2pool::p2p
     void Protocol::read_payload()
     {
         boost::asio::async_read(socket,
-                                boost::asio::buffer(tempMessage->payload, tempMessage->length),
+                                boost::asio::buffer(tempMessage->payload, tempMessage->unpacked_length()),
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
@@ -181,7 +187,7 @@ namespace c2pool::p2p
         {
             //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
         }
-        if (msg->version < c2pool::config::MINIMUM_PROTOCOL_VERSION)
+        if (msg->version < node->net()->MINIMUM_PROTOCOL_VERSION)
         {
             //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
         }
@@ -190,7 +196,7 @@ namespace c2pool::p2p
         other_sub_version = msg->sub_version;
         other_services = msg->services;
 
-        if (_nonce == node->nonce) //TODO: add nonce in Node
+        if (msg->nonce == node->nonce) //TODO: add nonce in Node
         {
             //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
         }
@@ -198,22 +204,22 @@ namespace c2pool::p2p
         //detect duplicate in node->peers
         for (auto _peer : node->peers)
         {
-            if (_peer.first == _nonce)
+            if (_peer.first == msg->nonce)
             {
-                string err = "Detected duplicate connection, disconnecting from " + std::get<0>(addr) + ":" + to_string(std::get<1>(addr));
-                Log::Debug(err);
+                string err = "Detected duplicate connection, disconnecting from " + std::get<0>(addr) + ":" + std::get<1>(addr);
+                //Log::Debug(err); //TODO: DEBUG
                 disconnect();
                 return;
             }
         }
 
-        nonce = _nonce;
-        connected2 = true;
+        _nonce = msg->nonce;
+        //connected2 = true; //?
 
         //TODO: safe thrade cancel
-        timeout_delayed.cancel();
+        //todo: timeout_delayed.cancel();
         //timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100)); //todo: timer io from constructor
-        timeout_delayed.async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
+        //todo: timeout_delayed.async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
         //_____________
 
         /* TODO: TIMER + DELEGATE
@@ -225,7 +231,7 @@ namespace c2pool::p2p
         self.dataReceived = new_dataReceived
              */
 
-        factory->proto_connected(this);
+        factory->protocol_connected(this);
 
         /* TODO: thread (coroutine?):
              self._stop_thread = deferral.run_repeatedly(lambda: [

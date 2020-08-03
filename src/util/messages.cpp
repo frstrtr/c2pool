@@ -30,14 +30,23 @@ namespace c2pool::messages
     {
         c2pool::str::substr(command, data, 0, command_length);
         c2pool::str::substr(length, data, command_length, payload_length);
-        unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
         c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
-        c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, unpacked_length);
+        c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, _unpacked_length);
     }
 
     void IMessage::decode_data()
     {
         sprintf(data, "%s%s%s%s", command, length, checksum, payload);
+    }
+
+    const unsigned int IMessage::unpacked_length()
+    {
+        if (_unpacked_length == 0)
+        {
+            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        }
+        return _unpacked_length;
     }
 
     //message
@@ -49,7 +58,7 @@ namespace c2pool::messages
 
     void message::receive()
     {
-        std::stringstream ss = c2pool::messages::python::pymessage::receive(command, checksum, payload, unpacked_length);
+        std::stringstream ss = c2pool::messages::python::pymessage::receive(command, checksum, payload, unpacked_length());
         unpack(ss);
     }
 

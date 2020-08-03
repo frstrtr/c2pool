@@ -53,16 +53,17 @@ namespace c2pool::messages
             return _prefix_length;
         }
 
+        const unsigned int unpacked_length();
+
         char *prefix;
         char command[command_length + 1];
         char length[payload_length + 1];
-        unsigned int unpacked_length;
         char checksum[checksum_length + 1];
         char payload[max_payload_length + 1];
         char data[command_length + payload_length + checksum_length + max_payload_length]; //full message without prefix //TODO
     private:
         size_t _prefix_length;
-
+        unsigned int _unpacked_length = 0;
     public:
         IMessage() {}
 

@@ -18,24 +18,24 @@ namespace c2pool::p2p
         nonce = c2pool::random::RandomNonce();
         port = _port;
 
-        client = std::make_shared<c2pool::p2p::Client>(); // client.start()
-        server = std::make_shared<c2pool::p2p::Server>(); // server.start()
+        client = std::make_unique<c2pool::p2p::Client>(); // client.start()
+        server = std::make_unique<c2pool::p2p::Server>(); // server.start()
 
         //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
 
         _think_timer.async_wait(_think);
     }
 
-    void Node::got_conn(c2pool::p2p::Protocol *protocol)
+    void Node::got_conn(shared_ptr<c2pool::p2p::Protocol> protocol)
     {
         if (peers.count(protocol->nonce()) != 0)
         {
             std::cout << "Already have peer!" << std::endl; //TODO: raise ValueError('already have peer')
         }
-        peers.insert(std::pair<int, c2pool::p2p::Protocol *>(protocol->nonce(), protocol));
+        peers.insert(std::pair<int, shared_ptr<c2pool::p2p::Protocol>>(protocol->nonce(), protocol));
     }
 
-    void Node::lost_conn(c2pool::p2p::Protocol *protocol, boost::exception *reason)
+    void Node::lost_conn(shared_ptr<c2pool::p2p::Protocol> protocol, boost::exception *reason)
     {
         if (peers.count(protocol->nonce()) == 0)
         {
@@ -49,7 +49,7 @@ namespace c2pool::p2p
             return;
         }
 
-        delete protocol; //todo: delete for smart pointer
+        protocol.reset(); //delete for smart pointer
 
         //todo: print 'Lost peer %s:%i - %s' % (conn.addr[0], conn.addr[1], reason.getErrorMessage())
     }
