@@ -50,6 +50,8 @@ namespace c2pool::p2p
     public:
         Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory);
 
+        virtual void send(unique_ptr<c2pool::messages::message> msg);
+
         //OLD: fromStr
         virtual void handle(std::stringstream ss);
 
@@ -59,8 +61,8 @@ namespace c2pool::p2p
 
     protected:
 
-        //used for write message
-        virtual void write(char* msg, size_t length);
+        //used for write message in protocol
+        virtual void write(c2pool::messages::message* msg);
 
         void read_prefix();
 
