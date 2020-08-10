@@ -22,7 +22,7 @@ namespace c2pool::messages
 
     void IMessage::set_data(char *data_)
     {
-        memcpy(data, data_, 131);
+        memcpy(data, data_, data_length());
         //strcpy(data, data_);
     }
 
@@ -44,9 +44,22 @@ namespace c2pool::messages
     {
         if (_unpacked_length == 0)
         {
-            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+            if (length == 0) {
+                _unpacked_length = pack_payload_length();
+            }
+            else {
+                _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+            }
         }
         return _unpacked_length;
+    }
+
+    int IMessage::data_length() {
+        int res = 0;
+        res += command_length + payload_length + checksum_length;
+        res += unpacked_length();
+        cout << "RES: " << res << endl;
+        return res;
     }
 
     //message
@@ -101,6 +114,10 @@ namespace c2pool::messages
         packed_c_str = new char[str.length() + 1];
         memcpy(packed_c_str, str.c_str(), str.length() + 1);
         return packed_c_str;
+    }
+
+    int message::pack_payload_length(){
+        return c2pool::messages::python::pymessage::payload_length(command, pack_c_str());
     }
 
     //message_version

@@ -76,6 +76,10 @@ namespace c2pool::messages
 
         //from command, length, checksum, payload to data
         void decode_data();
+
+        int data_length();
+    protected:
+        virtual int pack_payload_length() { return 0;} //возвращает длину для упакованного payload msg, которое формируется в c2pool.
     };
 
     class message : public IMessage
@@ -113,7 +117,8 @@ namespace c2pool::messages
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual string _pack() = 0;
-
+    protected:
+        int pack_payload_length() override;
     private:
         char *packed_c_str;
     };
@@ -240,7 +245,7 @@ namespace c2pool::messages
         {
             addrs = _addrs;
         }
-        
+
         void _unpack(stringstream &ss) override;
 
         string _pack() override;
@@ -248,7 +253,7 @@ namespace c2pool::messages
 
     //__________________________
     /*
-    
+
     class message_shares : public message
     {
     public:

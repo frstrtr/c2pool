@@ -37,10 +37,10 @@ namespace c2pool::p2p
     }
 
     //msg.data(), msg.length()
-    void Protocol::write(char *msg, size_t length)
+    void Protocol::write(c2pool::messages::message* msg)
     {
         boost::asio::async_write(socket,
-                                 boost::asio::buffer(msg, length),
+                                 boost::asio::buffer(msg->data, msg->unpacked_length),
                                  [this](boost::system::error_code ec, std::size_t /*length*/) {
                                      if (!ec)
                                      {
@@ -139,6 +139,11 @@ namespace c2pool::p2p
         boost::asio::post(factory->io_context, [this]() { socket.close(); });
     }
 
+    void Protocol::send(unique_ptr<c2pool::messages::message> msg){
+        msg->send();
+        write()
+    }
+
     //OLD: fromStr
     void Protocol::handle(std::stringstream ss)
     {
@@ -231,7 +236,7 @@ namespace c2pool::p2p
         self.dataReceived = new_dataReceived
              */
 
-        factory->protocol_connected(this);
+        factory->protocol_connected(shared_from_this());
 
         /* TODO: thread (coroutine?):
              self._stop_thread = deferral.run_repeatedly(lambda: [
@@ -243,11 +248,13 @@ namespace c2pool::p2p
                 self.sendAdvertisement(),
             random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
              */
+        
 
-        if (best_hash != -1)
-        {                                                 // -1 = None
-            node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
-        }
+        //best_hash = 0 default?
+        // if (best_hash != -1)
+        // {                                                 // -1 = None
+        //     node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
+        // }
     }
 
     void Protocol::handle(c2pool::messages::message_addrs *msg)

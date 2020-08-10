@@ -5,6 +5,7 @@
 #include "boost/asio.hpp"
 #include "p2p/node.h"
 #include "config.h"
+#include "networks/config.h"
 #include <memory>
 
 int main(int argc, char* argv[])

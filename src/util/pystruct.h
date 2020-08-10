@@ -36,6 +36,10 @@ namespace c2pool::messages::python
         static char *send(char *command, char *payload2);
 
         static char *send(c2pool::messages::message* msg);
+
+        static int payload_length(char *command, char *payload2);
+
+        static int payload_length(c2pool::messages::message *msg);
     };
 } // namespace c2pool::messages::python
 

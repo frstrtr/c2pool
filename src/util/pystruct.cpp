@@ -389,6 +389,80 @@ namespace c2pool::messages::python
 
         return send(msg->command, msg->pack_c_str());
     }
+
+    int pymessage::payload_length(char *command, char *payload2)
+    {
+
+        c2pool::python::Py::Initialize();
+        
+        int result_method = 0;
+
+        std::stringstream res;
+
+        char *ret = NULL;
+
+        // Загрузка модуля sys
+        auto sys = PyImport_ImportModule("sys");
+        auto sys_path = PyObject_GetAttrString(sys, "path");
+        // Путь до наших исходников Python
+        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        PyList_Append(sys_path, folder_path);
+
+        // Загрузка py файла
+        auto pName = PyUnicode_FromString("packtypes");
+        if (!pName)
+        {
+            return result_method;
+        }
+
+        // Загрузить объект модуля
+        auto pModule = PyImport_Import(pName);
+        if (!pModule)
+        {
+            return result_method;
+        }
+
+        // Словарь объектов содержащихся в модуле
+        auto pDict = PyModule_GetDict(pModule);
+        if (!pDict)
+        {
+            return result_method;
+        }
+
+        auto pObjct = PyDict_GetItemString(pDict, (const char *)"payload_length");
+        if (!pObjct)
+        {
+            return result_method;
+        }
+
+        // Проверка pObjct на годность.
+        if (!PyCallable_Check(pObjct))
+        {
+            return result_method;
+        }
+
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", command, payload2);
+        if (pVal != NULL)
+        {
+            PyObject *pResultRepr = PyObject_Repr(pVal);
+
+            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
+            // Для начала pResultRepr нужно привести к массиву байтов.
+            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "ISO-8859-1", "ERROR")));
+            Py_XDECREF(pResultRepr);
+            Py_XDECREF(pVal);
+        }
+
+        res << ret;
+        res >> result_method;
+
+        return result_method;
+    }
+
+    int pymessage::payload_length(c2pool::messages::message *msg)
+    {
+        return payload_length(msg->command, msg->pack_c_str());
+    }
 } // namespace c2pool::messages::python
 
 namespace c2pool::messages::python::for_test

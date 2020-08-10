@@ -785,6 +785,24 @@ def bytes_to_char_stringstream(_bytes):
     return ' '.join(chars)
 #----------------------CPP COMMANDS
 
+def payload_length(command, unpacked_payload):
+    """
+        
+    """
+
+    type_ = message_from_str(command)
+
+    #if error command
+    if type_ is None:
+        type_ = EnumMessages[9999]
+    
+    command = bytes(command, encoding = 'ISO-8859-1')
+    
+    msg = type_()
+    packed_payload = msg.pack(unpacked_payload)
+
+    return len(packed_payload)
+
 def receive_length(msg):
     #print('receive_length get: {0}, type {1}; after encoding {2}'.format(msg, type(msg), bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
     #print('when bytes {0}'.format(bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
@@ -964,6 +982,7 @@ def TEST_UNPACKRES():
 # print(send('addrme','80'))
 # print(send('getaddrs','3'))
 # print(send('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))
+#print(payload_length('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))
 # res = b''
 # for i in send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18').split(' '):
 #     res += bytes(chr(int(i)), encoding = 'utf-8')
