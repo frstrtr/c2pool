@@ -42,9 +42,16 @@ namespace c2pool::messages
 
     const unsigned int IMessage::unpacked_length()
     {
+        std::cout << _unpacked_length << " " << length << std::endl;
         if (_unpacked_length == 0)
         {
-            if (length == 0) {
+            int count = 0;
+            for (int i = 0; i < 5; i++){
+                if (length[i] != '\0') count++;
+            }
+            std::cout << "COUNT = " << count << std::endl;
+            if (count == 0) {
+std::cout << "TEST" << std::endl;
                 _unpacked_length = pack_payload_length();
             }
             else {

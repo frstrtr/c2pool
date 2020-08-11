@@ -79,7 +79,7 @@ namespace c2pool::messages
 
         int data_length();
     protected:
-        virtual int pack_payload_length() { return 0;} //возвращает длину для упакованного payload msg, которое формируется в c2pool.
+        virtual int pack_payload_length() { std::cout<< "this:(" << std::endl; return 0;} //возвращает длину для упакованного payload msg, которое формируется в c2pool.
     };
 
     class message : public IMessage
