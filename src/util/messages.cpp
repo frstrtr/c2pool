@@ -22,15 +22,17 @@ namespace c2pool::messages
 
     void IMessage::set_data(char *data_)
     {
-        memcpy(data, data_, data_length());
+        memcpy(data, data_, set_length(data_));
         //strcpy(data, data_);
     }
 
     void IMessage::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);
-        c2pool::str::substr(length, data, command_length, payload_length);
-        _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        if (_unpacked_length == 0) {
+            c2pool::str::substr(length, data, command_length, payload_length);
+            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        }
         c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
         c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, _unpacked_length);
     }
@@ -42,30 +44,22 @@ namespace c2pool::messages
 
     const unsigned int IMessage::unpacked_length()
     {
-        std::cout << _unpacked_length << " " << length << std::endl;
-        if (_unpacked_length == 0)
-        {
-            int count = 0;
-            for (int i = 0; i < 5; i++){
-                if (length[i] != '\0') count++;
-            }
-            std::cout << "COUNT = " << count << std::endl;
-            if (count == 0) {
-std::cout << "TEST" << std::endl;
-                _unpacked_length = pack_payload_length();
-            }
-            else {
-                _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
-            }
-        }
+//                _unpacked_length = pack_payload_length(); //this save
         return _unpacked_length;
     }
 
-    int IMessage::data_length() {
+    int IMessage::set_length(char *data_) {
         int res = 0;
+
         res += command_length + payload_length + checksum_length;
-        res += unpacked_length();
-        cout << "RES: " << res << endl;
+
+        if (data_ != nullptr) {
+            c2pool::str::substr(length, data_, command_length, payload_length);
+            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        }
+        res += _unpacked_length;
+        //cout << "RES: " << res << endl;
+
         return res;
     }
 
@@ -123,7 +117,7 @@ std::cout << "TEST" << std::endl;
         return packed_c_str;
     }
 
-    int message::pack_payload_length(){
+    int message::pack_payload_length() {
         return c2pool::messages::python::pymessage::payload_length(command, pack_c_str());
     }
 

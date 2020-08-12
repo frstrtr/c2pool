@@ -76,10 +76,11 @@ namespace c2pool::messages
 
         //from command, length, checksum, payload to data
         void decode_data();
-
-        int data_length();
     protected:
-        virtual int pack_payload_length() { std::cout<< "this:(" << std::endl; return 0;} //возвращает длину для упакованного payload msg, которое формируется в c2pool.
+        //возвращает длину для упакованного payload msg, которое формируется в c2pool.
+        virtual int pack_payload_length() {return 0;} 
+
+        int set_length(char* data_);
     };
 
     class message : public IMessage
