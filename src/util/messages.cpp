@@ -44,7 +44,6 @@ namespace c2pool::messages
 
     const unsigned int IMessage::unpacked_length()
     {
-//                _unpacked_length = pack_payload_length(); //this save
         return _unpacked_length;
     }
 
@@ -58,7 +57,6 @@ namespace c2pool::messages
             _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
         }
         res += _unpacked_length;
-        //cout << "RES: " << res << endl;
 
         return res;
     }
