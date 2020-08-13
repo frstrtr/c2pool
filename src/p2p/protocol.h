@@ -62,7 +62,7 @@ namespace c2pool::p2p
     protected:
 
         //used for write message in protocol
-        virtual void write(c2pool::messages::message* msg);
+        //virtual void write(unique_ptr<c2pool::messages::message> msg);
 
         void read_prefix();
 

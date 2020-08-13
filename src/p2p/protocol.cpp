@@ -36,21 +36,21 @@ namespace c2pool::p2p
         //addr;
     }
 
-    //msg.data(), msg.length()
-    void Protocol::write(c2pool::messages::message* msg)
-    {
-        boost::asio::async_write(socket,
-                                 boost::asio::buffer(msg->data, msg->unpacked_length),
-                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
-                                     if (!ec)
-                                     {
-                                     }
-                                     else
-                                     {
-                                         disconnect();
-                                     }
-                                 });
-    }
+    // //msg.data(), msg.length()
+    // void Protocol::write(unique_ptr<c2pool::messages::message> msg)
+    // {
+    //     boost::asio::async_write(socket,
+    //                              boost::asio::buffer(msg->data, msg->get_length()),
+    //                              [this](boost::system::error_code ec, std::size_t /*length*/) {
+    //                                  if (!ec)
+    //                                  {
+    //                                  }
+    //                                  else
+    //                                  {
+    //                                      disconnect();
+    //                                  }
+    //                              });
+    // }
 
     void Protocol::read_prefix()
     {
@@ -141,7 +141,17 @@ namespace c2pool::p2p
 
     void Protocol::send(unique_ptr<c2pool::messages::message> msg){
         msg->send();
-        write()
+        boost::asio::async_write(socket,
+                                 boost::asio::buffer(msg->data, msg->get_length()),
+                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
+                                     if (!ec)
+                                     {
+                                     }
+                                     else
+                                     {
+                                         disconnect();
+                                     }
+                                 });
     }
 
     //OLD: fromStr

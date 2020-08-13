@@ -76,6 +76,8 @@ namespace c2pool::messages
 
         //from command, length, checksum, payload to data
         void decode_data();
+
+        int get_length();
     protected:
         //возвращает длину для упакованного payload msg, которое формируется в c2pool.
         virtual int pack_payload_length() {return 0;} 

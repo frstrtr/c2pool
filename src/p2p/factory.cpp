@@ -2,6 +2,7 @@
 #include <iostream>
 #include <thread>
 #include <boost/asio.hpp>
+#include <boost/bind.hpp>
 #include <deque>
 #include <list>
 #include <memory>
@@ -35,7 +36,7 @@ namespace c2pool::p2p
     {
         desired_conns = _desired_conns;
         max_attempts = _max_attempts;
-        _think_timer.async_wait(_think);
+        _think_timer.async_wait(boost::bind(&Client::_think, this, boost::asio::placeholders::error));
     }
 
     //todo: void -> bool
@@ -56,12 +57,16 @@ namespace c2pool::p2p
         }
     }
 
-    void Client::_think()
+    void Client::_think(const boost::system::error_code &error)
     {
-        //TODO: finish method
-        boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0) * 1000));
-        _think_timer.expires_at(_think_timer.expires_at() + interval);
-        _think_timer.async_wait(_think);
+        if (!error)
+        {
+            //TODO: finish method
+            boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0) * 1000));
+            _think_timer.expires_at(_think_timer.expires_at() + interval);
+            _think_timer.async_wait(boost::bind(&Client::_think, this, boost::asio::placeholders::error));
+        }
+        //TODO: debug log error
     }
 
     //--------------------------Server
