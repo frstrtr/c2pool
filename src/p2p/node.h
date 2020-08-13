@@ -3,7 +3,7 @@
 
 #include <map>
 #include <set>
-#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
+// #include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 #include <boost/asio.hpp>
 #include <memory>
 #include "config.h"
@@ -48,7 +48,7 @@ namespace c2pool::p2p
     class INode
     {
     public:
-        INode(NodesManager *_nodes) : nodes(_nodes)
+        INode(std::shared_ptr<NodesManager> _nodes) : nodes(_nodes)
         {
         }
 
@@ -59,7 +59,7 @@ namespace c2pool::p2p
         }
 
     public:
-        const NodesManager *nodes;
+        const std::shared_ptr<NodesManager> nodes;
     };
 } // namespace c2pool::p2p
 
@@ -89,7 +89,7 @@ namespace c2pool::p2p
     class Node : public INode
     {
     public:
-        Node(c2pool::p2p::NodesManager *_nodes, std::string _port);
+        Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port);
 
         virtual void handle_shares() = 0;
         virtual void handle_share_hashes() = 0;
@@ -98,7 +98,7 @@ namespace c2pool::p2p
 
         void got_conn(std::shared_ptr<Protocol> protocol);
         void lost_conn(std::shared_ptr<Protocol> protocol, boost::exception *reason);
-        void _think(); //TODO: rename method
+        void _think(const boost::system::error_code &error); //TODO: rename method
 
         //TODO: void got_addr();
         //TODO: void get_good_peers();

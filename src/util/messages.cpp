@@ -48,17 +48,16 @@ namespace c2pool::messages
     }
 
     int IMessage::set_length(char *data_) {
-        int res = 0;
-
-        res += command_length + payload_length + checksum_length;
-
         if (data_ != nullptr) {
             c2pool::str::substr(length, data_, command_length, payload_length);
             _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
         }
-        res += _unpacked_length;
 
-        return res;
+        return get_length();
+    }
+
+    int IMessage::get_length(){
+        return command_length + payload_length + checksum_length + unpacked_length();
     }
 
     //message

@@ -38,9 +38,9 @@ namespace c2pool::p2p
     class Factory
     {
     public:
-        Factory(boost::asio::io_context &context, shared_ptr<c2pool::p2p::NodesManager> _nodes);
+        Factory(boost::asio::io_context &context, std::shared_ptr<c2pool::p2p::NodesManager> _nodes);
 
-        void protocol_connected(shared_ptr<c2pool::p2p::Protocol> proto);
+        void protocol_connected(std::shared_ptr<c2pool::p2p::Protocol> proto);
     public:
         boost::asio::io_context &io_context;
 
@@ -52,12 +52,12 @@ namespace c2pool::p2p
     class Client : public Factory
     {
     public:
-        Client(boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts);
+        Client(boost::asio::io_context &io_context_, std::shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts);
 
         //todo: void -> bool
         void connect(std::string ip, std::string port);
 
-        void _think(); //TODO: change name
+        void _think(const boost::system::error_code &error); //TODO: change name
 
     protected:
         tcp::resolver resolver;
@@ -68,7 +68,7 @@ namespace c2pool::p2p
     class Server : public Factory
     {
     public:
-        Server(boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, const tcp::endpoint &endpoint, int _max_conns);
+        Server(boost::asio::io_context &io_context_, std::shared_ptr<c2pool::p2p::NodesManager> _nodes, const tcp::endpoint &endpoint, int _max_conns);
 
         void accept();
 
