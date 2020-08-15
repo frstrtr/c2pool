@@ -91,10 +91,10 @@ namespace c2pool::p2p
     public:
         Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port);
 
-        virtual void handle_shares() = 0;
-        virtual void handle_share_hashes() = 0;
-        virtual void handle_get_shares() = 0;
-        virtual void handle_bestblock() = 0;
+        virtual void handle_shares() {/*TODO*/};
+        virtual void handle_share_hashes() {/*TODO*/};
+        virtual void handle_get_shares() {/*TODO*/};
+        virtual void handle_bestblock() {/*TODO*/};
 
         void got_conn(std::shared_ptr<Protocol> protocol);
         void lost_conn(std::shared_ptr<Protocol> protocol, boost::exception *reason);

@@ -12,6 +12,8 @@
 #include "protocol.h"
 #include "factory.h"
 
+#include <iterator>
+
 //c2pool::p2p::Node
 namespace c2pool::p2p
 {
@@ -22,9 +24,9 @@ namespace c2pool::p2p
 
         //boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts
         client = std::make_unique<c2pool::p2p::Client>(_nodes->io_context(), _nodes, 10, 30); // client.start()
-        c2pool::p2p::Client* test_client = new c2pool::p2p::Client(_nodes->io_context(), _nodes, 10, 30);
+        c2pool::p2p::Client *test_client = new c2pool::p2p::Client(_nodes->io_context(), _nodes, 10, 30);
         //boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, const tcp::endpoint &endpoint, int _max_conns
-        tcp::endpoint the_endpoint(tcp::v4(), atoi(_port.c_str())); //ipv4, port; atoi -> str to int
+        tcp::endpoint the_endpoint(tcp::v4(), atoi(_port.c_str()));                                     //ipv4, port; atoi -> str to int
         server = std::make_unique<c2pool::p2p::Server>(_nodes->io_context(), _nodes, the_endpoint, 50); // server.start()
 
         //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
@@ -38,7 +40,7 @@ namespace c2pool::p2p
         {
             std::cout << "Already have peer!" << std::endl; //TODO: raise ValueError('already have peer')
         }
-        peers.insert(std::pair<int, shared_ptr<c2pool::p2p::Protocol>>(protocol->nonce(), protocol));
+        peers.insert(std::make_pair<int, shared_ptr<c2pool::p2p::Protocol>>(protocol->nonce(), protocol->shared_from_this()));
     }
 
     void Node::lost_conn(shared_ptr<c2pool::p2p::Protocol> protocol, boost::exception *reason)
@@ -64,9 +66,14 @@ namespace c2pool::p2p
     { //TODO: rename method&
         if (peers.size() > 0)
         {
-            c2pool::random::RandomChoice(peers)->send(make_unique<c2pool::messages::message_getaddrs>(8)); //TODO: add send_getaddrs to c2pool::p2p::Protocol
+            int pos = c2pool::random::RandomInt(0, peers.size());
+            auto item = peers.begin();
+            std::advance(item, pos);
+            auto proto = item->second;
+            proto->send(std::make_unique<c2pool::messages::message_getaddrs>(8));
+            //c2pool::random::RandomChoice<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>>(peers)->send(std::make_unique<c2pool::messages::message_getaddrs>(8)); //TODO: add send_getaddrs to c2pool::p2p::Protocol
         }
-        boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0 / 20)*1000));
+        boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0 / 20) * 1000));
         _think_timer.expires_at(_think_timer.expires_at() + interval);
         _think_timer.async_wait(boost::bind(&Node::_think, this, boost::asio::placeholders::error));
     }
