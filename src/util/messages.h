@@ -119,7 +119,7 @@ namespace c2pool::messages
         // }
 
         virtual void _unpack(std::stringstream &ss) = 0;
-        virtual string _pack() = 0;
+        virtual std::string _pack() = 0;
     protected:
         int pack_payload_length() override;
     private:
