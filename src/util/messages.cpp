@@ -118,6 +118,18 @@ namespace c2pool::messages
         return c2pool::messages::python::pymessage::payload_length(command, pack_c_str());
     }
 
+    //message_error
+
+    void message_error::_unpack(std::stringstream &ss)
+    {
+        //NOTHING :(
+    }
+
+    string message_error::_pack()
+    {
+        return std::string("MESSAGE_ERROR!");
+    }
+
     //message_version
 
     void message_version::_unpack(std::stringstream &ss)
