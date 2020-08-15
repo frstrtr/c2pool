@@ -4,6 +4,7 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <iterator>
 
 namespace c2pool::random
 {
@@ -14,10 +15,17 @@ namespace c2pool::random
     float RandomFloat(float min, float max);
 
     template <typename T>
-    T RandomChoice(std::vector<T> list);
+    T RandomChoice(std::vector<T> &list);
 
-    template <typename K, typename V>
-    V RandomChoice(std::map<K, V> map);
+    //TODO: Remake?
+    // template <typename K, typename V, typename Compare = std::less<K>,
+    //           typename Alloc = std::allocator<std::pair<const K, V>>>
+    // V RandomChoice(std::map<K, V, Compare, Alloc> m)
+    // { //TODO: THIS WANNA TEST
+    //     int pos = RandomInt(0, m.size());
+    //     std::iterator item = m.cbegin();
+    //     return std::advance(item, pos);
+    // }
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l);
@@ -47,11 +55,11 @@ namespace c2pool::str
     //from [exclude]
     void substr(char *dest, char *source, int from, unsigned int length);
 
-    char* from_bytes_to_strChar(char* source);
+    char *from_bytes_to_strChar(char *source);
 
     //char и unsigned char будут так же верно сравниваться.
     //true - equaled
-    bool compare_str(char* first_str, char* second_str, unsigned int length);
+    bool compare_str(char *first_str, char *second_str, unsigned int length);
 } // namespace c2pool::str
 
 #endif //CPOOL_OTHER_H
