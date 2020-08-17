@@ -34,6 +34,7 @@ namespace c2pool::p2p
     //--------------------------Client
     Client::Client(boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts) : resolver(io_context_), Factory(io_context_, _nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
     {
+        std::cout << "ClientFactory created." << std::endl; //TODO: DEBUG_LOGGER
         desired_conns = _desired_conns;
         max_attempts = _max_attempts;
         _think_timer.async_wait(boost::bind(&Client::_think, this, boost::asio::placeholders::error));
@@ -59,10 +60,12 @@ namespace c2pool::p2p
 
     void Client::_think(const boost::system::error_code &error)
     {
+        std::cout << "ClientFactory _think." << std::endl; //TODO: DEBUG_LOGGER
         if (!error)
         {
             //TODO: finish method
-            boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0) * 1000));
+            boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(20.0) * 1000));
+            std::cout << "Expovariate: " << c2pool::random::Expovariate(20.0) << std::endl;
             _think_timer.expires_at(_think_timer.expires_at() + interval);
             _think_timer.async_wait(boost::bind(&Client::_think, this, boost::asio::placeholders::error));
         }
@@ -73,6 +76,7 @@ namespace c2pool::p2p
     Server::Server(boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, const tcp::endpoint &endpoint, int _max_conns)
         : acceptor_(io_context, endpoint), Factory(io_context_, _nodes)
     {
+        std::cout << "ServerFactory created." << std::endl; //TODO: DEBUG_LOGGER
         max_conns = _max_conns;
         accept();
     }

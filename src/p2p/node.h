@@ -22,9 +22,7 @@ namespace c2pool::p2p
     class NodesManager
     {
     public:
-        NodesManager(boost::asio::io_context& _io, c2pool::config::Network* _networkConfig) : _io_context(_io){
-            _net = _networkConfig; //TODO
-        }
+        NodesManager(boost::asio::io_context& _io, c2pool::config::Network* _networkConfig);
 
         boost::asio::io_context& io_context() const{ //todo: const?
             return _io_context;
