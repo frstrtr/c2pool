@@ -7,9 +7,18 @@
 #include "config.h"
 #include "networks/config.h"
 #include <memory>
+#include <console.h>
+
 
 int main(int argc, char* argv[])
 {
+    
+    // c2pool::console::Logger::Init();
+    // c2pool::console::Logger::Trace(12);
+
+    std::cout << "Start c2pool..." << std::endl; //TODO: DEBUG_LOGGER
+
+
     c2pool::config::Network* net = new c2pool::config::Network();
     boost::asio::io_context io;
 

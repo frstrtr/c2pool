@@ -14,17 +14,30 @@
 
 #include <iterator>
 
+//c2pool::p2p::NodesManager
+namespace c2pool::p2p
+{
+    NodesManager::NodesManager(boost::asio::io_context &_io, c2pool::config::Network *_networkConfig) : _io_context(_io)
+    {
+        std::cout << "Initialization NodesManager..." << std::endl; //TODO: DEBUG_LOGGER
+        _net = _networkConfig; //TODO
+    }
+
+} // namespace c2pool::p2p
+
 //c2pool::p2p::Node
 namespace c2pool::p2p
 {
     Node::Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port) : INode(_nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
     {
+        std::cout << "Start Node initialization..." << std::endl; //TODO: DEBUG_LOGGER
         nonce = c2pool::random::RandomNonce();
+        std::cout << "Node nonce generated: " << nonce << std::endl; //TODO: DEBUG_LOGGER
         port = _port;
 
         //boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts
         client = std::make_unique<c2pool::p2p::Client>(_nodes->io_context(), _nodes, 10, 30); // client.start()
-        
+
         //boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, const tcp::endpoint &endpoint, int _max_conns
         tcp::endpoint the_endpoint(tcp::v4(), atoi(_port.c_str()));                                     //ipv4, port; atoi -> str to int
         server = std::make_unique<c2pool::p2p::Server>(_nodes->io_context(), _nodes, the_endpoint, 50); // server.start()
@@ -32,6 +45,7 @@ namespace c2pool::p2p
         //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
 
         _think_timer.async_wait(boost::bind(&Node::_think, this, boost::asio::placeholders::error));
+        std::cout << "Node created." << std::endl; //TODO: DEBUG_LOGGER
     }
 
     void Node::got_conn(shared_ptr<c2pool::p2p::Protocol> protocol)

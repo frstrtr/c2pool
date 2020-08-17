@@ -290,6 +290,7 @@ namespace c2pool::p2p
     //ClientProtocol
     ClientProtocol::ClientProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints) : Protocol(std::move(_socket), _factory)
     {
+        std::cout << "ClientProtocol created." << std::endl; //TODO: DEBUG_LOGGER
         do_connect(endpoints);
     }
 
@@ -300,6 +301,7 @@ namespace c2pool::p2p
     //ServerProtocol
     ServerProtocol::ServerProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : Protocol(std::move(_socket), _factory)
     {
+        std::cout << "ServerProtocol created." << std::endl; //TODO: DEBUG_LOGGER
         start();
     }
 

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.18.1)
 project(cpool)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -16,8 +16,19 @@ set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER})
 set(c2pool_libs util p2p networks other)
 
 #BOOST
+
+# SET(Boost_USE_STATIC_LIBS ON)
+# FIND_PACKAGE(Boost 1.72.0 COMPONENTS log REQUIRED)
+ADD_DEFINITIONS(-DBOOST_LOG_DYN_LINK)
 FIND_PACKAGE(Boost 1.72.0 REQUIRED)
 include_directories(${Boost_INCLUDE_DIRS})
+
+
+
+# find_package(Boost 1.72.0 COMPONENTS REQUIRED log)
+# find_library(loglib libboost_log.a C:\Program Files\boost\boost_1_72_0)
+# target_link_libraries(Boost::log INTERFACE ${loglib})
+
 #PYTHON
 
 
