@@ -12,6 +12,8 @@ using boost::asio::ip::tcp;
 #include "protocol.h"
 #include "factory.h"
 #include "node.h"
+#include "console.h"
+
 //-----------------------------------------------------------
 
 class Node;
@@ -221,8 +223,7 @@ namespace c2pool::p2p
         {
             if (_peer.first == msg->nonce)
             {
-                string err = "Detected duplicate connection, disconnecting from " + std::get<0>(addr) + ":" + std::get<1>(addr);
-                //Log::Debug(err); //TODO: DEBUG
+                LOG_WARNING << "Detected duplicate connection, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
                 disconnect();
                 return;
             }
@@ -290,7 +291,7 @@ namespace c2pool::p2p
     //ClientProtocol
     ClientProtocol::ClientProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints) : Protocol(std::move(_socket), _factory)
     {
-        std::cout << "ClientProtocol created." << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "ClientProtocol created.";
         do_connect(endpoints);
     }
 
@@ -301,7 +302,7 @@ namespace c2pool::p2p
     //ServerProtocol
     ServerProtocol::ServerProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : Protocol(std::move(_socket), _factory)
     {
-        std::cout << "ServerProtocol created." << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "ServerProtocol created.";
         start();
     }
 

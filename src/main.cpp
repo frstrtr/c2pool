@@ -9,15 +9,18 @@
 #include <memory>
 #include <console.h>
 
-
 int main(int argc, char* argv[])
 {
-    
-    // c2pool::console::Logger::Init();
-    // c2pool::console::Logger::Trace(12);
+    c2pool::console::Logger::Init();
 
-    std::cout << "Start c2pool..." << std::endl; //TODO: DEBUG_LOGGER
+    LOG_TRACE << "A trace severity message" << "TEST";
+    LOG_DEBUG << "A debug severity message";
+    LOG_INFO << "An informational severity message";
+    LOG_WARNING << "A warning severity message";
+    LOG_ERROR << "An error severity message";
+    LOG_FATAL << "A fatal severity message";
 
+    LOG_INFO << "Start c2pool...";
 
     c2pool::config::Network* net = new c2pool::config::Network();
     boost::asio::io_context io;
