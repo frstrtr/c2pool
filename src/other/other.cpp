@@ -49,7 +49,7 @@ namespace c2pool::random
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l)
     {
-        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-l);
+        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1/l);
     }
 
     unsigned long long RandomNonce()

@@ -11,13 +11,17 @@
 
 namespace c2pool::console
 {
+    #define LOG_TRACE BOOST_LOG_TRIVIAL(trace)
+    #define LOG_ERROR BOOST_LOG_TRIVIAL(error)
+    #define LOG_DEBUG BOOST_LOG_TRIVIAL(debug)
+    #define LOG_INFO BOOST_LOG_TRIVIAL(info)
+    #define LOG_WARNING BOOST_LOG_TRIVIAL(warning)
+    #define LOG_FATAL BOOST_LOG_TRIVIAL(fatal)
+
     class Logger
     {
     private:
-        static Logger *instance;
-
-        static boost::log::sources::severity_logger<boost::log::trivial::severity_level> lg;
-
+        inline static Logger *instance;
 
         Logger();
 
@@ -25,12 +29,5 @@ namespace c2pool::console
         static void Init();
 
         static Logger* log();
-
-        template <typename T>
-        static Logger &Trace(T var){
-            BOOST_LOG_SEV(lg, boost::log::trivial::trace) << "TEST" << "TEST" << 1 << "TEST" << var;
-            return *instance;
-        }
-        
     };
 } // namespace c2pool::console

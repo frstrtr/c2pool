@@ -11,6 +11,7 @@
 #include <iostream>
 #include "protocol.h"
 #include "factory.h"
+#include "console.h"
 
 #include <iterator>
 
@@ -19,7 +20,7 @@ namespace c2pool::p2p
 {
     NodesManager::NodesManager(boost::asio::io_context &_io, c2pool::config::Network *_networkConfig) : _io_context(_io)
     {
-        std::cout << "Initialization NodesManager..." << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "Initialization NodesManager...";
         _net = _networkConfig; //TODO
     }
 
@@ -30,9 +31,9 @@ namespace c2pool::p2p
 {
     Node::Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port) : INode(_nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
     {
-        std::cout << "Start Node initialization..." << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "Start Node initialization...";
         nonce = c2pool::random::RandomNonce();
-        std::cout << "Node nonce generated: " << nonce << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "Node nonce generated: ";
         port = _port;
 
         //boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts
@@ -45,7 +46,7 @@ namespace c2pool::p2p
         //todo? self.singleclientconnectors = [reactor.connectTCP(addr, port, SingleClientFactory(self)) for addr, port in self.connect_addrs]
 
         _think_timer.async_wait(boost::bind(&Node::_think, this, boost::asio::placeholders::error));
-        std::cout << "Node created." << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "Node created.";
     }
 
     void Node::got_conn(shared_ptr<c2pool::p2p::Protocol> protocol)
@@ -77,7 +78,8 @@ namespace c2pool::p2p
     }
 
     void Node::_think(const boost::system::error_code &error)
-    { //TODO: rename method&
+    { //TODO: rename method?
+        LOG_DEBUG << "Node _think.";
         if (peers.size() > 0)
         {
             int pos = c2pool::random::RandomInt(0, peers.size());
@@ -87,7 +89,9 @@ namespace c2pool::p2p
             proto->send(std::make_unique<c2pool::messages::message_getaddrs>(8));
             //c2pool::random::RandomChoice<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>>(peers)->send(std::make_unique<c2pool::messages::message_getaddrs>(8)); //TODO: add send_getaddrs to c2pool::p2p::Protocol
         }
-        boost::posix_time::milliseconds interval(static_cast<int>(c2pool::random::Expovariate(1.0 / 20) * 1000));
+        float rand = c2pool::random::Expovariate(20);
+        boost::posix_time::milliseconds interval(static_cast<int>(rand * 1000));
+        LOG_DEBUG << "[Node::_think()] Expovariate seconds: " << rand;
         _think_timer.expires_at(_think_timer.expires_at() + interval);
         _think_timer.async_wait(boost::bind(&Node::_think, this, boost::asio::placeholders::error));
     }

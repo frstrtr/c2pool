@@ -2,12 +2,13 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <console.h>
 using namespace std;
 
 namespace c2pool::config{
 
     Network::Network(){
-        std::cout << "Created Network Config." << std::endl; //TODO: DEBUG_LOGGER
+        LOG_INFO << "Created Network Config.";
     }
 
 }

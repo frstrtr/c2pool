@@ -16,16 +16,30 @@ set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER})
 set(c2pool_libs util p2p networks other)
 
 #BOOST
+# ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
 
-# SET(Boost_USE_STATIC_LIBS ON)
-# FIND_PACKAGE(Boost 1.72.0 COMPONENTS log REQUIRED)
-ADD_DEFINITIONS(-DBOOST_LOG_DYN_LINK)
-FIND_PACKAGE(Boost 1.72.0 REQUIRED)
+#set(BOOST_LOG_DYN_LINK ON)
+set(Boost_USE_STATIC_LIBS ON)
+
+set(Boost_DEBUG ON)
+set(Boost_VERBOSE ON)
+set(Boost_USE_DEBUG_LIBS         ON) # ignore debug libs and
+# set(Boost_USE_RELEASE_LIBS       ON)  # only find release libs
+# set(Boost_USE_MULTITHREADED      ON)
+# set(Boost_USE_STATIC_RUNTIME    OFF)
+find_package(Boost 1.74.0 COMPONENTS log log_setup REQUIRED)
+set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY} ${Boost_LOG_SETUP_LIBRARY})
+#find_package(Boost 1.74.0 REQUIRED)
+# find_package(Boost 1.74.0 REQUIRED)
 include_directories(${Boost_INCLUDE_DIRS})
 
+if(Boost_FOUND)
+	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
+    MESSAGE( STATUS "Boost_LIBRARIES = ${BOOST_LIBRARYDIR}.")
+    MESSAGE( STATUS "Boost_LIB_VERSION = ${Boost_LIB_VERSION}.")
+endif()
+    
 
-
-# find_package(Boost 1.72.0 COMPONENTS REQUIRED log)
 # find_library(loglib libboost_log.a C:\Program Files\boost\boost_1_72_0)
 # target_link_libraries(Boost::log INTERFACE ${loglib})
 
@@ -48,6 +62,8 @@ if(WIN32)
 endif()
 
 target_compile_definitions(cpool PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
-target_link_libraries(cpool LINK_PUBLIC ${Boost_LIBRARIES})
+target_link_libraries(cpool -Wl,--start-group  ${PROJECT_LIB} -Wl,--end-group)
+# target_link_libraries(cpool ${Boost_LIBRARIES})
+target_link_libraries(cpool Boost::log_setup Boost::log)
 target_link_libraries(cpool ${c2pool_libs})
 #target_link_libraries(cpool ${UTILS})
