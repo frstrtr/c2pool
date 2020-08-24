@@ -11,9 +11,10 @@ set(UTILS src/util)
 set(P2P src/p2p)
 set(NETWORKS src/networks)
 set(OTHER src/other)
+set(UNIVALUE src/univalue)
 #set(CRYPTO src/crypto)  #todo
 set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER})
-set(c2pool_libs util p2p networks other)
+set(c2pool_libs util p2p networks other univalue)
 
 #BOOST
 # ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
@@ -66,4 +67,3 @@ target_link_libraries(cpool -Wl,--start-group  ${PROJECT_LIB} -Wl,--end-group)
 # target_link_libraries(cpool ${Boost_LIBRARIES})
 target_link_libraries(cpool Boost::log_setup Boost::log)
 target_link_libraries(cpool ${c2pool_libs})
-#target_link_libraries(cpool ${UTILS})
