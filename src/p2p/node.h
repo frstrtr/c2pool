@@ -7,6 +7,7 @@
 #include <boost/asio.hpp>
 #include <memory>
 #include "config.h"
+#include "addrStore.h"
 
 namespace c2pool::p2p
 {
@@ -114,7 +115,7 @@ namespace c2pool::p2p
     private:
         //TODO: int preffered_storage;
         //TODO: connect_addrs
-        //TODO: addr_store //TODO: change type; net.BOOTSTRAP_ADDRS + saved addrs
+        c2pool::p2p::AddrStore addr_store; //TODO: change type; net.BOOTSTRAP_ADDRS + saved addrs
         //TODO: bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
         //TODO: std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
     };
