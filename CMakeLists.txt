@@ -13,7 +13,7 @@ set(NETWORKS src/networks)
 set(OTHER src/other)
 set(UNIVALUE src/univalue)
 #set(CRYPTO src/crypto)  #todo
-set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER})
+set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE})
 set(c2pool_libs util p2p networks other univalue)
 
 #BOOST

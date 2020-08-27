@@ -8,6 +8,6 @@ set(SOURCE
     lib/univalue_write.cpp
 )
 
-add_library(univalue ${HEADER} ${SOURCE})
+add_library(univalue STATIC ${HEADER} ${SOURCE})
 
 target_include_directories(univalue PUBLIC include PRIVATE lib)

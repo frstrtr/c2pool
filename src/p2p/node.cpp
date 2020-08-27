@@ -12,6 +12,7 @@
 #include "protocol.h"
 #include "factory.h"
 #include "console.h"
+#include "addrStore.h"
 
 #include <iterator>
 
@@ -29,7 +30,7 @@ namespace c2pool::p2p
 //c2pool::p2p::Node
 namespace c2pool::p2p
 {
-    Node::Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port) : INode(_nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
+    Node::Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store) : INode(_nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0)), addr_store(std::move(_addr_store))
     {
         LOG_INFO << "Start Node initialization...";
         nonce = c2pool::random::RandomNonce();

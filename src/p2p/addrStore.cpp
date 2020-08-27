@@ -1,11 +1,42 @@
-#include <addrStore.h>
+#include "addrStore.h"
+#include "univalue.h"
+#include "config.h"
 #include <string>
-#include <univalue>
+#include <fstream>
+#include "console.h"
 
 using std::string;
 
 namespace c2pool::p2p
 {
+    //template path — "data//bitcoin//addrs"
+    AddrStore::AddrStore(string path, c2pool::config::Network *net)
+    {
+        std::fstream AddrsFile(path, std::ios_base::in);
+
+        //exist file
+        if (AddrsFile)
+        {
+
+            string json;
+            //Если будет баг с тем, что файл как-то не так читается, то винить эту строку, не меня.
+            //Кто же знал, что вы будете разделять json файл на кучу строк.
+            AddrsFile >> json;
+
+            UniValue AddrsValue(UniValue::VARR);
+
+            for (int i = 0; i < ArrsValue.size())
+
+            value.pushKV("address", std::get<0>(kv.first));
+            value.pushKV("port", std::get<1>(kv.first));
+            value.pushKV("services", kv.second.service);
+            value.pushKV("first_seen", kv.second.first_seen);
+            value.pushKV("last_seen", kv.second.last_seen);
+
+        }
+
+
+    }
 
     bool AddrStore::Check(ADDR key)
     {
@@ -49,14 +80,15 @@ namespace c2pool::p2p
 
             value.pushKV("address", std::get<0>(kv.first));
             value.pushKV("port", std::get<1>(kv.first));
-            value.pushKV("services", kv.second.services);
-            value.pushKV("first_seen", kv.second.first);
-            value.pushKV("last_seen", kv.second.last);
+            value.pushKV("services", kv.second.service);
+            value.pushKV("first_seen", kv.second.first_seen);
+            value.pushKV("last_seen", kv.second.last_seen);
 
-            DictVal.push_back(V);
+            dict.push_back(value);
         }
 
-        std::string json = DictVal.write();
+        std::string json = dict.write();
+        return json;
     }
 
     void AddrStore::FromJSON(string json)
@@ -64,14 +96,14 @@ namespace c2pool::p2p
         UniValue ArrV(UniValue::VARR);
         ArrV.read(json); //TODO: add check for valid json.
 
-        for (int i = 0; i < vRead.size(); i++)
+        for (int i = 0; i < ArrV.size(); i++)
         {
-            auto key = std::make_tuple(ArrV[i]["address"], ArrV[i]["port"]);
+            auto key = std::make_tuple(ArrV[i]["address"].get_str(), ArrV[i]["port"].get_str());
 
             store[key] = {
-                ArrV[i]["services"],
-                ArrV[i]["first_seen"],
-                ArrV[i]["last_seen"]};
+                ArrV[i]["services"].get_int(),
+                ArrV[i]["first_seen"].get_real(),
+                ArrV[i]["last_seen"].get_real()};
         }
     }
 } // namespace c2pool::p2p

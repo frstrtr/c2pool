@@ -16,6 +16,7 @@ namespace c2pool::p2p
     class Protocol;
     class P2PNode;
     class BitcoindNode;
+    class AddrStore;
 } // namespace c2pool::p2p
 
 namespace c2pool::p2p
@@ -88,7 +89,7 @@ namespace c2pool::p2p
     class Node : public INode
     {
     public:
-        Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port);
+        Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store);
 
         virtual void handle_shares() {/*TODO*/};
         virtual void handle_share_hashes() {/*TODO*/};
