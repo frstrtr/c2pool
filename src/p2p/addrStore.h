@@ -9,7 +9,11 @@ using std::string;
 using std::tuple;
 
 #define ADDR tuple<string, string>
-#define EMPTY_ADDR_VALUE {-9999, -9999, -9999}
+#define EMPTY_ADDR_VALUE {0, 0, 0}
+
+namespace c2pool::config{
+    class Network;
+}
 
 namespace c2pool::p2p
 {
@@ -17,20 +21,19 @@ namespace c2pool::p2p
     struct AddrValue
     {
         int service;
-        float first_seen;
-        float last_seen;
+        double first_seen;
+        double last_seen;
     };
 
     class AddrStore
     {
     public:
-        AddrStore();
-        AddrStore(string json);
+        AddrStore(string path, c2pool::config::Network* net);
         bool Check(ADDR addr);
 
-        AddrValue Get(ADDR key);
         bool Add(ADDR key, AddrValue value);
         bool Remove(ADDR key);
+        AddrValue Get(ADDR key);
 
         string ToJSON();
         void FromJSON(string json);
