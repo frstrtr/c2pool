@@ -29,6 +29,7 @@ namespace c2pool::p2p
     {
     public:
         AddrStore(string path, c2pool::config::Network* net);
+        void SaveToFile();
         bool Check(ADDR addr);
 
         bool Add(ADDR key, AddrValue value);
@@ -41,6 +42,7 @@ namespace c2pool::p2p
         int len() { return store.size(); }
     private:
         map<ADDR, AddrValue> store;
+        std::string filePath;
     };
 
 } // namespace c2pool::p2p

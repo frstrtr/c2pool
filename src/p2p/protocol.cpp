@@ -58,7 +58,7 @@ namespace c2pool::p2p
     {
         tempMessage = std::make_unique<c2pool::messages::IMessage>(/*TODO: net.PREFIX*/);
         boost::asio::async_read(socket,
-                                boost::asio::buffer(tempMessage->prefix, node->net()->PREFIX.length()),
+                                boost::asio::buffer(tempMessage->prefix, node->net()->PREFIX_LENGTH),
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec /*&& <сравнение размеров prefix>*/)
                                     {

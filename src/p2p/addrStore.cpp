@@ -4,6 +4,7 @@
 #include <string>
 #include <fstream>
 #include "console.h"
+#include "other.h"
 
 using std::string;
 
@@ -12,30 +13,53 @@ namespace c2pool::p2p
     //template path — "data//bitcoin//addrs"
     AddrStore::AddrStore(string path, c2pool::config::Network *net)
     {
+        filePath = path;
         std::fstream AddrsFile(path, std::ios_base::in);
 
+        //FILE
         //exist file
         if (AddrsFile)
         {
-
             string json;
             //Если будет баг с тем, что файл как-то не так читается, то винить эту строку, не меня.
             //Кто же знал, что вы будете разделять json файл на кучу строк.
             AddrsFile >> json;
-
-            UniValue AddrsValue(UniValue::VARR);
-
-            for (int i = 0; i < ArrsValue.size())
-
-            value.pushKV("address", std::get<0>(kv.first));
-            value.pushKV("port", std::get<1>(kv.first));
-            value.pushKV("services", kv.second.service);
-            value.pushKV("first_seen", kv.second.first_seen);
-            value.pushKV("last_seen", kv.second.last_seen);
-
+            FromJSON(json);
+        }
+        else
+        {
+            LOG_WARNING << "AddrsFile not found!";
         }
 
+        //BOOTSTRAP
+        for (auto key : net->BOOTSTRAP_ADDRS)
+        {
+            store[key] = {
+                0,
+                (double)c2pool::time::timestamp(),
+                (double)c2pool::time::timestamp()};
+        }
 
+        //SAVE IN FILE
+        if (store.size() > 0)
+        {
+            SaveToFile();
+        }
+        else
+        {
+            LOG_WARNING << "AddrStore is empty!";
+        }
+
+        AddrsFile.close();
+    }
+
+    void AddrStore::SaveToFile()
+    {
+        std::fstream AddrsFile(filePath, std::ios_base::out);
+        AddrsFile << ToJSON();
+
+        AddrsFile.close();
+        LOG_DEBUG << "Addrs saved in file!";
     }
 
     bool AddrStore::Check(ADDR key)
@@ -59,6 +83,7 @@ namespace c2pool::p2p
         if (Check(key))
             return false;
         store.insert(std::pair<ADDR, AddrValue>(key, value));
+        SaveToFile();
         return true;
     }
 
@@ -67,6 +92,7 @@ namespace c2pool::p2p
         if (Check(key))
             return false;
         store.erase(key);
+        SaveToFile();
         return true;
     }
 
@@ -93,17 +119,16 @@ namespace c2pool::p2p
 
     void AddrStore::FromJSON(string json)
     {
-        UniValue ArrV(UniValue::VARR);
-        ArrV.read(json); //TODO: add check for valid json.
+        UniValue AddrsValue(UniValue::VARR);
+        AddrsValue.read(json); //TODO: add check for valid json.
 
-        for (int i = 0; i < ArrV.size(); i++)
+        for (int i = 0; i < AddrsValue.size(); i++)
         {
-            auto key = std::make_tuple(ArrV[i]["address"].get_str(), ArrV[i]["port"].get_str());
-
-            store[key] = {
-                ArrV[i]["services"].get_int(),
-                ArrV[i]["first_seen"].get_real(),
-                ArrV[i]["last_seen"].get_real()};
+            ADDR key = std::make_tuple(AddrsValue[i]["address"].get_str(),
+                                       AddrsValue[i]["port"].get_str());
+            store[key] = {AddrsValue[i]["services"].get_int(),
+                          AddrsValue[i]["first_seen"].get_real(),
+                          AddrsValue[i]["last_seen"].get_real()};
         }
     }
 } // namespace c2pool::p2p
