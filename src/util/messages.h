@@ -55,7 +55,7 @@ namespace c2pool::messages
 
         const unsigned int unpacked_length();
 
-        char *prefix;
+        unsigned char *prefix;
         char command[command_length + 1];
         char length[payload_length + 1];
         char checksum[checksum_length + 1];
@@ -67,7 +67,7 @@ namespace c2pool::messages
     public:
         IMessage() {}
 
-        IMessage(const char *current_prefix);
+        IMessage(const unsigned char *current_prefix);
 
         void set_data(char *data_);
 

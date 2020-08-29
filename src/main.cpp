@@ -23,9 +23,9 @@ int main(int argc, char* argv[])
 
     LOG_INFO << "Start c2pool...";
 
-    c2pool::config::Network* net = new c2pool::config::Network();
+    c2pool::config::Network* net = new c2pool::config::DigibyteNetwork();
     boost::asio::io_context io;
-    c2pool::p2p::AddrStore addr_store("", net); //TODO: path
+    c2pool::p2p::AddrStore addr_store("data//digibyte//addrs", net); //TODO: path
 
     std::shared_ptr<c2pool::p2p::NodesManager> nodesManager = std::make_shared<c2pool::p2p::NodesManager>(io, net);
     

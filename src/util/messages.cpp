@@ -7,17 +7,26 @@
 #include <sstream>
 #include <string>
 #include <cstring>
+#include "console.h"
 using namespace c2pool::messages;
 
 namespace c2pool::messages
 {
     //IMessage
 
-    IMessage::IMessage(const char *current_prefix)
+    IMessage::IMessage(const unsigned char *current_prefix)
     {
-        _prefix_length = std::strlen(current_prefix);
-        prefix = new char[prefix_length()];
-        strcpy(prefix, current_prefix);
+        if (sizeof(current_prefix) > 0)
+        {
+            _prefix_length = sizeof(current_prefix) / sizeof(current_prefix[0]);
+        }
+        else
+        {
+            _prefix_length = 0;
+            LOG_WARNING << "prefix length <= 0!";
+        }
+        prefix = new unsigned char[prefix_length()];
+        memcpy(prefix, current_prefix, prefix_length());
     }
 
     void IMessage::set_data(char *data_)
@@ -29,7 +38,8 @@ namespace c2pool::messages
     void IMessage::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);
-        if (_unpacked_length == 0) {
+        if (_unpacked_length == 0)
+        {
             c2pool::str::substr(length, data, command_length, payload_length);
             _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
         }
@@ -47,8 +57,10 @@ namespace c2pool::messages
         return _unpacked_length;
     }
 
-    int IMessage::set_length(char *data_) {
-        if (data_ != nullptr) {
+    int IMessage::set_length(char *data_)
+    {
+        if (data_ != nullptr)
+        {
             c2pool::str::substr(length, data_, command_length, payload_length);
             _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
         }
@@ -56,7 +68,8 @@ namespace c2pool::messages
         return get_length();
     }
 
-    int IMessage::get_length(){
+    int IMessage::get_length()
+    {
         return command_length + payload_length + checksum_length + unpacked_length();
     }
 
@@ -114,7 +127,8 @@ namespace c2pool::messages
         return packed_c_str;
     }
 
-    int message::pack_payload_length() {
+    int message::pack_payload_length()
+    {
         return c2pool::messages::python::pymessage::payload_length(command, pack_c_str());
     }
 
