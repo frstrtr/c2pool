@@ -97,4 +97,11 @@ namespace c2pool::p2p
         _think_timer.expires_at(_think_timer.expires_at() + interval);
         _think_timer.async_wait(boost::bind(&Node::_think, this, boost::asio::placeholders::error));
     }
+
+    //P2PNode
+
+    P2PNode::P2PNode(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store) : Node(_nodes, _port, _addr_store)
+    {
+        LOG_INFO << "P2PNode created!";
+    }
 } // namespace c2pool::p2p
