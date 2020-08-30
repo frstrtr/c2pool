@@ -59,18 +59,33 @@ namespace c2pool::p2p
         }
     }
 
+    //TODO: finish method
     void Client::_think(const boost::system::error_code &error)
     {
         LOG_DEBUG << "ClientFactory _think.";
         if (!error)
         {
-            //TODO: finish method
+            //TODO: add attempt in if
+            if ((conns.size() < desired_conns) && (nodes->p2p_node->addr_store.len() > 0))
+            {
+                //TODO: add get best peer: (host, port), = self.node.get_good_peers(1)
+                //TEMP!!!
+                for (auto kv : nodes->p2p_node->addr_store)
+                {
+                    std::string _addr = kv.first; //addr_store[0];
+                    std::string _port = kv.second;
+                    connect(_addr, _port);
+                }
+                //_______
+            }
             float rand = c2pool::random::Expovariate(1);
             boost::posix_time::milliseconds interval(static_cast<int>(rand * 1000));
             LOG_DEBUG << "[Client::_think()] Expovariate: " << rand;
             _think_timer.expires_at(_think_timer.expires_at() + interval);
             _think_timer.async_wait(boost::bind(&Client::_think, this, boost::asio::placeholders::error));
-        } else {
+        }
+        else
+        {
             LOG_ERROR << error;
         }
     }

@@ -24,22 +24,24 @@ namespace c2pool::p2p
     class NodesManager
     {
     public:
-        NodesManager(boost::asio::io_context& _io, c2pool::config::Network* _networkConfig);
+        NodesManager(boost::asio::io_context &_io, c2pool::config::Network *_networkConfig);
 
-        boost::asio::io_context& io_context() const{ //todo: const?
+        boost::asio::io_context &io_context() const
+        { //todo: const?
             return _io_context;
         }
 
-        c2pool::config::Network* net() const
+        c2pool::config::Network *net() const
         {
             return _net;
         }
 
-    private:
-        boost::asio::io_context& _io_context;
-        c2pool::config::Network* _net; //config class
+    public:
         std::unique_ptr<c2pool::p2p::P2PNode> p2p_node;
         std::unique_ptr<c2pool::p2p::BitcoindNode> bitcoind_node;
+    private:
+        boost::asio::io_context &_io_context;
+        c2pool::config::Network *_net; //config class
     };
 } // namespace c2pool::p2p
 
@@ -53,7 +55,7 @@ namespace c2pool::p2p
         }
 
         //getter for network [config class]
-        c2pool::config::Network* net() const
+        c2pool::config::Network *net() const
         {
             return nodes->net();
         }
@@ -65,6 +67,7 @@ namespace c2pool::p2p
 
 namespace c2pool::p2p
 {
+    //p2pool: Node.py::Node
     class BitcoindNode : INode
     {
         //TODO: BitcoindFactory + BitcoindClientProtocol
@@ -86,15 +89,16 @@ namespace c2pool::p2p
 
 namespace c2pool::p2p
 {
+    //p2pool: p2p.py::Node
     class Node : public INode
     {
     public:
         Node(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store);
 
-        virtual void handle_shares() {/*TODO*/};
-        virtual void handle_share_hashes() {/*TODO*/};
-        virtual void handle_get_shares() {/*TODO*/};
-        virtual void handle_bestblock() {/*TODO*/};
+        virtual void handle_shares(){/*TODO*/};
+        virtual void handle_share_hashes(){/*TODO*/};
+        virtual void handle_get_shares(){/*TODO*/};
+        virtual void handle_bestblock(){/*TODO*/};
 
         void got_conn(std::shared_ptr<Protocol> protocol);
         void lost_conn(std::shared_ptr<Protocol> protocol, boost::exception *reason);
@@ -103,7 +107,6 @@ namespace c2pool::p2p
         //TODO: void got_addr();
         //TODO: void get_good_peers();
 
-        
         //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
         //Ещё варианты типов для nonce: unsigned long double; uint_fast64_t
         unsigned long long nonce;
@@ -113,16 +116,18 @@ namespace c2pool::p2p
         std::map<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>> peers;
         boost::asio::deadline_timer _think_timer;
 
-    private:
+    public:
         //TODO: int preffered_storage;
         //TODO: connect_addrs
-        c2pool::p2p::AddrStore addr_store; //TODO: change type; net.BOOTSTRAP_ADDRS + saved addrs
+        c2pool::p2p::AddrStore addr_store; //TODO: const
         //TODO: bool advertise_ip; //don't advertise local IP address as being available for incoming connections. useful for running a dark node, along with multiple -n ADDR's and --outgoing-conns 0
         //TODO: std::string external_ip; //specify your own public IP address instead of asking peers to discover it, useful for running dual WAN or asymmetric routing
     };
 
+    //p2pool: node.py::P2PNode
     class P2PNode : Node
     {
+        P2PNode(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store);
         //TODO: known_txs_var = BitcoindNode.known_txs_var
         //TODO: mining_txs_var = BitcoindNode.mining_txs_var
         //TODO: mining2_txs_var = BitcoindNode.mining2_txs_var
