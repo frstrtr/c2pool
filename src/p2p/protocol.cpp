@@ -302,6 +302,7 @@ namespace c2pool::p2p
     {
         boost::asio::async_connect(socket, endpoints, [this](boost::system::error_code ec, tcp::endpoint) {
             update_addr();
+            LOG_INFO << "Connected to " << std::get<0>(addr) << ":" << std::get<1>(addr);
             if (!ec)
             {
                 read_prefix();

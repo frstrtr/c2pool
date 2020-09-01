@@ -51,7 +51,6 @@ namespace c2pool::p2p
                                        boost::asio::ip::tcp::socket socket(io_context);
                                        auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
                                        protocol_connected(p);
-                                       LOG_INFO << "Connected to: " << ip << ":" << port;
                                    });
         }
         catch (const std::exception &e)
