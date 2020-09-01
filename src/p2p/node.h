@@ -39,6 +39,7 @@ namespace c2pool::p2p
     public:
         std::unique_ptr<c2pool::p2p::P2PNode> p2p_node;
         std::unique_ptr<c2pool::p2p::BitcoindNode> bitcoind_node;
+
     private:
         boost::asio::io_context &_io_context;
         c2pool::config::Network *_net; //config class
@@ -115,6 +116,7 @@ namespace c2pool::p2p
         std::string port;
         std::map<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>> peers;
         boost::asio::deadline_timer _think_timer;
+        std::vector<ADDR> get_good_peers(int max_count);
 
     public:
         //TODO: int preffered_storage;
@@ -125,8 +127,9 @@ namespace c2pool::p2p
     };
 
     //p2pool: node.py::P2PNode
-    class P2PNode : Node
+    class P2PNode : public Node
     {
+    public:
         P2PNode(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store);
         //TODO: known_txs_var = BitcoindNode.known_txs_var
         //TODO: mining_txs_var = BitcoindNode.mining_txs_var

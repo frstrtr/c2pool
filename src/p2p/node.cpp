@@ -13,8 +13,13 @@
 #include "factory.h"
 #include "console.h"
 #include "addrStore.h"
+#include <cmath>
 
 #include <iterator>
+
+using std::log;
+using std::max;
+using std::min;
 
 //c2pool::p2p::NodesManager
 namespace c2pool::p2p
@@ -87,7 +92,7 @@ namespace c2pool::p2p
             auto item = peers.begin();
             std::advance(item, pos);
             auto proto = item->second;
-            
+
             proto->send(std::make_unique<c2pool::messages::message_getaddrs>(8));
             //c2pool::random::RandomChoice<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>>(peers)->send(std::make_unique<c2pool::messages::message_getaddrs>(8)); //TODO: add send_getaddrs to c2pool::p2p::Protocol
         }
@@ -96,6 +101,33 @@ namespace c2pool::p2p
         LOG_DEBUG << "[Node::_think()] Expovariate seconds: " << rand;
         _think_timer.expires_at(_think_timer.expires_at() + interval);
         _think_timer.async_wait(boost::bind(&Node::_think, this, boost::asio::placeholders::error));
+    }
+
+    std::vector<ADDR> Node::get_good_peers(int max_count)
+    {
+
+        //TODO: this want to test
+        float t = c2pool::time::timestamp();
+        
+        std::vector<std::pair<float, ADDR>> values;
+        for (auto kv : addr_store.GetAll())
+        {
+            values.push_back(
+                std::make_pair(
+                    -log(max(3600.0, kv.second.last_seen - kv.second.first_seen)) / log(max(3600.0, t - kv.second.last_seen)) * c2pool::random::Expovariate(1),
+                    kv.first));
+        }
+
+        std::sort(values.begin(), values.end(), [](std::pair<float, ADDR> a, std::pair<float, ADDR> b) {
+            return a.first < b.first;
+        });
+
+        values.resize(min((int)values.size(), max_count));
+        std::vector<ADDR> result;
+        for (auto v : values){
+            result.push_back(v.second);
+        }
+        return result;
     }
 
     //P2PNode
