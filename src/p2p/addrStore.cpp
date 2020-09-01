@@ -78,6 +78,15 @@ namespace c2pool::p2p
             return EMPTY_ADDR_VALUE;
     }
 
+    std::vector<std::pair<ADDR, AddrValue>> AddrStore::GetAll()
+    {
+        std::vector<std::pair<ADDR, AddrValue>> res;
+        for (auto kv : store){
+            res.push_back(kv);
+        }
+        return res;
+    }
+
     bool AddrStore::Add(ADDR key, AddrValue value)
     {
         if (Check(key))

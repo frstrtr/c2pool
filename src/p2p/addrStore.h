@@ -3,6 +3,7 @@
 #include <string>
 #include <map>
 #include <tuple>
+#include <vector>
 
 using std::map;
 using std::string;
@@ -35,6 +36,7 @@ namespace c2pool::p2p
         bool Add(ADDR key, AddrValue value);
         bool Remove(ADDR key);
         AddrValue Get(ADDR key);
+        std::vector<std::pair<ADDR, AddrValue>> GetAll();
 
         string ToJSON();
         void FromJSON(string json);

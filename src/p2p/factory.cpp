@@ -1,5 +1,4 @@
 #include <cstdlib>
-#include <iostream>
 #include <thread>
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
@@ -8,6 +7,7 @@
 #include <memory>
 #include <set>
 #include <utility>
+#include <tuple>
 using boost::asio::ip::tcp;
 
 #include "protocol.h"
@@ -49,8 +49,9 @@ namespace c2pool::p2p
             resolver.async_resolve(ip, port,
                                    [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                                        boost::asio::ip::tcp::socket socket(io_context);
-                                       auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints);
+                                       auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
                                        protocol_connected(p);
+                                       LOG_INFO << "Connected to: " << ip << ":" << port;
                                    });
         }
         catch (const std::exception &e)
@@ -68,15 +69,10 @@ namespace c2pool::p2p
             //TODO: add attempt in if
             if ((conns.size() < desired_conns) && (nodes->p2p_node->addr_store.len() > 0))
             {
-                //TODO: add get best peer: (host, port), = self.node.get_good_peers(1)
-                //TEMP!!!
-                for (auto kv : nodes->p2p_node->addr_store)
+                for (auto addr : nodes->p2p_node->get_good_peers(1))
                 {
-                    std::string _addr = kv.first; //addr_store[0];
-                    std::string _port = kv.second;
-                    connect(_addr, _port);
+                    connect(std::get<0>(addr), std::get<1>(addr));
                 }
-                //_______
             }
             float rand = c2pool::random::Expovariate(1);
             boost::posix_time::milliseconds interval(static_cast<int>(rand * 1000));

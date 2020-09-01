@@ -30,10 +30,6 @@ namespace c2pool::p2p
     Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
     {
         factory = _factory;
-        
-        boost::asio::ip::tcp::endpoint ep = _socket.remote_endpoint();
-        
-        addr = std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
 
         //addr;
     }
@@ -141,7 +137,8 @@ namespace c2pool::p2p
         boost::asio::post(factory->io_context, [this]() { socket.close(); });
     }
 
-    void Protocol::send(unique_ptr<c2pool::messages::message> msg){
+    void Protocol::send(unique_ptr<c2pool::messages::message> msg)
+    {
         msg->send();
         boost::asio::async_write(socket,
                                  boost::asio::buffer(msg->data, msg->get_length()),
@@ -259,7 +256,6 @@ namespace c2pool::p2p
                 self.sendAdvertisement(),
             random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
              */
-        
 
         //best_hash = 0 default?
         // if (best_hash != -1)
@@ -288,6 +284,13 @@ namespace c2pool::p2p
     {
     }
 
+    void Protocol::update_addr()
+    {
+        boost::asio::ip::tcp::endpoint ep = socket.remote_endpoint();
+
+        addr = std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
+    }
+
     //ClientProtocol
     ClientProtocol::ClientProtocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory, const boost::asio::ip::tcp::resolver::results_type endpoints) : Protocol(std::move(_socket), _factory)
     {
@@ -295,8 +298,15 @@ namespace c2pool::p2p
         do_connect(endpoints);
     }
 
-    void ClientProtocol::do_connect(const boost::asio::ip::tcp::resolver::results_type endpoint)
+    void ClientProtocol::do_connect(const boost::asio::ip::tcp::resolver::results_type endpoints)
     {
+        boost::asio::async_connect(socket, endpoints, [this](boost::system::error_code ec, tcp::endpoint) {
+            update_addr();
+            if (!ec)
+            {
+                read_prefix();
+            }
+        });
     }
 
     //ServerProtocol
@@ -308,6 +318,7 @@ namespace c2pool::p2p
 
     void ServerProtocol::start()
     {
+        update_addr();
         read_prefix();
     }
 } // namespace c2pool::p2p

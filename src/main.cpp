@@ -10,8 +10,10 @@
 #include <console.h>
 #include <fstream>
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
+    SetThreadUILanguage(MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US));//for test
+    setlocale(LC_ALL, "rus");
     c2pool::console::Logger::Init();
 
     // LOG_TRACE << "A trace severity message" << "TEST";
@@ -23,16 +25,17 @@ int main(int argc, char* argv[])
 
     LOG_INFO << "Start c2pool...";
 
-    c2pool::config::Network* net = new c2pool::config::DigibyteNetwork();
+    c2pool::config::Network *net = new c2pool::config::DigibyteNetwork();
     boost::asio::io_context io;
     c2pool::p2p::AddrStore addr_store("data//digibyte//addrs", net); //TODO: path
 
     std::shared_ptr<c2pool::p2p::NodesManager> nodesManager = std::make_shared<c2pool::p2p::NodesManager>(io, net);
-    
+
     string port = "3035"; //TODO
 
-    std::unique_ptr<c2pool::p2p::Node> node = std::make_unique<c2pool::p2p::Node>(nodesManager, port, addr_store);
-    
+    //std::unique_ptr<c2pool::p2p::P2PNode> node = std::make_unique<c2pool::p2p::P2PNode>(nodesManager, port, addr_store);
+    nodesManager->p2p_node = std::make_unique<c2pool::p2p::P2PNode>(nodesManager, port, addr_store);
+
     io.run();
 
     return 0;

@@ -60,7 +60,6 @@ namespace c2pool::p2p
         }
 
     protected:
-
         //used for write message in protocol
         //virtual void write(unique_ptr<c2pool::messages::message> msg);
 
@@ -95,6 +94,8 @@ namespace c2pool::p2p
 
         virtual void handle(c2pool::messages::message_error *msg);
 
+        
+        void update_addr();
         //TODO: Friend class: Message for handle_<command>
     protected:
         const int version;
@@ -108,8 +109,8 @@ namespace c2pool::p2p
         std::tuple<std::string, std::string> addr;
 
         boost::asio::ip::tcp::socket socket;
-        c2pool::p2p::Node *node;
-        c2pool::p2p::Factory *factory;
+        c2pool::p2p::Node *node; //todo: shared_ptr
+        c2pool::p2p::Factory *factory; //todo: shared_ptr
 
         unique_ptr<c2pool::messages::IMessage> tempMessage; 
     };
