@@ -7,7 +7,7 @@ Bitcoin wiki page - https://en.bitcoin.it/wiki/P2Pool
 
 Bitcointalk forum thread - https://bitcointalk.org/index.php?topic=18313
 
-p2pool exchange/pool and more... written in c++ and LMDB.
+p2pool DEX/pool and more... written in c++ and LMDB.
 
 ## Donations towards further development of с2pool implementation in C++
 
