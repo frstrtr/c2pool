@@ -36,6 +36,7 @@ using boost::asio::ip::tcp;
 namespace c2pool::p2p
 {
     class Node;
+    class NodesManager;
     class Factory;
 }
 namespace c2pool::messages
@@ -50,7 +51,7 @@ namespace c2pool::p2p
     public:
         Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory);
 
-        virtual void send(unique_ptr<c2pool::messages::message> msg);
+        virtual void send(c2pool::messages::message *msg);
 
         //OLD: fromStr
         virtual void handle(std::stringstream ss);
@@ -109,7 +110,7 @@ namespace c2pool::p2p
         std::tuple<std::string, std::string> addr;
 
         boost::asio::ip::tcp::socket socket;
-        c2pool::p2p::Node *node; //todo: shared_ptr
+        std::shared_ptr<c2pool::p2p::NodesManager> nodes;
         c2pool::p2p::Factory *factory; //todo: shared_ptr
 
         unique_ptr<c2pool::messages::IMessage> tempMessage; 

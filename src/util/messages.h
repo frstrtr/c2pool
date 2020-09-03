@@ -141,8 +141,9 @@ namespace c2pool::messages
     public:
         message_version() : message("version") {}
 
-        message_version(int ver, int serv, address_type to, address_type from, long _nonce, string sub_ver, int _mode, long best_hash) : message("version")
+        message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, string sub_ver, int _mode, long best_hash) : message("version")
         {
+            std::cout << "Test5" << std::endl;
             version = ver;
             services = serv;
             addr_to = to;
@@ -151,6 +152,7 @@ namespace c2pool::messages
             sub_version = sub_ver;
             mode = _mode;
             best_share_hash = best_hash;
+            std::cout << version << " " << mode << std::endl;
         }
 
         void _unpack(std::stringstream &ss) override;
@@ -167,7 +169,7 @@ namespace c2pool::messages
         //     ('addr_from', bitcoin_data.address_type),
         address_type addr_from;
         //     ('nonce', pack.IntType(64)),
-        long nonce;
+        unsigned long long nonce;
         //     ('sub_version', pack.VarStrType()),
         string sub_version;
         //     ('mode', pack.IntType(32)), # always 1 for legacy compatibility

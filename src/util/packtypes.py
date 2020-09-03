@@ -643,7 +643,6 @@ class messageVersion(msg):
                     'mode': int(data[6]),
                     'best_share_hash': int(data[7])}  # int?
 
-
         return self.message_version.pack(msg_dict)
 
     def _unpack(self, data):
@@ -843,13 +842,11 @@ def send(command, payload2):
     """
         called when we send msg from c2pool to p2pool
     """
-
     type_ = message_from_str(command)
 
     #if error command
     if type_ is None:
         type_ = EnumMessages[9999]
-    
     command = bytes(command, encoding = 'ISO-8859-1')
     
     msg = type_()
@@ -978,7 +975,7 @@ def TEST_UNPACKRES():
 # TEST_UNPACKRES()
 """
 
-# print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18'))
+#print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;1008386737136591102;16;17;18'))
 # print(send('addrme','80'))
 # print(send('getaddrs','3'))
 # print(send('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))

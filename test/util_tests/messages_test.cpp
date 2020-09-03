@@ -15,9 +15,10 @@ using namespace std;
 
 TEST(TestMessages, IMessage)
 {
-    const char *test_prefix = "test_prefix";
-    unique_ptr<c2pool::messages::IMessage> msg = make_unique<c2pool::messages::IMessage>(test_prefix);
-    ASSERT_EQ(std::string(msg->prefix), std::string(test_prefix));
+    const unsigned char test_prefix[4] = {0x1, 0x2, 0x3, 0x4};
+    const unsigned char test_prefix2[4] = {0x1, 0x2, 0x3, 0x4};
+    c2pool::messages::IMessage* msg = new c2pool::messages::IMessage(test_prefix2);
+    ASSERT_EQ(*msg->prefix, *test_prefix);
 }
 
 TEST(TestMessages, message_version)
@@ -25,11 +26,11 @@ TEST(TestMessages, message_version)
     //SEND
     c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
     c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
-    c2pool::messages::message_version *firstMsg = new c2pool::messages::message_version(1, 2, addrs1, addrs2, 15, "16", 17, 18);
+    c2pool::messages::message_version *firstMsg = new c2pool::messages::message_version(1, 2, addrs1, addrs2, 1008386737136591102, "16", 17, 18);
     firstMsg->send();
 
     //expected data for firstMsg->send()
-    char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 80 249 219 9 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 15 0 0 0 0 0 0 0 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
+    char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 243 159 131 228 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 254 224 61 15 101 130 254 13 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
 
     ASSERT_EQ(*firstMsg->data, *expectedData);
 
