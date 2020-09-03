@@ -32,6 +32,10 @@ namespace c2pool::p2p
         conns.push_back(std::move(proto));
     }
 
+    std::shared_ptr<NodesManager> Factory::getNode(){
+        return nodes;
+    }
+
     //--------------------------Client
     Client::Client(boost::asio::io_context &io_context_, shared_ptr<c2pool::p2p::NodesManager> _nodes, int _desired_conns, int _max_attempts) : resolver(io_context_), Factory(io_context_, _nodes), _think_timer(_nodes->io_context(), boost::posix_time::seconds(0))
     {

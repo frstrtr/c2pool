@@ -92,8 +92,8 @@ namespace c2pool::p2p
             auto item = peers.begin();
             std::advance(item, pos);
             auto proto = item->second;
-
-            proto->send(std::make_unique<c2pool::messages::message_getaddrs>(8));
+            auto msg = new c2pool::messages::message_getaddrs(8);
+            proto->send(msg);
             //c2pool::random::RandomChoice<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>>(peers)->send(std::make_unique<c2pool::messages::message_getaddrs>(8)); //TODO: add send_getaddrs to c2pool::p2p::Protocol
         }
         float rand = c2pool::random::Expovariate(20);

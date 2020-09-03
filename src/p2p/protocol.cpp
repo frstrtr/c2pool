@@ -13,6 +13,7 @@ using boost::asio::ip::tcp;
 #include "factory.h"
 #include "node.h"
 #include "console.h"
+#include "messages.h"
 
 //-----------------------------------------------------------
 
@@ -30,7 +31,7 @@ namespace c2pool::p2p
     Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
     {
         factory = _factory;
-
+        nodes = factory->getNode(); //TODO: изменить на NodeManager
         //addr;
     }
 
@@ -53,15 +54,20 @@ namespace c2pool::p2p
     void Protocol::read_prefix()
     {
         tempMessage = std::make_unique<c2pool::messages::IMessage>(/*TODO: net.PREFIX*/);
+        
+        //char* temp;
+
         boost::asio::async_read(socket,
-                                boost::asio::buffer(tempMessage->prefix, node->net()->PREFIX_LENGTH),
+                                boost::asio::buffer(tempMessage->command, nodes->p2p_node->net()->PREFIX_LENGTH),
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec /*&& <сравнение размеров prefix>*/)
                                     {
+                                        LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command();
                                     }
                                     else
                                     {
+                                        LOG_ERROR << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });
@@ -137,7 +143,7 @@ namespace c2pool::p2p
         boost::asio::post(factory->io_context, [this]() { socket.close(); });
     }
 
-    void Protocol::send(unique_ptr<c2pool::messages::message> msg)
+    void Protocol::send(c2pool::messages::message *msg)
     {
         msg->send();
         boost::asio::async_write(socket,
@@ -145,10 +151,12 @@ namespace c2pool::p2p
                                  [this](boost::system::error_code ec, std::size_t /*length*/) {
                                      if (!ec)
                                      {
+                                        //
                                      }
                                      else
                                      {
-                                         disconnect();
+                                        LOG_ERROR << ec;
+                                        disconnect();
                                      }
                                  });
     }
@@ -201,7 +209,7 @@ namespace c2pool::p2p
         {
             //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
         }
-        if (msg->version < node->net()->MINIMUM_PROTOCOL_VERSION)
+        if (msg->version < nodes->p2p_node->net()->MINIMUM_PROTOCOL_VERSION)
         {
             //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
         }
@@ -210,13 +218,13 @@ namespace c2pool::p2p
         other_sub_version = msg->sub_version;
         other_services = msg->services;
 
-        if (msg->nonce == node->nonce) //TODO: add nonce in Node
+        if (msg->nonce == nodes->p2p_node->nonce) //TODO: add nonce in Node
         {
             //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
         }
 
         //detect duplicate in node->peers
-        for (auto _peer : node->peers)
+        for (auto _peer : nodes->p2p_node->peers)
         {
             if (_peer.first == msg->nonce)
             {
@@ -302,10 +310,16 @@ namespace c2pool::p2p
     {
         boost::asio::async_connect(socket, endpoints, [this](boost::system::error_code ec, tcp::endpoint) {
             update_addr();
-            LOG_INFO << "Connected to " << std::get<0>(addr) << ":" << std::get<1>(addr);
+            LOG_INFO << "Connect to " << std::get<0>(addr) << ":" << std::get<1>(addr);
             if (!ec)
             {
+                // c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
+                // c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
+                // c2pool::messages::message* firstMsg = new c2pool::messages::message_version(version, 0, addrs1, addrs2, nodes->p2p_node->nonce, "16", 1, 18);
+                // send(firstMsg);
                 read_prefix();
+            } else {
+                LOG_ERROR << ec;
             }
         });
     }

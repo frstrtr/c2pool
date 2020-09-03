@@ -44,6 +44,8 @@ namespace c2pool::p2p
     public:
         boost::asio::io_context &io_context;
 
+        std::shared_ptr<NodesManager> getNode();
+
     protected:
         std::shared_ptr<NodesManager> nodes;
         std::list<std::shared_ptr<Protocol>> conns; //todo: shared_ptr

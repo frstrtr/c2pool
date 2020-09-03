@@ -319,7 +319,7 @@ namespace c2pool::messages::python
 
     char *pymessage::send(char *command, char *payload2)
     {
-
+        //std::cout << "SEND_PACK_C_STR: " << command << ", " << payload2 << std::endl;
         c2pool::python::Py::Initialize();
 
         char *ret = NULL;
@@ -331,20 +331,19 @@ namespace c2pool::messages::python
         auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
+
         // Загрузка py файла
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
             return ret;
         }
-
         // Загрузить объект модуля
         auto pModule = PyImport_Import(pName);
         if (!pModule)
         {
             return ret;
         }
-
         // Словарь объектов содержащихся в модуле
         auto pDict = PyModule_GetDict(pModule);
         if (!pDict)
@@ -363,7 +362,6 @@ namespace c2pool::messages::python
         {
             return ret;
         }
-
         auto pVal = PyObject_CallFunction(pObjct, (char *)"(ss)", command, payload2);
         if (pVal != NULL)
         {
@@ -376,9 +374,11 @@ namespace c2pool::messages::python
             Py_XDECREF(pResultRepr);
             Py_XDECREF(pVal);
         }
-
+        // std::cout << strlen(ret) << std::endl;
         ret += 1;                 //remove first element ['] in string
         ret[strlen(ret) - 1] = 0; //remove last element ['] in string
+
+        // std::cout << "ret: " << ret << std::endl; //TODO: DEBUG_PYTHON
 
         return c2pool::str::from_bytes_to_strChar(ret);
     }
