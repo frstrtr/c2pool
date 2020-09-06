@@ -14,6 +14,7 @@ using boost::asio::ip::tcp;
 #include "node.h"
 #include "console.h"
 #include "messages.h"
+#include "pystruct.h"
 
 //-----------------------------------------------------------
 
@@ -62,7 +63,8 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec /*&& <сравнение размеров prefix>*/)
                                     {
-                                        LOG_INFO << "MSG: " << tempMessage->command;
+                                        c2pool::messages::python::other::debug_log(tempMessage->command, nodes->p2p_node->net()->PREFIX_LENGTH);
+                                        // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command();
                                     }
                                     else
@@ -80,6 +82,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_INFO << "read_command";
                                         read_length();
                                     }
                                     else
@@ -96,6 +99,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_INFO << "read_length";
                                         read_checksum();
                                     }
                                     else
@@ -112,6 +116,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_INFO << "read_checksum";
                                         read_payload();
                                     }
                                     else
@@ -128,6 +133,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_INFO << "read_payload";
                                         //todo: move tempMesssage -> new message
                                         read_prefix();
                                     }
