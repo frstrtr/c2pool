@@ -1,63 +1,75 @@
-[2020-09-06 07:06:31.693125]<info>: Start c2pool...
+[2020-09-06 07:06:31.693125]<info>: Start c2pool...        
 [2020-09-06 07:06:31.702115]<info>: Created Network Config.
 [2020-09-06 07:06:31.716105]<debug>: Addrs saved in file!
 [2020-09-06 07:06:31.719105]<info>: Initialization NodesManager...
-[2020-09-06 07:06:31.721103]<info>: Start Node initialization...
-[2020-09-06 07:06:31.724102]<info>: Node nonce generated: 
+[2020-09-06 07:06:31.721103]<info>: Start Node initialization...  
+[2020-09-06 07:06:31.724102]<info>: Node nonce generated:
 [2020-09-06 07:06:31.726100]<info>: ClientFactory created.
 [2020-09-06 07:06:31.728100]<info>: ServerFactory created.
 [2020-09-06 07:06:31.730097]<info>: Node created.
-[2020-09-06 07:06:31.732096]<info>: P2PNode created!
+[2020-09-06 07:06:31.732096]<info>: P2PNode created!      
 [2020-09-06 07:06:31.735095]<debug>: Node _think.
 [2020-09-06 07:06:31.741092]<debug>: [Node::_think()] Expovariate seconds: 10.1994
 [2020-09-06 07:06:31.744089]<debug>: ClientFactory _think.
-[2020-09-06 07:06:31.746087]<debug>: [Client::_think()] Expovariate: 0.643176
+[2020-09-06 07:06:31.746087]<debug>: [Client::_think()] Expovariate: 0.643176     
 [2020-09-06 07:06:31.749085]<info>: ClientProtocol created.
 [2020-09-06 07:06:31.774071]<info>: Connect to 217.72.4.157:5024
+b'\x83\xe6],\x81\xbfmh'
 [2020-09-06 07:06:32.058895]<info>: read_command
 [2020-09-06 07:06:32.060894]<info>: read_length
 [2020-09-06 07:06:32.062893]<info>: read_checksum
 [2020-09-06 07:06:32.064892]<info>: read_payload
+b'\xe5\x0c\x00\x00\x00\x00\x00\x00'
 [2020-09-06 07:06:32.067890]<info>: read_command
 [2020-09-06 07:06:32.085880]<info>: read_length
 [2020-09-06 07:06:32.119860]<info>: read_checksum
 [2020-09-06 07:06:32.122857]<info>: read_payload
+b'\x00\x00\xff\xff\xb0q\xfd\xbe'
 [2020-09-06 07:06:32.125854]<info>: read_command
 [2020-09-06 07:06:32.127853]<info>: read_length
 [2020-09-06 07:06:32.128852]<info>: read_checksum
 [2020-09-06 07:06:32.130851]<info>: read_payload
+b'\xff\xff\xc0\xa8\n\n\x13\xa0'
 [2020-09-06 07:06:32.132849]<info>: read_command
 [2020-09-06 07:06:32.148840]<info>: read_length
 [2020-09-06 07:06:32.150838]<info>: read_checksum
 [2020-09-06 07:06:32.164831]<info>: read_payload
+b'ool.bit\x01'
 [2020-09-06 07:06:32.182820]<info>: read_command
 [2020-09-06 07:06:32.187817]<info>: read_length
 [2020-09-06 07:06:32.189815]<info>: read_checksum
 [2020-09-06 07:06:32.191813]<info>: read_payload
+b'!x\xfaE\xf2\x9b\xe4A'
 [2020-09-06 07:06:32.369378]<debug>: ClientFactory _think.
 [2020-09-06 07:06:32.371376]<debug>: [Client::_think()] Expovariate: 0.676471
 [2020-09-06 07:06:32.374375]<info>: ClientProtocol created.
 [2020-09-06 07:06:32.399360]<info>: Connect to 217.72.4.157:5024
+b'\x83\xe6],\x81\xbfmh'
 [2020-09-06 07:06:32.429341]<info>: read_command
 [2020-09-06 07:06:32.432339]<info>: read_length
 [2020-09-06 07:06:32.433340]<info>: read_checksum
 [2020-09-06 07:06:32.449329]<info>: read_payload
+b'\xe5\x0c\x00\x00\x00\x00\x00\x00'
 [2020-09-06 07:06:32.463320]<info>: read_command
 [2020-09-06 07:06:32.466318]<info>: read_length
 [2020-09-06 07:06:32.467318]<info>: read_checksum
 [2020-09-06 07:06:32.480310]<info>: read_payload
+b'\x00\x00\xff\xff\xb0q\xfd\xbe'
 [2020-09-06 07:06:32.482309]<info>: read_command
 [2020-09-06 07:06:32.484308]<info>: read_length
 [2020-09-06 07:06:32.498299]<info>: read_checksum
 [2020-09-06 07:06:32.500297]<info>: read_payload
+b'\xff\xff\xc0\xa8\n\n\x13\xa0'
 [2020-09-06 07:06:32.515289]<info>: read_command
 [2020-09-06 07:06:32.517287]<info>: read_length
 [2020-09-06 07:06:32.531279]<info>: read_checksum
 [2020-09-06 07:06:32.533277]<info>: read_payload
+b'ool.bit\x01'
 [2020-09-06 07:06:32.548268]<info>: read_command
 [2020-09-06 07:06:32.550266]<info>: read_length
 [2020-09-06 07:06:32.566258]<info>: read_checksum
 [2020-09-06 07:06:32.581249]<info>: read_payload
+b'!x\xfaE\xf2\x9b\xe4A'
 [2020-09-06 07:06:33.045963]<debug>: ClientFactory _think.
 [2020-09-06 07:06:33.047961]<debug>: [Client::_think()] Expovariate: 0.0215321
 [2020-09-06 07:06:33.051960]<info>: ClientProtocol created.
@@ -65,20 +77,24 @@
 [2020-09-06 07:06:33.085939]<debug>: [Client::_think()] Expovariate: 0.202738
 [2020-09-06 07:06:33.090935]<info>: Connect to 217.72.4.157:5024
 [2020-09-06 07:06:33.092934]<info>: ClientProtocol created.
+b'\x83\xe6],\x81\xbfmh'
 [2020-09-06 07:06:33.102929]<info>: read_command
 [2020-09-06 07:06:33.141904]<info>: Connect to 217.72.4.157:5024
 [2020-09-06 07:06:33.143903]<info>: read_length
 [2020-09-06 07:06:33.145901]<error>: asio.misc:2 End of file
 [2020-09-06 07:06:33.147900]<info>: read_checksum
 [2020-09-06 07:06:33.149899]<info>: read_payload
+b'\xe5\x0c\x00\x00\x00\x00\x00\x00'
 [2020-09-06 07:06:33.184879]<info>: read_command
 [2020-09-06 07:06:33.199868]<info>: read_length
 [2020-09-06 07:06:33.216859]<info>: read_checksum
 [2020-09-06 07:06:33.233848]<info>: read_payload
+b'\x00\x00\xff\xff\xb0q\xfd\xbe'
 [2020-09-06 07:06:33.257833]<info>: read_command
 [2020-09-06 07:06:33.259831]<info>: read_length
 [2020-09-06 07:06:33.260831]<info>: read_checksum
 [2020-09-06 07:06:33.262829]<info>: read_payload
+b'\xff\xff\xc0\xa8\n\n\x13\xa0'
 [2020-09-06 07:06:33.264828]<info>: read_command
 [2020-09-06 07:06:33.266827]<info>: read_length
 [2020-09-06 07:06:33.280819]<info>: read_checksum
@@ -86,22 +102,17 @@
 [2020-09-06 07:06:33.298808]<debug>: [Client::_think()] Expovariate: 3.67937
 [2020-09-06 07:06:33.315797]<info>: read_payload
 [2020-09-06 07:06:33.317796]<info>: ClientProtocol created.
+b'ool.bit\x01'
 [2020-09-06 07:06:33.333787]<info>: read_command
 [2020-09-06 07:06:33.349777]<info>: read_length
 [2020-09-06 07:06:33.354774]<info>: Connect to 217.72.4.157:5024
 [2020-09-06 07:06:33.357771]<info>: read_checksum
 [2020-09-06 07:06:33.358772]<info>: read_payload
+b'!x\xfaE\xf2\x9b\xe4A'
 [2020-09-06 07:06:33.374762]<error>: asio.misc:2 End of file
 [2020-09-06 07:06:36.947398]<debug>: ClientFactory _think.
 [2020-09-06 07:06:36.952396]<debug>: [Client::_think()] Expovariate: 1.27818
 [2020-09-06 07:06:36.955393]<info>: ClientProtocol created.
 [2020-09-06 07:06:36.979378]<info>: Connect to 217.72.4.157:5024
 [2020-09-06 07:06:37.001365]<error>: asio.misc:2 End of file
-[2020-09-06 07:06:38.225530]<debug>: ClientFactory _think.
-[2020-09-06 07:06:38.227529]<debug>: [Client::_think()] Expovariate: 1.28865
-[2020-09-06 07:06:38.229528]<info>: ClientProtocol created.
-[2020-09-06 07:06:38.255512]<info>: Connect to 217.72.4.157:5024
-[2020-09-06 07:06:38.276499]<error>: asio.misc:2 End of file
-[2020-09-06 07:06:39.513486]<debug>: ClientFactory _think.
-[2020-09-06 07:06:39.515485]<debug>: [Client::_think()] Expovariate: 0.650051
-[2020-09-06 07:06:39.521481]<info>: ClientProtocol created.
+s
