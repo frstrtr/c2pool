@@ -180,6 +180,54 @@ stringstream pystruct::unpack(char *types, char *vars)
 namespace c2pool::messages::python
 {
 
+    void other::debug_log(char* data, unsigned int len){
+        c2pool::python::Py::Initialize();
+
+        // Загрузка модуля sys
+        auto sys = PyImport_ImportModule("sys");
+        auto sys_path = PyObject_GetAttrString(sys, "path");
+        // Путь до наших исходников Python
+        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        PyList_Append(sys_path, folder_path);
+
+        // Загрузка py файла
+        auto pName = PyUnicode_FromString("packtypes");
+        if (!pName)
+        {
+            return;
+        }
+
+        // Загрузить объект модуля
+        auto pModule = PyImport_Import(pName);
+        if (!pModule)
+        {
+            return;
+        }
+
+        // Словарь объектов содержащихся в модуле
+        auto pDict = PyModule_GetDict(pModule);
+        if (!pDict)
+        {
+            return;
+        }
+
+        auto pObjct = PyDict_GetItemString(pDict, (const char *)"debug_log");
+        if (!pObjct)
+        {
+            return;
+        }
+
+        // Проверка pObjct на годность.
+        if (!PyCallable_Check(pObjct))
+        {
+            return;
+        }
+
+        auto pVal = PyObject_CallFunction(pObjct, (char *)"(y#)", data, len);
+    }
+
+    //_________________________pymessage______________________
+
     unsigned int pymessage::receive_length(char *length_data)
     {
         c2pool::python::Py::Initialize();

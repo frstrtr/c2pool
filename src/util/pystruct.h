@@ -5,7 +5,8 @@
 #include <sstream>
 using namespace std;
 
-namespace c2pool::messages{
+namespace c2pool::messages
+{
     class message;
 }
 
@@ -23,6 +24,12 @@ namespace c2pool::python
 
 namespace c2pool::messages::python
 {
+    class other
+    {
+    public:
+        static void debug_log(char* data, unsigned int len);
+    };
+
     class pymessage
     {
     public:
@@ -35,7 +42,7 @@ namespace c2pool::messages::python
         //called, when send message to p2pool [packed]
         static char *send(char *command, char *payload2);
 
-        static char *send(c2pool::messages::message* msg);
+        static char *send(c2pool::messages::message *msg);
 
         static int payload_length(char *command, char *payload2);
 
