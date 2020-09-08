@@ -14,7 +14,7 @@ namespace c2pool::messages
 {
     //IMessage
 
-    IMessage::IMessage(const unsigned char *current_prefix)
+    IMessage::IMessage(const char *current_prefix)
     {
         if (sizeof(current_prefix) > 0)
         {
@@ -25,7 +25,7 @@ namespace c2pool::messages
             _prefix_length = 0;
             LOG_WARNING << "prefix length <= 0!";
         }
-        prefix = new unsigned char[prefix_length()];
+        prefix = new char[prefix_length()];
         memcpy(prefix, current_prefix, prefix_length());
     }
 
@@ -50,6 +50,16 @@ namespace c2pool::messages
     void IMessage::decode_data()
     {
         sprintf(data, "%s%s%s%s", command, length, checksum, payload);
+    }
+
+    void IMessage::set_unpacked_length(char* packed_len){
+        if (packed_len != nullptr)
+        {
+            memcpy(length, packed_len, payload_length);
+        }
+        if (length != nullptr){
+            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+        }
     }
 
     const unsigned int IMessage::unpacked_length()

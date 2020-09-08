@@ -96,7 +96,7 @@ namespace c2pool::str
         return (char *)result;
     }
 
-    bool compare_str(char *first_str, char *second_str, unsigned int length)
+    bool compare_str(const void* first_str, const void* second_str, unsigned int length)
     {
         if (memcmp(first_str, second_str, length) == 0)
             return true;
