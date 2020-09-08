@@ -17,6 +17,7 @@
 #include <memory>
 #include <set>
 #include <utility>
+#include <string>
 
 using boost::asio::ip::tcp;
 
@@ -62,6 +63,7 @@ namespace c2pool::p2p
         void _think(const boost::system::error_code &error); //TODO: change name
 
     protected:
+        std::set<std::tuple<std::string, std::string>> attempts;
         tcp::resolver resolver;
         int desired_conns, max_attempts;
         boost::asio::deadline_timer _think_timer;

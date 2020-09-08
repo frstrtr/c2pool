@@ -15,6 +15,7 @@ using boost::asio::ip::tcp;
 #include "console.h"
 #include "messages.h"
 #include "pystruct.h"
+#include "other.h"
 
 //-----------------------------------------------------------
 
@@ -55,15 +56,15 @@ namespace c2pool::p2p
     void Protocol::read_prefix()
     {
         tempMessage = std::make_unique<c2pool::messages::IMessage>(/*TODO: net.PREFIX*/);
-        
+        tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
         //char* temp;
 
         boost::asio::async_read(socket,
-                                boost::asio::buffer(tempMessage->command, nodes->p2p_node->net()->PREFIX_LENGTH),
+                                boost::asio::buffer(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH),
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
-                                    if (!ec /*&& <сравнение размеров prefix>*/)
+                                    if (!ec && c2pool::str::compare_str(tempMessage->prefix, nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH))
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->command, nodes->p2p_node->net()->PREFIX_LENGTH);
+                                        c2pool::messages::python::other::debug_log(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH);
                                         // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command();
                                     }
@@ -82,11 +83,13 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        LOG_INFO << "read_command";
+                                        c2pool::messages::python::other::debug_log(tempMessage->command, tempMessage->command_length);
+                                        //LOG_INFO << "read_command";
                                         read_length();
                                     }
                                     else
                                     {
+                                        LOG_ERROR << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });
@@ -99,11 +102,14 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        LOG_INFO << "read_length";
+                                        c2pool::messages::python::other::debug_log(tempMessage->length, tempMessage->payload_length);
+                                        tempMessage->set_unpacked_length();
+                                        // LOG_INFO << "read_length";
                                         read_checksum();
                                     }
                                     else
                                     {
+                                        LOG_ERROR << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });
@@ -116,11 +122,13 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        LOG_INFO << "read_checksum";
+                                        c2pool::messages::python::other::debug_log(tempMessage->checksum, tempMessage->checksum_length);
+                                        // LOG_INFO << "read_checksum";
                                         read_payload();
                                     }
                                     else
                                     {
+                                        LOG_ERROR << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });
@@ -133,12 +141,14 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        LOG_INFO << "read_payload";
+                                        c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
+                                        // LOG_INFO << "read_payload";
                                         //todo: move tempMesssage -> new message
                                         read_prefix();
                                     }
                                     else
                                     {
+                                        LOG_ERROR << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });

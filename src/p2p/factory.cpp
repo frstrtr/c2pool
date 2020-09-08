@@ -32,7 +32,8 @@ namespace c2pool::p2p
         conns.push_back(std::move(proto));
     }
 
-    std::shared_ptr<NodesManager> Factory::getNode(){
+    std::shared_ptr<NodesManager> Factory::getNode()
+    {
         return nodes;
     }
 
@@ -69,12 +70,17 @@ namespace c2pool::p2p
         LOG_DEBUG << "ClientFactory _think.";
         if (!error)
         {
-            //TODO: add attempt in if
-            if ((conns.size() < desired_conns) && (nodes->p2p_node->addr_store.len() > 0))
+            if ((conns.size() < desired_conns) && (nodes->p2p_node->addr_store.len() > 0) && (attempts.size() <= max_attempts))
             {
                 for (auto addr : nodes->p2p_node->get_good_peers(1))
                 {
-                    connect(std::get<0>(addr), std::get<1>(addr));
+                    if (attempts.find(addr) == attempts.end())
+                    {
+                        attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
+                        connect(std::get<0>(addr), std::get<1>(addr));
+                    } else {
+                        // LOG_TRACE << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+                    }
                 }
             }
             float rand = c2pool::random::Expovariate(1);
