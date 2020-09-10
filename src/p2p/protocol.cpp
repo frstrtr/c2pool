@@ -64,7 +64,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec && c2pool::str::compare_str(tempMessage->prefix, nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH))
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH);
+                                        LOG_DEBUG << "prefix: " << c2pool::messages::python::other::debug_log(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH);
                                         // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command();
                                     }
@@ -83,7 +83,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->command, tempMessage->command_length);
+                                        LOG_DEBUG << "command: " << c2pool::messages::python::other::debug_log(tempMessage->command, tempMessage->command_length);
                                         //LOG_INFO << "read_command";
                                         read_length();
                                     }
@@ -102,7 +102,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->length, tempMessage->payload_length);
+                                        LOG_DEBUG << "length: " << c2pool::messages::python::other::debug_log(tempMessage->length, tempMessage->payload_length);
                                         tempMessage->set_unpacked_length();
                                         // LOG_INFO << "read_length";
                                         read_checksum();
@@ -122,7 +122,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->checksum, tempMessage->checksum_length);
+                                        LOG_DEBUG << "checksum: " << c2pool::messages::python::other::debug_log(tempMessage->checksum, tempMessage->checksum_length);
                                         // LOG_INFO << "read_checksum";
                                         read_payload();
                                     }
@@ -141,7 +141,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
+                                        LOG_DEBUG << "payload: " << c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
                                         // LOG_INFO << "read_payload";
                                         //todo: move tempMesssage -> new message
                                         read_prefix();
