@@ -53,8 +53,11 @@ namespace c2pool::p2p
 
         virtual void send(c2pool::messages::message *msg);
 
-        //OLD: fromStr
+        //handle for msg from c2pool
         virtual void handle(std::stringstream ss);
+
+        //handle for msg from p2pool
+        virtual void handle(c2pool::messages::IMessage* _msg);
 
         unsigned long long nonce() const{
             return _nonce;
@@ -80,8 +83,15 @@ namespace c2pool::p2p
         //virtual void connectionMade() = 0;
         virtual void disconnect();
 
+        c2pool::messages::commands getCommand(char* cmd);
+
+        //GenerateMsg for msg from c2pool
         template <class MsgType>
         MsgType *GenerateMsg(std::stringstream &ss);
+
+        //GenerateMsg for msg from p2pool
+        template <class MsgType>
+        MsgType *GenerateMsg(c2pool::messages::IMessage* _msg);
 
         virtual void handle(c2pool::messages::message_version *msg);
 
@@ -113,7 +123,7 @@ namespace c2pool::p2p
         std::shared_ptr<c2pool::p2p::NodesManager> nodes;
         c2pool::p2p::Factory *factory; //todo: shared_ptr
 
-        unique_ptr<c2pool::messages::IMessage> tempMessage; 
+        c2pool::messages::IMessage* tempMessage; 
     };
 
     class ClientProtocol : public Protocol
