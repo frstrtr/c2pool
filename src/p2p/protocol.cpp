@@ -7,6 +7,7 @@
 #include <memory>
 #include <set>
 #include <utility>
+#include <sstream>
 using boost::asio::ip::tcp;
 
 #include "protocol.h"
@@ -55,7 +56,7 @@ namespace c2pool::p2p
 
     void Protocol::read_prefix()
     {
-        tempMessage = std::make_unique<c2pool::messages::IMessage>(/*TODO: net.PREFIX*/);
+        tempMessage = new c2pool::messages::IMessage(/*TODO: net.PREFIX*/);
         tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
         //char* temp;
 
@@ -143,7 +144,8 @@ namespace c2pool::p2p
                                     {
                                         LOG_DEBUG << "payload: " << c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
                                         // LOG_INFO << "read_payload";
-                                        //todo: move tempMesssage -> new message
+                                        //TODO: move tempMesssage -> new message
+                                        handle(tempMessage);
                                         read_prefix();
                                     }
                                     else
@@ -177,15 +179,41 @@ namespace c2pool::p2p
                                  });
     }
 
+    c2pool::messages::commands Protocol::getCommand(char* _cmd){
+        std::stringstream ss;
+        ss << _cmd;
+        std::string cmd;
+        ss >> cmd;
+
+        if (cmd == "addrs"){
+            return c2pool::messages::commands::cmd_addrs;
+        }
+        if (cmd == "version"){
+            return c2pool::messages::commands::cmd_version;
+        }
+        if (cmd == "getaddrs"){
+            return c2pool::messages::commands::cmd_getaddrs;
+        }
+        if (cmd == "addrme"){
+            return c2pool::messages::commands::cmd_addrme;
+        }
+        if (cmd == "ping"){
+            return c2pool::messages::commands::cmd_ping;
+        }
+           
+        return c2pool::messages::commands::cmd_error;
+    }
+
     //OLD: fromStr
+    //handle for msg from c2pool
+    //TODO: move to c2pool protocol
     void Protocol::handle(std::stringstream ss)
     {
-        //В Python скрипте, команда передается, как int, эквивалентный c2pool::messages::commands
-        int cmd;
-        ss >> cmd;
-        c2pool::messages::message *res;
+        char* _cmd = new char[12];
+        ss >> _cmd;
+        c2pool::messages::commands cmd = getCommand(_cmd);
 
-        switch (cmd) //todo: switch -> if (" " == cmd)
+        switch (cmd)
         {
         case c2pool::messages::commands::cmd_addrs:
             handle(GenerateMsg<c2pool::messages::message_addrs>(ss));
@@ -208,11 +236,48 @@ namespace c2pool::p2p
         }
     }
 
+    //GenerateMsg for msg from c2pool
     template <class MsgType>
     MsgType *Protocol::GenerateMsg(std::stringstream &ss)
     {
         MsgType *msg = new MsgType();
         msg->unpack(ss);
+        return msg;
+    }
+
+    //handle for msg from p2pool
+    void Protocol::handle(c2pool::messages::IMessage* _msg)
+    {
+        c2pool::messages::commands cmd = getCommand(_msg->command);
+
+        switch (cmd) //todo: switch -> if (" " == cmd)
+        {
+        case c2pool::messages::commands::cmd_addrs:
+            handle(GenerateMsg<c2pool::messages::message_addrs>(_msg));
+            break;
+        case c2pool::messages::commands::cmd_version:
+            handle(GenerateMsg<c2pool::messages::message_version>(_msg));
+            break;
+        case c2pool::messages::commands::cmd_ping:
+            handle(GenerateMsg<c2pool::messages::message_ping>(_msg));
+            break;
+        case c2pool::messages::commands::cmd_addrme:
+            handle(GenerateMsg<c2pool::messages::message_addrme>(_msg));
+            break;
+        case c2pool::messages::commands::cmd_getaddrs:
+            handle(GenerateMsg<c2pool::messages::message_getaddrs>(_msg));
+            break;
+        default:
+            handle(GenerateMsg<c2pool::messages::message_error>(_msg));
+            break;
+        }
+    }
+
+    //GenerateMsg for msg from p2pool
+    template <class MsgType>
+    MsgType *Protocol::GenerateMsg(c2pool::messages::IMessage* _msg)
+    {
+        MsgType *msg = static_cast<MsgType*>(_msg);
         return msg;
     }
 
