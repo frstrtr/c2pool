@@ -38,7 +38,7 @@ namespace c2pool::p2p
     class Node;
     class NodesManager;
     class Factory;
-}
+} // namespace c2pool::p2p
 namespace c2pool::messages
 {
     class message;
@@ -57,13 +57,17 @@ namespace c2pool::p2p
         virtual void handle(std::stringstream ss);
 
         //handle for msg from p2pool
-        virtual void handle(c2pool::messages::IMessage* _msg);
+        virtual void handle(c2pool::messages::IMessage *_msg);
 
-        unsigned long long nonce() const{
+        unsigned long long nonce() const
+        {
             return _nonce;
         }
 
     protected:
+        //call when connection has been made.
+        void connectionMade();
+
         //used for write message in protocol
         //virtual void write(unique_ptr<c2pool::messages::message> msg);
 
@@ -76,14 +80,14 @@ namespace c2pool::p2p
         void read_checksum();
 
         void read_payload();
-        
+
         //py: dataReceived(self, data)
         //virtual void handlePacket() = 0;
         //virtual void sendPacket(c2pool::messages::message *payload) = 0;
         //virtual void connectionMade() = 0;
         virtual void disconnect();
 
-        c2pool::messages::commands getCommand(char* cmd);
+        c2pool::messages::commands getCommand(char *cmd);
 
         //GenerateMsg for msg from c2pool
         template <class MsgType>
@@ -91,7 +95,7 @@ namespace c2pool::p2p
 
         //GenerateMsg for msg from p2pool
         template <class MsgType>
-        MsgType *GenerateMsg(c2pool::messages::IMessage* _msg);
+        MsgType *GenerateMsg(c2pool::messages::IMessage *_msg);
 
         virtual void handle(c2pool::messages::message_version *msg);
 
@@ -105,7 +109,6 @@ namespace c2pool::p2p
 
         virtual void handle(c2pool::messages::message_error *msg);
 
-        
         void update_addr();
         //TODO: Friend class: Message for handle_<command>
     protected:
@@ -118,12 +121,14 @@ namespace c2pool::p2p
 
         //peer address
         std::tuple<std::string, std::string> addr;
+        //host address
+        std::tuple<std::string, std::string> addrHost;
 
         boost::asio::ip::tcp::socket socket;
         std::shared_ptr<c2pool::p2p::NodesManager> nodes;
         c2pool::p2p::Factory *factory; //todo: shared_ptr
 
-        c2pool::messages::IMessage* tempMessage; 
+        c2pool::messages::IMessage *tempMessage;
     };
 
     class ClientProtocol : public Protocol

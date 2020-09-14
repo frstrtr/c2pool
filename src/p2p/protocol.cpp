@@ -35,7 +35,63 @@ namespace c2pool::p2p
     {
         factory = _factory;
         nodes = factory->getNode(); //TODO: изменить на NodeManager
-        //addr;
+    }
+
+    void Protocol::connectionMade()
+    {
+        update_addr();
+
+        c2pool::messages::address_type addr_to(0, std::get<0>(addr), c2pool::str::str_to_int(std::get<1>(addr)));
+        c2pool::messages::address_type addr_from(0, std::get<0>(addrHost), c2pool::str::str_to_int(std::get<1>(addrHost)));
+        //c2pool::messages::message_version *firstMsg = new c2pool::messages::message_version(1, 2, addrs1, addrs2, 1008386737136591102, "16", 17, 18);
+        auto msg_version = new c2pool::messages::message_version(
+            version,
+            1,
+            addr_to,
+            addr_from,
+            nodes->p2p_node->nonce,
+            "c2pool", //todo
+            1,
+            1 //todo
+        );
+        send(msg_version);
+
+        /*
+        self.send_version(
+            version=self.VERSION,
+            services=0,
+            addr_to=dict(
+                services=0,
+                address=self.transport.getPeer().host,
+                port=self.transport.getPeer().port,
+            ),
+            addr_from=dict(
+                services=0,
+                address=self.transport.getHost().host,
+                port=self.transport.getHost().port,
+            ),
+            nonce=self.node.nonce,
+            sub_version=p2pool.__version__,
+            mode=1,
+            best_share_hash=self.node.best_share_hash_func(),
+        )
+        
+        self.timeout_delayed = reactor.callLater(10, self._connect_timeout)
+        
+        self.get_shares = deferral.GenericDeferrer(
+            max_id=2**256,
+            func=lambda id, hashes, parents, stops: self.send_sharereq(id=id, hashes=hashes, parents=parents, stops=stops),
+            timeout=15,
+            on_timeout=self.disconnect,
+        )
+        
+        self.remote_tx_hashes = set() # view of peer's known_txs # not actually initially empty, but sending txs instead of tx hashes won't hurt
+        self.remote_remembered_txs_size = 0
+        
+        self.remembered_txs = {} # view of peer's mining_txs
+        self.remembered_txs_size = 0
+        self.known_txs_cache = {}
+        */
     }
 
     // //msg.data(), msg.length()
@@ -166,41 +222,47 @@ namespace c2pool::p2p
         msg->send();
         boost::asio::async_write(socket,
                                  boost::asio::buffer(msg->data, msg->get_length()),
-                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
+                                 [this, msg](boost::system::error_code ec, std::size_t /*length*/) {
                                      if (!ec)
                                      {
-                                        //
+                                         LOG_DEBUG << "send data: " << c2pool::messages::python::other::debug_log(msg->data, msg->get_length());
                                      }
                                      else
                                      {
-                                        LOG_ERROR << ec;
-                                        disconnect();
+                                         LOG_ERROR << "When try to send msg: " << ec;
+                                         disconnect();
                                      }
                                  });
     }
 
-    c2pool::messages::commands Protocol::getCommand(char* _cmd){
+    c2pool::messages::commands Protocol::getCommand(char *_cmd)
+    {
         std::stringstream ss;
         ss << _cmd;
         std::string cmd;
         ss >> cmd;
 
-        if (cmd == "addrs"){
+        if (cmd == "addrs")
+        {
             return c2pool::messages::commands::cmd_addrs;
         }
-        if (cmd == "version"){
+        if (cmd == "version")
+        {
             return c2pool::messages::commands::cmd_version;
         }
-        if (cmd == "getaddrs"){
+        if (cmd == "getaddrs")
+        {
             return c2pool::messages::commands::cmd_getaddrs;
         }
-        if (cmd == "addrme"){
+        if (cmd == "addrme")
+        {
             return c2pool::messages::commands::cmd_addrme;
         }
-        if (cmd == "ping"){
+        if (cmd == "ping")
+        {
             return c2pool::messages::commands::cmd_ping;
         }
-           
+
         return c2pool::messages::commands::cmd_error;
     }
 
@@ -209,7 +271,7 @@ namespace c2pool::p2p
     //TODO: move to c2pool protocol
     void Protocol::handle(std::stringstream ss)
     {
-        char* _cmd = new char[12];
+        char *_cmd = new char[12];
         ss >> _cmd;
         c2pool::messages::commands cmd = getCommand(_cmd);
 
@@ -246,7 +308,7 @@ namespace c2pool::p2p
     }
 
     //handle for msg from p2pool
-    void Protocol::handle(c2pool::messages::IMessage* _msg)
+    void Protocol::handle(c2pool::messages::IMessage *_msg)
     {
         c2pool::messages::commands cmd = getCommand(_msg->command);
 
@@ -275,9 +337,9 @@ namespace c2pool::p2p
 
     //GenerateMsg for msg from p2pool
     template <class MsgType>
-    MsgType *Protocol::GenerateMsg(c2pool::messages::IMessage* _msg)
+    MsgType *Protocol::GenerateMsg(c2pool::messages::IMessage *_msg)
     {
-        MsgType *msg = static_cast<MsgType*>(_msg);
+        MsgType *msg = static_cast<MsgType *>(_msg);
         return msg;
     }
 
@@ -378,6 +440,12 @@ namespace c2pool::p2p
         boost::asio::ip::tcp::endpoint ep = socket.remote_endpoint();
 
         addr = std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
+        LOG_INFO << "Connect to " << std::get<0>(addr) << ":" << std::get<1>(addr);
+
+        ep = socket.local_endpoint();
+        addrHost = std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
+
+        LOG_DEBUG << "Connect from " << std::get<0>(addrHost) << ":" << std::get<1>(addrHost);
     }
 
     //ClientProtocol
@@ -390,8 +458,7 @@ namespace c2pool::p2p
     void ClientProtocol::do_connect(const boost::asio::ip::tcp::resolver::results_type endpoints)
     {
         boost::asio::async_connect(socket, endpoints, [this](boost::system::error_code ec, tcp::endpoint) {
-            update_addr();
-            LOG_INFO << "Connect to " << std::get<0>(addr) << ":" << std::get<1>(addr);
+            connectionMade();
             if (!ec)
             {
                 // c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
@@ -399,7 +466,9 @@ namespace c2pool::p2p
                 // c2pool::messages::message* firstMsg = new c2pool::messages::message_version(version, 0, addrs1, addrs2, nodes->p2p_node->nonce, "16", 1, 18);
                 // send(firstMsg);
                 read_prefix();
-            } else {
+            }
+            else
+            {
                 LOG_ERROR << ec;
             }
         });
@@ -414,7 +483,7 @@ namespace c2pool::p2p
 
     void ServerProtocol::start()
     {
-        update_addr();
+        connectionMade();
         read_prefix();
     }
 } // namespace c2pool::p2p
