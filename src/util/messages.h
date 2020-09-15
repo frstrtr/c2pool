@@ -6,6 +6,7 @@
 #include <string>
 #include "types.h"
 #include "pack.h"
+#include <tuple>
 
 //TODO: remove trash comments
 
@@ -102,6 +103,9 @@ namespace c2pool::messages
         void receive_from_data(char *_set_data);
         //
         void send();
+
+        //return all msg with prefix, ready for send
+        std::tuple<char*, int> send_data(const void* _prefix, int _prefix_len);
 
         void unpack(std::string item);
         void unpack(std::stringstream &ss);

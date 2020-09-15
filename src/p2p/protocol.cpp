@@ -218,14 +218,20 @@ namespace c2pool::p2p
     }
 
     void Protocol::send(c2pool::messages::message *msg)
-    {
-        msg->send();
+    {        
+        // msg->send();
+        // LOG_DEBUG << "just data: " << c2pool::messages::python::other::debug_log(msg->data, msg->get_length());
+        // char* pref = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
+        // memcpy(pref, nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH);
+        // LOG_DEBUG << "just prefix: " << c2pool::messages::python::other::debug_log(pref, nodes->p2p_node->net()->PREFIX_LENGTH);
+        
+        auto msg_data = msg->send_data(nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH);
         boost::asio::async_write(socket,
-                                 boost::asio::buffer(msg->data, msg->get_length()),
-                                 [this, msg](boost::system::error_code ec, std::size_t /*length*/) {
+                                 boost::asio::buffer(std::get<0>(msg_data), std::get<1>(msg_data)),
+                                 [this, msg_data](boost::system::error_code ec, std::size_t /*length*/) {
                                      if (!ec)
                                      {
-                                         LOG_DEBUG << "send data: " << c2pool::messages::python::other::debug_log(msg->data, msg->get_length());
+                                         LOG_DEBUG << "Send data: " << c2pool::messages::python::other::debug_log(std::get<0>(msg_data), std::get<1>(msg_data));
                                      }
                                      else
                                      {
