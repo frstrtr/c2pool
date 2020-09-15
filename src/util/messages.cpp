@@ -8,6 +8,7 @@
 #include <string>
 #include <cstring>
 #include "console.h"
+#include <tuple>
 using namespace c2pool::messages;
 
 namespace c2pool::messages
@@ -49,15 +50,17 @@ namespace c2pool::messages
 
     void IMessage::decode_data()
     {
-        sprintf(data, "%s%s%s%s", command, length, checksum, payload);
+        sprintf(data, "%s%s%s%s", command, length, checksum, payload); //TODO: NOT WORKED!
     }
 
-    void IMessage::set_unpacked_length(char* packed_len){
+    void IMessage::set_unpacked_length(char *packed_len)
+    {
         if (packed_len != nullptr)
         {
             memcpy(length, packed_len, payload_length);
         }
-        if (length != nullptr){
+        if (length != nullptr)
+        {
             _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
         }
     }
@@ -109,6 +112,20 @@ namespace c2pool::messages
     void message::send()
     {
         set_data(c2pool::messages::python::pymessage::send(this));
+    }
+
+    std::tuple<char *, int> message::send_data(const void *_prefix, int _prefix_len)
+    {
+        send();
+
+        char *full_data = new char[_prefix_len + get_length()+1]; //TODO: delete full_data
+
+        memcpy(full_data, _prefix, _prefix_len);
+        memcpy(full_data+_prefix_len, data, get_length());
+
+        //std::cout << "pref_len = " << _prefix_len << ", data len = " << get_length() << ", full len = " << _prefix_len + get_length() << std::endl;
+
+        return std::make_tuple(full_data, _prefix_len + get_length());
     }
 
     void message::unpack(std::string item)
