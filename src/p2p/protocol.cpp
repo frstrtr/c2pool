@@ -214,6 +214,7 @@ namespace c2pool::p2p
 
     void Protocol::disconnect()
     {
+        factory->disconnect(addr);
         boost::asio::post(factory->io_context, [this]() { socket.close(); });
     }
 
