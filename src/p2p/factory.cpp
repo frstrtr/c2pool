@@ -51,8 +51,10 @@ namespace c2pool::p2p
     {
         try
         {
+            auto addr = std::make_tuple(ip, port);
             resolver.async_resolve(ip, port,
-                                   [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
+                                   [this,  addr](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
+                                       attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
                                        boost::asio::ip::tcp::socket socket(io_context);
                                        auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
                                        protocol_connected(p);
@@ -62,6 +64,10 @@ namespace c2pool::p2p
         {
             std::cerr << "Exception Client::connect(): " << e.what() << std::endl;
         }
+    }
+
+    void Client::disconnect(std::tuple<std::string, std::string> addr) {
+        attempts.erase(addr);
     }
 
     //TODO: finish method
@@ -76,7 +82,6 @@ namespace c2pool::p2p
                 {
                     if (attempts.find(addr) == attempts.end())
                     {
-                        attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
                         connect(std::get<0>(addr), std::get<1>(addr));
                     } else {
                         // LOG_TRACE << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
