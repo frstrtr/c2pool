@@ -51,6 +51,7 @@ namespace c2pool::p2p
     public:
         Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory);
 
+        //used for write message in protocol
         virtual void send(c2pool::messages::message *msg);
 
         //handle for msg from c2pool
@@ -68,9 +69,6 @@ namespace c2pool::p2p
         //call when connection has been made.
         void connectionMade();
 
-        //used for write message in protocol
-        //virtual void write(unique_ptr<c2pool::messages::message> msg);
-
         void read_prefix();
 
         void read_command();
@@ -81,13 +79,12 @@ namespace c2pool::p2p
 
         void read_payload();
 
-        //py: dataReceived(self, data)
-        //virtual void handlePacket() = 0;
-        //virtual void sendPacket(c2pool::messages::message *payload) = 0;
-        //virtual void connectionMade() = 0;
         virtual void disconnect();
 
         c2pool::messages::commands getCommand(char *cmd);
+
+        //py: packetReceived(self, command, payload2):
+        void handlePacket(c2pool::messages::IMessage *_msg);
 
         //GenerateMsg for msg from c2pool
         template <class MsgType>
@@ -128,7 +125,13 @@ namespace c2pool::p2p
         std::shared_ptr<c2pool::p2p::NodesManager> nodes;
         c2pool::p2p::Factory *factory; //todo: shared_ptr
 
+        bool connected = false; //in p2pool -> connected2
+        boost::asio::deadline_timer timeout_timer;//timeout_delayed;
+
         c2pool::messages::IMessage *tempMessage;
+
+    private:
+        void connect_timeout(const boost::system::error_code &error);
     };
 
     class ClientProtocol : public Protocol

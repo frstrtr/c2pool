@@ -31,10 +31,10 @@ namespace c2pool::p2p
 {
 
     //Protocol
-    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
+    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), nodes(factory->getNode()), version(3301), timeout_timer(nodes->io_context(), boost::posix_time::seconds(10))
     {
         factory = _factory;
-        nodes = factory->getNode(); //TODO: изменить на NodeManager
+        //nodes = factory->getNode(); //TODO: изменить на NodeManager
     }
 
     void Protocol::connectionMade()
@@ -74,41 +74,18 @@ namespace c2pool::p2p
             sub_version=p2pool.__version__,
             mode=1,
             best_share_hash=self.node.best_share_hash_func(),
-        )
-        
-        self.timeout_delayed = reactor.callLater(10, self._connect_timeout)
-        
+        )*/
+
+        timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
+
+        /*
         self.get_shares = deferral.GenericDeferrer(
             max_id=2**256,
             func=lambda id, hashes, parents, stops: self.send_sharereq(id=id, hashes=hashes, parents=parents, stops=stops),
             timeout=15,
             on_timeout=self.disconnect,
-        )
-        
-        self.remote_tx_hashes = set() # view of peer's known_txs # not actually initially empty, but sending txs instead of tx hashes won't hurt
-        self.remote_remembered_txs_size = 0
-        
-        self.remembered_txs = {} # view of peer's mining_txs
-        self.remembered_txs_size = 0
-        self.known_txs_cache = {}
-        */
+        )*/
     }
-
-    // //msg.data(), msg.length()
-    // void Protocol::write(unique_ptr<c2pool::messages::message> msg)
-    // {
-    //     boost::asio::async_write(socket,
-    //                              boost::asio::buffer(msg->data, msg->get_length()),
-    //                              [this](boost::system::error_code ec, std::size_t /*length*/) {
-    //                                  if (!ec)
-    //                                  {
-    //                                  }
-    //                                  else
-    //                                  {
-    //                                      disconnect();
-    //                                  }
-    //                              });
-    // }
 
     void Protocol::read_prefix()
     {
@@ -201,7 +178,7 @@ namespace c2pool::p2p
                                         LOG_DEBUG << "payload: " << c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
                                         // LOG_INFO << "read_payload";
                                         //TODO: move tempMesssage -> new message
-                                        handle(tempMessage);
+                                        handlePacket(tempMessage);
                                         read_prefix();
                                     }
                                     else
@@ -214,17 +191,18 @@ namespace c2pool::p2p
 
     void Protocol::disconnect()
     {
+        factory->disconnect(addr);
         boost::asio::post(factory->io_context, [this]() { socket.close(); });
     }
 
     void Protocol::send(c2pool::messages::message *msg)
-    {        
+    {
         // msg->send();
         // LOG_DEBUG << "just data: " << c2pool::messages::python::other::debug_log(msg->data, msg->get_length());
         // char* pref = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
         // memcpy(pref, nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH);
         // LOG_DEBUG << "just prefix: " << c2pool::messages::python::other::debug_log(pref, nodes->p2p_node->net()->PREFIX_LENGTH);
-        
+
         auto msg_data = msg->send_data(nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH);
         boost::asio::async_write(socket,
                                  boost::asio::buffer(std::get<0>(msg_data), std::get<1>(msg_data)),
@@ -270,6 +248,22 @@ namespace c2pool::p2p
         }
 
         return c2pool::messages::commands::cmd_error;
+    }
+
+    void Protocol::handlePacket(c2pool::messages::IMessage *_msg)
+    {
+        if (!(c2pool::str::compare_str(_msg->command, "version", 7)) && !connected)
+        {
+            LOG_WARNING << "first message was not version message";
+            //TODO: raise
+        }
+
+        //from packetReceived2
+        //TODO: TEST FOR ASYNC
+        timeout_timer.expires_from_now(boost::posix_time::seconds(100));
+        timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
+
+        handle(_msg);
     }
 
     //OLD: fromStr
@@ -351,16 +345,18 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_version *msg)
     {
-
-        std::cout << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version << ", client version " << msg->sub_version; //TODO: to Log system
+        LOG_INFO << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version << ", client version " << msg->sub_version;
 
         if (other_version != -1)
         {
-            //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
+            LOG_WARNING << "more than one version message";
+            //todo: raise
         }
+
         if (msg->version < nodes->p2p_node->net()->MINIMUM_PROTOCOL_VERSION)
         {
-            //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
+            LOG_WARNING << "peer too old";
+            //todo: raise
         }
 
         other_version = msg->version;
@@ -369,7 +365,8 @@ namespace c2pool::p2p
 
         if (msg->nonce == nodes->p2p_node->nonce) //TODO: add nonce in Node
         {
-            //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
+            LOG_WARNING << "was connected to self";
+            //TODO: raise
         }
 
         //detect duplicate in node->peers
@@ -384,35 +381,24 @@ namespace c2pool::p2p
         }
 
         _nonce = msg->nonce;
-        //connected2 = true; //?
+        connected = true;
 
-        //TODO: safe thrade cancel
-        //todo: timeout_delayed.cancel();
-        //timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100)); //todo: timer io from constructor
-        //todo: timeout_delayed.async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
-        //_____________
-
-        /* TODO: TIMER + DELEGATE
-             old_dataReceived = self.dataReceived
-        def new_dataReceived(data):
-            if self.timeout_delayed is not None:
-                self.timeout_delayed.reset(100)
-            old_dataReceived(data)
-        self.dataReceived = new_dataReceived
-             */
+        //TODO: TEST FOR ASYNC
+        timeout_timer.expires_from_now(boost::posix_time::seconds(100));
+        timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
 
         factory->protocol_connected(shared_from_this());
 
-        /* TODO: thread (coroutine?):
-             self._stop_thread = deferral.run_repeatedly(lambda: [
+        /*
+        self._stop_thread = deferral.run_repeatedly(lambda: [
             self.send_ping(),
-        random.expovariate(1/100)][-1])
+        random.expovariate(1/100)][-1]) */
 
-             if self.node.advertise_ip:
+        /*
+        if self.node.advertise_ip:
             self._stop_thread2 = deferral.run_repeatedly(lambda: [
                 self.sendAdvertisement(),
-            random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
-             */
+            random.expovariate(1/(100*len(self.node.peers) + 1))][-1]) */
 
         //best_hash = 0 default?
         // if (best_hash != -1)
@@ -423,10 +409,41 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_addrs *msg)
     {
+        for (auto addr : msg->addrs)
+        {
+            
+        }
+        /*
+        for addr_record in addrs:
+            self.node.got_addr((addr_record['address']['address'], addr_record['address']['port']), addr_record['address']['services'], min(int(time.time()), addr_record['timestamp']))
+            if random.random() < .8 and self.node.peers:
+                random.choice(self.node.peers.values()).send_addrs(addrs=[addr_record])
+        */
     }
 
     void Protocol::handle(c2pool::messages::message_addrme *msg)
     {
+
+        /*
+        host = self.transport.getPeer().host
+        #print 'addrme from', host, port
+        if host == '127.0.0.1':
+            if random.random() < .8 and self.node.peers:
+                random.choice(self.node.peers.values()).send_addrme(port=port) # services...
+        else:
+            self.node.got_addr((self.transport.getPeer().host, port), self.other_services, int(time.time()))
+            if random.random() < .8 and self.node.peers:
+                random.choice(self.node.peers.values()).send_addrs(addrs=[
+                    dict(
+                        address=dict(
+                            services=self.other_services,
+                            address=host,
+                            port=port,
+                        ),
+                        timestamp=int(time.time()),
+                    ),
+                ])
+        */
     }
 
     void Protocol::handle(c2pool::messages::message_ping *msg)
@@ -435,6 +452,22 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_getaddrs *msg)
     {
+
+        /*
+        if count > 100:
+            count = 100
+        self.send_addrs(addrs=[
+            dict(
+                timestamp=int(self.node.addr_store[host, port][2]),
+                address=dict(
+                    services=self.node.addr_store[host, port][0],
+                    address=host,
+                    port=port,
+                ),
+            ) for host, port in
+            self.node.get_good_peers(count)
+        ])
+        */
     }
 
     void Protocol::handle(c2pool::messages::message_error *msg)
@@ -452,6 +485,22 @@ namespace c2pool::p2p
         addrHost = std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
 
         LOG_DEBUG << "Connect from " << std::get<0>(addrHost) << ":" << std::get<1>(addrHost);
+    }
+
+    void Protocol::connect_timeout(const boost::system::error_code &error)
+    {
+        if (error != boost::asio::error::operation_aborted)
+        {
+            if (connected)
+            {
+                LOG_WARNING << "Handshake timed out, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
+            }
+            else
+            {
+                LOG_WARNING << "Connection timed out, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
+            }
+            disconnect();
+        }
     }
 
     //ClientProtocol
