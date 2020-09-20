@@ -14,6 +14,9 @@
 #include "console.h"
 #include "addrStore.h"
 #include <cmath>
+#include <algorithm>
+#include <types.h>
+#include <string>
 
 #include <iterator>
 
@@ -108,7 +111,7 @@ namespace c2pool::p2p
 
         //TODO: this want to test
         float t = c2pool::time::timestamp();
-        
+
         std::vector<std::pair<float, ADDR>> values;
         for (auto kv : addr_store.GetAll())
         {
@@ -124,14 +127,32 @@ namespace c2pool::p2p
 
         values.resize(min((int)values.size(), max_count));
         std::vector<ADDR> result;
-        for (auto v : values){
+        for (auto v : values)
+        {
             result.push_back(v.second);
         }
         return result;
     }
 
-    void Node::got_addr(c2pool::messages::addr addr){
-        //TODO: finish method
+    void Node::got_addr(c2pool::messages::addr addr)
+    {
+        addr.timestamp = std::min(addr.timestamp, c2pool::time::timestamp());
+        auto _key = std::make_tuple(addr.address.address, std::to_string(addr.address.port));
+        if (addr_store.Check(_key))
+        {
+            auto old_value = addr_store.Get(_key);
+            c2pool::p2p::AddrValue _value = {addr.address.services, old_value.first_seen, std::max(old_value.last_seen, (double)addr.timestamp)};
+
+            addr_store.Add(_key, _value);
+        }
+        else
+        {
+            if (addr_store.len() < 10000)
+            {
+                c2pool::p2p::AddrValue _value = {addr.address.services, (double)addr.timestamp, (double)addr.timestamp};
+                addr_store.Add(_key, _value);
+            }
+        }
     }
 
     //P2PNode

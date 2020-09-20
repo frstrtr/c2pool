@@ -1,7 +1,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 #include <boost/asio.hpp>
+#include <boost/bind.hpp>
 #include <deque>
 #include <list>
 #include <memory>
@@ -411,14 +413,23 @@ namespace c2pool::p2p
     {
         for (auto addr : msg->addrs)
         {
-            
+            nodes->p2p_node->got_addr(addr);
+            if ((c2pool::random::RandomFloat(0, 1) < 0.8f))
+            {
+                if (peers.size() > 0)
+                {
+                    int pos = c2pool::random::RandomInt(0, peers.size());
+                    auto item = peers.begin();
+                    std::advance(item, pos);
+                    auto proto = item->second;
+                    auto msg = new c2pool::messages::message_getaddrs(8);
+                    //proto->send(msg);
+                    //TODO: c2pool::random::RandomChoice for map
+
+                    //random.choice(self.node.peers.values()).send_addrs(addrs=[addr_record])
+                }
+            }
         }
-        /*
-        for addr_record in addrs:
-            self.node.got_addr((addr_record['address']['address'], addr_record['address']['port']), addr_record['address']['services'], min(int(time.time()), addr_record['timestamp']))
-            if random.random() < .8 and self.node.peers:
-                random.choice(self.node.peers.values()).send_addrs(addrs=[addr_record])
-        */
     }
 
     void Protocol::handle(c2pool::messages::message_addrme *msg)

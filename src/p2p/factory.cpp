@@ -64,6 +64,10 @@ namespace c2pool::p2p
         }
     }
 
+    void Client::disconnect(std::tuple<std::string, std::string> addr) {
+
+    }
+
     //TODO: finish method
     void Client::_think(const boost::system::error_code &error)
     {
