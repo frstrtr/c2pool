@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <iterator>
+#include <string>
 
 namespace c2pool::random
 {
@@ -60,6 +61,9 @@ namespace c2pool::str
     //char и unsigned char будут так же верно сравниваться.
     //true - equaled
     bool compare_str(const void* first_str, const void* second_str, unsigned int length);
+
+    //TODO: add str_to_int for char*
+    int str_to_int(std::string s);
 } // namespace c2pool::str
 
 #endif //CPOOL_OTHER_H

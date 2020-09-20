@@ -862,7 +862,7 @@ def send(command, payload2):
 # ------------------------------------------FOR C++ DEBUG----------------------------------
 
 def debug_log(char_array):
-    print(str(char_array))
+    return str(char_array)
 
 # ------------------------------------------FOR UNIT TESTS---------------------------------
 
