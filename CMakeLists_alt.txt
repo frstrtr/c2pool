@@ -1,0 +1,68 @@
+cmake_minimum_required(VERSION 3.18.1)
+project(cpool)
+
+set(CMAKE_CXX_STANDARD 20)
+
+#c2pool variables
+set(SOURCE_FILE src/main.cpp)
+#c2pool LIBS
+
+set(UTILS src/util)
+set(P2P src/p2p)
+set(NETWORKS src/networks)
+set(OTHER src/other)
+set(UNIVALUE src/univalue)
+#set(CRYPTO src/crypto)  #todo
+set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE})
+set(c2pool_libs util p2p networks other univalue)
+
+#BOOST
+# ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
+# SET(Boost_USE_STATIC_LIBS ON)
+# FIND_PACKAGE(Boost 1.72.0 COMPONENTS log REQUIRED)
+ADD_DEFINITIONS(-DBOOST_LOG_DYN_LINK)
+
+SET(CMAKE_INCLUDE_PATH ${CMAKE_INCLUDE_PATH} "C:/local/boost_1_74_0")
+SET(CMAKE_LIBRARY_PATH ${CMAKE_LIBRARY_PATH} "C:/local/boost_1_74_0/libs")
+
+FIND_PACKAGE(Boost 1.74.0 REQUIRED)
+
+IF (Boost_FOUND)
+    INCLUDE_DIRECTORIES(${Boost_INCLUDE_DIR})
+    ADD_DEFINITIONS( "-DHAS_BOOST" )
+    MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
+    MESSAGE( STATUS "Boost_LIBRARIES = ${BOOST_LIBRARYDIR}.")
+    MESSAGE( STATUS "Boost_LIB_VERSION = ${Boost_LIB_VERSION}.")
+ENDIF()
+
+set(Boost_USE_STATIC_LIBS ON)
+
+set(Boost_DEBUG ON)
+set(Boost_VERBOSE ON)
+set(Boost_USE_DEBUG_LIBS         ON) # ignore debug libs and
+
+find_package(Boost 1.74.0 COMPONENTS log log_setup REQUIRED)
+set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY} ${Boost_LOG_SETUP_LIBRARY})
+
+include_directories(${Boost_INCLUDE_DIRS})
+
+add_executable(cpool ${SOURCE_FILE})
+
+include_directories(${c2pool_dirs})
+foreach(subdir ${c2pool_dirs})
+    add_subdirectory(${subdir})
+endforeach()
+
+add_subdirectory(lib/googletest)
+add_subdirectory(test)
+
+if(WIN32)
+    target_link_libraries(cpool ws2_32) #возник баг, без этого не компилится boost код.
+    target_link_libraries(cpool wsock32) #возник баг, без этого не компилится boost код.
+endif()
+
+target_compile_definitions(cpool PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
+target_link_libraries(cpool -Wl,--start-group  ${PROJECT_LIB} -Wl,--end-group)
+# target_link_libraries(cpool ${Boost_LIBRARIES})
+target_link_libraries(cpool Boost::log_setup Boost::log)
+target_link_libraries(cpool ${c2pool_libs})
