@@ -33,7 +33,7 @@ namespace c2pool::p2p
         void SaveToFile();
         bool Check(ADDR addr);
 
-        bool Add(ADDR key, AddrValue value);
+        void Add(ADDR key, AddrValue value);
         bool Remove(ADDR key);
         AddrValue Get(ADDR key);
         std::vector<std::pair<ADDR, AddrValue>> GetAll();
