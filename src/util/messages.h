@@ -6,7 +6,6 @@
 #include <string>
 #include "types.h"
 #include "pack.h"
-#include <tuple>
 
 //TODO: remove trash comments
 
@@ -103,9 +102,6 @@ namespace c2pool::messages
         void receive_from_data(char *_set_data);
         //
         void send();
-
-        //return all msg with prefix, ready for send
-        std::tuple<char*, int> send_data(const void* _prefix, int _prefix_len);
 
         void unpack(std::string item);
         void unpack(std::stringstream &ss);
@@ -260,6 +256,301 @@ namespace c2pool::messages
 
         string _pack() override;
     };
+
+    //__________________________
+    /*
+
+    class message_shares : public message
+    {
+    public:
+        message_shares(share_type shrs, const string cmd = "version") : message(cmd)
+        {
+            shares = shrs;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> shares;
+
+            //TODO: override operator >> for share_type;
+        }
+
+        string pack() override
+        {
+            ComposedType ct;
+            ct.add(shares.ToString()); //todo check toString()
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_shares(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('shares', pack.ListType(p2pool_data.share_type)),
+        share_type shares;
+        // ])
+    };
+
+    class message_sharereq : public message
+    { // TODO переделать ListType.
+    public:
+        message_sharereq(int idd, ???ListType_Int256 hshs, int prnts, ???ListType_Int256 stps, const string cmd = "version"):message(cmd)
+        {
+            id = idd;
+            hashes = hshs;
+            parents = prnts;
+            stops = stps;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> id >> hashes >> parents >> stops;
+
+            //TODO: override operator >> for ListType_Int256;
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(id);
+            ct.add(hashes.ToString()); //todo check ListType_Int256, hashes.ToString()
+            ct.add(parents);
+            ct.add(stops.ToString()); //todo ListType_Int256, stops.ToString()
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_sharereq(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('id', pack.IntType(256)),
+        int id;
+        //     ('hashes', pack.ListType(pack.IntType(256))),
+        ListType_Int256 hashes;
+        //     ('parents', pack.VarIntType()),
+        int parents;
+        //     ('stops', pack.ListType(pack.IntType(256))),
+        ListType_Int256 stops;
+        // ])
+    };
+
+    class message_sharereply : public message
+    { // TODO Enum и ListTypeShareType
+    public:
+        message_sharereply(int idd, enum rslt, ListTypeShareType shrs, const string cmd = "version") : message(cmd)
+        {
+            id = idd;
+            result = rslt;
+            shares = shrs;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> id >> result >> shares;
+
+            //TODO: override operator >> for ListTypeShareType & enum;
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(id);
+            ct.add(result); //todo check enum
+            ct.add(shares); // todo check ListTypeShareType
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_sharereply(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('id', pack.IntType(256)),
+        int id;
+        //     ('result', pack.EnumType(pack.VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),
+        enum result; // TODO enum?
+        //     ('shares', pack.ListType(p2pool_data.share_type)),
+        ListTypeShareType shares; // TODO ListType
+        // ])
+    };
+
+    class message_bestblock : public message
+    { // TODO BitcoinDataBlockHeaderType
+    public:
+        message_bestblock(BitcoinDataBlockHeaderType hdr, const string cmd = "version") : message(cmd)
+        {
+            header = hdr;
+
+            //TODO: override operator >> for BitcoinDataBlockHeaderType;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> header;
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(header.ToString()); //todo check BitcoinDataBlockHeaderType
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_bestblock(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('header', bitcoin_data.block_header_type),
+        BitcoinDataBlockHeaderType header;
+        // ])
+    };
+
+    class message_have_tx : public message
+    {
+    public:
+        message_have_tx(int tx_hshs, const string cmd = "version") : message(cmd)
+        {
+            tx_hashes = tx_hshs;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> tx_hashes;
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(tx_hashes);
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_have_tx(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('tx_hashes', pack.ListType(pack.IntType(256))),
+        int tx_hashes;
+        // ])
+    };
+
+    class message_losing_tx : public message
+    { // TODO ListTypeInt256
+    public:
+        message_losing_tx(ListTypeInt256 tx_hshs, const string cmd = "version") : message(cmd)
+        {
+            tx_hashes = tx_hshs;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> tx_hashes;
+
+            //todo override operator >> for ListTypeInt256
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(tx_hashes); //todo check ListTypeInt256
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_losing_tx(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('tx_hashes', pack.ListType(pack.IntType(256))),
+        ListTypeInt256 tx_hashes;
+        // ])
+    };
+
+    class message_remember_tx : message
+    { // TODO ListTypeInt256, ListTypeTX
+    public:
+        message_remember_tx(ListTypeInt256 tx_hshs, ListTypeTX txss, const string cmd = "version") : message(cmd)
+        {
+            tx_hashes = tx_hshs;
+            txs = txss;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> tx_hashes >> txs;
+
+            //todo override operator >> forListTypeInt256, ListTypeTX
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(tx_hashes); //todo ListTypeInt256
+            ct.add(txs);       //todo ListTypeTX
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_remember_tx(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('tx_hashes', pack.ListType(pack.IntType(256))),
+        ListTypeInt256 tx_hashes;
+        //     ('txs', pack.ListType(bitcoin_data.tx_type)),
+        ListTypeTX txs;
+        // ])
+    };
+
+    class message_forget_tx : message
+    { // TODO ListTypeInt256
+    public:
+        message_forget_tx(ListTypeInt256 tx_hshs, const string cmd = "version") : message(cmd)
+        {
+            tx_hashes = tx_hshs;
+        }
+
+        void _unpack(stringstream &ss) override
+        {
+            ss >> tx_hashes;
+            //todo override operator >> for ListTypeInt256
+        }
+
+        string _pack() override
+        {
+            ComposedType ct;
+            ct.add(tx_hashes); //todo ListTypeInt256
+            return ct.read();
+        }
+
+        void handle(p2p::Protocol *protocol)
+        {
+            protocol->handle_forget_tx(<todo>);
+        }
+
+        //     = pack.ComposedType([
+        //     ('tx_hashes', pack.ListType(pack.IntType(256))),
+        ListTypeInt256 tx_hashes;
+        // ])
+    }
+
+
+
+    */
+
+    //__________________________
+
 } // namespace c2pool::messages
 
 #endif //CPOOL_MESSAGES_H

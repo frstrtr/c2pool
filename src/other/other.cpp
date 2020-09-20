@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstring>
 #include <sstream>
-#include <string>
 
 namespace c2pool::random
 {
@@ -102,13 +101,5 @@ namespace c2pool::str
         if (memcmp(first_str, second_str, length) == 0)
             return true;
         return false;
-    }
-
-    int str_to_int(std::string s){
-        std::stringstream ss;
-        ss << s;
-        int res;
-        ss >> res;
-        return res;
     }
 } // namespace c2pool::str

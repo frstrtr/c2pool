@@ -50,6 +50,5 @@ doc/concepts/TestIdeaProtocolWithMessages.ilk
 vc140.pdb
 
 #p2pool
-logs/
-data/
-*.log
+/logs
+/data

@@ -20,10 +20,6 @@ namespace c2pool::config
     {
         BOOTSTRAP_ADDRS = {
             CREATE_ADDR("217.72.4.157", "5024")
-            //CREATE_ADDR("144.202.73.168", "5024")
-            //CREATE_ADDR("thumb.dk", "5024")
-            //CREATE_ADDR("p2p-spb.xyz", "5024")
-            //CREATE_ADDR("p2p-spb.xyz", "9326")
             //"217.42.4.157:5025"
         };
         PREFIX_LENGTH = 8;
