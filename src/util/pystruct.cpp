@@ -180,10 +180,8 @@ stringstream pystruct::unpack(char *types, char *vars)
 namespace c2pool::messages::python
 {
 
-    char* other::debug_log(char* data, unsigned int len){
+    void other::debug_log(char* data, unsigned int len){
         c2pool::python::Py::Initialize();
-
-        char *ret = NULL;
 
         // Загрузка модуля sys
         auto sys = PyImport_ImportModule("sys");
@@ -192,51 +190,40 @@ namespace c2pool::messages::python
         auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
-
         // Загрузка py файла
         auto pName = PyUnicode_FromString("packtypes");
         if (!pName)
         {
-            return ret;
+            return;
         }
+
         // Загрузить объект модуля
         auto pModule = PyImport_Import(pName);
         if (!pModule)
         {
-            return ret;
+            return;
         }
+
         // Словарь объектов содержащихся в модуле
         auto pDict = PyModule_GetDict(pModule);
         if (!pDict)
         {
-            return ret;
+            return;
         }
 
         auto pObjct = PyDict_GetItemString(pDict, (const char *)"debug_log");
         if (!pObjct)
         {
-            return ret;
+            return;
         }
 
         // Проверка pObjct на годность.
         if (!PyCallable_Check(pObjct))
         {
-            return ret;
+            return;
         }
+
         auto pVal = PyObject_CallFunction(pObjct, (char *)"(y#)", data, len);
-        if (pVal != NULL)
-        {
-            PyObject *pResultRepr = PyObject_Repr(pVal);
-
-            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
-            // Для начала pResultRepr нужно привести к массиву байтов.
-            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
-
-            Py_XDECREF(pResultRepr);
-            Py_XDECREF(pVal);
-        }
-
-        return ret;
     }
 
     //_________________________pymessage______________________

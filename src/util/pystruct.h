@@ -27,7 +27,7 @@ namespace c2pool::messages::python
     class other
     {
     public:
-        static char* debug_log(char* data, unsigned int len);
+        static void debug_log(char* data, unsigned int len);
     };
 
     class pymessage

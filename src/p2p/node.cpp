@@ -130,10 +130,6 @@ namespace c2pool::p2p
         return result;
     }
 
-    void Node::got_addr(c2pool::messages::addr addr){
-        //TODO: finish method
-    }
-
     //P2PNode
 
     P2PNode::P2PNode(std::shared_ptr<c2pool::p2p::NodesManager> _nodes, std::string _port, c2pool::p2p::AddrStore _addr_store) : Node(_nodes, _port, _addr_store)

@@ -18,7 +18,6 @@
 #include <set>
 #include <utility>
 #include <string>
-#include <tuple>
 
 using boost::asio::ip::tcp;
 
@@ -43,9 +42,6 @@ namespace c2pool::p2p
         Factory(boost::asio::io_context &context, std::shared_ptr<c2pool::p2p::NodesManager> _nodes);
 
         void protocol_connected(std::shared_ptr<c2pool::p2p::Protocol> proto);
-
-        //called, when proto disconnected
-        virtual void disconnect(std::tuple<std::string, std::string> addr) {};
     public:
         boost::asio::io_context &io_context;
 
@@ -63,9 +59,6 @@ namespace c2pool::p2p
 
         //todo: void -> bool
         void connect(std::string ip, std::string port);
-
-        //called, when proto disconnected
-        void disconnect(std::tuple<std::string, std::string> addr) override;
 
         void _think(const boost::system::error_code &error); //TODO: change name
 

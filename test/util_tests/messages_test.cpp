@@ -15,8 +15,8 @@ using namespace std;
 
 TEST(TestMessages, IMessage)
 {
-    const char test_prefix[4] = {0x1, 0x2, 0x3, 0x4};
-    const char test_prefix2[4] = {0x1, 0x2, 0x3, 0x4};
+    const unsigned char test_prefix[4] = {0x1, 0x2, 0x3, 0x4};
+    const unsigned char test_prefix2[4] = {0x1, 0x2, 0x3, 0x4};
     c2pool::messages::IMessage* msg = new c2pool::messages::IMessage(test_prefix2);
     ASSERT_EQ(*msg->prefix, *test_prefix);
 }
