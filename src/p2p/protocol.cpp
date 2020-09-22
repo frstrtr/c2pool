@@ -422,8 +422,9 @@ namespace c2pool::p2p
                     auto item = peers.begin();
                     std::advance(item, pos);
                     auto proto = item->second;
-                    auto msg = new c2pool::messages::message_getaddrs(8);
-                    //proto->send(msg);
+                    auto std::vector<c2pool::messages::addr> addrs = {addr};
+                    auto msg = new c2pool::messages::message_addrs(addrs);
+                    proto->send(msg);
                     //TODO: c2pool::random::RandomChoice for map
 
                     //random.choice(self.node.peers.values()).send_addrs(addrs=[addr_record])
@@ -463,10 +464,19 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_getaddrs *msg)
     {
+        if (msg->count > 100)
+            msg->count = 100;
 
+        std::vector<c2pool::messages::addr> addrs;
+        for (auto addr : nodes->p2p_node->get_good_peers(msg->count)){
+            auto addrValue = nodes->p2p_node->addr_store.Get(addr);
+            c2pool::messages::addr temp_msg_addr(addrValue.last_seen, addrValue.service, std::get<0>(addr), c2pool::str::str_to_int(std::get<1>(addr)));
+            addrs.push_back(temp_msg_addr);
+        }
+
+        auto msg = new c2pool::messages::message_addrs(addrs);
+        proto->send(msg);
         /*
-        if count > 100:
-            count = 100
         self.send_addrs(addrs=[
             dict(
                 timestamp=int(self.node.addr_store[host, port][2]),
@@ -478,6 +488,9 @@ namespace c2pool::p2p
             ) for host, port in
             self.node.get_good_peers(count)
         ])
+
+        1) arr = self.node.get_good_peers(count)
+        2) for (auto addr : arr)
         */
     }
 
