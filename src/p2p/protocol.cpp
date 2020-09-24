@@ -1,7 +1,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 #include <boost/asio.hpp>
+#include <boost/bind.hpp>
 #include <deque>
 #include <list>
 #include <memory>
@@ -30,11 +32,10 @@ namespace c2pool::p2p
 {
 
     //Protocol
-    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301)
+    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301), timeout_timer(factory->io_context, boost::posix_time::seconds(10))
     {
         factory = _factory;
         nodes = factory->getNode(); //TODO: изменить на NodeManager
-        //addr;
     }
 
     // //msg.data(), msg.length()
@@ -290,10 +291,70 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_addrs *msg)
     {
+        for (auto _addr : msg->addrs)
+        {
+            nodes->p2p_node->got_addr(_addr);
+            if ((c2pool::random::RandomFloat(0, 1) < 0.8f))
+            {
+                if (nodes->p2p_node->peers.size() > 0)
+                {
+                    int pos = c2pool::random::RandomInt(0, nodes->p2p_node->peers.size());
+                    auto item = nodes->p2p_node->peers.begin();
+                    std::advance(item, pos);
+                    auto proto = item->second;
+
+                    std::vector<c2pool::messages::addr> addrs = {_addr};
+                    auto message = new c2pool::messages::message_addrs(addrs);
+
+                    proto->send(message);
+                    //TODO: c2pool::random::RandomChoice for map
+                }
+            }
+        }
     }
 
     void Protocol::handle(c2pool::messages::message_addrme *msg)
     {
+        if (std::get<0>(addr) == "127.0.0.1")
+        {
+            if (c2pool::random::RandomFloat(0, 1) < 0.8f)
+            {
+                if (nodes->p2p_node->peers.size() > 0)
+                {
+                    int pos = c2pool::random::RandomInt(0, nodes->p2p_node->peers.size());
+                    auto item = nodes->p2p_node->peers.begin();
+                    std::advance(item, pos);
+                    auto proto = item->second;
+
+                    auto message = new c2pool::messages::message_addrme(msg->port);
+
+                    proto->send(message);
+                    //TODO: c2pool::random::RandomChoice for map
+                }
+            }
+        }
+        else
+        {
+            c2pool::messages::addr _addr(c2pool::time::timestamp(), other_services, std::get<0>(addr), msg->port);
+            nodes->p2p_node->got_addr(_addr);
+
+            if (c2pool::random::RandomFloat(0, 1) < 0.8f)
+            {
+                if (nodes->p2p_node->peers.size() > 0)
+                {
+                    int pos = c2pool::random::RandomInt(0, nodes->p2p_node->peers.size());
+                    auto item = nodes->p2p_node->peers.begin();
+                    std::advance(item, pos);
+                    auto proto = item->second;
+
+                    std::vector<c2pool::messages::addr> addrs = {_addr};
+                    auto message = new c2pool::messages::message_addrs(addrs);
+
+                    proto->send(message);
+                    //TODO: c2pool::random::RandomChoice for map
+                }
+            }
+        }
     }
 
     void Protocol::handle(c2pool::messages::message_ping *msg)
@@ -302,6 +363,19 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_getaddrs *msg)
     {
+        if (msg->count > 100)
+            msg->count = 100;
+
+        std::vector<c2pool::messages::addr> addrs;
+        for (auto addr : nodes->p2p_node->get_good_peers(msg->count))
+        {
+            auto addrValue = nodes->p2p_node->addr_store.Get(addr);
+            c2pool::messages::addr temp_msg_addr(addrValue.last_seen, addrValue.service, std::get<0>(addr), c2pool::str::str_to_int(std::get<1>(addr)));
+            addrs.push_back(temp_msg_addr);
+        }
+
+        auto message = new c2pool::messages::message_addrs(addrs);
+        send(message);
     }
 
     void Protocol::handle(c2pool::messages::message_error *msg)
