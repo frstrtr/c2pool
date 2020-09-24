@@ -87,13 +87,13 @@ namespace c2pool::p2p
         return res;
     }
 
-    bool AddrStore::Add(ADDR key, AddrValue value)
+    void AddrStore::Add(ADDR key, AddrValue value)
     {
         if (Check(key))
-            return false;
-        store.insert(std::pair<ADDR, AddrValue>(key, value));
+            store[key] = value;
+        else
+            store.insert(std::pair<ADDR, AddrValue>(key, value));
         SaveToFile();
-        return true;
     }
 
     bool AddrStore::Remove(ADDR key)

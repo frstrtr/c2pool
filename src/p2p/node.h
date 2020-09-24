@@ -19,6 +19,11 @@ namespace c2pool::p2p
     class AddrStore;
 } // namespace c2pool::p2p
 
+namespace c2pool::messages
+{
+    class addr;
+} // namespace c2pool::messages
+
 namespace c2pool::p2p
 {
     class NodesManager
