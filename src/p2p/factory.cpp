@@ -52,9 +52,11 @@ namespace c2pool::p2p
         try
         {
             resolver.async_resolve(ip, port,
-                                   [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
+                                   [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                                        boost::asio::ip::tcp::socket socket(io_context);
+                                       LOG_DEBUG << "TEST_RESOLVE for: " << ip << ":" << port;
                                        auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
+                                       LOG_DEBUG << "TEST_RESOLVE for: " << ip << ":" << port;
                                        protocol_connected(p);
                                    });
         }
@@ -83,7 +85,7 @@ namespace c2pool::p2p
                         attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
                         connect(std::get<0>(addr), std::get<1>(addr));
                     } else {
-                        // LOG_TRACE << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+                        LOG_TRACE << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
                     }
                 }
             }
@@ -91,6 +93,7 @@ namespace c2pool::p2p
             boost::posix_time::milliseconds interval(static_cast<int>(rand * 1000));
             LOG_DEBUG << "[Client::_think()] Expovariate: " << rand;
             _think_timer.expires_at(_think_timer.expires_at() + interval);
+            LOG_DEBUG << " interval" ;
             _think_timer.async_wait(boost::bind(&Client::_think, this, boost::asio::placeholders::error));
         }
         else
