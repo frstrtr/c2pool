@@ -19,6 +19,10 @@ set(c2pool_libs util p2p networks other univalue)
 #BOOST
 # ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
+set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
+#set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic")
+
 #set(BOOST_LOG_DYN_LINK ON)
 set(Boost_USE_STATIC_LIBS ON)
 
@@ -63,6 +67,7 @@ if(WIN32)
 endif()
 
 target_compile_definitions(cpool PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
+target_link_libraries (cpool -static gcc stdc++ winpthread -dynamic)
 target_link_libraries(cpool -Wl,--start-group  ${PROJECT_LIB} -Wl,--end-group)
 # target_link_libraries(cpool ${Boost_LIBRARIES})
 target_link_libraries(cpool Boost::log_setup Boost::log)
