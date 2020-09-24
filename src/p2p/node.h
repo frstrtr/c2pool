@@ -110,9 +110,6 @@ namespace c2pool::p2p
         void lost_conn(std::shared_ptr<Protocol> protocol, boost::exception *reason);
         void _think(const boost::system::error_code &error); //TODO: rename method
 
-        //TODO: void got_addr();
-        //TODO: void get_good_peers();
-
         //В питоне random.randrange возвращает [0, 2^64), что входит в максимальное значение unsigned long long = 2^64-1
         //Ещё варианты типов для nonce: unsigned long double; uint_fast64_t
         unsigned long long nonce;
@@ -122,6 +119,7 @@ namespace c2pool::p2p
         std::map<unsigned long long, std::shared_ptr<c2pool::p2p::Protocol>> peers;
         boost::asio::deadline_timer _think_timer;
         std::vector<ADDR> get_good_peers(int max_count);
+        void got_addr(c2pool::messages::addr addr);
 
     public:
         //TODO: int preffered_storage;
