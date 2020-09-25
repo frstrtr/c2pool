@@ -418,16 +418,12 @@ namespace c2pool::p2p
             {
                 if (nodes->p2p_node->peers.size() > 0)
                 {
-                    int pos = c2pool::random::RandomInt(0, nodes->p2p_node->peers.size());
-                    auto item = nodes->p2p_node->peers.begin();
-                    std::advance(item, pos);
-                    auto proto = item->second;
+                    auto proto = c2pool::random::RandomChoice(nodes->p2p_node->peers);
 
                     std::vector<c2pool::messages::addr> addrs = {_addr};
                     auto message = new c2pool::messages::message_addrs(addrs);
 
                     proto->send(message);
-                    //TODO: c2pool::random::RandomChoice for map
                 }
             }
         }
@@ -441,15 +437,11 @@ namespace c2pool::p2p
             {
                 if (nodes->p2p_node->peers.size() > 0)
                 {
-                    int pos = c2pool::random::RandomInt(0, nodes->p2p_node->peers.size());
-                    auto item = nodes->p2p_node->peers.begin();
-                    std::advance(item, pos);
-                    auto proto = item->second;
+                    auto proto = c2pool::random::RandomChoice(nodes->p2p_node->peers);
 
                     auto message = new c2pool::messages::message_addrme(msg->port);
 
                     proto->send(message);
-                    //TODO: c2pool::random::RandomChoice for map
                 }
             }
         }
@@ -462,16 +454,12 @@ namespace c2pool::p2p
             {
                 if (nodes->p2p_node->peers.size() > 0)
                 {
-                    int pos = c2pool::random::RandomInt(0, nodes->p2p_node->peers.size());
-                    auto item = nodes->p2p_node->peers.begin();
-                    std::advance(item, pos);
-                    auto proto = item->second;
+                    auto proto = c2pool::random::RandomChoice(nodes->p2p_node->peers);;
 
                     std::vector<c2pool::messages::addr> addrs = {_addr};
                     auto message = new c2pool::messages::message_addrs(addrs);
 
                     proto->send(message);
-                    //TODO: c2pool::random::RandomChoice for map
                 }
             }
         }
@@ -490,7 +478,7 @@ namespace c2pool::p2p
         for (auto addr : nodes->p2p_node->get_good_peers(msg->count))
         {
             auto addrValue = nodes->p2p_node->addr_store.Get(addr);
-            DEBUG_LOG << addrValue;
+            //LOG_DEBUG << addrValue;
             c2pool::messages::addr temp_msg_addr(addrValue.last_seen, addrValue.service, std::get<0>(addr), c2pool::str::str_to_int(std::get<1>(addr)));
             addrs.push_back(temp_msg_addr);
         }
