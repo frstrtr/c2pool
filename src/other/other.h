@@ -18,15 +18,13 @@ namespace c2pool::random
     template <typename T>
     T RandomChoice(std::vector<T> &list);
 
-    //TODO: Remake?
-    // template <typename K, typename V, typename Compare = std::less<K>,
-    //           typename Alloc = std::allocator<std::pair<const K, V>>>
-    // V RandomChoice(std::map<K, V, Compare, Alloc> m)
-    // { //TODO: THIS WANNA TEST
-    //     int pos = RandomInt(0, m.size());
-    //     std::iterator item = m.cbegin();
-    //     return std::advance(item, pos);
-    // }
+    template <typename K, typename V>
+    V RandomChoice(std::map<K, V> m)
+    { //TODO: THIS WANNA TEST
+        int pos = RandomInt(0, m.size());
+        std::iterator item = m.cbegin();
+        return std::advance(item, pos);
+    }
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l);

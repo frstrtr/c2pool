@@ -54,7 +54,7 @@ namespace c2pool::messages
             return _prefix_length;
         }
 
-        void set_unpacked_length(char* packed_len = nullptr);
+        void set_unpacked_length(char *packed_len = nullptr);
         const unsigned int unpacked_length();
 
         char *prefix;
@@ -66,6 +66,7 @@ namespace c2pool::messages
     private:
         size_t _prefix_length;
         unsigned int _unpacked_length = 0;
+
     public:
         IMessage() {}
 
@@ -80,11 +81,12 @@ namespace c2pool::messages
         void decode_data();
 
         int get_length();
+
     protected:
         //возвращает длину для упакованного payload msg, которое формируется в c2pool.
-        virtual int pack_payload_length() {return 0;} 
+        virtual int pack_payload_length() { return 0; }
 
-        int set_length(char* data_);
+        int set_length(char *data_);
     };
 
     class message : public IMessage
@@ -105,7 +107,7 @@ namespace c2pool::messages
         void send();
 
         //return all msg with prefix, ready for send
-        std::tuple<char*, int> send_data(const void* _prefix, int _prefix_len);
+        std::tuple<char *, int> send_data(const void *_prefix, int _prefix_len);
 
         void unpack(std::string item);
         void unpack(std::stringstream &ss);
@@ -125,8 +127,10 @@ namespace c2pool::messages
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual std::string _pack() = 0;
+
     protected:
         int pack_payload_length() override;
+
     private:
         char *packed_c_str;
     };
@@ -148,7 +152,6 @@ namespace c2pool::messages
 
         message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, string sub_ver, int _mode, long best_hash) : message("version")
         {
-            std::cout << "Test5" << std::endl;
             version = ver;
             services = serv;
             addr_to = to;
@@ -157,7 +160,14 @@ namespace c2pool::messages
             sub_version = sub_ver;
             mode = _mode;
             best_share_hash = best_hash;
-            std::cout << version << " " << mode << std::endl;
+            std::cout << "version " << version << std::endl;
+            std::cout << "services " << services << std::endl;
+            std::cout << "addr_to " << addr_to << std::endl;
+            std::cout << "addr_from " << addr_from << std::endl;
+            std::cout << "nonce " << nonce << std::endl;
+            std::cout << "sub_version " << sub_version << std::endl;
+            std::cout << "mode " << mode << std::endl;
+            std::cout << "best_share_hash " << best_share_hash << std::endl;
         }
 
         void _unpack(std::stringstream &ss) override;

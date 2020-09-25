@@ -126,7 +126,7 @@ namespace c2pool::p2p
         c2pool::p2p::Factory *factory; //todo: shared_ptr
 
         bool connected = false; //in p2pool -> connected2
-        boost::asio::deadline_timer timeout_timer;//timeout_delayed;
+        //boost::asio::deadline_timer timeout_timer;//timeout_delayed;
 
         c2pool::messages::IMessage *tempMessage;
 

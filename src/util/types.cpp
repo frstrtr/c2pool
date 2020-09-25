@@ -87,8 +87,8 @@ namespace c2pool::messages
 
     addr::addr(int t, int _services, std::string _address, int _port)
     {
-        address_type a = address_type(_services, _address, _port);
-        address = a;
+        address_type a 
+        address = address_type(_services, _address, _port);
         timestamp = t;
     }
 
