@@ -129,6 +129,7 @@ namespace c2pool::p2p
         std::vector<ADDR> result;
         for (auto v : values)
         {
+            std::cout << std::get<0>(v.second) << " " << std::get<1>(v.second) << std::endl;
             result.push_back(v.second);
         }
         return result;

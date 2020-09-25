@@ -61,7 +61,6 @@ namespace c2pool::p2p
                                        LOG_DEBUG << "TEST_RESOLVE for: " << std::get<0>(addr) << ":" << std::get<1>(addr);
                                     //    try
                                     //    {
-                                           LOG_DEBUG << "MDA ti log";
                                            //LOG_DEBUG << io_context.stopped();
                                            auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
                                            LOG_DEBUG << "TEST_RESOLVE for: " << std::get<0>(addr) << ":" << std::get<1>(addr);

@@ -180,7 +180,7 @@ namespace c2pool::p2p
                                         LOG_DEBUG << "payload: " << c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
                                         // LOG_INFO << "read_payload";
                                         //TODO: move tempMesssage -> new message
-                                        //handlePacket(tempMessage);
+                                        handlePacket(tempMessage);
                                         read_prefix();
                                     }
                                     else
@@ -236,10 +236,10 @@ namespace c2pool::p2p
         {
             return c2pool::messages::commands::cmd_version;
         }
-        // if (cmd == "getaddrs")
-        // {
-        //     return c2pool::messages::commands::cmd_getaddrs;
-        // }
+        if (cmd == "getaddrs")
+        {
+            return c2pool::messages::commands::cmd_getaddrs;
+        }
         if (cmd == "addrme")
         {
             return c2pool::messages::commands::cmd_addrme;
@@ -471,6 +471,7 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_getaddrs *msg)
     {
+        LOG_DEBUG << "getaddrs";
         if (msg->count > 100)
             msg->count = 100;
 
