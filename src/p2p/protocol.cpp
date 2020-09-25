@@ -33,7 +33,7 @@ namespace c2pool::p2p
 {
 
     //Protocol
-    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301), timeout_timer(factory->io_context, boost::posix_time::seconds(10))
+    Protocol::Protocol(boost::asio::ip::tcp::socket _socket, c2pool::p2p::Factory *_factory) : socket(std::move(_socket)), version(3301) /*, timeout_timer(factory->io_context) */
     {
         factory = _factory;
         nodes = factory->getNode(); //TODO: изменить на NodeManager
@@ -78,7 +78,7 @@ namespace c2pool::p2p
             best_share_hash=self.node.best_share_hash_func(),
         )*/
 
-        timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
+        //timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
 
         /*
         self.get_shares = deferral.GenericDeferrer(
@@ -180,7 +180,7 @@ namespace c2pool::p2p
                                         LOG_DEBUG << "payload: " << c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
                                         // LOG_INFO << "read_payload";
                                         //TODO: move tempMesssage -> new message
-                                        handlePacket(tempMessage);
+                                        //handlePacket(tempMessage);
                                         read_prefix();
                                     }
                                     else
@@ -236,10 +236,10 @@ namespace c2pool::p2p
         {
             return c2pool::messages::commands::cmd_version;
         }
-        if (cmd == "getaddrs")
-        {
-            return c2pool::messages::commands::cmd_getaddrs;
-        }
+        // if (cmd == "getaddrs")
+        // {
+        //     return c2pool::messages::commands::cmd_getaddrs;
+        // }
         if (cmd == "addrme")
         {
             return c2pool::messages::commands::cmd_addrme;
@@ -262,8 +262,8 @@ namespace c2pool::p2p
 
         //from packetReceived2
         //TODO: TEST FOR ASYNC
-        timeout_timer.expires_from_now(boost::posix_time::seconds(100));
-        timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
+        // timeout_timer.expires_from_now(boost::posix_time::seconds(100));
+        // timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
 
         handle(_msg);
     }
@@ -386,8 +386,8 @@ namespace c2pool::p2p
         connected = true;
 
         //TODO: TEST FOR ASYNC
-        timeout_timer.expires_from_now(boost::posix_time::seconds(100));
-        timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
+        // timeout_timer.expires_from_now(boost::posix_time::seconds(100));
+        // timeout_timer.async_wait(boost::bind(&Protocol::connect_timeout, this, boost::asio::placeholders::error));
 
         factory->protocol_connected(shared_from_this());
 
@@ -490,6 +490,7 @@ namespace c2pool::p2p
         for (auto addr : nodes->p2p_node->get_good_peers(msg->count))
         {
             auto addrValue = nodes->p2p_node->addr_store.Get(addr);
+            DEBUG_LOG << addrValue;
             c2pool::messages::addr temp_msg_addr(addrValue.last_seen, addrValue.service, std::get<0>(addr), c2pool::str::str_to_int(std::get<1>(addr)));
             addrs.push_back(temp_msg_addr);
         }
