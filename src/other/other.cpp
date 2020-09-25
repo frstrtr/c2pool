@@ -7,6 +7,9 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <map>
+#include <memory>
+#include <iterator>
 
 namespace c2pool::random
 {
@@ -38,14 +41,6 @@ namespace c2pool::random
         int pos = RandomInt(0, list.size());
         return list[pos];
     }
-
-    // template <typename K, typename V, typename Compare = std::less<K>,
-    //     typename Alloc = std::allocator<std::pair<const K, V> > >
-    // V RandomChoice(std::map<K, V, Compare, Alloc> map)
-    // { //TODO: THIS WANNA TEST
-    //     int pos = RandomInt(0, map.size());
-    //     return std::advance(map.begin(), pos);
-    // }
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l)

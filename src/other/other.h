@@ -19,11 +19,12 @@ namespace c2pool::random
     T RandomChoice(std::vector<T> &list);
 
     template <typename K, typename V>
-    V RandomChoice(std::map<K, V> m)
-    { //TODO: THIS WANNA TEST
-        int pos = RandomInt(0, m.size());
-        std::iterator item = m.cbegin();
-        return std::advance(item, pos);
+    V RandomChoice(std::map<K, V>& dict)
+    {
+        int pos = RandomInt(0, dict.size());
+        auto item = dict.begin();
+        std::advance(item, pos);
+        return item->second;
     }
 
     ///l = 1.0/<среднее желаемое число>
