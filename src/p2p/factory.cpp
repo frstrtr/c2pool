@@ -58,12 +58,11 @@ namespace c2pool::p2p
                                    [this, addr](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                                        attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
                                        boost::asio::ip::tcp::socket socket(io_context);
-                                       LOG_DEBUG << "TEST_RESOLVE for: " << std::get<0>(addr) << ":" << std::get<1>(addr);
                                     //    try
                                     //    {
                                            //LOG_DEBUG << io_context.stopped();
                                            auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
-                                           LOG_DEBUG << "TEST_RESOLVE for: " << std::get<0>(addr) << ":" << std::get<1>(addr);
+                                        //    LOG_DEBUG << "TEST_RESOLVE for: " << std::get<0>(addr) << ":" << std::get<1>(addr);
                                            protocol_connected(p);
                                     //    }
                                     //    catch (const boost::exception &ex)

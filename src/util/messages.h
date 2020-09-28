@@ -160,14 +160,14 @@ namespace c2pool::messages
             sub_version = sub_ver;
             mode = _mode;
             best_share_hash = best_hash;
-            std::cout << "version " << version << std::endl;
-            std::cout << "services " << services << std::endl;
-            std::cout << "addr_to " << addr_to << std::endl;
-            std::cout << "addr_from " << addr_from << std::endl;
-            std::cout << "nonce " << nonce << std::endl;
-            std::cout << "sub_version " << sub_version << std::endl;
-            std::cout << "mode " << mode << std::endl;
-            std::cout << "best_share_hash " << best_share_hash << std::endl;
+            // std::cout << "version " << version << std::endl;
+            // std::cout << "services " << services << std::endl;
+            // std::cout << "addr_to " << addr_to << std::endl;
+            // std::cout << "addr_from " << addr_from << std::endl;
+            // std::cout << "nonce " << nonce << std::endl;
+            // std::cout << "sub_version " << sub_version << std::endl;
+            // std::cout << "mode " << mode << std::endl;
+            // std::cout << "best_share_hash " << best_share_hash << std::endl;
         }
 
         void _unpack(std::stringstream &ss) override;
@@ -269,7 +269,7 @@ namespace c2pool::messages
 
         message_addrs() : message("addrs") {}
 
-        message_addrs(std::shared_ptr<packageMessageData> msg_package) : message("addr", msg_package) {}
+        message_addrs(std::shared_ptr<packageMessageData> msg_package) : message("addrs", msg_package) {}
 
         message_addrs(vector<c2pool::messages::addr> _addrs) : message("addrs")
         {

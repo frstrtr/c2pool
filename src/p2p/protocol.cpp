@@ -206,6 +206,7 @@ namespace c2pool::p2p
         // LOG_DEBUG << "just prefix: " << c2pool::messages::python::other::debug_log(pref, nodes->p2p_node->net()->PREFIX_LENGTH);
 
         auto msg_data = msg->send_data(nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH);
+        
         boost::asio::async_write(socket,
                                  boost::asio::buffer(std::get<0>(msg_data), std::get<1>(msg_data)),
                                  [this, msg_data](boost::system::error_code ec, std::size_t /*length*/) {
@@ -227,28 +228,28 @@ namespace c2pool::p2p
         ss << _cmd;
         std::string cmd;
         ss >> cmd;
-        LOG_TRACE << "PARSED COMMAND" << cmd;
+        LOG_DEBUG << "getCommand: " << cmd;
 
-        // if (cmd == "addrs")
-        // {
-        //     return c2pool::messages::commands::cmd_addrs;
-        // }
+        if (cmd == "addrs")
+        {
+            return c2pool::messages::commands::cmd_addrs;
+        }
         if (cmd == "version")
         {
             return c2pool::messages::commands::cmd_version;
         }
-        // if (cmd == "getaddrs")
-        // {
-        //     return c2pool::messages::commands::cmd_getaddrs;
-        // }
-        // if (cmd == "addrme")
-        // {
-        //     return c2pool::messages::commands::cmd_addrme;
-        // }
-        // if (cmd == "ping")
-        // {
-        //     return c2pool::messages::commands::cmd_ping;
-        // }
+        if (cmd == "getaddrs")
+        {
+            return c2pool::messages::commands::cmd_getaddrs;
+        }
+        if (cmd == "addrme")
+        {
+            return c2pool::messages::commands::cmd_addrme;
+        }
+        if (cmd == "ping")
+        {
+            return c2pool::messages::commands::cmd_ping;
+        }
 
         return c2pool::messages::commands::cmd_error;
     }
@@ -296,7 +297,8 @@ namespace c2pool::p2p
             handle(GenerateMsg<c2pool::messages::message_getaddrs>(ss));
             break;
         default:
-            handle(GenerateMsg<c2pool::messages::message_error>(ss));
+            LOG_ERROR << "MESSAGE_ERROR"; //remake
+            //handle(GenerateMsg<c2pool::messages::message_error>(ss));
             break;
         }
     }
@@ -334,7 +336,8 @@ namespace c2pool::p2p
             handle(GenerateMsg<c2pool::messages::message_getaddrs>(_msg));
             break;
         default:
-            handle(GenerateMsg<c2pool::messages::message_error>(_msg));
+            LOG_ERROR << "MESSAGE_ERROR"; //remake
+            //handle(GenerateMsg<c2pool::messages::message_error>(_msg));
             break;
         }
     }
@@ -343,10 +346,8 @@ namespace c2pool::p2p
     template <typename MsgType>
     MsgType *Protocol::GenerateMsg(std::shared_ptr<c2pool::messages::packageMessageData> _msg)
     {
-        MsgType *msg = static_cast<MsgType *>(_msg);
-        LOG_DEBUG << "TEST1s";
+        MsgType *msg = new MsgType(_msg); //TODO: make_shared
         msg->receive();
-        LOG_DEBUG << "TEST2s";
         return msg;
     }
 
@@ -462,7 +463,8 @@ namespace c2pool::p2p
             {
                 if (nodes->p2p_node->peers.size() > 0)
                 {
-                    auto proto = c2pool::random::RandomChoice(nodes->p2p_node->peers);;
+                    auto proto = c2pool::random::RandomChoice(nodes->p2p_node->peers);
+                    ;
 
                     std::vector<c2pool::messages::addr> addrs = {_addr};
                     auto message = new c2pool::messages::message_addrs(addrs);

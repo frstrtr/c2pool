@@ -446,9 +446,9 @@ namespace c2pool::messages::python
 
     char *pymessage::send(c2pool::messages::message *msg)
     {
-        //std::cout << "SEND_PACK_C_STR: " << msg->command << ", " << msg->pack_c_str() << std::endl;
+        // std::cout << "SEND_PACK_C_STR: " << msg->packageData->command << ", " << msg->pack_c_str() << std::endl;
 
-        return send(msg->command, msg->pack_c_str());
+        return send(msg->packageData->command, msg->pack_c_str());
     }
 
     int pymessage::payload_length(char *command, char *payload2)
@@ -522,7 +522,7 @@ namespace c2pool::messages::python
 
     int pymessage::payload_length(c2pool::messages::message *msg)
     {
-        return payload_length(msg->command, msg->pack_c_str());
+        return payload_length(msg->packageData->command, msg->pack_c_str());
     }
 } // namespace c2pool::messages::python
 
