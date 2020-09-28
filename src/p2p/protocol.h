@@ -58,7 +58,7 @@ namespace c2pool::p2p
         virtual void handle(std::stringstream ss);
 
         //handle for msg from p2pool
-        virtual void handle(c2pool::messages::IMessage *_msg);
+        virtual void handle(std::shared_ptr<c2pool::messages::packageMessageData> _msg);
 
         unsigned long long nonce() const
         {
@@ -84,7 +84,7 @@ namespace c2pool::p2p
         c2pool::messages::commands getCommand(char *cmd);
 
         //py: packetReceived(self, command, payload2):
-        void handlePacket(c2pool::messages::IMessage *_msg);
+        void handlePacket(std::shared_ptr<c2pool::messages::packageMessageData> _msg);
 
         //GenerateMsg for msg from c2pool
         template <class MsgType>
@@ -92,7 +92,7 @@ namespace c2pool::p2p
 
         //GenerateMsg for msg from p2pool
         template <class MsgType>
-        MsgType *GenerateMsg(c2pool::messages::IMessage *_msg);
+        MsgType *GenerateMsg(std::shared_ptr<c2pool::messages::packageMessageData> _msg);
 
         virtual void handle(c2pool::messages::message_version *msg);
 
@@ -128,7 +128,7 @@ namespace c2pool::p2p
         bool connected = false; //in p2pool -> connected2
         //boost::asio::deadline_timer timeout_timer;//timeout_delayed;
 
-        c2pool::messages::IMessage *tempMessage;
+        std::shared_ptr<c2pool::messages::packageMessageData> tempMessage;
 
     private:
         void connect_timeout(const boost::system::error_code &error);

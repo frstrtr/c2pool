@@ -7,6 +7,7 @@
 #include "types.h"
 #include "pack.h"
 #include <tuple>
+#include <memory>
 
 //TODO: remove trash comments
 
@@ -28,7 +29,7 @@ namespace c2pool::messages
         cmd_addrme
     };
 
-    class IMessage
+    class packageMessageData
     {
     public:
         //TODO: enum -> macros in config file
@@ -68,9 +69,9 @@ namespace c2pool::messages
         unsigned int _unpacked_length = 0;
 
     public:
-        IMessage() {}
+        packageMessageData() {}
 
-        IMessage(const char *current_prefix);
+        packageMessageData(const char *current_prefix);
 
         void set_data(char *data_);
 
@@ -82,26 +83,28 @@ namespace c2pool::messages
 
         int get_length();
 
-    protected:
-        //возвращает длину для упакованного payload msg, которое формируется в c2pool.
-        virtual int pack_payload_length() { return 0; }
+        // protected:
+        //     //возвращает длину для упакованного payload msg, которое формируется в c2pool.
+        //     virtual int pack_payload_length() { return 0; }
 
         int set_length(char *data_);
     };
 
-    class message : public IMessage
+    class message
     {
     public:
         message(const char *_cmd);
+
+        message(const char *_cmd, std::shared_ptr<packageMessageData> _packageData);
 
         ~message()
         {
             delete packed_c_str;
         }
 
-        //receive message data from IMessage::command, IMessage::checksum, IMessage::payload, IMessage::unpacked_length;
+        //receive message data from packageMessageData::command, packageMessageData::checksum, packageMessageData::payload, packageMessageData::unpacked_length;
         void receive();
-        //receive message data from IMessage::data; use _set_data for init IMessage::data.
+        //receive message data from packageMessageData::data; use _set_data for init packageMessageData::data.
         void receive_from_data(char *_set_data);
         //
         void send();
@@ -115,21 +118,14 @@ namespace c2pool::messages
 
         char *pack_c_str();
 
-        // char *data() override
-        // {
-        //     //TODO:
-        // }
-
-        // std::size_t length() override
-        // {
-        //     //TODO:
-        // }
-
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual std::string _pack() = 0;
 
+        std::shared_ptr<packageMessageData> packageData;
+
     protected:
-        int pack_payload_length() override;
+        //возвращает длину для упакованного payload msg, которое формируется в c2pool.
+        int pack_payload_length() /*override*/;
 
     private:
         char *packed_c_str;
@@ -143,12 +139,16 @@ namespace c2pool::messages
         std::string _pack() override; //TODO
 
         message_error() : message("error") {}
+
+        message_error(std::shared_ptr<packageMessageData> msg_package) : message("error", msg_package) {}
     };
 
     class message_version : public message
     {
     public:
         message_version() : message("version") {}
+
+        message_version(std::shared_ptr<packageMessageData> msg_package) : message("version", msg_package) {}
 
         message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, string sub_ver, int _mode, long best_hash) : message("version")
         {
@@ -198,6 +198,9 @@ namespace c2pool::messages
     {
     public:
         message_ping() : message("ping") {}
+
+        message_ping(std::shared_ptr<packageMessageData> msg_package) : message("ping", msg_package) {}
+
         // message_ping(const std::string cmd = "ping") : message(cmd) {}
 
         void _unpack(std::stringstream &ss) override;
@@ -212,6 +215,9 @@ namespace c2pool::messages
     {
     public:
         message_addrme() : message("addrme") {}
+
+        message_addrme(std::shared_ptr<packageMessageData> msg_package) : message("addrme", msg_package) {}
+
         // message_addrme(int _port, const string cmd = "addrme") : message(cmd)
         // {
         //     port = _port;
@@ -235,6 +241,8 @@ namespace c2pool::messages
     {
     public:
         message_getaddrs() : message("getaddrs") {}
+
+        message_getaddrs(std::shared_ptr<packageMessageData> msg_package) : message("getaddrs", msg_package) {}
         // message_getaddrs(int cnt, const string cmd = "getaddr") : message(cmd)
         // {
         //     count = cnt;
@@ -260,6 +268,8 @@ namespace c2pool::messages
         vector<c2pool::messages::addr> addrs;
 
         message_addrs() : message("addrs") {}
+
+        message_addrs(std::shared_ptr<packageMessageData> msg_package) : message("addr", msg_package) {}
 
         message_addrs(vector<c2pool::messages::addr> _addrs) : message("addrs")
         {

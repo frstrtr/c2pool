@@ -5,6 +5,7 @@
 #include "types.h"
 #include "other.h"
 #include <sstream>
+#include <memory>
 
 //____ remove
 #include <boost/asio.hpp>
@@ -13,11 +14,11 @@
 
 using namespace std;
 
-TEST(TestMessages, IMessage)
+TEST(TestMessages, packageMessageData)
 {
     const char test_prefix[4] = {0x1, 0x2, 0x3, 0x4};
     const char test_prefix2[4] = {0x1, 0x2, 0x3, 0x4};
-    c2pool::messages::IMessage* msg = new c2pool::messages::IMessage(test_prefix2);
+    std::shared_ptr<c2pool::messages::packageMessageData> msg = std::make_shared<c2pool::messages::packageMessageData>(test_prefix2);
     ASSERT_EQ(*msg->prefix, *test_prefix);
 }
 
@@ -32,11 +33,11 @@ TEST(TestMessages, message_version)
     //expected data for firstMsg->send()
     char *expectedData = c2pool::str::from_bytes_to_strChar("118 101 114 115 105 111 110 0 0 0 0 0 111 0 0 0 243 159 131 228 1 0 0 0 2 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 4 5 6 7 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14 254 224 61 15 101 130 254 13 2 49 54 17 0 0 0 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0");
 
-    ASSERT_EQ(*firstMsg->data, *expectedData);
+    ASSERT_EQ(*firstMsg->packageData->data, *expectedData);
 
     //RECEIVE
     c2pool::messages::message_version *secondMsg = new c2pool::messages::message_version();
-    secondMsg->receive_from_data(firstMsg->data);
+    secondMsg->receive_from_data(firstMsg->packageData->data);
 
     // std::cout << "version " << secondMsg->version << std::endl;
     // std::cout << "services " << secondMsg->services << std::endl;
@@ -65,11 +66,11 @@ TEST(TestMessages, message_addrme)
     //expected data for firstMsg->send() // todo check DATA
     char *expectedData = c2pool::str::from_bytes_to_strChar("97 100 100 114 109 101 0 0 0 0 0 0 2 0 0 0 78 23 246 193 80 0");
 
-    ASSERT_EQ(*firstMsg->data, *expectedData);
+    ASSERT_EQ(*firstMsg->packageData->data, *expectedData);
 
     //RECEIVE
     c2pool::messages::message_addrme *secondMsg = new c2pool::messages::message_addrme();
-    secondMsg->receive_from_data(firstMsg->data); //todo
+    secondMsg->receive_from_data(firstMsg->packageData->data); //todo
 
     // std::cout << "port " << secondMsg->port << std::endl;
 
@@ -84,11 +85,11 @@ TEST(TestMessages, message_getaddrs)
     //expected data for firstMsg->send() // todo check DATA
     char *expectedData = c2pool::str::from_bytes_to_strChar("103 101 116 97 100 100 114 115 0 0 0 0 4 0 0 0 153 83 5 29 3 0 0 0");
 
-    ASSERT_EQ(*firstMsg->data, *expectedData);
+    ASSERT_EQ(*firstMsg->packageData->data, *expectedData);
 
     //RECEIVE
     c2pool::messages::message_getaddrs *secondMsg = new c2pool::messages::message_getaddrs();
-    secondMsg->receive_from_data(firstMsg->data); //todo
+    secondMsg->receive_from_data(firstMsg->packageData->data); //todo
 
     // std::cout << "count " << secondMsg->count << std::endl;
 
@@ -109,10 +110,10 @@ TEST(TestMessages, message_addrs)
     char *expectedData = c2pool::str::from_bytes_to_strChar("97 100 100 114 115 0 0 0 0 0 0 0 69 0 0 0 19 146 117 0 2 1 0 0 0 0 0 0 0 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 3 4 5 6 0 7 8 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 10 11 12 13 0 14");
 
 
-    ASSERT_EQ(*firstMsg->data, *expectedData);
+    ASSERT_EQ(*firstMsg->packageData->data, *expectedData);
     //RECEIVE
     c2pool::messages::message_addrs *secondMsg = new c2pool::messages::message_addrs();
-    secondMsg->receive_from_data(firstMsg->data); //todo
+    secondMsg->receive_from_data(firstMsg->packageData->data); //todo
     ASSERT_EQ(firstMsg->addrs.size(), secondMsg->addrs.size());
     
     for (int i = 0; i < firstMsg->addrs.size(); i++)
