@@ -13,9 +13,9 @@ using namespace c2pool::messages;
 
 namespace c2pool::messages
 {
-    //IMessage
+    //MessageData
 
-    IMessage::IMessage(const char *current_prefix)
+    packageMessageData::packageMessageData(const char *current_prefix)
     {
         if (sizeof(current_prefix) > 0)
         {
@@ -30,13 +30,13 @@ namespace c2pool::messages
         memcpy(prefix, current_prefix, prefix_length());
     }
 
-    void IMessage::set_data(char *data_)
+    void packageMessageData::set_data(char *data_)
     {
         memcpy(data, data_, set_length(data_));
         //strcpy(data, data_);
     }
 
-    void IMessage::encode_data()
+    void packageMessageData::encode_data()
     {
         c2pool::str::substr(command, data, 0, command_length);
         if (_unpacked_length == 0)
@@ -48,12 +48,12 @@ namespace c2pool::messages
         c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, _unpacked_length);
     }
 
-    void IMessage::decode_data()
+    void packageMessageData::decode_data()
     {
         sprintf(data, "%s%s%s%s", command, length, checksum, payload); //TODO: NOT WORKED!
     }
 
-    void IMessage::set_unpacked_length(char *packed_len)
+    void packageMessageData::set_unpacked_length(char *packed_len)
     {
         if (packed_len != nullptr)
         {
@@ -65,12 +65,12 @@ namespace c2pool::messages
         }
     }
 
-    const unsigned int IMessage::unpacked_length()
+    const unsigned int packageMessageData::unpacked_length()
     {
         return _unpacked_length;
     }
 
-    int IMessage::set_length(char *data_)
+    int packageMessageData::set_length(char *data_)
     {
         if (data_ != nullptr)
         {
@@ -81,7 +81,7 @@ namespace c2pool::messages
         return get_length();
     }
 
-    int IMessage::get_length()
+    int packageMessageData::get_length()
     {
         return command_length + payload_length + checksum_length + unpacked_length();
     }
@@ -90,12 +90,18 @@ namespace c2pool::messages
 
     message::message(const char *_cmd)
     {
-        strcpy(command, _cmd);
+        packageData = std::make_shared<packageMessageData>();
+        strcpy(packageData->command, _cmd);
+    }
+
+    message::message(const char *_cmd, std::shared_ptr<packageMessageData> _packageData){
+        packageData = _packageData;
+        strcpy(packageData->command, _cmd);
     }
 
     void message::receive()
     {
-        std::stringstream ss = c2pool::messages::python::pymessage::receive(command, checksum, payload, unpacked_length());
+        std::stringstream ss = c2pool::messages::python::pymessage::receive(packageData->command, packageData->checksum, packageData->payload, packageData->unpacked_length());
         unpack(ss);
     }
 
@@ -103,29 +109,30 @@ namespace c2pool::messages
     {
         if (_set_data != nullptr)
         {
-            set_data(_set_data);
+            packageData->set_data(_set_data);
         }
-        encode_data();
+        packageData->encode_data();
         receive();
     }
 
     void message::send()
     {
-        set_data(c2pool::messages::python::pymessage::send(this));
+        packageData = std::make_shared<packageMessageData>();
+        packageData->set_data(c2pool::messages::python::pymessage::send(this));
     }
 
     std::tuple<char *, int> message::send_data(const void *_prefix, int _prefix_len)
     {
         send();
 
-        char *full_data = new char[_prefix_len + get_length()+1]; //TODO: delete full_data
+        char *full_data = new char[_prefix_len + packageData->get_length()+1]; //TODO: delete full_data
 
         memcpy(full_data, _prefix, _prefix_len);
-        memcpy(full_data+_prefix_len, data, get_length());
+        memcpy(full_data+_prefix_len, packageData->data, packageData->get_length());
 
         //std::cout << "pref_len = " << _prefix_len << ", data len = " << get_length() << ", full len = " << _prefix_len + get_length() << std::endl;
 
-        return std::make_tuple(full_data, _prefix_len + get_length());
+        return std::make_tuple(full_data, _prefix_len + packageData->get_length());
     }
 
     void message::unpack(std::string item)
@@ -156,7 +163,7 @@ namespace c2pool::messages
 
     int message::pack_payload_length()
     {
-        return c2pool::messages::python::pymessage::payload_length(command, pack_c_str());
+        return c2pool::messages::python::pymessage::payload_length(packageData->command, pack_c_str());
     }
 
     //message_error
@@ -175,6 +182,9 @@ namespace c2pool::messages
 
     void message_version::_unpack(std::stringstream &ss)
     {
+        LOG_DEBUG << "TEST_UNPACKs";
+        std::string temp;
+        while(ss >> temp) LOG_DEBUG << temp;
         ss >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
     }
 

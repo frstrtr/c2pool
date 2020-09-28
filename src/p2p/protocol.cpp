@@ -91,7 +91,7 @@ namespace c2pool::p2p
 
     void Protocol::read_prefix()
     {
-        tempMessage = new c2pool::messages::IMessage(/*TODO: net.PREFIX*/);
+        tempMessage = std::make_shared<c2pool::messages::packageMessageData>(/*TODO: net.PREFIX*/);
         tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
         //char* temp;
 
@@ -227,32 +227,33 @@ namespace c2pool::p2p
         ss << _cmd;
         std::string cmd;
         ss >> cmd;
+        LOG_TRACE << "PARSED COMMAND" << cmd;
 
-        if (cmd == "addrs")
-        {
-            return c2pool::messages::commands::cmd_addrs;
-        }
+        // if (cmd == "addrs")
+        // {
+        //     return c2pool::messages::commands::cmd_addrs;
+        // }
         if (cmd == "version")
         {
             return c2pool::messages::commands::cmd_version;
         }
-        if (cmd == "getaddrs")
-        {
-            return c2pool::messages::commands::cmd_getaddrs;
-        }
-        if (cmd == "addrme")
-        {
-            return c2pool::messages::commands::cmd_addrme;
-        }
-        if (cmd == "ping")
-        {
-            return c2pool::messages::commands::cmd_ping;
-        }
+        // if (cmd == "getaddrs")
+        // {
+        //     return c2pool::messages::commands::cmd_getaddrs;
+        // }
+        // if (cmd == "addrme")
+        // {
+        //     return c2pool::messages::commands::cmd_addrme;
+        // }
+        // if (cmd == "ping")
+        // {
+        //     return c2pool::messages::commands::cmd_ping;
+        // }
 
         return c2pool::messages::commands::cmd_error;
     }
 
-    void Protocol::handlePacket(c2pool::messages::IMessage *_msg)
+    void Protocol::handlePacket(std::shared_ptr<c2pool::messages::packageMessageData> _msg)
     {
         if (!(c2pool::str::compare_str(_msg->command, "version", 7)) && !connected)
         {
@@ -300,6 +301,7 @@ namespace c2pool::p2p
         }
     }
 
+    //TODO: OLD, want to remake!
     //GenerateMsg for msg from c2pool
     template <class MsgType>
     MsgType *Protocol::GenerateMsg(std::stringstream &ss)
@@ -310,7 +312,7 @@ namespace c2pool::p2p
     }
 
     //handle for msg from p2pool
-    void Protocol::handle(c2pool::messages::IMessage *_msg)
+    void Protocol::handle(std::shared_ptr<c2pool::messages::packageMessageData> _msg)
     {
         c2pool::messages::commands cmd = getCommand(_msg->command);
 
@@ -338,10 +340,13 @@ namespace c2pool::p2p
     }
 
     //GenerateMsg for msg from p2pool
-    template <class MsgType>
-    MsgType *Protocol::GenerateMsg(c2pool::messages::IMessage *_msg)
+    template <typename MsgType>
+    MsgType *Protocol::GenerateMsg(std::shared_ptr<c2pool::messages::packageMessageData> _msg)
     {
         MsgType *msg = static_cast<MsgType *>(_msg);
+        LOG_DEBUG << "TEST1s";
+        msg->receive();
+        LOG_DEBUG << "TEST2s";
         return msg;
     }
 
@@ -431,6 +436,9 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_addrme *msg)
     {
+
+        LOG_DEBUG << msg->port;
+
         if (std::get<0>(addr) == "127.0.0.1")
         {
             if (c2pool::random::RandomFloat(0, 1) < 0.8f)
