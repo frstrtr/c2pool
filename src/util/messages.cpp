@@ -117,7 +117,6 @@ namespace c2pool::messages
 
     void message::send()
     {
-        packageData = std::make_shared<packageMessageData>();
         packageData->set_data(c2pool::messages::python::pymessage::send(this));
     }
 
@@ -129,8 +128,7 @@ namespace c2pool::messages
 
         memcpy(full_data, _prefix, _prefix_len);
         memcpy(full_data+_prefix_len, packageData->data, packageData->get_length());
-
-        //std::cout << "pref_len = " << _prefix_len << ", data len = " << get_length() << ", full len = " << _prefix_len + get_length() << std::endl;
+        // std::cout << "pref_len = " << _prefix_len << ", data len = " << packageData->get_length() << ", full len = " << _prefix_len + packageData->get_length() << std::endl;
 
         return std::make_tuple(full_data, _prefix_len + packageData->get_length());
     }
@@ -182,9 +180,6 @@ namespace c2pool::messages
 
     void message_version::_unpack(std::stringstream &ss)
     {
-        LOG_DEBUG << "TEST_UNPACKs";
-        std::string temp;
-        while(ss >> temp) LOG_DEBUG << temp;
         ss >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
     }
 
