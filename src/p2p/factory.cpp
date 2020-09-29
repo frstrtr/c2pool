@@ -56,21 +56,28 @@ namespace c2pool::p2p
             auto addr = std::make_tuple(ip, port);
             resolver.async_resolve(ip, port,
                                    [this, addr](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
-                                       attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
-                                       boost::asio::ip::tcp::socket socket(io_context);
-                                    //    try
-                                    //    {
+                                       if (!er)
+                                       {
+                                           attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
+                                           boost::asio::ip::tcp::socket socket(io_context);
+                                           //    try
+                                           //    {
                                            //LOG_DEBUG << io_context.stopped();
                                            auto p = std::make_shared<ClientProtocol>(std::move(socket), this, endpoints); //TODO: shared and unique
                                         //    LOG_DEBUG << "TEST_RESOLVE for: " << std::get<0>(addr) << ":" << std::get<1>(addr);
                                            protocol_connected(p);
-                                    //    }
-                                    //    catch (const boost::exception &ex)
-                                    //    {
-                                    //        // error handling
-                                    //        std::string info = boost::diagnostic_information(ex);
-                                    //        LOG_DEBUG << info; // some logging function you have
-                                    //    }
+                                           //    }
+                                           //    catch (const boost::exception &ex)
+                                           //    {
+                                           //        // error handling
+                                           //        std::string info = boost::diagnostic_information(ex);
+                                           //        LOG_DEBUG << info; // some logging function you have
+                                           //    }
+                                       }
+                                       else
+                                       {
+                                           LOG_ERROR << "Client::connect: " << er << " " << er.message();
+                                       }
                                    });
         }
         catch (const std::exception &e)

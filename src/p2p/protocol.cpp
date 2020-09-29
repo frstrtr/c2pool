@@ -541,9 +541,9 @@ namespace c2pool::p2p
     void ClientProtocol::do_connect(const boost::asio::ip::tcp::resolver::results_type endpoints)
     {
         boost::asio::async_connect(socket, endpoints, [this](boost::system::error_code ec, tcp::endpoint) {
-            connectionMade();
             if (!ec)
             {
+                connectionMade();
                 // c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
                 // c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
                 // c2pool::messages::message* firstMsg = new c2pool::messages::message_version(version, 0, addrs1, addrs2, nodes->p2p_node->nonce, "16", 1, 18);
@@ -552,7 +552,8 @@ namespace c2pool::p2p
             }
             else
             {
-                LOG_ERROR << ec;
+                LOG_ERROR << "do_connect: " << ec.message();
+                disconnect();
             }
         });
     }
