@@ -12,9 +12,10 @@ set(P2P src/p2p)
 set(NETWORKS src/networks)
 set(OTHER src/other)
 set(UNIVALUE src/univalue)
+set(BTCLIBS src/btclibs)
 #set(CRYPTO src/crypto)  #todo
-set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE})
-set(c2pool_libs util p2p networks other univalue)
+set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE} ${BTCLIBS})
+set(c2pool_libs util p2p networks other univalue btclibs)
 
 #BOOST
 # ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
