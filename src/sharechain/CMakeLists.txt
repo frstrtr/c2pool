@@ -1,12 +1,9 @@
 project(sharechain)
 
-# include_directories(../other)
-# include_directories(../networks)
-# include_directories(../util)
-# include_directories(../univalue)
+include_directories(../btclibs)
 
-set(HEADER_FILES share.h sharechain.h shareTypes.h)
-set(SOURCE_FILES share.cpp sharechain.cpp shareTypes.cpp)
+set(HEADER_FILES share.h sharechain.h shareStore.h shareTypes.h)
+set(SOURCE_FILES share.cpp sharechain.cpp shareStore.cpp shareTypes.cpp)
 
-add_library(p2p STATIC ${SOURCE_FILES} ${HEADER_FILES})
-# target_link_libraries(p2p other networks util univalue)
+add_library(sharechain STATIC ${SOURCE_FILES} ${HEADER_FILES})
+target_link_libraries(sharechain btclibs)
