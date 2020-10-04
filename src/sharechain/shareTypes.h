@@ -1,5 +1,19 @@
 #include <string>
 #include <vector>
+#include <uint256.h>
+
+//TODO: MerkleLink.index -> IntType(0)?????
+//TODO: HashLinkType.extra_data ->  FixedStrType(0) ?????
+
+
+
+//VarIntType = unsigned long long
+//IntType(256) = uint256
+//IntType(160) = uint160
+//IntType(64) = unsigned long long
+//IntType(32) = unsigned int
+//IntType(16) = unsigned short
+//PossiblyNoneType(0, IntType(256)) — Переменная, у которой 0 и None/nullptr — одно и то же.
 
 namespace c2pool::shares
 {
@@ -14,7 +28,7 @@ namespace c2pool::shares
     {
         std::string state;      //TODO: pack.FixedStrType(32)
         std::string extra_data; //TODO: pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
-        int length;             //TODO: pack.VarIntType()
+        unsigned long long length;             //pack.VarIntType()
     };
 
     class MerkleLink
@@ -26,26 +40,24 @@ namespace c2pool::shares
     class SmallBlockHeaderType
     {
     public:
-        int version; // + ('version', pack.VarIntType()),
-        //TODO: type ???
-        long long previousBlock; // ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
-        int timeStamp;           // + ('timestamp', pack.IntType(32)),
-        //TODO: type ???
-        long long bits;  // ('bits', bitcoin_data.FloatingIntegerType()),
-        long long nonce; // ('nonce', pack.IntType(32)),
+        unsigned long long version; // + ('version', pack.VarIntType()),
+        uint256 previousBlock; // TODO: none — ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
+        unsigned int timeStamp;           // ('timestamp', pack.IntType(32)),
+        unsigned int bits;  // ('bits', bitcoin_data.FloatingIntegerType()),
+        unsigned int nonce; // ('nonce', pack.IntType(32)),
     };
 
     class ShareData
     {
     public:
-        long long previous_share_hash; //TODO: pack.PossiblyNoneType(0, pack.IntType(256))
+        uint256 previous_share_hash; //TODO: none — pack.PossiblyNoneType(0, pack.IntType(256))
         std::string coinbase;
-        long long nonce;       //TODO: pack.IntType(32)
-        long long pubkey_hash; //TODO: pack.IntType(160)
-        long long subsidy;     //TODO: pack.IntType(64)
-        long long donation;    //TODO: pack.IntType(16)
+        unsigned int nonce;       //pack.IntType(32)
+        uint160 pubkey_hash; //pack.IntType(160)
+        unsigned long long subsidy;     //pack.IntType(64)
+        unsigned short donation;    //pack.IntType(16)
         StaleInfo stale_info;
-        int desired_version; //TODO: pack.VarIntType()
+        unsigned long long desired_version; //pack.VarIntType()
     };
 
     class SegwitData
@@ -53,7 +65,7 @@ namespace c2pool::shares
         //SEGWIT DATA, 94 data.py
     public:
         MerkleLink *txid_merkle_link;
-        long long wtxid_merkle_root; //TODO: pack.IntType(256)
+        uint256 wtxid_merkle_root; //pack.IntType(256)
 
         //InitPossiblyNoneType
         SegwitData()
@@ -68,14 +80,14 @@ namespace c2pool::shares
         ShareData *share_data;
         SegwitData *segwit_data;
 
-        std::vector<long long> new_transaction_hashes; //TODO: pack.ListType(pack.IntType(256))
+        std::vector<uint256> new_transaction_hashes; //pack.ListType(pack.IntType(256))
         //TODO: std::vector<???> transaction_hash_refs; //TODO: pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        long long far_share_hash; //TODO: pack.PossiblyNoneType(0, pack.IntType(256))
-        //TODO: bitcoin_data.FloatingIntegerType() max_bits;
-        //TODO: bitcoin_data.FloatingIntegerType() bits;
-        long long timestamp; //TODO: pack.IntType(32)
-        long long absheigth; //TODO: pack.IntType(32)
-        long long abswork;   //TODO: pack.IntType(128)
+        uint256 far_share_hash; //TODO: none — pack.PossiblyNoneType(0, pack.IntType(256))
+        unsigned int max_bits; //bitcoin_data.FloatingIntegerType() max_bits;
+        unsigned int bits;     //bitcoin_data.FloatingIntegerType() bits;
+        unsigned int timestamp; //pack.IntType(32)
+        unsigned int absheigth; //pack.IntType(32)
+        uint256 abswork;   //pack.IntType(128)
     };
 
     class ShareType
@@ -84,7 +96,7 @@ namespace c2pool::shares
         SmallBlockHeaderType *min_header;
         ShareInfoType *share_info;
         MerkleLink *ref_merkle_link;
-        long long last_txout_nonce; //TODO: IntType64
+        unsigned long long last_txout_nonce; //IntType64
         HashLinkType *hash_link;
         MerkleLink *merkle_link;
     };

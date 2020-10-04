@@ -20,7 +20,7 @@ set(SOURCE
 
 add_library(btclibs STATIC ${SOURCE} ${HEADER})
 
-target_include_directories(btclibs PUBLIC util)
+target_include_directories(btclibs PRIVATE util crypto compat)
 
 # target_include_directories(bna PUBLIC STATIC)
 # target_include_directories(bna PUBLIC include PRIVATE lib)
