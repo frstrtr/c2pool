@@ -1,6 +1,7 @@
 #include <string>
 #include <vector>
 #include <uint256.h>
+#include <memory>
 
 //TODO: MerkleLink.index -> IntType(0)?????
 //TODO: HashLinkType.extra_data ->  FixedStrType(0) ?????
@@ -36,8 +37,8 @@ namespace c2pool::shares
     class MerkleLink
     {
     public:
-        std::vector<long long> branch; //TODO: pack.ListType(pack.IntType(256))
-        int index;                     //TODO: pack.IntType(0) # it will always be 0
+        std::vector<uint256> branch; //TODO: pack.ListType(pack.IntType(256))
+        int index;                   //TODO: pack.IntType(0) # it will always be 0
 
         friend std::istream &operator>>(std::istream &is, MerkleLink &value);
         friend std::ostream &operator<<(std::ostream &os, const MerkleLink &value);
@@ -76,8 +77,8 @@ namespace c2pool::shares
     {
         //SEGWIT DATA, 94 data.py
     public:
-        MerkleLink *txid_merkle_link;
-        uint256 wtxid_merkle_root; //pack.IntType(256)
+        std::shared_ptr<MerkleLink> txid_merkle_link; //---------------
+        uint256 wtxid_merkle_root;                    //pack.IntType(256)
 
         //InitPossiblyNoneType
         SegwitData()
@@ -90,22 +91,32 @@ namespace c2pool::shares
         friend std::ostream &operator<<(std::ostream &os, const SegwitData &value);
     };
 
+    class TransactionHashRef
+    {
+    public:
+        unsigned long long share_count; //VarIntType
+        unsigned long long tx_count;    //VarIntType
+
+        friend std::istream &operator>>(std::istream &is, TransactionHashRef &value);
+        friend std::ostream &operator<<(std::ostream &os, const TransactionHashRef &value);
+    };
+
     class ShareInfoType
     {
     public:
-        ShareData *share_data;
-        SegwitData *segwit_data;
+        std::shared_ptr<ShareData> share_data;
+        std::shared_ptr<SegwitData> segwit_data;
 
-        std::vector<uint256> new_transaction_hashes; //pack.ListType(pack.IntType(256))
-        //TODO: std::vector<???> transaction_hash_refs; //TODO: pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        uint256 far_share_hash;  //TODO: none — pack.PossiblyNoneType(0, pack.IntType(256))
-        unsigned int max_bits;   //bitcoin_data.FloatingIntegerType() max_bits;
-        unsigned int bits;       //bitcoin_data.FloatingIntegerType() bits;
-        unsigned int timestamp;  //pack.IntType(32)
-        unsigned long absheigth; //pack.IntType(32)
+        std::vector<uint256> new_transaction_hashes;           //pack.ListType(pack.IntType(256))
+        std::vector<TransactionHashRef> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
+        uint256 far_share_hash;                                //TODO: none — pack.PossiblyNoneType(0, pack.IntType(256))
+        unsigned int max_bits;                                 //bitcoin_data.FloatingIntegerType() max_bits;
+        unsigned int bits;                                     //bitcoin_data.FloatingIntegerType() bits;
+        unsigned int timestamp;                                //pack.IntType(32)
+        unsigned long absheigth;                               //pack.IntType(32)
 
         //TODO: uint128
-        uint256 abswork; //pack.IntType(128)
+        uint128 abswork; //pack.IntType(128)
 
         friend std::istream &operator>>(std::istream &is, ShareInfoType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareInfoType &value);
@@ -114,12 +125,12 @@ namespace c2pool::shares
     class ShareType
     {
     public:
-        SmallBlockHeaderType *min_header;
-        ShareInfoType *share_info;
-        MerkleLink *ref_merkle_link;
+        std::shared_ptr<SmallBlockHeaderType> min_header;
+        std::shared_ptr<ShareInfoType> share_info;
+        std::shared_ptr<MerkleLink> ref_merkle_link;
         unsigned long long last_txout_nonce; //IntType64
-        HashLinkType *hash_link;
-        MerkleLink *merkle_link;
+        std::shared_ptr<HashLinkType> hash_link;
+        std::shared_ptr<MerkleLink> merkle_link;
 
         friend std::istream &operator>>(std::istream &is, ShareType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareType &value);
@@ -129,7 +140,7 @@ namespace c2pool::shares
     {
     public:
         std::string identifier; //TODO: pack.FixedStrType(64//8)
-        ShareInfoType *share_info;
+        std::shared_ptr<ShareInfoType> share_info;
 
         friend std::istream &operator>>(std::istream &is, RefType &value);
         friend std::ostream &operator<<(std::ostream &os, const RefType &value);
