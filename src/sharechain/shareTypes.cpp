@@ -6,7 +6,7 @@
 //HashLinkType
 namespace c2pool::shares
 {
-    HashLinkType::HashLinkType(std::string _state, std::string _extra_data)
+    HashLinkType::HashLinkType(std::string _state, std::string _extra_data, unsigned long long length)
     {
         state = _state;
         extra_data = _extra_data;
