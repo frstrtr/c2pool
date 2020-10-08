@@ -30,7 +30,7 @@ namespace c2pool::shares
         std::string extra_data;    //TODO: pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
         unsigned long long length; //pack.VarIntType()
 
-        HashLinkType();
+        HashLinkType() {}
         HashLinkType(std::string state, std::string extra_data);
 
         friend std::istream &operator>>(std::istream &is, HashLinkType &value);
