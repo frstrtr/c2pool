@@ -37,7 +37,7 @@ namespace c2pool::shares
     class MerkleLink
     {
     public:
-        std::vector<uint256> branch; //TODO: pack.ListType(pack.IntType(256))
+        std::vector<uint256> branch; //pack.ListType(pack.IntType(256))
         int index;                   //TODO: pack.IntType(0) # it will always be 0
 
         friend std::istream &operator>>(std::istream &is, MerkleLink &value);
@@ -48,7 +48,7 @@ namespace c2pool::shares
     {
     public:
         unsigned long long version; // + ('version', pack.VarIntType()),
-        uint256 previousBlock;      // TODO: none — ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
+        uint256 previousBlock;      // none — ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
         unsigned int timeStamp;     // ('timestamp', pack.IntType(32)),
         unsigned int bits;          // ('bits', bitcoin_data.FloatingIntegerType()),
         unsigned int nonce;         // ('nonce', pack.IntType(32)),
@@ -60,7 +60,7 @@ namespace c2pool::shares
     class ShareData
     {
     public:
-        uint256 previous_share_hash; //TODO: none — pack.PossiblyNoneType(0, pack.IntType(256))
+        uint256 previous_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
         std::string coinbase;
         unsigned int nonce;         //pack.IntType(32)
         uint160 pubkey_hash;        //pack.IntType(160)
@@ -109,13 +109,12 @@ namespace c2pool::shares
 
         std::vector<uint256> new_transaction_hashes;           //pack.ListType(pack.IntType(256))
         std::vector<TransactionHashRef> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        uint256 far_share_hash;                                //TODO: none — pack.PossiblyNoneType(0, pack.IntType(256))
+        uint256 far_share_hash;                                //none — pack.PossiblyNoneType(0, pack.IntType(256))
         unsigned int max_bits;                                 //bitcoin_data.FloatingIntegerType() max_bits;
         unsigned int bits;                                     //bitcoin_data.FloatingIntegerType() bits;
         unsigned int timestamp;                                //pack.IntType(32)
         unsigned long absheigth;                               //pack.IntType(32)
 
-        //TODO: uint128
         uint128 abswork; //pack.IntType(128)
 
         friend std::istream &operator>>(std::istream &is, ShareInfoType &value);
