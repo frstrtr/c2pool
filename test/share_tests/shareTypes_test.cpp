@@ -6,7 +6,7 @@
 
 
 //TODO: create CMakeList.txt
-TEST(Py, HashLinkTypeTest)
+TEST(Shares, HashLinkTypeTest)
 {
     c2pool::shares::HashLinkType hashLinkType1("1", "2");
     c2pool::shares::HashLinkType hashLinkType2;
