@@ -6,6 +6,12 @@
 //HashLinkType
 namespace c2pool::shares
 {
+    HashLinkType::HashLinkType(std::string _state, std::string _extra_data)
+    {
+        state = _state;
+        extra_data = _extra_data;
+    }
+
     std::istream &operator>>(std::istream &is, HashLinkType &value)
     {
         is >> value.state >> value.extra_data >> value.length;
@@ -16,6 +22,22 @@ namespace c2pool::shares
     {
         os << value.state << "," << value.extra_data << "," << value.length;
         return os;
+    }
+
+    bool operator==(const HashLinkType &first, const HashLinkType &second)
+    {
+        if (first.state != second.state)
+            return false;
+        if (first.extra_data != second.extra_data)
+            return false;
+        if (first.length != second.length)
+            return false;
+        return true;
+    }
+
+    bool operator!=(const HashLinkType &first, const HashLinkType &second)
+    {
+        return !(first == second);
     }
 
 } // namespace c2pool::shares
@@ -127,11 +149,11 @@ namespace c2pool::shares
         //share_data
         value.share_data = std::make_shared<ShareData>();
         is >> *value.share_data;
-        
+
         //segwit_data
         value.segwit_data = std::make_shared<SegwitData>();
         is >> *value.segwit_data;
-        
+
         //new_transaction_hashes
         int new_transaction_hashes_count;
         is >> new_transaction_hashes_count;
@@ -162,7 +184,7 @@ namespace c2pool::shares
 
         //TODO: "<<" for vector
         os << "," << value.new_transaction_hashes << "," << value.transaction_hash_refs;
-        
+
         os << "," << value.far_share_hash << "," << value.max_bits << "," << value.bits << "," << value.timestamp << "," << value.absheigth << "," << value.abswork;
         return os;
     }
