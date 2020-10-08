@@ -31,7 +31,7 @@ namespace c2pool::shares
         unsigned long long length; //pack.VarIntType()
 
         HashLinkType() {}
-        HashLinkType(std::string state, std::string extra_data);
+        HashLinkType(std::string state, std::string extra_data, unsigned long long length);
 
         friend std::istream &operator>>(std::istream &is, HashLinkType &value);
         friend std::ostream &operator<<(std::ostream &os, const HashLinkType &value);
