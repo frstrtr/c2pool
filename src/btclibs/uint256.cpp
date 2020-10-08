@@ -10,7 +10,7 @@
 #include <string.h>
 
 template <unsigned int BITS>
-base_blob<BITS>::base_blob(const std::vector<unsigned char>& vch)
+base_blob<BITS>::base_blob(const std::vector<unsigned char> &vch)
 {
     assert(vch.size() == sizeof(data));
     memcpy(data, vch.data(), sizeof(data));
@@ -19,11 +19,11 @@ base_blob<BITS>::base_blob(const std::vector<unsigned char>& vch)
 template <unsigned int BITS>
 std::string base_blob<BITS>::GetHex() const
 {
-    return HexStr(std::reverse_iterator<const uint8_t*>(data + sizeof(data)), std::reverse_iterator<const uint8_t*>(data));
+    return HexStr(std::reverse_iterator<const uint8_t *>(data + sizeof(data)), std::reverse_iterator<const uint8_t *>(data));
 }
 
 template <unsigned int BITS>
-void base_blob<BITS>::SetHex(const char* psz)
+void base_blob<BITS>::SetHex(const char *psz)
 {
     memset(data, 0, sizeof(data));
 
@@ -39,11 +39,13 @@ void base_blob<BITS>::SetHex(const char* psz)
     size_t digits = 0;
     while (::HexDigit(psz[digits]) != -1)
         digits++;
-    unsigned char* p1 = (unsigned char*)data;
-    unsigned char* pend = p1 + WIDTH;
-    while (digits > 0 && p1 < pend) {
+    unsigned char *p1 = (unsigned char *)data;
+    unsigned char *pend = p1 + WIDTH;
+    while (digits > 0 && p1 < pend)
+    {
         *p1 = ::HexDigit(psz[--digits]);
-        if (digits > 0) {
+        if (digits > 0)
+        {
             *p1 |= ((unsigned char)::HexDigit(psz[--digits]) << 4);
             p1++;
         }
@@ -51,7 +53,7 @@ void base_blob<BITS>::SetHex(const char* psz)
 }
 
 template <unsigned int BITS>
-void base_blob<BITS>::SetHex(const std::string& str)
+void base_blob<BITS>::SetHex(const std::string &str)
 {
     SetHex(str.c_str());
 }
@@ -62,21 +64,71 @@ std::string base_blob<BITS>::ToString() const
     return (GetHex());
 }
 
+// Explicit instantiations for base_blob<128>
+template base_blob<128>::base_blob(const std::vector<unsigned char> &);
+template std::string base_blob<128>::GetHex() const;
+template std::string base_blob<128>::ToString() const;
+template void base_blob<128>::SetHex(const char *);
+template void base_blob<128>::SetHex(const std::string &);
+
+std::istream &operator>>(std::istream &is, uint128 &value)
+{
+    std::string Hex;
+    is >> Hex;
+    value.SetHex(Hex);
+    return is;
+}
+
+std::ostream &operator<<(std::ostream &os, const uint128 &value)
+{
+    os << value.GetHex();
+    return os;
+}
+
 // Explicit instantiations for base_blob<160>
-template base_blob<160>::base_blob(const std::vector<unsigned char>&);
+template base_blob<160>::base_blob(const std::vector<unsigned char> &);
 template std::string base_blob<160>::GetHex() const;
 template std::string base_blob<160>::ToString() const;
-template void base_blob<160>::SetHex(const char*);
-template void base_blob<160>::SetHex(const std::string&);
+template void base_blob<160>::SetHex(const char *);
+template void base_blob<160>::SetHex(const std::string &);
+
+std::istream &operator>>(std::istream &is, uint160 &value)
+{
+    std::string Hex;
+    is >> Hex;
+    value.SetHex(Hex);
+    return is;
+}
+
+std::ostream &operator<<(std::ostream &os, const uint160 &value)
+{
+    os << value.GetHex();
+    return os;
+}
 
 // Explicit instantiations for base_blob<256>
-template base_blob<256>::base_blob(const std::vector<unsigned char>&);
+template base_blob<256>::base_blob(const std::vector<unsigned char> &);
 template std::string base_blob<256>::GetHex() const;
 template std::string base_blob<256>::ToString() const;
-template void base_blob<256>::SetHex(const char*);
-template void base_blob<256>::SetHex(const std::string&);
+template void base_blob<256>::SetHex(const char *);
+template void base_blob<256>::SetHex(const std::string &);
 
-uint256& UINT256_ONE() {
-    static uint256* one = new uint256(uint256S("0000000000000000000000000000000000000000000000000000000000000001"));
+std::istream &operator>>(std::istream &is, uint256 &value)
+{
+    std::string Hex;
+    is >> Hex;
+    value.SetHex(Hex);
+    return is;
+}
+
+std::ostream &operator<<(std::ostream &os, const uint256 &value)
+{
+    os << value.GetHex();
+    return os;
+}
+
+uint256 &UINT256_ONE()
+{
+    static uint256 *one = new uint256(uint256S("0000000000000000000000000000000000000000000000000000000000000001"));
     return *one;
 }
