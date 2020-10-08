@@ -30,8 +30,14 @@ namespace c2pool::shares
         std::string extra_data;    //TODO: pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
         unsigned long long length; //pack.VarIntType()
 
+        HashLinkType();
+        HashLinkType(std::string state, std::string extra_data);
+
         friend std::istream &operator>>(std::istream &is, HashLinkType &value);
         friend std::ostream &operator<<(std::ostream &os, const HashLinkType &value);
+        friend bool operator==(const HashLinkType &first, const HashLinkType &second);
+
+        friend bool operator!=(const HashLinkType &first, const HashLinkType &second);
     };
 
     class MerkleLink
