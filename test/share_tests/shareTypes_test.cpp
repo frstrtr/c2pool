@@ -126,13 +126,51 @@ TEST(Shares, ShareInfoType)
 
 TEST(Shares, ShareType)
 {
-    c2pool::shares::ShareType shareType1();
+    std::shared_ptr<SmallBlockHeaderType> min_header = = std::make_shared<SmallBlockHeaderType>(1, "02", 2, 3, 4);
+
+    std::shared_ptr<ShareData> share_data = std::make_shared<ShareData>("01", "a", 2, "03", 4, 5, 253, 6);
+
+    std::vector<uint256> branch_txidml {"01"};
+    std::shared_ptr<MerkleLink> txid_merkle_link = std::make_shared<MerkleLink>(branch_txidml, 1)
+    std::shared_ptr<SegwitData> segwit_data = std::make_shared<SegwitData>(txid_merkle_link, "02");
+    
+    std::vector<uint256> new_transaction_hashes{"01"};
+    std::vector<TransactionHashRef> transaction_hash_refs;
+    TransactionHashRef thr(0, 1);
+    transaction_hash_reft.push_back(thr);
+    std::shared_ptr<ShareInfoType>
+        share_info = std::make_shared<ShareInfoType>(share_data,
+                                                     segwit_data,
+                                                     new_transaction_hashes,
+                                                     transaction_hash_refs,
+                                                     "022", 22, 33, 44, 55);
+
+
+    std::vector<uint256> branch_rml {"01"};
+    std::shared_ptr<MerkleLink> ref_merkle_link = std::make_shared<MerkleLink>(branch_rml, 111);
+    
+    std::shared_ptr<HashLinkType> hash_link = std::make_shared<HashLInkType>("a", "b", 2);
+
+    std::vector<uint256> branch_ml {"01"};
+    std::shared_ptr<MerkleLink> merkle_link = std::make_shared<MerkleLink>(branch_ml, 222);
+
+    c2pool::shares::ShareType shareType1(min_header,
+                                         share_info,
+                                         ref_merkle_link,
+                                         64,
+                                         hash_link,
+                                         merkle_link);
     c2pool::shares::ShareType shareType2();
     std::stringstream ss;
-    ss << "1"
-       << " "
-       << "2";
+    
+    ss << 1 << "02" << 2 << 3 << 4 //SmallBlockHeaderType
+       << "01" << "a" << 2 << "03" << 4 << 5 << 253 << 6 //ShareData
+       << 1 /*length vector in txid_merkle_link*/ << "01" << 1 << "02" //MerkleLink
+       << 1 /*length vector new_transaction_hashes*/ << "01" //new_transaction_hashes
+       << 1 /*length vector transaction_hash_refs*/ << 0 << 1 //transaction_hash_refs
+       << "022" << 22 << 33 << 44 << 55;
     ss >> shareType2;
+    
     ASSERT_EQ(shareType1, shareType2);
     c2pool::shares::ShareType shareType3;
     std::stringstream ss2;
