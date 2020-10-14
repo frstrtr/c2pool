@@ -136,7 +136,7 @@ namespace c2pool::shares
         uint128 abswork; //pack.IntType(128)
 
         ShareInfoType(){};
-        ShareInfoType(std::shared_ptr<ShareData> share_data, sd::shared_ptr<SegwitData> segwit_data, std::vector<uint256> new_transaction_hashes, std::vector<TransactionHashRef> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits, unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork);
+        ShareInfoType(std::shared_ptr<ShareData> share_data, std::shared_ptr<SegwitData> segwit_data, std::vector<uint256> new_transaction_hashes, std::vector<TransactionHashRef> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits, unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork);
 
         friend std::istream &operator>>(std::istream &is, ShareInfoType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareInfoType &value);
