@@ -1,3 +1,7 @@
+#ifndef SHARE_STORE_H
+#define SHARE_STORE_H
+
+
 namespace c2pool::shares
 {
 
@@ -57,3 +61,5 @@ namespace c2pool::shares
         /*type?*/ void check_remove(){};
     };
 } // namespace c2pool::shares
+
+#endif

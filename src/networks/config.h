@@ -19,6 +19,7 @@ namespace c2pool::config
         const unsigned char *PREFIX;
         const unsigned char *IDENTIFIER;
         int MINIMUM_PROTOCOL_VERSION;
+        int SEGWIT_ACTIVATION_VERSION;
 
     protected:
         Network();
