@@ -1,6 +1,10 @@
+#ifndef SHARE_H
+#define SHARE_H
+
 #include <string>
 #include <shareTypes.h>
 #include <memory>
+#include <tuple>
 
 namespace c2pool::config
 {
@@ -18,7 +22,7 @@ namespace c2pool::shares
         int shareType;        //pack.VarIntType()
         string shareContents; //pack.VarStrType()
 
-        void load_share(/*in parameters block*/ Share share, string net, /*addr*/ peerAddr, /*out parameters block*/ share_versions[share['type']](net, peer_addr, share_versions[share['type']].get_dynamic_types(net)['share_type'].unpack(share['contents']))){
+        void load_share(/*in parameters block*/ Share share, string net, std::tuple<std::string, std::string> peerAddr, /*out parameters block*/ share_versions[share['type']](net, peer_addr, share_versions[share['type']].get_dynamic_types(net)['share_type'].unpack(share['contents']))){
 
         };
     };
@@ -26,16 +30,11 @@ namespace c2pool::shares
     class BaseShare
     {
     public:
-        BaseShare(shared_ptr<c2pool::config::Network> _net, auto _peer_addr, auto _contents); //TODO: types
+        BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents);
     public:
         int VERSION = 0;
         int VOTING_VERSION = 0;
         // auto SUCCESSOR = nullptr; // None //TODO
-        shared_ptr<SmallBlockHeaderType> small_block_header;
-
-        shared_ptr<ShareInfoType> share_info_type; // None
-        shared_ptr<ShareType> share_type;          // None
-        shared_ptr<RefType> ref_type;              // None
 
         auto gentxBeforeRefhash; //TODO: gentx_before_refhash = pack.VarStrType().pack(DONATION_SCRIPT) + pack.IntType(64).pack(0) + pack.VarStrType().pack('\x6a\x28' + pack.IntType(256).pack(0) + pack.IntType(64).pack(0))[:3]
 
@@ -44,114 +43,52 @@ namespace c2pool::shares
 
     public:
         shared_ptr<c2pool::config::Network> net;
-        auto peer_addr; //TODO: type
-        auto contents;  //TODO: type
+        std::tuple<std::string, std::string> peer_addr;
+        ShareType contents;
+
+        std::shared_ptr<SmallBlockHeaderType> min_header;
+        std::shared_ptr<ShareInfoType> share_info;
+        std::shared_ptr<HashLinkType> hash_link;
+        std::shared_ptr<MerkleLink> merkle_link;
+        std::shared_ptr<ShareData> share_data;
+        uint256 max_target; //TODO: arith_256?
+        uint256 target; //TODO: arith_256?
+        unsigned int timestamp;
+        uint256 previous_hash;
+        //template for new_script: p2pool->test->bitcoin->test_data->test_tx_hash()[34;38 lines]
+        auto /*TODO: char[N], where N = len('\x76\xa9' + ('\x14' + pack.IntType(160).pack(pubkey_hash)) + '\x88\xac') */ new_script;
+        unsigned long long desired_version;
+        unsigned long absheight;
+        uint128 abswork;
+        uint256 gentx_hash; //check_hash_link
+        c2pool::shares::Header header;
+        uint256 pow_hash; //litecoin_scrypt->sctyptmodule.c->scrypt_getpowhash
+        uint256 hash;
+        uint256 header_hash;
+        std::vector<uint256> new_transaction_hashes; //TODO: ShareInfoType && shared_ptr<vector<uint256>>?
+        unsigned int time_seen;
     public:
-        // @classmethod
-        void generateTransaction(/*in parameters block*/
+        
+        /*TODO: return type*/ auto generateTransaction(
+                                auto /*tracker type*/ tracker
                                  /*cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None*/
                                  /*out parameters block*/
                                  /*share_info, gentx, other_transaction_hashes, get_share*/){};
 
         // @classmethod
-        void getRefHash(/*this?*/ cls, auto net, auto shareInfo, auto refMerkleLink)
+        void getRefHash(shared_ptr<c2pool::config::Network> _net, auto shareInfo, auto refMerkleLink)
         {
             return 0; //pack.IntType(256).pack(bitcoin_data.check_merkle_link(bitcoin_data.hash256(cls.get_dynamic_types(net)['ref_type'].pack(dict(identifier=net.IDENTIFIER, share_info=share_info,))), ref_merkle_link))
         };
 
         // class initialization constructor __init__(self...)
     public:
-        BaseShare(/*this?*/ auto self, /*type?*/ auto net, /*type?*/ auto peer_addr, /*type?*/ auto contents)
-        {
-            /*type?*/ dynamicTypes = getDynamicTypes(net);    // dynamic_types = self.get_dynamic_types(net)
-            /*type?*/ shareInfo = dynamicTypes.shareInfoType; // self.share_info_type = dynamic_types['share_info_type']
-            /*type?*/ shareType = dynamicTypes.shareType;     // self.share_type = dynamic_types['share_type']
-            /*type?*/ refType = dynamicTypes.refType;         // self.ref_type = dynamic_types['ref_type']
-
-            // self.net = net
-            // self.peer_addr = peer_addr
-            // self.contents = contents
-
-            /*type?*/ minHeader = contents.minHeader;   // self.min_header = contents['min_header']
-            /*type?*/ shareInfo = contents.shareInfo;   // self.share_info = contents['share_info']
-            /*type?*/ hashLink = contents.hashLink;     // self.hash_link = contents['hash_link']
-            /*type?*/ merkleLink = contents.merkleLink; // self.merkle_link = contents['merkle_link']
-
-            /*type?*/ shareData = shareInfo.shareData;            // self.share_data = self.share_info['share_data']
-            /*type?*/ maxTarget = shareInfo.maxBits.target;       // self.max_target = self.share_info['max_bits'].target
-            /*type?*/ target = shareInfo.bits.target;             // self.target = self.share_info['bits'].target
-            /*type?*/ timestamp = shareInfo.timestamp;            // self.timestamp = self.share_info['timestamp']
-            /*type?*/ previousHash = shareData.previousShareHash; // self.previous_hash = self.share_data['previous_share_hash']
-            /*type?*/ newScript = /*function*/;                   //self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash'])
-            /*type?*/ desiredVersion = shareData.desiredVersion;  // self.desired_version = self.share_data['desired_version']
-            /*type?*/ absHeight = shareInfo.absHeight;            // self.absheight = self.share_info['absheight']
-            /*type?*/ absWork = shareInfo.absWork;                // self.abswork = self.share_info['abswork']
-
-            //  self.gentx_hash = check_hash_link(
-            //     self.hash_link,
-            //     self.get_ref_hash(net, self.share_info, contents['ref_merkle_link']) + pack.IntType(64).pack(self.contents['last_txout_nonce']) + pack.IntType(32).pack(0),
-            //     self.gentx_before_refhash,
-            // )
-            /*type?*/ gentxHash = chackHashLink(/*type?*/ hashLink, getRefHash(/*type?*/ net, /*type?*/ shareInfo, /*type?*/ contents.refMerkleLink) + /*pack.IntType(64).pack(self.contents['last_txout_nonce']) + pack.IntType(32).pack(0)*/, /*type?*/ gentxBeforeRefhash);
-
-            // merkle_root = bitcoin_data.check_merkle_link(self.gentx_hash, self.share_info['segwit_data']['txid_merkle_link'] if segwit_activated else self.merkle_link)
-
-            // self.header = dict(self.min_header, merkle_root=merkle_root)
-            /*type?*/ header = 0;
-            // self.pow_hash = net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(self.header))
-            /*type?*/ powHash = 0;
-            // self.hash = self.header_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(self.header))
-            /*type?*/ hash = 0;
-
-            // if self.target > net.MAX_TARGET:
-            //     from p2pool import p2p
-            //     raise p2p.PeerMisbehavingError('share target invalid')
-
-            // if self.pow_hash > self.target:
-            //     from p2pool import p2p
-            //     raise p2p.PeerMisbehavingError('share PoW invalid')
-
-            // self.new_transaction_hashes = self.share_info['new_transaction_hashes']
-            /*type?*/ newTransactionHashes = shareInfo.newTransactionHashes;
-
-            // # XXX eww
-            // self.time_seen = time.time()
-            /*type?*/ timeSeen = CURRENT_TIME;
-        };
-
-        // private:
-        /*type?*/ void repr{
-
-        };
-
-        /*type?*/ void as_share{
-
-        };
-
-        /*type?*/ void iterTransactionHashRefs{
-
-        };
-
         /*type?*/ check(/*type?*/ tracker, /*type?*/ otherTXs = nullptr){
 
         };
 
-        /*type?*/ getOtherTXHashes(/*type?*/ tracker){
-
-        };
-
-        // private:
-        /*type?*/ getOtherTXs(/*type?*/ tracker, /*type?*/ knownTXs){
-
-        };
-
-        /*type?*/ shouldPunishReason(/*type?*/ previousBlock, /*type?*/ bits, /*type?*/ tracker, /*type?*/ knownTXs){
-
-        };
-
-        /*type?*/ asBlock(/*type?*/ tracker, /*type?*/ knownTXs){
-
-        };
+        //TODO: [wanna this?] /*type?*/ void as_share;
+        //TODO: [wanna this?] /*type?*/ asBlock(/*type?*/ tracker, /*type?*/ knownTXs)
     };
 
     class NewShare : BaseShare
@@ -175,3 +112,5 @@ namespace c2pool::shares
         /*type?*/ SUCCESSOR = NewShare;
     };
 } // namespace c2pool::shares
+
+#endif //SHARE_H

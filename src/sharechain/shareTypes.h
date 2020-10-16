@@ -1,3 +1,6 @@
+#ifndef SHARE_TYPES_H
+#define SHARE_TYPES_H
+
 #include <string>
 #include <vector>
 #include <uint256.h>
@@ -16,11 +19,26 @@
 
 namespace c2pool::shares
 {
+    bool is_segwit_activated(int version, int segwit_activation_version);
+
     enum StaleInfo
     {
         None = 0,
         orphan = 253,
         doa = 254
+    };
+
+    class RawShare
+    {
+        /*
+            share_type = pack.ComposedType([
+                ('type', pack.VarIntType()),
+                ('contents', pack.VarStrType()),
+            ])
+        */
+    public:
+        int type;
+        std::string contents; //TODO: char* ?!
     };
 
     class HashLinkType
@@ -150,4 +168,16 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, RefType &value);
         friend std::ostream &operator<<(std::ostream &os, const RefType &value);
     };
+
+    //------------------------
+
+    //TODO:
+    class Header
+    {
+    public:
+        std::shared_ptr<SmallBlockHeaderType> header; //TODO: name: header?
+        uint256 merkle_root;                          //TODO: arith_uint256?
+    }
 } // namespace c2pool::shares
+
+#endif
