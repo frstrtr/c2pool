@@ -14,8 +14,10 @@ set(OTHER src/other)
 set(UNIVALUE src/univalue)
 set(BTCLIBS src/btclibs)
 set(SHARECHAIN src/sharechain)
+set(LEVELDB src/leveldb)
+set(DBSHELL src/dbshell)
 #set(CRYPTO src/crypto)  #todo
-set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE} ${BTCLIBS} ${SHARECHAIN})
+set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE} ${BTCLIBS} ${SHARECHAIN} ${LEVELDB} ${DBSHELL})
 set(c2pool_libs util p2p networks other univalue btclibs sharechain)
 
 #BOOST
