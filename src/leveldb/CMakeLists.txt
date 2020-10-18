@@ -30,7 +30,7 @@ else (WIN32)
   set(LEVELDB_PLATFORM_NAME LEVELDB_PLATFORM_POSIX)
 endif (WIN32)
 
-option(LEVELDB_BUILD_TESTS "Build LevelDB's unit tests" ON)
+option(LEVELDB_BUILD_TESTS "Build LevelDB's unit tests" OFF)
 option(LEVELDB_BUILD_BENCHMARKS "Build LevelDB's benchmarks" ON)
 option(LEVELDB_INSTALL "Install LevelDB's header and library" ON)
 
@@ -286,99 +286,99 @@ add_executable(leveldbutil
 )
 target_link_libraries(leveldbutil leveldb)
 
-if(LEVELDB_BUILD_TESTS)
-  enable_testing()
+# if(LEVELDB_BUILD_TESTS)
+#   enable_testing()
 
-  # Prevent overriding the parent project's compiler/linker settings on Windows.
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  set(install_gtest OFF)
-  set(install_gmock OFF)
-  set(build_gmock ON)
+#   # Prevent overriding the parent project's compiler/linker settings on Windows.
+#   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+#   set(install_gtest OFF)
+#   set(install_gmock OFF)
+#   set(build_gmock ON)
 
-  # This project is tested using GoogleTest.
-  add_subdirectory("third_party/googletest")
+#   # This project is tested using GoogleTest.
+#   add_subdirectory("third_party/googletest")
 
-  # GoogleTest triggers a missing field initializers warning.
-  if(LEVELDB_HAVE_NO_MISSING_FIELD_INITIALIZERS)
-    set_property(TARGET gtest
-        APPEND PROPERTY COMPILE_OPTIONS -Wno-missing-field-initializers)
-    set_property(TARGET gmock
-        APPEND PROPERTY COMPILE_OPTIONS -Wno-missing-field-initializers)
-  endif(LEVELDB_HAVE_NO_MISSING_FIELD_INITIALIZERS)
+#   # GoogleTest triggers a missing field initializers warning.
+#   if(LEVELDB_HAVE_NO_MISSING_FIELD_INITIALIZERS)
+#     set_property(TARGET gtest
+#         APPEND PROPERTY COMPILE_OPTIONS -Wno-missing-field-initializers)
+#     set_property(TARGET gmock
+#         APPEND PROPERTY COMPILE_OPTIONS -Wno-missing-field-initializers)
+#   endif(LEVELDB_HAVE_NO_MISSING_FIELD_INITIALIZERS)
 
-  function(leveldb_test test_file)
-    get_filename_component(test_target_name "${test_file}" NAME_WE)
+#   function(leveldb_test test_file)
+#     get_filename_component(test_target_name "${test_file}" NAME_WE)
 
-    add_executable("${test_target_name}" "")
-    target_sources("${test_target_name}"
-      PRIVATE
-        "${PROJECT_BINARY_DIR}/${LEVELDB_PORT_CONFIG_DIR}/port_config.h"
-        "util/testutil.cc"
-        "util/testutil.h"
+#     add_executable("${test_target_name}" "")
+#     target_sources("${test_target_name}"
+#       PRIVATE
+#         "${PROJECT_BINARY_DIR}/${LEVELDB_PORT_CONFIG_DIR}/port_config.h"
+#         "util/testutil.cc"
+#         "util/testutil.h"
 
-        "${test_file}"
-    )
-    target_link_libraries("${test_target_name}" leveldb gmock gtest)
-    target_compile_definitions("${test_target_name}"
-      PRIVATE
-        ${LEVELDB_PLATFORM_NAME}=1
-    )
-    if (NOT HAVE_CXX17_HAS_INCLUDE)
-      target_compile_definitions("${test_target_name}"
-        PRIVATE
-          LEVELDB_HAS_PORT_CONFIG_H=1
-      )
-    endif(NOT HAVE_CXX17_HAS_INCLUDE)
+#         "${test_file}"
+#     )
+#     target_link_libraries("${test_target_name}" leveldb gmock gtest)
+#     target_compile_definitions("${test_target_name}"
+#       PRIVATE
+#         ${LEVELDB_PLATFORM_NAME}=1
+#     )
+#     if (NOT HAVE_CXX17_HAS_INCLUDE)
+#       target_compile_definitions("${test_target_name}"
+#         PRIVATE
+#           LEVELDB_HAS_PORT_CONFIG_H=1
+#       )
+#     endif(NOT HAVE_CXX17_HAS_INCLUDE)
 
-    add_test(NAME "${test_target_name}" COMMAND "${test_target_name}")
-  endfunction(leveldb_test)
+#     add_test(NAME "${test_target_name}" COMMAND "${test_target_name}")
+#   endfunction(leveldb_test)
 
-  leveldb_test("db/c_test.c")
-  leveldb_test("db/fault_injection_test.cc")
+#   leveldb_test("db/c_test.c")
+#   leveldb_test("db/fault_injection_test.cc")
 
-  leveldb_test("issues/issue178_test.cc")
-  leveldb_test("issues/issue200_test.cc")
-  leveldb_test("issues/issue320_test.cc")
+#   leveldb_test("issues/issue178_test.cc")
+#   leveldb_test("issues/issue200_test.cc")
+#   leveldb_test("issues/issue320_test.cc")
 
-  leveldb_test("util/env_test.cc")
-  leveldb_test("util/status_test.cc")
-  leveldb_test("util/no_destructor_test.cc")
+#   leveldb_test("util/env_test.cc")
+#   leveldb_test("util/status_test.cc")
+#   leveldb_test("util/no_destructor_test.cc")
 
-  if(NOT BUILD_SHARED_LIBS)
-    leveldb_test("db/autocompact_test.cc")
-    leveldb_test("db/corruption_test.cc")
-    leveldb_test("db/db_test.cc")
-    leveldb_test("db/dbformat_test.cc")
-    leveldb_test("db/filename_test.cc")
-    leveldb_test("db/log_test.cc")
-    leveldb_test("db/recovery_test.cc")
-    leveldb_test("db/skiplist_test.cc")
-    leveldb_test("db/version_edit_test.cc")
-    leveldb_test("db/version_set_test.cc")
-    leveldb_test("db/write_batch_test.cc")
+#   if(NOT BUILD_SHARED_LIBS)
+#     leveldb_test("db/autocompact_test.cc")
+#     leveldb_test("db/corruption_test.cc")
+#     leveldb_test("db/db_test.cc")
+#     leveldb_test("db/dbformat_test.cc")
+#     leveldb_test("db/filename_test.cc")
+#     leveldb_test("db/log_test.cc")
+#     leveldb_test("db/recovery_test.cc")
+#     leveldb_test("db/skiplist_test.cc")
+#     leveldb_test("db/version_edit_test.cc")
+#     leveldb_test("db/version_set_test.cc")
+#     leveldb_test("db/write_batch_test.cc")
 
-    leveldb_test("helpers/memenv/memenv_test.cc")
+#     leveldb_test("helpers/memenv/memenv_test.cc")
 
-    leveldb_test("table/filter_block_test.cc")
-    leveldb_test("table/table_test.cc")
+#     leveldb_test("table/filter_block_test.cc")
+#     leveldb_test("table/table_test.cc")
 
-    leveldb_test("util/arena_test.cc")
-    leveldb_test("util/bloom_test.cc")
-    leveldb_test("util/cache_test.cc")
-    leveldb_test("util/coding_test.cc")
-    leveldb_test("util/crc32c_test.cc")
-    leveldb_test("util/hash_test.cc")
-    leveldb_test("util/logging_test.cc")
+#     leveldb_test("util/arena_test.cc")
+#     leveldb_test("util/bloom_test.cc")
+#     leveldb_test("util/cache_test.cc")
+#     leveldb_test("util/coding_test.cc")
+#     leveldb_test("util/crc32c_test.cc")
+#     leveldb_test("util/hash_test.cc")
+#     leveldb_test("util/logging_test.cc")
 
-    # TODO(costan): This test also uses
-    #               "util/env_{posix|windows}_test_helper.h"
-    if (WIN32)
-      leveldb_test("util/env_windows_test.cc")
-    else (WIN32)
-      leveldb_test("util/env_posix_test.cc")
-    endif (WIN32)
-  endif(NOT BUILD_SHARED_LIBS)
-endif(LEVELDB_BUILD_TESTS)
+#     # TODO(costan): This test also uses
+#     #               "util/env_{posix|windows}_test_helper.h"
+#     if (WIN32)
+#       leveldb_test("util/env_windows_test.cc")
+#     else (WIN32)
+#       leveldb_test("util/env_posix_test.cc")
+#     endif (WIN32)
+#   endif(NOT BUILD_SHARED_LIBS)
+# endif(LEVELDB_BUILD_TESTS)
 
 if(LEVELDB_BUILD_BENCHMARKS)
   function(leveldb_benchmark bench_file)
