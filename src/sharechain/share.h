@@ -1,6 +1,8 @@
 #ifndef SHARE_H
 #define SHARE_H
 
+#include "dbObject.h"
+
 #include <string>
 #include <shareTypes.h>
 #include <memory>
@@ -11,6 +13,7 @@ namespace c2pool::config
     class Network;
 }
 
+using dbshell::DBObject;
 using std::shared_ptr, std::string;
 using namespace c2pool::shares;
 
@@ -27,10 +30,11 @@ namespace c2pool::shares
         };
     };
 
-    class BaseShare
+    class BaseShare : public DBObject
     {
     public:
         BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents);
+
     public:
         int VERSION = 0;
         int VOTING_VERSION = 0;
@@ -52,7 +56,7 @@ namespace c2pool::shares
         std::shared_ptr<MerkleLink> merkle_link;
         std::shared_ptr<ShareData> share_data;
         uint256 max_target; //TODO: arith_256?
-        uint256 target; //TODO: arith_256?
+        uint256 target;     //TODO: arith_256?
         unsigned int timestamp;
         uint256 previous_hash;
         //template for new_script: p2pool->test->bitcoin->test_data->test_tx_hash()[34;38 lines]
@@ -67,13 +71,17 @@ namespace c2pool::shares
         uint256 header_hash;
         std::vector<uint256> new_transaction_hashes; //TODO: ShareInfoType && shared_ptr<vector<uint256>>?
         unsigned int time_seen;
+
     public:
-        
+        virtual std::string SerializeJSON() override;
+        virtual void DeserializeJSON(std::string json);
+
+    public:
         /*TODO: return type*/ auto generateTransaction(
-                                auto /*tracker type*/ tracker
-                                 /*cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None*/
-                                 /*out parameters block*/
-                                 /*share_info, gentx, other_transaction_hashes, get_share*/){};
+            auto /*tracker type*/ tracker
+            /*cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None*/
+            /*out parameters block*/
+            /*share_info, gentx, other_transaction_hashes, get_share*/){};
 
         // @classmethod
         void getRefHash(shared_ptr<c2pool::config::Network> _net, auto shareInfo, auto refMerkleLink)

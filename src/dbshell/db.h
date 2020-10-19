@@ -12,7 +12,7 @@ namespace dbshell
     //TODO: stream << key/value;
     class Database
     {
-    private:
+    protected:
         leveldb::DB *db;
 
         leveldb::Options options;
