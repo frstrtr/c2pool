@@ -1,7 +1,85 @@
 #include <shareTracker.h>
 #include <share.h>
 #include <vector>
+#include <uint256.h>
+#include <share.h>
+
 using std::vector;
+
+namespace c2pool::shares::tracker
+{
+    ProtoAttributeDelta::ProtoAttributeDelta(BaseShare item)
+    {
+        head = item.hash;
+        tail = item.previous_hash;
+        height = 1;
+    }
+
+    ProtoAttributeDelta::ProtoAttributeDelta(uint256 _head, uint256 _tail, int _height)
+    {
+        head = _head;
+        tail = _tail;
+        height = _height;
+    }
+
+    //TODO: TEST
+
+    ProtoAttributeDelta operator+(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b)
+    {
+        if (a.tail != b.head)
+        {
+            //ERROR
+            //TODO: assert
+        }
+        return ProtoAttributeDelta(a.head, b.tail, a.height + b.height);
+    }
+    ProtoAttributeDelta operator-(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b)
+    {
+        // if (tail != b.head)
+        // {
+        //     //ERROR
+        //     //TODO: assert
+        // }
+
+        if (a.head == b.head)
+        {
+            return ProtoAttributeDelta(b.tail, a.tail, a.height-b.height);
+        }
+        if (a.tail == b.tail)
+        {
+            return ProtoAttributeDelta(a.head, b.head, a.height-b.height);
+        }
+        //TODO: Assertion Error
+    }
+
+    // ProtoAttributeDelta& ProtoAttributeDelta::operator+=(const ProtoAttributeDelta& b){
+    //     if (tail != b.head){
+    //         //ERROR
+    //         //TODO: assert
+    //     }
+    //     tail = b.tail;
+    //     height = b.height;
+    //     return *this;
+    // }
+
+    // ProtoAttributeDelta& ProtoAttributeDelta::operator-=(const ProtoAttributeDelta& b){
+    //     if (tail != b.head){
+    //         //ERROR
+    //         //TODO: assert
+    //     }
+    //     tail = b.tail;
+    //     height = b.height;
+    //     return *this;
+
+    //     if (head == b.head){
+
+    //     }
+    //     if (tail == b.tail){
+
+    //     }
+    //     //TODO: Assertion Error
+    // }
+} // namespace c2pool::shares::tracker
 
 namespace c2pool::shares::tracker
 {
