@@ -9,7 +9,7 @@ Bitcointalk forum thread - https://bitcointalk.org/index.php?topic=18313
 
 Some technical details - https://bitcointalk.org/index.php?topic=457574
 
-p2pool sharechain based DEX/mining pool/hr marketplace and more... written in c++ and LMDB.
+p2pool sharechain based DEX/mining pool/hr marketplace and more... written in c++ and LevelDB.
 
 ## Donations towards further development of с2pool implementation in C++
 
