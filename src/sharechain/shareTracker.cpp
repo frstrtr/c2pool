@@ -302,7 +302,8 @@ namespace c2pool::shares::tracker
             heads.erase(delta.head);
             tails[tail].erase(delta.head);
             //remove empty set from tails map
-            if (tails[delta.tail].empty()){
+            if (tails[delta.tail].empty())
+            {
                 tails.erase(delta.tail);
             }
         }
@@ -311,9 +312,12 @@ namespace c2pool::shares::tracker
             auto tail = heads[delta.head];
             heads.erase(delta.head);
             tails[tail].erase(delta.head);
-            if (reverse[delta.tail] != {delta.head}){
+            if (reverse[delta.tail] != {delta.head})
+            {
                 //has sibling
-            } else {
+            }
+            else
+            {
                 tails[tail].insert(delta.tail);
                 heads[delta.tail] = tail;
             }
@@ -322,7 +326,8 @@ namespace c2pool::shares::tracker
         {
             auto _heads = tails[delta.tail];
             tails.erase(delta.tail);
-            for (auto head : _heads){
+            for (auto head : _heads)
+            {
                 heads[head] = delta.head;
             }
             tails[delta.head] = {_heads};
@@ -332,16 +337,20 @@ namespace c2pool::shares::tracker
         else if (_exist_tails && (reverse[delta.tail].size() > 1))
         {
             set<uint256> _heads;
-            for (auto x : tails[delta.tail]){
-                if (is_child_of(delta.head, x)){
+            for (auto x : tails[delta.tail])
+            {
+                if (is_child_of(delta.head, x))
+                {
                     _heads.insert(x);
                     tails[delta.tail].erase(x);
                 }
 
-                if (tails[delta.tail].empty()){
+                if (tails[delta.tail].empty())
+                {
                     tails.erase(delta.tail);
                 }
-                for (auto head : _heads){
+                for (auto head : _heads)
+                {
                     heads[head] = delta.head;
                 }
                 //TODO: assert delta.head not in self.tails
@@ -349,15 +358,16 @@ namespace c2pool::shares::tracker
 
                 remove_special2.happened(item);
             }
-
         }
-        else {
+        else
+        {
             //TODO: raise NotImplementedError()
         }
 
         items.erase(delta.head);
         reverse[delta.tail].erase(delta.head);
-        if (reverse[delta.tail].empty()){
+        if (reverse[delta.tail].empty())
+        {
             reverse.erase(delta.tail);
         }
 
