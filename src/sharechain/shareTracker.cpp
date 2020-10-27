@@ -28,6 +28,13 @@ namespace c2pool::shares::tracker
         height = _height;
     }
 
+    ProtoAttributeDelta::ProtoAttributeDelta(uint256 element_id)
+    {
+        head = element_id;
+        tail = element_id;
+        height = 0;
+    }
+
     //TODO: TEST
 
     ProtoAttributeDelta operator+(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b)
@@ -58,33 +65,99 @@ namespace c2pool::shares::tracker
         //TODO: Assertion Error
     }
 
-    // ProtoAttributeDelta& ProtoAttributeDelta::operator+=(const ProtoAttributeDelta& b){
-    //     if (tail != b.head){
-    //         //ERROR
-    //         //TODO: assert
-    //     }
-    //     tail = b.tail;
-    //     height = b.height;
-    //     return *this;
-    // }
+    //OkayProtoAttributeDelta
 
-    // ProtoAttributeDelta& ProtoAttributeDelta::operator-=(const ProtoAttributeDelta& b){
-    //     if (tail != b.head){
-    //         //ERROR
-    //         //TODO: assert
-    //     }
-    //     tail = b.tail;
-    //     height = b.height;
-    //     return *this;
+    OkayProtoAttributeDelta::OkayProtoAttributeDelta(BaseShare item) : ProtoAttributeDelta(item)
+    {
+        //TODO: work = bitcoin_data.target_to_average_attempts(item.target)
+        //TODO: min_work = bitcoin_data.target_to_average_attempts(share.max_target)
+    }
 
-    //     if (head == b.head){
+    OkayProtoAttributeDelta::OkayProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work, uint256 _min_work) : ProtoAttributeDelta(_head, _tail, _height)
+    {
+        work = _work;
+        min_work = _min_work;
+    }
 
-    //     }
-    //     if (tail == b.tail){
+    OkayProtoAttributeDelta::OkayProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta(element_id)
+    {
+        work = 0;     //TODO: init zero
+        min_work = 0; //TODO: init zero
+    }
 
-    //     }
-    //     //TODO: Assertion Error
-    // }
+    OkayProtoAttributeDelta operator+(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b)
+    {
+        if (a.tail != b.head)
+        {
+            //ERROR
+            //TODO: assert
+        }
+        return OkayProtoAttributeDelta(a.head, b.tail, a.height + b.height, a.work + b.work, a.min_work + b.min_work);
+    }
+    OkayProtoAttributeDelta operator-(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b)
+    {
+        // if (tail != b.head)
+        // {
+        //     //ERROR
+        //     //TODO: assert
+        // }
+
+        if (a.head == b.head)
+        {
+            return OkayProtoAttributeDelta(b.tail, a.tail, a.height - b.height, a.work - b.work, a.min_work - b.min_work);
+        }
+        if (a.tail == b.tail)
+        {
+            return OkayProtoAttributeDelta(a.head, b.head, a.height - b.height, a.work - b.work, a.min_work - b.min_work);
+        }
+        //TODO: Assertion Error
+    }
+
+    //SubsetProtoAttributeDelta
+
+    SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(BaseShare item) : ProtoAttributeDelta(item)
+    {
+        //TODO: work = bitcoin_data.target_to_average_attempts(item.target)
+    }
+
+    SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work) : ProtoAttributeDelta(_head, _tail, _height)
+    {
+        work = _work;
+    }
+
+    SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta(element_id)
+    {
+        work = 0; //TODO: init zero
+    }
+
+    SubsetProtoAttributeDelta operator+(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b)
+    {
+        if (a.tail != b.head)
+        {
+            //ERROR
+            //TODO: assert
+        }
+        return SubsetProtoAttributeDelta(a.head, b.tail, a.height + b.height, a.work + b.work);
+    }
+    SubsetProtoAttributeDelta operator-(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b)
+    {
+        // if (tail != b.head)
+        // {
+        //     //ERROR
+        //     //TODO: assert
+        // }
+
+        if (a.head == b.head)
+        {
+            return SubsetProtoAttributeDelta(b.tail, a.tail, a.height - b.height, a.work - b.work);
+        }
+        if (a.tail == b.tail)
+        {
+            return SubsetProtoAttributeDelta(a.head, b.head, a.height - b.height, a.work - b.work);
+        }
+        //TODO: Assertion Error
+    }
+
 } // namespace c2pool::shares::tracker
 
 //TrackerView
@@ -220,6 +293,74 @@ namespace c2pool::shares::tracker
             children = reverse[delta.head];
         }
 
-        //TODO: finish
+        bool _exist_heads = (heads.find(delta.head) != heads.end());
+        bool _exist_tails = (tails.find(delta.tail) != tails.end());
+
+        if (_exist_heads && _exist_tails)
+        {
+            auto tail = heads[delta.head];
+            heads.erase(delta.head);
+            tails[tail].erase(delta.head);
+            //remove empty set from tails map
+            if (tails[delta.tail].empty()){
+                tails.erase(delta.tail);
+            }
+        }
+        else if (_exist_heads)
+        {
+            auto tail = heads[delta.head];
+            heads.erase(delta.head);
+            tails[tail].erase(delta.head);
+            if (reverse[delta.tail] != {delta.head}){
+                //has sibling
+            } else {
+                tails[tail].insert(delta.tail);
+                heads[delta.tail] = tail;
+            }
+        }
+        else if (_exist_tails && (reverse[delta.tail].size() <= 1))
+        {
+            auto _heads = tails[delta.tail];
+            tails.erase(delta.tail);
+            for (auto head : _heads){
+                heads[head] = delta.head;
+            }
+            tails[delta.head] = {_heads};
+
+            remove_special.happened(item);
+        }
+        else if (_exist_tails && (reverse[delta.tail].size() > 1))
+        {
+            set<uint256> _heads;
+            for (auto x : tails[delta.tail]){
+                if (is_child_of(delta.head, x)){
+                    _heads.insert(x);
+                    tails[delta.tail].erase(x);
+                }
+
+                if (tails[delta.tail].empty()){
+                    tails.erase(delta.tail);
+                }
+                for (auto head : _heads){
+                    heads[head] = delta.head;
+                }
+                //TODO: assert delta.head not in self.tails
+                tails[delta.head] = _heads;
+
+                remove_special2.happened(item);
+            }
+
+        }
+        else {
+            //TODO: raise NotImplementedError()
+        }
+
+        items.erase(delta.head);
+        reverse[delta.tail].erase(delta.head);
+        if (reverse[delta.tail].empty()){
+            reverse.erase(delta.tail);
+        }
+
+        removed.happened(item);
     }
 } // namespace c2pool::shares::tracker
