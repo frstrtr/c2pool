@@ -45,6 +45,12 @@ namespace c2pool::shares
 //TODO: MerkleLink
 namespace c2pool::shares
 {
+    MerkleLink::MerkleLink(std::vector<uint256> _branch, int _index)
+    {
+        branch = _branch;
+        index = _index;
+    }
+
     std::istream &operator>>(std::istream &is, MerkleLink &value)
     {
         //TODO:value.branch
@@ -72,6 +78,15 @@ namespace c2pool::shares
 //TODO: SmallBlockHeaderType
 namespace c2pool::shares
 {
+    SmallBlockHeaderType::SmallBlockHeaderType(unsigned long long _version, uint256 _previousBlock, unsigned int _timeStamp, unsigned int _bits, unsigned int _nonce)
+    {
+        version = _version;
+        previousBlock = _previousBlock;
+        timeStamp = _timeStamp;
+        bits = _bits;
+        nonce = _nonce;
+    };
+
     std::istream &operator>>(std::istream &is, SmallBlockHeaderType &value)
     {
         is >> value.version >> value.previousBlock >> value.timeStamp >> value.bits >> value.nonce;
@@ -89,6 +104,18 @@ namespace c2pool::shares
 //TODO: ShareData
 namespace c2pool::shares
 {
+    ShareData::ShareData(uint256 _previous_share_hash, std::string _coinbase, unsigned int _nonce, uint160 _pubkey_hash, unsigned long long _subsidy, unsigned short _donation, StaleInfo _stale_info, unsigned long long _desired_version)
+    {
+        previous_share_hash = _previous_share_hash;
+        coinbase = _coinbase;
+        nonce = _nonce;
+        pubkey_hash = _pubkey_hash;
+        subsidy = _subsidy;
+        donation = _donation;
+        stale_info = _stale_info;
+        desired_version = _desired_version;
+    };
+
     std::istream &operator>>(std::istream &is, ShareData &value)
     {
         is >> value.previous_share_hash >> value.coinbase >> value.nonce >> value.pubkey_hash >> value.subsidy >> value.donation >> value.stale_info >> value.desired_version;
@@ -106,6 +133,12 @@ namespace c2pool::shares
 //TODO: SegwitData
 namespace c2pool::shares
 {
+    SegwitData::SegwitData(std::shared_ptr<MerkleLink> _txid_merkle_link, uint256 _wtxid_merkle_root)
+    {
+        txid_merkle_link = _txid_merkle_link;
+        wtxid_merkle_root = _wtxid_merkle_root;
+    };
+
     std::istream &operator>>(std::istream &is, SegwitData &value)
     {
         value.txid_merkle_link = std::make_shared<MerkleLink>();
@@ -127,6 +160,12 @@ namespace c2pool::shares
 //TODO: TransactionHashRef
 namespace c2pool::shares
 {
+    TransactionHashRef::TransactionHashRef(unsigned long long _share_count, unsigned long long _tx_count)
+    {
+        share_count = _share_count;
+        tx_count = _tx_count;
+    };
+
     std::istream &operator>>(std::istream &is, TransactionHashRef &value)
     {
         is >> value.share_count >> value.tx_count;
@@ -144,6 +183,20 @@ namespace c2pool::shares
 //TODO: ShareInfoType
 namespace c2pool::shares
 {
+    ShareInfoType::ShareInfoType(std::shared_ptr<ShareData> _share_data, sd::shared_ptr<SegwitData> _segwit_data, std::vector<uint256> _new_transaction_hashes, std::vector<TransactionHashRef> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork)
+    {
+        share_data = _share_data;
+        segwit_data = _segwit_data;
+        new_transaction_hashes = _new_transaction_hashes;
+        transaction_hash_refs = _transaction_hash_refs;
+        far_share_hash = _far_share_hash;
+        max_bits = _max_bits;
+        bits = _bits;
+        timestamp = _timestamp;
+        absheigth = _absheigth;
+        abswork = _abswork;
+    };
+
     std::istream &operator>>(std::istream &is, ShareInfoType &value)
     {
         //share_data
@@ -194,6 +247,16 @@ namespace c2pool::shares
 //TODO: ShareType
 namespace c2pool::shares
 {
+    ShareType::ShareType(std::shared_ptr<SmallBlockHeaderType> _min_header, std::shared_ptr<ShareInfoType> _share_info, std::shared_ptr<MerkleLink> _ref_merkle_link, unsigned long long _last_txout_nonce, std::shared_ptr<HashLinkType> _hash_link, std::shared_ptr<MerkleLink> _merkle_link)
+    {
+        min_header = _min_header;
+        share_info = _share_info;
+        ref_merkle_link = _ref_merkle_link;
+        last_txout_nonce = _last_txout_nonce;
+        hash_link = _hash_link;
+        merkle_link = _merkle_link;
+    };
+
     std::istream &operator>>(std::istream &is, ShareType &value)
     {
         //min_header
@@ -228,6 +291,12 @@ namespace c2pool::shares
 //TODO: RefType
 namespace c2pool::shares
 {
+    RefType::RefType(std::string _identifier, std::shared_ptr<ShareInfoType> _share_info)
+    {
+        identifier = _identifier;
+        share_info = _share_info;
+    };
+
     std::istream &operator>>(std::istream &is, RefType &value)
     {
         //identifier
