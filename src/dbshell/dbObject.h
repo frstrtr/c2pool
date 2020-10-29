@@ -1,3 +1,6 @@
+#ifndef DBSHELL_OBJECT_H
+#define DBSHELL_OBJECT_H
+
 // interface for any objects which should be put into the database
 #include <string>
 
@@ -10,3 +13,5 @@ namespace dbshell
         virtual void DeserializeJSON(std::string json) = 0;
     };
 } // namespace dbshell
+
+#endif

@@ -53,7 +53,6 @@ namespace c2pool::shares
 
     std::istream &operator>>(std::istream &is, MerkleLink &value)
     {
-        //TODO:value.branch
         int branch_count;
         is >> branch_count;
         for (int i = 0; i < branch_count; i++)
@@ -68,8 +67,11 @@ namespace c2pool::shares
 
     std::ostream &operator<<(std::ostream &os, const MerkleLink &value)
     {
-        //TODO:value.branch
-        os << value.branch << "," << value.index;
+        os << value.branch.size() << ",";
+        for (int i = 0; i < value.branch.size(); i++){
+            os << value.branch[i] << ",";
+        }
+        os << value.index;
         return os;
     }
 
@@ -118,13 +120,20 @@ namespace c2pool::shares
 
     std::istream &operator>>(std::istream &is, ShareData &value)
     {
-        is >> value.previous_share_hash >> value.coinbase >> value.nonce >> value.pubkey_hash >> value.subsidy >> value.donation >> value.stale_info >> value.desired_version;
+
+        is >> value.previous_share_hash >> value.coinbase >> value.nonce >> value.pubkey_hash >> value.subsidy >> value.donation;
+        
+        int stale_info_int;
+        is >> stale_info_int;
+        value.stale_info = (StaleInfo) stale_info_int;
+
+        is >> value.desired_version;
         return is;
     }
 
     std::ostream &operator<<(std::ostream &os, const ShareData &value)
     {
-        os << value.previous_share_hash << "," << value.coinbase << "," << value.nonce << "," << value.pubkey_hash << "," << value.subsidy << "," << value.donation << "," << value.stale_info << "," << value.desired_version;
+        os << value.previous_share_hash.GetHex() << "," << value.coinbase << "," << value.nonce << "," << value.pubkey_hash.GetHex() << "," << value.subsidy << "," << value.donation << "," << value.stale_info << "," << value.desired_version;
         return os;
     }
 
@@ -183,7 +192,7 @@ namespace c2pool::shares
 //TODO: ShareInfoType
 namespace c2pool::shares
 {
-    ShareInfoType::ShareInfoType(std::shared_ptr<ShareData> _share_data, sd::shared_ptr<SegwitData> _segwit_data, std::vector<uint256> _new_transaction_hashes, std::vector<TransactionHashRef> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork)
+    ShareInfoType::ShareInfoType(std::shared_ptr<ShareData> _share_data, std::shared_ptr<SegwitData> _segwit_data, std::vector<uint256> _new_transaction_hashes, std::vector<TransactionHashRef> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork)
     {
         share_data = _share_data;
         segwit_data = _segwit_data;
@@ -235,8 +244,15 @@ namespace c2pool::shares
     {
         os << *value.share_data << "," << *value.segwit_data;
 
-        //TODO: "<<" for vector
-        os << "," << value.new_transaction_hashes << "," << value.transaction_hash_refs;
+        os <<  "," << value.new_transaction_hashes.size();
+        for (int i = 0; i < value.new_transaction_hashes.size(); i++){
+            os << "," << value.new_transaction_hashes[i];
+        }
+
+        os << "," << value.transaction_hash_refs.size();
+        for (int i = 0; i < value.new_transaction_hashes.size(); i++){
+            os << "," << value.transaction_hash_refs[i];
+        }
 
         os << "," << value.far_share_hash << "," << value.max_bits << "," << value.bits << "," << value.timestamp << "," << value.absheigth << "," << value.abswork;
         return os;

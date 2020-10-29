@@ -1,5 +1,9 @@
+#ifndef DBSHELL_BATCH_H
+#define DBSHELL_BATCH_H
+
 #include "leveldb/db.h"
 #include "leveldb/write_batch.h"
+#include "db.h"
 
 namespace dbshell{
     class DBObject;
@@ -22,3 +26,5 @@ namespace dbshell
     };
 
 } // namespace dbshell
+
+#endif

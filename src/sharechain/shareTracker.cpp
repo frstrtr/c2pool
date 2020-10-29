@@ -5,6 +5,7 @@
 #include <set>
 #include <map>
 #include <uint256.h>
+#include <arith_uint256.h>
 #include <share.h>
 #include "events.h"
 
@@ -81,8 +82,8 @@ namespace c2pool::shares::tracker
 
     OkayProtoAttributeDelta::OkayProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta(element_id)
     {
-        work = 0;     //TODO: init zero
-        min_work = 0; //TODO: init zero
+        work.SetHex("0");
+        min_work.SetHex("0");
     }
 
     OkayProtoAttributeDelta operator+(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b)
@@ -92,7 +93,13 @@ namespace c2pool::shares::tracker
             //ERROR
             //TODO: assert
         }
-        return OkayProtoAttributeDelta(a.head, b.tail, a.height + b.height, a.work + b.work, a.min_work + b.min_work);
+
+        auto a_work = UintToArith256(a.work);
+        auto b_work = UintToArith256(b.work);
+        auto a_min_work = UintToArith256(a.min_work);
+        auto b_min_work = UintToArith256(b.min_work);
+
+        return OkayProtoAttributeDelta(a.head, b.tail, a.height + b.height, ArithToUint256(a_work + b_work), ArithToUint256(a_min_work + b_min_work));
     }
     OkayProtoAttributeDelta operator-(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b)
     {
@@ -101,14 +108,17 @@ namespace c2pool::shares::tracker
         //     //ERROR
         //     //TODO: assert
         // }
-
+        auto a_work = UintToArith256(a.work);
+        auto b_work = UintToArith256(b.work);
+        auto a_min_work = UintToArith256(a.min_work);
+        auto b_min_work = UintToArith256(b.min_work);
         if (a.head == b.head)
         {
-            return OkayProtoAttributeDelta(b.tail, a.tail, a.height - b.height, a.work - b.work, a.min_work - b.min_work);
+            return OkayProtoAttributeDelta(b.tail, a.tail, a.height - b.height, ArithToUint256(a_work - b_work), ArithToUint256(a_min_work - b_min_work));
         }
         if (a.tail == b.tail)
         {
-            return OkayProtoAttributeDelta(a.head, b.head, a.height - b.height, a.work - b.work, a.min_work - b.min_work);
+            return OkayProtoAttributeDelta(a.head, b.head, a.height - b.height, ArithToUint256(a_work - b_work), ArithToUint256(a_min_work - b_min_work));
         }
         //TODO: Assertion Error
     }
@@ -127,7 +137,7 @@ namespace c2pool::shares::tracker
 
     SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta(element_id)
     {
-        work = 0; //TODO: init zero
+        work.SetHex("0");
     }
 
     SubsetProtoAttributeDelta operator+(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b)
@@ -137,7 +147,9 @@ namespace c2pool::shares::tracker
             //ERROR
             //TODO: assert
         }
-        return SubsetProtoAttributeDelta(a.head, b.tail, a.height + b.height, a.work + b.work);
+        auto a_work = UintToArith256(a.work);
+        auto b_work = UintToArith256(b.work);
+        return SubsetProtoAttributeDelta(a.head, b.tail, a.height + b.height, ArithToUint256(a_work + b_work));
     }
     SubsetProtoAttributeDelta operator-(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b)
     {
@@ -147,13 +159,15 @@ namespace c2pool::shares::tracker
         //     //TODO: assert
         // }
 
+        auto a_work = UintToArith256(a.work);
+        auto b_work = UintToArith256(b.work);
         if (a.head == b.head)
         {
-            return SubsetProtoAttributeDelta(b.tail, a.tail, a.height - b.height, a.work - b.work);
+            return SubsetProtoAttributeDelta(b.tail, a.tail, a.height - b.height, ArithToUint256(a_work - b_work));
         }
         if (a.tail == b.tail)
         {
-            return SubsetProtoAttributeDelta(a.head, b.head, a.height - b.height, a.work - b.work);
+            return SubsetProtoAttributeDelta(a.head, b.head, a.height - b.height, ArithToUint256(a_work - b_work));
         }
         //TODO: Assertion Error
     }
@@ -312,7 +326,9 @@ namespace c2pool::shares::tracker
             auto tail = heads[delta.head];
             heads.erase(delta.head);
             tails[tail].erase(delta.head);
-            if (reverse[delta.tail] != {delta.head})
+            
+            //if (reverse[delta.tail] != {delta.head}) 
+            if ((reverse[delta.tail].find(delta.head) != reverse[delta.tail].end()) && (reverse[delta.tail].size() == 1))
             {
                 //has sibling
             }

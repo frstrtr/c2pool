@@ -40,7 +40,7 @@ namespace c2pool::shares
         int VOTING_VERSION = 0;
         // auto SUCCESSOR = nullptr; // None //TODO
 
-        auto gentxBeforeRefhash; //TODO: gentx_before_refhash = pack.VarStrType().pack(DONATION_SCRIPT) + pack.IntType(64).pack(0) + pack.VarStrType().pack('\x6a\x28' + pack.IntType(256).pack(0) + pack.IntType(64).pack(0))[:3]
+        //auto gentxBeforeRefhash; //TODO: gentx_before_refhash = pack.VarStrType().pack(DONATION_SCRIPT) + pack.IntType(64).pack(0) + pack.VarStrType().pack('\x6a\x28' + pack.IntType(256).pack(0) + pack.IntType(64).pack(0))[:3]
 
         int gentxSize = 50000; // conservative estimate, will be overwritten during execution
         int gentxWeight = 200000;
@@ -55,12 +55,15 @@ namespace c2pool::shares
         std::shared_ptr<HashLinkType> hash_link;
         std::shared_ptr<MerkleLink> merkle_link;
         std::shared_ptr<ShareData> share_data;
-        uint256 max_target; //TODO: arith_256?
-        uint256 target;     //TODO: arith_256?
+        uint256 max_target;
+        uint256 target;
         unsigned int timestamp;
         uint256 previous_hash;
+        
+        //TODO:
         //template for new_script: p2pool->test->bitcoin->test_data->test_tx_hash()[34;38 lines]
-        auto /*TODO: char[N], where N = len('\x76\xa9' + ('\x14' + pack.IntType(160).pack(pubkey_hash)) + '\x88\xac') */ new_script;
+        //auto /*TODO: char[N], where N = len('\x76\xa9' + ('\x14' + pack.IntType(160).pack(pubkey_hash)) + '\x88\xac') */ new_script;
+        
         unsigned long long desired_version;
         unsigned long absheight;
         uint128 abswork;
@@ -101,23 +104,26 @@ namespace c2pool::shares
 
     class NewShare : BaseShare
     {
-        /*type?*/ VERSION = 33;
-        /*type?*/ VOTING_VERSION = 33;
-        /*type?*/ SUCCESSOR = nullptr;
+        //TODO: INIT
+        // /*type?*/ VERSION = 33;
+        // /*type?*/ VOTING_VERSION = 33;
+        // /*type?*/ SUCCESSOR = nullptr;
     };
 
     class PreSegwitShare : BaseShare
     {
-        /*type?*/ VERSION = 32;
-        /*type?*/ VOTING_VERSION = 32;
-        /*type?*/ SUCCESSOR = NewShare;
+        //TODO: INIT
+        // /*type?*/ VERSION = 32;
+        // /*type?*/ VOTING_VERSION = 32;
+        // /*type?*/ SUCCESSOR = NewShare;
     };
 
     class Share : BaseShare
     {
-        /*type?*/ VERSION = 17;
-        /*type?*/ VOTING_VERSION = 17;
-        /*type?*/ SUCCESSOR = NewShare;
+        //TODO: INIT
+        // /*type?*/ VERSION = 17;
+        // /*type?*/ VOTING_VERSION = 17;
+        // /*type?*/ SUCCESSOR = NewShare;
     };
 } // namespace c2pool::shares
 

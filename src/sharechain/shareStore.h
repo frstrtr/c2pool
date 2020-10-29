@@ -2,6 +2,7 @@
 #define SHARE_STORE_H
 
 #include "db.h"
+#include "uint256.h"
 
 namespace c2pool::shares{
     class BaseShare;

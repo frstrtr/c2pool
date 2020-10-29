@@ -1,3 +1,6 @@
+#ifndef EVENTS_H
+#define EVENTS_H
+
 #include <boost/signals2.hpp>
 
 namespace c2pool::util::events
@@ -15,11 +18,14 @@ namespace c2pool::util::events
         {
             sig.connect(std::bind(__f, __args...));
         }
-        
-        void unsubscribe(){
+
+        void unsubscribe()
+        {
             //TODO
         }
 
         void happened(Args... args) const { sig(args...); }
     };
 } // namespace c2pool::util::events
+
+#endif
