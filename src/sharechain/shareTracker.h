@@ -110,7 +110,7 @@ namespace c2pool::shares::tracker
         //TrackerView
     public:
         map<uint256, tuple<delta_type, unsigned long>> _deltas; // item_hash -> delta, ref
-        map<unsigned long, set<uint256>> _reverse_deltas = {}   // ref -> set of item_hashes
+        map<unsigned long, set<uint256>> _reverse_deltas = {};   // ref -> set of item_hashes
 
         unsigned long ref_generator = 0; //TrackerView::_ref_generator
         map<unsigned long, delta_type> _delta_refs = {};      // ref -> delta
@@ -145,9 +145,9 @@ namespace c2pool::shares::tracker
 
         delta_type _get_delta(uint256 item_hash)
         {
-            if (deltas.find(item_hash) != deltas.end())
+            if (_deltas.find(item_hash) != _deltas.end())
             {
-                auto delta_ref1 = deltas[item_hash];
+                auto delta_ref1 = _deltas[item_hash];
                 auto delta2 = _delta_refs[std::get<1>(delta_ref1)];
                 return std::get<0>(delta_ref1) + delta2;
             }
@@ -303,7 +303,7 @@ namespace c2pool::shares::tracker
             }
             catch(const std::exception& e)
             {
-                LOG_ERROR << e.what() << '\n'; //TODO:
+                LOG_ERROR << e.what() << '\n';
                 return false;
             }
 

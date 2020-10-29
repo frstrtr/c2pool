@@ -1,3 +1,6 @@
+#ifndef DBSHELL_DB_H
+#define DBSHELL_DB_H
+
 #include "leveldb/db.h"
 #include <string>
 
@@ -40,3 +43,5 @@ namespace dbshell
         Database &operator=(const Database &) = delete;
     };
 } // namespace dbshell
+
+#endif

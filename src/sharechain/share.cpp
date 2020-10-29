@@ -78,12 +78,12 @@ namespace c2pool::shares
         //TODO: self.hash = self.header_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(self.header))
 
         //TODO: add MAX_TARGET in net
-        if (target > net->MAX_TARGET)
+        if (target.Compare(net->MAX_TARGET) > 0)//target > net->MAX_TARGET)
         {
             //TODO: raise p2p.PeerMisbehavingError('share target invalid')
         }
 
-        if (pow_hash > target)
+        if (pow_hash.Compare(target) > 0)//pow_hash > target)
         {
             //TODO: raise p2p.PeerMisbehavingError('share PoW invalid')
         }

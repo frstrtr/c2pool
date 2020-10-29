@@ -198,7 +198,7 @@ namespace c2pool::shares
     public:
         std::shared_ptr<SmallBlockHeaderType> header; //TODO: name: header?
         uint256 merkle_root;                          //TODO: arith_uint256?
-    }
+    };
 } // namespace c2pool::shares
 
 #endif
