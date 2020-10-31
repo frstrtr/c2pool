@@ -68,7 +68,8 @@ namespace c2pool::shares
     std::ostream &operator<<(std::ostream &os, const MerkleLink &value)
     {
         os << value.branch.size() << ",";
-        for (int i = 0; i < value.branch.size(); i++){
+        for (int i = 0; i < value.branch.size(); i++)
+        {
             os << value.branch[i] << ",";
         }
         os << value.index;
@@ -122,10 +123,10 @@ namespace c2pool::shares
     {
 
         is >> value.previous_share_hash >> value.coinbase >> value.nonce >> value.pubkey_hash >> value.subsidy >> value.donation;
-        
+
         int stale_info_int;
         is >> stale_info_int;
-        value.stale_info = (StaleInfo) stale_info_int;
+        value.stale_info = (StaleInfo)stale_info_int;
 
         is >> value.desired_version;
         return is;
@@ -244,13 +245,15 @@ namespace c2pool::shares
     {
         os << *value.share_data << "," << *value.segwit_data;
 
-        os <<  "," << value.new_transaction_hashes.size();
-        for (int i = 0; i < value.new_transaction_hashes.size(); i++){
+        os << "," << value.new_transaction_hashes.size();
+        for (int i = 0; i < value.new_transaction_hashes.size(); i++)
+        {
             os << "," << value.new_transaction_hashes[i];
         }
 
         os << "," << value.transaction_hash_refs.size();
-        for (int i = 0; i < value.new_transaction_hashes.size(); i++){
+        for (int i = 0; i < value.new_transaction_hashes.size(); i++)
+        {
             os << "," << value.transaction_hash_refs[i];
         }
 
@@ -330,4 +333,17 @@ namespace c2pool::shares
         return os;
     }
 
+} // namespace c2pool::shares
+
+namespace c2pool::shares
+{
+    std::istream &operator>>(std::istream &is, RawShare &value)
+    {
+        is >> value.type >> value.contents;
+    }
+
+    std::ostream &operator<<(std::ostream &os, const RawShare &value)
+    {
+        os << value.type << "," << value.contents;
+    }
 } // namespace c2pool::shares
