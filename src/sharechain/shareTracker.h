@@ -2,6 +2,7 @@
 #define SHARE_TRACKER_H
 
 #include <shareTypes.h>
+#include <share.h>
 #include <uint256.h>
 #include <vector>
 #include <map>

@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <tuple>
+#include <uint256.h>
 
 namespace c2pool::config
 {
@@ -20,6 +21,8 @@ namespace c2pool::config
         const unsigned char *IDENTIFIER;
         int MINIMUM_PROTOCOL_VERSION;
         int SEGWIT_ACTIVATION_VERSION;
+
+        uint256 MAX_TARGET;
 
     protected:
         Network();

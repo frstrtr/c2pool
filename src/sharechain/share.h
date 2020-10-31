@@ -13,21 +13,46 @@ namespace c2pool::config
     class Network;
 }
 
+namespace c2pool::shares::tracker
+{
+    class OkayTracker;
+}
+
 using dbshell::DBObject;
 using std::shared_ptr, std::string;
 using namespace c2pool::shares;
 
 namespace c2pool::shares
 {
-    class Share
+
+    template <typename ShareClass>
+    ShareClass load_share(RawShare _share, shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr)
     {
-    public:
-        int shareType;        //pack.VarIntType()
-        string shareContents; //pack.VarStrType()
+        ShareVersion type = (ShareVersion)_share.type;
+        switch (type)
+        {
+        case Share:
+        case PreSegwitShare:
+        case NewShare:
+            return ShareClass(_net, _peer_addr, _share.contents);
+        default:
+            if (_share.type < Share)
+            {
+                //TODO: raise p2p.PeerMisbehavingError('sent an obsolete share')
+            }
+            else
+            {
+                //TODO: raise ValueError('unknown share type: %r' % (share['type'],))
+            }
+            break;
+        }
+    }
 
-        void load_share(/*in parameters block*/ Share share, string net, std::tuple<std::string, std::string> peerAddr, /*out parameters block*/ share_versions[share['type']](net, peer_addr, share_versions[share['type']].get_dynamic_types(net)['share_type'].unpack(share['contents']))){
-
-        };
+    struct GeneratedTransaction{
+        std::shared_ptr<ShareInfoType> share_info;
+        //TODO: gentx
+        std::vector<uint256> other_transaction_hashes;
+        //TODO boost::functional: get_share()
     };
 
     class BaseShare : public DBObject
@@ -38,6 +63,7 @@ namespace c2pool::shares
     public:
         int VERSION = 0;
         int VOTING_VERSION = 0;
+        ShareVersion TYPE = NoneVersion;
         // auto SUCCESSOR = nullptr; // None //TODO
 
         //auto gentxBeforeRefhash; //TODO: gentx_before_refhash = pack.VarStrType().pack(DONATION_SCRIPT) + pack.IntType(64).pack(0) + pack.VarStrType().pack('\x6a\x28' + pack.IntType(256).pack(0) + pack.IntType(64).pack(0))[:3]
@@ -59,11 +85,11 @@ namespace c2pool::shares
         uint256 target;
         unsigned int timestamp;
         uint256 previous_hash;
-        
+
         //TODO:
         //template for new_script: p2pool->test->bitcoin->test_data->test_tx_hash()[34;38 lines]
         //auto /*TODO: char[N], where N = len('\x76\xa9' + ('\x14' + pack.IntType(160).pack(pubkey_hash)) + '\x88\xac') */ new_script;
-        
+
         unsigned long long desired_version;
         unsigned long absheight;
         uint128 abswork;
@@ -80,50 +106,36 @@ namespace c2pool::shares
         virtual void DeserializeJSON(std::string json);
 
     public:
-        /*TODO: return type*/ auto generateTransaction(
-            auto /*tracker type*/ tracker
-            /*cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None*/
-            /*out parameters block*/
-            /*share_info, gentx, other_transaction_hashes, get_share*/){};
 
-        // @classmethod
-        void getRefHash(shared_ptr<c2pool::config::Network> _net, auto shareInfo, auto refMerkleLink)
-        {
-            return 0; //pack.IntType(256).pack(bitcoin_data.check_merkle_link(bitcoin_data.hash256(cls.get_dynamic_types(net)['ref_type'].pack(dict(identifier=net.IDENTIFIER, share_info=share_info,))), ref_merkle_link))
-        };
+        //TODO: return type
+        static GeneratedTransaction generate_transaction(c2pool::shares::tracker::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
+                                         uint256 _block_target, unsigned int _desired_timestamp,
+                                         uint256 _desired_target, MerkleLink _ref_merkle_link,
+                                         /*TODO: <type> desired_other_transaction_hashes_and_fees, */
+                                         shared_ptr<c2pool::config::Network> _net, /*TODO: <type> known_txs, <type> last_txout_nonce=0,*/
+                                         long long base_subsidy, shared_ptr<SegwitData> _segwit_data);
 
-        // class initialization constructor __init__(self...)
+        // //TODO: return struct
+        // /*TODO: return type*/ auto generateTransaction(
+        //     auto /*tracker type*/ tracker
+        //     /*cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None*/
+        //     /*out parameters block*/
+        //     /*share_info, gentx, other_transaction_hashes, get_share*/){};
+
+        // // @classmethod
+        // void getRefHash(shared_ptr<c2pool::config::Network> _net, auto shareInfo, auto refMerkleLink)
+        // {
+        //     //pack.IntType(256).pack(bitcoin_data.check_merkle_link(bitcoin_data.hash256(cls.get_dynamic_types(net)['ref_type'].pack(dict(identifier=net.IDENTIFIER, share_info=share_info,))), ref_merkle_link))
+        // };
+
+        // // class initialization constructor __init__(self...)
     public:
-        /*type?*/ check(/*type?*/ tracker, /*type?*/ otherTXs = nullptr){
+        // /*type?*/ check(/*type?*/ tracker, /*type?*/ otherTXs = nullptr){
 
-        };
+        // };
 
         //TODO: [wanna this?] /*type?*/ void as_share;
         //TODO: [wanna this?] /*type?*/ asBlock(/*type?*/ tracker, /*type?*/ knownTXs)
-    };
-
-    class NewShare : BaseShare
-    {
-        //TODO: INIT
-        // /*type?*/ VERSION = 33;
-        // /*type?*/ VOTING_VERSION = 33;
-        // /*type?*/ SUCCESSOR = nullptr;
-    };
-
-    class PreSegwitShare : BaseShare
-    {
-        //TODO: INIT
-        // /*type?*/ VERSION = 32;
-        // /*type?*/ VOTING_VERSION = 32;
-        // /*type?*/ SUCCESSOR = NewShare;
-    };
-
-    class Share : BaseShare
-    {
-        //TODO: INIT
-        // /*type?*/ VERSION = 17;
-        // /*type?*/ VOTING_VERSION = 17;
-        // /*type?*/ SUCCESSOR = NewShare;
     };
 } // namespace c2pool::shares
 
