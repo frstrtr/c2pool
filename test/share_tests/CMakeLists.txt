@@ -1,7 +1,7 @@
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
 
-set(SHARE_TESTS_SOURCE shareTypes_test.cpp)
+set(SHARE_TESTS_SOURCE shareTypes_test.cpp share_test.cpp tracker_test.cpp)
 add_executable(runShareTests ${SHARE_TESTS_SOURCE})
 
 
