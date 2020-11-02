@@ -6,6 +6,7 @@
 #include <other.h>
 #include <uint256.h>
 #include <arith_uint256.h>
+#include <bitcoin/data.h>
 
 #include <memory>
 #include <sstream>
@@ -124,7 +125,7 @@ namespace c2pool::shares
                                                          uint256 _block_target, unsigned int _desired_timestamp,
                                                          uint256 _desired_target, MerkleLink _ref_merkle_link,
                                                          /*TODO: <type> desired_other_transaction_hashes_and_fees, */
-                                                         shared_ptr<c2pool::config::Network> _net, /*TODO: <type> known_txs, <type> last_txout_nonce=0,*/
+                                                         shared_ptr<c2pool::config::Network> _net, map<uint256, TransactionType> known_txs, /*TODO:  <type> last_txout_nonce=0,*/
                                                          long long base_subsidy, shared_ptr<SegwitData> _segwit_data)
     {
         auto t0 = c2pool::time::timestamp();
@@ -187,14 +188,16 @@ namespace c2pool::shares
 
         //TODO: create get_chain in Tracker
         vector<BaseShare> past_shares = _tracker.get_chain(_share_data->previous_share_hash, std::min(height, 100));
-        /*TODO: Create tx's:
-        map<uint256, <VALUE>> tx_hash_to_this;
+        
+        map<uint256, tuple<int, int>> tx_hash_to_this;
 
-        for i, share in enumerate(past_shares):
-            for j, tx_hash in enumerate(share.new_transaction_hashes):
-                if tx_hash not in tx_hash_to_this:
-                    tx_hash_to_this[tx_hash] = [1+i, j] # share_count, tx_count
-        */
+        for (int i = 0; i < past_shares.size(); i++){
+            for (int j = 0; j < past_shares[i].new_transaction_hashes.size(); j++){
+                if (tx_hash_to_this.find(past_shares[i].new_transaction_hashes[j]) == tx_hash_to_this.end()){
+                    tx_hash_to_this[past_shares[i].new_transaction_hashes[j]] = make_tuple(1+i, j);
+                }
+            }
+        }
 
         auto t2 = c2pool::time::timestamp();
 
@@ -263,6 +266,9 @@ namespace c2pool::shares
                 80+all_transaction_real_size+cls.gentx_size, 
                 3*80+all_transaction_weight+cls.gentx_weight)
        */
+
+
+        set<uint256> included_transactions(other_transaction_hashes.begin(), other_transaction_hashes.end()); //TODO: test
 
         /*TODO: Create tx's
 
