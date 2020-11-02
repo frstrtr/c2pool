@@ -718,6 +718,83 @@ class FloatingIntegerType(Type):
     
     def write(self, file, item):
         return self._inner.write(file, item.bits)
+
+#---new
+
+def is_segwit_tx(tx):
+    return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
+
+tx_in_type = ComposedType([
+    ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
+        ('hash', IntType(256)),
+        ('index', IntType(32)),
+    ]))),
+    ('script', VarStrType()),
+    ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
+])
+
+tx_out_type = ComposedType([
+    ('value', IntType(64)),
+    ('script', VarStrType()),
+])
+
+tx_id_type = ComposedType([
+    ('version', IntType(32)),
+    ('tx_ins', ListType(tx_in_type)),
+    ('tx_outs', ListType(tx_out_type)),
+    ('lock_time', IntType(32))
+])
+
+class TransactionType(Type):
+    _int_type = IntType(32)
+    _varint_type = VarIntType()
+    _witness_type = ListType(VarStrType())
+    _wtx_type = ComposedType([
+        ('flag', IntType(8)),
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type))
+    ])
+    _ntx_type = ComposedType([
+        ('tx_outs', ListType(tx_out_type)),
+        ('lock_time', _int_type)
+    ])
+    _write_type = ComposedType([
+        ('version', _int_type),
+        ('marker', IntType(8)),
+        ('flag', IntType(8)),
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type))
+    ])
+
+    def read(self, file):
+        version = self._int_type.read(file)
+        marker = self._varint_type.read(file)
+        if marker == 0:
+            next = self._wtx_type.read(file) #_wtx_type
+            witness = [None]*len(next['tx_ins'])
+            for i in range(len(next['tx_ins'])):
+                witness[i] = self._witness_type.read(file)
+            locktime = self._int_type.read(file)
+            return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
+        else:
+            tx_ins = [None]*marker
+            for i in range(marker):
+                tx_ins[i] = tx_in_type.read(file)
+            next = self._ntx_type.read(file) #_ntx_type
+            return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
+    
+    def write(self, file, item):
+        if is_segwit_tx(item):
+            assert len(item['tx_ins']) == len(item['witness'])
+            self._write_type.write(file, item)
+            for w in item['witness']:
+                self._witness_type.write(file, w)
+            self._int_type.write(file, item['lock_time'])
+            return
+        return tx_id_type.write(file, item)
+
+tx_type = TransactionType()
+
 # ------------------------------------------messages and types---------------------------------------
 address_type = ComposedType([
     ('services', IntType(64)),
@@ -1311,3 +1388,42 @@ def TEST_UNPACKRES():
 #print(PossiblyNoneType(0, IntType(8)).pack(0))
 
 #print(ListType(VarIntType(), 2).pack([12,23,23,23]))
+
+tx_packed = tx_type.pack({
+    'version':1, 
+    'tx_outs': [{
+        'value':2,
+        'script':'test_script'}],
+    'tx_ins': [{
+        'sequence':1,
+        'script':'tx_ins_test_script',
+        'previous_output':{
+            'hash':123,
+            'index':321}}],
+    'lock_time':199,
+})
+print(tx_packed)
+tx_unpacked = tx_type.unpack(tx_packed)
+print(tx_unpacked)
+
+segwit_tx_packed = tx_type.pack({
+    'version':1, 
+    'tx_outs': [{
+        'value':2,
+        'script':'test_script'}],
+    'tx_ins': [{
+        'sequence':1,
+        'script':'tx_ins_test_script',
+        'previous_output':{
+            'hash':123,
+            'index':321}}],
+    'lock_time':199,
+    
+    'marker': 0,
+    'flag': 1,
+    'witness':[{'test_witness'}]
+})
+print('____________')
+print(segwit_tx_packed)
+segwit_tx_unpacked = tx_type.unpack(segwit_tx_packed)
+print(segwit_tx_unpacked)
