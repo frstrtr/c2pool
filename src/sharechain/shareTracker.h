@@ -11,6 +11,7 @@
 #include <tuple>
 #include "events.h"
 #include <memory>
+#include "console.h"
 
 using c2pool::util::events::Event;
 using std::shared_ptr;
@@ -224,7 +225,7 @@ namespace c2pool::shares::tracker
 
         virtual void remove(uint256 item_hash);
 
-        //TODO: create get_chain
+        vector<BaseShare> get_chain();
 
         bool is_child_of(uint256 item_hash, uint256 possible_child_hash);
     };
@@ -300,7 +301,7 @@ namespace c2pool::shares::tracker
 
             try
             {
-                share.check(shared_from_this()); //TODO
+                //share.check(shared_from_this()); //TODO
             }
             catch(const std::exception& e)
             {

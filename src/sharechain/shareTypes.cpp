@@ -193,7 +193,7 @@ namespace c2pool::shares
 //TODO: ShareInfoType
 namespace c2pool::shares
 {
-    ShareInfoType::ShareInfoType(std::shared_ptr<ShareData> _share_data, std::shared_ptr<SegwitData> _segwit_data, std::vector<uint256> _new_transaction_hashes, std::vector<TransactionHashRef> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork)
+    ShareInfoType::ShareInfoType(std::shared_ptr<ShareData> _share_data, std::vector<uint256> _new_transaction_hashes, std::vector<TransactionHashRef> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork, std::shared_ptr<SegwitData> _segwit_data)
     {
         share_data = _share_data;
         segwit_data = _segwit_data;
@@ -340,10 +340,12 @@ namespace c2pool::shares
     std::istream &operator>>(std::istream &is, RawShare &value)
     {
         is >> value.type >> value.contents;
+        return is;
     }
 
     std::ostream &operator<<(std::ostream &os, const RawShare &value)
     {
         os << value.type << "," << value.contents;
+        return os;
     }
 } // namespace c2pool::shares

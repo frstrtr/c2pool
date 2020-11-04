@@ -6,7 +6,8 @@
 #include <other.h>
 #include <uint256.h>
 #include <arith_uint256.h>
-#include <bitcoin/data.h>
+#include <data.h>
+#include <console.h>
 
 #include <memory>
 #include <sstream>
@@ -24,6 +25,9 @@ namespace c2pool::shares
     {
         return (segwit_activation_version > 0) && (version >= segwit_activation_version);
     }
+
+    int BaseShare::gentxSize = 50000;
+    int BaseShare::gentxWeight = 200000;
 
     BaseShare::BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents)
     {
@@ -124,19 +128,19 @@ namespace c2pool::shares
     GeneratedTransaction BaseShare::generate_transaction(c2pool::shares::tracker::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
                                                          uint256 _block_target, unsigned int _desired_timestamp,
                                                          uint256 _desired_target, MerkleLink _ref_merkle_link,
-                                                         /*TODO: <type> desired_other_transaction_hashes_and_fees, */
-                                                         shared_ptr<c2pool::config::Network> _net, map<uint256, TransactionType> known_txs, /*TODO:  <type> last_txout_nonce=0,*/
+                                                         vector<tuple<uint256, int>> desired_other_transaction_hashes_and_fees,
+                                                         shared_ptr<c2pool::config::Network> _net, map<uint256, bitcoind::data::TransactionType> known_txs, /*TODO:  <type> last_txout_nonce=0,*/
                                                          long long base_subsidy, shared_ptr<SegwitData> _segwit_data)
     {
         auto t0 = c2pool::time::timestamp();
-        std::shared_ptr<BaseShare> previous_share; //TODO: tracker BaseShare -> shared_ptr<BaseShare>
+        BaseShare previous_share; //TODO: tracker BaseShare -> shared_ptr<BaseShare>
         if (_share_data->previous_share_hash.IsNull())
         {
             previous_share = _tracker.items[_share_data->previous_share_hash];
         }
         else
         {
-            previous_share = nullptr;
+            previous_share.TYPE = NoneVersion;
         }
 
         auto height_last = _tracker.get_height_and_last(_share_data->previous_share_hash);
@@ -145,7 +149,7 @@ namespace c2pool::shares
         //TODO ASSERT: assert height >= net.REAL_CHAIN_LENGTH or last is None
 
         uint256 pre_target3;
-        //TODO: add TARGET_LOOKBEHIND in network
+
         if (height < _net->TARGET_LOOKBEHIND)
         {
             pre_target3 = _net->MAX_TARGET;
@@ -159,8 +163,8 @@ namespace c2pool::shares
             if (!attempts_per_second.IsNull())
             {
                 pre_target.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-                //TODO: add SHARED_PERIOD in network
-                pre_target = (pre_target / _net->SHARED_PERIOD * attempts_per_second) - 1;
+                
+                pre_target = (pre_target / UintToArith256(attempts_per_second) * _net->SHARE_PERIOD) - 1;
             }
             else
             {
@@ -175,68 +179,86 @@ namespace c2pool::shares
         uint256 max_bits; //TODO: = bitcoin_data.FloatingInteger.from_target_upper_bound(pre_target3)
         uint256 bits;     //TODO: =bitcoin_data.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//30, pre_target3)))
 
-        std::vector<uint256> new_transaction_hashes; //TODO: type
-        int new_transaction_size = 0;                //including witnesses //TODO: type
-        int all_transaction_stripped_size = 0;       //stripped size //TODO: type
-        int all_transaction_real_size = 0;           //including witnesses, for statistics //TODO: type
-        int new_transaction_weight = 0;              //TODO: type
-        int all_transaction_weight = 0;              //TODO: type
-        vector<uint256> transaction_hash_refs;       // = [] //TODO: type
-        vector<uint256> other_transaction_hashes;    // = [] //TODO: type
+        std::vector<uint256> new_transaction_hashes;
+        int new_transaction_size = 0;                //including witnesses
+        int all_transaction_stripped_size = 0;       //stripped size
+        int all_transaction_real_size = 0;           //including witnesses, for statistics
+        int new_transaction_weight = 0;
+        int all_transaction_weight = 0;
+        vector<tuple<int, int>> transaction_hash_refs;
+        vector<uint256> other_transaction_hashes;
 
         auto t1 = c2pool::time::timestamp();
 
         //TODO: create get_chain in Tracker
         vector<BaseShare> past_shares = _tracker.get_chain(_share_data->previous_share_hash, std::min(height, 100));
-        
+
         map<uint256, tuple<int, int>> tx_hash_to_this;
 
-        for (int i = 0; i < past_shares.size(); i++){
-            for (int j = 0; j < past_shares[i].new_transaction_hashes.size(); j++){
-                if (tx_hash_to_this.find(past_shares[i].new_transaction_hashes[j]) == tx_hash_to_this.end()){
-                    tx_hash_to_this[past_shares[i].new_transaction_hashes[j]] = make_tuple(1+i, j);
+        for (int i = 0; i < past_shares.size(); i++)
+        {
+            for (int j = 0; j < past_shares[i].new_transaction_hashes.size(); j++)
+            {
+                if (tx_hash_to_this.find(past_shares[i].new_transaction_hashes[j]) == tx_hash_to_this.end())
+                {
+                    tx_hash_to_this[past_shares[i].new_transaction_hashes[j]] = std::make_tuple(1 + i, j);
                 }
             }
         }
 
         auto t2 = c2pool::time::timestamp();
 
-        /*TODO: Create tx's
-        
-        for tx_hash, fee in desired_other_transaction_hashes_and_fees:
-            if known_txs is not None:
-                this_stripped_size = bitcoin_data.tx_id_type.packed_size(known_txs[tx_hash])
-                this_real_size     = bitcoin_data.tx_type.packed_size(known_txs[tx_hash])
-                this_weight        = this_real_size + 3*this_stripped_size
-            else: # we're just verifying someone else's share. We'll calculate sizes in should_punish_reason()
-                this_stripped_size = 0
-                this_real_size = 0
-                this_weight = 0
+        for (auto txhash_fee : desired_other_transaction_hashes_and_fees)
+        {
+            uint256 tx_hash = std::get<0>(txhash_fee);
+            int fee = std::get<1>(txhash_fee);
 
-            if all_transaction_stripped_size + this_stripped_size + 80 + cls.gentx_size +  500 > net.BLOCK_MAX_SIZE:
-                break
-            if all_transaction_weight + this_weight + 4*80 + cls.gentx_weight + 2000 > net.BLOCK_MAX_WEIGHT:
-                break
+            int this_stripped_size = 0;
+            int this_real_size = 0;
+            int this_weight = 0;
 
-            if tx_hash in tx_hash_to_this:
-                this = tx_hash_to_this[tx_hash]
-                if known_txs is not None:
-                    all_transaction_stripped_size += this_stripped_size
-                    all_transaction_real_size += this_real_size
-                    all_transaction_weight += this_weight
-            else:
-                if known_txs is not None:
-                    new_transaction_size += this_real_size
-                    all_transaction_stripped_size += this_stripped_size
-                    all_transaction_real_size += this_real_size
-                    new_transaction_weight += this_weight
-                    all_transaction_weight += this_weight
-                new_transaction_hashes.append(tx_hash)
-                this = [0, len(new_transaction_hashes)-1]
-            transaction_hash_refs.extend(this)
-            other_transaction_hashes.append(tx_hash)
+            if (known_txs.size() > 0)
+            {
+                //TODO: packed_size for type
+                //this_stripped_size = bitcoin_data.tx_id_type.packed_size(known_txs[tx_hash]);
+                //TODO: packed_size for type
+                //this_real_size     = bitcoin_data.tx_type.packed_size(known_txs[tx_hash]);
+                this_weight = this_real_size + 3 * this_stripped_size;
+            }
 
-        */
+            //TODO: gentx_size — static/const? method — static?
+            if (all_transaction_stripped_size + this_stripped_size + 80 + gentxSize + 500 > _net->BLOCK_MAX_SIZE)
+                break;
+            if (all_transaction_weight + this_weight + 320 + gentxWeight + 2000 > _net->BLOCK_MAX_WEIGHT)
+                break;
+
+            tuple<int, int> _this;
+            if (tx_hash_to_this.find(tx_hash) != tx_hash_to_this.end())
+            {
+                _this = tx_hash_to_this[tx_hash];
+                if (known_txs.size() > 0)
+                {
+                    all_transaction_stripped_size += this_stripped_size;
+                    all_transaction_real_size += this_real_size;
+                    all_transaction_weight += this_weight;
+                }
+            }
+            else
+            {
+                if (known_txs.size() > 0)
+                {
+                    new_transaction_size += this_real_size;
+                    all_transaction_stripped_size += this_stripped_size;
+                    all_transaction_real_size += this_real_size;
+                    new_transaction_weight += this_weight;
+                    all_transaction_weight += this_weight;
+                }
+                new_transaction_hashes.push_back(tx_hash);
+                _this = std::make_tuple(0, new_transaction_hashes.size() - 1);
+            }
+            transaction_hash_refs.push_back(_this);
+            other_transaction_hashes.push_back(tx_hash);
+        }
 
         auto t3 = c2pool::time::timestamp();
 
@@ -249,32 +271,35 @@ namespace c2pool::shares
 
         auto t4 = c2pool::time::timestamp();
 
-        /*TODO: Create tx's
-        
-        if all_transaction_stripped_size:
-            print "Generating a share with %i bytes, %i WU (new: %i B, %i WU) in %i tx (%i new), plus est gentx of %i bytes/%i WU" % (
-                all_transaction_real_size,
-                all_transaction_weight,
-                new_transaction_size,
-                new_transaction_weight,
-                len(other_transaction_hashes),
-                len(new_transaction_hashes),
-                cls.gentx_size,
-                cls.gentx_weight)
-            print "Total block stripped size=%i B, full size=%i B,  weight: %i WU" % (
-                80+all_transaction_stripped_size+cls.gentx_size, 
-                80+all_transaction_real_size+cls.gentx_size, 
-                3*80+all_transaction_weight+cls.gentx_weight)
-       */
+        if (all_transaction_stripped_size > 0)
+        {
+            LOG_INFO << "Generating a share with " << all_transaction_real_size << " bytes, "
+                     << all_transaction_weight << " WU (new: " << new_transaction_size
+                     << " B, " << new_transaction_weight << " WU) in " << other_transaction_hashes.size()
+                     << " tx (" << new_transaction_hashes.size() << " new), plus est gentx of "
+                     << gentxSize << " bytes/" << gentxWeight << " WU";
 
+            LOG_INFO << "Total block stripped size=" << 80 + all_transaction_stripped_size + gentxSize
+                     << " B, full size=" << 80 + all_transaction_real_size + gentxSize << " B,  weight: "
+                     << 240 + all_transaction_weight + gentxWeight << " WU";
+        }
 
         set<uint256> included_transactions(other_transaction_hashes.begin(), other_transaction_hashes.end()); //TODO: test
 
-        /*TODO: Create tx's
+        vector<int> removed_fees;
+        for (auto txhash_fee : desired_other_transaction_hashes_and_fees)
+        {
+            uint256 tx_hash = std::get<0>(txhash_fee);
+            int fee = std::get<1>(txhash_fee);
+            if (included_transactions.find(tx_hash) == included_transactions.end()){
+                removed_fees.push_back(fee);
+            }
+        }
+        //TODO: definite_fees = sum(0 if fee is None else fee for tx_hash, fee in desired_other_transaction_hashes_and_fees if tx_hash in included_transactions)
+        
 
-        included_transactions = set(other_transaction_hashes)
-        removed_fees = [fee for tx_hash, fee in desired_other_transaction_hashes_and_fees if tx_hash not in included_transactions]
-        definite_fees = sum(0 if fee is None else fee for tx_hash, fee in desired_other_transaction_hashes_and_fees if tx_hash in included_transactions)
+
+        /*TODO: Create tx's
         if None not in removed_fees:
             share_data = dict(share_data, subsidy=share_data['subsidy'] - sum(removed_fees))
         else:
@@ -283,9 +308,9 @@ namespace c2pool::shares
        */
 
         uint256 _prev;
-        if (previous_share != nullptr)
+        if (previous_share.TYPE != NoneVersion)
         {
-            _prev = previous_share->share_data->previous_share_hash;
+            _prev = previous_share.share_data->previous_share_hash;
         }
         else
         {
@@ -294,7 +319,7 @@ namespace c2pool::shares
         //TODO: create get_cumulative_weights in tracker
         auto cumulative_weights = _tracker.get_cumulative_weights(
             _prev,
-            std::max(0, std::min(height, _net->REAL_CHAIN_LENGTH) - 1), //TODO: add REAL_CHAIN_LENGTH in network
+            std::max(0, std::min(height, _net->REAL_CHAIN_LENGTH) - 1),
             //TODO: 65535*net.SPREAD*bitcoin_data.target_to_average_attempts(block_target)
         );
 
@@ -314,13 +339,13 @@ namespace c2pool::shares
 
         bool segwit_activated = is_segwit_activated(/*TODO*/);
 
-        if (_segwit_data == nullptr && known_txs == nullptr)
+        if (_segwit_data == nullptr && known_txs.size() > 0 )
         {
             segwit_activated = false;
         }
 
         //TODO: add in if: and any(bitcoin_data.is_segwit_tx(known_txs[h]) for h in other_transaction_hashes):
-        if (!(segwit_activated || (known_txs == nullptr)))
+        if (!(segwit_activated || (known_txs.size() > 0)))
         {
             //TODO RAISE: raise ValueError('segwit transaction included before activation')
         }
@@ -336,26 +361,32 @@ namespace c2pool::shares
         */
 
         uint256 _far_share_hash;
-        if (last.IsNull() && height < 99){
+        if (last.IsNull() && height < 99)
+        {
             _far_share_hash.SetNull();
-        } else {
+        }
+        else
+        {
             _tracker.get_nth_parent_hash(_share_data->previous_share_hash, 99); //TODO
         }
         auto share_info = std::make_shared<ShareInfoType>(_share_data, new_transaction_hashes, transaction_hash_refs, _far_share_hash, max_bits, bits /*TODO: , timestamp, absheight, abswork*/);
 
-        if (previous_share != nullptr && _desired_timestamp > previous_share->timestamp+180){
-            LOG_WARNING << "Warning: Previous share's timestamp is " << _desired_timestamp - previous_share->timestamp << " seconds old.\n"
-                      << "Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n"
-                      << "If your clock is more than 300 seconds behind, it can result in orphaned shares.\n"
-                      << "(It's also possible that this share is just taking a long time to mine.)";
+        if (previous_share.TYPE != NoneVersion && _desired_timestamp > previous_share.timestamp + 180)
+        {
+            LOG_WARNING << "Warning: Previous share's timestamp is " << _desired_timestamp - previous_share.timestamp << " seconds old.\n"
+                        << "Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n"
+                        << "If your clock is more than 300 seconds behind, it can result in orphaned shares.\n"
+                        << "(It's also possible that this share is just taking a long time to mine.)";
         }
 
-        if (previous_share != nullptr && previous_share->timestamp > c2pool::time::timestamp()+3){
-            LOG_WARNING << "WARNING! Previous share's timestamp is" << previous_share->timestamp - c2pool::time::timestamp() << "seconds in the future. This is not normal.\n"
+        if (previous_share.TYPE != NoneVersion && previous_share.timestamp > c2pool::time::timestamp() + 3)
+        {
+            LOG_WARNING << "WARNING! Previous share's timestamp is" << previous_share.timestamp - c2pool::time::timestamp() << "seconds in the future. This is not normal.\n"
                         << "Make sure your system clock is accurate. Errors beyond 300 sec result in orphaned shares.";
         }
 
-        if (segwit_activated){
+        if (segwit_activated)
+        {
             share_info->segwit_data = _segwit_data;
         }
 
@@ -402,7 +433,7 @@ namespace c2pool::shares
             (t5-t4)*1000.)
         */
 
-        return GeneratedTransaction();//TODO: init
+        return GeneratedTransaction(); //TODO: init
     }
 
     std::string BaseShare::SerializeJSON()

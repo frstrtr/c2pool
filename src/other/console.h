@@ -1,3 +1,6 @@
+#ifndef OTHER_CONSOLE_H
+#define OTHER_CONSOLE_H
+
 #include <iostream>
 
 #include <boost/log/core.hpp>
@@ -24,10 +27,11 @@ namespace c2pool::console
         inline static Logger *instance;
 
         Logger();
-
     public:
         static void Init();
 
         static Logger* log();
     };
 } // namespace c2pool::console
+
+#endif

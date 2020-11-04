@@ -7,6 +7,9 @@
 #include <shareTypes.h>
 #include <memory>
 #include <tuple>
+#include <vector>
+#include <map>
+#include "uint256.h"
 
 namespace c2pool::config
 {
@@ -18,9 +21,15 @@ namespace c2pool::shares::tracker
     class OkayTracker;
 }
 
+namespace bitcoind::data
+{
+    class TransactionType;
+}
+
 using dbshell::DBObject;
 using std::shared_ptr, std::string;
 using namespace c2pool::shares;
+using std::vector, std::tuple, std::map;
 
 namespace c2pool::shares
 {
@@ -48,7 +57,8 @@ namespace c2pool::shares
         }
     }
 
-    struct GeneratedTransaction{
+    struct GeneratedTransaction
+    {
         std::shared_ptr<ShareInfoType> share_info;
         //TODO: gentx
         std::vector<uint256> other_transaction_hashes;
@@ -58,6 +68,8 @@ namespace c2pool::shares
     class BaseShare : public DBObject
     {
     public:
+        BaseShare(){};
+
         BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents);
 
     public:
@@ -68,8 +80,8 @@ namespace c2pool::shares
 
         //auto gentxBeforeRefhash; //TODO: gentx_before_refhash = pack.VarStrType().pack(DONATION_SCRIPT) + pack.IntType(64).pack(0) + pack.VarStrType().pack('\x6a\x28' + pack.IntType(256).pack(0) + pack.IntType(64).pack(0))[:3]
 
-        int gentxSize = 50000; // conservative estimate, will be overwritten during execution
-        int gentxWeight = 200000;
+        static int gentxSize; // conservative estimate, will be overwritten during execution
+        static int gentxWeight;
 
     public:
         shared_ptr<c2pool::config::Network> net;
@@ -102,25 +114,17 @@ namespace c2pool::shares
         unsigned int time_seen;
 
     public:
-        virtual std::string SerializeJSON() override;
-        virtual void DeserializeJSON(std::string json);
+        virtual std::string SerializeJSON() override;   //TODO
+        virtual void DeserializeJSON(std::string json); //TODO
 
     public:
-
         //TODO: return type
         static GeneratedTransaction generate_transaction(c2pool::shares::tracker::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
-                                         uint256 _block_target, unsigned int _desired_timestamp,
-                                         uint256 _desired_target, MerkleLink _ref_merkle_link,
-                                         /*TODO: <type> desired_other_transaction_hashes_and_fees, */
-                                         shared_ptr<c2pool::config::Network> _net, /*TODO: <type> known_txs, <type> last_txout_nonce=0,*/
-                                         long long base_subsidy, shared_ptr<SegwitData> _segwit_data);
-
-        // //TODO: return struct
-        // /*TODO: return type*/ auto generateTransaction(
-        //     auto /*tracker type*/ tracker
-        //     /*cls, tracker, share_data, block_target, desired_timestamp, desired_target, ref_merkle_link, desired_other_transaction_hashes_and_fees, net, known_txs=None, last_txout_nonce=0, base_subsidy=None, segwit_data=None*/
-        //     /*out parameters block*/
-        //     /*share_info, gentx, other_transaction_hashes, get_share*/){};
+                                                         uint256 _block_target, unsigned int _desired_timestamp,
+                                                         uint256 _desired_target, MerkleLink _ref_merkle_link,
+                                                         vector<tuple<uint256, int>> desired_other_transaction_hashes_and_fees,
+                                                         shared_ptr<c2pool::config::Network> _net, map<uint256, bitcoind::data::TransactionType> known_txs, /*TODO:  <type> last_txout_nonce=0,*/
+                                                         long long base_subsidy, shared_ptr<SegwitData> _segwit_data);
 
         // // @classmethod
         // void getRefHash(shared_ptr<c2pool::config::Network> _net, auto shareInfo, auto refMerkleLink)
