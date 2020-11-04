@@ -8,8 +8,8 @@
 
 namespace c2pool::config
 {
-    #define CREATE_ADDR(addr, port) std::make_tuple<std::string, std::string>(addr, port)
-    
+#define CREATE_ADDR(addr, port) std::make_tuple<std::string, std::string>(addr, port)
+
     class Network
     {
     public:
@@ -21,6 +21,13 @@ namespace c2pool::config
         const unsigned char *IDENTIFIER;
         int MINIMUM_PROTOCOL_VERSION;
         int SEGWIT_ACTIVATION_VERSION;
+        int TARGET_LOOKBEHIND;
+        int SHARE_PERIOD;
+        int BLOCK_MAX_SIZE;
+        int BLOCK_MAX_WEIGHT;
+        int REAL_CHAIN_LENGTH;
+        int CHAIN_LENGTH;
+        int SPREAD;
 
         uint256 MAX_TARGET;
 

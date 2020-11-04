@@ -1389,6 +1389,7 @@ def TEST_UNPACKRES():
 
 #print(ListType(VarIntType(), 2).pack([12,23,23,23]))
 
+'''
 tx_packed = tx_type.pack({
     'version':1, 
     'tx_outs': [{
@@ -1427,3 +1428,22 @@ print('____________')
 print(segwit_tx_packed)
 segwit_tx_unpacked = tx_type.unpack(segwit_tx_packed)
 print(segwit_tx_unpacked)
+print(tx_type.packed_size({
+    'version':1, 
+    'tx_outs': [{
+        'value':2,
+        'script':'test_script'}],
+    'tx_ins': [{
+        'sequence':1,
+        'script':'tx_ins_test_script',
+        'previous_output':{
+            'hash':123,
+            'index':321}}],
+    'lock_time':199,
+    
+    'marker': 0,
+    'flag': 1,
+    'witness':[{'test_witne2323ss'}]
+}))
+'''
+#print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))

@@ -10,11 +10,11 @@
 #include "uint256.h"
 #include "arith_uint256.h"
 
-
 using namespace std;
 
 class TestNetwork : public c2pool::config::Network
 {
+public:
     TestNetwork()
     {
         BOOTSTRAP_ADDRS = {
@@ -29,7 +29,8 @@ class TestNetwork : public c2pool::config::Network
     }
 };
 
-struct TestShare{
+struct TestShare
+{
     arith_uint256 hash;
     arith_uint256 previous_hash;
 };
@@ -38,17 +39,19 @@ class ShareTrackerTest : public ::testing::Test
 {
 protected:
     shared_ptr<TestNetwork> net;
-    vector<TestShare> _items; 
+    vector<TestShare> _items;
+
 protected:
     void SetUp()
     {
         net = make_shared<TestNetwork>();
         stringstream ss;
         string hex_hash;
-        for (int i = 0; i < 50; i++){
+        for (int i = 0; i < 50; i++)
+        {
             ss << hex << i;
             ss >> hex_hash;
-            TestShare share = {arith_uint256(hex_hash), arith_uint256(hex_hash)-1};
+            TestShare share = {arith_uint256(hex_hash), arith_uint256(hex_hash) - 1};
             _items.push_back(share);
         }
     }
@@ -61,5 +64,4 @@ protected:
 
 TEST(ShareTrackerTest, InitOkayTrackerTest)
 {
-    
 }

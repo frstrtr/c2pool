@@ -16,9 +16,10 @@ set(BTCLIBS src/btclibs)
 set(SHARECHAIN src/sharechain)
 set(LEVELDB src/leveldb)
 set(DBSHELL src/dbshell)
+set(BITCOIND src/bitcoind)
 #set(CRYPTO src/crypto)  #todo
-set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE} ${BTCLIBS} ${SHARECHAIN} ${LEVELDB} ${DBSHELL})
-set(c2pool_libs util p2p networks other univalue btclibs sharechain leveldb dbshell)
+set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE} ${BTCLIBS} ${SHARECHAIN} ${LEVELDB} ${DBSHELL} ${BITCOIND})
+set(c2pool_libs util p2p networks other univalue btclibs sharechain leveldb dbshell bitcoind)
 
 #BOOST
 # ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
