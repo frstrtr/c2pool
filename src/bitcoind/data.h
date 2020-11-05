@@ -10,10 +10,10 @@ using std::vector;
 namespace bitcoind::data
 {
 
-    uint256 target_to_average_attempts(uint256 target)
-    {
-        //TODO:
-    }
+    // uint256 target_to_average_attempts(uint256 target)
+    // {
+    //     //TODO:
+    // }
 
     class PreviousOutput
     {

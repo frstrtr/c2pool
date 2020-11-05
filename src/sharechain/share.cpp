@@ -40,6 +40,7 @@ namespace c2pool::shares
         hash_link = contents.hash_link;
         merkle_link = contents.merkle_link;
 
+        
         //TODO:
         // # save some memory if we can
         // txrefs = self.share_info['transaction_hash_refs']
@@ -59,6 +60,7 @@ namespace c2pool::shares
 
         //TODO: assert not self.hash_link['extra_data'], repr(self.hash_link['extra_data'])
 
+
         share_data = share_info->share_data;
 
         std::stringstream ss;
@@ -66,6 +68,7 @@ namespace c2pool::shares
 
         ss << std::hex << share_info->max_bits;
         ss >> str_value;
+        
         max_target.SetHex(str_value);
         // max_target = share_info->max_//bits; //TODO: .target [data.py, 381]
 
@@ -73,6 +76,7 @@ namespace c2pool::shares
         ss >> str_value;
         target.SetHex(str_value);
         // target = share_info->bits;         //TODO: .target [data.py, 382]
+
 
         timestamp = share_info->timestamp;
         previous_hash = share_data->previous_share_hash;
@@ -125,6 +129,7 @@ namespace c2pool::shares
 
     //TODO: write debug logs
     //TODO: return type
+    template <int Version>
     GeneratedTransaction BaseShare::generate_transaction(c2pool::shares::tracker::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
                                                          uint256 _block_target, unsigned int _desired_timestamp,
                                                          uint256 _desired_target, MerkleLink _ref_merkle_link,
@@ -317,11 +322,11 @@ namespace c2pool::shares
             _prev.SetNull();
         }
         //TODO: create get_cumulative_weights in tracker
-        auto cumulative_weights = _tracker.get_cumulative_weights(
-            _prev,
-            std::max(0, std::min(height, _net->REAL_CHAIN_LENGTH) - 1),
-            //TODO: 65535*net.SPREAD*bitcoin_data.target_to_average_attempts(block_target)
-        );
+        // auto cumulative_weights = _tracker.get_cumulative_weights(
+        //     _prev,
+        //     std::max(0, std::min(height, _net->REAL_CHAIN_LENGTH) - 1),
+        //     //TODO: 65535*net.SPREAD*bitcoin_data.target_to_average_attempts(block_target)
+        // );
 
         //TODO ASSERT: assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
 
@@ -337,7 +342,7 @@ namespace c2pool::shares
         dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit        
         */
 
-        bool segwit_activated = is_segwit_activated(/*TODO*/);
+        bool segwit_activated = is_segwit_activated(Version, _net->SEGWIT_ACTIVATION_VERSION);
 
         if (_segwit_data == nullptr && known_txs.size() > 0 )
         {
@@ -367,7 +372,7 @@ namespace c2pool::shares
         }
         else
         {
-            _tracker.get_nth_parent_hash(_share_data->previous_share_hash, 99); //TODO
+            //TODO: _tracker.get_nth_parent_hash(_share_data->previous_share_hash, 99); //TODO
         }
         auto share_info = std::make_shared<ShareInfoType>(_share_data, new_transaction_hashes, transaction_hash_refs, _far_share_hash, max_bits, bits /*TODO: , timestamp, absheight, abswork*/);
 
