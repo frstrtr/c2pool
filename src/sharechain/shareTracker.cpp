@@ -213,6 +213,7 @@ namespace c2pool::shares::tracker
     {
         //TrackerView
         using namespace std::placeholders;
+        //TODO:
         remove_special.subscribe(&Tracker<delta_type>::_handle_remove_special, *this, _1);
         remove_special2.subscribe(&Tracker<delta_type>::_handle_remove_special2, *this, _1);
         removed.subscribe(&Tracker<delta_type>::_handle_removed, *this, _1);
@@ -226,6 +227,7 @@ namespace c2pool::shares::tracker
     {
         //TrackerView
         using namespace std::placeholders;
+        //TODO: EVENT
         remove_special.subscribe(&Tracker<delta_type>::_handle_remove_special, *this, _1);
         remove_special2.subscribe(&Tracker<delta_type>::_handle_remove_special2, *this, _1);
         removed.subscribe(&Tracker<delta_type>::_handle_removed, *this, _1);

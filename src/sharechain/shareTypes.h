@@ -59,7 +59,10 @@ namespace c2pool::shares
         std::vector<uint256> branch; //pack.ListType(pack.IntType(256))
         int index;                   //TODO: pack.IntType(0) # it will always be 0
 
-        MerkleLink(){};
+        MerkleLink()
+        {
+            index = 0;
+        };
         MerkleLink(std::vector<uint256> branch, int index);
 
         friend std::istream &operator>>(std::istream &is, MerkleLink &value);

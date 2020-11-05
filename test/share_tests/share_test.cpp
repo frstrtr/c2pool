@@ -43,15 +43,59 @@ protected:
     BaseShare* share;
 
 protected:
+    template <typename UINT_TYPE>
+    UINT_TYPE CreateUINT(string hex){
+        UINT_TYPE _number;
+        _number.SetHex(hex);
+        return _number;
+    }
+
     virtual void SetUp()
     {
         net = make_shared<TestNetwork>();
         tuple<string, string> peer_addr = make_tuple<std::string, std::string>("192.168.0.1", "1337");
 
-        ShareType share_type;
+        ShareType share_type( 
+            make_shared<SmallBlockHeaderType>(
+                1,
+                CreateUINT<uint256>("2"),
+                3,
+                4,
+                5
+            ),
+            make_shared<ShareInfoType>(
+                make_shared<ShareData>(
+                    CreateUINT<uint256>("2"),
+                    "empty",
+                    5,
+                    CreateUINT<uint160>("33"),
+                    11,
+                    1,
+                    StaleInfo::None,
+                    1337
+                ),
+                vector<uint256>(),
+                vector<TransactionHashRef>(),
+                CreateUINT<uint256>("2"),
+                10000,
+                9999,
+                100123123,
+                12,
+                CreateUINT<uint128>("321"),
+                make_shared<SegwitData>(
+                    make_shared<MerkleLink>(),
+                    CreateUINT<uint256>("0")
+                )
+            ),
+            make_shared<MerkleLink>(),
+            5,
+            make_shared<HashLinkType>("state", "", 5),
+            make_shared<MerkleLink>()
+        );
 
-        //share = new BaseShare(net, peer_addr, share_type);
-        share = new BaseShare();
+
+        share = new BaseShare(net, peer_addr, share_type);
+        //share = new BaseShare();
     }
 
     virtual void TearDown()
@@ -61,5 +105,9 @@ protected:
 
 TEST_F(BaseShareTest, InitBaseShare)
 {
-    cout << share->timestamp;
+    cout << share->timestamp << endl;
+}
+
+TEST_F(BaseShareTest, GenerateTransaction){
+    //TODO:
 }
