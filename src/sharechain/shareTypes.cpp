@@ -84,21 +84,21 @@ namespace c2pool::shares
     SmallBlockHeaderType::SmallBlockHeaderType(unsigned long long _version, uint256 _previousBlock, unsigned int _timeStamp, unsigned int _bits, unsigned int _nonce)
     {
         version = _version;
-        previousBlock = _previousBlock;
-        timeStamp = _timeStamp;
+        previous_block = _previousBlock;
+        timestamp = _timeStamp;
         bits = _bits;
         nonce = _nonce;
     };
 
     std::istream &operator>>(std::istream &is, SmallBlockHeaderType &value)
     {
-        is >> value.version >> value.previousBlock >> value.timeStamp >> value.bits >> value.nonce;
+        is >> value.version >> value.previous_block >> value.timestamp >> value.bits >> value.nonce;
         return is;
     }
 
     std::ostream &operator<<(std::ostream &os, const SmallBlockHeaderType &value)
     {
-        os << value.version << "," << value.previousBlock << "," << value.timeStamp << "," << value.bits << "," << value.nonce;
+        os << value.version << "," << value.previous_block << "," << value.timestamp << "," << value.bits << "," << value.nonce;
         return os;
     }
 

@@ -79,7 +79,7 @@
 //     };
 
 //     /*type?*/ void attemptVerify(/*type?*/ share){};
-//     /*type?*/ void think(/*type?*/ blockRelHeightFunc, /*type?*/ previousBlock, /*type?*/ bits, /*type?*/ knownTX){};
+//     /*type?*/ void think(/*type?*/ blockRelHeightFunc, /*type?*/ previous_block, /*type?*/ bits, /*type?*/ knownTX){};
 //     /*type?*/ void score(/*type?*/ shareHash, /*type?*/ blockRelHeightFunc){};
 // }
 

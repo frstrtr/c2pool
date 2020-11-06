@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18.1)
-project(cpool)
+set(PROJ_NAME c2pool)
+project(${PROJ_NAME})
 
 set(CMAKE_CXX_STANDARD 20)
 
@@ -52,7 +53,7 @@ endif()
 #PYTHON
 
 
-add_executable(cpool ${SOURCE_FILE})
+add_executable(${PROJ_NAME} ${SOURCE_FILE})
 
 include_directories(${c2pool_dirs})
 foreach(subdir ${c2pool_dirs})
@@ -63,12 +64,12 @@ add_subdirectory(lib/googletest)
 add_subdirectory(test)
 
 if(WIN32)
-    target_link_libraries(cpool ws2_32) #возник баг, без этого не компилится boost код.
-    target_link_libraries(cpool wsock32) #возник баг, без этого не компилится boost код.
+    target_link_libraries(${PROJ_NAME} ws2_32) #возник баг, без этого не компилится boost код.
+    target_link_libraries(${PROJ_NAME} wsock32) #возник баг, без этого не компилится boost код.
 endif()
 
-target_compile_definitions(cpool PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
-target_link_libraries(cpool -Wl,--start-group  ${PROJECT_LIB} -Wl,--end-group)
-# target_link_libraries(cpool ${Boost_LIBRARIES})
-target_link_libraries(cpool Boost::log_setup Boost::log)
-target_link_libraries(cpool ${c2pool_libs})
+target_compile_definitions(${PROJ_NAME} PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
+target_link_libraries(${PROJ_NAME} -Wl,--start-group  ${PROJECT_LIB} -Wl,--end-group)
+# target_link_libraries(${PROJ_NAME} ${Boost_LIBRARIES})
+target_link_libraries(${PROJ_NAME} Boost::log_setup Boost::log)
+target_link_libraries(${PROJ_NAME} ${c2pool_libs})

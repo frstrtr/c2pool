@@ -8,6 +8,7 @@
 #include <arith_uint256.h>
 #include <data.h>
 #include <console.h>
+#include <univalue.h>
 
 #include <memory>
 #include <sstream>
@@ -443,8 +444,13 @@ namespace c2pool::shares
 
     std::string BaseShare::SerializeJSON()
     {
-        return "test";
-        //TODO
+        //TODO:
+        UniValue json(UniValue::VOBJ);
+
+        json.pushKV("TYPE", (int)TYPE);
+        json.pushKV("contents", contents);
+
+        return json.write();
     }
     void BaseShare::DeserializeJSON(std::string json)
     {
