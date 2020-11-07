@@ -60,7 +60,21 @@ namespace c2pool::shares
 
             return result;
         }
+
+        HashLinkType &operator=(UniValue value)
+        {
+            
+            return *this;
+        }
         */
+
+        HashLinkType &operator=(UniValue value)
+        {
+            state = value["state"].get_str();
+            extra_data = value["extra_data"].get_str();
+            length = value["length"].get_int64();
+            return *this;
+        }
 
         operator UniValue()
         {
@@ -88,6 +102,19 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, MerkleLink &value);
         friend std::ostream &operator<<(std::ostream &os, const MerkleLink &value);
+
+        MerkleLink &operator=(UniValue value)
+        {
+            for (auto hex_str : value["branch"].get_array().getValues())
+            {
+                uint256 temp_uint256;
+                temp_uint256.SetHex(hex_str.get_str());
+                branch.push_back(temp_uint256);
+            }
+            index = value["index"].get_int();
+
+            return *this;
+        }
 
         operator UniValue()
         {
@@ -121,6 +148,17 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, SmallBlockHeaderType &value);
         friend std::ostream &operator<<(std::ostream &os, const SmallBlockHeaderType &value);
 
+        SmallBlockHeaderType &operator=(UniValue value)
+        {
+            version = value["version"].get_int64();
+            previous_block.SetHex(value["previous_block"].get_str());
+            timestamp = value["timestamp"].get_int64();
+            bits = value["bits"].get_int64();
+            nonce = value["nonce"].get_int64();
+
+            return *this;
+        }
+
         operator UniValue()
         {
             UniValue result(UniValue::VOBJ);
@@ -152,6 +190,20 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, ShareData &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareData &value);
+
+        ShareData &operator=(UniValue value)
+        {
+            previous_share_hash.SetHex(value["previous_share_hash"].get_str());
+            coinbase = value["coinbase"].get_str();
+            nonce = value["nonce"].get_int64();
+            pubkey_hash.SetHex(value["pubkey_hash"].get_str());
+            subsidy = value["subsidy"].get_int64();
+            donation = value["donation"].get_int();
+            stale_info = (StaleInfo)value["stale_info"].get_int();
+            desired_version = value["desired_version"].get_int64();
+
+            return *this;
+        }
 
         operator UniValue()
         {
@@ -187,6 +239,16 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, SegwitData &value);
         friend std::ostream &operator<<(std::ostream &os, const SegwitData &value);
 
+        SegwitData &operator=(UniValue value)
+        {
+            txid_merkle_link = std::make_shared<MerkleLink>();
+            *txid_merkle_link = value["txid_merkle_link"].get_obj();
+
+            wtxid_merkle_root.SetHex(value["wtxid_merkle_root"].get_str());
+
+            return *this;
+        }
+
         operator UniValue()
         {
             UniValue result(UniValue::VOBJ);
@@ -209,6 +271,14 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, TransactionHashRef &value);
         friend std::ostream &operator<<(std::ostream &os, const TransactionHashRef &value);
+
+        TransactionHashRef &operator=(UniValue value)
+        {
+            share_count = value["share_count"].get_int64();
+            tx_count = value["tx_count"].get_int64();
+
+            return *this;
+        }
 
         operator UniValue()
         {
@@ -243,6 +313,39 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, ShareInfoType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareInfoType &value);
 
+        ShareInfoType &operator=(UniValue value)
+        {
+            share_data = std::make_shared<ShareData>();
+            *share_data = value["share_data"].get_obj();
+
+            segwit_data = std::make_shared<SegwitData>();
+            *segwit_data = value["segwit_data"].get_obj();
+
+            for (auto hex_str : value["new_transaction_hashes"].get_array().getValues())
+            {
+                uint256 temp_uint256;
+                temp_uint256.SetHex(hex_str.get_str());
+                new_transaction_hashes.push_back(temp_uint256);
+            }
+
+            for (auto tx_hash_ref : value["transaction_hash_refs"].get_array().getValues())
+            {
+                TransactionHashRef temp_tx_hash_ref;
+                temp_tx_hash_ref = tx_hash_ref.get_obj();
+                transaction_hash_refs.push_back(temp_tx_hash_ref);
+            }
+
+            far_share_hash.SetHex(value["far_share_hash"].get_str());
+
+            max_bits = value["max_bits"].get_int64();
+            bits = value["bits"].get_int64();
+            timestamp = value["timestamp"].get_int64();
+            absheigth = value["absheigth"].get_int64();
+
+            abswork.SetHex(value["abswork"].get_str());
+            return *this;
+        }
+
         operator UniValue()
         {
             UniValue result(UniValue::VOBJ);
@@ -258,7 +361,8 @@ namespace c2pool::shares
             result.pushKV("new_transaction_hashes", new_transaction_hashes_array);
 
             UniValue transaction_hash_refs_array;
-            for (auto tx_hash_ref : transaction_hash_refs){
+            for (auto tx_hash_ref : transaction_hash_refs)
+            {
                 transaction_hash_refs_array.push_back(tx_hash_ref);
             }
             result.pushKV("transaction_hash_refs", transaction_hash_refs_array);
@@ -290,6 +394,28 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, ShareType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareType &value);
 
+        ShareType &operator=(UniValue value)
+        {
+            min_header = std::make_shared<SmallBlockHeaderType>();
+            *min_header = value["min_header"].get_obj();
+
+            share_info = std::make_shared<ShareInfoType>();
+            *share_info = value["share_info"].get_obj();
+
+            ref_merkle_link = std::make_shared<MerkleLink>();
+            *ref_merkle_link = value["ref_merkle_link"].get_obj();
+
+            last_txout_nonce = value["last_txout_nonce"].get_int64();
+
+            hash_link = std::make_shared<HashLinkType>();
+            *hash_link = value["hash_link"].get_obj();
+
+            merkle_link = std::make_shared<MerkleLink>();
+            *merkle_link = value["merkle_link"].get_obj();
+
+            return *this;
+        }
+
         operator UniValue()
         {
             UniValue result(UniValue::VOBJ);
@@ -317,6 +443,16 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, RefType &value);
         friend std::ostream &operator<<(std::ostream &os, const RefType &value);
 
+        RefType &operator=(UniValue value)
+        {
+            identifier = value["identifier"].get_str();
+
+            share_info = std::make_shared<ShareInfoType>();
+            *share_info = value["share_info"].get_obj();
+
+            return *this;
+        }
+
         operator UniValue()
         {
             UniValue result(UniValue::VOBJ);
@@ -334,6 +470,16 @@ namespace c2pool::shares
     public:
         std::shared_ptr<SmallBlockHeaderType> header; //TODO: name: header?
         uint256 merkle_root;                          //TODO: arith_uint256?
+
+        Header &operator=(UniValue value)
+        {
+            header = std::make_shared<SmallBlockHeaderType>();
+            *header = value["header"].get_obj();
+
+            merkle_root.SetHex(value["merkle_root"].get_str());
+
+            return *this;
+        }
 
         operator UniValue()
         {
@@ -360,6 +506,14 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, RawShare &value);
         friend std::ostream &operator<<(std::ostream &os, const RawShare &value);
+
+        RawShare &operator=(UniValue value)
+        {
+            type = value["type"].get_int();
+            contents = value["contents"].get_obj();
+
+            return *this;
+        }
 
         operator UniValue()
         {

@@ -455,6 +455,12 @@ namespace c2pool::shares
     void BaseShare::DeserializeJSON(std::string json)
     {
         //TODO:
+        UniValue ShareValue(UniValue::VOBJ);
+        ShareValue.read(json);
+
+        TYPE = (ShareVersion)ShareValue["TYPE"].get_int();
+        contents = ShareValue["contents"].get_obj();
+
     }
 
 } // namespace c2pool::shares
