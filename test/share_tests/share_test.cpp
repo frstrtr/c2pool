@@ -8,6 +8,7 @@
 #include <config.h>
 #include "uint256.h"
 #include "arith_uint256.h"
+#include "univalue.h"
 
 
 using namespace std;
@@ -115,14 +116,15 @@ TEST_F(BaseShareTest, GenerateTransaction){
 
 TEST_F(BaseShareTest, TestSerialize){
     string share_json = share->SerializeJSON();
-    string json = "{\"TYPE\":33,\"contents\":{\"min_header\":{\"version\":1,\"previous_block\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"timestamp\":3,\"bits\":4,\"nonce\":5},\"share_info\":{\"share_data\":{\"previous_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"coinbase\":\"empty\",\"nonce\":5,\"pubkey_hash\":\"0000000000000000000000000000000000000033\",\"subsidy\":11,\"donation\":1,\"stale_info\":0,\"desired_version\":1337},\"segwit_data\":{\"txid_merkle_link\":{\"branch\":[],\"index\":0},\"wtxid_merkle_root\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"new_transaction_hashes\":null,\"transaction_hash_refs\":null,\"far_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"max_bits\":10000,\"bits\":9999,\"timestamp\":100123123,\"absheight\":12,\"abswork\":\"00000000000000000000000000000321\"},\"ref_merkle_link\":{\"branch\":[],\"index\":0},\"last_txout_nonce\":5,\"hash_link\":{\"state\":\"state\",\"extra_data\":\"\",\"length\":5},\"merkle_link\":{\"branch\":[],\"index\":0}}}";
+    string json = "{\"TYPE\":33,\"contents\":{\"min_header\":{\"version\":1,\"previous_block\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"timestamp\":3,\"bits\":4,\"nonce\":5},\"share_info\":{\"share_data\":{\"previous_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"coinbase\":\"empty\",\"nonce\":5,\"pubkey_hash\":\"0000000000000000000000000000000000000033\",\"subsidy\":11,\"donation\":1,\"stale_info\":0,\"desired_version\":1337},\"segwit_data\":{\"txid_merkle_link\":{\"branch\":[],\"index\":0},\"wtxid_merkle_root\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"new_transaction_hashes\":[],\"transaction_hash_refs\":[],\"far_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"max_bits\":10000,\"bits\":9999,\"timestamp\":100123123,\"absheigth\":12,\"abswork\":\"00000000000000000000000000000321\"},\"ref_merkle_link\":{\"branch\":[],\"index\":0},\"last_txout_nonce\":5,\"hash_link\":{\"state\":\"state\",\"extra_data\":\"\",\"length\":5},\"merkle_link\":{\"branch\":[],\"index\":0}}}";
     ASSERT_EQ(share_json, json);
 }
 
 TEST_F(BaseShareTest, TestDeserialize){
     string json = share->SerializeJSON();
+
     BaseShare share_from_json;
     share_from_json.DeserializeJSON(json);
 
-    ASSERT_EQ(share->min_header->nonce, share_from_json.min_header->nonce);
+    ASSERT_EQ(share->contents.min_header->nonce, share_from_json.contents.min_header->nonce);
 }

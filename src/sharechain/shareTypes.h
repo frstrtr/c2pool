@@ -6,6 +6,7 @@
 #include <uint256.h>
 #include <memory>
 #include "univalue.h"
+#include <iostream>
 
 //TODO: MerkleLink.index -> IntType(0)?????
 //TODO: HashLinkType.extra_data ->  FixedStrType(0) ?????
@@ -336,8 +337,10 @@ namespace c2pool::shares
             share_data = std::make_shared<ShareData>();
             *share_data = value["share_data"].get_obj();
 
+
             segwit_data = std::make_shared<SegwitData>();
             *segwit_data = value["segwit_data"].get_obj();
+
 
             for (auto hex_str : value["new_transaction_hashes"].get_array().getValues())
             {
@@ -345,6 +348,7 @@ namespace c2pool::shares
                 temp_uint256.SetHex(hex_str.get_str());
                 new_transaction_hashes.push_back(temp_uint256);
             }
+
 
             for (auto tx_hash_ref : value["transaction_hash_refs"].get_array().getValues())
             {
@@ -354,7 +358,6 @@ namespace c2pool::shares
             }
 
             far_share_hash.SetHex(value["far_share_hash"].get_str());
-
             max_bits = value["max_bits"].get_int64();
             bits = value["bits"].get_int64();
             timestamp = value["timestamp"].get_int64();
@@ -371,14 +374,14 @@ namespace c2pool::shares
             result.pushKV("share_data", *share_data);
             result.pushKV("segwit_data", *segwit_data);
 
-            UniValue new_transaction_hashes_array;
+            UniValue new_transaction_hashes_array(UniValue::VARR);
             for (auto hash : new_transaction_hashes)
             {
                 new_transaction_hashes_array.push_back(hash.GetHex());
             }
             result.pushKV("new_transaction_hashes", new_transaction_hashes_array);
 
-            UniValue transaction_hash_refs_array;
+            UniValue transaction_hash_refs_array(UniValue::VARR);
             for (auto tx_hash_ref : transaction_hash_refs)
             {
                 transaction_hash_refs_array.push_back(tx_hash_ref);
@@ -389,7 +392,7 @@ namespace c2pool::shares
             result.pushKV("max_bits", (uint64_t)max_bits);
             result.pushKV("bits", (uint64_t)bits);
             result.pushKV("timestamp", (uint64_t)timestamp);
-            result.pushKV("absheight", (uint64_t)absheigth);
+            result.pushKV("absheigth", (uint64_t)absheigth);
             result.pushKV("abswork", abswork.GetHex());
 
             return result;
