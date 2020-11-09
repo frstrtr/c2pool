@@ -15,7 +15,7 @@ namespace c2pool::shares
 {
 
     //TODO: ARCHIVE ???
-    class ShareStore : Database
+    class ShareStore : public Database
     {
     public:
         ShareStore(const std::string /*TODO: boost::filesystem*/ filepath /*, net, share_cb, verifiedHashCB*/);

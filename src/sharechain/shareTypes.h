@@ -49,8 +49,8 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, HashLinkType &value);
         friend std::ostream &operator<<(std::ostream &os, const HashLinkType &value);
+        
         friend bool operator==(const HashLinkType &first, const HashLinkType &second);
-
         friend bool operator!=(const HashLinkType &first, const HashLinkType &second);
 
         /*
@@ -82,7 +82,7 @@ namespace c2pool::shares
 
             result.pushKV("state", state);
             result.pushKV("extra_data", extra_data);
-            result.pushKV("lenght", length);
+            result.pushKV("length", length);
 
             return result;
         }
@@ -102,6 +102,9 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, MerkleLink &value);
         friend std::ostream &operator<<(std::ostream &os, const MerkleLink &value);
+
+        friend bool operator==(const MerkleLink &first, const MerkleLink &second);
+        friend bool operator!=(const MerkleLink &first, const MerkleLink &second);
 
         MerkleLink &operator=(UniValue value)
         {
@@ -148,6 +151,9 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, SmallBlockHeaderType &value);
         friend std::ostream &operator<<(std::ostream &os, const SmallBlockHeaderType &value);
 
+        friend bool operator==(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second);
+        friend bool operator!=(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second);
+
         SmallBlockHeaderType &operator=(UniValue value)
         {
             version = value["version"].get_int64();
@@ -190,6 +196,9 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, ShareData &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareData &value);
+
+        friend bool operator==(const ShareData &first, const ShareData &second);
+        friend bool operator!=(const ShareData &first, const ShareData &second);
 
         ShareData &operator=(UniValue value)
         {
@@ -239,6 +248,9 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, SegwitData &value);
         friend std::ostream &operator<<(std::ostream &os, const SegwitData &value);
 
+        friend bool operator==(const SegwitData &first, const SegwitData &second);
+        friend bool operator!=(const SegwitData&first, const SegwitData &second);
+
         SegwitData &operator=(UniValue value)
         {
             txid_merkle_link = std::make_shared<MerkleLink>();
@@ -271,6 +283,9 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, TransactionHashRef &value);
         friend std::ostream &operator<<(std::ostream &os, const TransactionHashRef &value);
+
+        friend bool operator==(const TransactionHashRef &first, const TransactionHashRef &second);
+        friend bool operator!=(const TransactionHashRef &first, const TransactionHashRef &second);
 
         TransactionHashRef &operator=(UniValue value)
         {
@@ -312,6 +327,9 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, ShareInfoType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareInfoType &value);
+
+        friend bool operator==(const ShareInfoType &first, const ShareInfoType &second);
+        friend bool operator!=(const ShareInfoType &first, const ShareInfoType &second);
 
         ShareInfoType &operator=(UniValue value)
         {
@@ -394,6 +412,9 @@ namespace c2pool::shares
         friend std::istream &operator>>(std::istream &is, ShareType &value);
         friend std::ostream &operator<<(std::ostream &os, const ShareType &value);
 
+        friend bool operator==(const ShareType &first, const ShareType &second);
+        friend bool operator!=(const ShareType &first, const ShareType &second);
+
         ShareType &operator=(UniValue value)
         {
             min_header = std::make_shared<SmallBlockHeaderType>();
@@ -442,6 +463,9 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, RefType &value);
         friend std::ostream &operator<<(std::ostream &os, const RefType &value);
+
+        friend bool operator==(const RefType &first, const RefType &second);
+        friend bool operator!=(const RefType &first, const RefType &second);
 
         RefType &operator=(UniValue value)
         {
@@ -506,6 +530,9 @@ namespace c2pool::shares
 
         friend std::istream &operator>>(std::istream &is, RawShare &value);
         friend std::ostream &operator<<(std::ostream &os, const RawShare &value);
+
+        friend bool operator==(const RawShare &first, const RawShare &second);
+        friend bool operator!=(const RawShare &first, const RawShare &second);
 
         RawShare &operator=(UniValue value)
         {

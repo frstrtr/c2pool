@@ -3,8 +3,155 @@
 #include <memory>
 #include <shareTypes.h>
 #include <sstream>
+#include <string>
+#include "univalue.h"
+#include "uint256.h"
+#include <vector>
 
-//TODO: create CMakeList.txt
+using namespace std;
+using namespace c2pool::shares;
+
+template <typename UINT_TYPE>
+UINT_TYPE CreateUINT(string hex)
+{
+    UINT_TYPE _number;
+    _number.SetHex(hex);
+    return _number;
+}
+
+TEST(ShareTypes, HashLinkTypeDeSerialize)
+{
+    HashLinkType first("1", "232", 3);
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    HashLinkType second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, MerkleLinkDeSerialize)
+{
+    MerkleLink first(std::vector<uint256>(), 0);
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    MerkleLink second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, SmallBlockHeaderTypeDeSerialize)
+{
+    SmallBlockHeaderType first(1, CreateUINT<uint256>("1331"), 2, 3, 4);
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    SmallBlockHeaderType second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, ShareDataDeSerialize)
+{
+    ShareData first(CreateUINT<uint256>("2"),
+                    "empty",
+                    5,
+                    CreateUINT<uint160>("33"),
+                    11,
+                    1,
+                    StaleInfo::None,
+                    1337);
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    ShareData second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, SegwitDataDeSerialize)
+{
+    SegwitData first(make_shared<MerkleLink>(vector<uint256>(), 0), CreateUINT<uint256>("19324"));
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    SegwitData second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, TransactionHashRefDeSerialize)
+{
+    TransactionHashRef first(1000, 2000);
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    TransactionHashRef second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, ShareInfoTypeDeSerialize)
+{
+    ShareInfoType first(
+                make_shared<ShareData>(
+                    CreateUINT<uint256>("2"),
+                    "empty",
+                    5,
+                    CreateUINT<uint160>("33"),
+                    11,
+                    1,
+                    StaleInfo::None,
+                    1337
+                ),
+                vector<uint256>(),
+                vector<TransactionHashRef>(),
+                CreateUINT<uint256>("2"),
+                10000,
+                9999,
+                100123123,
+                12,
+                CreateUINT<uint128>("321"),
+                make_shared<SegwitData>(
+                    make_shared<MerkleLink>(),
+                    CreateUINT<uint256>("0")
+                )
+            );
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    std::cout << json << std::endl;
+
+    ShareInfoType second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+//TODO:
+#ifdef FALSE
+
 TEST(Shares, HashLinkTypeTest)
 {
     c2pool::shares::HashLinkType hashLinkType1("1", "2");
@@ -130,10 +277,11 @@ TEST(Shares, ShareType)
 
     std::shared_ptr<ShareData> share_data = std::make_shared<ShareData>("01", "a", 2, "03", 4, 5, 253, 6);
 
-    std::vector<uint256> branch_txidml {"01"};
+    std::vector<uint256> branch_txidml{"01"};
     std::shared_ptr<MerkleLink> txid_merkle_link = std::make_shared<MerkleLink>(branch_txidml, 1)
-    std::shared_ptr<SegwitData> segwit_data = std::make_shared<SegwitData>(txid_merkle_link, "02");
-    
+        std::shared_ptr<SegwitData>
+            segwit_data = std::make_shared<SegwitData>(txid_merkle_link, "02");
+
     std::vector<uint256> new_transaction_hashes{"01"};
     std::vector<TransactionHashRef> transaction_hash_refs;
     TransactionHashRef thr(0, 1);
@@ -145,13 +293,12 @@ TEST(Shares, ShareType)
                                                      transaction_hash_refs,
                                                      "022", 22, 33, 44, 55);
 
-
-    std::vector<uint256> branch_rml {"01"};
+    std::vector<uint256> branch_rml{"01"};
     std::shared_ptr<MerkleLink> ref_merkle_link = std::make_shared<MerkleLink>(branch_rml, 111);
-    
+
     std::shared_ptr<HashLinkType> hash_link = std::make_shared<HashLInkType>("a", "b", 2);
 
-    std::vector<uint256> branch_ml {"01"};
+    std::vector<uint256> branch_ml{"01"};
     std::shared_ptr<MerkleLink> merkle_link = std::make_shared<MerkleLink>(branch_ml, 222);
 
     c2pool::shares::ShareType shareType1(min_header,
@@ -162,15 +309,16 @@ TEST(Shares, ShareType)
                                          merkle_link);
     c2pool::shares::ShareType shareType2();
     std::stringstream ss;
-    
+
     ss << 1 << "02" << 2 << 3 << 4 //SmallBlockHeaderType
-       << "01" << "a" << 2 << "03" << 4 << 5 << 253 << 6 //ShareData
+       << "01"
+       << "a" << 2 << "03" << 4 << 5 << 253 << 6                       //ShareData
        << 1 /*length vector in txid_merkle_link*/ << "01" << 1 << "02" //MerkleLink
-       << 1 /*length vector new_transaction_hashes*/ << "01" //new_transaction_hashes
-       << 1 /*length vector transaction_hash_refs*/ << 0 << 1 //transaction_hash_refs
+       << 1 /*length vector new_transaction_hashes*/ << "01"           //new_transaction_hashes
+       << 1 /*length vector transaction_hash_refs*/ << 0 << 1          //transaction_hash_refs
        << "022" << 22 << 33 << 44 << 55;
     ss >> shareType2;
-    
+
     ASSERT_EQ(shareType1, shareType2);
     c2pool::shares::ShareType shareType3;
     std::stringstream ss2;
@@ -195,3 +343,5 @@ TEST(Shares, RefType)
     ss2 >> refType3;
     ASSERT_EQ(refType1, refType3);
 }
+
+#endif

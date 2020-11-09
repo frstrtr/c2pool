@@ -2,6 +2,7 @@ project(dbshell)
 
 include_directories(../univalue)
 include_directories(../leveldb)
+include_directories(../other)
 
 set(HEADER 
     db.h
@@ -16,6 +17,6 @@ set(SOURCE
 
 add_library(dbshell ${HEADER} ${SOURCE})
 
-target_link_libraries(dbshell univalue leveldb)
+target_link_libraries(dbshell univalue leveldb other)
 
 # target_include_directories(dbshell)

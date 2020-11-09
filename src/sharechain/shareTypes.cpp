@@ -6,10 +6,11 @@
 //HashLinkType
 namespace c2pool::shares
 {
-    HashLinkType::HashLinkType(std::string _state, std::string _extra_data, unsigned long long length)
+    HashLinkType::HashLinkType(std::string _state, std::string _extra_data, unsigned long long _length)
     {
         state = _state;
         extra_data = _extra_data;
+        length = _length;
     }
 
     std::istream &operator>>(std::istream &is, HashLinkType &value)
@@ -76,6 +77,33 @@ namespace c2pool::shares
         return os;
     }
 
+    bool operator==(const MerkleLink &first, const MerkleLink &second)
+    {
+        if (first.branch.size() == second.branch.size())
+        {
+            for (int i = 0; i < first.branch.size(); i++)
+            {
+                if (first.branch[i].Compare(second.branch[i]) != 0)
+                {
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        if (first.index != second.index)
+            return false;
+        return true;
+    }
+
+    bool operator!=(const MerkleLink &first, const MerkleLink &second)
+    {
+        return !(first == second);
+    }
+
 } // namespace c2pool::shares
 
 //TODO: SmallBlockHeaderType
@@ -100,6 +128,26 @@ namespace c2pool::shares
     {
         os << value.version << "," << value.previous_block << "," << value.timestamp << "," << value.bits << "," << value.nonce;
         return os;
+    }
+
+    bool operator==(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second)
+    {
+        if (first.version != second.version)
+            return false;
+        if (first.previous_block.Compare(second.previous_block) != 0)
+            return false;
+        if (first.timestamp != second.timestamp)
+            return false;
+        if (first.bits != second.bits)
+            return false;
+        if (first.nonce != second.nonce)
+            return false;
+        return true;
+    }
+
+    bool operator!=(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second)
+    {
+        return !(first == second);
     }
 
 } // namespace c2pool::shares
@@ -138,6 +186,40 @@ namespace c2pool::shares
         return os;
     }
 
+    bool operator==(const ShareData &first, const ShareData &second)
+    {
+        if (first.previous_share_hash.Compare(second.previous_share_hash) != 0)
+            return false;
+
+        if (first.coinbase != second.coinbase)
+            return false;
+
+        if (first.nonce != second.nonce)
+            return false;
+
+        if (first.pubkey_hash.Compare(second.pubkey_hash) != 0)
+            return false;
+
+        if (first.subsidy != second.subsidy)
+            return false;
+
+        if (first.donation != second.donation)
+            return false;
+
+        if (first.stale_info != second.stale_info)
+            return false;
+
+        if (first.desired_version != second.desired_version)
+            return false;
+
+        return true;
+    }
+
+    bool operator!=(const ShareData &first, const ShareData &second)
+    {
+        return !(first == second);
+    }
+
 } // namespace c2pool::shares
 
 //TODO: SegwitData
@@ -165,6 +247,22 @@ namespace c2pool::shares
         return os;
     }
 
+    bool operator==(const SegwitData &first, const SegwitData &second)
+    {
+        if (first.wtxid_merkle_root.Compare(second.wtxid_merkle_root) != 0)
+            return false;
+
+        if (*first.txid_merkle_link != *second.txid_merkle_link)
+            return false;
+
+        return true;
+    }
+
+    bool operator!=(const SegwitData &first, const SegwitData &second)
+    {
+        return !(first == second);
+    }
+
 } // namespace c2pool::shares
 
 //TODO: TransactionHashRef
@@ -186,6 +284,22 @@ namespace c2pool::shares
     {
         os << value.share_count << "," << value.tx_count;
         return os;
+    }
+
+    bool operator==(const TransactionHashRef &first, const TransactionHashRef &second)
+    {
+        if (first.share_count != second.share_count)
+            return false;
+
+        if (first.tx_count != second.tx_count)
+            return false;
+
+        return true;
+    }
+
+    bool operator!=(const TransactionHashRef &first, const TransactionHashRef &second)
+    {
+        return !(first == second);
     }
 
 } // namespace c2pool::shares
@@ -261,6 +375,71 @@ namespace c2pool::shares
         return os;
     }
 
+    bool operator==(const ShareInfoType &first, const ShareInfoType &second)
+    {
+        if (*first.share_data != *second.share_data)
+            return false;
+
+        if (*first.segwit_data != *second.segwit_data)
+            return false;
+
+        if (first.new_transaction_hashes.size() == second.new_transaction_hashes.size())
+        {
+            for (int i = 0; i < first.new_transaction_hashes.size(); i++)
+            {
+                if (first.new_transaction_hashes[i].Compare(second.new_transaction_hashes[i]) != 0)
+                {
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        if (first.transaction_hash_refs.size() == second.transaction_hash_refs.size())
+        {
+            for (int i = 0; i < first.transaction_hash_refs.size(); i++)
+            {
+                if (first.transaction_hash_refs[i] != second.transaction_hash_refs[i])
+                {
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        if (first.far_share_hash.Compare(second.far_share_hash) != 0)
+        {
+            return false;
+        }
+
+        if (first.max_bits != second.max_bits)
+            return false;
+        if (first.bits != second.bits)
+            return false;
+        if (first.timestamp != second.timestamp)
+            return false;
+        if (first.absheigth != second.absheigth)
+            return false;
+
+        if (first.abswork.Compare(second.abswork) != 0)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool operator!=(const ShareInfoType &first, const ShareInfoType &second)
+    {
+        return !(first == second);
+    }
+
 } // namespace c2pool::shares
 
 //TODO: ShareType
@@ -305,6 +484,34 @@ namespace c2pool::shares
         return os;
     }
 
+    bool operator==(const ShareType &first, const ShareType &second)
+    {
+        if (*first.min_header != *second.min_header)
+            return false;
+
+        if (*first.share_info != *second.share_info)
+            return false;
+
+        if (*first.ref_merkle_link != *second.ref_merkle_link)
+            return false;
+
+        if (first.last_txout_nonce != second.last_txout_nonce)
+            return false;
+
+        if (*first.hash_link != *second.hash_link)
+            return false;
+
+        if (*first.merkle_link != *second.merkle_link)
+            return false;
+
+        return true;
+    }
+
+    bool operator!=(const ShareType &first, const ShareType &second)
+    {
+        return !(first == second);
+    }
+
 } // namespace c2pool::shares
 
 //TODO: RefType
@@ -333,6 +540,22 @@ namespace c2pool::shares
         return os;
     }
 
+    bool operator==(const RefType &first, const RefType &second)
+    {
+        if (first.identifier != second.identifier)
+            return false;
+
+        if (*first.share_info != *second.share_info)
+            return false;
+
+        return true;
+    }
+
+    bool operator!=(const RefType &first, const RefType &second)
+    {
+        return !(first == second);
+    }
+
 } // namespace c2pool::shares
 
 namespace c2pool::shares
@@ -347,5 +570,21 @@ namespace c2pool::shares
     {
         os << value.type << "," << value.contents;
         return os;
+    }
+
+    bool operator==(const RawShare &first, const RawShare &second)
+    {
+        if (first.type != second.type)
+            return false;
+
+        if (first.contents != second.contents)
+            return false;
+
+        return true;
+    }
+
+    bool operator!=(const RawShare &first, const RawShare &second)
+    {
+        return !(first == second);
     }
 } // namespace c2pool::shares

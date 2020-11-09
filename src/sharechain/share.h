@@ -70,7 +70,7 @@ namespace c2pool::shares
     public:
         BaseShare(){};
 
-        BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents);
+        BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents, ShareVersion _TYPE = NoneVersion);
 
     public:
         int VERSION = 0;
