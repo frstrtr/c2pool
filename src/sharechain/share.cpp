@@ -30,7 +30,7 @@ namespace c2pool::shares
     int BaseShare::gentxSize = 50000;
     int BaseShare::gentxWeight = 200000;
 
-    BaseShare::BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents)
+    BaseShare::BaseShare(shared_ptr<c2pool::config::Network> _net, std::tuple<std::string, std::string> _peer_addr, ShareType _contents, ShareVersion _TYPE)
     {
         net = _net;
         peer_addr = _peer_addr;
@@ -41,6 +41,7 @@ namespace c2pool::shares
         hash_link = contents.hash_link;
         merkle_link = contents.merkle_link;
 
+        TYPE = _TYPE;
         
         //TODO:
         // # save some memory if we can
@@ -458,9 +459,10 @@ namespace c2pool::shares
         UniValue ShareValue(UniValue::VOBJ);
         ShareValue.read(json);
 
-        TYPE = (ShareVersion)ShareValue["TYPE"].get_int();
-        contents = ShareValue["contents"].get_obj();
 
+        TYPE = (ShareVersion)ShareValue["TYPE"].get_int();
+        LOG_DEBUG << TYPE;
+        contents = ShareValue["contents"].get_obj();
     }
 
 } // namespace c2pool::shares

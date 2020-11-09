@@ -2,6 +2,7 @@
 #include "dbObject.h"
 #include "dbBatch.h"
 #include <string>
+#include "console.h"
 //#include <console>
 
 namespace dbshell
@@ -66,6 +67,8 @@ namespace dbshell
         }
 
         //TODO: try catch deserialize?
+
+        LOG_DEBUG << "Database::Read" << _value;
 
         value.DeserializeJSON(_value);
 
