@@ -15,39 +15,19 @@ using std::vector, std::tuple, std::set, std::map;
 //ProtoAttributeDelta //TODO: rename
 namespace c2pool::shares::tracker
 {
-    ProtoAttributeDelta::ProtoAttributeDelta(BaseShare item)
-    {
-        head = item.hash;
-        tail = item.previous_hash;
-        height = 1;
-    }
-
-    ProtoAttributeDelta::ProtoAttributeDelta(uint256 _head, uint256 _tail, int _height)
-    {
-        head = _head;
-        tail = _tail;
-        height = _height;
-    }
-
-    ProtoAttributeDelta::ProtoAttributeDelta(uint256 element_id)
-    {
-        head = element_id;
-        tail = element_id;
-        height = 0;
-    }
-
-    //TODO: TEST
-
-    ProtoAttributeDelta operator+(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b)
+    template <typename item_type>
+    ProtoAttributeDelta<item_type> operator+(const ProtoAttributeDelta<item_type> &a, const ProtoAttributeDelta<item_type> &b)
     {
         if (a.tail != b.head)
         {
             //ERROR
             //TODO: assert
         }
-        return ProtoAttributeDelta(a.head, b.tail, a.height + b.height);
+        return ProtoAttributeDelta<item_type>(a.head, b.tail, a.height + b.height);
     }
-    ProtoAttributeDelta operator-(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b)
+
+    template <typename item_type>
+    ProtoAttributeDelta<item_type> operator-(const ProtoAttributeDelta<item_type> &a, const ProtoAttributeDelta<item_type> &b)
     {
         // if (tail != b.head)
         // {
@@ -57,36 +37,18 @@ namespace c2pool::shares::tracker
 
         if (a.head == b.head)
         {
-            return ProtoAttributeDelta(b.tail, a.tail, a.height - b.height);
+            return ProtoAttributeDelta<item_type>(b.tail, a.tail, a.height - b.height);
         }
         if (a.tail == b.tail)
         {
-            return ProtoAttributeDelta(a.head, b.head, a.height - b.height);
+            return ProtoAttributeDelta<item_type>(a.head, b.head, a.height - b.height);
         }
         //TODO: Assertion Error
     }
 
     //OkayProtoAttributeDelta
-
-    OkayProtoAttributeDelta::OkayProtoAttributeDelta(BaseShare item) : ProtoAttributeDelta(item)
-    {
-        //TODO: work = bitcoin_data.target_to_average_attempts(item.target)
-        //TODO: min_work = bitcoin_data.target_to_average_attempts(share.max_target)
-    }
-
-    OkayProtoAttributeDelta::OkayProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work, uint256 _min_work) : ProtoAttributeDelta(_head, _tail, _height)
-    {
-        work = _work;
-        min_work = _min_work;
-    }
-
-    OkayProtoAttributeDelta::OkayProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta(element_id)
-    {
-        work.SetHex("0");
-        min_work.SetHex("0");
-    }
-
-    OkayProtoAttributeDelta operator+(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b)
+    template <typename item_type>
+    OkayProtoAttributeDelta<item_type> operator+(const OkayProtoAttributeDelta<item_type> &a, const OkayProtoAttributeDelta<item_type> &b)
     {
         if (a.tail != b.head)
         {
@@ -99,9 +61,11 @@ namespace c2pool::shares::tracker
         auto a_min_work = UintToArith256(a.min_work);
         auto b_min_work = UintToArith256(b.min_work);
 
-        return OkayProtoAttributeDelta(a.head, b.tail, a.height + b.height, ArithToUint256(a_work + b_work), ArithToUint256(a_min_work + b_min_work));
+        return OkayProtoAttributeDelta<item_type>(a.head, b.tail, a.height + b.height, ArithToUint256(a_work + b_work), ArithToUint256(a_min_work + b_min_work));
     }
-    OkayProtoAttributeDelta operator-(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b)
+
+    template <typename item_type>
+    OkayProtoAttributeDelta<item_type> operator-(const OkayProtoAttributeDelta<item_type> &a, const OkayProtoAttributeDelta<item_type> &b)
     {
         // if (tail != b.head)
         // {
@@ -114,33 +78,19 @@ namespace c2pool::shares::tracker
         auto b_min_work = UintToArith256(b.min_work);
         if (a.head == b.head)
         {
-            return OkayProtoAttributeDelta(b.tail, a.tail, a.height - b.height, ArithToUint256(a_work - b_work), ArithToUint256(a_min_work - b_min_work));
+            return OkayProtoAttributeDelta<item_type>(b.tail, a.tail, a.height - b.height, ArithToUint256(a_work - b_work), ArithToUint256(a_min_work - b_min_work));
         }
         if (a.tail == b.tail)
         {
-            return OkayProtoAttributeDelta(a.head, b.head, a.height - b.height, ArithToUint256(a_work - b_work), ArithToUint256(a_min_work - b_min_work));
+            return OkayProtoAttributeDelta<item_type>(a.head, b.head, a.height - b.height, ArithToUint256(a_work - b_work), ArithToUint256(a_min_work - b_min_work));
         }
         //TODO: Assertion Error
     }
 
     //SubsetProtoAttributeDelta
 
-    SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(BaseShare item) : ProtoAttributeDelta(item)
-    {
-        //TODO: work = bitcoin_data.target_to_average_attempts(item.target)
-    }
-
-    SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work) : ProtoAttributeDelta(_head, _tail, _height)
-    {
-        work = _work;
-    }
-
-    SubsetProtoAttributeDelta::SubsetProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta(element_id)
-    {
-        work.SetHex("0");
-    }
-
-    SubsetProtoAttributeDelta operator+(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b)
+    template <typename item_type>
+    SubsetProtoAttributeDelta<item_type> operator+(const SubsetProtoAttributeDelta<item_type> &a, const SubsetProtoAttributeDelta<item_type> &b)
     {
         if (a.tail != b.head)
         {
@@ -149,9 +99,11 @@ namespace c2pool::shares::tracker
         }
         auto a_work = UintToArith256(a.work);
         auto b_work = UintToArith256(b.work);
-        return SubsetProtoAttributeDelta(a.head, b.tail, a.height + b.height, ArithToUint256(a_work + b_work));
+        return SubsetProtoAttributeDelta<item_type>(a.head, b.tail, a.height + b.height, ArithToUint256(a_work + b_work));
     }
-    SubsetProtoAttributeDelta operator-(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b)
+
+    template <typename item_type>
+    SubsetProtoAttributeDelta<item_type> operator-(const SubsetProtoAttributeDelta<item_type> &a, const SubsetProtoAttributeDelta<item_type> &b)
     {
         // if (tail != b.head)
         // {
@@ -163,11 +115,11 @@ namespace c2pool::shares::tracker
         auto b_work = UintToArith256(b.work);
         if (a.head == b.head)
         {
-            return SubsetProtoAttributeDelta(b.tail, a.tail, a.height - b.height, ArithToUint256(a_work - b_work));
+            return SubsetProtoAttributeDelta<item_type>(b.tail, a.tail, a.height - b.height, ArithToUint256(a_work - b_work));
         }
         if (a.tail == b.tail)
         {
-            return SubsetProtoAttributeDelta(a.head, b.head, a.height - b.height, ArithToUint256(a_work - b_work));
+            return SubsetProtoAttributeDelta<item_type>(a.head, b.head, a.height - b.height, ArithToUint256(a_work - b_work));
         }
         //TODO: Assertion Error
     }

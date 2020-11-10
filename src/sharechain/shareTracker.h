@@ -25,6 +25,7 @@ namespace c2pool::shares
 namespace c2pool::shares::tracker
 {
     //TODO: Rename по-человечески.
+    template <typename item_type>
     class ProtoAttributeDelta
     {
     public:
@@ -40,14 +41,31 @@ namespace c2pool::shares::tracker
             tail.SetNull();
         }
 
-        ProtoAttributeDelta(BaseShare item);
+        ProtoAttributeDelta(item_type item)
+        {
+            head = item.hash;
+            tail = item.previous_hash;
+            height = 1;
+        }
 
-        ProtoAttributeDelta(uint256 _head, uint256 _tail, int _height);
+        ProtoAttributeDelta(uint256 _head, uint256 _tail, int _height)
+        {
+            head = _head;
+            tail = _tail;
+            height = _height;
+        }
 
-        ProtoAttributeDelta(uint256 element_id); //get_none
+        ProtoAttributeDelta(uint256 element_id) //get_none
+        {
+            head = element_id;
+            tail = element_id;
+            height = 0;
+        }
 
-        friend ProtoAttributeDelta operator+(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b);
-        friend ProtoAttributeDelta operator-(const ProtoAttributeDelta &a, const ProtoAttributeDelta &b);
+        template <typename T>
+        friend ProtoAttributeDelta<T> operator+(const ProtoAttributeDelta<T> &a, const ProtoAttributeDelta<T> &b);
+        template <typename T>
+        friend ProtoAttributeDelta<T> operator-(const ProtoAttributeDelta<T> &a, const ProtoAttributeDelta<T> &b);
 
         static uint256 get_head(BaseShare item)
         {
@@ -65,26 +83,41 @@ namespace c2pool::shares::tracker
 
     //TODO: Rename по-человечески.
     //For OkayTracker
-    class OkayProtoAttributeDelta : public ProtoAttributeDelta
+    template <typename item_type>
+    class OkayProtoAttributeDelta : public ProtoAttributeDelta<item_type>
     {
     public:
         uint256 work;     //TODO: arith_256
         uint256 min_work; //TODO: arith_256
 
     public:
-        OkayProtoAttributeDelta() : ProtoAttributeDelta()
+        OkayProtoAttributeDelta() : ProtoAttributeDelta<item_type>()
         {
             work.SetNull();
             min_work.SetNull();
         }
 
-        OkayProtoAttributeDelta(BaseShare item);
+        OkayProtoAttributeDelta(item_type item) : ProtoAttributeDelta<item_type>(item)
+        {
+            //TODO: work = bitcoin_data.target_to_average_attempts(item.target)
+            //TODO: min_work = bitcoin_data.target_to_average_attempts(share.max_target)
+        }
 
-        OkayProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work, uint256 _min_work);
+        OkayProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work, uint256 _min_work) : ProtoAttributeDelta<item_type>(_head, _tail, _height)
+        {
+            work = _work;
+            min_work = _min_work;
+        }
 
-        OkayProtoAttributeDelta(uint256 element_id); //get_none
+        OkayProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta<item_type>(element_id)
+        {
+            work.SetHex("0");
+            min_work.SetHex("0");
+        }
 
+        template <typename T>
         friend OkayProtoAttributeDelta operator+(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b);
+        template <typename T>
         friend OkayProtoAttributeDelta operator-(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b);
 
         // OkayProtoAttributeDelta& operator+(const OkayProtoAttributeDelta& b);
@@ -93,24 +126,36 @@ namespace c2pool::shares::tracker
 
     //TODO: Rename по-человечески.
     //For SubsetTracker
-    class SubsetProtoAttributeDelta : public ProtoAttributeDelta
+    template <typename item_type>
+    class SubsetProtoAttributeDelta : public ProtoAttributeDelta<item_type>
     {
     public:
         uint256 work; //TODO: arith_256
 
     public:
-        SubsetProtoAttributeDelta() : ProtoAttributeDelta()
+        SubsetProtoAttributeDelta() : ProtoAttributeDelta<item_type>()
         {
             work.SetNull();
         }
 
-        SubsetProtoAttributeDelta(BaseShare item);
+        SubsetProtoAttributeDelta(BaseShare item) : ProtoAttributeDelta<item_type>(item)
+        {
+            //TODO: work = bitcoin_data.target_to_average_attempts(item.target)
+        }
 
-        SubsetProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work);
+        SubsetProtoAttributeDelta(uint256 _head, uint256 _tail, int _height, uint256 _work) : ProtoAttributeDelta<item_type>(_head, _tail, _height)
+        {
+            work = _work;
+        }
 
-        SubsetProtoAttributeDelta(uint256 element_id); //get_none
+        SubsetProtoAttributeDelta(uint256 element_id) : ProtoAttributeDelta<item_type>(element_id)
+        {
+            work.SetHex("0");
+        }
 
+        template <typename T>
         friend SubsetProtoAttributeDelta operator+(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b);
+        template <typename T>
         friend SubsetProtoAttributeDelta operator-(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b);
 
         // SubsetProtoAttributeDelta& operator+(const SubsetProtoAttributeDelta& b);
@@ -120,37 +165,40 @@ namespace c2pool::shares::tracker
 
 namespace c2pool::shares::tracker
 {
-    template <typename delta_type>
+    template<template<typename> typename delta_type, typename item_type>
     class Tracker
     {
     public:
-        map<uint256, BaseShare> items;
+
+        #define DELTA_TYPE delta_type<item_type>
+
+        map<uint256, item_type> items;
         map<uint256, set<uint256>> reverse;
 
         map<uint256, uint256> heads;
         map<uint256, set<uint256>> tails;
 
-        Event<BaseShare> added;
-        Event<BaseShare> remove_special;
-        Event<BaseShare> remove_special2;
-        Event<BaseShare> removed;
+        Event<item_type> added;
+        Event<item_type> remove_special;
+        Event<item_type> remove_special2;
+        Event<item_type> removed;
 
         //TODO: auto get_nth_parent_hash = DistanceSkipList(self);
 
         //TrackerView
     public:
-        map<uint256, tuple<delta_type, unsigned long>> _deltas; // item_hash -> delta, ref
+        map<uint256, tuple<DELTA_TYPE, unsigned long>> _deltas; // item_hash -> delta, ref
         map<unsigned long, set<uint256>> _reverse_deltas = {};  // ref -> set of item_hashes
 
         unsigned long ref_generator = 0;                      //TrackerView::_ref_generator
-        map<unsigned long, delta_type> _delta_refs = {};      // ref -> delta
+        map<unsigned long, DELTA_TYPE> _delta_refs = {};      // ref -> delta
         map<uint256, unsigned long> _reverse_delta_refs = {}; // delta.tail -> ref
 
-        void _handle_remove_special(BaseShare item);
+        void _handle_remove_special(item_type item);
 
-        void _handle_remove_special2(BaseShare item);
+        void _handle_remove_special2(item_type item);
 
-        void _handle_removed(BaseShare item);
+        void _handle_removed(item_type item);
 
         int get_height(uint256 item_hash)
         {
@@ -173,7 +221,7 @@ namespace c2pool::shares::tracker
             return std::make_tuple(delta.height, delta.tail);
         }
 
-        delta_type _get_delta(uint256 item_hash)
+        DELTA_TYPE _get_delta(uint256 item_hash)
         {
             if (_deltas.find(item_hash) != _deltas.end())
             {
@@ -183,12 +231,12 @@ namespace c2pool::shares::tracker
             }
             else
             {
-                return delta_type(items[item_hash]);
+                return DELTA_TYPE(items[item_hash]);
             }
             //TODO: assert res.head == item_hash
         }
 
-        void _set_delta(uint256 item_hash, delta_type delta)
+        void _set_delta(uint256 item_hash, DELTA_TYPE delta)
         {
             uint256 other_item_hash = delta.tail;
             if (_reverse_delta_refs.find(other_item_hash) == _reverse_delta_refs.end())
@@ -198,12 +246,12 @@ namespace c2pool::shares::tracker
                 {
                     //TODO: assert ref_generator not in self._delta_refs
                 }
-                _delta_refs[ref_generator] = delta_type(other_item_hash);
+                _delta_refs[ref_generator] = DELTA_TYPE(other_item_hash);
                 _reverse_delta_refs[other_item_hash] = ref_generator;
             }
 
             unsigned long _ref = _reverse_delta_refs[other_item_hash];
-            delta_type ref_delta = _delta_refs[_ref];
+            DELTA_TYPE ref_delta = _delta_refs[_ref];
             if (ref_delta.tail != other_item_hash)
             {
                 //TODO: assert ref_delta.tail == other_item_hash
@@ -216,7 +264,7 @@ namespace c2pool::shares::tracker
                 if (_reverse_deltas[prev_ref].empty() && (prev_ref != _ref))
                 {
                     _reverse_deltas.erase(prev_ref);
-                    delta_type x = _delta_refs[prev_ref];
+                    DELTA_TYPE x = _delta_refs[prev_ref];
                     _delta_refs.erase(prev_ref);
                     _reverse_delta_refs.erase(x.tail);
                 }
@@ -225,11 +273,11 @@ namespace c2pool::shares::tracker
             _reverse_deltas[_ref] = {item_hash};
         }
 
-        delta_type get_delta_to_last(uint256 item_hash)
+        DELTA_TYPE get_delta_to_last(uint256 item_hash)
         {
 
-            delta_type delta = delta_type(item_hash);
-            vector<tuple<uint256, delta_type>> updates;
+            DELTA_TYPE delta = DELTA_TYPE(item_hash);
+            vector<tuple<uint256, DELTA_TYPE>> updates;
 
             while (items.find(delta.tail) != items.end())
             {
@@ -244,25 +292,25 @@ namespace c2pool::shares::tracker
             return delta;
         }
 
-        delta_type get_delta(uint256 item, uint256 ancestor)
+        DELTA_TYPE get_delta(uint256 item, uint256 ancestor)
         {
             //TODO: assert self._tracker.is_child_of(ancestor, item)
-            return delta_type(item) - delta_type(ancestor);
+            return DELTA_TYPE(item) - DELTA_TYPE(ancestor);
         }
 
         //Tracker
     public:
         Tracker();
 
-        Tracker(vector<c2pool::shares::BaseShare> &_items);
+        Tracker(vector<item_type> &_items);
 
-        virtual void add(BaseShare item);
+        virtual void add(item_type item);
 
         virtual void remove(uint256 item_hash);
 
-        vector<BaseShare> get_chain(uint256 start_hash, int length)
+        vector<item_type> get_chain(uint256 start_hash, int length)
         {
-            vector<BaseShare> result_chain;
+            vector<item_type> result_chain;
             if (length > get_height(start_hash))
             {
                 //TODO ASSERT: assert length <= self.get_height(start_hash)
@@ -271,7 +319,7 @@ namespace c2pool::shares::tracker
             {
                 auto item = items[start_hash];
                 result_chain.push_back(item);
-                start_hash = delta_type::get_tail(item);
+                start_hash = DELTA_TYPE::get_tail(item);
             }
             return result_chain;
         }
@@ -279,26 +327,26 @@ namespace c2pool::shares::tracker
         bool is_child_of(uint256 item_hash, uint256 possible_child_hash);
     };
 
-    template <typename subset_of_type>
-    class SubsetTracker : public Tracker<SubsetProtoAttributeDelta>
+    template <typename subset_of_type, typename item_type>
+    class SubsetTracker : public Tracker<SubsetProtoAttributeDelta, item_type>
     {
     public:
         shared_ptr<subset_of_type> subset_of;
 
     public:
-        SubsetTracker(shared_ptr<subset_of_type> _subset_of) : Tracker<SubsetProtoAttributeDelta>()
+        SubsetTracker(shared_ptr<subset_of_type> _subset_of) : Tracker<SubsetProtoAttributeDelta, item_type>()
         {
             //self.get_nth_parent_hash = subset_of.get_nth_parent_hash # overwrites Tracker.__init__'s
             subset_of = _subset_of;
         }
 
-        SubsetTracker(vector<c2pool::shares::BaseShare> &_items, subset_of_type *_subset_of) : Tracker<SubsetProtoAttributeDelta>(_items)
+        SubsetTracker(vector<item_type> &_items, subset_of_type *_subset_of) : Tracker<SubsetProtoAttributeDelta, item_type>(_items)
         {
             //self.get_nth_parent_hash = subset_of.get_nth_parent_hash # overwrites Tracker.__init__'s
             subset_of = _subset_of;
         }
 
-        void add(BaseShare item) override
+        void add(item_type item) override
         {
             if (subset_of != nullptr)
             {
@@ -317,20 +365,20 @@ namespace c2pool::shares::tracker
         }
     };
 
-    class OkayTracker : public Tracker<OkayProtoAttributeDelta>, std::enable_shared_from_this<OkayTracker>
+    class OkayTracker : public Tracker<OkayProtoAttributeDelta, BaseShare>, std::enable_shared_from_this<OkayTracker>
     {
     public:
         shared_ptr<c2pool::config::Network> net;
-        SubsetTracker<OkayTracker> verified;
+        SubsetTracker<OkayTracker, BaseShare> verified;
         //TODO: self.get_cumulative_weights = WeightsSkipList(self)
 
     public:
-        OkayTracker(shared_ptr<c2pool::config::Network> _net) : Tracker<OkayProtoAttributeDelta>(), verified(shared_from_this())
+        OkayTracker(shared_ptr<c2pool::config::Network> _net) : Tracker<OkayProtoAttributeDelta, BaseShare>(), verified(shared_from_this())
         {
             net = _net;
         }
 
-        OkayTracker(vector<c2pool::shares::BaseShare> &_items) : Tracker<OkayProtoAttributeDelta>(_items), verified(shared_from_this())
+        OkayTracker(vector<c2pool::shares::BaseShare> &_items) : Tracker<OkayProtoAttributeDelta, BaseShare>(_items), verified(shared_from_this())
         {
             //TODO:
         }
