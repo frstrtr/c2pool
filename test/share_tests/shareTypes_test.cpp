@@ -113,35 +113,30 @@ TEST(ShareTypes, TransactionHashRefDeSerialize)
 TEST(ShareTypes, ShareInfoTypeDeSerialize)
 {
     ShareInfoType first(
-                make_shared<ShareData>(
-                    CreateUINT<uint256>("2"),
-                    "empty",
-                    5,
-                    CreateUINT<uint160>("33"),
-                    11,
-                    1,
-                    StaleInfo::None,
-                    1337
-                ),
-                vector<uint256>(),
-                vector<TransactionHashRef>(),
-                CreateUINT<uint256>("2"),
-                10000,
-                9999,
-                100123123,
-                12,
-                CreateUINT<uint128>("321"),
-                make_shared<SegwitData>(
-                    make_shared<MerkleLink>(),
-                    CreateUINT<uint256>("0")
-                )
-            );
+        make_shared<ShareData>(
+            CreateUINT<uint256>("2"),
+            "empty",
+            5,
+            CreateUINT<uint160>("33"),
+            11,
+            1,
+            StaleInfo::None,
+            1337),
+        vector<uint256>(),
+        vector<TransactionHashRef>(),
+        CreateUINT<uint256>("2"),
+        10000,
+        9999,
+        100123123,
+        12,
+        CreateUINT<uint128>("321"),
+        make_shared<SegwitData>(
+            make_shared<MerkleLink>(),
+            CreateUINT<uint256>("0")));
 
     UniValue value;
     value = first;
     string json = value.write();
-
-    std::cout << json << std::endl;
 
     ShareInfoType second;
     second = value;
@@ -149,6 +144,135 @@ TEST(ShareTypes, ShareInfoTypeDeSerialize)
     ASSERT_EQ(first, second);
 }
 
+TEST(ShareTypes, ShareTypeDeSerialize)
+{
+    ShareType first(
+        make_shared<SmallBlockHeaderType>(
+            1,
+            CreateUINT<uint256>("2"),
+            3,
+            4,
+            5),
+        make_shared<ShareInfoType>(
+            make_shared<ShareData>(
+                CreateUINT<uint256>("2"),
+                "empty",
+                5,
+                CreateUINT<uint160>("33"),
+                11,
+                1,
+                StaleInfo::None,
+                1337),
+            vector<uint256>(),
+            vector<TransactionHashRef>(),
+            CreateUINT<uint256>("2"),
+            10000,
+            9999,
+            100123123,
+            12,
+            CreateUINT<uint128>("321"),
+            make_shared<SegwitData>(
+                make_shared<MerkleLink>(),
+                CreateUINT<uint256>("0"))),
+        make_shared<MerkleLink>(),
+        5,
+        make_shared<HashLinkType>("state", "", 5),
+        make_shared<MerkleLink>());
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    ShareType second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, RefTypeDeSerialize)
+{
+    RefType first(
+        "123",
+        std::make_shared<ShareInfoType>(
+            make_shared<ShareData>(
+                CreateUINT<uint256>("2"),
+                "empty",
+                5,
+                CreateUINT<uint160>("33"),
+                11,
+                1,
+                StaleInfo::None,
+                1337),
+            vector<uint256>(),
+            vector<TransactionHashRef>(),
+            CreateUINT<uint256>("2"),
+            10000,
+            9999,
+            100123123,
+            12,
+            CreateUINT<uint128>("321"),
+            make_shared<SegwitData>(
+                make_shared<MerkleLink>(),
+                CreateUINT<uint256>("0"))));
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    RefType second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
+
+TEST(ShareTypes, RawShareDeSerialize)
+{
+    ShareType _share_type(
+        make_shared<SmallBlockHeaderType>(
+            1,
+            CreateUINT<uint256>("2"),
+            3,
+            4,
+            5),
+        make_shared<ShareInfoType>(
+            make_shared<ShareData>(
+                CreateUINT<uint256>("2"),
+                "empty",
+                5,
+                CreateUINT<uint160>("33"),
+                11,
+                1,
+                StaleInfo::None,
+                1337),
+            vector<uint256>(),
+            vector<TransactionHashRef>(),
+            CreateUINT<uint256>("2"),
+            10000,
+            9999,
+            100123123,
+            12,
+            CreateUINT<uint128>("321"),
+            make_shared<SegwitData>(
+                make_shared<MerkleLink>(),
+                CreateUINT<uint256>("0"))),
+        make_shared<MerkleLink>(),
+        5,
+        make_shared<HashLinkType>("state", "", 5),
+        make_shared<MerkleLink>());
+
+    RawShare first(
+        102,
+        _share_type);
+
+    UniValue value;
+    value = first;
+    string json = value.write();
+
+    RawShare second;
+    second = value;
+
+    ASSERT_EQ(first, second);
+}
 //TODO:
 #ifdef FALSE
 

@@ -531,6 +531,12 @@ namespace c2pool::shares
         int type; //enum ShareVersion
         ShareType contents;
 
+        RawShare(){}
+        RawShare(int _type, ShareType _contens){
+            type = _type;
+            contents = _contens;
+        }
+
         friend std::istream &operator>>(std::istream &is, RawShare &value);
         friend std::ostream &operator<<(std::ostream &os, const RawShare &value);
 
