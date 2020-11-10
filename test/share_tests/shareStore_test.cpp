@@ -122,4 +122,6 @@ TEST_F(ShareStoreTest, AddReadShareStore)
 
 
     store->Read(share->hash.ToString(), second_share);
+
+    ASSERT_EQ(share->contents, second_share.contents);
 }
