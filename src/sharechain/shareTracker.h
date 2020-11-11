@@ -116,9 +116,9 @@ namespace c2pool::shares::tracker
         }
 
         template <typename T>
-        friend OkayProtoAttributeDelta operator+(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b);
+        friend OkayProtoAttributeDelta<T> operator+(const OkayProtoAttributeDelta<T> &a, const OkayProtoAttributeDelta<T> &b);
         template <typename T>
-        friend OkayProtoAttributeDelta operator-(const OkayProtoAttributeDelta &a, const OkayProtoAttributeDelta &b);
+        friend OkayProtoAttributeDelta<T> operator-(const OkayProtoAttributeDelta<T> &a, const OkayProtoAttributeDelta<T> &b);
 
         // OkayProtoAttributeDelta& operator+(const OkayProtoAttributeDelta& b);
         // OkayProtoAttributeDelta& operator-(const OkayProtoAttributeDelta& b);
@@ -154,9 +154,9 @@ namespace c2pool::shares::tracker
         }
 
         template <typename T>
-        friend SubsetProtoAttributeDelta operator+(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b);
+        friend SubsetProtoAttributeDelta<T> operator+(const SubsetProtoAttributeDelta<T> &a, const SubsetProtoAttributeDelta<T> &b);
         template <typename T>
-        friend SubsetProtoAttributeDelta operator-(const SubsetProtoAttributeDelta &a, const SubsetProtoAttributeDelta &b);
+        friend SubsetProtoAttributeDelta<T> operator-(const SubsetProtoAttributeDelta<T> &a, const SubsetProtoAttributeDelta<T> &b);
 
         // SubsetProtoAttributeDelta& operator+(const SubsetProtoAttributeDelta& b);
         // SubsetProtoAttributeDelta& operator-(const SubsetProtoAttributeDelta& b);
@@ -226,8 +226,9 @@ namespace c2pool::shares::tracker
             if (_deltas.find(item_hash) != _deltas.end())
             {
                 auto delta_ref1 = _deltas[item_hash];
-                auto delta2 = _delta_refs[std::get<1>(delta_ref1)];
-                return std::get<0>(delta_ref1) + delta2;
+                DELTA_TYPE delta2 = _delta_refs[std::get<1>(delta_ref1)];
+                DELTA_TYPE _d = std::get<0>(delta_ref1);
+                return _d + delta2;
             }
             else
             {
@@ -352,7 +353,7 @@ namespace c2pool::shares::tracker
             {
                 //TODO: assert self._delta_type.get_head(item) in self._subset_of.items
             }
-            Tracker<SubsetProtoAttributeDelta>::add(item);
+            Tracker<SubsetProtoAttributeDelta, item_type>::add(item);
         }
 
         void remove(uint256 item_hash) override
@@ -361,7 +362,7 @@ namespace c2pool::shares::tracker
             {
                 //TODO: assert item_hash in self._subset_of.items
             }
-            Tracker<SubsetProtoAttributeDelta>::remove(item_hash);
+            Tracker<SubsetProtoAttributeDelta, item_type>::remove(item_hash);
         }
     };
 

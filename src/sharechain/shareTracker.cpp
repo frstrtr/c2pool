@@ -133,22 +133,22 @@ namespace c2pool::shares::tracker
     /*template <typename delta_type>
     Tracker<delta_type>:: */
 
-    template <typename delta_type>
-    void Tracker<delta_type>::_handle_remove_special(BaseShare item)
+    template<template<typename> typename delta_type, typename item_type>
+    void Tracker<delta_type, item_type>::_handle_remove_special(item_type item)
     {
         //TODO
         // delta_type delta = delta_type(item);
     }
 
-    template <typename delta_type>
-    void Tracker<delta_type>::_handle_remove_special2(BaseShare item)
+    template<template<typename> typename delta_type, typename item_type>
+    void Tracker<delta_type, item_type>::_handle_remove_special2(item_type item)
     {
         //TODO
         // delta_type delta = delta_type(item);
     }
 
-    template <typename delta_type>
-    void Tracker<delta_type>::_handle_removed(BaseShare item)
+    template<template<typename> typename delta_type, typename item_type>
+    void Tracker<delta_type, item_type>::_handle_removed(item_type item)
     {
         //TODO
         // delta_type delta = delta_type(item);
@@ -160,29 +160,29 @@ namespace c2pool::shares::tracker
 namespace c2pool::shares::tracker
 {
 
-    template <typename delta_type>
-    Tracker<delta_type>::Tracker()
+    template<template<typename> typename delta_type, typename item_type>
+    Tracker<delta_type, item_type>::Tracker()
     {
         //TrackerView
         using namespace std::placeholders;
 
-        remove_special.subscribe(&Tracker<delta_type>::_handle_remove_special, this, _1);
-        remove_special2.subscribe(&Tracker<delta_type>::_handle_remove_special2, this, _1);
-        removed.subscribe(&Tracker<delta_type>::_handle_removed, this, _1);
+        remove_special.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special, this, _1);
+        remove_special2.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special2, this, _1);
+        removed.subscribe(&Tracker<delta_type, item_type>::_handle_removed, this, _1);
 
         //Tracker
         //self.get_nth_parent_hash = DistanceSkipList(self) //TODO
     }
 
-    template <typename delta_type>
-    Tracker<delta_type>::Tracker(vector<c2pool::shares::BaseShare> &_items)
+    template<template<typename> typename delta_type, typename item_type>
+    Tracker<delta_type, item_type>::Tracker(vector<item_type> &_items)
     {
         //TrackerView
         using namespace std::placeholders;
 
-        remove_special.subscribe(&Tracker<delta_type>::_handle_remove_special, this, _1);
-        remove_special2.subscribe(&Tracker<delta_type>::_handle_remove_special2, this, _1);
-        removed.subscribe(&Tracker<delta_type>::_handle_removed, this, _1);
+        remove_special.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special, this, _1);
+        remove_special2.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special2, this, _1);
+        removed.subscribe(&Tracker<delta_type, item_type>::_handle_removed, this, _1);
 
         //Tracker
         //self.get_nth_parent_hash = DistanceSkipList(self) //TODO
@@ -193,10 +193,10 @@ namespace c2pool::shares::tracker
         }
     }
 
-    template <typename delta_type>
-    void Tracker<delta_type>::add(BaseShare item)
+    template<template<typename> typename delta_type, typename item_type>
+    void Tracker<delta_type, item_type>::add(item_type item)
     {
-        delta_type delta = delta_type(item);
+        DELTA_TYPE delta = DELTA_TYPE(item);
 
         if (items.find(delta.head) != items.end())
         {
@@ -243,8 +243,8 @@ namespace c2pool::shares::tracker
         added.happened(item);
     }
 
-    template <typename delta_type>
-    void Tracker<delta_type>::remove(uint256 item_hash)
+    template<template<typename> typename delta_type, typename item_type>
+    void Tracker<delta_type, item_type>::remove(uint256 item_hash)
     {
         if (items.find(item_hash) == items.end())
         {
@@ -253,7 +253,7 @@ namespace c2pool::shares::tracker
 
         auto item = items[item_hash];
 
-        delta_type delta = delta_type(item);
+        DELTA_TYPE delta = DELTA_TYPE(item);
 
         set<uint256> children;
         if (reverse.find(delta.head) != reverse.end())

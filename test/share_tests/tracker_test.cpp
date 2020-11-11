@@ -40,7 +40,6 @@ class ShareTrackerTest : public ::testing::Test
 protected:
     shared_ptr<TestNetwork> net;
     vector<TestShare> _items;
-
 protected:
     void SetUp()
     {
