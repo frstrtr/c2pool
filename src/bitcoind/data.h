@@ -4,16 +4,27 @@
 #include <cstring>
 #include <vector>
 #include <uint256.h>
+#include <arith_uint256.h>
+#include <iostream>
 
 using std::vector;
 
 namespace bitcoind::data
 {
 
-    // uint256 target_to_average_attempts(uint256 target)
-    // {
-    //     //TODO:
-    // }
+    uint256 target_to_average_attempts(uint256 target)
+    {
+        arith_uint256 arith_target = UintToArith256(target) + 1;
+
+        if (arith_target.GetHex() == "0000000000000000000000000000000000000000000000000000000000000000")
+        {
+            arith_target.SetHex("0000000000000000000000000000000000000000000000000000000000000001");
+            return ArithToUint256(arith_target);
+        }
+        arith_uint256 result("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        result /= arith_target;
+        return ArithToUint256(result);
+    }
 
     class PreviousOutput
     {
