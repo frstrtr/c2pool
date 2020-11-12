@@ -26,6 +26,15 @@ namespace bitcoind::data
         return ArithToUint256(result);
     }
 
+    uint256 average_attempts_to_target(uint256 average_attempts){
+        //todo: assert average_attempts > 0
+        auto arith_average_attempts = UintToArith256(average_attempts);
+        arith_uint256 result("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        result /= arith_average_attempts;
+        result -= 1;
+        return ArithToUint256(result);
+    }
+
     class PreviousOutput
     {
     public:
