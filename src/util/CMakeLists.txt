@@ -1,6 +1,7 @@
 project(util)
 
 include_directories(../other)
+include_directories(../univalue)
 
 find_package(Python3 REQUIRED Development) #cmake --help-module FindPython
 message("
@@ -14,7 +15,7 @@ set(SOURCE_FILES pack.cpp pystruct.cpp filesys.cpp messages.cpp types.cpp)
 
 add_library(util STATIC ${SOURCE_FILES} ${HEADER_FILES})
 
-target_link_libraries(util other)
+target_link_libraries(util other univalue)
 
 target_compile_definitions(util PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
 target_include_directories(util PUBLIC ${Python3_INCLUDE_DIRS})
