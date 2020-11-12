@@ -1,4 +1,5 @@
 from __future__ import absolute_import, division
+import itertools
 
 import codecs
 import binascii
@@ -7,14 +8,16 @@ import io as StringIO
 from io import BytesIO
 import os
 import hashlib
+import json
 
-#-------------------------------------------p2pool util/math---------------------------------------
+# -------------------------------------------p2pool util/math---------------------------------------
 
 
 #import __builtin__
 import math
 import random
 import time
+
 
 def median(x, use_float=True):
     # there exist better algorithms...
@@ -29,6 +32,7 @@ def median(x, use_float=True):
     else:
         return sum//2
 
+
 def mean(x):
     total = 0
     count = 0
@@ -37,10 +41,12 @@ def mean(x):
         count += 1
     return total/count
 
+
 def shuffled(x):
     x = list(x)
     random.shuffle(x)
     return x
+
 
 def shift_left(n, m):
     # python: :(
@@ -58,11 +64,13 @@ def shift_left(n, m):
 
 # add_to_range = lambda x, (low, high): (min(low, x), max(high, x))
 
+
 def nth(i, n=0):
     i = iter(i)
     for _ in xrange(n):
         i.next()
     return i.next()
+
 
 def geometric(p):
     if p <= 0 or p > 1:
@@ -70,6 +78,7 @@ def geometric(p):
     if p == 1:
         return 1
     return int(math.log1p(-random.random()) / math.log1p(-p)) + 1
+
 
 def add_dicts_ext(add_func=lambda a, b: a+b, zero=0):
     def add_dicts(*dicts):
@@ -79,9 +88,13 @@ def add_dicts_ext(add_func=lambda a, b: a+b, zero=0):
                 res[k] = add_func(res.get(k, zero), v)
         return dict((k, v) for k, v in res.iteritems() if v != zero)
     return add_dicts
+
+
 add_dicts = add_dicts_ext()
 
-mult_dict = lambda c, x: dict((k, c*v) for k, v in x.iteritems())
+
+def mult_dict(c, x): return dict((k, c*v) for k, v in x.iteritems())
+
 
 def format(x, add_space=False):
     prefixes = 'kMGTPEZY'
@@ -93,6 +106,7 @@ def format(x, add_space=False):
     if add_space and s:
         s = ' ' + s
     return '%i' % (x,) + s
+
 
 def format_dt(dt):
     for value, name in [
@@ -106,7 +120,9 @@ def format_dt(dt):
             break
     return '%.01f %s' % (dt/value, name)
 
-perfect_round = lambda x: int(x + random.random())
+
+def perfect_round(x): return int(x + random.random())
+
 
 def erf(x):
     # save the sign of x
@@ -114,32 +130,37 @@ def erf(x):
     if x < 0:
         sign = -1
     x = abs(x)
-    
+
     # constants
-    a1 =  0.254829592
+    a1 = 0.254829592
     a2 = -0.284496736
-    a3 =  1.421413741
+    a3 = 1.421413741
     a4 = -1.453152027
-    a5 =  1.061405429
-    p  =  0.3275911
-    
+    a5 = 1.061405429
+    p = 0.3275911
+
     # A&S formula 7.1.26
     t = 1.0/(1.0 + p*x)
     y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*math.exp(-x*x)
-    return sign*y # erf(-x) = -erf(x)
+    return sign*y  # erf(-x) = -erf(x)
+
 
 def find_root(y_over_dy, start, steps=10, bounds=(None, None)):
     guess = start
     for i in xrange(steps):
         prev, guess = guess, guess - y_over_dy(guess)
-        if bounds[0] is not None and guess < bounds[0]: guess = bounds[0]
-        if bounds[1] is not None and guess > bounds[1]: guess = bounds[1]
+        if bounds[0] is not None and guess < bounds[0]:
+            guess = bounds[0]
+        if bounds[1] is not None and guess > bounds[1]:
+            guess = bounds[1]
         if guess == prev:
             break
     return guess
 
+
 def ierf(z):
     return find_root(lambda x: (erf(x) - z)/(2*math.e**(-x**2)/math.sqrt(math.pi)), 0)
+
 
 def binomial_conf_interval(x, n, conf=0.95):
     assert 0 <= x <= n and 0 <= conf < 1
@@ -154,7 +175,9 @@ def binomial_conf_interval(x, n, conf=0.95):
     bottom = 1 + z**2/n
     return [clip(x, (0, 1)) for x in add_to_range(x/n, [(topa - topb)/bottom, (topa + topb)/bottom])]
 
-minmax = lambda x: (min(x), max(x))
+
+def minmax(x): return (min(x), max(x))
+
 
 def format_binomial_conf(x, n, conf=0.95, f=lambda x: x):
     if n == 0:
@@ -162,16 +185,19 @@ def format_binomial_conf(x, n, conf=0.95, f=lambda x: x):
     left, right = minmax(map(f, binomial_conf_interval(x, n, conf)))
     return '~%.1f%% (%.f-%.f%%)' % (100*f(x/n), math.floor(100*left), math.ceil(100*right))
 
+
 def reversed(x):
     try:
         return __builtin__.reversed(x)
     except TypeError:
         return reversed(list(x))
 
+
 class Object(object):
     def __init__(self, **kwargs):
         for k, v in kwargs.iteritems():
             setattr(self, k, v)
+
 
 def add_tuples(res, *tuples):
     for t in tuples:
@@ -180,10 +206,12 @@ def add_tuples(res, *tuples):
         res = tuple(a + b for a, b in zip(res, t))
     return res
 
+
 def flatten_linked_list(x):
     while x is not None:
         x, cur = x
         yield cur
+
 
 def weighted_choice(choices):
     choices = list((item, weight) for item, weight in choices)
@@ -193,6 +221,7 @@ def weighted_choice(choices):
             return item
         target -= weight
     raise AssertionError()
+
 
 def natural_to_string(n, alphabet=None):
     if n < 0:
@@ -211,6 +240,7 @@ def natural_to_string(n, alphabet=None):
         res.reverse()
         return ''.join(res)
 
+
 def string_to_natural(s, alphabet=None):
     if alphabet is None:
         assert not s.startswith('\x00')
@@ -220,20 +250,21 @@ def string_to_natural(s, alphabet=None):
         assert not s.startswith(alphabet[0])
         return sum(alphabet.index(char) * len(alphabet)**i for i, char in enumerate(reversed(s)))
 
+
 class RateMonitor(object):
     def __init__(self, max_lookback_time):
         self.max_lookback_time = max_lookback_time
-        
+
         self.datums = []
         self.first_timestamp = None
-    
+
     def _prune(self):
         start_time = time.time() - self.max_lookback_time
         for i, (ts, datum) in enumerate(self.datums):
             if ts > start_time:
                 del self.datums[:i]
                 return
-    
+
     def get_datums_in_last(self, dt=None):
         if dt is None:
             dt = self.max_lookback_time
@@ -241,7 +272,7 @@ class RateMonitor(object):
         self._prune()
         now = time.time()
         return [datum for ts, datum in self.datums if ts > now - dt], min(dt, now - self.first_timestamp) if self.first_timestamp is not None else 0
-    
+
     def add_datum(self, datum):
         self._prune()
         t = time.time()
@@ -250,17 +281,15 @@ class RateMonitor(object):
         else:
             self.datums.append((t, datum))
 
+
 def merge_dicts(*dicts):
     res = {}
-    for d in dicts: res.update(d)
+    for d in dicts:
+        res.update(d)
     return res
 
 
-
-
-
 # ------------------------------------------p2pool memoize------------------------------------------
-import itertools
 
 
 class LRUDict(object):
@@ -398,6 +427,8 @@ class Type(object):
         return packed_size
 
 #0 < VarIntType < 2^64
+
+
 class VarIntType(Type):
     def read(self, file):
         data = file.read(1)
@@ -669,9 +700,10 @@ class FixedStrType(Type):
             raise ValueError('incorrect length item!')
         file.write(item)
 
+
 class FloatingInteger(object):
     __slots__ = ['bits', '_target']
-    
+
     @classmethod
     def from_target_upper_bound(cls, target):
         n = natural_to_string(target)
@@ -680,49 +712,53 @@ class FloatingInteger(object):
         bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
         bits = IntType(32).unpack(bits2)
         return cls(bits)
-    
+
     def __init__(self, bits, target=None):
         self.bits = bits
         self._target = None
         if target is not None and self.target != target:
             raise ValueError('target does not match')
-    
+
     @property
     def target(self):
         res = self._target
         if res is None:
-            res = self._target = shift_left(self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
+            res = self._target = shift_left(
+                self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
         return res
-    
+
     def __hash__(self):
         return hash(self.bits)
-    
+
     def __eq__(self, other):
         return self.bits == other.bits
-    
+
     def __ne__(self, other):
         return not (self == other)
-    
+
     def __cmp__(self, other):
         assert False
-    
+
     def __repr__(self):
         return 'FloatingInteger(bits=%s, target=%s)' % (hex(self.bits), hex(self.target))
 
+
 class FloatingIntegerType(Type):
     _inner = IntType(32)
-    
+
     def read(self, file):
         bits = self._inner.read(file)
         return FloatingInteger(bits)
-    
+
     def write(self, file, item):
         return self._inner.write(file, item.bits)
 
-#---new
+# ---new
+
 
 def is_segwit_tx(tx):
     return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
+
 
 tx_in_type = ComposedType([
     ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
@@ -744,6 +780,7 @@ tx_id_type = ComposedType([
     ('tx_outs', ListType(tx_out_type)),
     ('lock_time', IntType(32))
 ])
+
 
 class TransactionType(Type):
     _int_type = IntType(32)
@@ -770,7 +807,7 @@ class TransactionType(Type):
         version = self._int_type.read(file)
         marker = self._varint_type.read(file)
         if marker == 0:
-            next = self._wtx_type.read(file) #_wtx_type
+            next = self._wtx_type.read(file)  # _wtx_type
             witness = [None]*len(next['tx_ins'])
             for i in range(len(next['tx_ins'])):
                 witness[i] = self._witness_type.read(file)
@@ -780,9 +817,9 @@ class TransactionType(Type):
             tx_ins = [None]*marker
             for i in range(marker):
                 tx_ins[i] = tx_in_type.read(file)
-            next = self._ntx_type.read(file) #_ntx_type
+            next = self._ntx_type.read(file)  # _ntx_type
             return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
-    
+
     def write(self, file, item):
         if is_segwit_tx(item):
             assert len(item['tx_ins']) == len(item['witness'])
@@ -792,6 +829,7 @@ class TransactionType(Type):
             self._int_type.write(file, item['lock_time'])
             return
         return tx_id_type.write(file, item)
+
 
 tx_type = TransactionType()
 
@@ -807,7 +845,7 @@ share_type = ComposedType([
     ('contents', VarStrType()),
 ])
 
-#TODO:
+# TODO:
 # block_header_type = ComposedType([
 #     ('version', IntType(32)),
 #     ('previous_block', PossiblyNoneType(0, IntType(256))),
@@ -955,7 +993,7 @@ class UnpackResult:
         self.res += other.res
 
     def __str__(self):
-        return self.res.rstrip(' ') #todo: remove last ' '?
+        return self.res.rstrip(' ')  # todo: remove last ' '?
 
 
 class msg:
@@ -1125,9 +1163,118 @@ class messageGetAddrs(msg):
         res = t['count']
         return res
 
+# -------------------------------------------Global-Type-------------------------------------
+
+
+class TYPE:
+
+    # tx's---------------------
+    tx_in_type = ComposedType([
+        ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
+            ('hash', IntType(256)),
+            ('index', IntType(32)),
+        ]))),
+        ('script', VarStrType()),
+        ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
+    ])
+
+    tx_out_type = ComposedType([
+        ('value', IntType(64)),
+        ('script', VarStrType()),
+    ])
+
+    tx_id_type = ComposedType([
+        ('version', IntType(32)),
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type)),
+        ('lock_time', IntType(32))
+    ])
+
+    tx_type = TransactionType()
+    # messages and types-------
+
+    address_type = ComposedType([
+        ('services', IntType(64)),
+        ('address', IPV6AddressType()),
+        ('port', IntType(16, 'big')),
+    ])
+
+    share_type = ComposedType([
+        ('type', VarIntType()),
+        ('contents', VarStrType()),
+    ])
+
+    message_error = ComposedType([
+        ('issue', VarStrType())
+    ])
+
+    message_version = ComposedType([
+        ('version', IntType(32)),
+        ('services', IntType(64)),
+        ('addr_to', address_type),
+        ('addr_from', address_type),
+        ('nonce', IntType(64)),
+        ('sub_version', VarStrType()),
+        ('mode', IntType(32)),  # always 1 for legacy compatibility
+        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
+    ])
+
+    message_ping = ComposedType([])
+
+    message_addrme = ComposedType([('port', IntType(16))])
+
+    message_addrs = ComposedType([
+        ('addrs', ListType(ComposedType([
+            ('timestamp', IntType(64)),
+            ('address', address_type),  # todo check it out
+        ]))),
+    ])
+
+    message_getaddrs = ComposedType([
+        ('count', IntType(32)),
+    ])
+
+    @classmethod
+    def get_type(cls, type_name):
+        return getattr(cls, type_name, None)
+    
+    @classmethod
+    def get_json_dict(cls, type_name, _json):
+        '''
+            json_str -> dict
+            +
+            Пост-обработка спецефичных структур
+        '''
+        return json.loads(_json)
+
+    # @classmethod
+    # def 
+
+def serialize(type_name, _json):
+    _type = TYPE.get_type(type_name)
+    if _type is None:
+        return 'error_type'
+    json_dict = TYPE.get_json_dict(_json)
+    result = bytes_to_char_stringstream(_type.pack(json_dict))
+    return result
+
+def deserialize(type_name, _bytes_array):
+    _type = TYPE.get_type(type_name)
+    if _type is None:
+        return 'error_type'
+    _obj_dict = _type.unpack(_bytes_array)
+    result = str(_obj_dict)
+    return result
+
+def packed_size(type_name, _json):
+    _type = TYPE.get_type(type_name)
+    if _type is None:
+        return 0
+    json_dict = TYPE.get_json_dict(_json)
+    result = _type.packed_size(json_dict)
+    return result
+
 # ------------------------------------------packtypes-for-C---------------------------------
-
-
 EnumMessages = {
     9999: messageError,  # todo: create this class
     0: messageVersion,
@@ -1157,28 +1304,31 @@ def message_pack(command, vars):
 def message_unpack(command, data):
     pass
 
+
 def bytes_to_char_stringstream(_bytes):
     chars = [str(byte) for byte in _bytes]
     return ' '.join(chars)
-#----------------------CPP COMMANDS
+# ----------------------CPP COMMANDS
+
 
 def payload_length(command, unpacked_payload):
     """
-        
+
     """
 
     type_ = message_from_str(command)
 
-    #if error command
+    # if error command
     if type_ is None:
         type_ = EnumMessages[9999]
-    
-    command = bytes(command, encoding = 'ISO-8859-1')
-    
+
+    command = bytes(command, encoding='ISO-8859-1')
+
     msg = type_()
     packed_payload = msg.pack(unpacked_payload)
 
     return len(packed_payload)
+
 
 def receive_length(msg):
     #print('receive_length get: {0}, type {1}; after encoding {2}'.format(msg, type(msg), bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
@@ -1188,11 +1338,12 @@ def receive_length(msg):
     #print('length = {0}'.format(length))
     return length
 
+
 def receive(_command, checksum, payload):
     """
         called when we receive msg from p2pool to c2pool
     """
-    
+
     # print('_command = {0}'.format(_command))
     # print('checksum = {0}'.format(checksum))
     # print('payload = {0}'.format(payload))
@@ -1201,12 +1352,12 @@ def receive(_command, checksum, payload):
     # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
     # checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
 
-    #checksum check
+    # checksum check
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
-        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
+        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
+            hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
         return '-1'
-    #------------
-
+    # ------------
 
     type_ = message_from_str(command)
     if type_ is None:
@@ -1222,34 +1373,38 @@ def send(command, payload2):
     """
     type_ = message_from_str(command)
 
-    #if error command
+    # if error command
     if type_ is None:
         type_ = EnumMessages[9999]
-    command = bytes(command, encoding = 'ISO-8859-1')
-    
+    command = bytes(command, encoding='ISO-8859-1')
+
     msg = type_()
     payload = msg.pack(payload2)
 
     #print('SEND_PAYLOAD: {0}'.format(payload))
 
-    result = struct.pack('<12sI', command, len(payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
+    result = struct.pack('<12sI', command, len(
+        payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
     #print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
     #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
 # ------------------------------------------FOR C++ DEBUG----------------------------------
 
+
 def debug_log(char_array):
     print(str(char_array))
 
 # ------------------------------------------FOR UNIT TESTS---------------------------------
+
 
 def get_packed_int(num):
     #print('get_packed_int() get {0}; packed: {1} '.format(num, struct.pack('<I', num)))
 
     return bytes_to_char_stringstream(struct.pack('<I', num))
 
-def data_for_test_receive(to_char = True):
+
+def data_for_test_receive(to_char=True):
     message_version = ComposedType([
         ('version', IntType(32)),
         ('services', IntType(64)),
@@ -1262,29 +1417,33 @@ def data_for_test_receive(to_char = True):
     ])
 
     message_version_dict = {
-        'version':1,
-        'services':2,
-        'addr_to': {'services':3, 'address':'4.5.6.7', 'port':8},
-        'addr_from':{'services':9, 'address':'10.11.12.13', 'port':14},
-        'nonce':15,
+        'version': 1,
+        'services': 2,
+        'addr_to': {'services': 3, 'address': '4.5.6.7', 'port': 8},
+        'addr_from': {'services': 9, 'address': '10.11.12.13', 'port': 14},
+        'nonce': 15,
         'sub_version': '16',
-        'mode':17,
-        'best_share_hash':18
-        }
-    #---------------------
+        'mode': 17,
+        'best_share_hash': 18
+    }
+    # ---------------------
     if to_char:
         return bytes_to_char_stringstream(message_version.pack(message_version_dict))
     else:
         return message_version.pack(message_version_dict)
 
+
 def length_for_test_receive():
     return len(data_for_test_receive(False))
+
 
 def checksum_for_test_receive():
     return bytes_to_char_stringstream(hashlib.sha256(hashlib.sha256(data_for_test_receive(False)).digest()).digest()[:4])
 
+
 def data_for_test_send():
-    return send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
+    return send('version', '1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
+
 
 def emulate_protocol_get_data(command, payload2):
     res_send = send(command, payload2)
@@ -1293,10 +1452,12 @@ def emulate_protocol_get_data(command, payload2):
         res += '{0} '.format(i)
     res.rstrip(' ')
 
+
 def test_get_bytes_from_cpp(_bytes):
-    print('FROM PYTHON: test_get_bytes_from_cpp: {0}, len: {1}'.format(_bytes, len(_bytes)))
-    
-    
+    print('FROM PYTHON: test_get_bytes_from_cpp: {0}, len: {1}'.format(
+        _bytes, len(_bytes)))
+
+
 # ------------------------------------------TESTS------------------------------------------
 """
 def TEST_PACK_UNPACK():
@@ -1359,12 +1520,12 @@ def TEST_UNPACKRES():
 """
 
 
-#debug_log('\x83\xe6],\x81\xbfmhversion\x00\x00\x00\x00\x00\x7f\x00\x00\x00\xeeoH\xb7\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xb0q\xed\xa2\xe8\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xc0\xa8\n\n\x13\xa0\xdeD(\x9f#\xb3oz\x128222e87-c2pool.bit\x01\x00\x00\x00\tc\x9d\x1c*\xad\x84I\xe4\xa8L\xb7\xa7D\x94\x0b\x0e\xc7\x01Q\xa7\xcdZ^\x9d\x18a3Rc\x82\xd2')
-#print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;1008386737136591102;16;17;18'))
+# debug_log('\x83\xe6],\x81\xbfmhversion\x00\x00\x00\x00\x00\x7f\x00\x00\x00\xeeoH\xb7\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xb0q\xed\xa2\xe8\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xc0\xa8\n\n\x13\xa0\xdeD(\x9f#\xb3oz\x128222e87-c2pool.bit\x01\x00\x00\x00\tc\x9d\x1c*\xad\x84I\xe4\xa8L\xb7\xa7D\x94\x0b\x0e\xc7\x01Q\xa7\xcdZ^\x9d\x18a3Rc\x82\xd2')
+# print(send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;1008386737136591102;16;17;18'))
 # print(send('addrme','80'))
 # print(send('getaddrs','3'))
 # print(send('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))
-#print(payload_length('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))
+# print(payload_length('addrs','1;2,3.4.5.6,7+8;9,10.11.12.13,14'))
 # res = b''
 # for i in send('version','1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18').split(' '):
 #     res += bytes(chr(int(i)), encoding = 'utf-8')
@@ -1375,15 +1536,14 @@ def TEST_UNPACKRES():
 # print(length_for_test_receive())
 
 
-
-#print(VarIntType().pack(2**64-1))
+# print(VarIntType().pack(2**64-1))
 
 # FI = FloatingInteger(2**32-1)
 # print(FI)
 # print(FloatingIntegerType().pack(FI))
 # print(FixedStrType(0).pack(b"1233"))
 
-#print(IntType(0).pack(0))
+# print(IntType(0).pack(0))
 
 #print(PossiblyNoneType(0, IntType(8)).pack(0))
 
@@ -1427,7 +1587,7 @@ segwit_tx_packed = tx_type.pack({
 print('____________')
 print(segwit_tx_packed)
 segwit_tx_unpacked = tx_type.unpack(segwit_tx_packed)
-print(segwit_tx_unpacked)
+print(type(segwit_tx_unpacked))
 print(tx_type.packed_size({
     'version':1, 
     'tx_outs': [{
@@ -1446,4 +1606,4 @@ print(tx_type.packed_size({
     'witness':[{'test_witne2323ss'}]
 }))
 '''
-#print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
+# print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
