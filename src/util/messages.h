@@ -6,6 +6,7 @@
 #include <string>
 #include "types.h"
 #include "pack.h"
+#include "uint256.h"
 
 //TODO: remove trash comments
 
@@ -53,7 +54,7 @@ namespace c2pool::messages
             return _prefix_length;
         }
 
-        void set_unpacked_length(char* packed_len = nullptr);
+        void set_unpacked_length(char *packed_len = nullptr);
         const unsigned int unpacked_length();
 
         char *prefix;
@@ -65,6 +66,7 @@ namespace c2pool::messages
     private:
         size_t _prefix_length;
         unsigned int _unpacked_length = 0;
+
     public:
         IMessage() {}
 
@@ -79,11 +81,12 @@ namespace c2pool::messages
         void decode_data();
 
         int get_length();
+
     protected:
         //возвращает длину для упакованного payload msg, которое формируется в c2pool.
-        virtual int pack_payload_length() {return 0;} 
+        virtual int pack_payload_length() { return 0; }
 
-        int set_length(char* data_);
+        int set_length(char *data_);
     };
 
     class message : public IMessage
@@ -121,8 +124,10 @@ namespace c2pool::messages
 
         virtual void _unpack(std::stringstream &ss) = 0;
         virtual std::string _pack() = 0;
+
     protected:
         int pack_payload_length() override;
+
     private:
         char *packed_c_str;
     };
@@ -176,8 +181,37 @@ namespace c2pool::messages
         //     ('mode', pack.IntType(32)), # always 1 for legacy compatibility
         int mode;
         //     ('best_share_hash', pack.PossiblyNoneType(0, pack.IntType(256))),
-        long best_share_hash; // TODO: long long?
+        uint256 best_share_hash;
         // ])
+
+        message_version &operator=(UniValue value)
+        {
+            version = value["version"].get_int();
+            services = value["services"].get_int();
+            addr_to = value["addr_to"].get_obj();
+            addr_from = value["addr_from"].get_obj();
+            nonce = value["nonce"].get_int64();
+            sub_version = value["sub_version"].get_str();
+            mode = value["mode"].get_int();
+            best_share_hash.SetHex(value["best_share_hash"].get_str());
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("version", version);
+            result.pushKV("services", services);
+            result.pushKV("addr_to", addr_to);
+            result.pushKV("addr_from", addr_from);
+            result.pushKV("nonce", nonce);
+            result.pushKV("sub_version", sub_version);
+            result.pushKV("mode", mode);
+            result.pushKV("best_share_hash", best_share_hash.GetHex());
+
+            return result;
+        }
     };
 
     class message_ping : public message
@@ -215,6 +249,21 @@ namespace c2pool::messages
         //    ('port', pack.IntType(16)),
         int port;
         //])
+        message_addrme &operator=(UniValue value)
+        {
+            port = value["port"].get_int();
+
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("port", port);
+
+            return result;
+        }
     };
 
     class message_getaddrs : public message
@@ -238,6 +287,23 @@ namespace c2pool::messages
         //     ('count', pack.IntType(32)),
         int count;
         // ])
+
+        message_getaddrs &operator=(UniValue value)
+        {
+
+            count = value["count"].get_int();
+
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("count", count);
+
+            return result;
+        }
     };
 
     class message_addrs : public message
@@ -245,6 +311,7 @@ namespace c2pool::messages
     public:
         vector<c2pool::messages::addr> addrs;
 
+    public:
         message_addrs() : message("addrs") {}
 
         message_addrs(vector<c2pool::messages::addr> _addrs) : message("addrs")
@@ -255,6 +322,31 @@ namespace c2pool::messages
         void _unpack(stringstream &ss) override;
 
         string _pack() override;
+
+        message_addrs &operator=(UniValue value)
+        {
+            for (auto arr_value : value["addrs"].get_array().getValues())
+            {
+                c2pool::messages::addr _temp_addr;
+                _temp_addr = arr_value;
+                addrs.push_back(_temp_addr);
+            }
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+            
+            UniValue addrs_array(UniValue::VARR);
+
+            for (auto _addr : addrs){
+                addrs_array.push_back(_addr);
+            } 
+            result.pushKV("addrs", addrs_array);
+
+            return result;
+        }
     };
 
     //__________________________

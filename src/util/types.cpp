@@ -19,18 +19,6 @@ namespace c2pool::messages
         port = _port;
     }
 
-    std::istream &operator>>(std::istream &is, address_type &value)
-    {
-        is >> value.services >> value.address >> value.port;
-        return is;
-    }
-
-    std::ostream &operator<<(std::ostream &os, const address_type &value)
-    {
-        os << value.services << "," << value.address << "," << value.port;
-        return os;
-    }
-
     bool operator==(const address_type &first, const address_type &second)
     {
         if (first.address != second.address)
@@ -60,19 +48,6 @@ namespace c2pool::messages
         contents = _contents;
     }
 
-    std::istream &operator>>(std::istream &is, share_type &value)
-    {
-        is >> value.type >> value.contents; //TODO: read string to contents, from parse '<data>'
-        return is;
-    }
-
-    std::ostream &operator<<(std::ostream &os, const share_type &value)
-    {
-        os << value.type << ","
-           << "'" << value.contents << "'";
-        return os;
-    }
-
     addr::addr()
     {
         address = address_type();
@@ -90,18 +65,6 @@ namespace c2pool::messages
         address_type a = address_type(_services, _address, _port);
         address = a;
         timestamp = t;
-    }
-
-    std::istream &operator>>(std::istream &is, addr &value)
-    {
-        is >> value.timestamp >> value.address;
-        return is;
-    }
-
-    std::ostream &operator<<(std::ostream &os, const addr &value)
-    {
-        os << value.timestamp << ";" <<  value.address;
-        return os;
     }
 
     bool operator==(const addr &first, const addr &second)
