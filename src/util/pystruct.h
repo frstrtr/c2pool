@@ -24,31 +24,12 @@ namespace c2pool::python
     };
 } // namespace c2pool::python
 
-namespace c2pool::messages::python
+namespace c2pool::python
 {
     class other
     {
     public:
         static void debug_log(char *data, unsigned int len);
-    };
-
-    class pymessage
-    {
-    public:
-        static unsigned int receive_length(char *length_data);
-
-        //called, when get message from p2pool [unpacked]
-        static std::stringstream receive(char *command, char *checksum, char *payload, unsigned int length);
-
-        //TODO: prefix
-        //called, when send message to p2pool [packed]
-        static char *send(char *command, char *payload2);
-
-        static char *send(c2pool::messages::message *msg);
-
-        static int payload_length(char *command, char *payload2);
-
-        static int payload_length(c2pool::messages::message *msg);
     };
 
     class PyPackTypes
