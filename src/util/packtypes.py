@@ -1234,10 +1234,19 @@ class TYPE:
         ('count', IntType(32)),
     ])
 
+    command_number = {
+        'error': 9990,
+        'version': 0,
+        'ping': 1,
+        'addrme': 2,
+        'addrs': 3,
+        'getaddrs': 4
+    }
+
     @classmethod
     def get_type(cls, type_name):
         return getattr(cls, type_name, None)
-    
+
     @classmethod
     def get_json_dict(cls, type_name, _json):
         '''
@@ -1248,7 +1257,8 @@ class TYPE:
         return json.loads(_json)
 
     # @classmethod
-    # def 
+    # def
+
 
 def serialize(type_name, _json):
     _type = TYPE.get_type(type_name)
@@ -1258,6 +1268,7 @@ def serialize(type_name, _json):
     result = bytes_to_char_stringstream(_type.pack(json_dict))
     return result
 
+
 def deserialize(type_name, _bytes_array):
     _type = TYPE.get_type(type_name)
     if _type is None:
@@ -1265,6 +1276,7 @@ def deserialize(type_name, _bytes_array):
     _obj_dict = _type.unpack(_bytes_array)
     result = str(_obj_dict)
     return result
+
 
 def packed_size(type_name, _json):
     _type = TYPE.get_type(type_name)
@@ -1275,14 +1287,6 @@ def packed_size(type_name, _json):
     return result
 
 # ------------------------------------------packtypes-for-C---------------------------------
-EnumMessages = {
-    9999: messageError,  # todo: create this class
-    0: messageVersion,
-    1: messagePing,
-    2: messageAddrme,
-    3: messageAddrs,
-    4: messageGetAddrs
-}
 
 
 def message_from_str(strcmd):
