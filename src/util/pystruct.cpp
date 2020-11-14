@@ -34,7 +34,6 @@ namespace c2pool::python
     }
 } // namespace c2pool::python
 
-
 namespace c2pool::python
 {
 
@@ -137,7 +136,7 @@ namespace c2pool::python
     }
 
     template <typename PyObjectType>
-    char * PyPackTypes::GetCallFunctionResult(PyObjectType *pyObj)
+    char *PyPackTypes::GetCallFunctionResult(PyObjectType *pyObj)
     {
         char *ret = NULL;
         if (pyObj != NULL)
@@ -172,7 +171,7 @@ namespace c2pool::python
         msg_value = value;
         msg.pushKV("value", msg_value);
 
-        auto pVal = PyObject_CallFunction(pObjct, (char *)"(s)", msg.write());
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg.write());
 
         auto result = GetCallFunctionResult(pVal);
 
@@ -204,7 +203,7 @@ namespace c2pool::python
     UniValue PyPackTypes::deserialize(c2pool::messages::message *msg)
     {
         UniValue result(UniValue::VOBJ);
-        auto methodObj = GetMethodObject("deserialize");
+        auto methodObj = GetMethodObject("deserialize_msg");
         if (methodObj == nullptr)
         {
             result.setNull();
@@ -218,14 +217,27 @@ namespace c2pool::python
         return result;
     }
 
-    int PyPackTypes::payload_length(c2pool::messages::message *msg){
-        int result;
-        std::stringstream ss;
+    int PyPackTypes::payload_length(c2pool::messages::message *msg)
+    {
+        int result = 0;
 
         auto methodObj = GetMethodObject("payload_length");
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(ss)", msg->command, msg->pack_c_str());
+        if (methodObj == nullptr)
+        {
+            return -1; //TODO обработка ситуации, если получено nullptr
+        }
+
+        UniValue json_msg(UniValue::VOBJ);
+        json_msg.pushKV("name_type", msg->command);
+        UniValue msg_value(UniValue::VOBJ);
+        msg_value = msg;
+        json_msg.pushKV("value", msg_value);
+
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
+        auto raw_result = GetCallFunctionResult(pVal);
         
-        ss << GetCallFunctionResult(pVal);
+        stringstream ss;
+        ss << raw_result;
         ss >> result;
 
         return result;
@@ -279,9 +291,9 @@ namespace c2pool::python
         return result;
     }
 
-} // namespace c2pool::messages::python
+} // namespace c2pool::python
 
 namespace c2pool::python::for_test
 {
-    
+
 } // namespace c2pool::python::for_test

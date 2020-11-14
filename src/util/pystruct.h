@@ -49,6 +49,8 @@ namespace c2pool::python
 
         //unsigned char* -> bytes -> json -> obj(c++)
         static UniValue deserialize(char *name_type, char *value, int length); //length = len(value)
+        
+        //(def name: deserialize_msg)
         //msg.[unsigned char*] -> bytes -> json -> obj(c++)
         static UniValue deserialize(c2pool::messages::message *msg);
 
@@ -59,17 +61,15 @@ namespace c2pool::python
         static unsigned int packed_size(char *name_type, T &value);
 
         static unsigned int receive_length(char *length_data);
-
     };
-} // namespace c2pool::messages::python
+} // namespace c2pool::python
 
 namespace c2pool::python::for_test
 {
     class pymessage
     {
     public:
-        
     };
-} // namespace c2pool::messages::python::for_test
+} // namespace c2pool::python::for_test
 
 #endif //CPOOL_PYSTRUCT_H
