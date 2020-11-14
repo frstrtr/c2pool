@@ -1234,7 +1234,7 @@ class TYPE:
         ('count', IntType(32)),
     ])
 
-    command_number = {
+    message_command_number = {
         'error': 9990,
         'version': 0,
         'ping': 1,
@@ -1244,52 +1244,85 @@ class TYPE:
     }
 
     @classmethod
-    def get_type(cls, type_name):
-        return getattr(cls, type_name, None)
+    def get_type(cls, name_type):
+        return getattr(cls, name_type, None)
 
     @classmethod
-    def get_json_dict(cls, type_name, _json):
+    def get_json_dict(cls, raw_json):
         '''
             json_str -> dict
             +
             Пост-обработка спецефичных структур
         '''
-        return json.loads(_json)
+        return json.loads(raw_json)
 
     # @classmethod
     # def
 
 
-def serialize(type_name, _json):
-    _type = TYPE.get_type(type_name)
+def serialize(raw_json):
+    _json = TYPE.get_json_dict(raw_json)
+    _type = TYPE.get_type(json['name_type'])
     if _type is None:
         return 'error_type'
-    json_dict = TYPE.get_json_dict(_json)
-    result = bytes_to_char_stringstream(_type.pack(json_dict))
+    result = bytes_to_char_stringstream(_type.pack(_json['value']))
     return result
 
 
-def deserialize(type_name, _bytes_array):
-    _type = TYPE.get_type(type_name)
+def deserialize(name_type, _bytes_array):
+    _type = TYPE.get_type(name_type)
     if _type is None:
         return 'error_type'
     _obj_dict = _type.unpack(_bytes_array)
     result = str(_obj_dict)
     return result
 
+def deserialize_msg(_command, checksum, payload): #todo
+    # print('_command = {0}'.format(_command))
+    # print('checksum = {0}'.format(checksum))
+    # print('payload = {0}'.format(payload))
 
-def packed_size(type_name, _json):
-    _type = TYPE.get_type(type_name)
+    command = _command.rstrip('\0')
+    # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
+    # checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
+
+    # checksum check
+    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
+            hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
+        return '-1'
+    # ------------
+
+    type_ = TYPE.get_type('message_' + command)
+    if type_ is None:
+        return '-2'
+
+    return str(type_.unpack(payload))
+
+def packed_size(raw_json):
+    _json = TYPE.get_json_dict(raw_json)
+    _type = TYPE.get_type(json['name_type'])
     if _type is None:
-        return 0
-    json_dict = TYPE.get_json_dict(_json)
-    result = _type.packed_size(json_dict)
+        return 'error_type'
+    result = _type.packed_size(_json['value'])
     return result
+
+def payload_length(raw_json): 
+    _json = TYPE.get_json_dict(raw_json)
+    _type = TYPE.get_type(json['name_type'])
+    if _type is None:
+        return '-1' #todo: обработка
+    result = len(_type.pack(_json['value']))
+    return str(result)
+
+def receive_length(msg):
+    length, = struct.unpack('<I', msg)
+    return str(length)
 
 # ------------------------------------------packtypes-for-C---------------------------------
 
 
-def message_from_str(strcmd):
+def message_from_str(strcmd): #remove
     '''
         return message method without num; strcmd = <command>
     '''
@@ -1300,12 +1333,12 @@ def message_from_str(strcmd):
     return messageError
 
 
-def message_pack(command, vars):
+def message_pack(command, vars): #remove
     t = EnumMessages[command]
     return t.pack(vars)
 
 
-def message_unpack(command, data):
+def message_unpack(command, data): #remove
     pass
 
 
@@ -1315,7 +1348,7 @@ def bytes_to_char_stringstream(_bytes):
 # ----------------------CPP COMMANDS
 
 
-def payload_length(command, unpacked_payload):
+def payload_length_legacy(command, unpacked_payload): #remove
     """
 
     """
@@ -1334,16 +1367,8 @@ def payload_length(command, unpacked_payload):
     return len(packed_payload)
 
 
-def receive_length(msg):
-    #print('receive_length get: {0}, type {1}; after encoding {2}'.format(msg, type(msg), bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
-    #print('when bytes {0}'.format(bytes(msg, encoding = 'utf-8').decode('unicode-escape').encode('utf-8')))
-    #length, = struct.unpack('<I', bytes(msg, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1'))
-    length, = struct.unpack('<I', msg)
-    #print('length = {0}'.format(length))
-    return length
 
-
-def receive(_command, checksum, payload):
+def receive(_command, checksum, payload): #reworked [now deserialize_msg]
     """
         called when we receive msg from p2pool to c2pool
     """
