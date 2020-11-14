@@ -179,8 +179,28 @@ namespace c2pool::python
     }
 
     char *PyPackTypes::serialize(c2pool::messages::message *msg)
-    { //TODO: test * - > &
-        return serialize(msg->command, *msg);
+    {
+        auto methodObj = GetMethodObject("serialize_msg");
+        if (methodObj == nullptr)
+        {
+            return nullptr; //TODO обработка ситуации, если получено nullptr
+        }
+        UniValue json_msg(UniValue::VOBJ);
+        json_msg.pushKV("name_type", (msg->command);
+        UniValue msg_value(UniValue::VOBJ);
+        msg_value = msg;
+        json_msg.pushKV("value", msg_value);
+
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
+
+        auto result = GetCallFunctionResult(pVal);
+
+        if (c2pool::str::compare_str(result, "ERROR", 5)){
+            //ERROR
+            return "";
+        }
+
+        return c2pool::str::from_bytes_to_strChar(result);
     }
 
     UniValue PyPackTypes::deserialize(char *name_type, char *value, int length)
@@ -235,7 +255,7 @@ namespace c2pool::python
 
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
         auto raw_result = GetCallFunctionResult(pVal);
-        
+
         stringstream ss;
         ss << raw_result;
         ss >> result;

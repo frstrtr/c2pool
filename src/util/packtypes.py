@@ -925,6 +925,30 @@ def serialize(raw_json):
     result = bytes_to_char_stringstream(_type.pack(_json['value']))
     return result
 
+def serialize_msg(raw_json):
+
+    """
+        called when we send msg from c2pool to p2pool
+    """
+
+    _json = TYPE.get_json_dict(raw_json)
+    _type = TYPE.get_type(json['name_type'])
+
+    # if error command
+    if _type is None:
+        return 'ERROR'
+    command = bytes(json['name_type'], encoding='ISO-8859-1')
+
+    payload = _type.pack(json['value'])
+
+    #print('SEND_PAYLOAD: {0}'.format(payload))
+
+    result = struct.pack('<12sI', command, len(
+        payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
+    #print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
+    #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
+    return bytes_to_char_stringstream(result)
+
 
 def deserialize(name_type, _bytes_array):
     _type = TYPE.get_type(name_type)
@@ -1005,11 +1029,10 @@ def send(command, payload2):
 
 # ------------------------------------------FOR C++ DEBUG----------------------------------
 
-
 def debug_log(char_array):
     print(str(char_array))
 
-# ------------------------------------------FOR UNIT TESTS-C++-----------------------------
+# ------------------------------------------FOR-UNIT-TESTS-C++-----------------------------
 
 
 # ------------------------------------------TESTS------------------------------------------
