@@ -759,48 +759,25 @@ class FloatingIntegerType(Type):
 def is_segwit_tx(tx):
     return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
 
-
-tx_in_type = ComposedType([
-    ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
-        ('hash', IntType(256)),
-        ('index', IntType(32)),
-    ]))),
-    ('script', VarStrType()),
-    ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
-])
-
-tx_out_type = ComposedType([
-    ('value', IntType(64)),
-    ('script', VarStrType()),
-])
-
-tx_id_type = ComposedType([
-    ('version', IntType(32)),
-    ('tx_ins', ListType(tx_in_type)),
-    ('tx_outs', ListType(tx_out_type)),
-    ('lock_time', IntType(32))
-])
-
-
 class TransactionType(Type):
     _int_type = IntType(32)
     _varint_type = VarIntType()
     _witness_type = ListType(VarStrType())
     _wtx_type = ComposedType([
         ('flag', IntType(8)),
-        ('tx_ins', ListType(tx_in_type)),
-        ('tx_outs', ListType(tx_out_type))
+        ('tx_ins', ListType(TYPE.tx_in_type)),
+        ('tx_outs', ListType(TYPE.tx_out_type))
     ])
     _ntx_type = ComposedType([
-        ('tx_outs', ListType(tx_out_type)),
+        ('tx_outs', ListType(TYPE.tx_out_type)),
         ('lock_time', _int_type)
     ])
     _write_type = ComposedType([
         ('version', _int_type),
         ('marker', IntType(8)),
         ('flag', IntType(8)),
-        ('tx_ins', ListType(tx_in_type)),
-        ('tx_outs', ListType(tx_out_type))
+        ('tx_ins', ListType(TYPE.tx_in_type)),
+        ('tx_outs', ListType(TYPE.tx_out_type))
     ])
 
     def read(self, file):
@@ -816,7 +793,7 @@ class TransactionType(Type):
         else:
             tx_ins = [None]*marker
             for i in range(marker):
-                tx_ins[i] = tx_in_type.read(file)
+                tx_ins[i] = TYPE.tx_in_type.read(file)
             next = self._ntx_type.read(file)  # _ntx_type
             return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
 
@@ -828,23 +805,10 @@ class TransactionType(Type):
                 self._witness_type.write(file, w)
             self._int_type.write(file, item['lock_time'])
             return
-        return tx_id_type.write(file, item)
+        return TYPE.tx_id_type.write(file, item)
 
-
-tx_type = TransactionType()
 
 # ------------------------------------------messages and types---------------------------------------
-address_type = ComposedType([
-    ('services', IntType(64)),
-    ('address', IPV6AddressType()),
-    ('port', IntType(16, 'big')),
-])
-
-share_type = ComposedType([
-    ('type', VarIntType()),
-    ('contents', VarStrType()),
-])
-
 # TODO:
 # block_header_type = ComposedType([
 #     ('version', IntType(32)),
@@ -854,318 +818,7 @@ share_type = ComposedType([
 #     ('bits', FloatingIntegerType()),  # todo Check this new type
 #     ('nonce', IntType(32)),
 # ])
-
-
-# todo check it from bitcoin/data/py derivated from pack.Type class
-# class TransactionType(pack.Type):
-#     _int_type = pack.IntType(32)
-#     _varint_type = pack.VarIntType()
-#     _witness_type = pack.ListType(pack.VarStrType())
-#     _wtx_type = pack.ComposedType([
-#         ('flag', pack.IntType(8)),
-#         ('tx_ins', pack.ListType(tx_in_type)),
-#         ('tx_outs', pack.ListType(tx_out_type))
-#     ])
-#     _ntx_type = pack.ComposedType([
-#         ('tx_outs', pack.ListType(tx_out_type)),
-#         ('lock_time', _int_type)
-#     ])
-#     _write_type = pack.ComposedType([
-#         ('version', _int_type),
-#         ('marker', pack.IntType(8)),
-#         ('flag', pack.IntType(8)),
-#         ('tx_ins', pack.ListType(tx_in_type)),
-#         ('tx_outs', pack.ListType(tx_out_type))
-#     ])
-
-#     def read(self, file):
-#         version = self._int_type.read(file)
-#         marker = self._varint_type.read(file)
-#         if marker == 0:
-#             next = self._wtx_type.read(file)
-#             witness = [None]*len(next['tx_ins'])
-#             for i in xrange(len(next['tx_ins'])):  # todo replace by py3 range()
-#                 witness[i] = self._witness_type.read(file)
-#             locktime = self._int_type.read(file)
-#             return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
-#         else:
-#             tx_ins = [None]*marker
-#             for i in xrange(marker):  # todo replace by py3 range()
-#                 tx_ins[i] = tx_in_type.read(file)
-#             next = self._ntx_type.read(file)
-#             return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
-
-#     def write(self, file, item):
-#         if is_segwit_tx(item):
-#             assert len(item['tx_ins']) == len(item['witness'])
-#             self._write_type.write(file, item)
-#             for w in item['witness']:
-#                 self._witness_type.write(file, w)
-#             self._int_type.write(file, item['lock_time'])
-#             return
-#         return tx_id_type.write(file, item)
-
-
-# tx_type = TransactionType()
-
-
-class Address_Type():
-
-    @staticmethod
-    def parseIn(_data):
-        # данные внутри других данных разделяются символом ","
-        data = _data.split(',')
-        return {'services': int(data[0]), 'address': data[1], 'port': int(data[2])}
-
-    @staticmethod
-    def parseOut(_data):
-        return str(_data['services']) + ' ' + str(_data['address']) + ' ' + str(_data['port'])
-
-# class Bitcoin_Data_Address_Type(): # todo SAME as Address_Type()!!! check
-
-#     @staticmethod
-#     def parseIn(_data):
-#         data = _data.split(',') #данные внутри других данных разделяются символом ","
-#         pass
-
-#     @staticmethod
-#     def parseOut(_data):
-#         pass
-
-
-class Share_Type():
-
-    @staticmethod
-    def parseIn(_data):
-        # данные внутри других данных разделяются символом ","
-        data = _data.split(',')
-        return {'type': data[0], 'contents': data[1]}
-
-    @staticmethod
-    def parseOut(_data):
-        return str(_data['type'] + ' ' + str(_data['contents']))
-
-
-class Block_Header_Type():
-
-    @staticmethod
-    def parseIn(_data):
-        # данные внутри других данных разделяются символом ","
-        data = _data.split(',')
-        # ('version', pack.IntType(32)),
-        # ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
-        # ('merkle_root', pack.IntType(256)),
-        # ('timestamp', pack.IntType(32)),
-        # ('bits', FloatingIntegerType()),
-        # ('nonce', pack.IntType(32)),
-        return {'version': data[0], 'previous_block': data[1], 'merkle_root': data[2], 'timestamp': data[3], 'bits': data[4], 'nonce': data[5]}
-
-    @staticmethod
-    def parseOut(_data):
-        return str(_data['version']) + ' ' + str(_data['previous_block']) + ' ' + str(_data['merkle_root']) + ' ' + str(_data['timestamp']) + ' ' + str(_data['bits']) + ' ' + str(_data['nonce'])
-
-
-class TX_Type():  # todo check TransactionType class above @line #410
-
-    @staticmethod
-    def parseIn(_data):
-        # данные внутри других данных разделяются символом ","
-        data = _data.split(',')
-        pass
-
-    @staticmethod
-    def parseOut(_data):
-        pass
-
-
-class UnpackResult:
-
-    def __init__(self):
-        self.res = ''
-
-    def __iadd__(self, other):
-        if isinstance(other, bytes):
-            other = other.decode()
-        self.res += str(other) + ' '
-        return self
-
-    def __add__(self, other):
-        self.res += other.res
-
-    def __str__(self):
-        return self.res.rstrip(' ')  # todo: remove last ' '?
-
-
-class msg:
-
-    def pack(self, _data):
-        data = self.parseVars(_data)
-        return self._pack(data)
-
-    def unpack(self, _data):
-        data = _data
-        if isinstance(_data, str):
-            data = _data.encode()
-        return self._unpack(data)
-
-    def parseVars(self, vars):
-        # в c++ переменные в stringstream подаются с разделителем в виде символа ";".
-        res = vars.split(';')
-        return res  # список переменных на упаковку.
-
-
-class messageError(msg):
-    command = 'error'
-
-    message_error = ComposedType([
-        ('issue', VarStrType())
-    ])
-
-    def __init__(self, text):
-        self.issue = text
-
-    def _pack(self, data):
-        if self.issue:
-            msg_dict = {'issue': self.issue}
-        else:
-            msg_dict = {'issue': data}
-        return self.message_error.pack(msg_dict)
-
-    def _unpack(self, data):
-        pass
-
-
-class messageVersion(msg):
-    command = 'version'
-
-    message_version = ComposedType([
-        ('version', IntType(32)),
-        ('services', IntType(64)),
-        ('addr_to', address_type),
-        ('addr_from', address_type),
-        ('nonce', IntType(64)),
-        ('sub_version', VarStrType()),
-        ('mode', IntType(32)),  # always 1 for legacy compatibility
-        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
-    ])
-
-    def _pack(self, data):
-        msg_dict = {'version': int(data[0]),
-                    'services': int(data[1]),
-                    'addr_to': Address_Type.parseIn(data[2]),
-                    'addr_from': Address_Type.parseIn(data[3]),
-                    'nonce': int(data[4]),
-                    'sub_version': data[5],
-                    'mode': int(data[6]),
-                    'best_share_hash': int(data[7])}  # int?
-
-        return self.message_version.pack(msg_dict)
-
-    def _unpack(self, data):
-        res = UnpackResult()
-        t = dict(self.message_version.unpack(data))
-        res += t['version']
-        res += t['services']
-
-        res += Address_Type.parseOut(t['addr_to'])  # todo: test
-        res += Address_Type.parseOut(t['addr_from'])  # todo: test
-
-        res += t['nonce']
-        res += t['sub_version']
-        res += t['mode']
-        res += t['best_share_hash']
-        return res
-
-
-class messagePing(msg):
-    command = 'ping'
-
-    message_ping = ComposedType([])
-
-    def _pack(self, data):
-        return self.message_ping.pack({})
-
-    def _unpack(self, data):
-        res = UnpackResult()
-        t = dict(self.message_ping.unpack(data))
-        res = ''
-        return res
-
-
-class messageAddrme(msg):
-    command = 'addrme'
-
-    message_addrme = ComposedType([('port', IntType(16))])
-
-    def _pack(self, data):
-        msg_dict = {'port': int(data[0])}
-        return self.message_addrme.pack(msg_dict)
-
-    def _unpack(self, data):
-        res = UnpackResult()
-        t = dict(self.message_addrme.unpack(data))
-        res = t['port']
-        return res
-
-
-class messageAddrs(msg):
-    command = 'addrs'
-
-    message_addrs = ComposedType([
-        ('addrs', ListType(ComposedType([
-            ('timestamp', IntType(64)),
-            ('address', address_type),  # todo check it out
-        ]))),
-    ])
-
-    def _pack(self, data):
-        msg_dict = {
-            'addrs': [{
-                'timestamp': int(d[0]),
-                'address': Address_Type.parseIn(d[1]),
-            } for d in data]}
-        return self.message_addrs.pack(msg_dict)
-
-    def _unpack(self, data):
-        res = UnpackResult()
-        t = dict(self.message_addrs.unpack(data))
-        for addr in t['addrs']:
-            res += addr['timestamp']
-            res += Address_Type.parseOut(addr['address'])
-        return res
-
-    def parseVars(self, vars):
-        res = None
-        # в с++ переменные массива в stringstream подаются с разделителем в виде символа "+"
-        res = []
-        buff = vars.split('+')
-        for r in buff:
-            res += [r.split(';')]
-        return res  # список переменных на упаковку.
-
-
-class messageGetAddrs(msg):
-    command = 'getaddrs'
-
-    message_getaddrs = ComposedType([
-        ('count', IntType(32)),
-    ])
-
-    def _pack(self, data):
-        msg_dict = {
-            'count': int(data[0]),
-        }
-        return self.message_getaddrs.pack(msg_dict)
-
-    def _unpack(self, data):
-        res = UnpackResult()
-        t = dict(self.message_getaddrs.unpack(data))
-        res = t['count']
-        return res
-
-# -------------------------------------------Global-Type-------------------------------------
-
-
+# -------------------------------------------Global-Type----------------------------------------------
 class TYPE:
 
     # tx's---------------------
@@ -1259,6 +912,10 @@ class TYPE:
     # @classmethod
     # def
 
+# -------------------------------------------Methods--------------------------------------------------
+def bytes_to_char_stringstream(_bytes):
+    chars = [str(byte) for byte in _bytes]
+    return ' '.join(chars)
 
 def serialize(raw_json):
     _json = TYPE.get_json_dict(raw_json)
@@ -1277,7 +934,7 @@ def deserialize(name_type, _bytes_array):
     result = str(_obj_dict)
     return result
 
-def deserialize_msg(_command, checksum, payload): #todo
+def deserialize_msg(_command, checksum, payload): 
     # print('_command = {0}'.format(_command))
     # print('checksum = {0}'.format(checksum))
     # print('payload = {0}'.format(payload))
@@ -1322,79 +979,7 @@ def receive_length(msg):
 # ------------------------------------------packtypes-for-C---------------------------------
 
 
-def message_from_str(strcmd): #remove
-    '''
-        return message method without num; strcmd = <command>
-    '''
-
-    for (k, v) in EnumMessages.items():
-        if v.command == strcmd:
-            return v
-    return messageError
-
-
-def message_pack(command, vars): #remove
-    t = EnumMessages[command]
-    return t.pack(vars)
-
-
-def message_unpack(command, data): #remove
-    pass
-
-
-def bytes_to_char_stringstream(_bytes):
-    chars = [str(byte) for byte in _bytes]
-    return ' '.join(chars)
 # ----------------------CPP COMMANDS
-
-
-def payload_length_legacy(command, unpacked_payload): #remove
-    """
-
-    """
-
-    type_ = message_from_str(command)
-
-    # if error command
-    if type_ is None:
-        type_ = EnumMessages[9999]
-
-    command = bytes(command, encoding='ISO-8859-1')
-
-    msg = type_()
-    packed_payload = msg.pack(unpacked_payload)
-
-    return len(packed_payload)
-
-
-
-def receive(_command, checksum, payload): #reworked [now deserialize_msg]
-    """
-        called when we receive msg from p2pool to c2pool
-    """
-
-    # print('_command = {0}'.format(_command))
-    # print('checksum = {0}'.format(checksum))
-    # print('payload = {0}'.format(payload))
-
-    command = _command.rstrip('\0')
-    # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
-    # checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
-
-    # checksum check
-    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
-        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
-            hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
-        return '-1'
-    # ------------
-
-    type_ = message_from_str(command)
-    if type_ is None:
-        return '-2'
-
-    obj = type_()
-    return str(obj.unpack(payload))
-
 
 def send(command, payload2):
     """
@@ -1424,67 +1009,7 @@ def send(command, payload2):
 def debug_log(char_array):
     print(str(char_array))
 
-# ------------------------------------------FOR UNIT TESTS---------------------------------
-
-
-def get_packed_int(num):
-    #print('get_packed_int() get {0}; packed: {1} '.format(num, struct.pack('<I', num)))
-
-    return bytes_to_char_stringstream(struct.pack('<I', num))
-
-
-def data_for_test_receive(to_char=True):
-    message_version = ComposedType([
-        ('version', IntType(32)),
-        ('services', IntType(64)),
-        ('addr_to', address_type),
-        ('addr_from', address_type),
-        ('nonce', IntType(64)),
-        ('sub_version', VarStrType()),
-        ('mode', IntType(32)),
-        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
-    ])
-
-    message_version_dict = {
-        'version': 1,
-        'services': 2,
-        'addr_to': {'services': 3, 'address': '4.5.6.7', 'port': 8},
-        'addr_from': {'services': 9, 'address': '10.11.12.13', 'port': 14},
-        'nonce': 15,
-        'sub_version': '16',
-        'mode': 17,
-        'best_share_hash': 18
-    }
-    # ---------------------
-    if to_char:
-        return bytes_to_char_stringstream(message_version.pack(message_version_dict))
-    else:
-        return message_version.pack(message_version_dict)
-
-
-def length_for_test_receive():
-    return len(data_for_test_receive(False))
-
-
-def checksum_for_test_receive():
-    return bytes_to_char_stringstream(hashlib.sha256(hashlib.sha256(data_for_test_receive(False)).digest()).digest()[:4])
-
-
-def data_for_test_send():
-    return send('version', '1;2;3,4.5.6.7,8;9,10.11.12.13,14;15;16;17;18')
-
-
-def emulate_protocol_get_data(command, payload2):
-    res_send = send(command, payload2)
-    res = ''
-    for i in res_send:
-        res += '{0} '.format(i)
-    res.rstrip(' ')
-
-
-def test_get_bytes_from_cpp(_bytes):
-    print('FROM PYTHON: test_get_bytes_from_cpp: {0}, len: {1}'.format(
-        _bytes, len(_bytes)))
+# ------------------------------------------FOR UNIT TESTS-C++-----------------------------
 
 
 # ------------------------------------------TESTS------------------------------------------
