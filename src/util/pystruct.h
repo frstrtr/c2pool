@@ -63,7 +63,7 @@ namespace c2pool::python
     };
 } // namespace c2pool::messages::python
 
-namespace c2pool::messages::python::for_test
+namespace c2pool::python::for_test
 {
     class pymessage
     {
