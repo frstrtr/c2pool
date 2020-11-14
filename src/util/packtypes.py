@@ -67,7 +67,7 @@ def shift_left(n, m):
 
 def nth(i, n=0):
     i = iter(i)
-    for _ in xrange(n):
+    for _ in range(n):
         i.next()
     return i.next()
 
@@ -759,6 +759,7 @@ class FloatingIntegerType(Type):
 def is_segwit_tx(tx):
     return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
 
+
 class TransactionType(Type):
     _int_type = IntType(32)
     _varint_type = VarIntType()
@@ -913,9 +914,12 @@ class TYPE:
     # def
 
 # -------------------------------------------Methods--------------------------------------------------
+
+
 def bytes_to_char_stringstream(_bytes):
     chars = [str(byte) for byte in _bytes]
     return ' '.join(chars)
+
 
 def serialize(raw_json):
     _json = TYPE.get_json_dict(raw_json)
@@ -925,8 +929,8 @@ def serialize(raw_json):
     result = bytes_to_char_stringstream(_type.pack(_json['value']))
     return result
 
-def serialize_msg(raw_json):
 
+def serialize_msg(raw_json):
     """
         called when we send msg from c2pool to p2pool
     """
@@ -958,7 +962,8 @@ def deserialize(name_type, _bytes_array):
     result = str(_obj_dict)
     return result
 
-def deserialize_msg(_command, checksum, payload): 
+
+def deserialize_msg(_command, checksum, payload):
     # print('_command = {0}'.format(_command))
     # print('checksum = {0}'.format(checksum))
     # print('payload = {0}'.format(payload))
@@ -969,8 +974,8 @@ def deserialize_msg(_command, checksum, payload):
 
     # checksum check
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
-        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
-            hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
+        # print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
+        #     hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
         return '-1'
     # ------------
 
@@ -980,6 +985,7 @@ def deserialize_msg(_command, checksum, payload):
 
     return str(type_.unpack(payload))
 
+
 def packed_size(raw_json):
     _json = TYPE.get_json_dict(raw_json)
     _type = TYPE.get_type(json['name_type'])
@@ -988,46 +994,22 @@ def packed_size(raw_json):
     result = _type.packed_size(_json['value'])
     return result
 
-def payload_length(raw_json): 
+
+def payload_length(raw_json):
     _json = TYPE.get_json_dict(raw_json)
     _type = TYPE.get_type(json['name_type'])
     if _type is None:
-        return '-1' #todo: обработка
+        return '-1'  # todo: обработка
     result = len(_type.pack(_json['value']))
     return str(result)
+
 
 def receive_length(msg):
     length, = struct.unpack('<I', msg)
     return str(length)
 
-# ------------------------------------------packtypes-for-C---------------------------------
-
-
-# ----------------------CPP COMMANDS
-
-def send(command, payload2):
-    """
-        called when we send msg from c2pool to p2pool
-    """
-    type_ = message_from_str(command)
-
-    # if error command
-    if type_ is None:
-        type_ = EnumMessages[9999]
-    command = bytes(command, encoding='ISO-8859-1')
-
-    msg = type_()
-    payload = msg.pack(payload2)
-
-    #print('SEND_PAYLOAD: {0}'.format(payload))
-
-    result = struct.pack('<12sI', command, len(
-        payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-    #print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
-    #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
-    return bytes_to_char_stringstream(result)
-
 # ------------------------------------------FOR C++ DEBUG----------------------------------
+
 
 def debug_log(char_array):
     print(str(char_array))

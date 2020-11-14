@@ -49,7 +49,7 @@ namespace c2pool::python
 
         //unsigned char* -> bytes -> json -> obj(c++)
         static UniValue deserialize(char *name_type, char *value, int length); //length = len(value)
-        
+
         //(def name: deserialize_msg)
         //msg.[unsigned char*] -> bytes -> json -> obj(c++)
         static UniValue deserialize(c2pool::messages::message *msg);
