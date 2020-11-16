@@ -83,7 +83,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->command, tempMessage->command_length);
+                                        c2pool::python::other::debug_log(tempMessage->command, tempMessage->command_length);
                                         //LOG_INFO << "read_command";
                                         read_length();
                                     }
@@ -102,7 +102,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->length, tempMessage->payload_length);
+                                        c2pool::python::other::debug_log(tempMessage->length, tempMessage->payload_length);
                                         tempMessage->set_unpacked_length();
                                         // LOG_INFO << "read_length";
                                         read_checksum();
@@ -122,7 +122,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->checksum, tempMessage->checksum_length);
+                                        c2pool::python::other::debug_log(tempMessage->checksum, tempMessage->checksum_length);
                                         // LOG_INFO << "read_checksum";
                                         read_payload();
                                     }
@@ -141,7 +141,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
+                                        c2pool::python::other::debug_log(tempMessage->payload, tempMessage->unpacked_length());
                                         // LOG_INFO << "read_payload";
                                         //todo: move tempMesssage -> new message
                                         read_prefix();
@@ -178,41 +178,43 @@ namespace c2pool::p2p
     }
 
     //OLD: fromStr
-    void Protocol::handle(std::stringstream ss)
+    void Protocol::handle(UniValue &value)
     {
         //В Python скрипте, команда передается, как int, эквивалентный c2pool::messages::commands
         int cmd;
-        ss >> cmd;
+        cmd = value["name_type"].get_int();
         c2pool::messages::message *res;
+
+        auto json = value["value"].get_obj();
 
         switch (cmd) //todo: switch -> if (" " == cmd)
         {
         case c2pool::messages::commands::cmd_addrs:
-            handle(GenerateMsg<c2pool::messages::message_addrs>(ss));
+            handle(GenerateMsg<c2pool::messages::message_addrs>(json));
             break;
         case c2pool::messages::commands::cmd_version:
-            handle(GenerateMsg<c2pool::messages::message_version>(ss));
+            handle(GenerateMsg<c2pool::messages::message_version>(json));
             break;
         case c2pool::messages::commands::cmd_ping:
-            handle(GenerateMsg<c2pool::messages::message_ping>(ss));
+            handle(GenerateMsg<c2pool::messages::message_ping>(json));
             break;
         case c2pool::messages::commands::cmd_addrme:
-            handle(GenerateMsg<c2pool::messages::message_addrme>(ss));
+            handle(GenerateMsg<c2pool::messages::message_addrme>(json));
             break;
         case c2pool::messages::commands::cmd_getaddrs:
-            handle(GenerateMsg<c2pool::messages::message_getaddrs>(ss));
+            handle(GenerateMsg<c2pool::messages::message_getaddrs>(json));
             break;
         default:
-            handle(GenerateMsg<c2pool::messages::message_error>(ss));
+            handle(GenerateMsg<c2pool::messages::message_error>(json));
             break;
         }
     }
 
     template <class MsgType>
-    MsgType *Protocol::GenerateMsg(std::stringstream &ss)
+    MsgType *Protocol::GenerateMsg(UniValue &value)
     {
         MsgType *msg = new MsgType();
-        msg->unpack(ss);
+        *msg = value;
         return msg;
     }
 

@@ -55,16 +55,16 @@ namespace c2pool::p2p
         LOG_INFO << "Node created.";
     }
 
-    void Node::got_conn(shared_ptr<c2pool::p2p::Protocol> protocol)
+    void Node::got_conn(std::shared_ptr<c2pool::p2p::Protocol> protocol)
     {
         if (peers.count(protocol->nonce()) != 0)
         {
             std::cout << "Already have peer!" << std::endl; //TODO: raise ValueError('already have peer')
         }
-        peers.insert(std::make_pair<int, shared_ptr<c2pool::p2p::Protocol>>(protocol->nonce(), protocol->shared_from_this()));
+        peers.insert(std::make_pair<int, std::shared_ptr<c2pool::p2p::Protocol>>(protocol->nonce(), protocol->shared_from_this()));
     }
 
-    void Node::lost_conn(shared_ptr<c2pool::p2p::Protocol> protocol, boost::exception *reason)
+    void Node::lost_conn(std::shared_ptr<c2pool::p2p::Protocol> protocol, boost::exception *reason)
     {
         if (peers.count(protocol->nonce()) == 0)
         {

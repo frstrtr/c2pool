@@ -983,7 +983,13 @@ def deserialize_msg(_command, checksum, payload):
     if type_ is None:
         return '-2'
 
-    return str(type_.unpack(payload))
+    value = type_.unpack(payload)
+    result = {
+        'name_type': TYPE.message_command_type[command],
+        'value': value
+    }
+
+    return result
 
 
 def packed_size(raw_json):

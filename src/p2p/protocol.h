@@ -54,7 +54,7 @@ namespace c2pool::p2p
         virtual void send(c2pool::messages::message *msg);
 
         //OLD: fromStr
-        virtual void handle(std::stringstream ss);
+        virtual void handle(UniValue &value);
 
         unsigned long long nonce() const{
             return _nonce;
@@ -81,7 +81,7 @@ namespace c2pool::p2p
         virtual void disconnect();
 
         template <class MsgType>
-        MsgType *GenerateMsg(std::stringstream &ss);
+        MsgType *GenerateMsg(UniValue &value);
 
         virtual void handle(c2pool::messages::message_version *msg);
 
