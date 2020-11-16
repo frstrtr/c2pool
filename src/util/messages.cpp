@@ -91,6 +91,7 @@ namespace c2pool::messages
         strcpy(command, _cmd);
     }
 
+    /*TODO: REWORK FOR STATIC TEMPLATE [for tests]
     void message::receive()
     {
         UniValue value = c2pool::python::PyPackTypes::deserialize(this);
@@ -105,16 +106,12 @@ namespace c2pool::messages
         }
         encode_data();
         receive();
-    }
+    } 
+    */
 
     void message::send()
     {
         set_data(c2pool::python::PyPackTypes::serialize(this));
-    }
-
-    void message::unpack(UniValue &value)
-    {
-        _unpack(value);
     }
 
     UniValue message::pack()
@@ -129,11 +126,6 @@ namespace c2pool::messages
 
     //message_error
 
-    void message_error::_unpack(UniValue &value)
-    {
-        //NOTHING :(
-    }
-
     UniValue message_error::_pack()
     {
         UniValue value(UniValue::VOBJ);
@@ -142,11 +134,6 @@ namespace c2pool::messages
     }
 
     //message_version
-
-    void message_version::_unpack(UniValue &value)
-    {
-        *this = value;
-    }
 
     UniValue message_version::_pack()
     {
@@ -157,11 +144,6 @@ namespace c2pool::messages
 
     //message_ping
 
-    void message_ping::_unpack(UniValue &value)
-    {
-        //todo: Empty variables list
-    }
-
     UniValue message_ping::_pack()
     {
         UniValue value(UniValue::VOBJ);
@@ -169,11 +151,6 @@ namespace c2pool::messages
     }
 
     //message_addrme
-
-    void message_addrme::_unpack(UniValue &value)
-    {
-        *this = value;
-    }
 
     UniValue message_addrme::_pack()
     {
@@ -184,11 +161,6 @@ namespace c2pool::messages
 
     //message_getaddrs
 
-    void message_getaddrs::_unpack(UniValue &value)
-    {
-        *this = value;
-    }
-
     UniValue message_getaddrs::_pack()
     {
         UniValue value(UniValue::VOBJ);
@@ -197,11 +169,6 @@ namespace c2pool::messages
     }
 
     //message_addrs
-
-    void message_addrs::_unpack(UniValue &value)
-    {
-        *this = value;
-    }
 
     UniValue message_addrs::_pack()
     {

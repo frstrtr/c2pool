@@ -100,13 +100,12 @@ namespace c2pool::messages
         }
 
         //receive message data from IMessage::command, IMessage::checksum, IMessage::payload, IMessage::unpacked_length;
-        void receive();
+        //TODO: void receive();
         //receive message data from IMessage::data; use _set_data for init IMessage::data.
-        void receive_from_data(char *_set_data);
+        //TODO: void receive_from_data(char *_set_data);
         //
         void send();
 
-        void unpack(UniValue &value);
         UniValue pack();
 
         // char *data() override
@@ -119,7 +118,6 @@ namespace c2pool::messages
         //     //TODO:
         // }
 
-        virtual void _unpack(UniValue &value) = 0;
         virtual UniValue _pack() = 0;
 
     protected:
@@ -132,11 +130,23 @@ namespace c2pool::messages
     class message_error : public message
     {
     public:
-        void _unpack(UniValue &value) override;
 
         UniValue _pack() override;
 
         message_error() : message("error") {}
+
+        message_error &operator=(UniValue value)
+        {
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            return result;
+        }
+
     };
 
     class message_version : public message
@@ -155,8 +165,6 @@ namespace c2pool::messages
             mode = _mode;
             best_share_hash = best_hash;
         }
-
-        void _unpack(UniValue &value) override;
 
         UniValue _pack() override;
 
@@ -215,9 +223,19 @@ namespace c2pool::messages
         message_ping() : message("ping") {}
         // message_ping(const std::string cmd = "ping") : message(cmd) {}
 
-        void _unpack(UniValue &value) override;
-
         UniValue _pack() override;
+
+        message_ping &operator=(UniValue value)
+        {
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            return result;
+        }
 
         // message_ping = pack.ComposedType([])
         //todo Empty list
@@ -235,8 +253,6 @@ namespace c2pool::messages
         {
             port = prt;
         }
-
-        void _unpack(UniValue &value) override;
 
         UniValue _pack() override;
 
@@ -273,8 +289,6 @@ namespace c2pool::messages
         {
             count = cnt;
         }
-
-        void _unpack(UniValue &value) override;
 
         UniValue _pack() override;
 
@@ -313,8 +327,6 @@ namespace c2pool::messages
         {
             addrs = _addrs;
         }
-
-        void _unpack(UniValue &value) override;
 
         UniValue _pack() override;
 
