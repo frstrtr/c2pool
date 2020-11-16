@@ -2,12 +2,13 @@
 #include "protocol.h"
 #include <iostream>
 #include "types.h"
-#include "pack.h"
 #include "other.h"
 #include <sstream>
 #include <string>
 #include <cstring>
 #include "console.h"
+#include "pystruct.h"
+#include "univalue.h"
 using namespace c2pool::messages;
 
 namespace c2pool::messages
@@ -41,7 +42,7 @@ namespace c2pool::messages
         if (_unpacked_length == 0)
         {
             c2pool::str::substr(length, data, command_length, payload_length);
-            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+            _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
         c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
         c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, _unpacked_length);
@@ -58,7 +59,7 @@ namespace c2pool::messages
             memcpy(length, packed_len, payload_length);
         }
         if (length != nullptr){
-            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+            _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
     }
 
@@ -72,7 +73,7 @@ namespace c2pool::messages
         if (data_ != nullptr)
         {
             c2pool::str::substr(length, data_, command_length, payload_length);
-            _unpacked_length = c2pool::messages::python::pymessage::receive_length(length);
+            _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
 
         return get_length();
@@ -92,8 +93,8 @@ namespace c2pool::messages
 
     void message::receive()
     {
-        std::stringstream ss = c2pool::messages::python::pymessage::receive(command, checksum, payload, unpacked_length());
-        unpack(ss);
+        UniValue value = c2pool::python::PyPackTypes::deserialize(this);
+        unpack(value);
     }
 
     void message::receive_from_data(char *_set_data = nullptr)
@@ -108,132 +109,105 @@ namespace c2pool::messages
 
     void message::send()
     {
-        set_data(c2pool::messages::python::pymessage::send(this));
+        set_data(c2pool::python::PyPackTypes::serialize(this));
     }
 
-    void message::unpack(std::string item)
+    void message::unpack(UniValue &value)
     {
-        std::stringstream ss;
-        ss << item;
-        _unpack(ss);
+        _unpack(value);
     }
 
-    void message::unpack(std::stringstream &ss)
+    UniValue message::pack()
     {
-        _unpack(ss);
-    }
-
-    std::string message::pack()
-    {
-        //TODO:
         return _pack();
-    }
-
-    char *message::pack_c_str()
-    {
-        std::string str = pack();
-        packed_c_str = new char[str.length() + 1];
-        memcpy(packed_c_str, str.c_str(), str.length() + 1);
-        return packed_c_str;
     }
 
     int message::pack_payload_length()
     {
-        return c2pool::messages::python::pymessage::payload_length(command, pack_c_str());
+        return c2pool::python::PyPackTypes::payload_length(this);
     }
 
     //message_error
 
-    void message_error::_unpack(std::stringstream &ss)
+    void message_error::_unpack(UniValue &value)
     {
         //NOTHING :(
     }
 
-    string message_error::_pack()
+    UniValue message_error::_pack()
     {
-        return std::string("MESSAGE_ERROR!");
+        UniValue value(UniValue::VOBJ);
+        value.pushKV("text", "MESSAGE_ERROR");
+        return value;
     }
 
     //message_version
 
-    void message_version::_unpack(std::stringstream &ss)
+    void message_version::_unpack(UniValue &value)
     {
-        ss >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
+        *this = value;
     }
 
-    string message_version::_pack()
+    UniValue message_version::_pack()
     {
-        c2pool::pack::ComposedType ct;
-        ct.add(version);
-        ct.add(services);
-        ct.add(addr_to);
-        ct.add(addr_from);
-        ct.add(nonce);
-        ct.add(sub_version);
-        ct.add(mode);
-        ct.add(best_share_hash);
-        return ct.read();
+        UniValue value(UniValue::VOBJ);
+        value = *this;
+        return value;
     }
 
     //message_ping
 
-    void message_ping::_unpack(std::stringstream &ss)
+    void message_ping::_unpack(UniValue &value)
     {
         //todo: Empty variables list
     }
 
-    std::string message_ping::_pack()
+    UniValue message_ping::_pack()
     {
-        c2pool::pack::ComposedType ct;
-        //TODO: ct.add(cmd);
-        return ct.read();
+        UniValue value(UniValue::VOBJ);
+        return value;
     }
 
     //message_addrme
 
-    void message_addrme::_unpack(std::stringstream &ss)
+    void message_addrme::_unpack(UniValue &value)
     {
-        ss >> port;
+        *this = value;
     }
 
-    std::string message_addrme::_pack()
+    UniValue message_addrme::_pack()
     {
-        c2pool::pack::ComposedType ct;
-        ct.add(port);
-        return ct.read();
+        UniValue value(UniValue::VOBJ);
+        value = *this;
+        return value;
     }
 
     //message_getaddrs
 
-    void message_getaddrs::_unpack(std::stringstream &ss)
+    void message_getaddrs::_unpack(UniValue &value)
     {
-        ss >> count;
+        *this = value;
     }
 
-    std::string message_getaddrs::_pack()
+    UniValue message_getaddrs::_pack()
     {
-        c2pool::pack::ComposedType ct;
-        ct.add(count);
-        return ct.read();
+        UniValue value(UniValue::VOBJ);
+        value = *this;
+        return value;
     }
 
     //message_addrs
 
-    void message_addrs::_unpack(std::stringstream &ss)
+    void message_addrs::_unpack(UniValue &value)
     {
-        //перед массивом идёт int(длина массива)
-        addr addrBuff;
-        while (ss >> addrBuff)
-        {
-            addrs.push_back(addrBuff);
-        }
+        *this = value;
     }
 
-    std::string message_addrs::_pack()
+    UniValue message_addrs::_pack()
     {
-        c2pool::pack::ComposedType ct;
-        ct.add(addrs);
-        return ct.read();
+        UniValue value(UniValue::VOBJ);
+        value = *this;
+        return value;
     }
 
 } // namespace c2pool::messages

@@ -186,7 +186,7 @@ namespace c2pool::python
             return nullptr; //TODO обработка ситуации, если получено nullptr
         }
         UniValue json_msg(UniValue::VOBJ);
-        json_msg.pushKV("name_type", (msg->command);
+        json_msg.pushKV("name_type", msg->command);
         UniValue msg_value(UniValue::VOBJ);
         msg_value = msg;
         json_msg.pushKV("value", msg_value);
@@ -279,7 +279,7 @@ namespace c2pool::python
         msg_value = value;
         msg.pushKV("value", msg_value);
 
-        auto pVal = PyObject_CallFunction(pObjct, (char *)"(s)", msg.write());
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg.write());
         auto raw_result = GetCallFunctionResult(pVal);
 
         stringstream ss;
