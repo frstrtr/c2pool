@@ -10,8 +10,8 @@ message("
 ")
 
 
-set(HEADER_FILES pack.h pystruct.h filesys.h messages.h types.h events.h)
-set(SOURCE_FILES pack.cpp pystruct.cpp filesys.cpp messages.cpp types.cpp)
+set(HEADER_FILES pystruct.h filesys.h messages.h types.h events.h)
+set(SOURCE_FILES pystruct.cpp filesys.cpp messages.cpp types.cpp)
 
 add_library(util STATIC ${SOURCE_FILES} ${HEADER_FILES})
 

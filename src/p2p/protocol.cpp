@@ -64,7 +64,7 @@ namespace c2pool::p2p
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec && c2pool::str::compare_str(tempMessage->prefix, nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH))
                                     {
-                                        c2pool::messages::python::other::debug_log(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH);
+                                        c2pool::python::other::debug_log(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH);
                                         // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command();
                                     }

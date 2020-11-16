@@ -113,7 +113,7 @@ namespace c2pool::p2p
         std::shared_ptr<c2pool::p2p::NodesManager> nodes;
         c2pool::p2p::Factory *factory; //todo: shared_ptr
 
-        unique_ptr<c2pool::messages::IMessage> tempMessage; 
+        std::unique_ptr<c2pool::messages::IMessage> tempMessage; 
     };
 
     class ClientProtocol : public Protocol
