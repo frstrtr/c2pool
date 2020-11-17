@@ -15,6 +15,7 @@ namespace c2pool::p2p
     class Protocol;
 }
 
+//for packing: UniValue value = msg;
 namespace c2pool::messages
 {
 
@@ -106,20 +107,6 @@ namespace c2pool::messages
         //
         void send();
 
-        UniValue pack();
-
-        // char *data() override
-        // {
-        //     //TODO:
-        // }
-
-        // std::size_t length() override
-        // {
-        //     //TODO:
-        // }
-
-        virtual UniValue _pack() = 0;
-
     protected:
         int pack_payload_length() override;
 
@@ -130,9 +117,6 @@ namespace c2pool::messages
     class message_error : public message
     {
     public:
-
-        UniValue _pack() override;
-
         message_error() : message("error") {}
 
         message_error &operator=(UniValue value)
@@ -146,11 +130,20 @@ namespace c2pool::messages
 
             return result;
         }
-
     };
 
     class message_version : public message
     {
+    public:
+        int version;
+        int services;
+        address_type addr_to;
+        address_type addr_from;
+        unsigned long long nonce;
+        std::string sub_version;
+        int mode; //# always 1 for legacy compatibility
+        uint256 best_share_hash;
+
     public:
         message_version() : message("version") {}
 
@@ -165,27 +158,6 @@ namespace c2pool::messages
             mode = _mode;
             best_share_hash = best_hash;
         }
-
-        UniValue _pack() override;
-
-        //= pack.ComposedType([
-        //     ('version', pack.IntType(32)),
-        int version;
-        //     ('services', pack.IntType(64)),
-        int services;
-        //     ('addr_to', bitcoin_data.address_type),
-        address_type addr_to;
-        //     ('addr_from', bitcoin_data.address_type),
-        address_type addr_from;
-        //     ('nonce', pack.IntType(64)),
-        unsigned long long nonce;
-        //     ('sub_version', pack.VarStrType()),
-        std::string sub_version;
-        //     ('mode', pack.IntType(32)), # always 1 for legacy compatibility
-        int mode;
-        //     ('best_share_hash', pack.PossiblyNoneType(0, pack.IntType(256))),
-        uint256 best_share_hash;
-        // ])
 
         message_version &operator=(UniValue value)
         {
@@ -221,9 +193,6 @@ namespace c2pool::messages
     {
     public:
         message_ping() : message("ping") {}
-        // message_ping(const std::string cmd = "ping") : message(cmd) {}
-
-        UniValue _pack() override;
 
         message_ping &operator=(UniValue value)
         {
@@ -236,30 +205,21 @@ namespace c2pool::messages
 
             return result;
         }
-
-        // message_ping = pack.ComposedType([])
-        //todo Empty list
     };
 
     class message_addrme : public message
     {
     public:
+        int port;
+
+    public:
         message_addrme() : message("addrme") {}
-        // message_addrme(int _port, const string cmd = "addrme") : message(cmd)
-        // {
-        //     port = _port;
-        // }
-        message_addrme(int prt) : message("addrme")
+
+        message_addrme(int _port) : message("addrme")
         {
-            port = prt;
+            port = _port;
         }
 
-        UniValue _pack() override;
-
-        //= pack.ComposedType([
-        //    ('port', pack.IntType(16)),
-        int port;
-        //])
         message_addrme &operator=(UniValue value)
         {
             port = value["port"].get_int();
@@ -280,22 +240,15 @@ namespace c2pool::messages
     class message_getaddrs : public message
     {
     public:
+        int count;
+
+    public:
         message_getaddrs() : message("getaddrs") {}
-        // message_getaddrs(int cnt, const string cmd = "getaddr") : message(cmd)
-        // {
-        //     count = cnt;
-        // }
+
         message_getaddrs(int cnt) : message("getaddrs")
         {
             count = cnt;
         }
-
-        UniValue _pack() override;
-
-        //     = pack.ComposedType([
-        //     ('count', pack.IntType(32)),
-        int count;
-        // ])
 
         message_getaddrs &operator=(UniValue value)
         {
@@ -328,8 +281,6 @@ namespace c2pool::messages
             addrs = _addrs;
         }
 
-        UniValue _pack() override;
-
         message_addrs &operator=(UniValue value)
         {
             for (auto arr_value : value["addrs"].get_array().getValues())
@@ -344,12 +295,13 @@ namespace c2pool::messages
         operator UniValue()
         {
             UniValue result(UniValue::VOBJ);
-            
+
             UniValue addrs_array(UniValue::VARR);
 
-            for (auto _addr : addrs){
+            for (auto _addr : addrs)
+            {
                 addrs_array.push_back(_addr);
-            } 
+            }
             result.pushKV("addrs", addrs_array);
 
             return result;
