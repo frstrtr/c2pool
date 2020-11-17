@@ -53,12 +53,14 @@ namespace c2pool::messages
         sprintf(data, "%s%s%s%s", command, length, checksum, payload);
     }
 
-    void IMessage::set_unpacked_length(char* packed_len){
+    void IMessage::set_unpacked_length(char *packed_len)
+    {
         if (packed_len != nullptr)
         {
             memcpy(length, packed_len, payload_length);
         }
-        if (length != nullptr){
+        if (length != nullptr)
+        {
             _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
     }
@@ -114,67 +116,21 @@ namespace c2pool::messages
         set_data(c2pool::python::PyPackTypes::serialize(this));
     }
 
-    UniValue message::pack()
+    /*
+
+    char *message::pack_c_str()
     {
-        return _pack();
+        std::string str = pack();
+        packed_c_str = new char[str.length() + 1];
+        memcpy(packed_c_str, str.c_str(), str.length() + 1);
+        return packed_c_str;
     }
+
+    */
 
     int message::pack_payload_length()
     {
         return c2pool::python::PyPackTypes::payload_length(this);
-    }
-
-    //message_error
-
-    UniValue message_error::_pack()
-    {
-        UniValue value(UniValue::VOBJ);
-        value.pushKV("text", "MESSAGE_ERROR");
-        return value;
-    }
-
-    //message_version
-
-    UniValue message_version::_pack()
-    {
-        UniValue value(UniValue::VOBJ);
-        value = *this;
-        return value;
-    }
-
-    //message_ping
-
-    UniValue message_ping::_pack()
-    {
-        UniValue value(UniValue::VOBJ);
-        return value;
-    }
-
-    //message_addrme
-
-    UniValue message_addrme::_pack()
-    {
-        UniValue value(UniValue::VOBJ);
-        value = *this;
-        return value;
-    }
-
-    //message_getaddrs
-
-    UniValue message_getaddrs::_pack()
-    {
-        UniValue value(UniValue::VOBJ);
-        value = *this;
-        return value;
-    }
-
-    //message_addrs
-
-    UniValue message_addrs::_pack()
-    {
-        UniValue value(UniValue::VOBJ);
-        value = *this;
-        return value;
     }
 
 } // namespace c2pool::messages
