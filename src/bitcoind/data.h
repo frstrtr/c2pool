@@ -6,8 +6,26 @@
 #include <uint256.h>
 #include <arith_uint256.h>
 #include <iostream>
+#include "py_base.h"
 
 using std::vector;
+
+namespace bitcoind::data::python
+{
+    class PyBitcoindData : c2pool::python::PythonBase
+    {
+    protected:
+        static const char *filepath;
+    public:
+        static uint256 target_to_average_attempts(uint256 target);
+
+        static uint256 average_attempts_to_target(uint256 average_attempts);
+
+        static double target_to_difficulty(uint256 target);
+
+        static uint256 difficulty_to_target(uint256 difficulty);
+    };
+} // namespace bitcoind::data::python
 
 namespace bitcoind::data
 {
@@ -26,7 +44,8 @@ namespace bitcoind::data
         return ArithToUint256(result);
     }
 
-    uint256 average_attempts_to_target(uint256 average_attempts){
+    uint256 average_attempts_to_target(uint256 average_attempts)
+    {
         //todo: assert average_attempts > 0
         auto arith_average_attempts = UintToArith256(average_attempts);
         arith_uint256 result("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
