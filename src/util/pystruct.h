@@ -1,8 +1,8 @@
 #ifndef CPOOL_PYSTRUCT_H
 #define CPOOL_PYSTRUCT_H
 
+#include <py_base.h>
 #include <string>
-#include <sstream>
 #include <univalue.h>
 
 using namespace std;
@@ -14,32 +14,14 @@ namespace c2pool::messages
 
 namespace c2pool::python
 {
-    class Py
-    {
-    public:
-        static bool _ready;
-        static void Initialize();
-
-        static void Finalize();
-    };
-} // namespace c2pool::python
-
-namespace c2pool::python
-{
     class other
     {
     public:
         static void debug_log(char *data, unsigned int len);
     };
 
-    class PyPackTypes
+    class PyPackTypes : public c2pool::python::PythonBase
     {
-    private:
-        static auto GetMethodObject(const char *method_name, const char *filename = "packtypes");
-
-        template <typename PyObjectType>
-        static char *GetCallFunctionResult(PyObjectType *pyObj);
-
     public:
         //obj(c++) -> json -> bytes -> unsigned_char*
         template <typename T>

@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <iterator>
+#include <string>
 
 namespace c2pool::random
 {
@@ -59,7 +60,21 @@ namespace c2pool::str
 
     //char и unsigned char будут так же верно сравниваться.
     //true - equaled
-    bool compare_str(const void* first_str, const void* second_str, unsigned int length);
+    bool compare_str(const void *first_str, const void *second_str, unsigned int length);
 } // namespace c2pool::str
 
+namespace c2pool::filesystem
+{
+
+    //full path to main project folder
+    std::string getProjectDir();
+
+    const char *getProjectDir_c();
+
+    //full subdirection path.
+    std::string getSubDir(std::string path);
+
+    const char *getSubDir_c(std::string path);
+
+} // namespace c2pool::filesystem
 #endif //CPOOL_OTHER_H

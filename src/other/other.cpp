@@ -49,7 +49,7 @@ namespace c2pool::random
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l)
     {
-        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1/l);
+        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1 / l);
     }
 
     unsigned long long RandomNonce()
@@ -96,10 +96,40 @@ namespace c2pool::str
         return (char *)result;
     }
 
-    bool compare_str(const void* first_str, const void* second_str, unsigned int length)
+    bool compare_str(const void *first_str, const void *second_str, unsigned int length)
     {
         if (memcmp(first_str, second_str, length) == 0)
             return true;
         return false;
     }
 } // namespace c2pool::str
+
+namespace c2pool::filesystem
+{
+
+    //full path to main project folder
+    std::string getProjectDir()
+    {
+        return RESOURCES_DIR;
+    }
+
+    const char *getProjectDir_c()
+    {
+        return RESOURCES_DIR;
+    }
+
+    //full subdirection path.
+    std::string getSubDir(std::string path)
+    {
+        return getProjectDir() + path;
+    }
+
+    const char *getSubDir_c(std::string path)
+    {
+        std::string str = getSubDir(path);
+        char *cstr = new char[str.length() + 1];
+        std::strcpy(cstr, str.c_str());
+        return cstr;
+    }
+
+} // namespace c2pool::filesystem

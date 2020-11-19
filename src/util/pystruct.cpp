@@ -3,36 +3,12 @@
 #include "other.h"
 #include "messages.h"
 #include "univalue.h"
-#include "filesys.h"
-
 #include <tuple>
 #include <iostream>
 #include <sstream>
+#include <py_base.h>
 
 using namespace std;
-
-namespace c2pool::python
-{
-    bool Py::_ready = false;
-
-    void Py::Initialize()
-    {
-        if (!_ready)
-        {
-            Py_Initialize();
-            _ready = true;
-        }
-    }
-
-    void Py::Finalize()
-    {
-        if (_ready)
-        {
-            Py_Finalize();
-            _ready = false;
-        }
-    }
-} // namespace c2pool::python
 
 namespace c2pool::python
 {
@@ -45,7 +21,7 @@ namespace c2pool::python
         auto sys = PyImport_ImportModule("sys");
         auto sys_path = PyObject_GetAttrString(sys, "path");
         // Путь до наших исходников Python
-        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
+        auto folder_path = PyUnicode_FromString(c2pool::filesystem::getSubDir_c("/src/util"));
         PyList_Append(sys_path, folder_path);
 
         // Загрузка py файла
@@ -86,76 +62,7 @@ namespace c2pool::python
 
     //PyPackTypes
 
-    auto PyPackTypes::GetMethodObject(const char *method_name, const char *filename)
-    {
-        c2pool::python::Py::Initialize();
-
-        PyObject *pObjct = nullptr;
-
-        // Загрузка модуля sys
-        auto sys = PyImport_ImportModule("sys");
-        auto sys_path = PyObject_GetAttrString(sys, "path");
-        // Путь до наших исходников Python
-        auto folder_path = PyUnicode_FromString(FileSystem::getSubDir_c("/src/util"));
-        PyList_Append(sys_path, folder_path);
-
-        // Загрузка py файла
-        auto pName = PyUnicode_FromString(filename);
-        if (!pName)
-        {
-            return pObjct;
-        }
-
-        // Загрузить объект модуля
-        auto pModule = PyImport_Import(pName);
-        if (!pModule)
-        {
-            return pObjct;
-        }
-
-        // Словарь объектов содержащихся в модуле
-        auto pDict = PyModule_GetDict(pModule);
-        if (!pDict)
-        {
-            return pObjct;
-        }
-
-        pObjct = PyDict_GetItemString(pDict, method_name);
-        if (!pObjct)
-        {
-            return pObjct;
-        }
-
-        // Проверка pObjct на годность.
-        if (!PyCallable_Check(pObjct))
-        {
-            return pObjct;
-        }
-
-        return pObjct;
-    }
-
-    template <typename PyObjectType>
-    char *PyPackTypes::GetCallFunctionResult(PyObjectType *pyObj)
-    {
-        char *ret = NULL;
-        if (pyObj != NULL)
-        {
-            PyObject *pResultRepr = PyObject_Repr(pyObj);
-
-            // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
-            // Для начала pResultRepr нужно привести к массиву байтов.
-            ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
-
-            Py_XDECREF(pResultRepr);
-            Py_XDECREF(pyObj);
-        }
-        ret += 1;                 //remove first element ['] in string
-        ret[strlen(ret) - 1] = 0; //remove last element ['] in string
-
-        // std::cout << "ret: " << ret << std::endl; //TODO: DEBUG_PYTHON
-        return ret;
-    }
+    
 
     template <typename T>
     char *PyPackTypes::serialize(char *name_type, T &value)
@@ -192,7 +99,6 @@ namespace c2pool::python
         json_msg.pushKV("value", msg_value);
 
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
-
         auto result = GetCallFunctionResult(pVal);
 
         if (c2pool::str::compare_str(result, "ERROR", 5)){
@@ -291,8 +197,6 @@ namespace c2pool::python
 
     unsigned int PyPackTypes::receive_length(char *length_data)
     {
-        c2pool::python::Py::Initialize();
-
         unsigned int result = 0;
 
         auto methodObj = GetMethodObject("receive_length");
