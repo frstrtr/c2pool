@@ -8,8 +8,6 @@
 #include "uint256.h"
 #include <vector>
 
-//TODO: remove trash comments
-
 namespace c2pool::p2p
 {
     class Protocol;
