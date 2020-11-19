@@ -12,7 +12,6 @@ using namespace std;
 
 namespace c2pool::python
 {
-
     void other::debug_log(char *data, unsigned int len)
     {
         c2pool::python::Py::Initialize();
@@ -62,12 +61,12 @@ namespace c2pool::python
 
     //PyPackTypes
 
-    
+    const char *PyPackTypes::filepath = "/src/util";
 
     template <typename T>
     char *PyPackTypes::serialize(char *name_type, T &value)
     {
-        auto methodObj = GetMethodObject("serialize");
+        auto methodObj = GetMethodObject("serialize", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             return nullptr; //TODO обработка ситуации, если получено nullptr
@@ -87,7 +86,7 @@ namespace c2pool::python
 
     char *PyPackTypes::serialize(c2pool::messages::message *msg)
     {
-        auto methodObj = GetMethodObject("serialize_msg");
+        auto methodObj = GetMethodObject("serialize_msg", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             return nullptr; //TODO обработка ситуации, если получено nullptr
@@ -101,7 +100,8 @@ namespace c2pool::python
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
         auto result = GetCallFunctionResult(pVal);
 
-        if (c2pool::str::compare_str(result, "ERROR", 5)){
+        if (c2pool::str::compare_str(result, "ERROR", 5))
+        {
             //ERROR
             return "";
         }
@@ -112,7 +112,7 @@ namespace c2pool::python
     UniValue PyPackTypes::deserialize(char *name_type, char *value, int length)
     {
         UniValue result(UniValue::VOBJ);
-        auto methodObj = GetMethodObject("deserialize");
+        auto methodObj = GetMethodObject("deserialize", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             result.setNull();
@@ -129,7 +129,7 @@ namespace c2pool::python
     UniValue PyPackTypes::deserialize(c2pool::messages::message *msg)
     {
         UniValue result(UniValue::VOBJ);
-        auto methodObj = GetMethodObject("deserialize_msg");
+        auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             result.setNull();
@@ -147,7 +147,7 @@ namespace c2pool::python
     {
         int result = 0;
 
-        auto methodObj = GetMethodObject("payload_length");
+        auto methodObj = GetMethodObject("payload_length", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             return -1; //TODO обработка ситуации, если получено nullptr
@@ -174,7 +174,7 @@ namespace c2pool::python
     {
         unsigned int result = 0;
 
-        auto methodObj = GetMethodObject("packed_size");
+        auto methodObj = GetMethodObject("packed_size", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             return -1; //TODO обработка ситуации, если получено nullptr
@@ -199,7 +199,7 @@ namespace c2pool::python
     {
         unsigned int result = 0;
 
-        auto methodObj = GetMethodObject("receive_length");
+        auto methodObj = GetMethodObject("receive_length", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             return -1; //TODO обработка ситуации, если получено nullptr

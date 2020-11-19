@@ -22,6 +22,8 @@ namespace c2pool::python
 
     class PyPackTypes : public c2pool::python::PythonBase
     {
+    protected:
+        static const char *filepath;
     public:
         //obj(c++) -> json -> bytes -> unsigned_char*
         template <typename T>
