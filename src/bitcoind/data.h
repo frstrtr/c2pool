@@ -16,6 +16,7 @@ namespace bitcoind::data::python
     {
     protected:
         static const char *filepath;
+
     public:
         static uint256 target_to_average_attempts(uint256 target);
 
@@ -32,26 +33,22 @@ namespace bitcoind::data
 
     uint256 target_to_average_attempts(uint256 target)
     {
-        arith_uint256 arith_target = UintToArith256(target) + 1;
-
-        if (arith_target.GetHex() == "0000000000000000000000000000000000000000000000000000000000000000")
-        {
-            arith_target.SetHex("0000000000000000000000000000000000000000000000000000000000000001");
-            return ArithToUint256(arith_target);
-        }
-        arith_uint256 result("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        result /= arith_target;
-        return ArithToUint256(result);
+        return bitcoind::data::python::PyBitcoindData::target_to_average_attempts(target);
     }
 
     uint256 average_attempts_to_target(uint256 average_attempts)
     {
-        //todo: assert average_attempts > 0
-        auto arith_average_attempts = UintToArith256(average_attempts);
-        arith_uint256 result("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        result /= arith_average_attempts;
-        result -= 1;
-        return ArithToUint256(result);
+        return bitcoind::data::python::PyBitcoindData::average_attempts_to_target(average_attempts);
+    }
+
+    double target_to_difficulty(uint256 target)
+    {
+        return bitcoind::data::python::PyBitcoindData::target_to_difficulty(target);
+    }
+
+    uint256 difficulty_to_target(uint256 difficulty)
+    {
+        return bitcoind::data::python::PyBitcoindData::difficulty_to_target(difficulty);
     }
 
     class PreviousOutput

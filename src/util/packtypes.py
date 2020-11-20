@@ -894,7 +894,14 @@ class TYPE:
         'ping': 1,
         'addrme': 2,
         'addrs': 3,
-        'getaddrs': 4
+        'getaddrs': 4,
+        #new:
+        'shares' : 5, 
+        'sharereq' : 6,
+        'sharereply': 7,
+        'best_block' : 8, #todo
+        'have_tx' : 9,
+        'losing_tx' : 10
     }
 
     @classmethod

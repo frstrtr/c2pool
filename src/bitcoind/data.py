@@ -31,7 +31,7 @@ def difficulty_to_target(hex_difficulty):
     return min(int((0xffff0000 * 2**(256-64) + 1)/difficulty - 1 + 0.5), 2**256-1)
 
 
-def test():
+def debug():
     print('target_to_average_attempts:')
     print(target_to_average_attempts('0'))
     print(target_to_average_attempts('1'))
@@ -49,3 +49,5 @@ def test():
     print('difficulty_to_target:')
     print(difficulty_to_target('1'))
     print(difficulty_to_target('ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'))
+
+#debug()
