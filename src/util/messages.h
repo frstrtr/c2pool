@@ -1,11 +1,13 @@
 #ifndef CPOOL_MESSAGES_H
 #define CPOOL_MESSAGES_H
 
+#include "types.h"
+#include "uint256.h"
+#include "shareTypes.h"
+
 #include <iostream>
 #include <sstream>
 #include <string>
-#include "types.h"
-#include "uint256.h"
 #include <vector>
 
 namespace c2pool::p2p
@@ -24,7 +26,14 @@ namespace c2pool::messages
         cmd_addrs,
         cmd_getaddrs,
         cmd_ping,
-        cmd_addrme
+        cmd_addrme,
+        //new:
+        cmd_shares,
+        cmd_sharereq,
+        cmd_sharereply,
+        cmd_best_block, //TODO
+        cmd_have_tx,
+        cmd_losing_tx
     };
 
     class IMessage
@@ -301,6 +310,249 @@ namespace c2pool::messages
                 addrs_array.push_back(_addr);
             }
             result.pushKV("addrs", addrs_array);
+
+            return result;
+        }
+    };
+
+    class message_shares : public message
+    {
+    public:
+        std::vector<c2pool::shares::RawShare> shares;
+
+    public:
+        message_shares() : message("shares") {}
+
+        message_shares(std::vector<c2pool::shares::RawShare> _shares) : message("shares")
+        {
+            shares = _shares;
+        }
+
+        message_shares &operator=(UniValue value)
+        {
+            for (auto arr_value : value["shares"].get_array().getValues())
+            {
+                c2pool::shares::RawShare _temp_share;
+                _temp_share = arr_value;
+                shares.push_back(_temp_share);
+            }
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            UniValue shares_array(UniValue::VARR);
+            for (auto _share : shares)
+            {
+                shares_array.push_back(_share);
+            }
+            result.pushKV("shares", shares_array);
+
+            return result;
+        }
+    };
+
+    class message_sharereq : public message
+    {
+    public:
+        uint256 id;
+        std::vector<uint256> hashes;
+        unsigned long long parents;
+        std::vector<uint256> stops;
+
+    public:
+        message_sharereq() : message("sharereq") {}
+
+        message_sharereq(uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops) : message("sharereq")
+        {
+            id = _id;
+            hashes = _hashes;
+            parents = _parents;
+            stops = _stops;
+        }
+
+        message_sharereq &operator=(UniValue value)
+        {
+            id.SetHex(value["id"].get_str());
+            for (auto arr_value : value["hashes"].get_array().getValues())
+            {
+                uint256 _temp_hash;
+                _temp_hash.SetHex(arr_value.get_str());
+                hashes.push_back(_temp_hash);
+            }
+            parents = value["parents"].get_int64();
+            for (auto arr_value : value["stops"].get_array().getValues())
+            {
+                uint256 _temp_stop;
+                _temp_stop.SetHex(arr_value.get_str());
+                stops.push_back(_temp_stop);
+            }
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("id", id.GetHex());
+
+            UniValue hashes_array(UniValue::VARR);
+            for (auto _hash : hashes)
+            {
+                hashes_array.push_back(_hash.GetHex());
+            }
+            result.pushKV("hashes", hashes_array);
+
+            result.pushKV("parents", parents);
+
+            UniValue stops_array(UniValue::VARR);
+            for (auto _stop : stops)
+            {
+                hashes_array.push_back(_stop.GetHex());
+            }
+            result.pushKV("stops", stops_array);
+
+            return result;
+        }
+    };
+
+    enum ShareReplyResult
+    {
+        good = 0,
+        too_long = 1,
+        unk2 = 2,
+        unk3 = 3,
+        unk4 = 4,
+        unk5 = 5,
+        unk6 = 6
+    };
+
+    class message_sharereply : public message
+    {
+    public:
+        uint256 id;
+        ShareReplyResult result;
+        std::vector<c2pool::shares::RawShare> shares;
+
+    public:
+        message_sharereply() : message("sharereply") {}
+
+        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares) : message("sharereply")
+        {
+            id = _id;
+            result = _result;
+            shares = _shares;
+        }
+
+        message_sharereply &operator=(UniValue value)
+        {
+            id.SetHex(value["id"].get_str());
+
+            result = (ShareReplyResult)value["result"].get_int();
+
+            for (auto arr_value : value["shares"].get_array().getValues())
+            {
+                c2pool::shares::RawShare _temp_share;
+                _temp_share = arr_value;
+                shares.push_back(_temp_share);
+            }
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("id", id.GetHex());
+
+            result.pushKV("result", (int)result);
+
+            UniValue shares_array(UniValue::VARR);
+            for (auto _share : shares)
+            {
+                shares_array.push_back(_share);
+            }
+            result.pushKV("shares", shares_array);
+
+            return result;
+        }
+    };
+
+    class message_have_tx : public message
+    {
+    public:
+        std::vector<uint256> tx_hashes;
+
+    public:
+        message_have_tx() : message("have_tx") {}
+
+        message_have_tx(std::vector<uint256> _tx_hashes) : message("have_tx")
+        {
+            tx_hashes = _tx_hashes;
+        }
+
+        message_have_tx &operator=(UniValue value)
+        {
+            for (auto arr_value : value["tx_hashes"].get_array().getValues())
+            {
+                uint256 _temp_tx_hash;
+                _temp_tx_hash.SetHex(arr_value.get_str());
+                tx_hashes.push_back(_temp_tx_hash);
+            }
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            UniValue tx_hashes_array(UniValue::VARR);
+            for (auto _tx_hash : tx_hashes)
+            {
+                tx_hashes_array.push_back(_tx_hash.GetHex());
+            }
+            result.pushKV("tx_hashes", tx_hashes_array);
+
+            return result;
+        }
+    };
+
+    class message_losing_tx : public message
+    {
+    public:
+        std::vector<uint256> tx_hashes;
+
+    public:
+        message_losing_tx() : message("losing_tx") {}
+
+        message_losing_tx(std::vector<uint256> _tx_hashes) : message("losing_tx")
+        {
+            tx_hashes = _tx_hashes;
+        }
+
+        message_losing_tx &operator=(UniValue value)
+        {
+            for (auto arr_value : value["tx_hashes"].get_array().getValues())
+            {
+                uint256 _temp_tx_hash;
+                _temp_tx_hash.SetHex(arr_value.get_str());
+                tx_hashes.push_back(_temp_tx_hash);
+            }
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            UniValue tx_hashes_array(UniValue::VARR);
+            for (auto _tx_hash : tx_hashes)
+            {
+                tx_hashes_array.push_back(_tx_hash.GetHex());
+            }
+            result.pushKV("tx_hashes", tx_hashes_array);
 
             return result;
         }

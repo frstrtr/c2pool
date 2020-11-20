@@ -204,6 +204,26 @@ namespace c2pool::p2p
         case c2pool::messages::commands::cmd_getaddrs:
             handle(GenerateMsg<c2pool::messages::message_getaddrs>(json));
             break;
+        //new:
+        case c2pool::messages::commands::cmd_shares:
+            handle(GenerateMsg<c2pool::messages::message_shares>(json));
+            break;
+        case c2pool::messages::commands::cmd_sharereq:
+            handle(GenerateMsg<c2pool::messages::message_sharereq>(json));
+            break;
+        case c2pool::messages::commands::cmd_sharereply:
+            handle(GenerateMsg<c2pool::messages::message_sharereply>(json));
+            break;
+        //TODO:
+        // case c2pool::messages::commands::cmd_best_block:
+        //     handle(GenerateMsg<c2pool::messages::message_best_block>(json));
+        //     break;
+        case c2pool::messages::commands::have_tx:
+            handle(GenerateMsg<c2pool::messages::message_have_tx>(json));
+            break;
+        case c2pool::messages::commands::cmd_losing_tx:
+            handle(GenerateMsg<c2pool::messages::message_losing_tx>(json));
+            break;
         default:
             handle(GenerateMsg<c2pool::messages::message_error>(json));
             break;
@@ -292,22 +312,57 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_addrs *msg)
     {
+        //TODO:
     }
 
     void Protocol::handle(c2pool::messages::message_addrme *msg)
     {
+        //TODO:
     }
 
     void Protocol::handle(c2pool::messages::message_ping *msg)
     {
+        //TODO:
     }
 
     void Protocol::handle(c2pool::messages::message_getaddrs *msg)
     {
+        //TODO:
     }
 
     void Protocol::handle(c2pool::messages::message_error *msg)
     {
+        //TODO:
+    }
+
+    void Protocol::handle(c2pool::messages::message_shares *msg)
+    {
+        //TODO:
+    }
+
+    void Protocol::handle(c2pool::messages::message_sharereq *msg)
+    {
+        //TODO:
+    }
+
+    void Protocol::handle(c2pool::messages::message_sharereply *msg)
+    {
+        //TODO:
+    }
+
+    //TODO:
+    // void Protocol::handle(c2pool::messages::message_best_block *msg)
+    // {
+    // }
+
+    void Protocol::handle(c2pool::messages::message_have_tx *msg)
+    {
+        //TODO:
+    }
+
+    void Protocol::handle(c2pool::messages::message_losing_tx *msg)
+    {
+        //TODO:
     }
 
     void Protocol::update_addr()

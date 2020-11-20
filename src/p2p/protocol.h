@@ -95,6 +95,18 @@ namespace c2pool::p2p
 
         virtual void handle(c2pool::messages::message_error *msg);
 
+        virtual void handle(c2pool::messages::message_shares *msg);
+
+        virtual void handle(c2pool::messages::message_sharereq *msg);
+
+        virtual void handle(c2pool::messages::message_sharereply *msg);
+
+        //TODO: virtual void handle(c2pool::messages::message_best_block *msg);
+
+        virtual void handle(c2pool::messages::message_have_tx *msg);
+
+        virtual void handle(c2pool::messages::message_losing_tx *msg);
+
         
         void update_addr();
         //TODO: Friend class: Message for handle_<command>

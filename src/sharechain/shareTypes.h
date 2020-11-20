@@ -48,26 +48,8 @@ namespace c2pool::shares
         HashLinkType() {}
         HashLinkType(std::string state, std::string extra_data, unsigned long long length);
 
-        friend std::istream &operator>>(std::istream &is, HashLinkType &value);
-        friend std::ostream &operator<<(std::ostream &os, const HashLinkType &value);
-        
         friend bool operator==(const HashLinkType &first, const HashLinkType &second);
         friend bool operator!=(const HashLinkType &first, const HashLinkType &second);
-
-        /*
-        operator UniValue(){
-            UniValue result(UniValue::VOBJ);
-        
-
-            return result;
-        }
-
-        HashLinkType &operator=(UniValue value)
-        {
-            
-            return *this;
-        }
-        */
 
         HashLinkType &operator=(UniValue value)
         {
@@ -100,9 +82,6 @@ namespace c2pool::shares
             index = 0;
         };
         MerkleLink(std::vector<uint256> branch, int index);
-
-        friend std::istream &operator>>(std::istream &is, MerkleLink &value);
-        friend std::ostream &operator<<(std::ostream &os, const MerkleLink &value);
 
         friend bool operator==(const MerkleLink &first, const MerkleLink &second);
         friend bool operator!=(const MerkleLink &first, const MerkleLink &second);
@@ -149,9 +128,6 @@ namespace c2pool::shares
         SmallBlockHeaderType(){};
         SmallBlockHeaderType(unsigned long long version, uint256 previous_block, unsigned int timeStamp, unsigned int bits, unsigned int nonce);
 
-        friend std::istream &operator>>(std::istream &is, SmallBlockHeaderType &value);
-        friend std::ostream &operator<<(std::ostream &os, const SmallBlockHeaderType &value);
-
         friend bool operator==(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second);
         friend bool operator!=(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second);
 
@@ -194,9 +170,6 @@ namespace c2pool::shares
 
         ShareData(){};
         ShareData(uint256 previous_share_hash, std::string coinbase, unsigned int nonce, uint160 pubkey_hash, unsigned long long subsidy, unsigned short donation, StaleInfo stale_info, unsigned long long desired_version);
-
-        friend std::istream &operator>>(std::istream &is, ShareData &value);
-        friend std::ostream &operator<<(std::ostream &os, const ShareData &value);
 
         friend bool operator==(const ShareData &first, const ShareData &second);
         friend bool operator!=(const ShareData &first, const ShareData &second);
@@ -246,11 +219,8 @@ namespace c2pool::shares
         };
         SegwitData(std::shared_ptr<MerkleLink> txid_merkle_link, uint256 wtxid_merkle_root);
 
-        friend std::istream &operator>>(std::istream &is, SegwitData &value);
-        friend std::ostream &operator<<(std::ostream &os, const SegwitData &value);
-
         friend bool operator==(const SegwitData &first, const SegwitData &second);
-        friend bool operator!=(const SegwitData&first, const SegwitData &second);
+        friend bool operator!=(const SegwitData &first, const SegwitData &second);
 
         SegwitData &operator=(UniValue value)
         {
@@ -281,9 +251,6 @@ namespace c2pool::shares
 
         TransactionHashRef(){};
         TransactionHashRef(unsigned long long share_count, unsigned long long tx_count);
-
-        friend std::istream &operator>>(std::istream &is, TransactionHashRef &value);
-        friend std::ostream &operator<<(std::ostream &os, const TransactionHashRef &value);
 
         friend bool operator==(const TransactionHashRef &first, const TransactionHashRef &second);
         friend bool operator!=(const TransactionHashRef &first, const TransactionHashRef &second);
@@ -326,9 +293,6 @@ namespace c2pool::shares
         ShareInfoType(){};
         ShareInfoType(std::shared_ptr<ShareData> share_data, std::vector<uint256> new_transaction_hashes, std::vector<TransactionHashRef> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits, unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork, std::shared_ptr<SegwitData> segwit_data = nullptr);
 
-        friend std::istream &operator>>(std::istream &is, ShareInfoType &value);
-        friend std::ostream &operator<<(std::ostream &os, const ShareInfoType &value);
-
         friend bool operator==(const ShareInfoType &first, const ShareInfoType &second);
         friend bool operator!=(const ShareInfoType &first, const ShareInfoType &second);
 
@@ -337,10 +301,8 @@ namespace c2pool::shares
             share_data = std::make_shared<ShareData>();
             *share_data = value["share_data"].get_obj();
 
-
             segwit_data = std::make_shared<SegwitData>();
             *segwit_data = value["segwit_data"].get_obj();
-
 
             for (auto hex_str : value["new_transaction_hashes"].get_array().getValues())
             {
@@ -348,7 +310,6 @@ namespace c2pool::shares
                 temp_uint256.SetHex(hex_str.get_str());
                 new_transaction_hashes.push_back(temp_uint256);
             }
-
 
             for (auto tx_hash_ref : value["transaction_hash_refs"].get_array().getValues())
             {
@@ -412,9 +373,6 @@ namespace c2pool::shares
         ShareType(){};
         ShareType(std::shared_ptr<SmallBlockHeaderType> min_header, std::shared_ptr<ShareInfoType> share_info, std::shared_ptr<MerkleLink> ref_merkle_link, unsigned long long last_txout_nonce, std::shared_ptr<HashLinkType> hash_link, std::shared_ptr<MerkleLink> merkle_link);
 
-        friend std::istream &operator>>(std::istream &is, ShareType &value);
-        friend std::ostream &operator<<(std::ostream &os, const ShareType &value);
-
         friend bool operator==(const ShareType &first, const ShareType &second);
         friend bool operator!=(const ShareType &first, const ShareType &second);
 
@@ -463,9 +421,6 @@ namespace c2pool::shares
 
         RefType(){};
         RefType(std::string identifier, std::shared_ptr<ShareInfoType> share_info);
-
-        friend std::istream &operator>>(std::istream &is, RefType &value);
-        friend std::ostream &operator<<(std::ostream &os, const RefType &value);
 
         friend bool operator==(const RefType &first, const RefType &second);
         friend bool operator!=(const RefType &first, const RefType &second);
@@ -531,14 +486,12 @@ namespace c2pool::shares
         int type; //enum ShareVersion
         ShareType contents;
 
-        RawShare(){}
-        RawShare(int _type, ShareType _contens){
+        RawShare() {}
+        RawShare(int _type, ShareType _contens)
+        {
             type = _type;
             contents = _contens;
         }
-
-        friend std::istream &operator>>(std::istream &is, RawShare &value);
-        friend std::ostream &operator<<(std::ostream &os, const RawShare &value);
 
         friend bool operator==(const RawShare &first, const RawShare &second);
         friend bool operator!=(const RawShare &first, const RawShare &second);

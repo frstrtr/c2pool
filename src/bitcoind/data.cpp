@@ -1,5 +1,6 @@
 #include "data.h"
 #include "uint256.h"
+#include <sstream>
 
 namespace bitcoind::data::python
 {
@@ -43,7 +44,20 @@ namespace bitcoind::data::python
 
     double PyBitcoindData::target_to_difficulty(uint256 target)
     {
-        //TODO
+        double result;
+        auto methodObj = GetMethodObject("target_to_difficulty", filepath, "data");
+        if (methodObj == nullptr)
+        {
+            return result; //TODO обработка ситуации, если получено Null
+        }
+
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", target.GetHex());
+        auto raw_result = GetCallFunctionResult(pVal);
+
+        std::stringstream ss;
+        ss << raw_result;
+        ss >> result;
+        return result;
     }
 
     uint256 PyBitcoindData::difficulty_to_target(uint256 difficulty)
