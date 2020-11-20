@@ -218,7 +218,7 @@ namespace c2pool::p2p
         // case c2pool::messages::commands::cmd_best_block:
         //     handle(GenerateMsg<c2pool::messages::message_best_block>(json));
         //     break;
-        case c2pool::messages::commands::have_tx:
+        case c2pool::messages::commands::cmd_have_tx:
             handle(GenerateMsg<c2pool::messages::message_have_tx>(json));
             break;
         case c2pool::messages::commands::cmd_losing_tx:
