@@ -167,12 +167,12 @@ namespace c2pool::p2p
                                  [this](boost::system::error_code ec, std::size_t /*length*/) {
                                      if (!ec)
                                      {
-                                        //
+                                         //
                                      }
                                      else
                                      {
-                                        LOG_ERROR << ec;
-                                        disconnect();
+                                         LOG_ERROR << ec;
+                                         disconnect();
                                      }
                                  });
     }
@@ -337,7 +337,86 @@ namespace c2pool::p2p
 
     void Protocol::handle(c2pool::messages::message_shares *msg)
     {
-        //TODO:
+        auto t0 = c2pool::time::timestamp();
+        std::vector<std::tuple<BaseShare, std::vector</*TODO: TX TYPE*/>>> result;
+
+        //wrappedshare type = RawShare
+        for (auto wrappedshare : msg->shares)
+        {
+            if (wrappedshare.type < c2pool::shares::ShareVersion::Share)
+                continue;
+            auto share = c2pool::shares::load_share<c2pool::shares::BaseShare>(wrappedshare, node->net(), addr);
+            vector</*TODO*/> txs;
+            if (wrappedshare.type >= 13)
+            {
+                for (auto tx_hash : share.share_info.new_transaction_hashes)
+                {
+                    /*TODO: TYPE*/ tx;
+                    if (node.known_txs_var.value.find(tx_hash) != node.known_txs_var.value.end())
+                    {
+                        tx = node.known_txs_var.value[tx_hash];
+                    }
+                    else
+                    {
+                        /*TODO:
+                        for cache in self.known_txs_cache.itervalues():
+                            if tx_hash in cache:
+                                tx = cache[tx_hash]
+                                print 'Transaction %064x rescued from peer latency cache!' % (tx_hash,)
+                                break
+                        else:
+                            print >>sys.stderr, 'Peer referenced unknown transaction %064x, disconnecting' % (tx_hash,)
+                            self.disconnect()
+                            return
+                        */
+                    }
+                    txs.push_back(tx);
+                }
+            }
+
+            //TODO: result.append((share, txs))
+
+            node->handle_shares(result, this);
+            auto t1 = c2pool::time::timestamp();
+
+            //TODO: 
+            //if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares)))
+
+        }
+        /*
+        
+        def handle_shares(self, shares):
+        t0 = time.time()
+        result = []
+        for wrappedshare in shares:
+            if wrappedshare['type'] < p2pool_data.Share.VERSION: continue
+            share = p2pool_data.load_share(wrappedshare, self.node.net, self.addr)
+            if wrappedshare['type'] >= 13:
+                txs = []
+                for tx_hash in share.share_info['new_transaction_hashes']:
+                    if tx_hash in self.node.known_txs_var.value:
+                        tx = self.node.known_txs_var.value[tx_hash]
+                    else:
+                        for cache in self.known_txs_cache.itervalues():
+                            if tx_hash in cache:
+                                tx = cache[tx_hash]
+                                print 'Transaction %064x rescued from peer latency cache!' % (tx_hash,)
+                                break
+                        else:
+                            print >>sys.stderr, 'Peer referenced unknown transaction %064x, disconnecting' % (tx_hash,)
+                            self.disconnect()
+                            return
+                    txs.append(tx)
+            else:
+                txs = None
+            
+            result.append((share, txs))
+            
+        self.node.handle_shares(result, self)
+        t1 = time.time()
+        if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares)))
+        
+        */
     }
 
     void Protocol::handle(c2pool::messages::message_sharereq *msg)
@@ -391,7 +470,9 @@ namespace c2pool::p2p
                 // c2pool::messages::message* firstMsg = new c2pool::messages::message_version(version, 0, addrs1, addrs2, nodes->p2p_node->nonce, "16", 1, 18);
                 // send(firstMsg);
                 read_prefix();
-            } else {
+            }
+            else
+            {
                 LOG_ERROR << ec;
             }
         });

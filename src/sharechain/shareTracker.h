@@ -165,12 +165,11 @@ namespace c2pool::shares::tracker
 
 namespace c2pool::shares::tracker
 {
-    template<template<typename> typename delta_type, typename item_type>
+    template <template <typename> typename delta_type, typename item_type>
     class Tracker
     {
     public:
-
-        #define DELTA_TYPE delta_type<item_type>
+#define DELTA_TYPE delta_type<item_type>
 
         map<uint256, item_type> items;
         map<uint256, set<uint256>> reverse;
@@ -366,7 +365,16 @@ namespace c2pool::shares::tracker
         }
     };
 
-    class OkayTracker : public Tracker<OkayProtoAttributeDelta, BaseShare>, std::enable_shared_from_this<OkayTracker>
+    struct TrackerThinkResult
+    {
+        uint256 best_hash;
+        std::vector<std::tuple<std::tuple<std::string, std::string>, uint256> desired;
+        std::vector<auto /*TODO*/> decorated_heads, 
+        std::set<std::tuple<std::string, std::string>> bad_peer_addresses
+    }
+
+    class OkayTracker : public Tracker<OkayProtoAttributeDelta, BaseShare>,
+                        std::enable_shared_from_this<OkayTracker>
     {
     public:
         shared_ptr<c2pool::config::Network> net;
@@ -412,7 +420,10 @@ namespace c2pool::shares::tracker
             return true;
         }
 
-        //TODO: def think(self, block_rel_height_func, previous_block, bits, known_txs)
+        TrackerThinkResult think(auto block_rel_height_func, uint256 previous_block, unsigned int bits, auto known_txs)
+        {
+            //TODO            
+        }
 
         //TODO: def score(self, share_hash, block_rel_height_func)
     };
