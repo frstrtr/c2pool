@@ -1,20 +1,21 @@
 #include "node.h"
 
-#include <map>
-#include <set>
-#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
-#include <boost/asio.hpp>
-#include <boost/bind.hpp>
-#include <memory>
 #include "config.h"
 #include "other.h"
-#include <iostream>
 #include "protocol.h"
 #include "factory.h"
 #include "console.h"
 #include "addrStore.h"
-#include <cmath>
+#include "events.h
 
+#include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
+#include <boost/asio.hpp>
+#include <boost/bind.hpp>
+#include <map>
+#include <set>
+#include <memory>
+#include <iostream>
+#include <cmath>
 #include <iterator>
 
 using std::log;

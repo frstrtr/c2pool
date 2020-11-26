@@ -1,12 +1,14 @@
 #ifndef BITCOIND_DATA_H
 #define BITCOIND_DATA_H
 
+#include "uint256.h"
+#include "arith_uint256.h"
+#include "py_base.h"
+
 #include <cstring>
 #include <vector>
-#include <uint256.h>
-#include <arith_uint256.h>
 #include <iostream>
-#include "py_base.h"
+
 
 using std::vector;
 
@@ -18,6 +20,7 @@ namespace bitcoind::data::python
         static const char *filepath;
 
     public:
+    
         static uint256 target_to_average_attempts(uint256 target);
 
         static uint256 average_attempts_to_target(uint256 average_attempts);

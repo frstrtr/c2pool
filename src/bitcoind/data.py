@@ -7,6 +7,7 @@ def hex_to_int(hex_str):
 
 #--------------------bitcoind-data------------------------
 
+# target
 def target_to_average_attempts(hex_target):
     target = hex_to_int(hex_target)
     assert 0 <= target and isinstance(target, int), target
