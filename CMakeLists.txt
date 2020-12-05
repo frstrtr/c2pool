@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18.1)
+cmake_minimum_required(VERSION 3.16.1)
 set(PROJ_NAME c2pool)
 project(${PROJ_NAME})
 
@@ -35,7 +35,7 @@ set(Boost_USE_DEBUG_LIBS         ON) # ignore debug libs and
 # set(Boost_USE_RELEASE_LIBS       ON)  # only find release libs
 # set(Boost_USE_MULTITHREADED      ON)
 # set(Boost_USE_STATIC_RUNTIME    OFF)
-find_package(Boost 1.74.0 COMPONENTS log log_setup REQUIRED)
+find_package(Boost 1.71.0 COMPONENTS log log_setup REQUIRED)
 set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY} ${Boost_LOG_SETUP_LIBRARY})
 #find_package(Boost 1.74.0 REQUIRED)
 # find_package(Boost 1.74.0 REQUIRED)

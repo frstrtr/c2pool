@@ -6,7 +6,7 @@ set(SOURCE_FILES converter.cpp other.cpp console.cpp)
 
 set(Boost_USE_STATIC_LIBS ON)
 
-find_package(Boost 1.74.0 REQUIRED COMPONENTS log log_setup)
+find_package(Boost 1.71.0 REQUIRED COMPONENTS log log_setup)
 
 add_library(other STATIC ${SOURCE_FILES} ${HEADER_FILES})
 
