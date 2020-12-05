@@ -25,7 +25,7 @@ ADD_DEFINITIONS(-DBOOST_LOG_DYN_LINK)
 SET(CMAKE_INCLUDE_PATH ${CMAKE_INCLUDE_PATH} "C:/local/boost_1_74_0")
 SET(CMAKE_LIBRARY_PATH ${CMAKE_LIBRARY_PATH} "C:/local/boost_1_74_0/libs")
 
-FIND_PACKAGE(Boost 1.74.0 REQUIRED)
+FIND_PACKAGE(Boost 1.71.0 REQUIRED)
 
 IF (Boost_FOUND)
     INCLUDE_DIRECTORIES(${Boost_INCLUDE_DIR})
@@ -41,7 +41,7 @@ set(Boost_DEBUG ON)
 set(Boost_VERBOSE ON)
 set(Boost_USE_DEBUG_LIBS         ON) # ignore debug libs and
 
-find_package(Boost 1.74.0 COMPONENTS log log_setup REQUIRED)
+find_package(Boost 1.71.0 COMPONENTS log log_setup REQUIRED)
 set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY} ${Boost_LOG_SETUP_LIBRARY})
 
 include_directories(${Boost_INCLUDE_DIRS})
