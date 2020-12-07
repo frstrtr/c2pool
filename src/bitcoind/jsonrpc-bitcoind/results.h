@@ -172,195 +172,196 @@ namespace c2pool::bitcoind::data
 //================================================================
 
 //getblocktemplate
-
-class GetBlockTemplateResultTx
+namespace c2pool::bitcoind::data
 {
-public:
-    string data;
-    uint256 hash;
-    string txid;
-    vector<long long> depends;
-    long long fee;
-    long long sigops;
-    long long wight;
-
-    GetBlockTemplateResultTx &operator=(UniValue value)
+    class GetBlockTemplateResultTx
     {
-        data = value["data"].get_str();
+    public:
+        string data;
+        uint256 hash;
+        string txid;
+        vector<long long> depends;
+        long long fee;
+        long long sigops;
+        long long wight;
 
-        string hash_raw = value["hash"].get_str();
-        hash.SetHex(hash_raw);
-
-        txid = value["txid"].get_str();
-
-        for (auto depend : value["depends"].get_array().getValues())
+        GetBlockTemplateResultTx &operator=(UniValue value)
         {
-            depends.push_back(depend.get_int64());
+            data = value["data"].get_str();
+
+            string hash_raw = value["hash"].get_str();
+            hash.SetHex(hash_raw);
+
+            txid = value["txid"].get_str();
+
+            for (auto depend : value["depends"].get_array().getValues())
+            {
+                depends.push_back(depend.get_int64());
+            }
+
+            fee = value["fee"].get_int64();
+            sigops = value["sigops"].get_int64();
+            wight = value["wight"].get_int64();
+
+            return *this;
         }
+    };
 
-        fee = value["fee"].get_int64();
-        sigops = value["sigops"].get_int64();
-        wight = value["wight"].get_int64();
-
-        return *this;
-    }
-};
-
-class GetBlockTemplateResultAux
-{
-public:
-    string flags;
-
-    GetBlockTemplateResultAux &operator=(UniValue value)
+    class GetBlockTemplateResultAux
     {
-        flags = value["flags"].get_str();
+    public:
+        string flags;
 
-        return *this;
-    }
-};
+        GetBlockTemplateResultAux &operator=(UniValue value)
+        {
+            flags = value["flags"].get_str();
 
-class GetBlockTemplateResult
-{
-public:
-    string bits;
-    long long curtime;
-    long long height;
-    uint256 previousblockhash;
-    long long sigoplimit;
-    long long sizelimit;
-    long long weightlimit;
+            return *this;
+        }
+    };
 
-    vector<GetBlockTemplateResultTx> transactions;
-
-    int version;
-
-    GetBlockTemplateResultAux *coinbaseaux;
-    GetBlockTemplateResultTx *coinbasetxn;
-
-    long long *coinbasevalue;
-    string workid;
-
-    // Witness commitment defined in BIP 0141.
-    string default_witness_commitment;
-
-    // Optional long polling from BIP 0022.
-    string longpollid;
-    string longpolluri;
-    bool *submitold;
-
-    // Basic pool extension from BIP 0023.
-    string target;
-    long long expires;
-
-    // Mutations from BIP 0023.
-    long long maxtime;
-    long long mintime;
-    vector<string> mutables; //json:mutable
-    string noncerange;
-
-    // Block proposal from BIP 0023.
-    vector<string> capabilities;
-    string reject_reason; //json: reject-reason
-
-    GetBlockTemplateResult &operator=(UniValue value)
+    class GetBlockTemplateResult
     {
-        bits = value["bits"].get_str();
-        curtime = value["curtime"].get_int64();
-        height = value["height"].get_int64();
+    public:
+        string bits;
+        long long curtime;
+        long long height;
+        uint256 previousblockhash;
+        long long sigoplimit;
+        long long sizelimit;
+        long long weightlimit;
 
-        string previousblockhash_raw = value["previousblockhash"].get_str();
-        previousblockhash.SetHex(previousblockhash_raw);
+        vector<GetBlockTemplateResultTx> transactions;
 
-        sigoplimit = value["sigoplimit"].get_int64();
-        sizelimit = value["sizelimit"].get_int64();
-        weightlimit = value["weightlimit"].get_int64();
+        int version;
 
-        for (auto obj : value["transactions"].get_array().getValues())
+        GetBlockTemplateResultAux *coinbaseaux;
+        GetBlockTemplateResultTx *coinbasetxn;
+
+        long long *coinbasevalue;
+        string workid;
+
+        // Witness commitment defined in BIP 0141.
+        string default_witness_commitment;
+
+        // Optional long polling from BIP 0022.
+        string longpollid;
+        string longpolluri;
+        bool *submitold;
+
+        // Basic pool extension from BIP 0023.
+        string target;
+        long long expires;
+
+        // Mutations from BIP 0023.
+        long long maxtime;
+        long long mintime;
+        vector<string> mutables; //json:mutable
+        string noncerange;
+
+        // Block proposal from BIP 0023.
+        vector<string> capabilities;
+        string reject_reason; //json: reject-reason
+
+        GetBlockTemplateResult &operator=(UniValue value)
         {
-            GetBlockTemplateResultTx tx;
-            tx = obj.get_obj();
-            transactions.push_back(tx);
+            bits = value["bits"].get_str();
+            curtime = value["curtime"].get_int64();
+            height = value["height"].get_int64();
+
+            string previousblockhash_raw = value["previousblockhash"].get_str();
+            previousblockhash.SetHex(previousblockhash_raw);
+
+            sigoplimit = value["sigoplimit"].get_int64();
+            sizelimit = value["sizelimit"].get_int64();
+            weightlimit = value["weightlimit"].get_int64();
+
+            for (auto obj : value["transactions"].get_array().getValues())
+            {
+                GetBlockTemplateResultTx tx;
+                tx = obj.get_obj();
+                transactions.push_back(tx);
+            }
+
+            version = value["version"].get_int();
+
+            *coinbaseaux = value["coinbaseaux"].get_obj();
+            *coinbasetxn = value["coinbasetxn"].get_obj();
+
+            *coinbasevalue = value["coinbasevalue"].get_int64(); //TODO:? nullptr
+
+            workid = value["workid"].get_str();
+
+            default_witness_commitment = value["default_witness_commitment"].get_str();
+
+            longpollid = value["longpollid"].get_str();
+            longpolluri = value["longpolluri"].get_str();
+            *submitold = value["submitold"].get_bool(); //TODO: ? nullptr
+
+            target = value["target"].get_str(); //TODO: uint256?
+            expires = value["expires"].get_int64();
+
+            maxtime = value["maxtime"].get_int64();
+            mintime = value["mintime"].get_int64();
+
+            for (auto obj : value["mutable"].get_array().getValues())
+            {
+                mutables.push_back(obj.get_str());
+            }
+
+            noncerange = value["noncerange"].get_str();
+
+            for (auto obj : value["capabilities"].get_array().getValues())
+            {
+                capabilities.push_back(obj.get_str());
+            }
+
+            reject_reason = value["reject-reason"].get_str();
+
+            return *this;
         }
+    };
 
-        version = value["version"].get_int();
+    // getmininginfo
 
-        *coinbaseaux = value["coinbaseaux"].get_obj();
-        *coinbasetxn = value["coinbasetxn"].get_obj();
-
-        *coinbasevalue = value["coinbasevalue"].get_int64(); //TODO:? nullptr
-
-        workid = value["workid"].get_str();
-
-        default_witness_commitment = value["default_witness_commitment"].get_str();
-
-        longpollid = value["longpollid"].get_str();
-        longpolluri = value["longpolluri"].get_str();
-        *submitold = value["submitold"].get_bool(); //TODO: ? nullptr
-
-        target = value["target"].get_str(); //TODO: uint256?
-        expires = value["expires"].get_int64();
-
-        maxtime = value["maxtime"].get_int64();
-        mintime = value["mintime"].get_int64();
-
-        for (auto obj : value["mutable"].get_array().getValues())
-        {
-            mutables.push_back(obj.get_str());
-        }
-
-        noncerange = value["noncerange"].get_str();
-
-        for (auto obj : value["capabilities"].get_array().getValues())
-        {
-            capabilities.push_back(obj.get_str());
-        }
-
-        reject_reason = value["reject-reason"].get_str();
-
-        return *this;
-    }
-};
-
-// getmininginfo
-
-class GetMiningInfoResult
-{
-public:
-    long long blocks;
-    unsigned long long currentblocksize;
-    unsigned long long currentblockweight;
-    unsigned long long currentblocktx;
-    double difficulty;
-    string errors;
-    bool generate;
-    int genproclimit;
-    double hashespersec;
-    double networkhashps;
-    unsigned long long pooledtx;
-    bool testnet;
-
-    GetMiningInfoResult &operator=(UniValue value)
+    class GetMiningInfoResult
     {
-        blocks = value["blocks"].get_int64();
-        currentblocksize = value["currentblocksize"].get_int64();
-        currentblockweight = value["currentblockweight"].get_int64();
-        currentblocktx = value["currentblocktx"].get_int64();
-        difficulty = value["difficulty"].get_real();
-        errors = value["errors"].get_str();
-        generate = value["generate"].get_bool();
-        genproclimit = value["genproclimit"].get_int();
-        hashespersec = value["hashespersec"].get_real();
-        networkhashps = value["networkhashps"].get_real();
-        pooledtx = value["pooledtx"].get_int64();
-        testnet = value["testnet"].get_bool();
+    public:
+        long long blocks;
+        unsigned long long currentblocksize;
+        unsigned long long currentblockweight;
+        unsigned long long currentblocktx;
+        double difficulty;
+        string errors;
+        bool generate;
+        int genproclimit;
+        double hashespersec;
+        double networkhashps;
+        unsigned long long pooledtx;
+        bool testnet;
 
-        return *this;
-    }
-};
+        GetMiningInfoResult &operator=(UniValue value)
+        {
+            blocks = value["blocks"].get_int64();
+            currentblocksize = value["currentblocksize"].get_int64();
+            currentblockweight = value["currentblockweight"].get_int64();
+            currentblocktx = value["currentblocktx"].get_int64();
+            difficulty = value["difficulty"].get_real();
+            errors = value["errors"].get_str();
+            generate = value["generate"].get_bool();
+            genproclimit = value["genproclimit"].get_int();
+            hashespersec = value["hashespersec"].get_real();
+            networkhashps = value["networkhashps"].get_real();
+            pooledtx = value["pooledtx"].get_int64();
+            testnet = value["testnet"].get_bool();
 
-// getnetworkhashps
-// prioritisetransaction
-// submitblock
-// submitheader
+            return *this;
+        }
+    };
 
+    // getnetworkhashps
+    // prioritisetransaction
+    // submitblock
+    // submitheader
+} // namespace c2pool::bitcoind::data
 #endif

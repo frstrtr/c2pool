@@ -1,30 +1,52 @@
 #include <gtest/gtest.h>
 #include <tuple>
 #include <string>
+#include <vector>
 #include <sstream>
 #include <iostream>
 
-#include "bitcoind.h"
+#include "jsonrpc-bitcoind/bitcoind.h"
 
-TEST(BitcoindJSON_RPC, getblockchaininfo){
-    auto first = CreateUINT256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    uint256 first_res = bitcoind::data::target_to_average_attempts(first);
-    cout << first_res.GetHex() << endl;
-    ASSERT_EQ(first_res.GetHex(), "0000000000000000000000000000000000000000000000000000000000000001");
-    
-    auto second = CreateUINT256("1");
-    uint256 second_res = bitcoind::data::target_to_average_attempts(second);
-    cout << second_res.GetHex() << endl;
-    //Note: in Python: '0x8000000000000000000000000000000000000000000000000000000000000000'
-    ASSERT_EQ(second_res.GetHex(), "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+using namespace c2pool::bitcoind;
+using namespace c2pool::bitcoind::data;
+using namespace std;
 
-    auto third = CreateUINT256("100000000000000000000000000000000");
-    uint256 third_res = bitcoind::data::target_to_average_attempts(third);
-    cout << third_res.GetHex() << endl;
-    ASSERT_EQ(third_res.GetHex(), "00000000000000000000000000000000ffffffffffffffffffffffffffffffff");
+class Bitcoind_JSONRPC : public ::testing::Test
+{
+protected:
+    c2pool::bitcoind::Bitcoind* bitcoind;
+protected:
+    template <typename UINT_TYPE>
+    UINT_TYPE CreateUINT(string hex)
+    {
+        UINT_TYPE _number;
+        _number.SetHex(hex);
+        return _number;
+    }
 
-    auto fourth = CreateUINT256("ffffffffffffffffffffffffffffffff");
-    uint256 fourth_res = bitcoind::data::target_to_average_attempts(fourth);
-    cout << fourth_res.GetHex() << endl;
-    ASSERT_EQ(fourth_res.GetHex(), "00000000000000000000000000000000ffffffffffffffffffffffffffffffff");
+    virtual void SetUp()
+    {
+        bitcoind = new c2pool::bitcoind::Bitcoind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+    }
+
+    virtual void TearDown()
+    {
+        delete bitcoind;
+    }
+};
+
+TEST_F(Bitcoind_JSONRPC, getblockchaininfo)
+{
+    GetBlockChainInfoResult result = bitcoind->GetBlockChainInfo();
+    cout << result.bestblockhash << endl;
+}
+
+TEST_F(Bitcoind_JSONRPC, getblocktemplate)
+{
+    vector<string> rules{"segwit"};
+    rules.push_back("segwit");
+    GetBlockTemplateRequest request(rules);
+
+    GetBlockTemplateResult result = bitcoind->GetBlockChainInfo(request);
+    cout << result.version << endl;
 }
