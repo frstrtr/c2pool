@@ -82,7 +82,7 @@ namespace c2pool::bitcoind
         }
 
     public:
-        
+        GetBlockTemplate()
     };
 } // namespace c2pool::bitcoind
 
