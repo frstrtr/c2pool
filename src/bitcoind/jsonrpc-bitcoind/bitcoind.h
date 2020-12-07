@@ -3,6 +3,7 @@
 
 #include "requests.h"
 #include "results.h"
+#include "univalue.h"
 
 #include <stdio.h>
 
@@ -10,6 +11,9 @@
 
 #include <string>
 #include <cstring>
+
+using std::string;
+using namespace c2pool::bitcoind::data;
 
 namespace c2pool::bitcoind
 {
@@ -62,10 +66,15 @@ namespace c2pool::bitcoind
         std::string request(std::string command, c2pool::bitcoind::data::TemplateRequest *req = nullptr)
         {
             std::string json_answer = "";
+            char *params = "";
+            if (req)
+            {
+                params = req->get_params().c_str();
+            }
             if (curl)
             {
                 char *data = new char[strlen(dataFormat) + req->get_length() + 1];
-                sprintf(data, dataFormat, command, req->get_params().c_str());
+                sprintf(data, dataFormat, command, params);
 
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &json_answer);
@@ -82,8 +91,24 @@ namespace c2pool::bitcoind
         }
 
     public:
-        GetBlockTemplate()
-    };
-} // namespace c2pool::bitcoind
+        GetBlockChainInfoResult GetBlockChainInfo()
+        {
+            string json = request("getblockchaininfo");
+            UniValue jsonValue(UniValue::VOBJ);
+            jsonValue.read(json);
+            GetBlockChainInfoResult result = jsonValue;
+            return result;
+        }
+
+        //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
+        GetBlockTemplateResult GetBlockTemplate(GetBlockTemplateRequest* req)
+        {
+            string json = request("getblockchaininfo", req);
+            UniValue jsonValue(UniValue::VOBJ);
+            jsonValue.read(json);
+            GetBlockTemplateResult result = jsonValue;
+            return result;
+        }
+    } // namespace c2pool::bitcoind
 
 #endif

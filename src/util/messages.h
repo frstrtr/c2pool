@@ -463,18 +463,18 @@ namespace c2pool::messages
 
         operator UniValue()
         {
-            UniValue result(UniValue::VOBJ);
+            UniValue _result(UniValue::VOBJ);
 
-            result.pushKV("id", id.GetHex());
+            _result.pushKV("id", id.GetHex());
 
-            result.pushKV("result", (int)result);
+            _result.pushKV("result", (int)result);
 
             UniValue shares_array(UniValue::VARR);
             for (auto _share : shares)
             {
                 shares_array.push_back(_share);
             }
-            result.pushKV("shares", shares_array);
+            _result.pushKV("shares", shares_array);
 
             return result;
         }
