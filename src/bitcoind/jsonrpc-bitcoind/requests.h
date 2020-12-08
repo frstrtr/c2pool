@@ -9,7 +9,7 @@ using std::vector, std::string;
 
 //In request class constructor only required agruments, without optional.
 
-namespace c2pool::bitcoind::data
+namespace c2pool::bitcoind::jsonrpc::data
 {
     class TemplateRequest
     {

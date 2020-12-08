@@ -65,7 +65,7 @@ namespace c2pool::shares
 
             result.pushKV("state", state);
             result.pushKV("extra_data", extra_data);
-            result.pushKV("length", length);
+            result.pushKV("length", (uint64_t)length);
 
             return result;
         }
@@ -146,7 +146,7 @@ namespace c2pool::shares
         {
             UniValue result(UniValue::VOBJ);
 
-            result.pushKV("version", version);
+            result.pushKV("version", (uint64_t)version);
             result.pushKV("previous_block", previous_block.GetHex());
             result.pushKV("timestamp", (uint64_t)timestamp);
             result.pushKV("bits", (uint64_t)bits);
@@ -196,10 +196,10 @@ namespace c2pool::shares
             result.pushKV("coinbase", coinbase);
             result.pushKV("nonce", (uint64_t)nonce);
             result.pushKV("pubkey_hash", pubkey_hash.GetHex());
-            result.pushKV("subsidy", subsidy);
+            result.pushKV("subsidy", (uint64_t)subsidy);
             result.pushKV("donation", donation);
             result.pushKV("stale_info", (int)stale_info);
-            result.pushKV("desired_version", desired_version);
+            result.pushKV("desired_version", (uint64_t)desired_version);
 
             return result;
         }
@@ -267,8 +267,8 @@ namespace c2pool::shares
         {
             UniValue result(UniValue::VOBJ);
 
-            result.pushKV("share_count", share_count);
-            result.pushKV("tx_count", tx_count);
+            result.pushKV("share_count", (uint64_t)share_count);
+            result.pushKV("tx_count", (uint64_t)tx_count);
 
             return result;
         }
@@ -405,7 +405,7 @@ namespace c2pool::shares
             result.pushKV("min_header", *min_header);
             result.pushKV("share_info", *share_info);
             result.pushKV("ref_merkle_link", *ref_merkle_link);
-            result.pushKV("last_txout_nonce", last_txout_nonce);
+            result.pushKV("last_txout_nonce", (uint64_t)last_txout_nonce);
             result.pushKV("hash_link", *hash_link);
             result.pushKV("merkle_link", *merkle_link);
 

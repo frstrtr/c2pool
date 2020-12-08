@@ -187,7 +187,7 @@ namespace c2pool::messages
             result.pushKV("services", services);
             result.pushKV("addr_to", addr_to);
             result.pushKV("addr_from", addr_from);
-            result.pushKV("nonce", nonce);
+            result.pushKV("nonce", (uint64_t)nonce);
             result.pushKV("sub_version", sub_version);
             result.pushKV("mode", mode);
             result.pushKV("best_share_hash", best_share_hash.GetHex());
@@ -405,7 +405,7 @@ namespace c2pool::messages
             }
             result.pushKV("hashes", hashes_array);
 
-            result.pushKV("parents", parents);
+            result.pushKV("parents", (uint64_t)parents);
 
             UniValue stops_array(UniValue::VARR);
             for (auto _stop : stops)

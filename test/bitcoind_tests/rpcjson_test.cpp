@@ -7,14 +7,14 @@
 
 #include "jsonrpc-bitcoind/bitcoind.h"
 
-using namespace c2pool::bitcoind;
-using namespace c2pool::bitcoind::data;
+using namespace c2pool::bitcoind::jsonrpc;
+using namespace c2pool::bitcoind::jsonrpc::data;
 using namespace std;
 
 class Bitcoind_JSONRPC : public ::testing::Test
 {
 protected:
-    c2pool::bitcoind::Bitcoind* bitcoind;
+    Bitcoind* bitcoind;
 protected:
     template <typename UINT_TYPE>
     UINT_TYPE CreateUINT(string hex)
@@ -26,7 +26,7 @@ protected:
 
     virtual void SetUp()
     {
-        bitcoind = new c2pool::bitcoind::Bitcoind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+        bitcoind = new Bitcoind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
     }
 
     virtual void TearDown()
@@ -45,8 +45,8 @@ TEST_F(Bitcoind_JSONRPC, getblocktemplate)
 {
     vector<string> rules{"segwit"};
     rules.push_back("segwit");
-    GetBlockTemplateRequest request(rules);
+    GetBlockTemplateRequest* request = new GetBlockTemplateRequest(rules);
 
-    GetBlockTemplateResult result = bitcoind->GetBlockChainInfo(request);
+    GetBlockTemplateResult result = bitcoind->GetBlockTemplate(request);
     cout << result.version << endl;
 }
