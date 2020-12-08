@@ -10,7 +10,7 @@
 
 using std::string, std::vector, std::map;
 
-namespace c2pool::bitcoind::data
+namespace c2pool::bitcoind::jsonrpc::data
 {
     class Bip9SoftForkDescription
     {
@@ -48,7 +48,7 @@ namespace c2pool::bitcoind::data
     };
 } // namespace c2pool::bitcoind::data
 
-namespace c2pool::bitcoind::data
+namespace c2pool::bitcoind::jsonrpc::data
 {
     class GetBlockChainInfoResult
     {
@@ -172,7 +172,7 @@ namespace c2pool::bitcoind::data
 //================================================================
 
 //getblocktemplate
-namespace c2pool::bitcoind::data
+namespace c2pool::bitcoind::jsonrpc::data
 {
     class GetBlockTemplateResultTx
     {

@@ -23,6 +23,8 @@ set(PYLIB src/pylib)
 set(c2pool_dirs ${UTILS} ${P2P} ${NETWORKS} ${OTHER} ${UNIVALUE} ${BTCLIBS} ${SHARECHAIN} ${LEVELDB} ${DBSHELL} ${BITCOIND} ${PYLIB})
 set(c2pool_libs util p2p networks other univalue btclibs sharechain leveldb dbshell bitcoind pylib)
 
+
+set(CURL_LIBRARY "-lcurl")
 #BOOST
 # ADD_DEFINITIONS(-DBoost_NO_BOOST_CMAKE=ON)
 

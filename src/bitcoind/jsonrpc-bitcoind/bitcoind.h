@@ -11,11 +11,12 @@
 
 #include <string>
 #include <cstring>
+#include <iostream>
 
 using std::string;
-using namespace c2pool::bitcoind::data;
+using namespace c2pool::bitcoind::jsonrpc::data;
 
-namespace c2pool::bitcoind
+namespace c2pool::bitcoind::jsonrpc
 {
     class Bitcoind
     {
@@ -38,7 +39,7 @@ namespace c2pool::bitcoind
 
                 curl_easy_setopt(curl, CURLOPT_URL, address); //"http://127.0.0.1:8332/"
 
-                char *userpwd = new char[150];
+                char *userpwd = new char[strlen(username) + strlen(password) + 1];
                 sprintf(userpwd, "%s:%s", username, password);
                 curl_easy_setopt(curl, CURLOPT_USERPWD, userpwd); //"bitcoin:B1TC01ND"
 
@@ -63,24 +64,35 @@ namespace c2pool::bitcoind
                 return 0; //error
         }
 
-        std::string request(std::string command, c2pool::bitcoind::data::TemplateRequest *req = nullptr)
+        std::string request(std::string command, c2pool::bitcoind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
             std::string json_answer = "";
             char *params = "";
-            if (req)
+            if (req != nullptr)
             {
-                params = req->get_params().c_str();
+                params = new char[req->get_params().length() + 1];
+                strcpy(params, req->get_params().c_str());
+                //params = req->get_params().c_str();
             }
             if (curl)
             {
-                char *data = new char[strlen(dataFormat) + req->get_length() + 1];
-                sprintf(data, dataFormat, command, params);
+                long data_length = strlen(dataFormat) + 1 + command.length();
+                if (req)
+                    data_length += req->get_length();
+                char *data = new char[data_length];
+                sprintf(data, dataFormat, command.c_str(), params);
+                printf("%s\n", data);
+
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(data));
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
 
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &json_answer);
 
                 CURLcode res = curl_easy_perform(curl);
-
+                if (!res){
+                    std::cout << res << std::endl; //TODO: DEBUG ERROR
+                }
                 //TODO: [FOR DEBUG]:
                 // if (!res)
                 //     std::cout << content << std::endl;
@@ -93,22 +105,26 @@ namespace c2pool::bitcoind
     public:
         GetBlockChainInfoResult GetBlockChainInfo()
         {
+
             string json = request("getblockchaininfo");
+            std::cout << json << std::endl;
             UniValue jsonValue(UniValue::VOBJ);
             jsonValue.read(json);
-            GetBlockChainInfoResult result = jsonValue;
+            GetBlockChainInfoResult result;
+            result = jsonValue;
             return result;
         }
 
         //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
-        GetBlockTemplateResult GetBlockTemplate(GetBlockTemplateRequest* req)
+        GetBlockTemplateResult GetBlockTemplate(GetBlockTemplateRequest *req)
         {
             string json = request("getblockchaininfo", req);
             UniValue jsonValue(UniValue::VOBJ);
             jsonValue.read(json);
-            GetBlockTemplateResult result = jsonValue;
+            GetBlockTemplateResult result;
+            result = jsonValue;
             return result;
         }
-    } // namespace c2pool::bitcoind
-
+    }; // namespace c2pool::bitcoind
+} // namespace c2pool::bitcoind::jsonrpc
 #endif
