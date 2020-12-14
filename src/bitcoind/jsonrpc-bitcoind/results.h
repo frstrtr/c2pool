@@ -8,6 +8,10 @@
 #include <vector>
 #include <map>
 
+//TODO: for debug
+#include <iostream>
+using std::cout, std::endl;
+
 using std::string, std::vector, std::map;
 
 namespace c2pool::bitcoind::jsonrpc::data
@@ -34,19 +38,39 @@ namespace c2pool::bitcoind::jsonrpc::data
         }
     };
 
-    class SoftForks
+    class SoftFork
     {
     public:
-        vector<SoftForks *> softforks; //TODO: ?
-        map<string, Bip9SoftForkDescription> bip9_softforks;
+        string type;
+        bool active;
+        int height;
 
-        SoftForks &operator=(UniValue value)
+        SoftFork &operator=(UniValue value)
         {
-            //todo
+            type = value["type"].get_str();
+            active = value["active"].get_bool();
+            height = value["height"].get_int();
             return *this;
         }
     };
-} // namespace c2pool::bitcoind::data
+
+    class SoftForks
+    {
+    public:
+        map<string, SoftFork> softforks;
+        //map<string, Bip9SoftForkDescription> bip9_softforks;
+
+        SoftForks &operator=(UniValue value)
+        {
+            auto keys = value.getKeys();
+            for (auto key : keys)
+            {
+                softforks[key] = value[key];
+            }
+            return *this;
+        }
+    };
+} // namespace c2pool::bitcoind::jsonrpc::data
 
 namespace c2pool::bitcoind::jsonrpc::data
 {
@@ -60,9 +84,12 @@ namespace c2pool::bitcoind::jsonrpc::data
         double difficulty;
         unsigned long long mediantime;
         double verificationprogress;
+
+        uint256 chainwork;
+        long long size_on_disk;
+
         bool pruned;
-        int pruneheight;
-        SoftForks softforks; //TODO: name?
+        SoftForks softforks;
 
         GetBlockChainInfoResult &operator=(UniValue value)
         {
@@ -76,8 +103,12 @@ namespace c2pool::bitcoind::jsonrpc::data
             difficulty = value["difficulty"].get_real();
             mediantime = value["mediantime"].get_int64();
             verificationprogress = value["verificationprogress"].get_real();
+
+            string chainwork_temp = value["chainwork"].get_str();
+            chainwork.SetHex(chainwork_temp);
+
+            size_on_disk = value["size_on_disk"].get_int64();
             pruned = value["pruned"].get_bool();
-            pruneheight = value["pruneheight"].get_int();
             softforks = value["softforks"].get_obj();
             return *this;
         }
@@ -165,7 +196,7 @@ namespace c2pool::bitcoind::jsonrpc::data
             return *this;
         }
     };
-} // namespace c2pool::bitcoind::data
+} // namespace c2pool::bitcoind::jsonrpc::data
 
 //================================================================
 //=========================Mining RPC=============================
@@ -179,11 +210,11 @@ namespace c2pool::bitcoind::jsonrpc::data
     public:
         string data;
         uint256 hash;
-        string txid;
+        uint256 txid;
         vector<long long> depends;
         long long fee;
         long long sigops;
-        long long wight;
+        long long weight;
 
         GetBlockTemplateResultTx &operator=(UniValue value)
         {
@@ -192,7 +223,8 @@ namespace c2pool::bitcoind::jsonrpc::data
             string hash_raw = value["hash"].get_str();
             hash.SetHex(hash_raw);
 
-            txid = value["txid"].get_str();
+            string txid_raw = value["txid"].get_str();
+            txid.SetHex(hash_raw);
 
             for (auto depend : value["depends"].get_array().getValues())
             {
@@ -201,7 +233,7 @@ namespace c2pool::bitcoind::jsonrpc::data
 
             fee = value["fee"].get_int64();
             sigops = value["sigops"].get_int64();
-            wight = value["wight"].get_int64();
+            weight = value["weight"].get_int64();
 
             return *this;
         }
@@ -223,58 +255,75 @@ namespace c2pool::bitcoind::jsonrpc::data
     class GetBlockTemplateResult
     {
     public:
-        string bits;
-        long long curtime;
-        long long height;
+        // Block proposal from BIP 0023.
+        vector<string> capabilities;
+
+        int version;
+        vector<string> rules;
+
+        //TODO: vbavailable
+        int vbrequired;
+
         uint256 previousblockhash;
+        vector<GetBlockTemplateResultTx> transactions;
+
+        GetBlockTemplateResultAux *coinbaseaux; //TODO: test serialize
+
+        long long *coinbasevalue;
+        // Optional long polling from BIP 0022.
+        string longpollid;
+        //TODO?: string longpolluri;
+
+        // Basic pool extension from BIP 0023.
+        string target;
+
+        long long mintime;
+
+        vector<string> mutables; //json:mutable
+
+        string noncerange;
+
         long long sigoplimit;
         long long sizelimit;
         long long weightlimit;
 
-        vector<GetBlockTemplateResultTx> transactions;
-
-        int version;
-
-        GetBlockTemplateResultAux *coinbaseaux;
-        GetBlockTemplateResultTx *coinbasetxn;
-
-        long long *coinbasevalue;
-        string workid;
+        string bits;
+        long long curtime;
+        long long height;
 
         // Witness commitment defined in BIP 0141.
         string default_witness_commitment;
 
-        // Optional long polling from BIP 0022.
-        string longpollid;
-        string longpolluri;
-        bool *submitold;
+        GetBlockTemplateResultTx *coinbasetxn;
 
-        // Basic pool extension from BIP 0023.
-        string target;
-        long long expires;
-
-        // Mutations from BIP 0023.
-        long long maxtime;
-        long long mintime;
-        vector<string> mutables; //json:mutable
-        string noncerange;
-
-        // Block proposal from BIP 0023.
-        vector<string> capabilities;
-        string reject_reason; //json: reject-reason
-
+        /* OLD
+            string workid;
+            bool *submitold;
+            long long expires;
+            // Mutations from BIP 0023.
+            long long maxtime;
+            string reject_reason; //json: reject-reason
+        */
+    public:
         GetBlockTemplateResult &operator=(UniValue value)
         {
-            bits = value["bits"].get_str();
-            curtime = value["curtime"].get_int64();
-            height = value["height"].get_int64();
+            for (auto obj : value["capabilities"].get_array().getValues())
+            {
+                capabilities.push_back(obj.get_str());
+            }
+
+            version = value["version"].get_int();
+
+            for (auto obj : value["rules"].get_array().getValues())
+            {
+                rules.push_back(obj.get_str());
+            }
+
+            //TODO: vbavailable
+            vbrequired = value["vbrequired"].get_int();
 
             string previousblockhash_raw = value["previousblockhash"].get_str();
             previousblockhash.SetHex(previousblockhash_raw);
-
-            sigoplimit = value["sigoplimit"].get_int64();
-            sizelimit = value["sizelimit"].get_int64();
-            weightlimit = value["weightlimit"].get_int64();
 
             for (auto obj : value["transactions"].get_array().getValues())
             {
@@ -283,26 +332,20 @@ namespace c2pool::bitcoind::jsonrpc::data
                 transactions.push_back(tx);
             }
 
-            version = value["version"].get_int();
+            if (!value["coinbaseaux"].empty())
+            {
+                *coinbaseaux = value["coinbaseaux"].get_obj();
+            }
 
-            *coinbaseaux = value["coinbaseaux"].get_obj();
-            *coinbasetxn = value["coinbasetxn"].get_obj();
-
-            *coinbasevalue = value["coinbasevalue"].get_int64(); //TODO:? nullptr
-
-            workid = value["workid"].get_str();
-
-            default_witness_commitment = value["default_witness_commitment"].get_str();
+            if (!value["coinbasevalue"].isNull())
+            {
+                *coinbasevalue = value["coinbasevalue"].get_int64();
+            }
 
             longpollid = value["longpollid"].get_str();
-            longpolluri = value["longpolluri"].get_str();
-            *submitold = value["submitold"].get_bool(); //TODO: ? nullptr
-
             target = value["target"].get_str(); //TODO: uint256?
-            expires = value["expires"].get_int64();
-
-            maxtime = value["maxtime"].get_int64();
             mintime = value["mintime"].get_int64();
+
 
             for (auto obj : value["mutable"].get_array().getValues())
             {
@@ -311,12 +354,29 @@ namespace c2pool::bitcoind::jsonrpc::data
 
             noncerange = value["noncerange"].get_str();
 
-            for (auto obj : value["capabilities"].get_array().getValues())
-            {
-                capabilities.push_back(obj.get_str());
-            }
+            sigoplimit = value["sigoplimit"].get_int64();
+            sizelimit = value["sizelimit"].get_int64();
+            weightlimit = value["weightlimit"].get_int64();
 
+            bits = value["bits"].get_str();
+            curtime = value["curtime"].get_int64();
+            height = value["height"].get_int64();
+
+            default_witness_commitment = value["default_witness_commitment"].get_str();
+
+            if (!value["coinbasetxn"].isNull())
+            {
+                *coinbasetxn = value["coinbasetxn"].get_obj();
+            }
+            
+            /* OLD:
+            workid = value["workid"].get_str();
+            longpolluri = value["longpolluri"].get_str();
+            *submitold = value["submitold"].get_bool(); //TODO: ? nullptr
+            expires = value["expires"].get_int64();
+            maxtime = value["maxtime"].get_int64();
             reject_reason = value["reject-reason"].get_str();
+            */
 
             return *this;
         }
@@ -363,5 +423,5 @@ namespace c2pool::bitcoind::jsonrpc::data
     // prioritisetransaction
     // submitblock
     // submitheader
-} // namespace c2pool::bitcoind::data
+} // namespace c2pool::bitcoind::jsonrpc::data
 #endif

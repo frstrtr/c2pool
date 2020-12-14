@@ -64,11 +64,13 @@ namespace c2pool::bitcoind::jsonrpc
                 return 0; //error
         }
 
-        std::string request(std::string command, c2pool::bitcoind::jsonrpc::data::TemplateRequest *req = nullptr)
+        UniValue request(std::string command, c2pool::bitcoind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
+            UniValue result;
+            result.setNull();
             std::string json_answer = "";
             char *params = "";
-            if (req != nullptr)
+            if (req)
             {
                 params = new char[req->get_params().length() + 1];
                 strcpy(params, req->get_params().c_str());
@@ -81,7 +83,7 @@ namespace c2pool::bitcoind::jsonrpc
                     data_length += req->get_length();
                 char *data = new char[data_length];
                 sprintf(data, dataFormat, command.c_str(), params);
-                printf("%s\n", data);
+                //printf("%s\n", data);
 
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(data));
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
@@ -90,8 +92,9 @@ namespace c2pool::bitcoind::jsonrpc
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &json_answer);
 
                 CURLcode res = curl_easy_perform(curl);
-                if (!res){
-                    std::cout << res << std::endl; //TODO: DEBUG ERROR
+                if (res)
+                {
+                    std::cout << "res curl error: " << res << std::endl; //TODO: DEBUG ERROR
                 }
                 //TODO: [FOR DEBUG]:
                 // if (!res)
@@ -99,17 +102,26 @@ namespace c2pool::bitcoind::jsonrpc
                 // else
                 //     std::cerr << "1" << curl_easy_strerror(res) << std::endl;
             }
-            return json_answer;
+
+            if (json_answer.empty())
+            {
+                return result;
+            }
+            //std::cout << json_answer << std::endl; //TODO: DEBUG LOG
+            result.read(json_answer);
+
+            if (!result["error"].isNull())
+            {
+                //TODO: DEBUG ERROR << result["error"].get_str();
+            }
+            return result["result"].get_obj();
         }
 
     public:
+        //https://bitcoin-rpc.github.io/en/doc/0.17.99/rpc/blockchain/getblockchaininfo/
         GetBlockChainInfoResult GetBlockChainInfo()
         {
-
-            string json = request("getblockchaininfo");
-            std::cout << json << std::endl;
-            UniValue jsonValue(UniValue::VOBJ);
-            jsonValue.read(json);
+            UniValue jsonValue = request("getblockchaininfo");
             GetBlockChainInfoResult result;
             result = jsonValue;
             return result;
@@ -118,9 +130,7 @@ namespace c2pool::bitcoind::jsonrpc
         //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
         GetBlockTemplateResult GetBlockTemplate(GetBlockTemplateRequest *req)
         {
-            string json = request("getblockchaininfo", req);
-            UniValue jsonValue(UniValue::VOBJ);
-            jsonValue.read(json);
+            UniValue jsonValue = request("getblocktemplate", req);
             GetBlockTemplateResult result;
             result = jsonValue;
             return result;

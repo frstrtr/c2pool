@@ -26,7 +26,8 @@ protected:
 
     virtual void SetUp()
     {
-        bitcoind = new Bitcoind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+        //bitcoind = new Bitcoind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+        bitcoind = new Bitcoind("Daniil", "Just_the_place_for_a_Snark", "http://217.72.4.157:8332/");
     }
 
     virtual void TearDown()
