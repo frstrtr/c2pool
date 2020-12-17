@@ -135,6 +135,15 @@ namespace c2pool::bitcoind::jsonrpc
             result = jsonValue;
             return result;
         }
+
+        //https://bitcoincore.org/en/doc/0.20.0/rpc/blockchain/getblockheader/
+        GetBlockHeaderResult GetBlockHeader(GetBlockHeaderRequest *req)
+        {
+            UniValue jsonValue = request("getblockheader", req);
+            GetBlockHeaderResult result;
+            result = jsonValue;
+            return result;
+        }
     }; // namespace c2pool::bitcoind
 } // namespace c2pool::bitcoind::jsonrpc
 #endif

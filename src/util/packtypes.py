@@ -760,55 +760,6 @@ def is_segwit_tx(tx):
     return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
 
 
-class TransactionType(Type):
-    _int_type = IntType(32)
-    _varint_type = VarIntType()
-    _witness_type = ListType(VarStrType())
-    _wtx_type = ComposedType([
-        ('flag', IntType(8)),
-        ('tx_ins', ListType(TYPE.tx_in_type)),
-        ('tx_outs', ListType(TYPE.tx_out_type))
-    ])
-    _ntx_type = ComposedType([
-        ('tx_outs', ListType(TYPE.tx_out_type)),
-        ('lock_time', _int_type)
-    ])
-    _write_type = ComposedType([
-        ('version', _int_type),
-        ('marker', IntType(8)),
-        ('flag', IntType(8)),
-        ('tx_ins', ListType(TYPE.tx_in_type)),
-        ('tx_outs', ListType(TYPE.tx_out_type))
-    ])
-
-    def read(self, file):
-        version = self._int_type.read(file)
-        marker = self._varint_type.read(file)
-        if marker == 0:
-            next = self._wtx_type.read(file)  # _wtx_type
-            witness = [None]*len(next['tx_ins'])
-            for i in range(len(next['tx_ins'])):
-                witness[i] = self._witness_type.read(file)
-            locktime = self._int_type.read(file)
-            return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
-        else:
-            tx_ins = [None]*marker
-            for i in range(marker):
-                tx_ins[i] = TYPE.tx_in_type.read(file)
-            next = self._ntx_type.read(file)  # _ntx_type
-            return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
-
-    def write(self, file, item):
-        if is_segwit_tx(item):
-            assert len(item['tx_ins']) == len(item['witness'])
-            self._write_type.write(file, item)
-            for w in item['witness']:
-                self._witness_type.write(file, w)
-            self._int_type.write(file, item['lock_time'])
-            return
-        return TYPE.tx_id_type.write(file, item)
-
-
 # ------------------------------------------messages and types---------------------------------------
 # TODO:
 # block_header_type = ComposedType([
@@ -844,7 +795,6 @@ class TYPE:
         ('lock_time', IntType(32))
     ])
 
-    tx_type = TransactionType()
     # messages and types-------
 
     address_type = ComposedType([
@@ -919,6 +869,56 @@ class TYPE:
 
     # @classmethod
     # def
+
+class TransactionType(Type):
+    _int_type = IntType(32)
+    _varint_type = VarIntType()
+    _witness_type = ListType(VarStrType())
+    _wtx_type = ComposedType([
+        ('flag', IntType(8)),
+        ('tx_ins', ListType(TYPE.tx_in_type)),
+        ('tx_outs', ListType(TYPE.tx_out_type))
+    ])
+    _ntx_type = ComposedType([
+        ('tx_outs', ListType(TYPE.tx_out_type)),
+        ('lock_time', _int_type)
+    ])
+    _write_type = ComposedType([
+        ('version', _int_type),
+        ('marker', IntType(8)),
+        ('flag', IntType(8)),
+        ('tx_ins', ListType(TYPE.tx_in_type)),
+        ('tx_outs', ListType(TYPE.tx_out_type))
+    ])
+
+    def read(self, file):
+        version = self._int_type.read(file)
+        marker = self._varint_type.read(file)
+        if marker == 0:
+            next = self._wtx_type.read(file)  # _wtx_type
+            witness = [None]*len(next['tx_ins'])
+            for i in range(len(next['tx_ins'])):
+                witness[i] = self._witness_type.read(file)
+            locktime = self._int_type.read(file)
+            return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
+        else:
+            tx_ins = [None]*marker
+            for i in range(marker):
+                tx_ins[i] = TYPE.tx_in_type.read(file)
+            next = self._ntx_type.read(file)  # _ntx_type
+            return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
+
+    def write(self, file, item):
+        if is_segwit_tx(item):
+            assert len(item['tx_ins']) == len(item['witness'])
+            self._write_type.write(file, item)
+            for w in item['witness']:
+                self._witness_type.write(file, w)
+            self._int_type.write(file, item['lock_time'])
+            return
+        return TYPE.tx_id_type.write(file, item)
+    
+TYPE.tx_type = TransactionType()
 
 # -------------------------------------------Methods--------------------------------------------------
 
@@ -1122,7 +1122,7 @@ def TEST_UNPACKRES():
 #print(ListType(VarIntType(), 2).pack([12,23,23,23]))
 
 '''
-tx_packed = tx_type.pack({
+tx_packed = TYPE.tx_type.pack({
     'version':1, 
     'tx_outs': [{
         'value':2,
@@ -1136,10 +1136,10 @@ tx_packed = tx_type.pack({
     'lock_time':199,
 })
 print(tx_packed)
-tx_unpacked = tx_type.unpack(tx_packed)
+tx_unpacked = TYPE.tx_type.unpack(tx_packed)
 print(tx_unpacked)
 
-segwit_tx_packed = tx_type.pack({
+segwit_tx_packed = TYPE.tx_type.pack({
     'version':1, 
     'tx_outs': [{
         'value':2,
@@ -1158,9 +1158,9 @@ segwit_tx_packed = tx_type.pack({
 })
 print('____________')
 print(segwit_tx_packed)
-segwit_tx_unpacked = tx_type.unpack(segwit_tx_packed)
+segwit_tx_unpacked = TYPE.tx_type.unpack(segwit_tx_packed)
 print(type(segwit_tx_unpacked))
-print(tx_type.packed_size({
+print(TYPE.tx_type.packed_size({
     'version':1, 
     'tx_outs': [{
         'value':2,
@@ -1179,3 +1179,10 @@ print(tx_type.packed_size({
 }))
 '''
 # print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
+
+'''
+import codecs
+_data = "02000000000101ba24a6faccd891ebcd502409473f292a34b8b362f948a9c676e77c495d08df380d00000000fdffffff02de1f0100000000001600140fcc3eb9fb3fffd304c92cad073c279c1f3d6b79618c0e000000000017a9147638d052f6a00b238c9b4a6f1eec58d8ee3498d8870247304402201a0b1a4e8951885ac1578b0d798733639e1cb08815135345ffce9680b6bdeddf02203df0bdae3ccf2a644b73f36e026e5fa0d3d83ff2d72ea75e501ca9efa702ac2d0121034bbb1d1fb15d82150c1588a37578a799715130ffaba571836146adbb3a2ac70320170a00"
+unpacked = TYPE.tx_type.unpack(codecs.decode(_data, 'hex'))
+print(unpacked)
+'''

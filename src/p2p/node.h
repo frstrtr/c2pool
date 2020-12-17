@@ -1,6 +1,7 @@
 #ifndef CPOOL_NODE_H
 #define CPOOL_NODE_H
 
+#include "bitcoind.h"
 #include "config.h"
 #include "addrStore.h"
 #include "events.h"
@@ -8,12 +9,17 @@
 // #include <boost/exception/all.hpp> //TODO: all reason = boost::exception???
 #include <boost/asio.hpp>
 #include <map>
+#include <vector>
 #include <set>
+#include <tuple>
 #include <memory>
 #include <limits>
 #include <algorithm>
+#include <string>
 
+using c2pool::bitcoind::jsonrpc::data::GetBlockTemplateResultTx;
 using namespace c2pool::util::events;
+using std::map, std::vector, std::tuple, std::set, std::string;
 
 namespace c2pool::p2p
 {
@@ -79,18 +85,18 @@ namespace c2pool::p2p
     {
     public:
         std::unique_ptr<c2pool::p2p::Factory> factory;
-        //TODO: bitcoind
+        std::shared_ptr<c2pool::bitcoind::jsonrpc::Bitcoind> bitcoind;
         std::shared_ptr<c2pool::shares::OkayTracker> tracker;
         std::shared_ptr<P2PNode> p2p_node;
 
-        VariableDict</*TODO*/> known_txs_var;
-        Variable</*TODO*/> mining_txs_var;
-        Variable</*TODO*/> mining2_txs_var;
-        Variable</*TODO*/> best_share_var;
-        Variable</*TODO*/> desired_var;
+        VariableDict<uint256, GetBlockTemplateResultTx> known_txs_var;
+        Variable<map<uint256, GetBlockTemplateResultTx>> mining_txs_var;
+        Variable<map<uint256, GetBlockTemplateResultTx>> mining2_txs_var;
+        Variable<uint256> best_share_var;
+        Variable<vector<tuple<tuple<string, string>, uint256>> desired_var;
 
     public:
-        BitcoindNode(c2pool::p2p::Factory _factory, auto _bitcoind, auto shares, auto known_verified_share_hashes, std::shared_ptr<NodesManager> _nodes) : INode(_nodes)
+        BitcoindNode(c2pool::p2p::Factory _factory, c2pool::bitcoind::jsonrpc::Bitcoind _bitcoind, auto shares, auto known_verified_share_hashes, std::shared_ptr<NodesManager> _nodes) : INode(_nodes)
         {
             factory = _factory;
             bitcoind = _bitcoind;

@@ -196,6 +196,65 @@ namespace c2pool::bitcoind::jsonrpc::data
             return *this;
         }
     };
+
+    class GetBlockHeaderResult
+    {
+    public:
+        uint256 hash; //hex
+        int confirmations;
+        int height;
+        int version;
+        uint256 versionHex; //hex
+        uint256 merkleroot; //hex
+        long long time;
+        long long mediantime;
+        long long nonce;
+        uint256 bits; //hex
+        long long difficulty;
+        uint256 chainwork; //hex
+        int nTx;
+        uint256 previousblockhash; //hex
+        uint256 nextblockhash; //hex
+        
+
+        GetBlockHeaderResult &operator=(UniValue value)
+        {
+            string hash_temp = value["hash"].get_str();
+            hash.SetHex(hash_temp);
+
+            confirmations = value["confirmations"].get_int();
+            height = value["height"].get_int();
+            version = value["version"].get_int();
+            
+            string versionHex_temp = value["versionHex"].get_str();
+            versionHex.SetHex(versionHex_temp);
+
+            string merkleroot_temp = value["merkleroot"].get_str();
+            merkleroot.SetHex(merkleroot_temp);
+
+            time = value["time"].get_int64();
+            mediantime = value["mediantime"].get_int64();
+            nonce = value["nonce"].get_int64();
+
+            string bits_temp = value["bits"].get_str();
+            bits.SetHex(bits_temp);
+
+            difficulty = value["difficulty"].get_int64();
+
+            string chainwork_temp = value["chainwork"].get_str();
+            chainwork.SetHex(chainwork_temp);
+
+            nTx = value["nTx"].get_int();
+
+            string previousblockhash_temp = value["previousblockhash"].get_str();
+            previousblockhash.SetHex(previousblockhash_temp);
+
+            string nextblockhash_temp = value["nextblockhash"].get_str();
+            nextblockhash.SetHex(nextblockhash_temp);
+
+            return *this;
+        }
+    };
 } // namespace c2pool::bitcoind::jsonrpc::data
 
 //================================================================

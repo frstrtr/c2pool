@@ -368,10 +368,10 @@ namespace c2pool::shares::tracker
     struct TrackerThinkResult
     {
         uint256 best_hash;
-        std::vector<std::tuple<std::tuple<std::string, std::string>, uint256> desired;
-        std::vector<auto /*TODO*/> decorated_heads, 
+        std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
+        std::vector<auto /*TODO*/> decorated_heads;
         std::set<std::tuple<std::string, std::string>> bad_peer_addresses
-    }
+    };
 
     class OkayTracker : public Tracker<OkayProtoAttributeDelta, BaseShare>,
                         std::enable_shared_from_this<OkayTracker>
@@ -422,7 +422,7 @@ namespace c2pool::shares::tracker
 
         TrackerThinkResult think(auto block_rel_height_func, uint256 previous_block, unsigned int bits, auto known_txs)
         {
-            //TODO            
+            //TODO
         }
 
         //TODO: def score(self, share_hash, block_rel_height_func)

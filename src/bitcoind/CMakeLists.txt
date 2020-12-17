@@ -13,7 +13,7 @@ include_directories(${CURL_INCLUDE_DIR})
 
 
 
-set(HEADER_FILES data.h 
+set(HEADER_FILES data.h helper.h
     jsonrpc-bitcoind/bitcoind.h jsonrpc-bitcoind/requests.h jsonrpc-bitcoind/results.h)
 set(SOURCE_FILES data.cpp 
     jsonrpc-bitcoind/bitcoind.cpp)

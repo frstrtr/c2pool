@@ -87,6 +87,24 @@ namespace c2pool::bitcoind::jsonrpc::data
             }
         }
     };
-} // namespace c2pool::bitcoind::data
+
+    class GetBlockHeaderRequest : public TemplateRequest
+    {
+    public:
+        //required
+        uint256 blockhash;
+
+    public:
+        GetBlockHeaderRequest(uint256 _blockhash) : TemplateRequest("getblockheader")
+        {
+            blockhash = _blockhash;
+        }
+
+        void set_params() override
+        {
+            params.pushKV("blockhash", blockhash.ToString());
+        }
+    }; // namespace c2pool::bitcoind::jsonrpc::data
+} // namespace c2pool::bitcoind::jsonrpc::data
 
 #endif

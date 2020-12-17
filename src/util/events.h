@@ -48,7 +48,7 @@ namespace c2pool::util::events
         Event<VarType, VarType> transitioned;
 
     public:
-        VariableDict() {}
+        Variable() {}
 
         Variable(VarType _value)
         {
