@@ -14,9 +14,9 @@
 #include <iostream>
 
 using std::string;
-using namespace c2pool::bitcoind::jsonrpc::data;
+using namespace c2pool::coind::jsonrpc::data;
 
-namespace c2pool::bitcoind::jsonrpc
+namespace c2pool::coind::jsonrpc
 {
     class Bitcoind
     {
@@ -64,7 +64,7 @@ namespace c2pool::bitcoind::jsonrpc
                 return 0; //error
         }
 
-        UniValue request(std::string command, c2pool::bitcoind::jsonrpc::data::TemplateRequest *req = nullptr)
+        UniValue request(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
             UniValue result;
             result.setNull();
@@ -135,6 +135,6 @@ namespace c2pool::bitcoind::jsonrpc
             result = jsonValue;
             return result;
         }
-    }; // namespace c2pool::bitcoind
-} // namespace c2pool::bitcoind::jsonrpc
+    }; // namespace c2pool::coind
+} // namespace c2pool::coind::jsonrpc
 #endif

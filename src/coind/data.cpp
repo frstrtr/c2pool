@@ -2,7 +2,7 @@
 #include "uint256.h"
 #include <sstream>
 
-namespace bitcoind::data::python
+namespace coind::data::python
 {
     const char *PyBitcoindData::filepath = "/src/util";
 
@@ -77,4 +77,4 @@ namespace bitcoind::data::python
         result.SetHex(raw_result);
         return result;
     }
-}; // namespace bitcoind::data::python
+}; // namespace coind::data::python

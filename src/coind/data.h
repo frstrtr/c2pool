@@ -12,7 +12,7 @@
 
 using std::vector;
 
-namespace bitcoind::data::python
+namespace coind::data::python
 {
     class PyBitcoindData : c2pool::python::PythonBase
     {
@@ -29,29 +29,29 @@ namespace bitcoind::data::python
 
         static uint256 difficulty_to_target(uint256 difficulty);
     };
-} // namespace bitcoind::data::python
+} // namespace coind::data::python
 
-namespace bitcoind::data
+namespace coind::data
 {
 
     uint256 target_to_average_attempts(uint256 target)
     {
-        return bitcoind::data::python::PyBitcoindData::target_to_average_attempts(target);
+        return coind::data::python::PyBitcoindData::target_to_average_attempts(target);
     }
 
     uint256 average_attempts_to_target(uint256 average_attempts)
     {
-        return bitcoind::data::python::PyBitcoindData::average_attempts_to_target(average_attempts);
+        return coind::data::python::PyBitcoindData::average_attempts_to_target(average_attempts);
     }
 
     double target_to_difficulty(uint256 target)
     {
-        return bitcoind::data::python::PyBitcoindData::target_to_difficulty(target);
+        return coind::data::python::PyBitcoindData::target_to_difficulty(target);
     }
 
     uint256 difficulty_to_target(uint256 difficulty)
     {
-        return bitcoind::data::python::PyBitcoindData::difficulty_to_target(difficulty);
+        return coind::data::python::PyBitcoindData::difficulty_to_target(difficulty);
     }
 
     class PreviousOutput
@@ -124,6 +124,6 @@ namespace bitcoind::data
         vector<tx_in_type> tx_ins;
         vector<tx_out_type> tx_outs;
     };
-} // namespace bitcoind::data
+} // namespace coind::data
 
 #endif //BITCOIND_DATA_H

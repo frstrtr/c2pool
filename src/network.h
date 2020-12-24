@@ -1,10 +1,11 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include "btclibs/uint256.h"
+
 #include <vector>
 #include <string>
 #include <tuple>
-#include <uint256.h>
 
 namespace c2pool::config
 {

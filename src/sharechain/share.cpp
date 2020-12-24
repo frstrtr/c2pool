@@ -136,7 +136,7 @@ namespace c2pool::shares
                                                          uint256 _block_target, unsigned int _desired_timestamp,
                                                          uint256 _desired_target, MerkleLink _ref_merkle_link,
                                                          vector<tuple<uint256, int>> desired_other_transaction_hashes_and_fees,
-                                                         shared_ptr<c2pool::config::Network> _net, map<uint256, bitcoind::data::TransactionType> known_txs, /*TODO:  <type> last_txout_nonce=0,*/
+                                                         shared_ptr<c2pool::config::Network> _net, map<uint256, coind::data::TransactionType> known_txs, /*TODO:  <type> last_txout_nonce=0,*/
                                                          long long base_subsidy, shared_ptr<SegwitData> _segwit_data)
     {
         auto t0 = c2pool::time::timestamp();

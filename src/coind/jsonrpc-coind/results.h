@@ -14,7 +14,7 @@ using std::cout, std::endl;
 
 using std::string, std::vector, std::map;
 
-namespace c2pool::bitcoind::jsonrpc::data
+namespace c2pool::coind::jsonrpc::data
 {
     class Bip9SoftForkDescription
     {
@@ -70,9 +70,9 @@ namespace c2pool::bitcoind::jsonrpc::data
             return *this;
         }
     };
-} // namespace c2pool::bitcoind::jsonrpc::data
+} // namespace c2pool::coind::jsonrpc::data
 
-namespace c2pool::bitcoind::jsonrpc::data
+namespace c2pool::coind::jsonrpc::data
 {
     class GetBlockChainInfoResult
     {
@@ -196,14 +196,14 @@ namespace c2pool::bitcoind::jsonrpc::data
             return *this;
         }
     };
-} // namespace c2pool::bitcoind::jsonrpc::data
+} // namespace c2pool::coind::jsonrpc::data
 
 //================================================================
 //=========================Mining RPC=============================
 //================================================================
 
 //getblocktemplate
-namespace c2pool::bitcoind::jsonrpc::data
+namespace c2pool::coind::jsonrpc::data
 {
     class GetBlockTemplateResultTx
     {
@@ -423,5 +423,5 @@ namespace c2pool::bitcoind::jsonrpc::data
     // prioritisetransaction
     // submitblock
     // submitheader
-} // namespace c2pool::bitcoind::jsonrpc::data
+} // namespace c2pool::coind::jsonrpc::data
 #endif
