@@ -5,7 +5,7 @@ import warnings
 def hex_to_int(hex_str):
     return int(hex_str, 16)
 
-#--------------------bitcoind-data------------------------
+#--------------------coind-data------------------------
 
 # target
 def target_to_average_attempts(hex_target):

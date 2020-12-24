@@ -44,7 +44,7 @@ namespace c2pool::p2p
 
     public:
         std::unique_ptr<c2pool::p2p::P2PNode> p2p_node;
-        std::unique_ptr<c2pool::p2p::BitcoindNode> bitcoind_node;
+        std::unique_ptr<c2pool::p2p::BitcoindNode> coind_node;
 
     private:
         boost::asio::io_context &_io_context;
@@ -79,7 +79,7 @@ namespace c2pool::p2p
     {
     public:
         std::unique_ptr<c2pool::p2p::Factory> factory;
-        //TODO: bitcoind
+        //TODO: coind
         std::shared_ptr<c2pool::shares::OkayTracker> tracker;
         std::shared_ptr<P2PNode> p2p_node;
 
@@ -90,10 +90,10 @@ namespace c2pool::p2p
         Variable</*TODO*/> desired_var;
 
     public:
-        BitcoindNode(c2pool::p2p::Factory _factory, auto _bitcoind, auto shares, auto known_verified_share_hashes, std::shared_ptr<NodesManager> _nodes) : INode(_nodes)
+        BitcoindNode(c2pool::p2p::Factory _factory, auto _coind, auto shares, auto known_verified_share_hashes, std::shared_ptr<NodesManager> _nodes) : INode(_nodes)
         {
             factory = _factory;
-            bitcoind = _bitcoind;
+            coind = _coind;
             tracker = std::make_shared<c2pool::shares::OkayTracker>(net());
 
             for (auto share : shares)
@@ -112,7 +112,7 @@ namespace c2pool::p2p
 
         void set_best_share()
         {
-            auto tracker_think_result = tracker.think(/*TODO: self.get_height_rel_highest, self.bitcoind_work.value['previous_block'], self.bitcoind_work.value['bits'], self.known_txs_var.value*/);
+            auto tracker_think_result = tracker.think(/*TODO: self.get_height_rel_highest, self.coind_work.value['previous_block'], self.coind_work.value['bits'], self.known_txs_var.value*/);
             /*TODO:
             self.best_share_var.set(best)
             self.desired_var.set(desired)
@@ -234,7 +234,7 @@ namespace c2pool::p2p
         }
 
         //TODO: BitcoindFactory + BitcoindClientProtocol
-        //TODO: bitcoind
+        //TODO: coind
         //TODO: set_best_share()
         //TODO: get_current_txouts
 

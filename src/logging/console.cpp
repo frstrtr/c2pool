@@ -1,5 +1,5 @@
-#include <iostream>
-#include <console.h>
+#include "console.h"
+#include "config.h"
 
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
@@ -10,8 +10,6 @@
 #include <boost/log/sources/severity_logger.hpp>
 #include <boost/log/sources/record_ostream.hpp>
 #include <boost/log/utility/setup/console.hpp>
-
-#define DEBUG
 
 namespace logging = boost::log;
 namespace src = boost::log::sources;
@@ -28,13 +26,17 @@ namespace c2pool::console
             keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at midnight >*/
             keywords::format = "[%TimeStamp%]<%Severity%>: %Message%"                     /*< log record format >*/
         );
-#ifdef DEBUG
-        logging::core::get()->set_filter(
-            logging::trivial::severity >= logging::trivial::trace);
-#else
-        logging::core::get()->set_filter(
-            logging::trivial::severity >= logging::trivial::info);
-#endif
+        if (c2pool_config::debug)
+        {
+            logging::core::get()->set_filter(
+                logging::trivial::severity >= logging::trivial::trace);
+        }
+        else
+        {
+
+            logging::core::get()->set_filter(
+                logging::trivial::severity >= logging::trivial::info);
+        }
         logging::add_console_log(std::cout, boost::log::keywords::format = "[%TimeStamp%]<%Severity%>: %Message%");
 
         logging::add_common_attributes();
