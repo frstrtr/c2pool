@@ -12,7 +12,7 @@ Some technical details - https://bitcointalk.org/index.php?topic=457574
 p2pool sharechain based temporal levelled blockchain DEX/mining pool/hr marketplace and more... written in c++ using LevelDB.
 
 ![Time Hybrid Evaluation](/doc/concepts/THE%20coin.png)
-Time Hybrid Evaluation coin
+Time Hybrid Evaluation coin (THE coin)
 
 ## Donations towards further development of с2pool implementation in C++
 
