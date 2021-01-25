@@ -1,4 +1,5 @@
 #include "config.h"
+#include "logging/console.h"
 
 #include <iostream>
 #include <cstring>
@@ -79,7 +80,11 @@ ARGS_PARSE_RESULT args_parse(int &ac, char *av[])
         return EXIT;
     }
 
-    LOG_DEBUG << vm["debug"].as<bool>() << " | " << c2pool_config::debug << endl;
+    if (vm.count("version"))
+    {
+        cout << 0.1 << endl; //TODO
+        return EXIT;
+    }
 
     //EXAMPLE:
     // if (vm.count("compression"))

@@ -17,8 +17,8 @@ set(SOURCE_FILES
 
 set(Boost_USE_STATIC_LIBS ON)
 
-find_package(Boost 1.71.0 COMPONENTS program_options REQUIRED)
-set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY} ${Boost_LOG_SETUP_LIBRARY})
+find_package(Boost 1.71.0 COMPONENTS program_options log REQUIRED)
+#set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY})
 include_directories(${Boost_INCLUDE_DIRS})
 
 if(Boost_FOUND)
@@ -36,4 +36,4 @@ target_sources(${PROJ_NAME} PUBLIC ${SOURCE_FILES})
 
 add_subdirectory(lib/googletest)
 
-target_link_libraries(${PROJ_NAME} Boost::program_options)
+target_link_libraries(${PROJ_NAME} Boost::program_options Boost::log)
