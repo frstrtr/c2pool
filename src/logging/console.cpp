@@ -1,5 +1,4 @@
 #include "console.h"
-#include "config.h"
 
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
