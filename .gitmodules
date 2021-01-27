@@ -1,3 +1,9 @@
 [submodule "lib/googletest"]
 	path = lib/googletest
 	url = https://github.com/frstrtr/googletest.git
+[submodule "lib/leveldb"]
+	path = lib/leveldb
+	url = https://github.com/frstrtr/leveldb.git
+[submodule "lib/univalue"]
+	path = lib/univalue
+	url = https://github.com/frstrtr/univalue.git
