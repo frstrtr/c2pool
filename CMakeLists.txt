@@ -1,39 +1,46 @@
-cmake_minimum_required(VERSION 3.16.1)
+cmake_minimum_required(VERSION 3.16)
 set(CMAKE_CXX_STANDARD 20)
-
-add_definitions(-DSOME_IMPORTANT_DEFINITION)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -Wall")
-
-
-set(PROJ_NAME c2pool)
-project(${PROJ_NAME})
+project(c2pool)
 
 #c2pool variables
-set(MAIN_FILE src/${PROJ_NAME}.cpp)
-set(SOURCE_FILES 
-    src/config.h src/config.cpp
-    src/network.h src/network.cpp
-)
 
 set(Boost_USE_STATIC_LIBS ON)
 
 find_package(Boost 1.71.0 COMPONENTS program_options log REQUIRED)
 #set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY})
-include_directories(${Boost_INCLUDE_DIRS})
-
 if(Boost_FOUND)
 	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
     MESSAGE( STATUS "Boost_LIBRARIES = ${BOOST_LIBRARYDIR}.")
     MESSAGE( STATUS "Boost_LIB_VERSION = ${Boost_LIB_VERSION}.")
 endif()
+include_directories(${Boost_INCLUDE_DIRS})
 
-include_directories(src)
-add_subdirectory(src)
-link_directories(src)
+find_package(Python3 REQUIRED Development) #cmake --help-module FindPython
+message("
+    PyLibs:
+    Python3_INCLUDE_DIRS=${Python3_INCLUDE_DIRS}
+    Python3_LIBRARIES=${Python3_LIBRARIES}
+")
+include_directories(${Python3_INCLUDE_DIRS})
 
-add_executable(${PROJ_NAME} ${MAIN_FILE})
-target_sources(${PROJ_NAME} PUBLIC ${SOURCE_FILES})
 
-add_subdirectory(lib/googletest)
+add_subdirectory(lib)
+#---------------
 
-target_link_libraries(${PROJ_NAME} Boost::program_options Boost::log)
+include_directories(${CMAKE_SOURCE_DIR})
+
+add_subdirectory(btclibs)
+add_subdirectory(coind)
+add_subdirectory(dbshell)
+add_subdirectory(logging)
+add_subdirectory(networks)
+add_subdirectory(other)
+add_subdirectory(p2p)
+add_subdirectory(pylib)
+add_subdirectory(sharechain)
+add_subdirectory(util)
+
+add_subdirectory(c2pool)
+
+#add_subdirectory(lib/googletest)
+#add_subdirectory(test)
