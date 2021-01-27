@@ -21,8 +21,11 @@ Telegram:
 
 ### t.me/c2pool
 
-Install:
+# Install:
+
 1. 
 git clone --recursive https://github.com/frstrtr/c2pool.git
+
 or after cloning
+
 git submodule update --init
