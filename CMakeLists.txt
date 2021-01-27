@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_CXX_STANDARD 20)
 project(c2pool)
 
-#c2pool variables
+#check lib's
+if (NOT EXISTS ${CMAKE_SOURCE_DIR}/lib/googletest/.git OR NOT EXISTS ${CMAKE_SOURCE_DIR}/lib/leveldb/.git OR NOT EXISTS ${CMAKE_SOURCE_DIR}/lib/univalue/.git)
+    message(FATAL_ERROR "Git submodules not initialized, execute:\n  git submodule update --init")
+endif()
 
+#init packages
 set(Boost_USE_STATIC_LIBS ON)
 
 find_package(Boost 1.71.0 COMPONENTS program_options log REQUIRED)
