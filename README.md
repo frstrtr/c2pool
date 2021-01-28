@@ -23,3 +23,6 @@ BTC:
 Telegram:
 
 ### t.me/c2pool
+
+Discord:
+### https://discord.gg/bK6ZA6AT3w
