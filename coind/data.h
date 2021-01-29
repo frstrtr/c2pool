@@ -1,5 +1,4 @@
-#ifndef BITCOIND_DATA_H
-#define BITCOIND_DATA_H
+#pragma once
 
 #include "uint256.h"
 #include "arith_uint256.h"
@@ -125,5 +124,3 @@ namespace coind::data
         vector<tx_out_type> tx_outs;
     };
 } // namespace coind::data
-
-#endif //BITCOIND_DATA_H

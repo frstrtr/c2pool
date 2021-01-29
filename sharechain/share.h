@@ -1,6 +1,4 @@
-#ifndef SHARE_H
-#define SHARE_H
-
+#pragma once
 #include "dbObject.h"
 
 #include <string>
@@ -143,5 +141,3 @@ namespace c2pool::shares
         //TODO: [wanna this?] /*type?*/ asBlock(/*type?*/ tracker, /*type?*/ knownTXs)
     };
 } // namespace c2pool::shares
-
-#endif //SHARE_H

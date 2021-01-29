@@ -1,5 +1,4 @@
-#ifndef JSONRPC_BITCOIND_REQUESTS_H
-#define JSONRPC_BITCOIND_REQUESTS_H
+#pragma once
 
 #include "univalue.h"
 
@@ -88,5 +87,3 @@ namespace c2pool::coind::jsonrpc::data
         }
     };
 } // namespace c2pool::coind::data
-
-#endif

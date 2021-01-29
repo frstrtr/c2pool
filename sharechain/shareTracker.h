@@ -1,5 +1,4 @@
-#ifndef SHARE_TRACKER_H
-#define SHARE_TRACKER_H
+#pragma once
 
 #include <shareTypes.h>
 #include <share.h>
@@ -428,5 +427,3 @@ namespace c2pool::shares::tracker
         //TODO: def score(self, share_hash, block_rel_height_func)
     };
 } // namespace c2pool::shares::tracker
-
-#endif //SHARE_TRACHER_H

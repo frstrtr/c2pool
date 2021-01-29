@@ -1,5 +1,4 @@
-#ifndef OTHER_CONSOLE_H
-#define OTHER_CONSOLE_H
+#pragma once
 
 #include <iostream>
 
@@ -33,5 +32,3 @@ namespace c2pool::console
         static Logger* log();
     };
 } // namespace c2pool::console
-
-#endif

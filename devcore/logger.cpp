@@ -1,4 +1,4 @@
-#include "console.h"
+#include "logger.h"
 
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
@@ -10,7 +10,7 @@
 #include <boost/log/sources/record_ostream.hpp>
 #include <boost/log/utility/setup/console.hpp>
 
-#include "c2pool/config.h"
+#include "c2pool/config.h" //TODO
 
 namespace logging = boost::log;
 namespace src = boost::log::sources;

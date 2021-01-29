@@ -1,26 +1,26 @@
 #include "config.h"
 #include <logging/console.h>
+#include <devcore/common.h>
+using namespace c2pool::dev;
 
 #include <iostream>
 #include <cstring>
 #include <string>
+#include <signal.h>
 using std::cout, std::endl;
 using std::string;
 
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
+
+
+
 //TODO: move macros to other.h
 #define fmt(TEMPL, DATA) (boost::format{TEMPL} % DATA).str()
 #define fmt_c(TEMPL, DATA) fmt(TEMPL, DATA).data()
 
-enum ARGS_PARSE_RESULT
-{
-    OK,
-    EXIT
-};
-
-ARGS_PARSE_RESULT args_parse(int &ac, char *av[])
+int main(int ac, char *av[])
 {
     //========================================================================================================================
     //TODO:
@@ -77,13 +77,13 @@ ARGS_PARSE_RESULT args_parse(int &ac, char *av[])
     if (vm.count("help"))
     {
         cout << desc << endl;
-        return EXIT;
+        return C2PoolErrors::success;
     }
 
     if (vm.count("version"))
     {
         cout << 0.1 << endl; //TODO
-        return EXIT;
+        return C2PoolErrors::success;
     }
 
     //EXAMPLE:
@@ -96,18 +96,17 @@ ARGS_PARSE_RESULT args_parse(int &ac, char *av[])
     // {
     //     std::cout << "Compression level was not set.\n";
     // }
-    return OK;
-}
 
-int main(int ac, char *av[])
-{
-    ARGS_PARSE_RESULT parse_result = args_parse(ac, av);
-    switch (parse_result)
-    {
-    case EXIT:
-        return 1;
-    case OK:
-        //just ok :)
-        break;
+    //============================================================
+
+    ExitSignalHandler exitSignalHandler;
+    signal(SIGINT, &ExitSignalHandler::handler);
+    signal(SIGTERM, &ExitSignalHandler::handler);
+    signal(SIGINT, &ExitSignalHandler::handler);
+
+    while(exitSignalHandler.working()){
+        //TODO: work
     }
+
+    return C2PoolErrors::success;
 }

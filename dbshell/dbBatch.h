@@ -1,5 +1,4 @@
-#ifndef DBSHELL_BATCH_H
-#define DBSHELL_BATCH_H
+#pragma once
 
 #include "leveldb/db.h"
 #include "leveldb/write_batch.h"
@@ -26,5 +25,3 @@ namespace dbshell
     };
 
 } // namespace dbshell
-
-#endif

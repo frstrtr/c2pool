@@ -1,5 +1,4 @@
-#ifndef EVENTS_H
-#define EVENTS_H
+#pragma once
 
 #include <boost/signals2.hpp>
 #include <map>
@@ -125,5 +124,3 @@ namespace c2pool::util::events
         }
     };
 } // namespace c2pool::util::events
-
-#endif

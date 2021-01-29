@@ -1,5 +1,4 @@
-#ifndef CPOOL_NODE_H
-#define CPOOL_NODE_H
+#pragma once
 
 #include "config.h"
 #include "addrStore.h"
@@ -308,5 +307,3 @@ namespace c2pool::p2p
         //TODO: mining2_txs_var = BitcoindNode.mining2_txs_var
     };
 } // namespace c2pool::p2p
-
-#endif //CPOOL_NODE_H

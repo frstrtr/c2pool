@@ -1,7 +1,5 @@
 #include "py_base.h"
-#include "other.h"
-#include "Python.h"
-
+#include <Python.h>
 
 namespace c2pool::python
 {
