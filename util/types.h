@@ -1,5 +1,4 @@
-#ifndef CPOOL_TYPES_H
-#define CPOOL_TYPES_H
+#pragma once
 
 #include <string>
 #include "univalue.h"
@@ -114,5 +113,3 @@ namespace c2pool::messages
         friend bool operator!=(const addr &first, const addr &second);
     };
 } // namespace c2pool::messages
-
-#endif //CPOOL_TYPES_H

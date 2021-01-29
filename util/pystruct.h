@@ -1,5 +1,4 @@
-#ifndef CPOOL_PYSTRUCT_H
-#define CPOOL_PYSTRUCT_H
+#pragma once
 
 #include <py_base.h>
 #include <string>
@@ -55,5 +54,3 @@ namespace c2pool::python::for_test
     public:
     };
 } // namespace c2pool::python::for_test
-
-#endif //CPOOL_PYSTRUCT_H

@@ -1,5 +1,4 @@
-#ifndef JSONRPC_BITCOIND_RESULTS_H
-#define JSONRPC_BITCOIND_RESULTS_H
+#pragma once
 
 #include "uint256.h"
 #include "univalue.h"
@@ -424,4 +423,3 @@ namespace c2pool::coind::jsonrpc::data
     // submitblock
     // submitheader
 } // namespace c2pool::coind::jsonrpc::data
-#endif

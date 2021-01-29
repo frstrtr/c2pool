@@ -1,5 +1,4 @@
-#ifndef CONFIG_H
-#define CONFIG_H
+#pragma once
 
 #include "btclibs/uint256.h"
 
@@ -50,5 +49,3 @@ namespace c2pool::config
     }
     */
 } // namespace c2pool::config
-
-#endif //CONFIG_H

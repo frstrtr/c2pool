@@ -1,5 +1,4 @@
-#ifndef CPOOL_MESSAGES_H
-#define CPOOL_MESSAGES_H
+#pragma once
 
 #include "types.h"
 #include "uint256.h"
@@ -559,5 +558,3 @@ namespace c2pool::messages
     };
 
 } // namespace c2pool::messages
-
-#endif //CPOOL_MESSAGES_H

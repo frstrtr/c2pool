@@ -1,6 +1,4 @@
-#ifndef SHARE_STORE_H
-#define SHARE_STORE_H
-
+#pragma once
 #include "db.h"
 #include "uint256.h"
 
@@ -31,5 +29,3 @@ namespace c2pool::shares
     //     /*type?*/ void check_remove(){};
     };
 } // namespace c2pool::shares
-
-#endif

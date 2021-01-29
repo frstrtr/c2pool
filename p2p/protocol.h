@@ -1,6 +1,3 @@
-#ifndef CPOOL_PROTOCOL_H
-#define CPOOL_PROTOCOL_H
-
 #include "boost/asio.hpp"
 #include "types.h"
 
@@ -248,5 +245,3 @@ namespace c2pool::p2p
 
 //     void handle_getaddrs(int count);
 // };
-
-#endif //CPOOL_PROTOCOL_H

@@ -1,5 +1,5 @@
-#ifndef ADDR_STORE_H
-#define ADDR_STORE_H
+#pragma once
+
 #include <string>
 #include <map>
 #include <tuple>
@@ -48,5 +48,3 @@ namespace c2pool::p2p
     };
 
 } // namespace c2pool::p2p
-
-#endif //ADDR_STORE_H

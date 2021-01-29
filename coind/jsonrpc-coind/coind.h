@@ -1,5 +1,4 @@
-#ifndef JSONRPC_BITCOIND_H
-#define JSONRPC_BITCOIND_H
+#pragma once
 
 #include "requests.h"
 #include "results.h"
@@ -137,4 +136,3 @@ namespace c2pool::coind::jsonrpc
         }
     }; // namespace c2pool::coind
 } // namespace c2pool::coind::jsonrpc
-#endif

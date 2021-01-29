@@ -1,5 +1,4 @@
-#ifndef SHARE_TYPES_H
-#define SHARE_TYPES_H
+#pragma once
 
 #include <string>
 #include <vector>
@@ -515,5 +514,3 @@ namespace c2pool::shares
         }
     };
 } // namespace c2pool::shares
-
-#endif

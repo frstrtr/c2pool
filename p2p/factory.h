@@ -1,6 +1,4 @@
-#ifndef CPOOL_FACTORY_H
-#define CPOOL_FACTORY_H
-
+#pragma once
 // #include "boost/asio.hpp"
 // #include <vector>
 // #include <algorithm>
@@ -188,5 +186,3 @@ namespace c2pool::p2p
 //     int max_attempts;
 // };
 //} // namespace c2pool::p2p
-
-#endif //CPOOL_FACTORY_H

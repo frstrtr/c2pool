@@ -1,8 +1,7 @@
-#ifndef PY_BASE_H
-#define PY_BASE_H
-#include "Python.h"
-#include "other.h"
+#pragma once
+#include <Python.h>
 #include <iostream>
+#include "filesystem.h"
 
 namespace c2pool::python
 {
@@ -94,5 +93,3 @@ namespace c2pool::python
         }
     };
 } // namespace c2pool::python
-
-#endif // PY_BASE_H
