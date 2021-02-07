@@ -2,6 +2,7 @@
 #include <boost/random.hpp>
 #include <ctime>
 #include <cmath>
+#include <vector>
 
 namespace c2pool::random
 {

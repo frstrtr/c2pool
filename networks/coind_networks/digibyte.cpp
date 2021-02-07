@@ -1,14 +1,13 @@
-#include "network.h"
-#include "btclibs/uint256.h"
+#include <networks/network.h>
+#include <btclibs/uint256.h>
 
 #include <vector>
 #include <string>
 #include <tuple>
 
-class DigibyteNetwork : public Network
+namespace c2pool
 {
-public:
-    DigibyteNetwork() : Network()
+    DigibyteNetwork::DigibyteNetwork() : Network()
     {
         BOOTSTRAP_ADDRS = {
             CREATE_ADDR("217.72.4.157", "5024")
@@ -28,4 +27,4 @@ public:
         CHAIN_LENGTH = 24 * 60 * 60 / 10;
         SPREAD = 30;
     }
-};
+} // namespace c2pool

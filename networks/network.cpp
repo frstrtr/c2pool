@@ -6,7 +6,7 @@
 #include <tuple>
 using namespace std;
 
-namespace c2pool::config
+namespace c2pool
 {
 
     Network::Network()
