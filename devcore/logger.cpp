@@ -1,4 +1,9 @@
 #include "logger.h"
+#include "config.h"
+using c2pool::dev::c2pool_config;
+
+#include <memory>
+using std::shared_ptr;
 
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
@@ -10,12 +15,11 @@
 #include <boost/log/sources/record_ostream.hpp>
 #include <boost/log/utility/setup/console.hpp>
 
-#include "c2pool/config.h" //TODO
-
 namespace logging = boost::log;
 namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
+
 namespace c2pool::console
 {
     Logger::Logger()
@@ -27,7 +31,7 @@ namespace c2pool::console
             keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at midnight >*/
             keywords::format = "[%TimeStamp%]<%Severity%>: %Message%"                     /*< log record format >*/
         );
-        if (c2pool_config::debug)
+        if (c2pool_config::get()->debug)
         {
             logging::core::get()->set_filter(
                 logging::trivial::severity >= logging::trivial::trace);

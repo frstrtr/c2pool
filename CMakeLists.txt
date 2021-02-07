@@ -10,7 +10,7 @@ endif()
 #init packages
 set(Boost_USE_STATIC_LIBS ON)
 
-find_package(Boost 1.71.0 COMPONENTS program_options log REQUIRED)
+find_package(Boost 1.71.0 COMPONENTS program_options log log_setup REQUIRED)
 #set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY})
 if(Boost_FOUND)
 	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
@@ -34,13 +34,14 @@ add_subdirectory(lib)
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_subdirectory(btclibs)
-add_subdirectory(coind)
-add_subdirectory(dbshell)
+# add_subdirectory(coind)
+# add_subdirectory(dbshell)
 add_subdirectory(networks)
-add_subdirectory(p2p)
-add_subdirectory(sharechain)
-add_subdirectory(util)
+# add_subdirectory(p2p)
+# add_subdirectory(sharechain)
+# add_subdirectory(util)
 add_subdirectory(devcore)
+add_subdirectory(libnet)
 
 add_subdirectory(c2pool)
 

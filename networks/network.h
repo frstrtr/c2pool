@@ -6,7 +6,7 @@
 #include <string>
 #include <tuple>
 
-namespace c2pool::config
+namespace c2pool
 {
 #define CREATE_ADDR(addr, port) std::make_tuple<std::string, std::string>(addr, port)
 
@@ -35,7 +35,11 @@ namespace c2pool::config
         Network();
     };
 
-    
+    class DigibyteNetwork : public Network
+    {
+    public:
+        DigibyteNetwork();
+    };
 
     /*
     template for test config:
@@ -48,4 +52,4 @@ namespace c2pool::config
         }
     }
     */
-} // namespace c2pool::config
+} // namespace c2pool

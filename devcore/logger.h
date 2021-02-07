@@ -1,6 +1,8 @@
 #pragma once
 
 #include <iostream>
+#include <memory>
+using std::shared_ptr;
 
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
@@ -10,6 +12,11 @@
 #include <boost/log/utility/setup/common_attributes.hpp>
 #include <boost/log/sources/severity_logger.hpp>
 #include <boost/log/sources/record_ostream.hpp>
+
+namespace c2pool::dev
+{
+    class c2pool_config;
+}
 
 namespace c2pool::console
 {

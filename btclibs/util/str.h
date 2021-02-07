@@ -5,7 +5,7 @@
 #ifndef BITCOIN_UTIL_STRING_H
 #define BITCOIN_UTIL_STRING_H
 
-#include <attributes.h>
+#include <btclibs/attributes.h>
 
 #include <cstring>
 #include <string>
