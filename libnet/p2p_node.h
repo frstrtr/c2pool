@@ -4,7 +4,7 @@ namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
 #include <memory>
-using std::shared_ptr;
+using std::shared_ptr, std::unique_ptr;
 
 namespace c2pool
 {
@@ -26,7 +26,7 @@ namespace c2pool::p2p
     class P2PNode
     {
     public:
-        P2PNode(shared_ptr<NodeManager> _mngr);
+        P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
         void start();
     private:
         void protocol_connected(); //todo
@@ -37,7 +37,9 @@ namespace c2pool::p2p
     private:
         shared_ptr<NodeManager> _manager;
         shared_ptr<c2pool::dev::coind_config> _config;
-        std::unique_ptr<std::thread> _thread;
+        unique_ptr<std::thread> _thread;
+        shared_ptr<io::steady_timer> _auto_connect_timer;
+        const std::chrono::milliseconds auto_connect_interval {1000L};
         
         io::io_context _context;
         //client
@@ -46,5 +48,6 @@ namespace c2pool::p2p
         ip::tcp::acceptor _acceptor;
     private:
         unsigned long long node_id; //nonce
+        
     };
 } // namespace c2pool::p2p

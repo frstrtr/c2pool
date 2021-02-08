@@ -1,5 +1,4 @@
 #pragma once
-#include "p2p_node.h"
 
 #include <networks/network.h>
 #include <devcore/config.h>
@@ -8,22 +7,19 @@
 #include <iostream>
 using std::shared_ptr;
 
+namespace c2pool::p2p{class P2PNode;}
+
+
 namespace c2pool::libnet
 {
-    class NodeManager : std::enable_shared_from_this<NodeManager>
+    class NodeManager : public std::enable_shared_from_this<NodeManager>
     {
     public:
         NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
         {
         }
 
-        void run()
-        {
-            std::cout << shared_from_this().get() << std::endl;
-            // p2pnode = std::make_shared<c2pool::p2p::P2PNode>(shared_from_this());
-            // std::cout << p2pnode.get() << std::endl;
-            //p2pnode->start();
-        }
+        void run();
 
     public:
         shared_ptr<c2pool::Network> net() const
