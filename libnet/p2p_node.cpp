@@ -13,9 +13,10 @@ using namespace c2pool::libnet;
 
 namespace c2pool::p2p
 {
-    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr) : _context(1), _resolver(_context), _acceptor(_context), _manager(_mngr)
+    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), _manager(_mngr)
     {
         _config = _mngr->config();
+        _auto_connect_timer = std::make_shared<io::steady_timer>(_context);
     }
 
     void P2PNode::listen()
@@ -24,7 +25,10 @@ namespace c2pool::p2p
             if (!ec)
             {
                 auto _socket = std::make_shared<P2PSocket>(std::move(socket));
-                
+                //TODO: protocol_connected()
+                //передать protocol_connected по указателю на метод
+                //и вызвать его только после обработки message_versionф
+                //???
             }
             else
             {
@@ -36,6 +40,10 @@ namespace c2pool::p2p
 
     void P2PNode::auto_connect()
     {
+        _auto_connect_timer->expires_after(auto_connect_interval);
+        _auto_connect_timer->async_wait([this](boost::system::error_code const &_ec){
+            auto_connect();
+        });
     }
 
     void P2PNode::start()
