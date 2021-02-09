@@ -6,6 +6,8 @@ namespace ip = boost::asio::ip;
 #include <memory>
 using std::shared_ptr, std::unique_ptr;
 
+#include <devcore/addrStore.h>
+
 namespace c2pool
 {
     namespace libnet
@@ -28,6 +30,8 @@ namespace c2pool::p2p
     public:
         P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
         void start();
+
+        std::vector<ADDR> get_good_peers(int max_count);
     private:
         void protocol_connected(); //todo
 

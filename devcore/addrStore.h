@@ -18,7 +18,7 @@ namespace c2pool{
     class Network;
 }
 
-namespace c2pool::p2p
+namespace c2pool::dev
 {
 
     struct AddrValue
