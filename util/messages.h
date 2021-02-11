@@ -1,8 +1,8 @@
 #pragma once
 
 #include "types.h"
-#include "uint256.h"
-#include "shareTypes.h"
+#include <btclibs/uint256.h>
+#include <sharechain/shareTypes.h>
 
 #include <iostream>
 #include <sstream>
@@ -138,6 +138,11 @@ namespace c2pool::messages
         }
     };
 
+    enum PoolVersion{
+        None = 0,
+        C2Pool = 1
+    };
+
     class message_version : public message
     {
     public:
@@ -149,6 +154,7 @@ namespace c2pool::messages
         std::string sub_version;
         int mode; //# always 1 for legacy compatibility
         uint256 best_share_hash;
+        PoolVersion pool_version;
 
     public:
         message_version() : message("version") {}
@@ -175,6 +181,12 @@ namespace c2pool::messages
             sub_version = value["sub_version"].get_str();
             mode = value["mode"].get_int();
             best_share_hash.SetHex(value["best_share_hash"].get_str());
+            if (value.exists("pool_version")){
+                int pool_ver_temp = value["pool_version"].get_int();
+                pool_version = (PoolVersion) pool_ver_temp;
+            } else {
+                pool_version = PoolVersion::None;
+            }
             return *this;
         }
 

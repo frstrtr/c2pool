@@ -100,6 +100,8 @@ namespace c2pool::p2p
         _thread.reset(new std::thread([&]() {
             listen();
             auto_connect();
+            
+            _context.run();
         }));
     }
 

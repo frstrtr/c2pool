@@ -1,12 +1,12 @@
 #include "pystruct.h"
 #include "Python.h"
-#include "other.h"
 #include "messages.h"
 #include "univalue.h"
 #include <tuple>
 #include <iostream>
 #include <sstream>
-#include <py_base.h>
+#include <devcore/py_base.h>
+#include <devcore/str.h>
 
 using namespace std;
 
@@ -81,7 +81,7 @@ namespace c2pool::python
 
         auto result = GetCallFunctionResult(pVal);
 
-        return c2pool::str::from_bytes_to_strChar(result);
+        return c2pool::dev::from_bytes_to_strChar(result);
     }
 
     char *PyPackTypes::serialize(c2pool::messages::message *msg)
@@ -100,13 +100,13 @@ namespace c2pool::python
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
         auto result = GetCallFunctionResult(pVal);
 
-        if (c2pool::str::compare_str(result, "ERROR", 5))
+        if (c2pool::dev::compare_str(result, "ERROR", 5))
         {
             //ERROR
             return "";
         }
 
-        return c2pool::str::from_bytes_to_strChar(result);
+        return c2pool::dev::from_bytes_to_strChar(result);
     }
 
     UniValue PyPackTypes::deserialize(char *name_type, char *value, int length)

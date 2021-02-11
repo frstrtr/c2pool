@@ -1,4 +1,13 @@
 #pragma once
+
+namespace c2pool{
+    namespace messages{
+        class message;
+    }
+}
+
+#include <memory>
+
 #include <boost/asio.hpp>
 namespace ip = boost::asio::ip;
 
@@ -18,6 +27,7 @@ namespace c2pool::p2p
             return _socket.remote_endpoint(ec);
         }
 
+        void write(std::shared_ptr<c2pool::messages::message> msg);
 
     private:
         boost::asio::ip::tcp::socket _socket;
