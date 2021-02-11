@@ -9,6 +9,8 @@
 #include <iostream>
 #include <utility>
 #include <tuple>
+#include <algorithm>
+using std::max, std::min;
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
@@ -50,13 +52,13 @@ namespace c2pool::p2p
         _auto_connect_timer->async_wait([this](boost::system::error_code const &_ec) {
             if (!_ec)
             {
-                if ((conns.size() < _config->desired_conns) && (_manager->addr_store.len() > 0) && (attempts.size() <= _config->max_attempts))
+                if ((client_connections.size() < _config->desired_conns) && (_manager->addr_store()->len() > 0) && (client_attempts.size() <= _config->max_attempts))
                 {
                     for (auto addr : get_good_peers(1))
                     {
-                        if (attempts.find(addr) == attempts.end())
+                        if (client_attempts.find(std::get<0>(addr)) == client_attempts.end())
                         {
-                            attempts.insert(addr); //TODO: перенести в отдельный метод, который вызывает при подключении протоколом.
+                            client_attempts.insert(std::get<0>(addr));
                             std::string ip = std::get<0>(addr);
                             std::string port = std::get<1>(addr);
                             try
@@ -65,8 +67,9 @@ namespace c2pool::p2p
                                                        [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                                                            boost::asio::ip::tcp::socket socket(_context);
                                                            auto _socket = std::make_shared<P2PSocket>(std::move(socket));
-                                                           auto p = std::make_shared<Protocol>(std::move(_socket), _manager, endpoints); //TODO: shared and unique
-                                                           protocol_connected(p);
+                                                        //TODO: Когда доделается протокол.
+                                                        //    auto p = std::make_shared<Protocol>(std::move(_socket), _manager, endpoints); //TODO: shared and unique
+                                                        //    protocol_connected(p);
                                                        });
                             }
                             catch (const std::exception &e)
@@ -96,15 +99,16 @@ namespace c2pool::p2p
         LOG_INFO << "P2PNode started!"; //TODO: logging name thread
         _thread.reset(new std::thread([&]() {
             listen();
+            auto_connect();
         }));
     }
 
     std::vector<ADDR> P2PNode::get_good_peers(int max_count)
     {
-        float t = c2pool::time::timestamp();
+        float t = c2pool::dev::timestamp();
 
         std::vector<std::pair<float, ADDR>> values;
-        for (auto kv : addr_store.GetAll())
+        for (auto kv : _manager->addr_store()->GetAll())
         {
             values.push_back(
                 std::make_pair(

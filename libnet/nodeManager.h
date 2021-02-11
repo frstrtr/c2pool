@@ -8,8 +8,10 @@
 #include <iostream>
 using std::shared_ptr;
 
-namespace c2pool::p2p{class P2PNode;}
-
+namespace c2pool::p2p
+{
+    class P2PNode;
+}
 
 namespace c2pool::libnet
 {
@@ -18,7 +20,7 @@ namespace c2pool::libnet
     public:
         NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
         {
-            c2pool::dev::AddrStore addr_store("data//digibyte//addrs", _network); //TODO: boost::filesystem path
+            _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network); //TODO: boost::filesystem path
         }
 
         void run();
@@ -34,11 +36,17 @@ namespace c2pool::libnet
             return _config;
         }
 
+        shared_ptr<c2pool::dev::AddrStore> addr_store() const
+        {
+            return _addr_store;
+        }
+
     private:
         shared_ptr<c2pool::Network> _net;
         shared_ptr<c2pool::dev::coind_config> _config;
+        shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::p2p::P2PNode> p2pnode;
-        shared_ptr<c2pool::dev::AddrStore> addr_store;
+
         //TODO:CoindNode
     };
-} // namespace c2pool::p2p
+} // namespace c2pool::libnet

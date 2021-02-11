@@ -11,7 +11,7 @@
 using std::string;
 using std::shared_ptr;
 
-namespace c2pool::p2p
+namespace c2pool::dev
 {
     //template path — "data//bitcoin//addrs"
     AddrStore::AddrStore(string path, shared_ptr<c2pool::Network> net)
