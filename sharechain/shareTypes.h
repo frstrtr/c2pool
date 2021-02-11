@@ -2,7 +2,7 @@
 
 #include <string>
 #include <vector>
-#include <uint256.h>
+#include <btclibs/uint256.h>
 #include <memory>
 #include "univalue.h"
 #include <iostream>

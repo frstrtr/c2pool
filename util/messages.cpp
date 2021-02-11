@@ -1,12 +1,11 @@
 #include "messages.h"
-#include "protocol.h"
 #include <iostream>
 #include "types.h"
-#include "other.h"
 #include <sstream>
 #include <string>
 #include <cstring>
-#include "console.h"
+#include <devcore/logger.h>
+#include <devcore/str.h>
 #include "pystruct.h"
 #include "univalue.h"
 using namespace c2pool::messages;
@@ -38,14 +37,14 @@ namespace c2pool::messages
 
     void IMessage::encode_data()
     {
-        c2pool::str::substr(command, data, 0, command_length);
+        c2pool::dev::substr(command, data, 0, command_length);
         if (_unpacked_length == 0)
         {
-            c2pool::str::substr(length, data, command_length, payload_length);
+            c2pool::dev::substr(length, data, command_length, payload_length);
             _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
-        c2pool::str::substr(checksum, data, command_length + payload_length, checksum_length);
-        c2pool::str::substr(payload, data, command_length + payload_length + checksum_length, _unpacked_length);
+        c2pool::dev::substr(checksum, data, command_length + payload_length, checksum_length);
+        c2pool::dev::substr(payload, data, command_length + payload_length + checksum_length, _unpacked_length);
     }
 
     void IMessage::decode_data()
@@ -74,7 +73,7 @@ namespace c2pool::messages
     {
         if (data_ != nullptr)
         {
-            c2pool::str::substr(length, data_, command_length, payload_length);
+            c2pool::dev::substr(length, data_, command_length, payload_length);
             _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
 
