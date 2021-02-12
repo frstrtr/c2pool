@@ -1,10 +1,12 @@
 #pragma once
 
-namespace c2pool{
-    namespace messages{
+namespace c2pool
+{
+    namespace messages
+    {
         class message;
     }
-}
+} // namespace c2pool
 
 #include <memory>
 
@@ -20,7 +22,8 @@ namespace c2pool::p2p
 
         bool isConnected() const { return _socket.is_open(); }
         ip::tcp::socket &get() { return _socket; }
-        
+        void disconnect() { _socket.close(); }
+
         ip::tcp::endpoint endpoint()
         {
             boost::system::error_code ec;
@@ -29,7 +32,15 @@ namespace c2pool::p2p
 
         void write(std::shared_ptr<c2pool::messages::message> msg);
 
+        void read_prefix();
+        void read_command();
+        void read_length();
+        void read_checksum();
+        void read_payload();
+
+        //TODO: очередь из сообщений???
+
     private:
         boost::asio::ip::tcp::socket _socket;
     };
-} // namespace p2pool::p2p
+} // namespace c2pool::p2p
