@@ -159,7 +159,7 @@ namespace c2pool::messages
     public:
         message_version() : message("version") {}
 
-        message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, std::string sub_ver, int _mode, uint256 best_hash) : message("version")
+        message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, std::string sub_ver, int _mode, uint256 best_hash, PoolVersion pool_ver = PoolVersion::None) : message("version")
         {
             version = ver;
             services = serv;
@@ -169,6 +169,7 @@ namespace c2pool::messages
             sub_version = sub_ver;
             mode = _mode;
             best_share_hash = best_hash;
+            pool_version = pool_ver;
         }
 
         message_version &operator=(UniValue value)
