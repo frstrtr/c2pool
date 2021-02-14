@@ -5,9 +5,9 @@
 
 namespace c2pool::libnet::messages
 {
-    //message_p2pool_bytes_converter
+    //p2pool_converter
 
-    message_p2pool_bytes_converter::message_p2pool_bytes_converter(const char *current_prefix)
+    p2pool_converter::p2pool_converter(const char *current_prefix)
     {
         if (sizeof(current_prefix) > 0)
         {
@@ -22,13 +22,12 @@ namespace c2pool::libnet::messages
         memcpy(prefix, current_prefix, prefix_length);
     }
 
-    void message_p2pool_bytes_converter::set_data(char *data_)
+    void p2pool_converter::set_data(char *data_)
     {
         memcpy(data, data_, set_length(data_));
-        //strcpy(data, data_);
     }
 
-    void message_p2pool_bytes_converter::encode_data()
+    void p2pool_converter::deserialize()
     {
         c2pool::dev::substr(command, data, 0, COMMAND_LENGTH);
         if (_unpacked_length == 0)
@@ -40,12 +39,12 @@ namespace c2pool::libnet::messages
         c2pool::dev::substr(payload, data, COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH, _unpacked_length);
     }
 
-    void message_p2pool_bytes_converter::decode_data()
+    void p2pool_converter::serialize()
     {
         sprintf(data, "%s%s%s%s", command, length, checksum, payload);
     }
 
-    void message_p2pool_bytes_converter::set_unpacked_length(char *packed_len)
+    void p2pool_converter::set_unpacked_length(char *packed_len)
     {
         if (packed_len != nullptr)
         {
@@ -57,12 +56,12 @@ namespace c2pool::libnet::messages
         }
     }
 
-    const unsigned int message_p2pool_bytes_converter::unpacked_length()
+    const unsigned int p2pool_converter::unpacked_length()
     {
         return _unpacked_length;
     }
 
-    int message_p2pool_bytes_converter::set_length(char *data_)
+    int p2pool_converter::set_length(char *data_)
     {
         if (data_ != nullptr)
         {
@@ -73,17 +72,21 @@ namespace c2pool::libnet::messages
         return get_length();
     }
 
-    int message_p2pool_bytes_converter::get_length()
+    int p2pool_converter::get_length()
     {
         return COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + unpacked_length();
     }
 
-    //message
+    //new p2pool_converter
 
-    message::message(const char *_cmd)
+    void p2ool_converter::encode()
     {
-        strcpy(command, _cmd);
+        //todo: 
     }
+
+    //base_message
+
+    //message
 
     void message::send()
     {
