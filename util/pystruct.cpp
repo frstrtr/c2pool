@@ -1,12 +1,13 @@
 #include "pystruct.h"
 #include "Python.h"
-#include "messages.h"
+//#include "messages.h"
 #include "univalue.h"
 #include <tuple>
 #include <iostream>
 #include <sstream>
 #include <devcore/py_base.h>
 #include <devcore/str.h>
+#include <libnet/messages.h>
 
 using namespace std;
 
@@ -84,7 +85,7 @@ namespace c2pool::python
         return c2pool::dev::from_bytes_to_strChar(result);
     }
 
-    char *PyPackTypes::serialize(c2pool::messages::message *msg)
+    char *PyPackTypes::serialize(shared_ptr<c2pool::libnet::messages::base_message> msg)
     {
         auto methodObj = GetMethodObject("serialize_msg", filepath, "packtypes");
         if (methodObj == nullptr)
@@ -126,7 +127,24 @@ namespace c2pool::python
         return result;
     }
 
-    UniValue PyPackTypes::deserialize(c2pool::messages::message *msg)
+    // UniValue PyPackTypes::deserialize(shared_ptr<c2pool::libnet::messages::base_message> msg)
+    // {
+    //     UniValue result(UniValue::VOBJ);
+    //     auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
+    //     if (methodObj == nullptr)
+    //     {
+    //         result.setNull();
+    //         return result; //TODO: проверка на Null на выходе функции.
+    //     }
+    //     auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", msg->converter->get_command(), msg->checksum, 4, msg->payload, msg->unpacked_length());
+
+    //     auto raw_result = GetCallFunctionResult(pVal);
+    //     result.read(raw_result);
+
+    //     return result;
+    // }
+
+    UniValue PyPackTypes::deserialize(char* command, char* checksum, char* payload, int unpacked_length)
     {
         UniValue result(UniValue::VOBJ);
         auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
@@ -135,7 +153,7 @@ namespace c2pool::python
             result.setNull();
             return result; //TODO: проверка на Null на выходе функции.
         }
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", msg->command, msg->checksum, 4, msg->payload, msg->unpacked_length());
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", command, checksum, 4, payload, unpacked_length);
 
         auto raw_result = GetCallFunctionResult(pVal);
         result.read(raw_result);
@@ -143,7 +161,7 @@ namespace c2pool::python
         return result;
     }
 
-    int PyPackTypes::payload_length(c2pool::messages::message *msg)
+    int PyPackTypes::payload_length(shared_ptr<c2pool::libnet::messages::base_message> msg)
     {
         int result = 0;
 
