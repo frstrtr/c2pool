@@ -1,8 +1,10 @@
 #pragma once
 
 #include <devcore/py_base.h>
+#include <libnet/messages.h>
 #include <string>
 #include <univalue.h>
+#include <memory>
 
 using namespace std;
 
@@ -28,16 +30,16 @@ namespace c2pool::python
         template <typename T>
         static char *serialize(char *name_type, T &value);
         //message_<command> -> json -> bytes -> unsigned_char*
-        static char *serialize(c2pool::messages::message *msg);
+        static char *serialize(shared_ptr<c2pool::libnet::messages::base_message> msg);
 
         //unsigned char* -> bytes -> json -> obj(c++)
-        static UniValue deserialize(char *name_type, char *value, int length); //length = len(value)
+        static UniValue deserialize(char* command, char* checksum, char* payload, int unpacked_length); //length = len(value)
 
         //(def name: deserialize_msg)
         //msg.[unsigned char*] -> bytes -> json -> obj(c++)
-        static UniValue deserialize(c2pool::messages::message *msg);
+        // static UniValue deserialize(c2pool::messages::message *msg);
 
-        static int payload_length(c2pool::messages::message *msg);
+        static int payload_length(shared_ptr<c2pool::libnet::messages::base_message> msg);
 
         //obj(c++) -> json -> bytes -> len(bytes)
         template <typename T>
