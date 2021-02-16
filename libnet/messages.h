@@ -1,7 +1,7 @@
 #pragma once
 
 #include <memory>
-#include <lib/univalue>
+#include <lib/univalue/include/univalue.h>
 
 #define COMMAND_LENGTH 12
 #define PAYLOAD_LENGTH 4           //len(payload)
@@ -35,7 +35,7 @@ namespace c2pool::libnet::messages
         virtual void set_data(char *data_) = 0;
 
         //from command, length, checksum, payload to data
-        virtual void decode() = 0;   //old: decode_data
+        virtual UniValue decode() = 0; //old: decode_data
         //from data to command, length, checksum, payload
         virtual void encode() = 0; //old: encode_data
 
@@ -60,9 +60,9 @@ namespace c2pool::libnet::messages
 
         void set_data(char *data_) override {}
 
-        void serialize() override {}
+        UniValue decode() override {}
 
-        void deserialize() override {}
+        void encode() override {}
 
         virtual const char *get_command() { return command; }
 
@@ -103,13 +103,13 @@ namespace c2pool::libnet::messages
 
         void set_unpacked_length(char *packed_len = nullptr);
 
+        //from command, length, checksum, payload to data
+        //void decode_data();
+        UniValue decode();
+
         //from data to command, length, checksum, payload
         //void encode_data();
         void encode();
-
-        //from command, length, checksum, payload to data
-        //void decode_data();
-        void decode();
 
         int get_length();
 
@@ -118,6 +118,27 @@ namespace c2pool::libnet::messages
         virtual int pack_payload_length() { return 0; }
 
         int set_length(char *data_);
+    };
+
+    class raw_message
+    {
+    public:
+        UniValue value;
+
+    protected:
+        std::unique_ptr<bytes_converter> converter;
+
+    public:
+        template <class converter_type>
+        raw_message()
+        {
+            converter = std::make_unique<converter_type>();
+        }
+
+        void deserialize()
+        {
+            value = converter->decode();
+        }
     };
 
     class base_message
@@ -148,8 +169,8 @@ namespace c2pool::libnet::messages
 
         //message -> bytes; msg = self
         template <class message_type>
-        void serialize(shared_ptr<message_type> msg){
-            
+        void serialize(shared_ptr<message_type> msg)
+        {
         }
 
         //bytes -> message; msg = self
@@ -158,7 +179,7 @@ namespace c2pool::libnet::messages
         {
             UniValue json_msg = converter->decode();
         }
-        
+
         friend class c2pool::python::PyPackTypes;
     };
 
