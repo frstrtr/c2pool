@@ -125,9 +125,6 @@ namespace c2pool::libnet::messages
         int get_length();
 
     protected:
-        //возвращает длину для упакованного payload msg, которое формируется в c2pool.
-        virtual int pack_payload_length() { return 0; }
-
         int set_length(char *data_);
     };
 

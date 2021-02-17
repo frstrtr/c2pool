@@ -15,14 +15,13 @@ namespace c2pool::p2p
     public:
         Protocol(P2PSocket socket);
 
-        void Protocol::handle(shared_ptr<raw_message> RawMSG);
+        void handle(shared_ptr<raw_message> RawMSG);
 
     protected:
         template <class MsgType>
-        MsgType *Protocol::GenerateMsg(UniValue &value)
+        shared_ptr<MsgType> GenerateMsg(UniValue &value)
         {
-            MsgType *msg = new MsgType();
-            shared_ptr<MsgType> = make_shared<MsgType>();
+            shared_ptr<MsgType> msg = make_shared<MsgType>();
             *msg = value;
             return msg;
         }
