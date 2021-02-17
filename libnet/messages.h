@@ -8,6 +8,11 @@
 #define CHECKSUM_LENGTH 4          //sha256(sha256(payload))[:4]
 #define MAX_PAYLOAD_LENGTH 8000000 //max len payload
 
+namespace c2pool::python
+{
+    class PyPackTypes;
+}
+
 namespace c2pool::libnet::messages
 {
 
@@ -37,7 +42,7 @@ namespace c2pool::libnet::messages
         //from command, length, checksum, payload to data
         virtual UniValue decode() = 0; //old: decode_data
         //from data to command, length, checksum, payload
-        virtual void encode() = 0; //old: encode_data
+        virtual char *encode(UniValue json) = 0; //old: encode_data
 
         virtual const char *get_command() = 0;
         virtual void set_command(const char *_command) = 0;
@@ -60,9 +65,13 @@ namespace c2pool::libnet::messages
 
         void set_data(char *data_) override {}
 
-        UniValue decode() override {}
+        UniValue decode() override
+        {
+            UniValue result(UniValue::VNULL);
+            return result;
+        }
 
-        void encode() override {}
+        char *encode(UniValue json) override { return get_data(); }
 
         virtual const char *get_command() { return command; }
 
@@ -72,8 +81,10 @@ namespace c2pool::libnet::messages
     };
 
     //for p2pool serialize/deserialize
-    class p2pool_converter : public bytes_converter
+    class p2pool_converter : public bytes_converter, public std::enable_shared_from_this<p2pool_converter>
     {
+        friend c2pool::python::PyPackTypes;
+
     public:
         int prefix_length;
         const unsigned int unpacked_length();
@@ -109,7 +120,7 @@ namespace c2pool::libnet::messages
 
         //from data to command, length, checksum, payload
         //void encode_data();
-        void encode();
+        char *encode(UniValue json);
 
         int get_length();
 
@@ -120,9 +131,13 @@ namespace c2pool::libnet::messages
         int set_length(char *data_);
     };
 
+    //TODO: create C2PoolConverter!
+
+    //message type for handle
     class raw_message
     {
     public:
+        c2pool::libnet::messages::commands name_type;
         UniValue value;
 
     protected:
@@ -137,47 +152,51 @@ namespace c2pool::libnet::messages
 
         void deserialize()
         {
-            value = converter->decode();
+            UniValue _value = converter->decode();
+
+            name_type = (c2pool::libnet::messages::commands)_value["name_type"].get_int();
+            value = _value["value"].get_obj();
         }
     };
 
     class base_message
     {
     protected:
-        std::unique_ptr<bytes_converter> converter;
+        std::shared_ptr<bytes_converter> converter;
+
+        virtual UniValue json_pack() = 0;
 
     public:
         template <class converter_type>
         base_message(const char *_cmd)
         {
-            converter = std::make_unique<converter_type>();
+            converter = std::make_shared<converter_type>();
             converter->set_command(_cmd);
         }
 
         base_message(const char *_cmd)
         {
-            converter = std::make_unique<empty_converter>(_cmd);
+            converter = std::make_shared<empty_converter>(_cmd);
         }
 
         template <class converter_type>
         void set_converter()
         {
-            std::unique_ptr<converter_type> new_converter = std::make_unique<converter_type>();
+            std::shared_ptr<converter_type> new_converter = std::make_shared<converter_type>();
             new_converter->set_command(converter->get_command());
             converter = new_converter;
         }
 
         //message -> bytes; msg = self
-        template <class message_type>
-        void serialize(shared_ptr<message_type> msg)
+        char *serialize()
         {
-        }
+            UniValue json_msg(UniValue::VOBJ);
+            json_msg.pushKV("name_type", converter->get_command());
+            UniValue msg_value(UniValue::VOBJ);
+            msg_value = json_pack();
+            json_msg.pushKV("value", msg_value);
 
-        //bytes -> message; msg = self
-        template <class message_type>
-        void deserialize(shared_ptr<message_type> msg)
-        {
-            UniValue json_msg = converter->decode();
+            return converter->encode(json_msg);
         }
 
         friend class c2pool::python::PyPackTypes;

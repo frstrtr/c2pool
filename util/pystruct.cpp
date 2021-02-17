@@ -64,40 +64,34 @@ namespace c2pool::python
 
     const char *PyPackTypes::filepath = "/src/util";
 
-    template <typename T>
-    char *PyPackTypes::serialize(char *name_type, T &value)
-    {
-        auto methodObj = GetMethodObject("serialize", filepath, "packtypes");
-        if (methodObj == nullptr)
-        {
-            return nullptr; //TODO обработка ситуации, если получено nullptr
-        }
-        UniValue msg(UniValue::VOBJ);
-        msg.pushKV("name_type", name_type);
-        UniValue msg_value(UniValue::VOBJ);
-        msg_value = value;
-        msg.pushKV("value", msg_value);
+    // template <typename T>
+    // char *PyPackTypes::serialize(char *name_type, T &value)
+    // {
+    //     auto methodObj = GetMethodObject("serialize", filepath, "packtypes");
+    //     if (methodObj == nullptr)
+    //     {
+    //         return nullptr; //TODO обработка ситуации, если получено nullptr
+    //     }
+    //     UniValue msg(UniValue::VOBJ);
+    //     msg.pushKV("name_type", name_type);
+    //     UniValue msg_value(UniValue::VOBJ);
+    //     msg_value = value;
+    //     msg.pushKV("value", msg_value);
 
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg.write());
+    //     auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg.write());
 
-        auto result = GetCallFunctionResult(pVal);
+    //     auto result = GetCallFunctionResult(pVal);
 
-        return c2pool::dev::from_bytes_to_strChar(result);
-    }
+    //     return c2pool::dev::from_bytes_to_strChar(result);
+    // }
 
-    char *PyPackTypes::serialize(shared_ptr<c2pool::libnet::messages::base_message> msg)
+    const char *PyPackTypes::encode(UniValue json_msg)
     {
         auto methodObj = GetMethodObject("serialize_msg", filepath, "packtypes");
         if (methodObj == nullptr)
         {
             return nullptr; //TODO обработка ситуации, если получено nullptr
         }
-        UniValue json_msg(UniValue::VOBJ);
-        json_msg.pushKV("name_type", msg->command);
-        UniValue msg_value(UniValue::VOBJ);
-        msg_value = msg;
-        json_msg.pushKV("value", msg_value);
-
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
         auto result = GetCallFunctionResult(pVal);
 
@@ -110,41 +104,7 @@ namespace c2pool::python
         return c2pool::dev::from_bytes_to_strChar(result);
     }
 
-    UniValue PyPackTypes::deserialize(char *name_type, char *value, int length)
-    {
-        UniValue result(UniValue::VOBJ);
-        auto methodObj = GetMethodObject("deserialize", filepath, "packtypes");
-        if (methodObj == nullptr)
-        {
-            result.setNull();
-            return result; //TODO: проверка на Null на выходе функции.
-        }
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#)", name_type, value, length);
-
-        auto raw_result = GetCallFunctionResult(pVal);
-        result.read(raw_result);
-
-        return result;
-    }
-
-    // UniValue PyPackTypes::deserialize(shared_ptr<c2pool::libnet::messages::base_message> msg)
-    // {
-    //     UniValue result(UniValue::VOBJ);
-    //     auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
-    //     if (methodObj == nullptr)
-    //     {
-    //         result.setNull();
-    //         return result; //TODO: проверка на Null на выходе функции.
-    //     }
-    //     auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", msg->converter->get_command(), msg->checksum, 4, msg->payload, msg->unpacked_length());
-
-    //     auto raw_result = GetCallFunctionResult(pVal);
-    //     result.read(raw_result);
-
-    //     return result;
-    // }
-
-    UniValue PyPackTypes::deserialize(char* command, char* checksum, char* payload, int unpacked_length)
+    UniValue PyPackTypes::decode(shared_ptr<c2pool::libnet::messages::p2pool_converter> converter)
     {
         UniValue result(UniValue::VOBJ);
         auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
@@ -153,7 +113,7 @@ namespace c2pool::python
             result.setNull();
             return result; //TODO: проверка на Null на выходе функции.
         }
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", command, checksum, 4, payload, unpacked_length);
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->unpacked_length());
 
         auto raw_result = GetCallFunctionResult(pVal);
         result.read(raw_result);
