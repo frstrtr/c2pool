@@ -25,15 +25,18 @@ namespace c2pool::python
     {
     protected:
         static const char *filepath;
+
     public:
         //obj(c++) -> json -> bytes -> unsigned_char*
-        template <typename T>
-        static char *serialize(char *name_type, T &value);
+        // template <typename T>
+        // static char *serialize(char *name_type, T &value);
         //message_<command> -> json -> bytes -> unsigned_char*
-        static char *serialize(shared_ptr<c2pool::libnet::messages::base_message> msg);
+        static const char *encode(UniValue json);
 
         //unsigned char* -> bytes -> json -> obj(c++)
-        static UniValue deserialize(char* command, char* checksum, char* payload, int unpacked_length); //length = len(value)
+        // static UniValue deserialize(char *command, char *checksum, char *payload, int unpacked_length); //length = len(value)
+
+        static UniValue decode(shared_ptr<c2pool::libnet::messages::p2pool_converter> converter); //length = len(value)
 
         //(def name: deserialize_msg)
         //msg.[unsigned char*] -> bytes -> json -> obj(c++)

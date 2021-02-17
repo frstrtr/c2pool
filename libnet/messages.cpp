@@ -27,26 +27,26 @@ namespace c2pool::libnet::messages
         memcpy(data, data_, set_length(data_));
     }
 
-    void p2pool_converter::deserialize()
-    {
-        c2pool::dev::substr(command, data, 0, COMMAND_LENGTH);
-        if (_unpacked_length == 0)
-        {
-            c2pool::dev::substr(length, data, COMMAND_LENGTH, PAYLOAD_LENGTH);
-            _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
-        }
-        c2pool::dev::substr(checksum, data, COMMAND_LENGTH + PAYLOAD_LENGTH, CHECKSUM_LENGTH);
-        c2pool::dev::substr(payload, data, COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH, _unpacked_length);
-    }
+    // void p2pool_converter::deserialize()
+    // {
+    //     c2pool::dev::substr(command, data, 0, COMMAND_LENGTH);
+    //     if (_unpacked_length == 0)
+    //     {
+    //         c2pool::dev::substr(length, data, COMMAND_LENGTH, PAYLOAD_LENGTH);
+    //         _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
+    //     }
+    //     c2pool::dev::substr(checksum, data, COMMAND_LENGTH + PAYLOAD_LENGTH, CHECKSUM_LENGTH);
+    //     c2pool::dev::substr(payload, data, COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH, _unpacked_length);
+    // }
 
-    void p2pool_converter::serialize()
-    {
-        sprintf(data, "%s%s%s%s", command, length, checksum, payload);
-    }
+    // void p2pool_converter::serialize()
+    // {
+    //     sprintf(data, "%s%s%s%s", command, length, checksum, payload);
+    // }
 
     void p2pool_converter::set_unpacked_length(char *packed_len)
     {
-        if (packed_len != nullptr)
+        if (packed_len != nullptr) //TODO: wanna to remove?
         {
             memcpy(length, packed_len, PAYLOAD_LENGTH);
         }
@@ -58,6 +58,7 @@ namespace c2pool::libnet::messages
 
     const unsigned int p2pool_converter::unpacked_length()
     {
+        set_unpacked_length();
         return _unpacked_length;
     }
 
@@ -79,22 +80,27 @@ namespace c2pool::libnet::messages
 
     //new p2pool_converter
 
-    void p2ool_converter::encode()
+    char* p2pool_converter::encode(UniValue json)
     {
-        //todo: 
+        set_data(c2pool::python::PyPackTypes::encode(json));
+        return get_data();
+    }
+
+    UniValue p2pool_converter::decode(){
+        return c2pool::python::PyPackTypes::decode(shared_from_this());
     }
 
     //base_message
 
     //message
 
-    void message::send()
-    {
-        set_data(c2pool::python::PyPackTypes::serialize(this));
-    }
+    // void message::send()
+    // {
+    //     set_data(c2pool::python::PyPackTypes::serialize(this));
+    // }
 
-    int message::pack_payload_length()
-    {
-        return c2pool::python::PyPackTypes::payload_length(this);
-    }
+    // int message::pack_payload_length()
+    // {
+    //     return c2pool::python::PyPackTypes::payload_length(this);
+    // }
 } // namespace c2pool::libnet::messages
