@@ -31,7 +31,7 @@ namespace c2pool::python
         // template <typename T>
         // static char *serialize(char *name_type, T &value);
         //message_<command> -> json -> bytes -> unsigned_char*
-        static const char *encode(UniValue json);
+        static char *encode(UniValue json);
 
         //unsigned char* -> bytes -> json -> obj(c++)
         // static UniValue deserialize(char *command, char *checksum, char *payload, int unpacked_length); //length = len(value)
@@ -42,11 +42,12 @@ namespace c2pool::python
         //msg.[unsigned char*] -> bytes -> json -> obj(c++)
         // static UniValue deserialize(c2pool::messages::message *msg);
 
-        static int payload_length(shared_ptr<c2pool::libnet::messages::base_message> msg);
+        // static int payload_length(shared_ptr<c2pool::libnet::messages::base_message> msg);
 
-        //obj(c++) -> json -> bytes -> len(bytes)
-        template <typename T>
-        static unsigned int packed_size(char *name_type, T &value);
+        //TODO: update
+        // //obj(c++) -> json -> bytes -> len(bytes)
+        // template <typename T>
+        // static unsigned int packed_size(char *name_type, T &value);
 
         static unsigned int receive_length(char *length_data);
     };
