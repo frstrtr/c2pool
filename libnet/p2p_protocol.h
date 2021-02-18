@@ -1,6 +1,7 @@
 #pragma once
 #include "p2p_socket.h"
 #include "messages.h"
+#include "converter.h"
 using namespace c2pool::libnet::messages;
 
 #include <lib/univalue/include/univalue.h>
@@ -10,13 +11,6 @@ using std::shared_ptr, std::make_shared;
 
 namespace c2pool::p2p
 {
-    template <class converter_type>
-    class message_addrs
-    {
-    public:
-        message_addrs(UniValue v) {}
-    };
-
     template <class converter_type>
     class Protocol
     {

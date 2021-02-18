@@ -13,7 +13,6 @@ namespace c2pool::python
     class PyPackTypes;
 }
 
-
 namespace c2pool::libnet::messages
 {
     class bytes_converter
