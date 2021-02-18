@@ -2,7 +2,7 @@
 #include <iostream>
 #include <string>
 
-namespace c2pool::messages
+namespace c2pool::util::messages
 {
 
     address_type::address_type()

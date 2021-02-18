@@ -4,7 +4,7 @@
 #include "univalue.h"
 
 //todo: move all methods to types.cpp
-namespace c2pool::messages
+namespace c2pool::util::messages
 {
 
     class address_type
