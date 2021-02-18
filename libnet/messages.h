@@ -45,10 +45,18 @@ namespace c2pool::libnet::messages
         std::unique_ptr<bytes_converter> converter;
 
     public:
-        template <class converter_type>
+        
         raw_message()
         {
-            converter = std::make_unique<converter_type>();
+            converter = std::make_unique<empty_converter>();
+        }
+
+        template <class converter_type>
+        void set_converter()
+        {
+            std::shared_ptr<converter_type> new_converter = std::make_shared<converter_type>();
+            new_converter->set_command(converter->get_command());
+            converter = new_converter;
         }
 
         void deserialize()
@@ -73,19 +81,6 @@ namespace c2pool::libnet::messages
         {
             converter = std::make_shared<converter_type>();
             converter->set_command(_cmd);
-        }
-
-        base_message(const char *_cmd)
-        {
-            converter = std::make_shared<empty_converter>(_cmd);
-        }
-
-        template <class converter_type>
-        void set_converter()
-        {
-            std::shared_ptr<converter_type> new_converter = std::make_shared<converter_type>();
-            new_converter->set_command(converter->get_command());
-            converter = new_converter;
         }
 
         //base_message -> bytes; msg = self
