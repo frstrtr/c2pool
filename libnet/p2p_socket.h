@@ -1,5 +1,7 @@
 #pragma once
 
+#include "p2p_protocol.h"
+
 namespace c2pool
 {
     namespace messages
@@ -11,14 +13,17 @@ namespace c2pool
 #include <memory>
 
 #include <boost/asio.hpp>
+#include <boost/function.hpp>
 namespace ip = boost::asio::ip;
 
 namespace c2pool::p2p
 {
-    class P2PSocket
+    typedef boost::function<bool(shared_ptr<c2pool::p2p::Protocol>)> protocol_handle;
+
+    class P2PSocket : public std::enable_shared_from_this<P2PSocket>
     {
     public:
-        P2PSocket(ip::tcp::socket socket);
+        P2PSocket(ip::tcp::socket socket, protocol_handle const &handle);
 
         bool isConnected() const { return _socket.is_open(); }
         ip::tcp::socket &get() { return _socket; }
@@ -32,15 +37,17 @@ namespace c2pool::p2p
 
         void write(std::shared_ptr<c2pool::messages::message> msg);
 
-        void read_prefix();
-        void read_command();
-        void read_length();
-        void read_checksum();
-        void read_payload();
-
-        //TODO: очередь из сообщений???
+    private:
+        void start_read();
+        void read_prefix(shared_ptr<raw_message> tempRawMessage);
+        void read_command(shared_ptr<raw_message> tempRawMessage);
+        void read_length(shared_ptr<raw_message> tempRawMessage);
+        void read_checksum(shared_ptr<raw_message> tempRawMessage);
+        void read_payload(shared_ptr<raw_message> tempRawMessage);
 
     private:
         boost::asio::ip::tcp::socket _socket;
+
+        std::weak_ptr<c2pool::p2p::Protocol> _protocol;
     };
 } // namespace c2pool::p2p
