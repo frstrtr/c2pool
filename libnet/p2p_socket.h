@@ -2,11 +2,11 @@
 
 #include "p2p_protocol.h"
 
-namespace c2pool
+namespace c2pool::libnet
 {
     namespace messages
     {
-        class message;
+        class base_message;
     }
 } // namespace c2pool
 
@@ -16,7 +16,7 @@ namespace c2pool
 #include <boost/function.hpp>
 namespace ip = boost::asio::ip;
 
-namespace c2pool::p2p
+namespace c2pool::libnet::p2p
 {
     typedef boost::function<bool(shared_ptr<c2pool::p2p::Protocol>)> protocol_handle;
 
@@ -35,7 +35,7 @@ namespace c2pool::p2p
             return _socket.remote_endpoint(ec);
         }
 
-        void write(std::shared_ptr<c2pool::messages::message> msg);
+        void write(std::shared_ptr<base_message> msg);
 
     private:
         void start_read();

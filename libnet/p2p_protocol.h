@@ -93,16 +93,17 @@ namespace c2pool::p2p
         shared_ptr<raw_message> make_raw_message() override
         {
             auto raw_msg = make_shared<raw_message>();
-            raw_msg->set_converter<converter_type>();
+            raw_msg->set_converter_type<converter_type>();
             return raw_msg;
         }
 
     protected:
-        template <template <class> class MsgType>
+        template <class MsgType>
         //template <class MsgType<>, class ct = converter_type>
-        shared_ptr<MsgType<converter_type>> GenerateMsg(UniValue &value)
+        shared_ptr<MsgType> GenerateMsg(UniValue &value)
         {
-            shared_ptr<MsgType<converter_type>> msg = make_shared<MsgType<converter_type>>();
+            shared_ptr<MsgType> msg = make_shared<MsgType>();
+            msg->set_converter_type<converter_type>();
             *msg = value;
             return msg;
         }

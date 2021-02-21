@@ -1,5 +1,5 @@
 #include "p2p_socket.h"
-#include <util/messages.h>
+#include "messages.h"
 #include <devcore/logger.h>
 
 #include <memory>
@@ -8,13 +8,16 @@
 #include <boost/function.hpp>
 namespace ip = boost::asio::ip;
 
-namespace c2pool::p2p
+using namespace c2pool::p2p;
+using namespace c2pool::libnet::messages;
+
+namespace c2pool::libnet::p2p
 {
 
     P2PSocket::P2PSocket(ip::tcp::socket socket, protocol_handle const &handle) : _socket(std::move(socket))
     {
         //TODO: check p2pool/c2pool node
-        shared_ptr<c2pool::p2p::Protocol> temp_protocol;
+        shared_ptr<Protocol> temp_protocol;
         //if p2pool:
         //create P2P_Protocol<c2pool::libnet::messages::p2pool_converter>
         temp_protocol = make_shared<p2pool_protocol>(shared_from_this());
@@ -33,7 +36,7 @@ namespace c2pool::p2p
         start_read();
     }
 
-    void P2PSocket::write(std::shared_ptr<c2pool::messages::message> msg)
+    void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
         msg->send(); //TODO: rename method;
         boost::asio::async_write(_socket, boost::asio::buffer(msg->data, msg->get_length()),
@@ -54,13 +57,13 @@ namespace c2pool::p2p
         read_prefix(tempRawMessage);
     }
 
-    void P2PSocket::read_prefix()
+    void P2PSocket::read_prefix(shared_ptr<raw_message> tempRawMessage)
     {
-        
-        tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
+        //TODO: move to make_raw_message
+        //tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
 
         boost::asio::async_read(socket,
-                                boost::asio::buffer(tempMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH),
+                                boost::asio::buffer(tempRawMessage->prefix, nodes->p2p_node->net()->PREFIX_LENGTH),
                                 [this](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec && c2pool::str::compare_str(tempMessage->prefix, nodes->p2p_node->net()->PREFIX, nodes->p2p_node->net()->PREFIX_LENGTH))
                                     {

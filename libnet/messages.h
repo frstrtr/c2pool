@@ -14,6 +14,11 @@
 
 using namespace c2pool::util::messages;
 
+namespace c2pool::libnet::p2p
+{
+    class P2PSocket;
+}
+
 namespace c2pool::libnet::messages
 {
 
@@ -37,26 +42,25 @@ namespace c2pool::libnet::messages
     //base_message type for handle
     class raw_message
     {
+        friend c2pool::libnet::p2p::P2PSocket;
+
     public:
         c2pool::libnet::messages::commands name_type;
         UniValue value;
 
     protected:
-        std::unique_ptr<bytes_converter> converter;
+        std::shared_ptr<bytes_converter> converter;
 
     public:
-        
         raw_message()
         {
-            converter = std::make_unique<empty_converter>();
+            converter = std::make_shared<empty_converter>();
         }
 
         template <class converter_type>
-        void set_converter()
+        void set_converter_type()
         {
-            std::shared_ptr<converter_type> new_converter = std::make_shared<converter_type>();
-            new_converter->set_command(converter->get_command());
-            converter = new_converter;
+            converter = std::make_shared<converter_type>(converter);
         }
 
         void deserialize()
@@ -76,11 +80,15 @@ namespace c2pool::libnet::messages
         virtual UniValue json_pack() = 0;
 
     public:
-        template <class converter_type>
         base_message(const char *_cmd)
         {
-            converter = std::make_shared<converter_type>();
-            converter->set_command(_cmd);
+            converter = std::make_shared<empty_converter>(_cmd);
+        }
+
+        template <class converter_type>
+        void set_converter_type()
+        {
+            converter = std::make_shared<converter_type>(converter);
         }
 
         //base_message -> bytes; msg = self
@@ -117,7 +125,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -125,7 +134,8 @@ namespace c2pool::libnet::messages
         }
     };
 
-    enum PoolVersion{
+    enum PoolVersion
+    {
         None = 0,
         C2Pool = 1
     };
@@ -169,16 +179,20 @@ namespace c2pool::libnet::messages
             sub_version = value["sub_version"].get_str();
             mode = value["mode"].get_int();
             best_share_hash.SetHex(value["best_share_hash"].get_str());
-            if (value.exists("pool_version")){
+            if (value.exists("pool_version"))
+            {
                 int pool_ver_temp = value["pool_version"].get_int();
-                pool_version = (PoolVersion) pool_ver_temp;
-            } else {
+                pool_version = (PoolVersion)pool_ver_temp;
+            }
+            else
+            {
                 pool_version = PoolVersion::None;
             }
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -205,7 +219,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -233,7 +248,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -264,7 +280,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -298,7 +315,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -338,7 +356,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -391,7 +410,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -460,7 +480,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue _result(UniValue::VOBJ);
 
@@ -503,7 +524,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
@@ -542,7 +564,8 @@ namespace c2pool::libnet::messages
             return *this;
         }
 
-        operator UniValue()
+    protected:
+        UniValue json_pack() override
         {
             UniValue result(UniValue::VOBJ);
 
