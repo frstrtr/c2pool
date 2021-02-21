@@ -3,6 +3,9 @@
 #include <memory>
 #include <lib/univalue/include/univalue.h>
 
+#include <tuple>
+using std::tuple;
+
 #define COMMAND_LENGTH 12
 #define PAYLOAD_LENGTH 4           //len(payload)
 #define CHECKSUM_LENGTH 4          //sha256(sha256(payload))[:4]
@@ -13,23 +16,41 @@ namespace c2pool::python
     class PyPackTypes;
 }
 
+namespace c2pool::libnet::p2p{
+    class P2PSocket;
+}
+
 namespace c2pool::libnet::messages
 {
     class bytes_converter
     {
+        friend c2pool::python::PyPackTypes;
+        friend c2pool::libnet::p2p::P2PSocket;
+    protected:
+        char *prefix;
+        char command[COMMAND_LENGTH + 1];
+        char length[PAYLOAD_LENGTH + 1];
+        char checksum[CHECKSUM_LENGTH + 1];
+        char payload[MAX_PAYLOAD_LENGTH + 1];
+        char data[COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + MAX_PAYLOAD_LENGTH]; //full message without prefix //TODO
     public:
         virtual char *get_data() = 0;
         virtual void set_data(char *data_) = 0;
 
         //from command, length, checksum, payload to data
         virtual UniValue decode() = 0; //old: decode_data
-        //from data to command, length, checksum, payload
-        virtual char *encode(UniValue json) = 0; //old: encode_data
+        //from msg_obj to tuple<char*, int>s(data, len)
+        virtual tuple<char *, int> encode(UniValue json) = 0; //old: encode_data
 
         virtual const char *get_command() = 0;
         virtual void set_command(const char *_command) = 0;
 
         virtual bool isEmpty() { return false; }
+
+        virtual int get_prefix_len() = 0;
+
+        virtual void set_unpacked_len(char *packed_len = nullptr) = 0;
+        virtual int get_unpacked_len() = 0;
     };
 
     class empty_converter : public bytes_converter
@@ -55,13 +76,18 @@ namespace c2pool::libnet::messages
             return result;
         }
 
-        char *encode(UniValue json) override { return get_data(); }
+        tuple<char *, int> encode(UniValue json) override { return std::make_tuple<char*, int>(get_data(), 0); }
 
         virtual const char *get_command() { return command; }
 
         void set_command(const char *_command) { strcpy(command, _command); }
 
         bool isEmpty() override { return true; }
+
+        int get_prefix_len() override { return 0;}
+
+        void set_unpacked_len(char *packed_len = nullptr) override {}
+        int get_unpacked_len() override { return 0;}
     };
 
     //for p2pool serialize/deserialize
@@ -71,15 +97,9 @@ namespace c2pool::libnet::messages
 
     public:
         int prefix_length;
-        const unsigned int unpacked_length();
+        void set_unpacked_len(char *packed_len = nullptr);
+        int get_unpacked_len() override;
 
-    public:
-        char *prefix;
-        char command[COMMAND_LENGTH + 1];
-        char length[PAYLOAD_LENGTH + 1];
-        char checksum[CHECKSUM_LENGTH + 1];
-        char payload[MAX_PAYLOAD_LENGTH + 1];
-        char data[COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + MAX_PAYLOAD_LENGTH]; //full message without prefix //TODO
     private:
         unsigned int _unpacked_length = 0;
 
@@ -88,7 +108,8 @@ namespace c2pool::libnet::messages
 
         p2pool_converter(const char *_command) { set_command(_command); }
 
-        p2pool_converter(std::shared_ptr<empty_converter> _empty) {
+        p2pool_converter(std::shared_ptr<empty_converter> _empty)
+        {
             set_command(_empty->get_command());
         }
 
@@ -99,21 +120,23 @@ namespace c2pool::libnet::messages
             delete prefix;
         }
 
-        char *get_data() { return data; }
-        void set_data(char *data_);
-
-        void set_unpacked_length(char *packed_len = nullptr);
+        char *get_data() override { return data; }
+        void set_data(char *data_) override;
 
         //from command, length, checksum, payload to data
         //void decode_data();
-        UniValue decode();
+        UniValue decode() override;
 
         //from data to command, length, checksum, payload
         //void encode_data();
-        char *encode(UniValue json);
+        tuple<char *, int> encode(UniValue json) override;
 
-        virtual const char *get_command() { return command; }
-        void set_command(const char *_command) { strcpy(command, _command); }
+        virtual const char *get_command() override { return command; }
+        void set_command(const char *_command) override { strcpy(command, _command); }
+
+
+        
+        int get_prefix_len() override { return prefix_length;}
 
         int get_length();
 

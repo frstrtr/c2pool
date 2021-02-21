@@ -3,6 +3,9 @@
 #include <devcore/str.h>
 #include <util/pystruct.h>
 
+#include <tuple>
+using std::tuple;
+
 namespace c2pool::libnet::messages
 {
     //p2pool_converter
@@ -23,7 +26,7 @@ namespace c2pool::libnet::messages
     //     memcpy(prefix, current_prefix, prefix_length);
     // } //TODO: update?
 
-    void p2pool_converter::set_unpacked_length(char *packed_len)
+    void p2pool_converter::set_unpacked_len(char *packed_len)
     {
         if (packed_len != nullptr) //TODO: wanna to remove?
         {
@@ -35,9 +38,9 @@ namespace c2pool::libnet::messages
         }
     }
 
-    const unsigned int p2pool_converter::unpacked_length()
+    int p2pool_converter::get_unpacked_len()
     {
-        set_unpacked_length();
+        set_unpacked_len();
         return _unpacked_length;
     }
 
@@ -69,10 +72,10 @@ namespace c2pool::libnet::messages
     //     memcpy(prefix, current_prefix, prefix_length);
     // }
 
-    char *p2pool_converter::encode(UniValue json)
+    tuple<char *, int> p2pool_converter::encode(UniValue json)
     {
         set_data(c2pool::python::PyPackTypes::encode(json));
-        return get_data();
+        return make_tuple<char*, int>(get_data(), get_length());
     }
 
     UniValue p2pool_converter::decode()
@@ -87,7 +90,7 @@ namespace c2pool::libnet::messages
 
     int p2pool_converter::get_length()
     {
-        return COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + unpacked_length();
+        return COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + get_unpacked_len();
     }
 
 } // namespace c2pool::libnet::messages

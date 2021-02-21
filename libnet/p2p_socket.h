@@ -11,7 +11,7 @@ namespace c2pool::libnet
 } // namespace c2pool
 
 #include <memory>
-
+#include <networks/network.h>
 #include <boost/asio.hpp>
 #include <boost/function.hpp>
 namespace ip = boost::asio::ip;
@@ -46,6 +46,7 @@ namespace c2pool::libnet::p2p
         void read_payload(shared_ptr<raw_message> tempRawMessage);
 
     private:
+        std::shared_ptr<c2pool::Network> _net;
         boost::asio::ip::tcp::socket _socket;
 
         std::weak_ptr<c2pool::p2p::Protocol> _protocol;
