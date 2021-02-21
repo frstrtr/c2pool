@@ -113,7 +113,7 @@ namespace c2pool::python
             result.setNull();
             return result; //TODO: проверка на Null на выходе функции.
         }
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->unpacked_length());
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->get_unpacked_len());
 
         auto raw_result = GetCallFunctionResult(pVal);
         result.read(raw_result);

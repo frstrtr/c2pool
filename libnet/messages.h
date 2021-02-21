@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <tuple>
 
 using namespace c2pool::util::messages;
 
@@ -74,6 +75,7 @@ namespace c2pool::libnet::messages
 
     class base_message
     {
+        friend class c2pool::python::PyPackTypes;
     protected:
         std::shared_ptr<bytes_converter> converter;
 
@@ -92,7 +94,7 @@ namespace c2pool::libnet::messages
         }
 
         //base_message -> bytes; msg = self
-        char *serialize()
+        std::tuple<char *, int> serialize()
         {
             UniValue json_msg(UniValue::VOBJ);
             json_msg.pushKV("name_type", converter->get_command());
@@ -102,8 +104,6 @@ namespace c2pool::libnet::messages
 
             return converter->encode(json_msg);
         }
-
-        friend class c2pool::python::PyPackTypes;
     };
 
     /*
