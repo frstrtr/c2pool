@@ -38,6 +38,8 @@ namespace c2pool::libnet::messages
         char command[COMMAND_LENGTH + 1];
 
     public:
+        empty_converter() {}
+
         empty_converter(const char *_command) { set_command(_command); }
 
         char *get_data() override
@@ -84,7 +86,13 @@ namespace c2pool::libnet::messages
     public:
         p2pool_converter() {}
 
-        p2pool_converter(const char *current_prefix);
+        p2pool_converter(const char *_command) { set_command(_command); }
+
+        p2pool_converter(std::shared_ptr<empty_converter> _empty) {
+            set_command(_empty->get_command());
+        }
+
+        //p2pool_converter(const char *current_prefix);
 
         ~p2pool_converter()
         {
@@ -103,6 +111,9 @@ namespace c2pool::libnet::messages
         //from data to command, length, checksum, payload
         //void encode_data();
         char *encode(UniValue json);
+
+        virtual const char *get_command() { return command; }
+        void set_command(const char *_command) { strcpy(command, _command); }
 
         int get_length();
 

@@ -7,20 +7,21 @@ namespace c2pool::libnet::messages
 {
     //p2pool_converter
 
-    p2pool_converter::p2pool_converter(const char *current_prefix)
-    {
-        if (sizeof(current_prefix) > 0)
-        {
-            prefix_length = sizeof(current_prefix) / sizeof(current_prefix[0]);
-        }
-        else
-        {
-            prefix_length = 0;
-            LOG_WARNING << "prefix length <= 0!";
-        }
-        prefix = new char[prefix_length];
-        memcpy(prefix, current_prefix, prefix_length);
-    } //TODO: update?
+    //TODO:
+    // p2pool_converter::p2pool_converter(const char *current_prefix)
+    // {
+    //     if (sizeof(current_prefix) > 0)
+    //     {
+    //         prefix_length = sizeof(current_prefix) / sizeof(current_prefix[0]);
+    //     }
+    //     else
+    //     {
+    //         prefix_length = 0;
+    //         LOG_WARNING << "prefix length <= 0!";
+    //     }
+    //     prefix = new char[prefix_length];
+    //     memcpy(prefix, current_prefix, prefix_length);
+    // } //TODO: update?
 
     void p2pool_converter::set_unpacked_length(char *packed_len)
     {
@@ -53,20 +54,20 @@ namespace c2pool::libnet::messages
 
     //new p2pool_converter
 
-    p2pool_converter::p2pool_converter(const char *current_prefix)
-    {
-        if (sizeof(current_prefix) > 0)
-        {
-            prefix_length = sizeof(current_prefix) / sizeof(current_prefix[0]);
-        }
-        else
-        {
-            prefix_length = 0;
-            LOG_WARNING << "prefix length <= 0!";
-        }
-        prefix = new char[prefix_length];
-        memcpy(prefix, current_prefix, prefix_length);
-    }
+    // p2pool_converter::p2pool_converter(const char *current_prefix)
+    // {
+    //     if (sizeof(current_prefix) > 0)
+    //     {
+    //         prefix_length = sizeof(current_prefix) / sizeof(current_prefix[0]);
+    //     }
+    //     else
+    //     {
+    //         prefix_length = 0;
+    //         LOG_WARNING << "prefix length <= 0!";
+    //     }
+    //     prefix = new char[prefix_length];
+    //     memcpy(prefix, current_prefix, prefix_length);
+    // }
 
     char *p2pool_converter::encode(UniValue json)
     {
