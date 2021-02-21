@@ -1,6 +1,8 @@
 #include "p2p_node.h"
 #include "nodeManager.h"
 #include "p2p_socket.h"
+#include "p2p_protocol.h"
+
 #include <devcore/logger.h>
 #include <devcore/addrStore.h>
 #include <devcore/common.h>
@@ -12,13 +14,14 @@
 #include <algorithm>
 using std::max, std::min;
 
+#include <boost/bind.hpp>
 #include <boost/asio.hpp>
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
 using namespace c2pool::libnet;
 
-namespace c2pool::p2p
+namespace c2pool::libnet::p2p
 {
     P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), _manager(_mngr)
     {
@@ -32,7 +35,8 @@ namespace c2pool::p2p
         _acceptor.async_accept([this](boost::system::error_code ec, ip::tcp::socket socket) {
             if (!ec)
             {
-                auto _socket = std::make_shared<P2PSocket>(std::move(socket));
+                //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
+                auto _socket = std::make_shared<P2PSocket>(std::move(socket), boost::bind(&P2PNode::protocol_connected, this, _1));
                 //TODO: protocol_connected()
                 //передать protocol_connected по указателю на метод
                 //и вызвать его только после обработки message_versionф
@@ -66,10 +70,8 @@ namespace c2pool::p2p
                                 _resolver.async_resolve(ip, port,
                                                        [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                                                            boost::asio::ip::tcp::socket socket(_context);
-                                                           auto _socket = std::make_shared<P2PSocket>(std::move(socket));
-                                                        //TODO: Когда доделается протокол.
-                                                        //    auto p = std::make_shared<Protocol>(std::move(_socket), _manager, endpoints); //TODO: shared and unique
-                                                        //    protocol_connected(p);
+                                                           
+                                                           auto _socket = std::make_shared<P2PSocket>(std::move(socket), boost::bind(&P2PNode::protocol_connected, this, _1));
                                                        });
                             }
                             catch (const std::exception &e)
@@ -130,4 +132,10 @@ namespace c2pool::p2p
         }
         return result;
     }
+
+    bool P2PNode::protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol){
+        //TODO:
+        return false;
+    }
+
 } // namespace c2pool::p2p

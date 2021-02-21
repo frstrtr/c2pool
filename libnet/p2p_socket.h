@@ -18,7 +18,7 @@ namespace ip = boost::asio::ip;
 
 namespace c2pool::libnet::p2p
 {
-    typedef boost::function<bool(shared_ptr<c2pool::p2p::Protocol>)> protocol_handle;
+    typedef boost::function<bool(shared_ptr<c2pool::libnet::p2p::Protocol>)> protocol_handle;
 
     class P2PSocket : public std::enable_shared_from_this<P2PSocket>
     {
@@ -49,6 +49,6 @@ namespace c2pool::libnet::p2p
         std::shared_ptr<c2pool::Network> _net;
         boost::asio::ip::tcp::socket _socket;
 
-        std::weak_ptr<c2pool::p2p::Protocol> _protocol;
+        std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
     };
 } // namespace c2pool::p2p

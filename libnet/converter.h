@@ -108,7 +108,7 @@ namespace c2pool::libnet::messages
 
         p2pool_converter(const char *_command) { set_command(_command); }
 
-        p2pool_converter(std::shared_ptr<empty_converter> _empty)
+        p2pool_converter(std::shared_ptr<bytes_converter> _empty)
         {
             set_command(_empty->get_command());
         }

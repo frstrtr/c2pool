@@ -1,4 +1,12 @@
 #pragma once
+
+#include "p2p_protocol.h"
+
+namespace c2pool::libnet::p2p
+{
+    class Protocol;
+}
+
 #include <boost/asio.hpp>
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
@@ -35,7 +43,7 @@ namespace c2pool
 
 using namespace c2pool::libnet;
 
-namespace c2pool::p2p
+namespace c2pool::libnet::p2p
 {
     class P2PNode
     {
@@ -46,7 +54,7 @@ namespace c2pool::p2p
         std::vector<ADDR> get_good_peers(int max_count);
 
     private:
-        void protocol_connected(); //todo
+        bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo
 
         void listen();
         void auto_connect();
