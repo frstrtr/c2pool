@@ -9,20 +9,20 @@ using namespace c2pool::libnet::messages;
 #include <memory>
 using std::shared_ptr, std::weak_ptr, std::make_shared;
 
-namespace c2pool::p2p
+namespace c2pool::libnet::p2p
 {
     class P2PSocket;
 }
 
-namespace c2pool::p2p
+namespace c2pool::libnet::p2p
 {
     class Protocol
     {
     protected:
-        shared_ptr<c2pool::p2p::P2PSocket> _socket;
+        shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
 
     protected:
-        Protocol(shared_ptr<c2pool::p2p::P2PSocket> _sct)
+        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct)
         {
             _socket = _sct;
         }
@@ -37,7 +37,7 @@ namespace c2pool::p2p
     class P2P_Protocol : public Protocol
     {
     public:
-        P2P_Protocol(shared_ptr<c2pool::p2p::P2PSocket> socket) : Protocol(socket)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
         {
         }
 

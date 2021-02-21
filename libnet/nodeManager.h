@@ -8,7 +8,7 @@
 #include <iostream>
 using std::shared_ptr;
 
-namespace c2pool::p2p
+namespace c2pool::libnet::p2p
 {
     class P2PNode;
 }
@@ -45,7 +45,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::Network> _net;
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
-        shared_ptr<c2pool::p2p::P2PNode> p2pnode;
+        shared_ptr<c2pool::libnet::p2p::P2PNode> p2pnode;
 
         //TODO:CoindNode
     };
