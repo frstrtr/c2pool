@@ -103,7 +103,7 @@ namespace c2pool::libnet::p2p
         shared_ptr<MsgType> GenerateMsg(UniValue &value)
         {
             shared_ptr<MsgType> msg = make_shared<MsgType>();
-            msg->set_converter_type<converter_type>();
+            msg->template set_converter_type<converter_type>();
             *msg = value;
             return msg;
         }
