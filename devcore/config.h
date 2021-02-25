@@ -9,6 +9,7 @@ namespace c2pool::dev
 
     private:
         static c2pool_config *_instance;
+
     public:
         static void INIT();
         static c2pool_config *get();
@@ -17,10 +18,12 @@ namespace c2pool::dev
     class coind_config
     {
     public:
-        int listenPort = -1;
-        int max_conns;     //server max connections
-        int desired_conns; //client max connections
-        int max_attempts;  //client максимум одновременно обрабатываемых попыток подключения
+        //TODO: initialization methods
+    public:
+        int listenPort = 3035;
+        int max_conns = 40;    //server max connections
+        int desired_conns = 6; //client max connections
+        int max_attempts = 10; //client максимум одновременно обрабатываемых попыток подключения
         //попытка подключения = подключение, которое произошло, но не проверенно на версию и прочие условия.
     };
 } // namespace c2pool::dev

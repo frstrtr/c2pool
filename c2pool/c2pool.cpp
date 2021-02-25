@@ -1,3 +1,5 @@
+#include "coind_master.h"
+
 #include <devcore/config.h>
 #include <devcore/logger.h>
 #include <devcore/common.h>
@@ -18,8 +20,6 @@ using std::string;
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
-
-
 
 //TODO: move macros to other.h
 #define fmt(TEMPL, DATA) (boost::format{TEMPL} % DATA).str()
@@ -51,7 +51,7 @@ int main(int ac, char *av[])
 
     //c2pool interface
     po::options_description c2pool_group("c2pool interface");
-    int p2p_port = 3035;                                                                                                                                                                                  //TODO: net.P2P_PORT
+    int p2p_port = 3035;                                                                                                                                                                                   //TODO: net.P2P_PORT
     c2pool_group.add_options()("c2pool-port", po::value<int>()->default_value(p2p_port), fmt_c("use port PORT to listen for connections (forward this port from your router!) (default: %1%)", p2p_port)); //fmt("s%1", 1).c_str());
     c2pool_group.add_options()("max-conns", po::value<int>()->default_value(40), "maximum incoming connections (default: 40)");                                                                            //in p2pool: dest='p2pool_conns'
     c2pool_group.add_options()("outgoing-conns", po::value<int>()->default_value(6), "outgoing connections (default: 6)");                                                                                 //in p2pool: dest='p2pool_outgoing_conns'
@@ -107,18 +107,21 @@ int main(int ac, char *av[])
     c2pool::console::Logger::Init();
     LOG_INFO << "Start c2pool...";
 
-    auto DGB_net = std::make_shared<c2pool::DigibyteNetwork>();
-    auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
-    auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_cfg);
-    DGB->run();
+    //Creating and initialization coinds network, config and NodeManager
+
+    //##########################DGB###############################
+    auto DGB = c2pool::master::Make_DGB();
+    //############################################################
 
 
+    //Init exit handler
     ExitSignalHandler exitSignalHandler;
     signal(SIGINT, &ExitSignalHandler::handler);
     signal(SIGTERM, &ExitSignalHandler::handler);
     signal(SIGINT, &ExitSignalHandler::handler);
 
-    while(exitSignalHandler.working()){
+    while (exitSignalHandler.working())
+    {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000)); //todo: std::chrono::milliseconds(100)
         std::cout << "main thread" << std::endl;
     }
