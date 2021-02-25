@@ -13,6 +13,7 @@ using std::shared_ptr;
 
 namespace c2pool::dev
 {
+    //todo: boost::filesystem
     //template path — "data//bitcoin//addrs"
     AddrStore::AddrStore(string path, shared_ptr<c2pool::Network> net)
     {

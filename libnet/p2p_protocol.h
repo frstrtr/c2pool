@@ -2,6 +2,7 @@
 
 #include "messages.h"
 #include "converter.h"
+#include <devcore/logger.h>
 using namespace c2pool::libnet::messages;
 
 #include <lib/univalue/include/univalue.h>
@@ -24,6 +25,7 @@ namespace c2pool::libnet::p2p
     protected:
         Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct)
         {
+            LOG_TRACE << "Base protocol: " << "start constuctor";
             _socket = _sct;
         }
 
@@ -39,6 +41,7 @@ namespace c2pool::libnet::p2p
     public:
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
         {
+            LOG_TRACE << "P2P_Protcol: " << "start constructor";
         }
 
         void handle(shared_ptr<raw_message> RawMSG) override

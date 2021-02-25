@@ -55,6 +55,7 @@ namespace c2pool::libnet::p2p
 
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo
+        bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo
 
         void listen();
         void auto_connect();
@@ -75,8 +76,9 @@ namespace c2pool::libnet::p2p
     private:
         unsigned long long node_id; //nonce
 
-        set<HOST_IDENT> client_attempts;
-        set<int /*TODO: Protocol*/> client_connections;
+        map<HOST_IDENT, shared_ptr<P2PSocket>> client_attempts;
+        set<shared_ptr<P2PSocket>> server_attempts;
+        set<shared_ptr<c2pool::libnet::p2p::Protocol>> client_connections;
         map<HOST_IDENT, int> server_connections;
     };
 } // namespace c2pool::p2p
