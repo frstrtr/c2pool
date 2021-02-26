@@ -47,9 +47,8 @@ namespace c2pool::libnet::p2p
         _acceptor.async_accept([this](boost::system::error_code ec, ip::tcp::socket socket) {
             if (!ec)
             {
-                shared_ptr<ip::tcp::socket> asio_socket = make_shared<ip::tcp::socket>(socket);
                 //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
-                auto _socket = std::make_shared<P2PSocket>(asio_socket);
+                auto _socket = std::make_shared<P2PSocket>(std::move(socket));
 
                 server_attempts.insert(_socket);
 
@@ -88,12 +87,12 @@ namespace c2pool::libnet::p2p
                             {
                                 _resolver.async_resolve(ip, port,
                                                         [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
-                                                            shared_ptr<ip::tcp::socket> socket = make_shared<ip::tcp::socket>(_context);
-                                                            auto _socket = std::make_shared<P2PSocket>(socket);
+                                                            ip::tcp::socket socket(_context);
+                                                            auto _socket = std::make_shared<P2PSocket>(std::move(socket));
 
                                                             client_attempts[ip] = _socket;
 
-                                                            _socket->init(boost::bind(&P2PNode::protocol_connected, this, _1));
+                                                            _socket->connector_init(boost::bind(&P2PNode::protocol_connected, this, _1), endpoints);
                                                         });
                             }
                             catch (const std::exception &e)
@@ -151,6 +150,7 @@ namespace c2pool::libnet::p2p
 
     bool P2PNode::protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
     {
+        LOG_DEBUG << "P2PNode::protocol_connected";
         //TODO:
         return false;
     }
