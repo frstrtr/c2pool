@@ -23,18 +23,22 @@ namespace c2pool::libnet::p2p
     class P2PSocket : public std::enable_shared_from_this<P2PSocket>
     {
     public:
-        P2PSocket(std::shared_ptr<ip::tcp::socket> socket);
+        //for receive
+        P2PSocket(ip::tcp::socket socket);
         
+        //for connect
+        void connector_init(protocol_handle const &handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
+
         void init(protocol_handle const &handle);
 
-        bool isConnected() const { return _socket->is_open(); }
-        shared_ptr<ip::tcp::socket> get() { return _socket; }
-        void disconnect() { _socket->close(); }
+        bool isConnected() const { return _socket.is_open(); }
+        ip::tcp::socket& get() { return _socket; }
+        void disconnect() { _socket.close(); }
 
         ip::tcp::endpoint endpoint()
         {
             boost::system::error_code ec;
-            return _socket->remote_endpoint(ec);
+            return _socket.remote_endpoint(ec);
         }
 
         void write(std::shared_ptr<base_message> msg);
@@ -49,7 +53,7 @@ namespace c2pool::libnet::p2p
 
     private:
         std::shared_ptr<c2pool::Network> _net;
-        std::shared_ptr<boost::asio::ip::tcp::socket> _socket;
+        ip::tcp::socket _socket;
 
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
     };
