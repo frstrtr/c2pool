@@ -1,4 +1,5 @@
 from __future__ import absolute_import, division
+print("used py script") #FOR DEBUG
 import itertools
 
 import codecs
@@ -759,6 +760,25 @@ class FloatingIntegerType(Type):
 def is_segwit_tx(tx):
     return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
 
+# tx's---------------------
+tx_in_type = ComposedType([
+    ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
+        ('hash', IntType(256)),
+        ('index', IntType(32)),
+    ]))),
+    ('script', VarStrType()),
+    ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
+])
+tx_out_type = ComposedType([
+    ('value', IntType(64)),
+    ('script', VarStrType()),
+])
+tx_id_type = ComposedType([
+    ('version', IntType(32)),
+    ('tx_ins', ListType(tx_in_type)),
+    ('tx_outs', ListType(tx_out_type)),
+    ('lock_time', IntType(32))
+])
 
 class TransactionType(Type):
     _int_type = IntType(32)
@@ -766,19 +786,19 @@ class TransactionType(Type):
     _witness_type = ListType(VarStrType())
     _wtx_type = ComposedType([
         ('flag', IntType(8)),
-        ('tx_ins', ListType(TYPE.tx_in_type)),
-        ('tx_outs', ListType(TYPE.tx_out_type))
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type))
     ])
     _ntx_type = ComposedType([
-        ('tx_outs', ListType(TYPE.tx_out_type)),
+        ('tx_outs', ListType(tx_out_type)),
         ('lock_time', _int_type)
     ])
     _write_type = ComposedType([
         ('version', _int_type),
         ('marker', IntType(8)),
         ('flag', IntType(8)),
-        ('tx_ins', ListType(TYPE.tx_in_type)),
-        ('tx_outs', ListType(TYPE.tx_out_type))
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type))
     ])
 
     def read(self, file):
@@ -794,7 +814,7 @@ class TransactionType(Type):
         else:
             tx_ins = [None]*marker
             for i in range(marker):
-                tx_ins[i] = TYPE.tx_in_type.read(file)
+                tx_ins[i] = tx_in_type.read(file)
             next = self._ntx_type.read(file)  # _ntx_type
             return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
 
@@ -806,7 +826,7 @@ class TransactionType(Type):
                 self._witness_type.write(file, w)
             self._int_type.write(file, item['lock_time'])
             return
-        return TYPE.tx_id_type.write(file, item)
+        return tx_id_type.write(file, item)
 
 
 # ------------------------------------------messages and types---------------------------------------
@@ -821,28 +841,6 @@ class TransactionType(Type):
 # ])
 # -------------------------------------------Global-Type----------------------------------------------
 class TYPE:
-
-    # tx's---------------------
-    tx_in_type = ComposedType([
-        ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
-            ('hash', IntType(256)),
-            ('index', IntType(32)),
-        ]))),
-        ('script', VarStrType()),
-        ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
-    ])
-
-    tx_out_type = ComposedType([
-        ('value', IntType(64)),
-        ('script', VarStrType()),
-    ])
-
-    tx_id_type = ComposedType([
-        ('version', IntType(32)),
-        ('tx_ins', ListType(tx_in_type)),
-        ('tx_outs', ListType(tx_out_type)),
-        ('lock_time', IntType(32))
-    ])
 
     tx_type = TransactionType()
     # messages and types-------
@@ -971,9 +969,9 @@ def deserialize(name_type, _bytes_array):
 
 
 def deserialize_msg(_command, checksum, payload):
-    # print('_command = {0}'.format(_command))
-    # print('checksum = {0}'.format(checksum))
-    # print('payload = {0}'.format(payload))
+    print('_command = {0}'.format(_command))
+    print('checksum = {0}'.format(checksum))
+    print('payload = {0}'.format(payload))
 
     command = _command.rstrip('\0')
     # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
@@ -1018,7 +1016,10 @@ def payload_length(raw_json):
 
 
 def receive_length(msg):
+    print("receive_length")
+    print(msg)
     length, = struct.unpack('<I', msg)
+    print('length = {0}'.format(length))
     return str(length)
 
 # ------------------------------------------FOR C++ DEBUG----------------------------------
@@ -1120,8 +1121,8 @@ def TEST_UNPACKRES():
 #print(PossiblyNoneType(0, IntType(8)).pack(0))
 
 #print(ListType(VarIntType(), 2).pack([12,23,23,23]))
-
 '''
+tx_type = TYPE.get_type("tx_type")
 tx_packed = tx_type.pack({
     'version':1, 
     'tx_outs': [{

@@ -8,6 +8,7 @@
 #include <devcore/py_base.h>
 #include <devcore/str.h>
 #include <libnet/messages.h>
+#include <devcore/logger.h>
 
 using namespace std;
 
@@ -62,7 +63,7 @@ namespace c2pool::python
 
     //PyPackTypes
 
-    const char *PyPackTypes::filepath = "/src/util";
+    const char *PyPackTypes::filepath = "/util";
 
     // template <typename T>
     // char *PyPackTypes::serialize(char *name_type, T &value)
@@ -177,6 +178,7 @@ namespace c2pool::python
     {
         unsigned int result = 0;
 
+        //auto methodObj = GetMethodObject("receive_length", "/home/sl33n/c2pool/util", "packtypes");
         auto methodObj = GetMethodObject("receive_length", filepath, "packtypes");
         if (methodObj == nullptr)
         {

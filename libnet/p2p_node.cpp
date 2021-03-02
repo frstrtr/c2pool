@@ -66,17 +66,17 @@ namespace c2pool::libnet::p2p
     {
         _auto_connect_timer->expires_after(auto_connect_interval);
         _auto_connect_timer->async_wait([this](boost::system::error_code const &_ec) {
-            LOG_TRACE << "auto connect timer";
+            //LOG_TRACE << "auto connect timer";
             if (!_ec)
             {
-                LOG_TRACE << "auto connect _ec false";
-                LOG_TRACE << client_connections.size() << " < " << _config->desired_conns;
+                //LOG_TRACE << "auto connect _ec false";
+                //LOG_TRACE << client_connections.size() << " < " << _config->desired_conns;
                 if ((client_connections.size() < _config->desired_conns) && (_manager->addr_store()->len() > 0) && (client_attempts.size() <= _config->max_attempts))
                 {
-                    LOG_TRACE << "if true";
+                    //LOG_TRACE << "if true";
                     for (auto addr : get_good_peers(1))
                     {
-                        LOG_TRACE << "for not empty";
+                        //LOG_TRACE << "for not empty";
                         if (client_attempts.find(std::get<0>(addr)) == client_attempts.end())
                         {
 
@@ -102,7 +102,7 @@ namespace c2pool::libnet::p2p
                         }
                         else
                         {
-                            LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+                            //TODO: [UNCOMMENT] LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
                         }
                     }
                 }
