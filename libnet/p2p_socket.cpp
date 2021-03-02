@@ -86,8 +86,11 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::start_read()
     {
+        LOG_TRACE << "START READING!:";
         //make raw_message for reading data
+        LOG_TRACE << _protocol.lock().use_count();
         shared_ptr<raw_message> tempRawMessage = _protocol.lock()->make_raw_message();
+        LOG_TRACE << "created temp_raw_message";
         //Socket started for reading!
         read_prefix(tempRawMessage);
     }
@@ -96,21 +99,24 @@ namespace c2pool::libnet::p2p
     {
         //TODO: move to make_raw_message
         //tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
-        tempRawMessage->converter->prefix = new char[100];
+        tempRawMessage->converter->prefix = new char[8];
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
-                                boost::asio::buffer(tempRawMessage->converter->prefix, 100),
+                                boost::asio::buffer(tempRawMessage->converter->prefix, 8),
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
                                     LOG_TRACE << "try to read prefix";
-                                    if (!ec && c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len()))
+                                    if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
                                     {
                                         LOG_TRACE << "compare prefix";
-                                        c2pool::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
+                                        //c2pool::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
+                                        LOG_TRACE << "after debug_log";
                                         // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command(tempRawMessage);
                                     }
                                     else
                                     {
+                                        LOG_TRACE << tempRawMessage->converter->prefix;
+                                        LOG_TRACE << "socket status when error in prefix: " <<_socket.is_open();
                                         LOG_ERROR << "read_prefix: " << ec << " " << ec.message();
                                         disconnect();
                                     }
@@ -124,6 +130,7 @@ namespace c2pool::libnet::p2p
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_TRACE << "try to read command";
                                         c2pool::python::other::debug_log(tempRawMessage->converter->command, COMMAND_LENGTH);
                                         //LOG_INFO << "read_command";
                                         read_length(tempRawMessage);
@@ -143,6 +150,7 @@ namespace c2pool::libnet::p2p
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_TRACE << "try to read length";
                                         c2pool::python::other::debug_log(tempRawMessage->converter->length, PAYLOAD_LENGTH);
                                         tempRawMessage->converter->set_unpacked_len();
                                         // LOG_INFO << "read_length";
@@ -163,6 +171,7 @@ namespace c2pool::libnet::p2p
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
                                     if (!ec)
                                     {
+                                        LOG_TRACE << "try to read checksum";
                                         c2pool::python::other::debug_log(tempRawMessage->converter->checksum, CHECKSUM_LENGTH);
                                         // LOG_INFO << "read_checksum";
                                         read_payload(tempRawMessage);
@@ -176,16 +185,17 @@ namespace c2pool::libnet::p2p
     }
     void P2PSocket::read_payload(shared_ptr<raw_message> tempRawMessage)
     {
-        auto self(shared_from_this());
-        
+        LOG_TRACE << "read_payload";
+        LOG_TRACE << tempRawMessage->converter->get_unpacked_len();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len()),
-                                [this, self, tempRawMessage](boost::system::error_code ec, std::size_t length) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
                                     if (!ec)
                                     {
                                         c2pool::python::other::debug_log(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len());
                                         // LOG_INFO << "read_payload";
                                         //todo: move tempMesssage -> new message
+                                        LOG_TRACE << "HANDLE MESSAGE!";
                                         start_read();
                                     }
                                     else

@@ -34,6 +34,7 @@ namespace c2pool::libnet::messages
         }
         if (length != nullptr)
         {
+            LOG_TRACE << "set_unpacked_len length != nullptr";
             _unpacked_length = c2pool::python::PyPackTypes::receive_length(length);
         }
     }
