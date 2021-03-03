@@ -32,8 +32,9 @@ namespace c2pool::libnet::p2p
         void init(protocol_handle const &handle);
 
         template <class protocol_type>
-        void get_protocol_type(){
-            
+        void get_protocol_type_and_version(protocol_handle const &handle, std::shared_ptr<raw_message> raw_message_version){
+            protocol_handle const & _handle = handle;
+            _protocol = std::make_share<protocol_type>(shared_from_this());
         }
 
         bool isConnected() const { return _socket.is_open(); }
