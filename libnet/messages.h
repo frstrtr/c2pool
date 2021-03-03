@@ -13,6 +13,8 @@
 #include <memory>
 #include <tuple>
 
+#include <devcore/logger.h>
+
 using namespace c2pool::util::messages;
 
 namespace c2pool::libnet::p2p
@@ -67,7 +69,7 @@ namespace c2pool::libnet::messages
         void deserialize()
         {
             UniValue _value = converter->decode();
-
+            LOG_TRACE << "deserialize value :" << _value.write();
             name_type = (c2pool::libnet::messages::commands)_value["name_type"].get_int();
             value = _value["value"].get_obj();
         }
