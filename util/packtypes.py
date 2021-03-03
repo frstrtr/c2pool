@@ -979,23 +979,25 @@ def deserialize_msg(_command, checksum, payload):
 
     # checksum check
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
-        # print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
-        #     hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
+        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
+            hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
         return '-1'
     # ------------
 
     type_ = TYPE.get_type('message_' + command)
     if type_ is None:
+        print("type not found")
         return '-2'
 
     value = type_.unpack(payload)
     result = {
-        'name_type': TYPE.message_command_type[command],
+        'name_type': TYPE.message_command_number[command],
         'value': value
     }
-
+    print(result)
     return result
 
+#test: deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 
 def packed_size(raw_json):
     _json = TYPE.get_json_dict(raw_json)

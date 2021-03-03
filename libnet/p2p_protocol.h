@@ -25,7 +25,8 @@ namespace c2pool::libnet::p2p
     protected:
         Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct)
         {
-            LOG_TRACE << "Base protocol: " << "start constuctor";
+            LOG_TRACE << "Base protocol: "
+                      << "start constuctor";
             _socket = _sct;
         }
 
@@ -35,19 +36,70 @@ namespace c2pool::libnet::p2p
         virtual shared_ptr<raw_message> make_raw_message() = 0;
     };
 
+    //protocol for init network type [c2pool/p2pool]; user only for messave_version
+    class initialize_network_protocol : public Protocol
+    {
+    private:
+        protocol_handle const &_handle;
+
+        //true = c2pool; false = p2pool
+        bool check_c2pool(UniValue &raw_message_version_json){
+            //todo
+            return false;            
+        }
+    public:
+        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle const &handle) : Protocol(socket), _handle(handle)
+        {
+        }
+
+        void handle(shared_ptr<raw_message> RawMSG_version) override
+        {
+            LOG_DEBUG << "called handle in initialize_network_protocol.";
+            RawMSG_version->deserialize();
+
+            UniValue json_value = RawMSG_version->value;
+
+            if (RawMSG_version->name_type == commands::cmd_version)
+            {
+                if (check_c2pool(json_value)){
+                    //c2pool
+                    //_socket->get_protocol_type<>
+                } else {
+                    //p2pool
+                    _socket->get_protocol_type<p2pool_protocol>();
+                }
+            }
+            else
+            {
+                LOG_WARNING << "initialize_network_protocol get not message_version";
+            }
+        }
+
+        shared_ptr<raw_message> make_raw_message() override
+        {
+            auto raw_msg = make_shared<raw_message>();
+            raw_msg->set_converter_type<p2pool_converter>();
+            return raw_msg;
+        }
+    };
+
     template <class converter_type>
     class P2P_Protocol : public Protocol
     {
     public:
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
         {
-            LOG_TRACE << "P2P_Protcol: " << "start constructor";
+            LOG_TRACE << "P2P_Protcol: "
+                      << "start constructor";
         }
 
         void handle(shared_ptr<raw_message> RawMSG) override
         {
+            LOG_DEBUG << "called HANDLE msg in p2p_protocol";
             //В Python скрипте, команда передается, как int, эквивалентный commands
-
+            RawMSG->deserialize();
+            LOG_TRACE << "rawmsg value = " << RawMSG->value.isNull();
+            LOG_TRACE << "RawMSG->value: " << RawMSG->value.write();
             UniValue json_value = RawMSG->value;
 
             switch (RawMSG->name_type) //todo: switch -> if (" " == cmd)

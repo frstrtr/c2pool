@@ -20,13 +20,14 @@ using namespace c2pool::libnet::messages;
 
 namespace c2pool::libnet::p2p
 {
+    //P2PSocket
 
     P2PSocket::P2PSocket(ip::tcp::socket socket) : _socket(std::move(socket))
     {
-        
     }
 
-    void P2PSocket::connector_init(protocol_handle const &handle, const boost::asio::ip::tcp::resolver::results_type endpoints){
+    void P2PSocket::connector_init(protocol_handle const &handle, const boost::asio::ip::tcp::resolver::results_type endpoints)
+    {
         //auto self = shared_from_this();
         boost::asio::async_connect(_socket, endpoints, [this, handle](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep) {
             LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
@@ -45,17 +46,21 @@ namespace c2pool::libnet::p2p
         });
     }
 
-    void P2PSocket::init(protocol_handle const &handle){
-        LOG_TRACE << "P2PSocket: " << "Start constructor";
+    void P2PSocket::init(protocol_handle const &handle)
+    {
+        LOG_TRACE << "P2PSocket: "
+                  << "Start constructor";
         //TODO: check p2pool/c2pool node
         shared_ptr<Protocol> temp_protocol;
 
-        LOG_TRACE << "P2PSocket: " << "before make_protocol";
+        LOG_TRACE << "P2PSocket: "
+                  << "before make_protocol";
         //if p2pool:
         //create P2P_Protocol<c2pool::libnet::messages::p2pool_converter>
         temp_protocol = make_shared<p2pool_protocol>(shared_from_this());
 
-        LOG_TRACE << "P2PSocket: " << "temp_protocol created";
+        LOG_TRACE << "P2PSocket: "
+                  << "temp_protocol created";
         //if c2pool:
         //create P2P_Protocol<c2pool::libnet::messages::c2pool_converter>
         //TODO: temp_protocol = make_shared<c2pool_protocol>(shared_from_this());
@@ -63,7 +68,8 @@ namespace c2pool::libnet::p2p
         //handle protocol for P2PNode
         handle(temp_protocol);
 
-        LOG_TRACE << "P2PSocket: " << "handle call";
+        LOG_TRACE << "P2PSocket: "
+                  << "handle call";
         //save protocol in P2PSocket like weak_ptr:
         _protocol = temp_protocol;
 
@@ -88,7 +94,7 @@ namespace c2pool::libnet::p2p
     {
         LOG_TRACE << "START READING!:";
         //make raw_message for reading data
-        LOG_TRACE << _protocol.lock().use_count();
+        LOG_TRACE << "protocol count" << _protocol.lock().use_count();
         shared_ptr<raw_message> tempRawMessage = _protocol.lock()->make_raw_message();
         LOG_TRACE << "created temp_raw_message";
         //Socket started for reading!
@@ -116,7 +122,7 @@ namespace c2pool::libnet::p2p
                                     else
                                     {
                                         LOG_TRACE << tempRawMessage->converter->prefix;
-                                        LOG_TRACE << "socket status when error in prefix: " <<_socket.is_open();
+                                        LOG_TRACE << "socket status when error in prefix: " << _socket.is_open();
                                         LOG_ERROR << "read_prefix: " << ec << " " << ec.message();
                                         disconnect();
                                     }
@@ -125,6 +131,7 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::read_command(shared_ptr<raw_message> tempRawMessage)
     {
+        LOG_TRACE << "protocol count in read_command" << _protocol.lock().use_count();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->command, COMMAND_LENGTH),
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
@@ -186,7 +193,6 @@ namespace c2pool::libnet::p2p
     void P2PSocket::read_payload(shared_ptr<raw_message> tempRawMessage)
     {
         LOG_TRACE << "read_payload";
-        LOG_TRACE << tempRawMessage->converter->get_unpacked_len();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len()),
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
@@ -194,8 +200,8 @@ namespace c2pool::libnet::p2p
                                     {
                                         c2pool::python::other::debug_log(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len());
                                         // LOG_INFO << "read_payload";
-                                        //todo: move tempMesssage -> new message
-                                        LOG_TRACE << "HANDLE MESSAGE!";
+                                        LOG_DEBUG << "HANDLE MESSAGE!";
+                                        _protocol.lock()->handle(tempRawMessage);
                                         start_read();
                                     }
                                     else

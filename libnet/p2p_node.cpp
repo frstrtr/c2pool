@@ -151,7 +151,11 @@ namespace c2pool::libnet::p2p
     bool P2PNode::protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
     {
         LOG_DEBUG << "P2PNode::protocol_connected";
-        //TODO:
+        if (protocol){
+            client_connections.insert(protocol);
+            return true;
+        }
+        LOG_WARNING << "P2PNode::protocol_connected - protocol = nullptr";
         return false;
     }
 

@@ -25,14 +25,19 @@ namespace c2pool::libnet::p2p
     public:
         //for receive
         P2PSocket(ip::tcp::socket socket);
-        
+
         //for connect
         void connector_init(protocol_handle const &handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
 
         void init(protocol_handle const &handle);
 
+        template <class protocol_type>
+        void get_protocol_type(){
+            
+        }
+
         bool isConnected() const { return _socket.is_open(); }
-        ip::tcp::socket& get() { return _socket; }
+        ip::tcp::socket &get() { return _socket; }
         void disconnect() { _socket.close(); }
 
         ip::tcp::endpoint endpoint()
