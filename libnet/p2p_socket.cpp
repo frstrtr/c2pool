@@ -1,5 +1,6 @@
 #include "p2p_socket.h"
 #include "messages.h"
+#include "p2p_protocol.h"
 #include <devcore/logger.h>
 #include <devcore/str.h>
 #include <networks/network.h>
@@ -50,31 +51,29 @@ namespace c2pool::libnet::p2p
     {
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
-        //TODO: check p2pool/c2pool node
-        shared_ptr<Protocol> temp_protocol;
 
-        LOG_TRACE << "P2PSocket: "
-                  << "before make_protocol";
         //if p2pool:
         //create P2P_Protocol<c2pool::libnet::messages::p2pool_converter>
-        temp_protocol = make_shared<p2pool_protocol>(shared_from_this());
+        initialize_protocol = std::make_shared<initialize_network_protocol>(shared_from_this(), handle);
 
-        LOG_TRACE << "P2PSocket: "
-                  << "temp_protocol created";
         //if c2pool:
         //create P2P_Protocol<c2pool::libnet::messages::c2pool_converter>
         //TODO: temp_protocol = make_shared<c2pool_protocol>(shared_from_this());
 
-        //handle protocol for P2PNode
-        handle(temp_protocol);
-
-        LOG_TRACE << "P2PSocket: "
-                  << "handle call";
-        //save protocol in P2PSocket like weak_ptr:
-        _protocol = temp_protocol;
+        _protocol = initialize_protocol;
 
         //start reading in socket:
         start_read();
+    }
+
+    template <class protocol_type>
+    void P2PSocket::get_protocol_type_and_version(protocol_handle const &handle, std::shared_ptr<raw_message> raw_message_version)
+    {
+        auto temp_protocol = std::make_shared<protocol_type>(shared_from_this());
+        handle(temp_protocol);
+
+        _protocol = temp_protocol;
+        _protocol.lock()->handle(raw_message_version);
     }
 
     void P2PSocket::write(std::shared_ptr<base_message> msg)

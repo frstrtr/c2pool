@@ -3,6 +3,7 @@
 #include "messages.h"
 #include "converter.h"
 #include <devcore/logger.h>
+#include "p2p_socket.h"
 using namespace c2pool::libnet::messages;
 
 #include <lib/univalue/include/univalue.h>
@@ -66,7 +67,7 @@ namespace c2pool::libnet::p2p
                     //_socket->get_protocol_type<>
                 } else {
                     //p2pool
-                    _socket->get_protocol_type<p2pool_protocol>();
+                    _socket->get_protocol_type_and_version<p2pool_protocol>(_handle, RawMSG_version);
                 }
             }
             else
