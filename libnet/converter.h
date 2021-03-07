@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <lib/univalue/include/univalue.h>
+#include <devcore/logger.h>
 
 #include <tuple>
 using std::tuple;
@@ -16,7 +17,8 @@ namespace c2pool::python
     class PyPackTypes;
 }
 
-namespace c2pool::libnet::p2p{
+namespace c2pool::libnet::p2p
+{
     class P2PSocket;
 }
 
@@ -26,6 +28,7 @@ namespace c2pool::libnet::messages
     {
         friend c2pool::python::PyPackTypes;
         friend c2pool::libnet::p2p::P2PSocket;
+
     protected:
         char *prefix;
         char command[COMMAND_LENGTH + 1];
@@ -76,7 +79,12 @@ namespace c2pool::libnet::messages
             return result;
         }
 
-        tuple<char *, int> encode(UniValue json) override { return std::make_tuple<char*, int>(get_data(), 0); }
+        tuple<char *, int> encode(UniValue json) override
+        {
+
+            LOG_WARNING << "called encode(json) from empty_converter!";
+            return std::make_tuple<char *, int>(get_data(), 0);
+        }
 
         virtual const char *get_command() { return command; }
 
@@ -84,10 +92,10 @@ namespace c2pool::libnet::messages
 
         bool isEmpty() override { return true; }
 
-        int get_prefix_len() override { return 0;}
+        int get_prefix_len() override { return 0; }
 
         void set_unpacked_len(char *packed_len = nullptr) override {}
-        int get_unpacked_len() override { return 0;}
+        int get_unpacked_len() override { return 0; }
     };
 
     //for p2pool serialize/deserialize
@@ -134,9 +142,7 @@ namespace c2pool::libnet::messages
         virtual const char *get_command() override { return command; }
         void set_command(const char *_command) override { strcpy(command, _command); }
 
-
-        
-        int get_prefix_len() override { return prefix_length;}
+        int get_prefix_len() override { return prefix_length; }
 
         int get_length();
 

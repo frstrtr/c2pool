@@ -91,8 +91,8 @@ namespace c2pool::libnet::p2p
                                                             auto _socket = std::make_shared<P2PSocket>(std::move(socket));
 
                                                             client_attempts[ip] = _socket;
-
-                                                            _socket->connector_init(boost::bind(&P2PNode::protocol_connected, this, _1), endpoints);
+                                                            protocol_handle handle = [this](shared_ptr<c2pool::libnet::p2p::Protocol> protocol){return protocol_connected(protocol);};
+                                                            _socket->connector_init(std::move(handle), endpoints);
                                                         });
                             }
                             catch (const std::exception &e)

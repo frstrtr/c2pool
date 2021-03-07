@@ -75,12 +75,15 @@ namespace c2pool::libnet::messages
 
     tuple<char *, int> p2pool_converter::encode(UniValue json)
     {
+        LOG_TRACE << "before set data with pypacktypes encode";
         set_data(c2pool::python::PyPackTypes::encode(json));
+        LOG_TRACE << "before return encode result";
         return make_tuple<char*, int>(get_data(), get_length());
     }
 
     UniValue p2pool_converter::decode()
     {
+        LOG_TRACE << "p2pool_converter::decode() called!";
         return c2pool::python::PyPackTypes::decode(shared_from_this());
     }
 

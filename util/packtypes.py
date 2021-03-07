@@ -468,7 +468,7 @@ class VarStrType(Type):
 
     def read(self, file):
         length = self._inner_size.read(file)
-        return file.read(length)
+        return file.read(length).decode('ascii')
 
     def write(self, file, item):
         self._inner_size.write(file, len(item))
@@ -570,7 +570,7 @@ class IntType(Type):
         if self.bytes == 0:
             return 0
         data = file.read(self.bytes)
-        return int(b2a_hex(data[::self.step]), 16)
+        return str(int(b2a_hex(data[::self.step]), 16))
 
     def write(self, file, item, a2b_hex=binascii.a2b_hex):
         if self.bytes == 0:
@@ -941,23 +941,28 @@ def serialize_msg(raw_json):
     """
 
     _json = TYPE.get_json_dict(raw_json)
-    _type = TYPE.get_type(json['name_type'])
+    print(_json)
+    _type = TYPE.get_type("message_"+_json['name_type'])
+    print(_json["name_type"])
+    print(_type)
 
     # if error command
     if _type is None:
         return 'ERROR'
-    command = bytes(json['name_type'], encoding='ISO-8859-1')
+    command = bytes(_json['name_type'], encoding='ISO-8859-1')
 
-    payload = _type.pack(json['value'])
+    payload = _type.pack(_json['value'])
 
-    #print('SEND_PAYLOAD: {0}'.format(payload))
+    print('SEND_PAYLOAD: {0}'.format(payload))
 
     result = struct.pack('<12sI', command, len(
         payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-    #print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
-    #print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
+    print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
+    print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
+#test
+print(serialize_msg("{\"name_type\":\"version\",\"value\":{\"version\":3301,\"services\":0,\"addr_to\":{\"services\":3,\"address\":\"4.5.6.7\",\"port\":8},\"addr_from\":{\"services\":9,\"address\":\"10.11.12.13\",\"port\":14},\"nonce\":6535423,\"sub_version\":\"16\",\"mode\":18,\"best_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000123\"}}"))
 
 def deserialize(name_type, _bytes_array):
     _type = TYPE.get_type(name_type)
@@ -995,7 +1000,7 @@ def deserialize_msg(_command, checksum, payload):
         'value': value
     }
     print(result)
-    return result
+    return str(result).replace("\'", "\"")
 
 #test: deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 

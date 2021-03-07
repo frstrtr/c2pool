@@ -98,12 +98,13 @@ namespace c2pool::libnet::messages
         //base_message -> bytes; msg = self
         std::tuple<char *, int> serialize()
         {
+            LOG_TRACE << "start serialize msg";
             UniValue json_msg(UniValue::VOBJ);
             json_msg.pushKV("name_type", converter->get_command());
             UniValue msg_value(UniValue::VOBJ);
             msg_value = json_pack();
             json_msg.pushKV("value", msg_value);
-
+            LOG_TRACE << "before encode message in serialize";
             return converter->encode(json_msg);
         }
     };

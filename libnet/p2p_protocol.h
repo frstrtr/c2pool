@@ -7,6 +7,7 @@
 using namespace c2pool::libnet::messages;
 
 #include <lib/univalue/include/univalue.h>
+#include <btclibs/uint256.h>
 
 #include <memory>
 using std::shared_ptr, std::weak_ptr, std::make_shared;
@@ -20,61 +21,48 @@ namespace c2pool::libnet::p2p
 {
     class Protocol
     {
+    public:
+        const int version;
+
+        unsigned int other_version = -1;
+        std::string other_sub_version;
+        int other_services; //TODO: int64? IntType(64)
+        unsigned long long _nonce;
+
     protected:
         shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
 
     protected:
-        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct)
-        {
-            LOG_TRACE << "Base protocol: "
-                      << "start constuctor";
-            _socket = _sct;
-        }
+        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct);
 
     public:
-        virtual void handle(shared_ptr<raw_message> RawMSG) = 0;
+        virtual void handle(shared_ptr<raw_message> RawMSG) {}
 
-        virtual shared_ptr<raw_message> make_raw_message() = 0;
+        virtual shared_ptr<raw_message> make_raw_message() { return make_shared<raw_message>(); }
     };
 
     //protocol for init network type [c2pool/p2pool]; user only for messave_version
-    class initialize_network_protocol : public Protocol
+    class initialize_network_protocol : public Protocol, public std::enable_shared_from_this<initialize_network_protocol>
     {
     private:
-        protocol_handle const &_handle;
+        protocol_handle _handle;
+
+        int test; //-remove
 
         //true = c2pool; false = p2pool
-        bool check_c2pool(UniValue &raw_message_version_json){
+        bool check_c2pool(UniValue &raw_message_version_json)
+        {
             //todo
-            return false;            
+            return false;
         }
+
     public:
-        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle const &handle) : Protocol(socket), _handle(handle)
+        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle handle_obj) : Protocol(socket), _handle(std::move(handle_obj))
         {
+            test = 1337;
         }
 
-        void handle(shared_ptr<raw_message> RawMSG_version) override
-        {
-            LOG_DEBUG << "called handle in initialize_network_protocol.";
-            RawMSG_version->deserialize();
-
-            UniValue json_value = RawMSG_version->value;
-
-            if (RawMSG_version->name_type == commands::cmd_version)
-            {
-                if (check_c2pool(json_value)){
-                    //c2pool
-                    //_socket->get_protocol_type<>
-                } else {
-                    //p2pool
-                    _socket->get_protocol_type_and_version<p2pool_protocol>(_handle, RawMSG_version);
-                }
-            }
-            else
-            {
-                LOG_WARNING << "initialize_network_protocol get not message_version";
-            }
-        }
+        void handle(shared_ptr<raw_message> RawMSG_version) override;
 
         shared_ptr<raw_message> make_raw_message() override
         {
@@ -166,6 +154,94 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_version> msg)
         {
+            LOG_DEBUG << "handle message_version";
+
+            LOG_TRACE << msg->best_share_hash.GetHex();
+
+            //--------
+            LOG_INFO << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version << ", client version " << msg->sub_version;
+
+            if (other_version != -1)
+            {
+                //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
+            }
+            //TODO; if (msg->version < nodes->p2p_node->net()->MINIMUM_PROTOCOL_VERSION)
+            {
+                //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
+            }
+
+            other_version = msg->version;
+            other_sub_version = msg->sub_version;
+            other_services = msg->services;
+
+            //TODO: if (msg->nonce == nodes->p2p_node->nonce) //TODO: add nonce in Node
+            {
+                //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
+            }
+
+            //detect duplicate in node->peers
+            // for (auto _peer : nodes->p2p_node->peers)
+            // {
+            //     if (_peer.first == msg->nonce)
+            //     {
+            //         LOG_WARNING << "Detected duplicate connection, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
+            //         disconnect();
+            //         return;
+            //     }
+            // }
+
+            _nonce = msg->nonce;
+            //connected2 = true; //?
+
+            //TODO: safe thrade cancel
+            //todo: timeout_delayed.cancel();
+            //timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100)); //todo: timer io from constructor
+            //todo: timeout_delayed.async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
+            //_____________
+
+            /* TODO: TIMER + DELEGATE
+             old_dataReceived = self.dataReceived
+        def new_dataReceived(data):
+            if self.timeout_delayed is not None:
+                self.timeout_delayed.reset(100)
+            old_dataReceived(data)
+        self.dataReceived = new_dataReceived
+             */
+
+            // factory->protocol_connected(shared_from_this());
+
+            /* TODO: thread (coroutine?):
+             self._stop_thread = deferral.run_repeatedly(lambda: [
+            self.send_ping(),
+        random.expovariate(1/100)][-1])
+
+             if self.node.advertise_ip:
+            self._stop_thread2 = deferral.run_repeatedly(lambda: [
+                self.sendAdvertisement(),
+            random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
+             */
+
+            //best_hash = 0 default?
+            // if (best_hash != -1)
+            // {                                                 // -1 = None
+            //     node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
+            // }
+            //--------
+
+            // message_version* msg = new message_version()
+            int ver = version;
+            std::string test_sub_ver = "16";
+            unsigned long long test_nonce = 6535423;
+            c2pool::util::messages::address_type addrs1(3, "4.5.6.7", 8);
+            c2pool::util::messages::address_type addrs2(9, "10.11.12.13", 14);
+            uint256 best_hash_test_answer;
+            best_hash_test_answer.SetHex("0123");
+            shared_ptr<message_version> answer_msg = std::make_shared<message_version>(ver, 0, addrs1, addrs2, test_nonce, test_sub_ver, 18, best_hash_test_answer);
+            LOG_TRACE << "set converter type for answer msg";
+            answer_msg->set_converter_type<converter_type>();
+            LOG_TRACE << "write answer msg for socket";
+            _socket->write(answer_msg);
+            // _socket->write()
             //TODO:
         }
         void handle(shared_ptr<message_addrs> msg)

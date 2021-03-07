@@ -1,17 +1,15 @@
 #pragma once
 
-
 #include "messages.h"
 using namespace c2pool::libnet::messages;
 namespace c2pool::libnet
 {
-    namespace p2p{
+    namespace p2p
+    {
         class Protocol;
         class initialize_network_protocol;
     }
 } // namespace c2pool
-
-
 
 #include <memory>
 #include <networks/network.h>
@@ -30,12 +28,12 @@ namespace c2pool::libnet::p2p
         P2PSocket(ip::tcp::socket socket);
 
         //for connect
-        void connector_init(protocol_handle const &handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
+        void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
 
-        void init(protocol_handle const &handle);
+        void init(protocol_handle handle);
 
         template <class protocol_type>
-        void get_protocol_type_and_version(protocol_handle const &handle, std::shared_ptr<raw_message> raw_message_version);
+        void set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version);
 
         bool isConnected() const { return _socket.is_open(); }
         ip::tcp::socket &get() { return _socket; }
