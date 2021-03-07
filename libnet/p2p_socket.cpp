@@ -27,7 +27,7 @@ namespace c2pool::libnet::p2p
     {
     }
 
-    void P2PSocket::connector_init(protocol_handle const &handle, const boost::asio::ip::tcp::resolver::results_type endpoints)
+    void P2PSocket::connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints)
     {
         //auto self = shared_from_this();
         boost::asio::async_connect(_socket, endpoints, [this, handle](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep) {
@@ -47,7 +47,7 @@ namespace c2pool::libnet::p2p
         });
     }
 
-    void P2PSocket::init(protocol_handle const &handle)
+    void P2PSocket::init(protocol_handle handle)
     {
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
@@ -67,14 +67,28 @@ namespace c2pool::libnet::p2p
     }
 
     template <class protocol_type>
-    void P2PSocket::get_protocol_type_and_version(protocol_handle const &handle, std::shared_ptr<raw_message> raw_message_version)
+    void P2PSocket::set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version)
     {
-        auto temp_protocol = std::make_shared<protocol_type>(shared_from_this());
-        handle(temp_protocol);
+        LOG_TRACE << "Set new protocol type!";
+        std::shared_ptr<c2pool::libnet::p2p::Protocol> temp_protocol = std::make_shared<protocol_type>(shared_from_this());
+        LOG_TRACE << "Called handle";
+        LOG_TRACE << handle;
+        if (handle.empty())
+        {
+            LOG_TRACE << "handle empty";
+        } else {
+            LOG_TRACE << "handle not empty";
+        }
 
+        LOG_TRACE << "Called handle";
+        handle(temp_protocol); // <---------------bug there!!!!!!!!!
+        LOG_TRACE << "Set new protocol like main!";
         _protocol = temp_protocol;
         _protocol.lock()->handle(raw_message_version);
+        LOG_TRACE << "set_protocol_type_and_version ended!";
     }
+
+    template void P2PSocket::set_protocol_type_and_version<p2pool_protocol>(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version);
 
     void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
@@ -84,7 +98,7 @@ namespace c2pool::libnet::p2p
                                  [this](boost::system::error_code _ec, std::size_t length) {
                                      if (_ec)
                                      {
-                                         //TODO: LOG ERROR
+                                         LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
                                      }
                                  });
     }

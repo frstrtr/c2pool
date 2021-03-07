@@ -21,7 +21,7 @@ namespace c2pool::python
     {
     protected:
         //ex. filepath: "/src/util"
-        static auto GetMethodObject(const char *method_name, const char* filepath, const char *filename)
+        static auto GetMethodObject(const char *method_name, const char *filepath, const char *filename)
         {
             Py::Initialize();
 
@@ -85,6 +85,7 @@ namespace c2pool::python
                 Py_XDECREF(pResultRepr);
                 Py_XDECREF(pyObj);
             }
+
             ret += 1;                 //remove first element ['] in string
             ret[strlen(ret) - 1] = 0; //remove last element ['] in string
 

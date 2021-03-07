@@ -91,17 +91,23 @@ namespace c2pool::python
         auto methodObj = GetMethodObject("serialize_msg", filepath, "packtypes");
         if (methodObj == nullptr)
         {
+            LOG_WARNING << "serialize_msg not founded";
             return nullptr; //TODO обработка ситуации, если получено nullptr
         }
+        LOG_TRACE << "1 encode";
+        LOG_TRACE << "json_msg.write(): " << json_msg.write();
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
+        LOG_TRACE << "2 encode";
         auto result = GetCallFunctionResult(pVal);
-
+        LOG_TRACE << "3 encode";
         if (c2pool::dev::compare_str(result, "ERROR", 5))
         {
+            LOG_TRACE << result;
             //ERROR
             return "";
         }
-
+        LOG_TRACE << "4 encode";
+        LOG_TRACE << result;
         return c2pool::dev::from_bytes_to_strChar(result);
     }
 
@@ -117,8 +123,10 @@ namespace c2pool::python
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->get_unpacked_len());
 
         auto raw_result = GetCallFunctionResult(pVal);
+        LOG_TRACE << "raw_result: " << raw_result;
         result.read(raw_result);
-
+        //result.read("{"name_type": 0, "value": {"addr_from": {"address": "10.10.10.10", "port": 5024, "services": 0}, "addr_to": {"address": "10.10.10.1", "port": 6736, "services": 0}, "best_share_hash": \"40867716461082619671918594213535070784980289528248303516486975277206795153061\", \"mode\": 1, \"nonce\": 2713422397866666268, \"services\": 0, \"sub_version\": b\"fa6c7cd-dirty-c2pool\", \"version\": 3301}}")
+        LOG_TRACE << "result :" << result.write();
         return result;
     }
 
