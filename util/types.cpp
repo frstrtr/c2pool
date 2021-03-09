@@ -12,7 +12,7 @@ namespace c2pool::util::messages
         port = 0;
     }
 
-    address_type::address_type(int _services, std::string _address, int _port)
+    address_type::address_type(unsigned long long _services, std::string _address, int _port)
     {
         services = _services;
         address = _address;

@@ -92,6 +92,8 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
+        //TODO-----------------------------------<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>
+        //['83', 'e6', '5d', '2c', '81', 'bf', '6d', '68'] PREFIX insert
         auto msg_data = msg->serialize(); //tuple<char*, int>(data, len)
         boost::asio::async_write(_socket, boost::asio::buffer(std::get<0>(msg_data), std::get<1>(msg_data)),
                                  //TODO: this -> shared_this()
@@ -122,7 +124,7 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->prefix, 8),
-                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
                                     LOG_TRACE << "try to read prefix";
                                     if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
                                     {
@@ -135,6 +137,7 @@ namespace c2pool::libnet::p2p
                                     else
                                     {
                                         LOG_TRACE << tempRawMessage->converter->prefix;
+                                        LOG_TRACE << "read_prefix: " << length;
                                         LOG_TRACE << "socket status when error in prefix: " << _socket.is_open();
                                         LOG_ERROR << "read_prefix: " << ec << " " << ec.message();
                                         disconnect();
