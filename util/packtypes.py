@@ -534,7 +534,10 @@ class StructType(Type):
 
     def read(self, file):
         data = file.read(self.length)
-        return struct.unpack(self.desc, data)[0]
+        result = struct.unpack(self.desc, data)[0]
+        if (self.length == 8):
+            result = str(result)
+        return result
 
     def write(self, file, item):
         file.write(struct.pack(self.desc, item))
@@ -906,6 +909,15 @@ class TYPE:
     def get_type(cls, name_type):
         return getattr(cls, name_type, None)
 
+#==============================
+
+    @classmethod
+    def get_value_version(cls, json_value):
+        json_value["best_share_hash"] = int(json_value["best_share_hash"], 16)
+        return json_value
+
+#==============================
+
     @classmethod
     def get_json_dict(cls, raw_json):
         '''
@@ -913,7 +925,17 @@ class TYPE:
             +
             Пост-обработка спецефичных структур
         '''
-        return json.loads(raw_json)
+        _json_dict = json.loads(raw_json)
+        name_type = _json_dict["name_type"]
+        value_func = getattr(cls, "get_value_" + name_type, None)
+
+        if value_func is None:
+            print("value_func is None!")
+            assert(False)
+
+        value = value_func(_json_dict["value"])
+
+        return name_type, value
 
     # @classmethod
     # def
@@ -939,19 +961,17 @@ def serialize_msg(raw_json):
     """
         called when we send msg from c2pool to p2pool
     """
-
-    _json = TYPE.get_json_dict(raw_json)
-    print(_json)
-    _type = TYPE.get_type("message_"+_json['name_type'])
-    print(_json["name_type"])
-    print(_type)
+    print("serialize_msg started")
+    name_type, value = TYPE.get_json_dict(raw_json)
+    print("name_type = {0}, value = {1}".format(name_type, value))
+    _type = TYPE.get_type("message_"+name_type)
 
     # if error command
     if _type is None:
         return 'ERROR'
-    command = bytes(_json['name_type'], encoding='ISO-8859-1')
+    command = bytes(name_type, encoding='ISO-8859-1')
 
-    payload = _type.pack(_json['value'])
+    payload = _type.pack(value)
 
     print('SEND_PAYLOAD: {0}'.format(payload))
 
@@ -962,7 +982,7 @@ def serialize_msg(raw_json):
     return bytes_to_char_stringstream(result)
 
 #test
-print(serialize_msg("{\"name_type\":\"version\",\"value\":{\"version\":3301,\"services\":0,\"addr_to\":{\"services\":3,\"address\":\"4.5.6.7\",\"port\":8},\"addr_from\":{\"services\":9,\"address\":\"10.11.12.13\",\"port\":14},\"nonce\":6535423,\"sub_version\":\"16\",\"mode\":18,\"best_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000123\"}}"))
+#print(serialize_msg("{\"name_type\":\"version\",\"value\":{\"version\":3301,\"services\":0,\"addr_to\":{\"services\":3,\"address\":\"4.5.6.7\",\"port\":8},\"addr_from\":{\"services\":9,\"address\":\"10.11.12.13\",\"port\":14},\"nonce\":6535423,\"sub_version\":\"16\",\"mode\":18,\"best_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000123\"}}"))
 
 def deserialize(name_type, _bytes_array):
     _type = TYPE.get_type(name_type)
@@ -1002,7 +1022,7 @@ def deserialize_msg(_command, checksum, payload):
     print(result)
     return str(result).replace("\'", "\"")
 
-#test: deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
+deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 
 def packed_size(raw_json):
     _json = TYPE.get_json_dict(raw_json)

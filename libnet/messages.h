@@ -9,6 +9,7 @@
 
 #include <sstream>
 #include <string>
+#include <sstream>
 #include <vector>
 #include <memory>
 #include <tuple>
@@ -174,14 +175,31 @@ namespace c2pool::libnet::messages
 
         message_version &operator=(UniValue value)
         {
+            LOG_TRACE << "1";
             version = value["version"].get_int();
-            services = value["services"].get_int();
+            LOG_TRACE << "1";
+            auto services_str = value["services"].get_str();
+            std::stringstream ss_services;
+            ss_services << services_str;
+            ss_services >> services;
+            
+            LOG_TRACE << "1";
             addr_to = value["addr_to"].get_obj();
+            LOG_TRACE << "1";
             addr_from = value["addr_from"].get_obj();
-            nonce = value["nonce"].get_int64();
+            LOG_TRACE << "1";
+            auto str_nonce = value["nonce"].get_str();
+            std::stringstream ss_nonce;
+            ss_nonce << str_nonce;
+            ss_nonce >> nonce;
+
+            LOG_TRACE << "1";
             sub_version = value["sub_version"].get_str();
+            LOG_TRACE << "1";
             mode = value["mode"].get_int();
+            LOG_TRACE << "1";
             best_share_hash.SetHex(value["best_share_hash"].get_str());
+            LOG_TRACE << "1";
             if (value.exists("pool_version"))
             {
                 int pool_ver_temp = value["pool_version"].get_int();
@@ -191,6 +209,7 @@ namespace c2pool::libnet::messages
             {
                 pool_version = PoolVersion::None;
             }
+            LOG_TRACE << "1";
             return *this;
         }
 

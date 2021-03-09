@@ -122,7 +122,7 @@ int main(int ac, char *av[])
 
     while (exitSignalHandler.working())
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000)); //todo: std::chrono::milliseconds(100)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10000)); //todo: std::chrono::milliseconds(100)
         std::cout << "main thread" << std::endl;
     }
 

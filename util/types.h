@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <sstream>
 #include "univalue.h"
 
 //todo: move all methods to types.cpp
@@ -15,17 +16,21 @@ namespace c2pool::util::messages
             ('address', pack.IPV6AddressType()),
             ('port', pack.IntType(16, 'big')),
          */
-        int services;
+        unsigned long long services;
         std::string address;
         int port;
 
         address_type();
 
-        address_type(int _services, std::string _address, int _port);
+        address_type(unsigned long long _services, std::string _address, int _port);
 
         address_type &operator=(UniValue value)
         {
-            services = value["services"].get_int();
+            auto services_str = value["services"].get_str();
+            std::stringstream ss_services;
+            ss_services << services_str;
+            ss_services >> services;
+
             address = value["address"].get_str();
             port = value["port"].get_int();
             return *this;
@@ -35,7 +40,7 @@ namespace c2pool::util::messages
         {
             UniValue result(UniValue::VOBJ);
 
-            result.pushKV("services", services);
+            result.pushKV("services", (uint64_t)services);
             result.pushKV("address", address);
             result.pushKV("port", port);
 

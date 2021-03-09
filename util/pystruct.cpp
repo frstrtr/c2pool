@@ -94,19 +94,17 @@ namespace c2pool::python
             LOG_WARNING << "serialize_msg not founded";
             return nullptr; //TODO обработка ситуации, если получено nullptr
         }
-        LOG_TRACE << "1 encode";
-        LOG_TRACE << "json_msg.write(): " << json_msg.write();
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", json_msg.write());
-        LOG_TRACE << "2 encode";
+        //auto msg_json_str = "{\"name_type\":\"version\",\"value\":{\"version\":3301,\"services\":0,\"addr_to\":{\"services\":3,\"address\":\"4.5.6.7\",\"port\":8},\"addr_from\":{\"services\":9,\"address\":\"10.11.12.13\",\"port\":14},\"nonce\":6535423,\"sub_version\":\"16\",\"mode\":18,\"best_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000123\"}}";//json_msg.write().c_str();
+        string str = json_msg.write();
+        const char* msg_json_str = str.c_str();
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg_json_str);
         auto result = GetCallFunctionResult(pVal);
-        LOG_TRACE << "3 encode";
         if (c2pool::dev::compare_str(result, "ERROR", 5))
         {
             LOG_TRACE << result;
             //ERROR
             return "";
         }
-        LOG_TRACE << "4 encode";
         LOG_TRACE << result;
         return c2pool::dev::from_bytes_to_strChar(result);
     }
