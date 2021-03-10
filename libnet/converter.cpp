@@ -94,7 +94,7 @@ namespace c2pool::libnet::messages
 
     int p2pool_converter::get_length()
     {
-        return prefix_length + COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + get_unpacked_len();
+        return COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + get_unpacked_len();
     }
 
 } // namespace c2pool::libnet::messages
