@@ -57,6 +57,9 @@ namespace c2pool::libnet::p2p
         void read_checksum(shared_ptr<raw_message> tempRawMessage);
         void read_payload(std::shared_ptr<raw_message> tempRawMessage);
 
+        void write_prefix(std::shared_ptr<base_message> msg);
+        void write_message_data(std::shared_ptr<base_message> msg);
+
     private:
         std::shared_ptr<c2pool::Network> _net;
         ip::tcp::socket _socket;
