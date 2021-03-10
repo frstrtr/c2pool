@@ -68,8 +68,9 @@ namespace c2pool::libnet::messages
             converter = std::make_shared<converter_type>(converter);
         }
 
-        void set_prefix(std::shared_ptr<c2pool::Network> _net){
-            converter->set_prefix((const char*)_net->PREFIX, _net->PREFIX_LENGTH);
+        void set_prefix(std::shared_ptr<c2pool::Network> _net)
+        {
+            converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
         }
 
         void deserialize()
@@ -84,6 +85,7 @@ namespace c2pool::libnet::messages
     class base_message
     {
         friend class c2pool::python::PyPackTypes;
+
     protected:
         std::shared_ptr<bytes_converter> converter;
 
@@ -99,6 +101,16 @@ namespace c2pool::libnet::messages
         void set_converter_type()
         {
             converter = std::make_shared<converter_type>(converter);
+        }
+
+        void set_prefix(std::shared_ptr<c2pool::Network> _net)
+        {
+            converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
+        }
+
+        std::tuple<char *, int> get_prefix(){
+            auto res = std::make_tuple<char*, int>(converter->get_prefix(), converter->get_prefix_len());
+            return res;
         }
 
         //base_message -> bytes; msg = self
@@ -187,7 +199,7 @@ namespace c2pool::libnet::messages
             std::stringstream ss_services;
             ss_services << services_str;
             ss_services >> services;
-            
+
             LOG_TRACE << "1";
             addr_to = value["addr_to"].get_obj();
             LOG_TRACE << "1";

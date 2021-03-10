@@ -142,6 +142,14 @@ namespace c2pool::libnet::p2p
             return raw_msg;
         }
 
+        template <class message_type, class... Args>
+        shared_ptr<message_type> make_message(Args&&... args){
+            auto msg = std::make_shared<message_type>(args...);
+            msg->template set_converter_type<converter_type>();
+            msg->set_prefix(_net);
+            return msg;
+        }
+
     protected:
         template <class MsgType>
         //template <class MsgType<>, class ct = converter_type>
@@ -237,9 +245,8 @@ namespace c2pool::libnet::p2p
             c2pool::util::messages::address_type addrs2(9, "10.11.12.13", 14);
             uint256 best_hash_test_answer;
             best_hash_test_answer.SetHex("0123");
-            shared_ptr<message_version> answer_msg = std::make_shared<message_version>(ver, 0, addrs1, addrs2, test_nonce, test_sub_ver, 18, best_hash_test_answer);
+            shared_ptr<message_version> answer_msg = make_message<message_version>(ver, 0, addrs1, addrs2, test_nonce, test_sub_ver, 18, best_hash_test_answer);
             LOG_TRACE << "set converter type for answer msg";
-            answer_msg->set_converter_type<converter_type>();
             LOG_TRACE << "write answer msg for socket";
             _socket->write(answer_msg);
             // _socket->write()

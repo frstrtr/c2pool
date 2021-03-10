@@ -76,7 +76,9 @@ namespace c2pool::libnet::p2p
         if (handle.empty())
         {
             LOG_TRACE << "handle empty";
-        } else {
+        }
+        else
+        {
             LOG_TRACE << "handle not empty";
         }
 
@@ -94,6 +96,28 @@ namespace c2pool::libnet::p2p
     {
         //TODO-----------------------------------<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>
         //['83', 'e6', '5d', '2c', '81', 'bf', '6d', '68'] PREFIX insert
+
+        write_prefix(msg);        
+
+        
+    }
+
+    void P2PSocket::write_prefix(std::shared_ptr<base_message> msg)
+    {
+        auto prefix_data = msg->get_prefix();
+        boost::asio::async_write(_socket, boost::asio::buffer(std::get<0>(prefix_data), std::get<1>(prefix_data)),
+                                 [this, msg](boost::system::error_code _ec, std::size_t length) {
+                                     if (_ec)
+                                     {
+                                         LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+                                         return;
+                                     }
+                                     write_message_data(msg);
+                                 });
+    }
+
+    void P2PSocket::write_message_data(std::shared_ptr<base_message> msg)
+    {
         auto msg_data = msg->serialize(); //tuple<char*, int>(data, len)
         boost::asio::async_write(_socket, boost::asio::buffer(std::get<0>(msg_data), std::get<1>(msg_data)),
                                  //TODO: this -> shared_this()
