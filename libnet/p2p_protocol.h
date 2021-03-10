@@ -31,9 +31,10 @@ namespace c2pool::libnet::p2p
 
     protected:
         shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
+        std::shared_ptr<c2pool::Network> _net;
 
     protected:
-        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct);
+        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, std::shared_ptr<c2pool::Network> _network);
 
     public:
         virtual void handle(shared_ptr<raw_message> RawMSG) {}
@@ -47,8 +48,6 @@ namespace c2pool::libnet::p2p
     private:
         protocol_handle _handle;
 
-        int test; //-remove
-
         //true = c2pool; false = p2pool
         bool check_c2pool(UniValue &raw_message_version_json)
         {
@@ -57,9 +56,8 @@ namespace c2pool::libnet::p2p
         }
 
     public:
-        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle handle_obj) : Protocol(socket), _handle(std::move(handle_obj))
+        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle handle_obj, std::shared_ptr<c2pool::Network> _network) : Protocol(socket, _network), _handle(std::move(handle_obj))
         {
-            test = 1337;
         }
 
         void handle(shared_ptr<raw_message> RawMSG_version) override;
@@ -68,6 +66,7 @@ namespace c2pool::libnet::p2p
         {
             auto raw_msg = make_shared<raw_message>();
             raw_msg->set_converter_type<p2pool_converter>();
+            raw_msg->set_prefix(_net);
             return raw_msg;
         }
     };
@@ -76,7 +75,8 @@ namespace c2pool::libnet::p2p
     class P2P_Protocol : public Protocol
     {
     public:
-        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
+        //TODO: constructor (shared_ptr<initialize_network_protocol>)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, shared_ptr<c2pool::Network> _network) : Protocol(socket, _network)
         {
             LOG_TRACE << "P2P_Protcol: "
                       << "start constructor";
@@ -138,6 +138,7 @@ namespace c2pool::libnet::p2p
         {
             auto raw_msg = make_shared<raw_message>();
             raw_msg->set_converter_type<converter_type>();
+            raw_msg->set_prefix(_net);
             return raw_msg;
         }
 

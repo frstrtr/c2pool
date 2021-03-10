@@ -89,12 +89,12 @@ namespace c2pool::libnet::messages
 
     void p2pool_converter::set_data(char *data_)
     {
-        memcpy(data, data_, set_length(data_));
+        memcpy(data, data_, set_length(data_)); //set_length return len for data_
     }
 
     int p2pool_converter::get_length()
     {
-        return COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + get_unpacked_len();
+        return prefix_length + COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + get_unpacked_len();
     }
 
 } // namespace c2pool::libnet::messages

@@ -6,6 +6,7 @@
 #include <util/types.h>
 #include <btclibs/uint256.h>
 #include <sharechain/shareTypes.h>
+#include <networks/network.h>
 
 #include <sstream>
 #include <string>
@@ -65,6 +66,10 @@ namespace c2pool::libnet::messages
         void set_converter_type()
         {
             converter = std::make_shared<converter_type>(converter);
+        }
+
+        void set_prefix(std::shared_ptr<c2pool::Network> _net){
+            converter->set_prefix((const char*)_net->PREFIX, _net->PREFIX_LENGTH);
         }
 
         void deserialize()
