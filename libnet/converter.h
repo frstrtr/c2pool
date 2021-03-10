@@ -31,6 +31,8 @@ namespace c2pool::libnet::messages
 
     protected:
         char *prefix;
+        int prefix_length = 0;
+
         char command[COMMAND_LENGTH + 1];
         char length[PAYLOAD_LENGTH + 1];
         char checksum[CHECKSUM_LENGTH + 1];
@@ -39,6 +41,23 @@ namespace c2pool::libnet::messages
     public:
         virtual char *get_data() = 0;
         virtual void set_data(char *data_) = 0;
+
+        char *get_prefix()
+        {
+            return prefix;
+        }
+
+        int get_prefix_len()
+        {
+            return prefix_length;
+        }
+
+        void set_prefix(const char *_prefix, int pref_len)
+        {
+            prefix = new char[pref_len];
+            memcpy(prefix, _prefix, pref_len);
+            prefix_length = pref_len;
+        }
 
         //from command, length, checksum, payload to data
         virtual UniValue decode() = 0; //old: decode_data
@@ -49,9 +68,7 @@ namespace c2pool::libnet::messages
         virtual void set_command(const char *_command) = 0;
 
         virtual bool isEmpty() { return false; }
-
-        virtual int get_prefix_len() = 0;
-
+        
         virtual void set_unpacked_len(char *packed_len = nullptr) = 0;
         virtual int get_unpacked_len() = 0;
     };
@@ -92,8 +109,6 @@ namespace c2pool::libnet::messages
 
         bool isEmpty() override { return true; }
 
-        int get_prefix_len() override { return 0; }
-
         void set_unpacked_len(char *packed_len = nullptr) override {}
         int get_unpacked_len() override { return 0; }
     };
@@ -104,7 +119,6 @@ namespace c2pool::libnet::messages
         friend c2pool::python::PyPackTypes;
 
     public:
-        int prefix_length;
         void set_unpacked_len(char *packed_len = nullptr);
         int get_unpacked_len() override;
 
@@ -141,8 +155,6 @@ namespace c2pool::libnet::messages
 
         virtual const char *get_command() override { return command; }
         void set_command(const char *_command) override { strcpy(command, _command); }
-
-        int get_prefix_len() override { return prefix_length; }
 
         int get_length();
 

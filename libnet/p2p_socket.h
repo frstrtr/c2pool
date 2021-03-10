@@ -2,9 +2,11 @@
 
 #include "messages.h"
 using namespace c2pool::libnet::messages;
-namespace c2pool::libnet
+namespace c2pool
 {
-    namespace p2p
+    class Network;
+
+    namespace libnet::p2p
     {
         class Protocol;
         class initialize_network_protocol;
@@ -25,7 +27,7 @@ namespace c2pool::libnet::p2p
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket);
+        P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network);
 
         //for connect
         void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
