@@ -3,6 +3,7 @@
 #include <string>
 #include <sstream>
 #include "univalue.h"
+#include <devcore/common.h>
 
 //todo: move all methods to types.cpp
 namespace c2pool::util::messages
@@ -26,10 +27,7 @@ namespace c2pool::util::messages
 
         address_type &operator=(UniValue value)
         {
-            auto services_str = value["services"].get_str();
-            std::stringstream ss_services;
-            ss_services << services_str;
-            ss_services >> services;
+            services = c2pool::dev::str_to_int<unsigned long long>(value["services"].get_str());
 
             address = value["address"].get_str();
             port = value["port"].get_int();
@@ -98,7 +96,9 @@ namespace c2pool::util::messages
 
         addr &operator=(UniValue value)
         {
-            timestamp = value["timestamp"].get_int();
+            timestamp = c2pool::dev::str_to_int<int>(value["timestamp"].get_str());
+
+
             address = value["address"].get_obj();
             return *this;
         }
