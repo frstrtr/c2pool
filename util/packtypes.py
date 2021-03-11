@@ -929,11 +929,12 @@ class TYPE:
         name_type = _json_dict["name_type"]
         value_func = getattr(cls, "get_value_" + name_type, None)
 
+        value = {}
         if value_func is None:
             print("value_func is None!")
-            assert(False)
-
-        value = value_func(_json_dict["value"])
+            value = _json_dict["value"]
+        else:
+            value = value_func(_json_dict["value"])
 
         return name_type, value
 
@@ -961,9 +962,9 @@ def serialize_msg(raw_json):
     """
         called when we send msg from c2pool to p2pool
     """
-    print("serialize_msg started")
+    # print("serialize_msg started")
     name_type, value = TYPE.get_json_dict(raw_json)
-    print("name_type = {0}, value = {1}".format(name_type, value))
+    # print("name_type = {0}, value = {1}".format(name_type, value))
     _type = TYPE.get_type("message_"+name_type)
 
     # if error command
@@ -973,16 +974,19 @@ def serialize_msg(raw_json):
 
     payload = _type.pack(value)
 
-    print('SEND_PAYLOAD: {0}'.format(payload))
+    # print('SEND_PAYLOAD: {0}'.format(payload))
 
     result = struct.pack('<12sI', command, len(
         payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
-    print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
-    print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
+    # print('FROM_PYTHON: send [result]: {0}, len: {1}'.format(result, len(result)))
+    # print('py_send result: {0}, after convert: {1}, len: {2}'.format(result, bytes_to_char_stringstream(result), len(result)))
     return bytes_to_char_stringstream(result)
 
 #test
 #print(serialize_msg("{\"name_type\":\"version\",\"value\":{\"version\":3301,\"services\":0,\"addr_to\":{\"services\":3,\"address\":\"4.5.6.7\",\"port\":8},\"addr_from\":{\"services\":9,\"address\":\"10.11.12.13\",\"port\":14},\"nonce\":6535423,\"sub_version\":\"16\",\"mode\":18,\"best_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000123\"}}"))
+
+def generate_error_json(command, error_text):
+    return str({"command":command, "error_text":error_text}).replace("\'", "\"")
 
 def deserialize(name_type, _bytes_array):
     _type = TYPE.get_type(name_type)
@@ -994,9 +998,9 @@ def deserialize(name_type, _bytes_array):
 
 
 def deserialize_msg(_command, checksum, payload):
-    print('_command = {0}'.format(_command))
-    print('checksum = {0}'.format(checksum))
-    print('payload = {0}'.format(payload))
+    # print('_command = {0}'.format(_command))
+    # print('checksum = {0}'.format(checksum))
+    # print('payload = {0}'.format(payload))
 
     command = _command.rstrip('\0')
     # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
@@ -1006,20 +1010,20 @@ def deserialize_msg(_command, checksum, payload):
     if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
         print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
             hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
-        return '-1'
+        return generate_error_json(command, "checksum check = false")
     # ------------
 
     type_ = TYPE.get_type('message_' + command)
     if type_ is None:
         print("type not found")
-        return '-2'
+        return generate_error_json(command, "message type not founded")
 
     value = type_.unpack(payload)
     result = {
         'name_type': TYPE.message_command_number[command],
         'value': value
     }
-    print(result)
+    #print(result)
     return str(result).replace("\'", "\"")
 
 deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
@@ -1043,17 +1047,17 @@ def payload_length(raw_json):
 
 
 def receive_length(msg):
-    print("receive_length")
-    print(msg)
+    # print("receive_length")
+    # print(msg)
     length, = struct.unpack('<I', msg)
-    print('length = {0}'.format(length))
+    # print('length = {0}'.format(length))
     return str(length)
 
 # ------------------------------------------FOR C++ DEBUG----------------------------------
 
 
 def debug_log(char_array):
-    print(str(char_array))
+    print("debug_log: {0}".format(str(char_array)))
 
 # ------------------------------------------FOR-UNIT-TESTS-C++-----------------------------
 

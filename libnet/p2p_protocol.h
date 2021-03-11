@@ -93,9 +93,6 @@ namespace c2pool::libnet::p2p
 
             switch (RawMSG->name_type) //todo: switch -> if (" " == cmd)
             {
-            case commands::cmd_addrs:
-                handle(GenerateMsg<message_addrs>(json_value));
-                break;
             case commands::cmd_version:
                 handle(GenerateMsg<message_version>(json_value));
                 break;
@@ -104,6 +101,9 @@ namespace c2pool::libnet::p2p
                 break;
             case commands::cmd_addrme:
                 handle(GenerateMsg<message_addrme>(json_value));
+                break;
+            case commands::cmd_addrs:
+                handle(GenerateMsg<message_addrs>(json_value));
                 break;
             case commands::cmd_getaddrs:
                 handle(GenerateMsg<message_getaddrs>(json_value));
@@ -143,7 +143,8 @@ namespace c2pool::libnet::p2p
         }
 
         template <class message_type, class... Args>
-        shared_ptr<message_type> make_message(Args&&... args){
+        shared_ptr<message_type> make_message(Args &&...args)
+        {
             auto msg = std::make_shared<message_type>(args...);
             msg->template set_converter_type<converter_type>();
             msg->set_prefix(_net);
@@ -270,7 +271,7 @@ namespace c2pool::libnet::p2p
         }
         void handle(shared_ptr<message_error> msg)
         {
-            //TODO:
+            LOG_WARNING << "Handled message_error! command = " << msg->command << " ; error_text = " << msg->error_text;
         }
         void handle(shared_ptr<message_shares> msg)
         {

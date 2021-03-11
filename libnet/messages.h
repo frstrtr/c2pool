@@ -31,10 +31,11 @@ namespace c2pool::libnet::messages
     {
         cmd_error = 9999,
         cmd_version = 0,
-        cmd_addrs,
-        cmd_getaddrs,
         cmd_ping,
         cmd_addrme,
+        cmd_addrs,
+        cmd_getaddrs,
+
         //new:
         cmd_shares,
         cmd_sharereq,
@@ -108,8 +109,9 @@ namespace c2pool::libnet::messages
             converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
         }
 
-        std::tuple<char *, int> get_prefix(){
-            auto res = std::make_tuple<char*, int>(converter->get_prefix(), converter->get_prefix_len());
+        std::tuple<char *, int> get_prefix()
+        {
+            auto res = std::make_tuple<char *, int>(converter->get_prefix(), converter->get_prefix_len());
             return res;
         }
 
@@ -139,10 +141,16 @@ namespace c2pool::libnet::messages
     class message_error : public base_message
     {
     public:
+        std::string command;
+        std::string error_text;
+
+    public:
         message_error() : base_message("error") {}
 
         message_error &operator=(UniValue value)
         {
+            command = value["command"].get_str();
+            error_text = value["error_text"].get_str();
             return *this;
         }
 
