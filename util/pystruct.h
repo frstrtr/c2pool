@@ -50,6 +50,8 @@ namespace c2pool::python
         // static unsigned int packed_size(char *name_type, T &value);
 
         static unsigned int receive_length(char *length_data);
+
+        static UniValue generate_error_json(UniValue json);
     };
 } // namespace c2pool::python
 
