@@ -31,12 +31,17 @@ namespace c2pool::console
             keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at midnight >*/
             keywords::format = "[%TimeStamp%]<%Severity%>: %Message%"                     /*< log record format >*/
         );
-        if (c2pool_config::get()->debug)
+        if (c2pool_config::get()->debug == c2pool::dev::trace)
         {
             logging::core::get()->set_filter(
                 logging::trivial::severity >= logging::trivial::trace);
         }
-        else
+        if (c2pool_config::get()->debug == c2pool::dev::debug)
+        {
+            logging::core::get()->set_filter(
+                logging::trivial::severity >= logging::trivial::debug);
+        }
+        if (c2pool_config::get()->debug == c2pool::dev::normal)
         {
 
             logging::core::get()->set_filter(

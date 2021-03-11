@@ -1,11 +1,20 @@
 #pragma once
+#include <istream>
+#include <string>
 
 namespace c2pool::dev
 {
+    enum DebugState
+    {
+        trace = 0,
+        debug = 1,
+        normal = 2
+    };
+
     class c2pool_config
     {
     public:
-        bool debug = false;
+        DebugState debug = normal;
 
     private:
         static c2pool_config *_instance;
@@ -27,3 +36,5 @@ namespace c2pool::dev
         //попытка подключения = подключение, которое произошло, но не проверенно на версию и прочие условия.
     };
 } // namespace c2pool::dev
+
+std::istream &operator>>(std::istream &in, c2pool::dev::DebugState &value);
