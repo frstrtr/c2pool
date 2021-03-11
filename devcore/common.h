@@ -2,9 +2,21 @@
 
 #include <ctime>
 #include <memory>
+#include <string>
+#include <sstream>
 
 namespace c2pool::dev
 {
+    template <typename int_type>
+    int_type str_to_int(std::string value)
+    {
+        std::stringstream ss;
+        int_type result;
+        ss<< value;
+        ss >> result;
+        return result;
+    }
+
     //TODO: create timestamp class
     int timestamp();
 
