@@ -39,6 +39,10 @@ namespace c2pool::libnet::messages
         char payload[MAX_PAYLOAD_LENGTH + 1];
         char data[COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + MAX_PAYLOAD_LENGTH]; //full message without prefix //TODO
     public:
+        bytes_converter() : prefix(NULL)
+        {
+        }
+
         virtual char *get_data() = 0;
         virtual void set_data(char *data_) = 0;
 
@@ -68,7 +72,7 @@ namespace c2pool::libnet::messages
         virtual void set_command(const char *_command) = 0;
 
         virtual bool isEmpty() { return false; }
-        
+
         virtual void set_unpacked_len(char *packed_len = nullptr) = 0;
         virtual int get_unpacked_len() = 0;
     };
@@ -139,7 +143,14 @@ namespace c2pool::libnet::messages
 
         ~p2pool_converter()
         {
-            delete prefix;
+            LOG_TRACE << "free() 2";
+            if (prefix != nullptr)
+            {
+                LOG_TRACE << "free() 2.1";
+                delete[] prefix;
+                LOG_TRACE << "free() 2.2";
+            }
+            LOG_TRACE << "free() 3";
         }
 
         char *get_data() override { return data; }

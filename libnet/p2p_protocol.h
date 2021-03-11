@@ -96,43 +96,43 @@ namespace c2pool::libnet::p2p
             case commands::cmd_version:
                 handle(GenerateMsg<message_version>(json_value));
                 break;
-                // case commands::cmd_ping:
-                //     handle(GenerateMsg<message_ping>(json_value));
-                //     break;
-                // case commands::cmd_addrme:
-                //     handle(GenerateMsg<message_addrme>(json_value));
-                //     break;
-                // case commands::cmd_addrs:
-                //     LOG_TRACE << "addrs1";
-                //     handle(GenerateMsg<message_addrs>(json_value));
-                //     LOG_TRACE << "addrs2";
-                //     break;
-                // case commands::cmd_getaddrs:
-                //     handle(GenerateMsg<message_getaddrs>(json_value));
-                //     break;
-                // //new:
-                // case commands::cmd_shares:
-                //     handle(GenerateMsg<message_shares>(json_value));
-                //     break;
-                // case commands::cmd_sharereq:
-                //     handle(GenerateMsg<message_sharereq>(json_value));
-                //     break;
-                // case commands::cmd_sharereply:
-                //     handle(GenerateMsg<message_sharereply>(json_value));
-                //     break;
-                // //TODO:
-                // // case commands::cmd_best_block:
-                // //     handle(GenerateMsg<message_best_block>(json_value));
-                // //     break;
-                // case commands::cmd_have_tx:
-                //     handle(GenerateMsg<message_have_tx>(json_value));
-                //     break;
-                // case commands::cmd_losing_tx:
-                //     handle(GenerateMsg<message_losing_tx>(json_value));
-                //     break;
-            case commands::cmd_error:
-                handle(GenerateMsg<message_error>(json_value));
+            case commands::cmd_ping:
+                handle(GenerateMsg<message_ping>(json_value));
                 break;
+            case commands::cmd_addrme:
+                handle(GenerateMsg<message_addrme>(json_value));
+                break;
+            case commands::cmd_addrs:
+                LOG_TRACE << "addrs1";
+                handle(GenerateMsg<message_addrs>(json_value));
+                LOG_TRACE << "addrs2";
+                break;
+            case commands::cmd_getaddrs:
+                handle(GenerateMsg<message_getaddrs>(json_value));
+                break;
+            //new:
+            case commands::cmd_shares:
+                handle(GenerateMsg<message_shares>(json_value));
+                break;
+            case commands::cmd_sharereq:
+                handle(GenerateMsg<message_sharereq>(json_value));
+                break;
+            case commands::cmd_sharereply:
+                handle(GenerateMsg<message_sharereply>(json_value));
+                break;
+            //TODO:
+            // case commands::cmd_best_block:
+            //     handle(GenerateMsg<message_best_block>(json_value));
+            //     break;
+            case commands::cmd_have_tx:
+                handle(GenerateMsg<message_have_tx>(json_value));
+                break;
+            case commands::cmd_losing_tx:
+                handle(GenerateMsg<message_losing_tx>(json_value));
+                break;
+                // case commands::cmd_error:
+                //     handle(GenerateMsg<message_error>(json_value));
+                //     break;
             }
         }
 
