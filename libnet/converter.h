@@ -143,14 +143,10 @@ namespace c2pool::libnet::messages
 
         ~p2pool_converter()
         {
-            LOG_TRACE << "free() 2";
             if (prefix != nullptr)
             {
-                LOG_TRACE << "free() 2.1";
                 delete[] prefix;
-                LOG_TRACE << "free() 2.2";
             }
-            LOG_TRACE << "free() 3";
         }
 
         char *get_data() override { return data; }
