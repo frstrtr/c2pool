@@ -14,7 +14,7 @@ using namespace std;
 class Bitcoind_JSONRPC : public ::testing::Test
 {
 protected:
-    Bitcoind* coind;
+    Coind* coind;
 protected:
     template <typename UINT_TYPE>
     UINT_TYPE CreateUINT(string hex)
@@ -26,8 +26,8 @@ protected:
 
     virtual void SetUp()
     {
-        //coind = new Bitcoind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
-        coind = new Bitcoind("Daniil", "Just_the_place_for_a_Snark", "http://217.72.4.157:8332/");
+        //coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+        coind = new Coind("Daniil", "Just_the_place_for_a_Snark", "http://217.72.4.157:8332/");
     }
 
     virtual void TearDown()

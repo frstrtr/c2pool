@@ -1,8 +1,8 @@
 #pragma once
 
-#include "uint256.h"
-#include "arith_uint256.h"
-#include "py_base.h"
+#include <btclibs/uint256.h>
+#include <btclibs/arith_uint256.h>
+#include <devcore/py_base.h>
 
 #include <cstring>
 #include <vector>

@@ -4,7 +4,8 @@
 
 #include <string>
 #include <vector>
-using std::vector, std::string;
+using std::vector;
+using std::string;
 
 //In request class constructor only required agruments, without optional.
 

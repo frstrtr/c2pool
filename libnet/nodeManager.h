@@ -2,15 +2,22 @@
 
 #include <networks/network.h>
 #include <devcore/config.h>
-#include <memory>
 #include <devcore/addrStore.h>
 
-#include <iostream>
+#include <coind/jsonrpc-coind/coind.h>
+
+#include <memory>
 using std::shared_ptr;
 
-namespace c2pool::libnet::p2p
+namespace c2pool::libnet
 {
-    class P2PNode;
+    namespace p2p
+    {
+
+        class P2PNode;
+    }
+
+    class CoindNode;
 }
 
 namespace c2pool::libnet
@@ -41,12 +48,18 @@ namespace c2pool::libnet
             return _addr_store;
         }
 
+        shared_ptr<c2pool::coind::jsonrpc::Coind> coind() const
+        {
+            return _coind;
+        }
+
     private:
         shared_ptr<c2pool::Network> _net;
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pnode;
-
-        //TODO:CoindNode
+        shared_ptr<c2pool::coind::jsonrpc::Coind> _coind;
+        shared_ptr<c2pool::libnet::CoindNode> coind_node; //TODO: init
+        //TODO: parent network
     };
 } // namespace c2pool::libnet
