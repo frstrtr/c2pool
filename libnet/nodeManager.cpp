@@ -1,5 +1,6 @@
 #include "nodeManager.h"
 #include "p2p_node.h"
+#include "coind_node.h"
 #include <boost/asio.hpp>
 using boost::asio::ip::tcp;
 

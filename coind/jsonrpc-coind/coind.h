@@ -17,7 +17,7 @@ using namespace c2pool::coind::jsonrpc::data;
 
 namespace c2pool::coind::jsonrpc
 {
-    class Bitcoind
+    class Coind
     {
     private:
         CURL *curl;
@@ -26,7 +26,7 @@ namespace c2pool::coind::jsonrpc
             "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": [%s] }";
 
     public:
-        Bitcoind(char *username, char *password, char *address)
+        Coind(char *username, char *password, char *address)
         {
             curl = curl_easy_init();
 
@@ -46,7 +46,7 @@ namespace c2pool::coind::jsonrpc
             }
         }
 
-        ~Bitcoind()
+        ~Coind()
         {
             curl_easy_cleanup(curl);
         }

@@ -9,5 +9,5 @@ set(SOURCE_FILES data.cpp
 
 
 add_library(coind STATIC ${SOURCE_FILES} ${HEADER_FILES})
-target_link_libraries(coind univalue btclibs util pylib ${CURL_LIBRARIES})
+target_link_libraries(coind univalue btclibs util devcore ${CURL_LIBRARIES})
 target_include_directories(coind PRIVATE ${CURL_INCLUDE_DIR})
