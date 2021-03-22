@@ -19,6 +19,11 @@ def average_attempts_to_target(hex_average_attempts):
     assert average_attempts > 0
     return min(int(2**256/average_attempts - 1 + 0.5), 2**256-1)
 
+#############################################################################################################################################
+#       0x00ffff * 2**(8*(0x1d - 3)) = 0xffff0000 * 2**(256-64); 
+#       where 0x00ffff * 2**(8*(0x1d - 3)) from https://ru.bitcoinwiki.org/wiki/%D0%A1%D0%BB%D0%BE%D0%B6%D0%BD%D0%BE%D1%81%D1%82%D1%8C
+#############################################################################################################################################
+
 def target_to_difficulty(hex_target):
     target = hex_to_int(hex_target)
     assert 0 <= target and isinstance(target, int), target
