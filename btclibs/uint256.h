@@ -122,7 +122,7 @@ class uint160 : public base_blob<160>
 public:
     uint160() {}
     explicit uint160(const std::vector<unsigned char> &vch) : base_blob<160>(vch) {}
-    
+
     friend std::istream &operator>>(std::istream &is, uint160 &value);
     friend std::ostream &operator<<(std::ostream &os, const uint160 &value);
 };
@@ -164,5 +164,7 @@ inline uint256 uint256S(const std::string &str)
 }
 
 uint256 &UINT256_ONE();
+
+
 
 #endif // BITCOIN_UINT256_H

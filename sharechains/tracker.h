@@ -2,6 +2,8 @@
 
 #include <lib/univalue/include/univalue.h>
 #include <btclibs/uint256.h>
+#include <btclibs/arith_uint256.h>
+#include <coind/data.h>
 #include <devcore/logger.h>
 
 #include <map>
@@ -27,8 +29,8 @@ namespace c2pool::shares::tracker
     private:
         queue<shared_ptr<BaseShare>> _queue;
 
-        uint256 work;
-        uint256 min_work;
+        arith_uint256 work;
+        arith_uint256 min_work;
 
     public:
         size_t size()
@@ -36,20 +38,7 @@ namespace c2pool::shares::tracker
             return _queue.size();
         }
 
-        void push(shared_ptr<BaseShare> share)
-        {
-            if (_queue.size() == LOOKBEHIND)
-            {
-                //TODO:
-                //auto temp = _queue.pop();
-                //work -= bitcoin_data.target_to_average_attempts(temp.max_target)
-                //min_work = bitcoin_data.target_to_average_attempts(temp.max_target)
-            }
-
-            _queue.push(share);
-            //work += bitcoin_data.target_to_average_attempts(share.target)
-            //min_work += bitcoin_data.target_to_average_attempts(share.max_target)
-        }
+        void push(shared_ptr<BaseShare> share);
     };
 
     class ShareTracker
@@ -59,6 +48,8 @@ namespace c2pool::shares::tracker
         LookbehindDelta lookbehind_items;
 
     public:
+        ShareTracker();
+
         void add(shared_ptr<BaseShare> share);
     };
 } // namespace c2pool::shares::tracker

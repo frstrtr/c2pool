@@ -1,6 +1,8 @@
 #pragma once
 
 #include <btclibs/uint256.h>
+#include <dbshell/dbObject.h>
+using dbshell::DBObject;
 
 #include <string>
 #include <memory>
@@ -13,7 +15,7 @@ using std::vector, std::tuple, std::map;
 
 namespace c2pool::shares::share
 {
-    class BaseShare
+    class BaseShare : public DBObject
     {
     public:
         uint256 max_target;
@@ -33,7 +35,11 @@ namespace c2pool::shares::share
         uint256 pow_hash; //litecoin_scrypt->sctyptmodule.c->scrypt_getpowhash
         uint256 hash;
         uint256 header_hash;
-        std::vector<uint256> new_transaction_hashes; //TODO: ShareInfoType && shared_ptr<vector<uint256>>?
+        vector<uint256> new_transaction_hashes; //TODO: ShareInfoType && shared_ptr<vector<uint256>>?
         unsigned int time_seen;
+
+    public:
+        string SerializeJSON() override;
+        void DeserializeJSON(std::string json) override;
     };
 } // namespace c2pool::shares::share

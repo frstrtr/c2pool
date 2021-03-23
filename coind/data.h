@@ -33,26 +33,14 @@ namespace coind::data::python
 namespace coind::data
 {
 
-    uint256 target_to_average_attempts(uint256 target)
-    {
-        return coind::data::python::PyBitcoindData::target_to_average_attempts(target);
-    }
+    uint256 target_to_average_attempts(uint256 target);
 
-    uint256 average_attempts_to_target(uint256 average_attempts)
-    {
-        return coind::data::python::PyBitcoindData::average_attempts_to_target(average_attempts);
-    }
+    uint256 average_attempts_to_target(uint256 average_attempts);
 
-    double target_to_difficulty(uint256 target)
-    {
-        return coind::data::python::PyBitcoindData::target_to_difficulty(target);
-    }
+    double target_to_difficulty(uint256 target);
 
-    uint256 difficulty_to_target(uint256 difficulty)
-    {
-        return coind::data::python::PyBitcoindData::difficulty_to_target(difficulty);
-    }
-
+    uint256 difficulty_to_target(uint256 difficulty);
+    
     class PreviousOutput
     {
     public:
