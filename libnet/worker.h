@@ -1,6 +1,6 @@
 #pragma once
 #include "nodeManager.h"
-#include <sharechains/shareTracker.h>
+#include <sharechains/tracker.h>
 #include <networks/network.h>
 #include <coind/jsonrpc-coind/coind.h>
 

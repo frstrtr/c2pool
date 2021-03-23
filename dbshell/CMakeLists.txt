@@ -5,9 +5,8 @@ set(HEADER
 )
 set(SOURCE
     db.cpp
-    dbObject.cpp
     dbBatch.cpp
 )
 
 add_library(dbshell ${HEADER} ${SOURCE})
-target_link_libraries(dbshell univalue leveldb other)
+target_link_libraries(dbshell univalue leveldb devcore)

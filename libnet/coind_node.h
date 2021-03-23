@@ -8,7 +8,7 @@ using c2pool::libnet::NodeManager;
 #include <coind/jsonrpc-coind/coind.h>
 using namespace c2pool::coind::jsonrpc;
 
-#include <sharechains/shareTracker.h>
+#include <sharechains/tracker.h>
 using namespace c2pool::shares::tracker;
 
 
