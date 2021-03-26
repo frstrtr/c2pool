@@ -46,7 +46,20 @@ Node:
                         который удаляет шару из tracker.verified и tracker.remove(share_hash)
                 ДАЛЬШЕ ????????
     5. @start
-            ???
+            инициализация stop_signal, для остановки процесса при нажатии на ctrl + c
+            #BITCOIND WORK:
+                Инициализация переменной bitcoind_work = helper.getwork(bincoind)
+                Создание и вызов inlineCallback метода @work_poller, которая является лябмдой:
+                    метод вызывает каждые 15 секунд, где обновляет значение bitcoind_work
+                        bitcoind_work.set((yield helper.getwork(self.bitcoind, self.bitcoind_work.value['use_getblocktemplate'], self.txidcache, self.feecache, self.feefifo, self.known_txs_var.value)))
+                    после обновления значения, вызывается check_and_purge_txs()
+            #PEER WORK:
+                Создается переменная best_block_header [variable.Variable(None)], которая становится полем класса.
+                Создается функция handle_header и становится методом класса self.handle_header.
+                На событие bitcoind_work.changed, подписывается лямбда и тут же она вызывается:
+                    лямбда pool_header вызывает handle_header.
+            # BEST SHARE
+                ??????
 
 P2PNode:
 ----p2p.py:
