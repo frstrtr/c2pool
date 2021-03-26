@@ -11,7 +11,6 @@ using namespace c2pool::coind::jsonrpc;
 #include <sharechains/tracker.h>
 using namespace c2pool::shares::tracker;
 
-
 #include <memory>
 using std::make_shared;
 using std::shared_ptr;
@@ -28,6 +27,7 @@ namespace c2pool::libnet
 
         shared_ptr<ShareTracker> _tracker; //init + move to NodeManager?
         shared_ptr<NodeManager> _node_manager;
+
     public:
         CoindNode(shared_ptr<NodeManager> node_manager)
         {
