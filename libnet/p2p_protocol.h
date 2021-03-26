@@ -6,7 +6,7 @@
 #include "p2p_socket.h"
 using namespace c2pool::libnet::messages;
 
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 #include <btclibs/uint256.h>
 
 #include <memory>

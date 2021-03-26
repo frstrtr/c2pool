@@ -1,7 +1,7 @@
 #pragma once
 
 #include <btclibs/uint256.h>
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 
 #include <string>
 #include <vector>

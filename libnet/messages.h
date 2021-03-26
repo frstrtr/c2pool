@@ -2,7 +2,7 @@
 
 #include "converter.h"
 
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 #include <util/types.h>
 #include <btclibs/uint256.h>
 #include <sharechain/shareTypes.h>

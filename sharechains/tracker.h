@@ -1,6 +1,6 @@
 #pragma once
 
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <coind/data.h>

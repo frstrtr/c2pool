@@ -1,8 +1,8 @@
 #pragma once
 #include "db.h"
 
-#include <lib/leveldb/include/leveldb/db.h> //TODO
-#include <lib/leveldb/include/leveldb/write_batch.h> //TODO:
+#include <leveldb/db.h>
+#include <leveldb/write_batch.h>
 
 namespace dbshell{
     class DBObject;

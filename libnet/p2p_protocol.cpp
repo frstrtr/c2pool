@@ -6,7 +6,7 @@ using namespace c2pool::libnet::messages;
 #include "converter.h"
 #include <devcore/logger.h>
 
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 
 #include <memory>
 using std::shared_ptr, std::weak_ptr, std::make_shared;

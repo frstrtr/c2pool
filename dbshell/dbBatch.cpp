@@ -1,7 +1,7 @@
 #include "dbBatch.h"
 #include "dbObject.h"
 
-#include <lib/leveldb/include/leveldb/db.h> //TODO
+#include <leveldb/db.h>
 
 namespace dbshell
 {
