@@ -2,7 +2,7 @@
 #include "share.h"
 using namespace c2pool::shares::share;
 
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 #include <btclibs/uint256.h>
 #include <devcore/logger.h>
 

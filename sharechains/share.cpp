@@ -1,6 +1,6 @@
 #include "share.h"
 
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 #include <devcore/logger.h>
 
 namespace c2pool::shares::share

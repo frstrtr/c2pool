@@ -1,6 +1,6 @@
 #pragma once
 
-#include <lib/leveldb/include/leveldb/db.h> //TODO:
+#include <leveldb/db.h>
 #include <string>
 
 namespace dbshell{

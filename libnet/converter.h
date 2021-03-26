@@ -1,7 +1,7 @@
 #pragma once
 
 #include <memory>
-#include <lib/univalue/include/univalue.h>
+#include <univalue.h>
 #include <devcore/logger.h>
 
 #include <tuple>
