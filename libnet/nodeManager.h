@@ -9,15 +9,26 @@
 #include <memory>
 using std::shared_ptr;
 
-namespace c2pool::libnet
+namespace c2pool
 {
-    namespace p2p
+    namespace libnet
     {
+        namespace p2p
+        {
 
-        class P2PNode;
+            class P2PNode;
+        }
+
+        class CoindNode;
     }
 
-    class CoindNode;
+    namespace shares
+    {
+        namespace tracker
+        {
+            class ShareTracker;
+        }
+    }
 }
 
 namespace c2pool::libnet
@@ -25,7 +36,7 @@ namespace c2pool::libnet
     class NodeManager : public std::enable_shared_from_this<NodeManager>
     {
     public:
-        NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
+        NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg, shared_ptr<c2pool::shares::tracker::ShareTracker> _shares_tracker) : _net(_network), _config(_cfg), _tracker(_shares_tracker)
         {
             _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network); //TODO: boost::filesystem path
         }
@@ -60,6 +71,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pnode;
         shared_ptr<c2pool::coind::jsonrpc::Coind> _coind;
         shared_ptr<c2pool::libnet::CoindNode> coind_node; //TODO: init
-        //TODO: parent network
+        shared_ptr<c2pool::shares::tracker::ShareTracker> _tracker;
+        //TODO: parent[coind] network
     };
 } // namespace c2pool::libnet

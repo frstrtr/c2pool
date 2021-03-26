@@ -1,8 +1,10 @@
 #include "nodeManager.h"
 #include "p2p_node.h"
 #include "coind_node.h"
+#include <sharechains/tracker.h>
 #include <boost/asio.hpp>
 using boost::asio::ip::tcp;
+using namespace c2pool::shares::tracker;
 
 namespace c2pool::libnet{
 
