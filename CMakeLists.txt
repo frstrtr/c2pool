@@ -46,5 +46,5 @@ add_subdirectory(libnet)
 
 add_subdirectory(c2pool)
 
-#add_subdirectory(lib/googletest)
-#add_subdirectory(test)
+#TESTS
+add_subdirectory(test)
