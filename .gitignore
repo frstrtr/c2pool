@@ -52,3 +52,6 @@ vc140.pdb
 #p2pool
 /logs
 /data
+
+#private configs
+/test/coind_tests/pass.h

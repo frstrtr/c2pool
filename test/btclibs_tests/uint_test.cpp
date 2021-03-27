@@ -3,8 +3,8 @@
 #include <memory>
 #include <string>
 #include <sstream>
-#include "uint256.h"
-#include "arith_uint256.h"
+#include <btclibs/uint256.h>
+#include <btclibs/arith_uint256.h>
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)

@@ -5,7 +5,11 @@
 #include <sstream>
 #include <iostream>
 
-#include "jsonrpc-coind/coind.h"
+#include <coind/jsonrpc-coind/coind.h>
+
+#ifdef PASS_EXIST
+#include "pass.h"
+#endif
 
 using namespace c2pool::coind::jsonrpc;
 using namespace c2pool::coind::jsonrpc::data;
@@ -14,7 +18,8 @@ using namespace std;
 class Bitcoind_JSONRPC : public ::testing::Test
 {
 protected:
-    Coind* coind;
+    Coind *coind;
+
 protected:
     template <typename UINT_TYPE>
     UINT_TYPE CreateUINT(string hex)
@@ -27,7 +32,16 @@ protected:
     virtual void SetUp()
     {
         //coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
-        coind = new Coind("Daniil", "Just_the_place_for_a_Snark", "http://217.72.4.157:8332/");
+#ifdef PASS_EXIST
+        auto _pass = get_pass();
+        char* username = std::get<0>(_pass);
+        char* password = std::get<1>(_pass);
+        char* addr = std::get<2>(_pass);
+        coind = new Coind(username, password, addr);
+
+#else
+        coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+#endif
     }
 
     virtual void TearDown()
@@ -46,7 +60,7 @@ TEST_F(Bitcoind_JSONRPC, getblocktemplate)
 {
     vector<string> rules{"segwit"};
     rules.push_back("segwit");
-    GetBlockTemplateRequest* request = new GetBlockTemplateRequest(rules);
+    GetBlockTemplateRequest *request = new GetBlockTemplateRequest(rules);
 
     GetBlockTemplateResult result = coind->GetBlockTemplate(request);
     cout << result.version << endl;
