@@ -92,23 +92,36 @@ namespace c2pool::coind::jsonrpc::data
 
         GetBlockChainInfoResult &operator=(UniValue value)
         {
+            std::cout << "1" << std::endl;
             chain = value["chain"].get_str();
+            std::cout << "2" << std::endl;
             blocks = value["blocks"].get_int();
+            std::cout << "3" << std::endl;
             headers = value["headers"].get_int();
+            std::cout << "4" << std::endl;
 
             string bestblockhash_temp = value["bestblockhash"].get_str();
             bestblockhash.SetHex(bestblockhash_temp);
+            std::cout << "5" << std::endl;
 
             difficulty = value["difficulty"].get_real();
+            std::cout << "6" << std::endl;
             mediantime = value["mediantime"].get_int64();
+            std::cout << "7" << std::endl;
             verificationprogress = value["verificationprogress"].get_real();
+            std::cout << "8" << std::endl;
 
             string chainwork_temp = value["chainwork"].get_str();
+            std::cout << "9" << std::endl;
             chainwork.SetHex(chainwork_temp);
+            std::cout << "10" << std::endl;
 
             size_on_disk = value["size_on_disk"].get_int64();
+            std::cout << "11" << std::endl;
             pruned = value["pruned"].get_bool();
+            std::cout << "12" << std::endl;
             softforks = value["softforks"].get_obj();
+            std::cout << "13" << std::endl;
             return *this;
         }
     };

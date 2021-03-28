@@ -4,9 +4,9 @@
 #include <sstream>
 #include <iostream>
 
-#include "uint256.h"
-#include "arith_uint256.h"
-#include "data.h"
+#include <btclibs/uint256.h>
+#include <btclibs/arith_uint256.h>
+#include <coind/data.h>
 
 using namespace std;
 

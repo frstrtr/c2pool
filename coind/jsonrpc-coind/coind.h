@@ -118,21 +118,21 @@ namespace c2pool::coind::jsonrpc
 
     public:
         //https://bitcoin-rpc.github.io/en/doc/0.17.99/rpc/blockchain/getblockchaininfo/
-        GetBlockChainInfoResult GetBlockChainInfo()
+        UniValue GetBlockChainInfo()
         {
             UniValue jsonValue = request("getblockchaininfo");
-            GetBlockChainInfoResult result;
-            result = jsonValue;
-            return result;
+            return jsonValue;
+        }
+
+        UniValue GetBlock(uint256 hash, int verbosity = 1){
+            
         }
 
         //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
-        GetBlockTemplateResult GetBlockTemplate(GetBlockTemplateRequest *req)
+        UniValue GetBlockTemplate(GetBlockTemplateRequest *req)
         {
             UniValue jsonValue = request("getblocktemplate", req);
-            GetBlockTemplateResult result;
-            result = jsonValue;
-            return result;
+            return jsonValue;
         }
     }; // namespace c2pool::coind
 } // namespace c2pool::coind::jsonrpc
