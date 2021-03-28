@@ -31,7 +31,6 @@ protected:
 
     virtual void SetUp()
     {
-        //coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
 #ifdef PASS_EXIST
         auto _pass = get_pass();
         char* username = std::get<0>(_pass);
@@ -52,8 +51,9 @@ protected:
 
 TEST_F(Bitcoind_JSONRPC, getblockchaininfo)
 {
-    GetBlockChainInfoResult result = coind->GetBlockChainInfo();
-    cout << result.bestblockhash << endl;
+    auto result = coind->GetBlockChainInfo();
+    cout << result["bestblockhash"].get_str() << endl;
+    cout << result.write() << endl;
 }
 
 TEST_F(Bitcoind_JSONRPC, getblocktemplate)
@@ -62,6 +62,6 @@ TEST_F(Bitcoind_JSONRPC, getblocktemplate)
     rules.push_back("segwit");
     GetBlockTemplateRequest *request = new GetBlockTemplateRequest(rules);
 
-    GetBlockTemplateResult result = coind->GetBlockTemplate(request);
-    cout << result.version << endl;
+    auto result = coind->GetBlockTemplate(request);
+    cout << result["version"].get_int() << endl;
 }
