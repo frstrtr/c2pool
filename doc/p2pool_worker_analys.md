@@ -1,4 +1,6 @@
 1. jsonrpc.py::_handle ?
+
+# Раньше stratum назывался Proxy для jsonrpc coind'a.
 #------------------------------
 
 StratumRPCMiningProvider

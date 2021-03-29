@@ -36,10 +36,10 @@ protected:
         char* username = std::get<0>(_pass);
         char* password = std::get<1>(_pass);
         char* addr = std::get<2>(_pass);
-        coind = new Coind(username, password, addr);
+        coind = new Coind(username, password, addr, std::make_shared<c2pool::DigibyteNetwork>());
 
 #else
-        coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/");
+        coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/", std::make_shared<c2pool::DigibyteNetwork>());
 #endif
     }
 
@@ -72,5 +72,11 @@ TEST_F(Bitcoind_JSONRPC, getblock)
     GetBlockRequest *request = new GetBlockRequest(block_hash);
     
     auto result = coind->GetBlock(request);
+    cout << result.write() << endl;
+}
+
+TEST_F(Bitcoind_JSONRPC, getnetworkinfo)
+{   
+    auto result = coind->GetNetworkInfo();
     cout << result.write() << endl;
 }

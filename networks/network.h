@@ -5,6 +5,13 @@
 #include <vector>
 #include <string>
 #include <tuple>
+#include <memory>
+using std::shared_ptr;
+
+namespace c2pool::coind::jsonrpc
+{
+    class Coind;
+}
 
 namespace c2pool
 {
@@ -31,6 +38,11 @@ namespace c2pool
 
         uint256 MAX_TARGET;
 
+    public:
+        virtual bool jsonrpc_check(shared_ptr<c2pool::coind::jsonrpc::Coind> coind) = 0;
+
+        virtual bool version_check(int version) = 0;
+
     protected:
         Network();
     };
@@ -39,6 +51,10 @@ namespace c2pool
     {
     public:
         DigibyteNetwork();
+
+        bool jsonrpc_check(shared_ptr<c2pool::coind::jsonrpc::Coind> coind) override;
+
+        bool version_check(int version) = 0;
     };
 
     /*
