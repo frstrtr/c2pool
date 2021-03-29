@@ -5,7 +5,7 @@
 #include <sstream>
 #include <iostream>
 
-#include <coind/jsonrpc-coind/coind.h>
+#include <coind/jsonrpc/coind.h>
 
 #ifdef PASS_EXIST
 #include "pass.h"
@@ -52,16 +52,25 @@ protected:
 TEST_F(Bitcoind_JSONRPC, getblockchaininfo)
 {
     auto result = coind->GetBlockChainInfo();
-    cout << result["bestblockhash"].get_str() << endl;
+    cout << "getblockchaininfo.bestblockhash = " << result["bestblockhash"].get_str() << endl;
     cout << result.write() << endl;
 }
 
 TEST_F(Bitcoind_JSONRPC, getblocktemplate)
 {
     vector<string> rules{"segwit"};
-    rules.push_back("segwit");
     GetBlockTemplateRequest *request = new GetBlockTemplateRequest(rules);
 
     auto result = coind->GetBlockTemplate(request);
     cout << result["version"].get_int() << endl;
+}
+
+TEST_F(Bitcoind_JSONRPC, getblock)
+{
+    uint256 block_hash;
+    block_hash.SetHex("a058f7934d45061a3431617330e21c4ea4d07b8bb6179471a4680366aee92b4f");
+    GetBlockRequest *request = new GetBlockRequest(block_hash);
+    
+    auto result = coind->GetBlock(request);
+    cout << result.write() << endl;
 }

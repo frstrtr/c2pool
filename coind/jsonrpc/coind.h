@@ -12,6 +12,8 @@
 #include <cstring>
 #include <iostream>
 
+//#include <devcore/logger.h>
+
 using std::string;
 using namespace c2pool::coind::jsonrpc::data;
 
@@ -23,7 +25,7 @@ namespace c2pool::coind::jsonrpc
         CURL *curl;
 
         const char *dataFormat =
-            "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": [%s] }";
+            "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": %s }";
 
     public:
         Coind(char *username, char *password, char *address)
@@ -68,11 +70,14 @@ namespace c2pool::coind::jsonrpc
             UniValue result;
             result.setNull();
             std::string json_answer = "";
-            char *params = "";
+            char *data(NULL);
+            char *params = new char[3];
+            strcpy(params, "[]");
             if (req)
             {
                 params = new char[req->get_params().length() + 1];
                 strcpy(params, req->get_params().c_str());
+                //std::cout << params << std::endl;
                 //params = req->get_params().c_str();
             }
             if (curl)
@@ -80,8 +85,9 @@ namespace c2pool::coind::jsonrpc
                 long data_length = strlen(dataFormat) + 1 + command.length();
                 if (req)
                     data_length += req->get_length();
-                char *data = new char[data_length];
+                data = new char[data_length];
                 sprintf(data, dataFormat, command.c_str(), params);
+                //std::cout << data << std::endl;
                 //printf("%s\n", data);
 
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(data));
@@ -102,6 +108,12 @@ namespace c2pool::coind::jsonrpc
                 //     std::cerr << "1" << curl_easy_strerror(res) << std::endl;
             }
 
+            delete req;
+            if (data)
+                delete[] data;
+            if (params)
+                delete[] params;
+
             if (json_answer.empty())
             {
                 return result;
@@ -111,7 +123,8 @@ namespace c2pool::coind::jsonrpc
 
             if (!result["error"].isNull())
             {
-                //TODO: DEBUG ERROR << result["error"].get_str();
+                //LOG_ERROR << result["error"].get_str();
+                std::cout << "CURL ERROR: " << result["error"].get_str() << endl;
             }
             return result["result"].get_obj();
         }
@@ -124,8 +137,10 @@ namespace c2pool::coind::jsonrpc
             return jsonValue;
         }
 
-        UniValue GetBlock(uint256 hash, int verbosity = 1){
-            
+        UniValue GetBlock(GetBlockRequest *req)
+        {
+            UniValue jsonValue = request("getblock", req);
+            return jsonValue;
         }
 
         //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
