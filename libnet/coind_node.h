@@ -5,7 +5,7 @@
 #include "nodeManager.h"
 using c2pool::libnet::NodeManager;
 
-#include <coind/jsonrpc-coind/coind.h>
+#include <coind/jsonrpc/coind.h>
 using namespace c2pool::coind::jsonrpc;
 
 #include <sharechains/tracker.h>

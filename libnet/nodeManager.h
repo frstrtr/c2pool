@@ -4,7 +4,7 @@
 #include <devcore/config.h>
 #include <devcore/addrStore.h>
 
-#include <coind/jsonrpc-coind/coind.h>
+#include <coind/jsonrpc/coind.h>
 
 #include <memory>
 using std::shared_ptr;

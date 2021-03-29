@@ -2,7 +2,7 @@
 #include "nodeManager.h"
 #include <sharechains/tracker.h>
 #include <networks/network.h>
-#include <coind/jsonrpc-coind/coind.h>
+#include <coind/jsonrpc/coind.h>
 
 
 #include <memory>

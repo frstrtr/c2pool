@@ -1,13 +1,21 @@
+#jsonrpc-coind
 set(CURL_LIBRARY "-lcurl")
 find_package(CURL REQUIRED)
-#TODO: MOVE jsonrpc-coind to lib
 
-set(HEADER_FILES data.h 
-    jsonrpc-coind/coind.h jsonrpc-coind/requests.h jsonrpc-coind/results.h)
-set(SOURCE_FILES data.cpp 
-    jsonrpc-coind/coind.cpp)
+set(jsonrpc_sources 
+        jsonrpc/coind.h 
+        jsonrpc/requests.h 
+        jsonrpc/results.h 
+        jsonrpc/coind.cpp)
 
+add_library(coind_jsonrpc STATIC ${jsonrpc_sources})
+target_link_libraries(coind_jsonrpc univalue btclibs util ${CURL_LIBRARIES})
+target_include_directories(coind_jsonrpc PRIVATE ${CURL_INCLUDE_DIR})
 
-add_library(coind STATIC ${SOURCE_FILES} ${HEADER_FILES})
-target_link_libraries(coind univalue btclibs util devcore ${CURL_LIBRARIES})
-target_include_directories(coind PRIVATE ${CURL_INCLUDE_DIR})
+#coind_tool
+set(coind_tool_sources 
+        data.h
+        data.cpp)
+
+add_library(coind_tool STATIC ${coind_tool_sources})
+target_link_libraries(coind_tool btclibs devcore)
