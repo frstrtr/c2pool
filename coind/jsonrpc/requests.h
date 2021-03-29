@@ -64,19 +64,31 @@ namespace c2pool::coind::jsonrpc::data
 
         void set_params() override
         {
-            // UniValue blockhash_value(UniValue::VSTR);
-            // blockhash_value.setStr(uint256)
-            // params.pushKV("blockhash", blockhash.ToString());
-            // params.pushKV("verbosity", verbosity);
-
-            //params.setStr(blockhash.ToString());
-            //params.push_back(blockhash.ToString());
-            //params.push_back(verbosity);
-
             params.push_back(blockhash.ToString());
             params.push_back(verbosity);
+        }
+    };
 
-            // params.setStr(blockhash.ToString()); //TRUE
+    class GetBlockHeaderRequest : public TemplateRequest
+    {
+    public:
+        //required
+        uint256 blockhash;
+
+    public:
+        //optional
+        bool verbose; //default = true
+    public:
+        GetBlockHeaderRequest(uint256 _blockhash, bool _verbose = true) : TemplateRequest("getblockheader")
+        {
+            blockhash = _blockhash;
+            verbose = _verbose;
+        }
+
+        void set_params() override
+        {
+            params.push_back(blockhash.ToString());
+            params.push_back(verbose);
         }
     };
 

@@ -1,8 +1,9 @@
 #pragma once
 
 #include "requests.h"
-#include "results.h"
+//#include "results.h"
 #include "univalue.h"
+#include <networks/network.h>
 
 #include <stdio.h>
 
@@ -11,24 +12,27 @@
 #include <string>
 #include <cstring>
 #include <iostream>
+#include <memory>
 
 //#include <devcore/logger.h>
 
+using std::shared_ptr, std::make_shared;
 using std::string;
 using namespace c2pool::coind::jsonrpc::data;
 
 namespace c2pool::coind::jsonrpc
 {
-    class Coind
+    class Coind : public std::enable_shared_from_this<Coind>
     {
     private:
         CURL *curl;
+        shared_ptr<Network> net;
 
         const char *dataFormat =
             "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": %s }";
 
     public:
-        Coind(char *username, char *password, char *address)
+        Coind(char *username, char *password, char *address, shared_ptr<Network> _net) : net(_net)
         {
             curl = curl_easy_init();
 
@@ -65,7 +69,7 @@ namespace c2pool::coind::jsonrpc
                 return 0; //error
         }
 
-        UniValue request(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
+        UniValue _request(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
             UniValue result;
             result.setNull();
@@ -121,19 +125,47 @@ namespace c2pool::coind::jsonrpc
             //std::cout << json_answer << std::endl; //TODO: DEBUG LOG
             result.read(json_answer);
 
+            return result;
+        }
+
+        UniValue request(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
+        {
+            auto result = _request(command, req);
+
             if (!result["error"].isNull())
             {
                 //LOG_ERROR << result["error"].get_str();
-                std::cout << "CURL ERROR: " << result["error"].get_str() << endl;
+                std::cout << "CURL ERROR: " << result["error"].get_str() << std::endl;
             }
             return result["result"].get_obj();
         }
 
+        //return data with "error" and etc...
+        UniValue request_full_data(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
+        {
+            return _request(command, req);
+        }
+
+    public:
+        //in p2pool, that helper.py:
+
+        bool check();
+
+        bool check_block_header(uint256);
+
     public:
         //https://bitcoin-rpc.github.io/en/doc/0.17.99/rpc/blockchain/getblockchaininfo/
-        UniValue GetBlockChainInfo()
+        UniValue GetBlockChainInfo(bool full = false)
         {
-            UniValue jsonValue = request("getblockchaininfo");
+            if (full)
+                return request_full_data("getblockchaininfo");
+            else
+                return request("getblockchaininfo");
+        }
+
+        UniValue GetNetworkInfo()
+        {
+            UniValue jsonValue = request("getnetworkinfo");
             return jsonValue;
         }
 
@@ -141,6 +173,14 @@ namespace c2pool::coind::jsonrpc
         {
             UniValue jsonValue = request("getblock", req);
             return jsonValue;
+        }
+
+        UniValue getblockheader(GetBlockHeaderRequest *req, bool full = false)
+        {
+            if (full)
+                return request_full_data("getblockheader", req);
+            else
+                return request("getblockheader", req);
         }
 
         //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/

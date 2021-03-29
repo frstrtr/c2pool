@@ -5,11 +5,11 @@ find_package(CURL REQUIRED)
 set(jsonrpc_sources 
         jsonrpc/coind.h 
         jsonrpc/requests.h 
-        jsonrpc/results.h 
+        #jsonrpc/results.h 
         jsonrpc/coind.cpp)
 
 add_library(coind_jsonrpc STATIC ${jsonrpc_sources})
-target_link_libraries(coind_jsonrpc univalue btclibs util ${CURL_LIBRARIES})
+target_link_libraries(coind_jsonrpc univalue btclibs util networks ${CURL_LIBRARIES})
 target_include_directories(coind_jsonrpc PRIVATE ${CURL_INCLUDE_DIR})
 
 #coind_tool
