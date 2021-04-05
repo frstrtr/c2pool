@@ -42,7 +42,7 @@ namespace c2pool::libnet::p2p
         virtual shared_ptr<raw_message> make_raw_message() { return make_shared<raw_message>(); }
     };
 
-    //protocol for init network type [c2pool/p2pool]; user only for messave_version
+    //protocol for init network type [c2pool/p2pool]; user only for message_version
     class initialize_network_protocol : public Protocol, public std::enable_shared_from_this<initialize_network_protocol>
     {
     private:

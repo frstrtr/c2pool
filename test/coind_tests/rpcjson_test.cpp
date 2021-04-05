@@ -61,7 +61,7 @@ TEST_F(Bitcoind_JSONRPC, getblocktemplate)
     vector<string> rules{"segwit"};
     GetBlockTemplateRequest *request = new GetBlockTemplateRequest(rules);
 
-    auto result = coind->GetBlockTemplate(request);
+    auto result = coind->getblocktemplate(request);
     cout << result["version"].get_int() << endl;
 }
 

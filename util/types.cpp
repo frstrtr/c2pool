@@ -48,6 +48,8 @@ namespace c2pool::util::messages
         contents = _contents;
     }
 
+    //addr
+
     addr::addr()
     {
         address = address_type();
@@ -81,4 +83,32 @@ namespace c2pool::util::messages
         return !(first == second);
     }
 
+    //inventory
+
+    inventory::inventory()
+    {
+        type = inventory_type::tx;
+        hash.SetNull();
+    }
+
+    inventory::inventory(inventory_type _type, uint256 _hash)
+    {
+        type = _type;
+        hash = _hash;
+    }
+
+    bool operator==(const inventory &first, const inventory &second)
+    {
+        if (first.type != second.type)
+            return false;
+        if (first.hash != second.hash)
+            return false;
+        return true;
+    }
+
+    bool operator!=(const inventory &first, const inventory &second)
+    {
+        return !(first == second);
+    }
+    
 } // namespace c2pool::messages

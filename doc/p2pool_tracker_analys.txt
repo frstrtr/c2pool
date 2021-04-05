@@ -1,0 +1,12 @@
+1.TrackerView ?
+2.delta_type  ?
+
+__________________________
+
+Tracker [forest.py]:
+    __getattr__ вызывает TrackerView методы и поля, которых нет в Tracker.
+
+
+
+OkayTracker [data.py]
+    Наследуется от 

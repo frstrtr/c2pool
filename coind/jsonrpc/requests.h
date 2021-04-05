@@ -104,6 +104,10 @@ namespace c2pool::coind::jsonrpc::data
         std::vector<string> capabilities;
 
     public:
+        GetBlockTemplateRequest() : TemplateRequest("getblocktemplate")
+        {
+        }
+
         GetBlockTemplateRequest(vector<string> _rules) : TemplateRequest("getblocktemplate")
         {
             rules = _rules;

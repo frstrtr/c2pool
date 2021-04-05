@@ -54,7 +54,7 @@ namespace c2pool
 
         bool jsonrpc_check(shared_ptr<c2pool::coind::jsonrpc::Coind> coind) override;
 
-        bool version_check(int version) = 0;
+        bool version_check(int version) override;
     };
 
     /*
