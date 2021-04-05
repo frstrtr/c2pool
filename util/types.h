@@ -2,7 +2,8 @@
 
 #include <string>
 #include <sstream>
-#include "univalue.h"
+#include <univalue.h>
+#include <btclibs/uint256.h>
 #include <devcore/common.h>
 
 //todo: move all methods to types.cpp
@@ -116,5 +117,42 @@ namespace c2pool::util::messages
         friend bool operator==(const addr &first, const addr &second);
 
         friend bool operator!=(const addr &first, const addr &second);
+    };
+
+    enum inventory_type{
+        tx = 1,
+        block = 2
+    };
+
+    class inventory
+    {
+    public:
+        /*
+            ('type', pack.EnumType(pack.IntType(32), {1: 'tx', 2: 'block'})),
+            ('hash', pack.IntType(256))
+        */
+        inventory_type type;
+        uint256 hash;
+
+        inventory();
+
+        inventory(inventory_type _type, uint256 _hash);
+
+        inventory &operator=(UniValue value)
+        {
+            type = (inventory_type)value["type"].get_int();
+            hash.SetHex(value["hash"].get_str());
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("type", type);
+            result.pushKV("hash", hash.GetHex());
+
+            return result;
+        }
     };
 } // namespace c2pool::messages

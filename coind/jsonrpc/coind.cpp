@@ -1,4 +1,7 @@
 #include "coind.h"
+#include "results.h"
+using namespace c2pool::coind::jsonrpc::data;
+
 #include "univalue.h"
 
 #include <iostream>
@@ -69,5 +72,106 @@ namespace c2pool::coind::jsonrpc
         {
             return false;
         }
+    }
+
+    getwork_result Coind::getwork(bool use_getblocktemplate)
+    {
+        UniValue work;
+        UniValue getblocktemplate_result;
+        if (use_getblocktemplate)
+        {
+            GetBlockTemplateRequest *req = new GetBlockTemplateRequest();
+            req->mode = "template";
+            req->rules.push_back("segwit");
+            getblocktemplate_result = getblocktemplate(req, true);
+        }
+        else
+        {
+            getblocktemplate_result = getmemorypool(); //TODO
+        }
+
+        int check_error_res = check_error(getblocktemplate_result);
+        if (!check_error_res)
+        {
+            if (check_error_res == coind_error_codes::MethodNotFound)
+            {
+                if (!use_getblocktemplate)
+                {
+                    GetBlockTemplateRequest *req = new GetBlockTemplateRequest();
+                    req->mode = "template";
+                    req->rules.push_back("segwit");
+                    getblocktemplate_result = getblocktemplate(req, true);
+                }
+                else
+                {
+                    getblocktemplate_result = getmemorypool(); //TODO
+                }
+
+                check_error_res = check_error(getblocktemplate_result);
+                if (!check_error_res)
+                {
+                    //TODO: LOG ERROR 'Error: Bitcoin version too old! Upgrade to v0.5 or newer!'
+                    //raise
+                }
+            }
+        }
+        work = getblocktemplate_result["result"].get_obj();
+
+        //------------
+
+        /* TODO: FOR WHAT?
+        if not 'start' in txidcache: # we clear it every 30 min
+        txidcache['start'] = time.time()
+        */
+
+        /* TODO: tx's
+           if not 'start' in txidcache: # we clear it every 30 min
+        txidcache['start'] = time.time()
+
+        t0 = time.time()
+        unpacked_transactions = []
+        txhashes = []
+        cachehits = 0
+        cachemisses = 0
+        knownhits = 0
+        knownmisses = 0
+        for x in work['transactions']:
+            x = x['data'] if isinstance(x, dict) else x
+            packed = None
+            if x in txidcache:
+                cachehits += 1
+                txid = (txidcache[x])
+                txhashes.append(txid)
+            else:
+                cachemisses += 1
+                packed = x.decode('hex')
+                txid = bitcoin_data.hash256(packed)
+                txidcache[x] = txid
+                txhashes.append(txid)
+            if txid in known_txs:
+                knownhits += 1
+                unpacked = known_txs[txid]
+            else:
+                knownmisses += 1
+                if not packed:
+                    packed = x.decode('hex')
+                unpacked = bitcoin_data.tx_type.unpack(packed)
+            unpacked_transactions.append(unpacked)
+
+        if time.time() - txidcache['start'] > 30*60.:
+            keepers = {(x['data'] if isinstance(x, dict) else x):txid for x, txid in zip(work['transactions'], txhashes)}
+            txidcache.clear()
+            txidcache.update(keepers)
+       */
+
+        if (!work.exists("height"))
+        {
+            uint256 previous_block_hash;
+            previous_block_hash.SetHex(work["previousblockhash"].get_str());
+            GetBlockRequest *getblock_req = new GetBlockRequest(previous_block_hash);
+            work.pushKV("height", GetBlock(getblock_req).get_int() + 1);
+        }
+
+        return {};
     }
 }

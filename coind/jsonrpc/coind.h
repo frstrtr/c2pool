@@ -1,7 +1,7 @@
 #pragma once
 
 #include "requests.h"
-//#include "results.h"
+#include "results.h"
 #include "univalue.h"
 #include <networks/network.h>
 
@@ -146,12 +146,45 @@ namespace c2pool::coind::jsonrpc
             return _request(command, req);
         }
 
+        enum coind_error_codes
+        {
+            MethodNotFound = -32601
+        };
+
+        //https://github.com/bitcoin/bitcoin/blob/master/src/rpc/protocol.h
+        //0 = OK!
+        int check_error(UniValue result)
+        {
+            if (result.exists("error"))
+            {
+                if (result["error"].empty())
+                {
+                    return 0;
+                }
+            }
+            else
+            {
+                return 0;
+            }
+
+            //-----------
+            auto error_obj = result["error"].get_obj();
+            int actual_error_code = error_obj["code"].get_int();
+            string actual_error_msg = error_obj["message"].get_str();
+
+            //TODO: log actual_error_msg!
+
+            return actual_error_code;
+        }
+
     public:
         //in p2pool, that helper.py:
 
         bool check();
 
         bool check_block_header(uint256);
+
+        getwork_result getwork(bool use_getblocktemplate = false);
 
     public:
         //https://bitcoin-rpc.github.io/en/doc/0.17.99/rpc/blockchain/getblockchaininfo/
@@ -184,10 +217,20 @@ namespace c2pool::coind::jsonrpc
         }
 
         //https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
-        UniValue GetBlockTemplate(GetBlockTemplateRequest *req)
+        UniValue getblocktemplate(GetBlockTemplateRequest *req, bool full = false)
         {
-            UniValue jsonValue = request("getblocktemplate", req);
-            return jsonValue;
+            if (full)
+                return request_full_data("getblocktemplate", req);
+            else
+                return request("getblocktemplate", req);
+        }
+
+        UniValue getmemorypool(bool full = false)
+        {
+            if (full)
+                return request_full_data("getmemorypool");
+            else
+                return request("getmemorypool");
         }
     }; // namespace c2pool::coind
 } // namespace c2pool::coind::jsonrpc
