@@ -8,33 +8,18 @@
 #include <memory>
 using std::shared_ptr;
 
-namespace c2pool
+namespace coind
 {
-    DigibyteNetwork::DigibyteNetwork() : Network()
+    DigibyteParentNetwork::DigibyteParentNetwork() : ParentNetwork()
     {
-        BOOTSTRAP_ADDRS = {
-            //CREATE_ADDR("217.72.4.157", "5024")
-            CREATE_ADDR("217.72.6.241", "5024")
-            //CREATE_ADDR("p2p-spb.xyz", "5025")
-            //CREATE_ADDR("217.42.4.157", "5025")
-            //"217.42.4.157:5025"
-        };
-        PREFIX_LENGTH = 8;
-        PREFIX = new unsigned char[PREFIX_LENGTH]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
-        IDENTIFIER = new unsigned char[8]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
-        MINIMUM_PROTOCOL_VERSION = 1600;
-        SEGWIT_ACTIVATION_VERSION = 17;
-
-        TARGET_LOOKBEHIND = 200;
-        SHARE_PERIOD = 25;
-        BLOCK_MAX_SIZE = 1000000;
-        BLOCK_MAX_WEIGHT = 4000000;
-        REAL_CHAIN_LENGTH = 24 * 60 * 60 / 10;
-        CHAIN_LENGTH = 24 * 60 * 60 / 10;
-        SPREAD = 30;
+        PREFIX_LENGTH = 4;
+        PREFIX = new unsigned char[PREFIX_LENGTH]{0xfa, 0xc3, 0xb6, 0xda};
+        P2P_PORT = 12024;
+        ADDRESS_VERSION = 30;
+        RPC_PORT = 14024;
     }
 
-    bool DigibyteNetwork::jsonrpc_check(shared_ptr<c2pool::coind::jsonrpc::Coind> coind)
+    bool DigibyteParentNetwork::jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind)
     {
         // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
         //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
@@ -48,12 +33,15 @@ namespace c2pool
         return check_header && (chain_type != "test");
     }
 
-    bool DigibyteNetwork::version_check(int version)
+    bool DigibyteParentNetwork::version_check(int version)
     {
         //lambda v: None if 7170200 <= v else 'DigiByte version too old. Upgrade to 7.17.2 or newer!'
-        if (7170200 <= version){
+        if (7170200 <= version)
+        {
             return true;
-        } else {
+        }
+        else
+        {
             return false;
         }
     }

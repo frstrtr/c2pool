@@ -8,7 +8,7 @@
 #include <memory>
 using std::shared_ptr;
 
-namespace c2pool::coind::jsonrpc
+namespace coind::jsonrpc
 {
     class Coind;
 }
@@ -38,11 +38,6 @@ namespace c2pool
 
         uint256 MAX_TARGET;
 
-    public:
-        virtual bool jsonrpc_check(shared_ptr<c2pool::coind::jsonrpc::Coind> coind) = 0;
-
-        virtual bool version_check(int version) = 0;
-
     protected:
         Network();
     };
@@ -51,10 +46,6 @@ namespace c2pool
     {
     public:
         DigibyteNetwork();
-
-        bool jsonrpc_check(shared_ptr<c2pool::coind::jsonrpc::Coind> coind) override;
-
-        bool version_check(int version) override;
     };
 
     /*
@@ -69,3 +60,46 @@ namespace c2pool
     }
     */
 } // namespace c2pool
+
+namespace coind
+{
+    class ParentNetwork
+    {
+
+        /*
+    template for test config:
+    class TestParentNetwork : ParentNetwork{
+    public:
+        TestNetwork(){
+            ...
+            PREFIX = "TESTNETWORK";
+            ...
+        }
+    }
+    */
+    public:
+        int PREFIX_LENGTH;
+        //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
+        const unsigned char *PREFIX;
+
+        int P2P_PORT;
+        int ADDRESS_VERSION;
+        int RPC_PORT;
+
+    public:
+        virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
+
+        virtual bool version_check(int version) = 0;
+    };
+
+    class DigibyteParentNetwork : public ParentNetwork
+    {
+    public:
+        DigibyteParentNetwork();
+
+    public:
+        bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) override;
+
+        bool version_check(int version) override;
+    };
+}

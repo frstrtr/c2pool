@@ -1,5 +1,5 @@
 #include "pystruct.h"
-#include "Python.h"
+#include <Python.h>
 //#include "messages.h"
 #include "univalue.h"
 #include <tuple>
@@ -12,7 +12,7 @@
 
 using namespace std;
 
-namespace c2pool::coind::p2p::python
+namespace coind::p2p::python
 {
     void other::debug_log(char *data, unsigned int len)
     {
@@ -88,7 +88,7 @@ namespace c2pool::coind::p2p::python
         return c2pool::dev::from_bytes_to_strChar(result);
     }
 
-    UniValue PyPackCoindTypes::decode(shared_ptr<c2pool::coind::p2p::messages::coind_converter> converter)
+    UniValue PyPackCoindTypes::decode(shared_ptr<coind::p2p::messages::coind_converter> converter)
     {
         UniValue result(UniValue::VOBJ);
         auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
@@ -141,7 +141,7 @@ namespace c2pool::coind::p2p::python
 
 } // namespace c2pool::python
 
-namespace c2pool::coind::p2p::python::for_test
+namespace coind::p2p::python::for_test
 {
 
 } // namespace c2pool::python::for_test

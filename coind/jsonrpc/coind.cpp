@@ -1,6 +1,6 @@
 #include "coind.h"
 #include "results.h"
-using namespace c2pool::coind::jsonrpc::data;
+using namespace coind::jsonrpc::data;
 
 #include "univalue.h"
 
@@ -9,7 +9,7 @@ using namespace c2pool::coind::jsonrpc::data;
 #include <string>
 using std::set, std::string;
 
-namespace c2pool::coind::jsonrpc
+namespace coind::jsonrpc
 {
 
     bool Coind::check()

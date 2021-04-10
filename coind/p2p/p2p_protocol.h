@@ -4,7 +4,7 @@
 #include "converter.h"
 #include <devcore/logger.h>
 #include "p2p_socket.h"
-using namespace c2pool::coind::p2p::messages;
+using namespace coind::p2p::messages;
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
@@ -12,23 +12,23 @@ using namespace c2pool::coind::p2p::messages;
 #include <memory>
 using std::shared_ptr, std::weak_ptr, std::make_shared;
 
-namespace c2pool::coind::p2p
+namespace coind::p2p
 {
     class P2PSocket;
 }
 
-namespace c2pool::coind::p2p
+namespace coind::p2p
 {
     //https://en.bitcoin.it/wiki/Protocol_documentation
     class CoindProtocol
     {
     public:
     protected:
-        shared_ptr<c2pool::coind::p2p::P2PSocket> _socket;
-        std::shared_ptr<c2pool::Network> _net; //TODO: parent network
+        shared_ptr<coind::p2p::P2PSocket> _socket;
+        std::shared_ptr<coind::ParentNetwork> _net; 
 
-    protected:
-        CoindProtocol(shared_ptr<c2pool::coind::p2p::P2PSocket> _sct, std::shared_ptr<c2pool::Network> _network);
+    public:
+        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, std::shared_ptr<coind::ParentNetwork> _network);
 
     public:
         shared_ptr<raw_message> make_raw_message()

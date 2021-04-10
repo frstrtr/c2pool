@@ -18,12 +18,12 @@ using namespace c2pool::util::messages;
 
 #include <devcore/logger.h>
 
-namespace c2pool::coind::p2p
+namespace coind::p2p
 {
     class P2PSocket;
 }
 
-namespace c2pool::coind::p2p::messages
+namespace coind::p2p::messages
 {
 
     enum commands
@@ -49,10 +49,10 @@ namespace c2pool::coind::p2p::messages
     //base_message type for handle
     class raw_message
     {
-        friend c2pool::coind::p2p::P2PSocket;
+        friend coind::p2p::P2PSocket;
 
     public:
-        c2pool::coind::p2p::messages::commands name_type;
+        coind::p2p::messages::commands name_type;
         UniValue value;
 
     protected:
@@ -64,7 +64,7 @@ namespace c2pool::coind::p2p::messages
             converter = std::make_shared<coind_converter>();
         }
 
-        void set_prefix(std::shared_ptr<c2pool::Network> _net)
+        void set_prefix(std::shared_ptr<coind::ParentNetwork> _net)
         {
             //TODO: correct prefix set!
             converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
@@ -74,14 +74,14 @@ namespace c2pool::coind::p2p::messages
         {
             UniValue _value = converter->decode();
             LOG_TRACE << "deserialize value :" << _value.write();
-            name_type = (c2pool::coind::p2p::messages::commands)_value["name_type"].get_int();
+            name_type = (coind::p2p::messages::commands)_value["name_type"].get_int();
             value = _value["value"].get_obj();
         }
     };
 
     class base_message
     {
-        friend class c2pool::coind::p2p::python::PyPackCoindTypes;
+        friend class coind::p2p::python::PyPackCoindTypes;
 
     protected:
         std::shared_ptr<coind_converter> converter;

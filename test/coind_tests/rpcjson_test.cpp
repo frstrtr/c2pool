@@ -11,8 +11,8 @@
 #include "pass.h"
 #endif
 
-using namespace c2pool::coind::jsonrpc;
-using namespace c2pool::coind::jsonrpc::data;
+using namespace coind::jsonrpc;
+using namespace coind::jsonrpc::data;
 using namespace std;
 
 class Bitcoind_JSONRPC : public ::testing::Test
@@ -36,7 +36,7 @@ protected:
         char* username = std::get<0>(_pass);
         char* password = std::get<1>(_pass);
         char* addr = std::get<2>(_pass);
-        coind = new Coind(username, password, addr, std::make_shared<c2pool::DigibyteNetwork>());
+        coind = new Coind(username, password, addr, std::make_shared<coind::DigibyteParentNetwork>());
 
 #else
         coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/", std::make_shared<c2pool::DigibyteNetwork>());

@@ -1,6 +1,6 @@
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
-set(COIND_TESTS_SOURCE #[[data_test.cpp]] rpcjson_test.cpp)
+set(COIND_TESTS_SOURCE #[[data_test.cpp]] rpcjson_test.cpp p2p_test.cpp)
 
 if (EXISTS ${CMAKE_CURRENT_LIST_DIR}/pass.h)
     message("exist coind pass file in tests!")
@@ -11,4 +11,4 @@ endif()
 add_executable(coind_test ${COIND_TESTS_SOURCE})
 
 target_link_libraries(coind_test gtest gtest_main)
-target_link_libraries(coind_test networks coind_tool coind_jsonrpc)
+target_link_libraries(coind_test devcore networks coind_tool coind_jsonrpc coind_p2p)

@@ -11,7 +11,7 @@
 #include <iostream>
 using namespace std;
 
-namespace c2pool::coind::jsonrpc::data
+namespace coind::jsonrpc::data
 {
     struct getwork_result{
         int version;
@@ -29,4 +29,4 @@ namespace c2pool::coind::jsonrpc::data
         bool use_getblocktemplate; //=use_getblocktemplate,
         time_t latency; //=end - start,
     };
-} // namespace c2pool::coind::jsonrpc::data
+} // namespace coind::jsonrpc::data
