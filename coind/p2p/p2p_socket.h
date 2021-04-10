@@ -1,34 +1,33 @@
 #pragma once
 
 #include "messages.h"
-using namespace c2pool::coind::p2p::messages;
+using namespace coind::p2p::messages;
 
-namespace c2pool
+namespace coind
 {
-    class Network;
+    class ParentNetwork;
+}
 
-    namespace coind::p2p
-    {
-        class CoindProtocol;
-    }
-} // namespace c2pool
+namespace coind::p2p
+{
+    class CoindProtocol;
+}
 
 #include <memory>
-#include <networks/network.h>
 #include <boost/asio.hpp>
 #include <boost/function.hpp>
 namespace ip = boost::asio::ip;
 
-namespace c2pool::coind::p2p
+namespace coind::p2p
 {
     class P2PSocket : public std::enable_shared_from_this<P2PSocket>
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network);
+        P2PSocket(ip::tcp::socket socket, shared_ptr<coind::ParentNetwork> _network);
 
         //for connect
-        void init(const boost::asio::ip::tcp::resolver::results_type endpoints);
+        void init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto);
 
         bool isConnected() const { return _socket.is_open(); }
         ip::tcp::socket &get() { return _socket; }
@@ -54,9 +53,9 @@ namespace c2pool::coind::p2p
         void write_message_data(std::shared_ptr<base_message> msg);
 
     private:
-        std::shared_ptr<c2pool::Network> _net; //TODO: Parent network
+        std::shared_ptr<coind::ParentNetwork> _net; //TODO: Parent network
         ip::tcp::socket _socket;
 
-        std::weak_ptr<c2pool::coind::p2p::CoindProtocol> _protocol;
+        std::weak_ptr<coind::p2p::CoindProtocol> _protocol;
     };
 } // namespace c2pool::p2p

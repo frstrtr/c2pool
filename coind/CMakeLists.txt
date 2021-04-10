@@ -29,7 +29,13 @@ set(coind_p2p_sources
         p2p/p2p_protocol.h
         p2p/p2p_protocol.cpp
         p2p/p2p_socket.h
-        p2p/p2p_socket.cpp)
+        p2p/p2p_socket.cpp
+        p2p/pystruct.h
+        p2p/pystruct.cpp)
 
+message("py3_lib in coind::p2p = ${Python3_LIBRARIES} \n
+        py3_include = ${Python3_INCLUDE_DIRS}
+")
 add_library(coind_p2p STATIC ${coind_p2p_sources})
 target_link_libraries(coind_p2p ${Python3_LIBRARIES} devcore util btclibs)
+target_include_directories(coind_p2p PUBLIC ${Python3_INCLUDE_DIRS})

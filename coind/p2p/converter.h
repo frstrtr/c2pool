@@ -12,21 +12,21 @@ using std::tuple;
 #define CHECKSUM_LENGTH 4          //sha256(sha256(payload))[:4]
 #define MAX_PAYLOAD_LENGTH 8000000 //max len payload
 
-namespace c2pool::coind::p2p::python{
+namespace coind::p2p::python{
     class PyPackCoindTypes;
 }
 
-namespace c2pool::coind::p2p
+namespace coind::p2p
 {
     class P2PSocket;
 }
 
-namespace c2pool::coind::p2p::messages
+namespace coind::p2p::messages
 {
     class coind_converter : public std::enable_shared_from_this<coind_converter>
     {
-        friend c2pool::coind::p2p::python::PyPackCoindTypes;
-        friend c2pool::coind::p2p::P2PSocket;
+        friend coind::p2p::python::PyPackCoindTypes;
+        friend coind::p2p::P2PSocket;
 
     protected:
         char *prefix;

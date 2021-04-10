@@ -16,26 +16,29 @@ using std::tuple;
 #include <boost/function.hpp>
 namespace ip = boost::asio::ip;
 
-using namespace c2pool::coind::p2p;
-using namespace c2pool::coind::p2p::messages;
+using namespace coind::p2p;
+using namespace coind::p2p::messages;
 
-namespace c2pool::coind::p2p
+namespace coind::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network) : _socket(std::move(socket)), _net(_network)
+    P2PSocket::P2PSocket(ip::tcp::socket socket, shared_ptr<coind::ParentNetwork> _network) : _socket(std::move(socket)), _net(_network)
     {
     }
 
-    void P2PSocket::init(const boost::asio::ip::tcp::resolver::results_type endpoints)
+    void P2PSocket::init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto)
     {
+        _protocol = proto;
         //auto self = shared_from_this();
+        std::cout << "Try to connected in P2PSocket::init" << std::endl;
         boost::asio::async_connect(_socket, endpoints, [this](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep) {
+            std::cout << "Connected to " << ep.address() << ":" << ep.port();
             LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
             if (!ec)
             {
                 //start reading in socket:
-        start_read();
+                start_read();
             }
             else
             {
@@ -154,7 +157,7 @@ namespace c2pool::coind::p2p
                                     if (!ec)
                                     {
                                         LOG_TRACE << "try to read command";
-                                        c2pool::coind::p2p::python::other::debug_log(tempRawMessage->converter->command, COMMAND_LENGTH);
+                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->command, COMMAND_LENGTH);
                                         //LOG_INFO << "read_command";
                                         read_length(tempRawMessage);
                                     }
@@ -174,7 +177,7 @@ namespace c2pool::coind::p2p
                                     if (!ec)
                                     {
                                         LOG_TRACE << "try to read length";
-                                        c2pool::coind::p2p::python::other::debug_log(tempRawMessage->converter->length, PAYLOAD_LENGTH);
+                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->length, PAYLOAD_LENGTH);
                                         tempRawMessage->converter->set_unpacked_len();
                                         // LOG_INFO << "read_length";
                                         read_checksum(tempRawMessage);
@@ -195,7 +198,7 @@ namespace c2pool::coind::p2p
                                     if (!ec)
                                     {
                                         LOG_TRACE << "try to read checksum";
-                                        c2pool::coind::p2p::python::other::debug_log(tempRawMessage->converter->checksum, CHECKSUM_LENGTH);
+                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->checksum, CHECKSUM_LENGTH);
                                         // LOG_INFO << "read_checksum";
                                         read_payload(tempRawMessage);
                                     }
@@ -214,7 +217,7 @@ namespace c2pool::coind::p2p
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
                                     if (!ec)
                                     {
-                                        c2pool::coind::p2p::python::other::debug_log(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len());
+                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len());
                                         // LOG_INFO << "read_payload";
                                         LOG_DEBUG << "HANDLE MESSAGE!";
                                         _protocol.lock()->handle(tempRawMessage);

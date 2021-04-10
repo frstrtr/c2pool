@@ -18,21 +18,21 @@
 
 using std::shared_ptr, std::make_shared;
 using std::string;
-using namespace c2pool::coind::jsonrpc::data;
+using namespace coind::jsonrpc::data;
 
-namespace c2pool::coind::jsonrpc
+namespace coind::jsonrpc
 {
     class Coind : public std::enable_shared_from_this<Coind>
     {
     private:
         CURL *curl;
-        shared_ptr<Network> net;
+        shared_ptr<coind::ParentNetwork> net;
 
         const char *dataFormat =
             "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": %s }";
 
     public:
-        Coind(char *username, char *password, char *address, shared_ptr<Network> _net) : net(_net)
+        Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net) : net(_net)
         {
             curl = curl_easy_init();
 
@@ -69,7 +69,7 @@ namespace c2pool::coind::jsonrpc
                 return 0; //error
         }
 
-        UniValue _request(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
+        UniValue _request(std::string command, coind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
             UniValue result;
             result.setNull();
@@ -128,7 +128,7 @@ namespace c2pool::coind::jsonrpc
             return result;
         }
 
-        UniValue request(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
+        UniValue request(std::string command, coind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
             auto result = _request(command, req);
 
@@ -141,7 +141,7 @@ namespace c2pool::coind::jsonrpc
         }
 
         //return data with "error" and etc...
-        UniValue request_full_data(std::string command, c2pool::coind::jsonrpc::data::TemplateRequest *req = nullptr)
+        UniValue request_full_data(std::string command, coind::jsonrpc::data::TemplateRequest *req = nullptr)
         {
             return _request(command, req);
         }
@@ -232,5 +232,5 @@ namespace c2pool::coind::jsonrpc
             else
                 return request("getmemorypool");
         }
-    }; // namespace c2pool::coind
-} // namespace c2pool::coind::jsonrpc
+    }; // namespace coind
+} // namespace coind::jsonrpc

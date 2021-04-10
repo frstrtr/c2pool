@@ -6,7 +6,7 @@
 #include <tuple>
 using std::tuple, std::make_tuple;
 
-namespace c2pool::coind::p2p::messages
+namespace coind::p2p::messages
 {
 
     void coind_converter::set_unpacked_len(char *packed_len)
@@ -18,7 +18,7 @@ namespace c2pool::coind::p2p::messages
         if (length != nullptr)
         {
             LOG_TRACE << "set_unpacked_len length != nullptr";
-            _unpacked_length = c2pool::coind::p2p::python::PyPackCoindTypes::receive_length(length);
+            _unpacked_length = coind::p2p::python::PyPackCoindTypes::receive_length(length);
         }
     }
 
@@ -33,7 +33,7 @@ namespace c2pool::coind::p2p::messages
         if (data_ != nullptr)
         {
             c2pool::dev::substr(length, data_, COMMAND_LENGTH, PAYLOAD_LENGTH);
-            _unpacked_length = c2pool::coind::p2p::python::PyPackCoindTypes::receive_length(length);
+            _unpacked_length = coind::p2p::python::PyPackCoindTypes::receive_length(length);
         }
 
         return get_length();
@@ -42,7 +42,7 @@ namespace c2pool::coind::p2p::messages
     tuple<char *, int> coind_converter::encode(UniValue json)
     {
         LOG_TRACE << "before set data with pypacktypes encode";
-        set_data(c2pool::coind::p2p::python::PyPackCoindTypes::encode(json));
+        set_data(coind::p2p::python::PyPackCoindTypes::encode(json));
         LOG_TRACE << "before return encode result";
         return make_tuple<char *, int>(get_data(), get_length());
     }
@@ -50,7 +50,7 @@ namespace c2pool::coind::p2p::messages
     UniValue coind_converter::decode()
     {
         LOG_TRACE << "p2pool_converter::decode() called!";
-        return c2pool::coind::p2p::python::PyPackCoindTypes::decode(shared_from_this());
+        return coind::p2p::python::PyPackCoindTypes::decode(shared_from_this());
     }
 
     void coind_converter::set_data(char *data_)

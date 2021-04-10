@@ -12,7 +12,7 @@ using std::vector;
 
 //In request class constructor only required agruments, without optional.
 
-namespace c2pool::coind::jsonrpc::data
+namespace coind::jsonrpc::data
 {
     class TemplateRequest
     {
@@ -144,4 +144,4 @@ namespace c2pool::coind::jsonrpc::data
             }
         }
     };
-} // namespace c2pool::coind::data
+} // namespace coind::data

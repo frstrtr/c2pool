@@ -59,7 +59,7 @@ namespace c2pool::libnet
             return _addr_store;
         }
 
-        shared_ptr<c2pool::coind::jsonrpc::Coind> coind() const
+        shared_ptr<coind::jsonrpc::Coind> coind() const
         {
             return _coind;
         }
@@ -69,7 +69,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pnode;
-        shared_ptr<c2pool::coind::jsonrpc::Coind> _coind;
+        shared_ptr<coind::jsonrpc::Coind> _coind;
         shared_ptr<c2pool::libnet::CoindNode> coind_node; //TODO: init
         shared_ptr<c2pool::shares::tracker::ShareTracker> _tracker;
         //TODO: parent[coind] network
