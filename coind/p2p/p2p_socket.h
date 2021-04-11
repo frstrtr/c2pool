@@ -28,6 +28,7 @@ namespace coind::p2p
 
         //for connect
         void init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto);
+        void connectionMade(boost::asio::ip::tcp::endpoint ep);
 
         bool isConnected() const { return _socket.is_open(); }
         ip::tcp::socket &get() { return _socket; }

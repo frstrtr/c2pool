@@ -1,8 +1,10 @@
 #include "p2p_socket.h"
 #include "messages.h"
 #include "p2p_protocol.h"
+#include <util/types.h>
 #include <devcore/logger.h>
 #include <devcore/str.h>
+#include <devcore/random.h>
 #include <networks/network.h>
 #include "pystruct.h"
 
@@ -35,9 +37,11 @@ namespace coind::p2p
         boost::asio::async_connect(_socket, endpoints, [this](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep) {
             std::cout << "Connected to " << ep.address() << ":" << ep.port();
             LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
+            connectionMade(ep);
             if (!ec)
             {
                 //start reading in socket:
+
                 start_read();
             }
             else
@@ -45,6 +49,23 @@ namespace coind::p2p
                 LOG_ERROR << "async_connect: " << ec << " " << ec.message();
             }
         });
+    }
+
+    void P2PSocket::connectionMade(boost::asio::ip::tcp::endpoint ep)
+    {
+        c2pool::util::messages::address_type addr_to(1, ep.address().to_string(), ep.port());
+        c2pool::util::messages::address_type addr_from(1, _socket.local_endpoint().address().to_string(), _socket.local_endpoint().port());
+        auto version_msg = _protocol.lock()->make_message<message_version>(
+            70017,
+            1,
+            c2pool::dev::timestamp(),
+            addr_to,
+            addr_from,
+            c2pool::random::RandomNonce(),
+            "C2Pool:v0.1",//TODO: Network.version
+            0
+        );
+        write(version_msg);
     }
 
     //TODO:
@@ -112,7 +133,6 @@ namespace coind::p2p
     {
         LOG_TRACE << "START READING!:";
         //make raw_message for reading data
-        LOG_TRACE << "protocol count" << _protocol.lock().use_count();
         shared_ptr<raw_message> tempRawMessage = _protocol.lock()->make_raw_message();
         LOG_TRACE << "created temp_raw_message";
         //Socket started for reading!
@@ -121,9 +141,6 @@ namespace coind::p2p
 
     void P2PSocket::read_prefix(shared_ptr<raw_message> tempRawMessage)
     {
-        //TODO: move to make_raw_message
-        //tempMessage->prefix = new char[nodes->p2p_node->net()->PREFIX_LENGTH];
-        tempRawMessage->converter->prefix = new char[8];
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->prefix, 8),
