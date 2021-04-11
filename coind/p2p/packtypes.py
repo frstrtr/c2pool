@@ -85,16 +85,16 @@ def add_dicts_ext(add_func=lambda a, b: a+b, zero=0):
     def add_dicts(*dicts):
         res = {}
         for d in dicts:
-            for k, v in d.iteritems():
+            for k, v in d.items():
                 res[k] = add_func(res.get(k, zero), v)
-        return dict((k, v) for k, v in res.iteritems() if v != zero)
+        return dict((k, v) for k, v in res.items() if v != zero)
     return add_dicts
 
 
 add_dicts = add_dicts_ext()
 
 
-def mult_dict(c, x): return dict((k, c*v) for k, v in x.iteritems())
+def mult_dict(c, x): return dict((k, c*v) for k, v in x.items())
 
 
 def format(x, add_space=False):
@@ -196,7 +196,7 @@ def reversed(x):
 
 class Object(object):
     def __init__(self, **kwargs):
-        for k, v in kwargs.iteritems():
+        for k, v in kwargs.items():
             setattr(self, k, v)
 
 
@@ -468,7 +468,7 @@ class VarStrType(Type):
 
     def read(self, file):
         length = self._inner_size.read(file)
-        return file.read(length).decode('ascii')
+        return codecs.decode(file.read(length), 'ascii')
 
     def write(self, file, item):
         self._inner_size.write(file, len(item))
@@ -481,7 +481,7 @@ class EnumType(Type):
         self.pack_to_unpack = pack_to_unpack
 
         self.unpack_to_pack = {}
-        for k, v in pack_to_unpack.iteritems():
+        for k, v in pack_to_unpack.items():
             if v in self.unpack_to_pack:
                 raise ValueError('duplicate value in pack_to_unpack')
             self.unpack_to_pack[v] = k
@@ -586,9 +586,11 @@ class IntType(Type):
 class IPV6AddressType(Type):
     def read(self, file):
         data = file.read(16)
+        print("dataIPV6Addr: {0}".format(data))
         if data[:12] == codecs.decode('00000000000000000000ffff', 'hex'):
             return '.'.join(str(x) for x in data[12:])
-        return ':'.join(data[i*2:(i+1)*2].encode('hex') for i in range(8))
+        #BUG:
+        return b':'.join(codecs.encode(data[i*2:(i+1)*2], 'hex') for i in range(8))
 
     def write(self, file, item):
         if ':' in item:
@@ -783,6 +785,7 @@ tx_id_type = ComposedType([
     ('lock_time', IntType(32))
 ])
 
+
 class TransactionType(Type):
     _int_type = IntType(32)
     _varint_type = VarIntType()
@@ -854,6 +857,36 @@ class TYPE:
         ('port', IntType(16, 'big')),
     ])
 
+    merkle_link_type = ComposedType([
+        ('branch', ListType(IntType(256))),
+        ('index', IntType(32)),
+    ])
+
+    merkle_tx_type = ComposedType([
+        ('tx', tx_id_type), # used only in aux_pow_type
+        ('block_hash', IntType(256)),
+        ('merkle_link', merkle_link_type),
+    ])
+
+    block_header_type = ComposedType([
+        ('version', IntType(32)),
+        ('previous_block', PossiblyNoneType(0, IntType(256))),
+        ('merkle_root', IntType(256)),
+        ('timestamp', IntType(32)),
+        ('bits', FloatingIntegerType()),
+        ('nonce', IntType(32)),
+    ])
+
+    block_type = ComposedType([
+        ('header', block_header_type),
+        ('txs', ListType(tx_type)),
+    ])
+
+    stripped_block_type = ComposedType([
+        ('header', block_header_type),
+        ('txs', ListType(tx_id_type)),
+    ])
+
     share_type = ComposedType([
         ('type', VarIntType()),
         ('contents', VarStrType()),
@@ -866,43 +899,97 @@ class TYPE:
     message_version = ComposedType([
         ('version', IntType(32)),
         ('services', IntType(64)),
+        ('time', IntType(64)),
         ('addr_to', address_type),
         ('addr_from', address_type),
         ('nonce', IntType(64)),
-        ('sub_version', VarStrType()),
-        ('mode', IntType(32)),  # always 1 for legacy compatibility
-        ('best_share_hash', PossiblyNoneType(0, IntType(256))),
+        ('sub_version_num', VarStrType()),
+        ('start_height', IntType(32)),
     ])
 
-    message_ping = ComposedType([])
+    message_verack = ComposedType([])
 
-    message_addrme = ComposedType([('port', IntType(16))])
-
-    message_addrs = ComposedType([
-        ('addrs', ListType(ComposedType([
-            ('timestamp', IntType(64)),
-            ('address', address_type),  # todo check it out
+    message_inv = ComposedType([
+        ('invs', ListType(ComposedType([
+            ('type', EnumType(IntType(32), {1: 'tx', 2: 'block'})),
+            ('hash', IntType(256)),
         ]))),
     ])
 
-    message_getaddrs = ComposedType([
-        ('count', IntType(32)),
+    message_getdata = ComposedType([
+        ('requests', ListType(ComposedType([
+            ('type', EnumType(IntType(32), {1: 'tx', 2: 'block'})),
+            ('hash', IntType(256)),
+        ]))),
+    ])
+    message_getblocks = ComposedType([
+        ('version', IntType(32)),
+        ('have', ListType(IntType(256))),
+        ('last', PossiblyNoneType(0, IntType(256))),
+    ])
+    message_getheaders = ComposedType([
+        ('version', IntType(32)),
+        ('have', ListType(IntType(256))),
+        ('last', PossiblyNoneType(0, IntType(256))),
+    ])
+    message_getaddr = ComposedType([])
+    
+    message_addr = ComposedType([
+        ('addrs', ListType(ComposedType([
+            ('timestamp', IntType(32)),
+            ('address', address_type),
+        ]))),
+    ])
+
+    message_tx = ComposedType([
+        ('tx', tx_type),
+    ])
+
+    message_block = ComposedType([
+        ('block', block_type),
+    ])
+
+    message_headers = ComposedType([
+        ('headers', ListType(block_type)),
+    ])
+
+    message_ping = ComposedType([
+        ('nonce', IntType(64)),
+    ])
+
+    message_pong = ComposedType([
+        ('nonce', IntType(64)),
+    ])
+
+    message_alert = ComposedType([
+        ('message', VarStrType()),
+        ('signature', VarStrType()),
+    ])
+
+    message_reject = ComposedType([
+        ('message', VarStrType()),
+        ('ccode', IntType(8)),
+        ('reason', VarStrType()),
+        ('data', IntType(256)),
     ])
 
     message_command_number = {
-        'error': 9990,
-        'version': 0,
-        'ping': 1,
-        'addrme': 2,
-        'addrs': 3,
-        'getaddrs': 4,
-        #new:
-        'shares' : 5, 
-        'sharereq' : 6,
-        'sharereply': 7,
-        'best_block' : 8, #todo
-        'have_tx' : 9,
-        'losing_tx' : 10
+        "error" : 9999,
+        "version" : 0,
+        "verack" : 1,
+        "ping" : 2,
+        "pong" : 3,
+        "alert" : 4,
+        "getaddr" : 5,
+        "addr" : 6,
+        "inv" : 7,
+        "getdata" : 8,
+        "reject" : 9,
+        "getblocks" : 10,
+        "getheaders" : 11,
+        "tx" : 12,
+        "block" : 13,
+        "header" : 14
     }
 
     @classmethod
@@ -911,10 +998,10 @@ class TYPE:
 
 #==============================
 
-    @classmethod
-    def get_value_version(cls, json_value):
-        json_value["best_share_hash"] = int(json_value["best_share_hash"], 16)
-        return json_value
+    # @classmethod
+    # def get_value_version(cls, json_value):
+    #     json_value["best_share_hash"] = int(json_value["best_share_hash"], 16)
+    #     return json_value
 
 #==============================
 
@@ -962,7 +1049,7 @@ def serialize_msg(raw_json):
     """
         called when we send msg from c2pool to p2pool
     """
-    # print("serialize_msg started")
+    print("serialize_msg started")
     name_type, value = TYPE.get_json_dict(raw_json)
     # print("name_type = {0}, value = {1}".format(name_type, value))
     _type = TYPE.get_type("message_"+name_type)
@@ -1026,7 +1113,7 @@ def deserialize_msg(_command, checksum, payload):
     #print(result)
     return str(result).replace("\'", "\"")
 
-deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
+#deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 
 def packed_size(raw_json):
     _json = TYPE.get_json_dict(raw_json)
@@ -1211,3 +1298,8 @@ print(tx_type.packed_size({
 }))
 '''
 # print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
+
+#-------------------------------------
+
+msg_version = TYPE.get_type("message_version").pack({'version':70017, "services":1, "time":123, "addr_to":{"services":1, "address":"91.108.24.119", "port":25565}, "addr_from":{"services":1, "address":"91.108.24.119", "port":25565}, "nonce":123456, "sub_version_num":"pool", "start_height":0})
+print(msg_version)

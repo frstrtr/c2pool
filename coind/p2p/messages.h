@@ -94,9 +94,8 @@ namespace coind::p2p::messages
             converter = std::make_shared<coind_converter>(_cmd);
         }
 
-        void set_prefix(std::shared_ptr<c2pool::Network> _net)
+        void set_prefix(std::shared_ptr<coind::ParentNetwork> _net)
         {
-            //TODO: correct prefix set!
             converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
         }
 
