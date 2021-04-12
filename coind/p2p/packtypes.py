@@ -390,12 +390,9 @@ class Type(object):
 
     def _unpack(self, data, ignore_trailing=False):
         obj = self.read(data)
-        print(obj)
         if not ignore_trailing and remaining(data):
-            print(ignore_trailing)
-            print(data)
-            print(remaining(data))
-            raise LateEnd()
+            print("Warning: LateEnd with obj = {0}".format(obj))
+            #raise LateEnd()
         return obj
 
     def _pack(self, obj):
@@ -591,7 +588,7 @@ class IPV6AddressType(Type):
         print("dataIPV6Addr: {0}".format(data))
         if data[:12] == codecs.decode('00000000000000000000ffff', 'hex'):
             return '.'.join(str(x) for x in data[12:])
-        return b':'.join(codecs.encode(data[i*2:(i+1)*2], 'hex') for i in range(8))
+        return codecs.decode(b':'.join(codecs.encode(data[i*2:(i+1)*2], 'hex') for i in range(8)), 'utf-8')
 
     def write(self, file, item):
         symb = ":"
@@ -670,9 +667,8 @@ def get_record(fields):
 class ComposedType(Type):
     def __init__(self, fields):
         self.fields = list(fields)
-        #@ - необязательный элемент
-        self.field_names = set(k for k, v in fields if not "@" in k )
-        self.record_type = get_record(k for k, v in self.fields if not "@" in k)
+        self.field_names = set(k for k, v in fields)
+        self.record_type = get_record(k for k, v in self.fields)
 
     def read(self, file):
         item = self.record_type()
@@ -683,11 +679,7 @@ class ComposedType(Type):
     def write(self, file, item):
         assert set(item.keys()) >= self.field_names
         for key, type_ in self.fields:
-            try:
-                type_.write(file, item[key])
-            except KeyError:
-                if "@" in key:
-                    continue
+            type_.write(file, item[key])
 
 
 class PossiblyNoneType(Type):
@@ -916,7 +908,6 @@ class TYPE:
         ('nonce', IntType(64)),
         ('sub_version_num', VarStrType()),
         ('start_height', IntType(32)),
-        ('@relay', PossiblyNoneType(0, IntType(8)))
     ])
 
     message_verack = ComposedType([])
@@ -1128,7 +1119,7 @@ def deserialize_msg(_command, checksum, payload):
     print(result)
     return str(result).replace("\'", "\"")
 
-deserialize_msg("version", b"e\xd4\x8c\x1d", b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00~kt`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00C~/k\xe3\xef\x1a\xac\x11/DigiByte:7.17.2/\x91\xa5\xc2\x00\x01")
+#deserialize_msg("version", b"e\xd4\x8c\x1d", b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00~kt`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00C~/k\xe3\xef\x1a\xac\x11/DigiByte:7.17.2/\x91\xa5\xc2\x00\x01")
 #deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 
 def packed_size(raw_json):
@@ -1330,8 +1321,8 @@ print(tx_type.packed_size({
 # deserialize_msg("version", b"e\xd4\x8c\x1d", b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00~kt`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00C~/k\xe3\xef\x1a\xac\x11/DigiByte:7.17.2/\x91\xa5\xc2\x00\x01")
 #----------
 
-msg_version = TYPE.get_type("message_version").pack({"@relay":1, 'addr_from': {'address': b'0000:0000:0000:0000:0000:0000:0000:0000', 'port': 0, 'services': 1037}, 'addr_to': {'address': b'0000:0000:0000:0000:0000:0000:0000:0000', 'port': 0, 'services': 0}, 'nonce': 12401488283952971331, 'services': 1037, 'start_height': 12756369, 'sub_version_num': '/DigiByte:7.17.2/', 'time': 1618242430, 'version': 70017})
-print(msg_version)
+# msg_version = TYPE.get_type("message_version").pack({'addr_from': {'address': b'0000:0000:0000:0000:0000:0000:0000:0000', 'port': 0, 'services': 1037}, 'addr_to': {'address': b'0000:0000:0000:0000:0000:0000:0000:0000', 'port': 0, 'services': 0}, 'nonce': 12401488283952971331, 'services': 1037, 'start_height': 12756369, 'sub_version_num': '/DigiByte:7.17.2/', 'time': 1618242430, 'version': 70017})
+# print(msg_version)
 
 # _payload = b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00\x0f\x8ct`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05n\xa4\x15\x9e\r\x98Y\x11/DigiByte:7.17.2/\xc5\xa7\xc2\x00\x01"
 # des_msg = deserialize_msg("version", hashlib.sha256(hashlib.sha256(_payload).digest()).digest()[:4], _payload)
