@@ -9,22 +9,25 @@ using std::tuple, std::make_tuple;
 namespace coind::p2p::messages
 {
 
-    void coind_converter::set_unpacked_len(char *packed_len)
+    void coind_converter::set_unpacked_len()
     {
-        if (packed_len != nullptr) //TODO: wanna to remove?
-        {
-            memcpy(length, packed_len, PAYLOAD_LENGTH);
-        }
-        if (length != nullptr)
+        if (length != nullptr && _unpacked_length == -1)
         {
             LOG_TRACE << "set_unpacked_len length != nullptr";
             _unpacked_length = coind::p2p::python::PyPackCoindTypes::receive_length(length);
+            LOG_TRACE << "_unpacked_len = " << _unpacked_length;
+            payload = new char[_unpacked_length+1];
         }
     }
 
     int coind_converter::get_unpacked_len()
     {
         set_unpacked_len();
+        if (_unpacked_length < 0)
+        {
+            //TODO: LOG _unpacked_length < 0
+            return 0;
+        }
         return _unpacked_length;
     }
 
@@ -55,7 +58,9 @@ namespace coind::p2p::messages
 
     void coind_converter::set_data(char *data_)
     {
-        memcpy(data, data_, set_length(data_)); //set_length return len for data_
+        auto data_length = set_length(data_);
+        data = new char[data_length];
+        memcpy(data, data_, data_length); //set_length return len for data_
     }
 
     int coind_converter::get_length()

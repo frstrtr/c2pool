@@ -109,7 +109,7 @@ namespace coind::p2p
                                  [this, msg](boost::system::error_code _ec, std::size_t length) {
                                      if (_ec)
                                      {
-                                         LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+                                         LOG_ERROR << "P2PSocket::write_prefix()" << _ec << ":" << _ec.message();
                                          return;
                                      }
                                      write_message_data(msg);
@@ -124,7 +124,7 @@ namespace coind::p2p
                                  [this](boost::system::error_code _ec, std::size_t length) {
                                      if (_ec)
                                      {
-                                         LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+                                         LOG_ERROR << "P2PSocket::write_message_data()" << _ec << ":" << _ec.message();
                                      }
                                  });
     }
@@ -143,13 +143,13 @@ namespace coind::p2p
     {
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
-                                boost::asio::buffer(tempRawMessage->converter->prefix, 8),
+                                boost::asio::buffer(tempRawMessage->converter->prefix, 4),
                                 [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
                                     LOG_TRACE << "try to read prefix";
                                     if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
                                     {
                                         LOG_TRACE << "compare prefix";
-                                        //c2pool::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
+                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
                                         LOG_TRACE << "after debug_log";
                                         // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command(tempRawMessage);

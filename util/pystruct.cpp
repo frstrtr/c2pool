@@ -22,7 +22,7 @@ namespace c2pool::python
         auto sys = PyImport_ImportModule("sys");
         auto sys_path = PyObject_GetAttrString(sys, "path");
         // Путь до наших исходников Python
-        auto folder_path = PyUnicode_FromString(c2pool::filesystem::getSubDir_c("/src/util"));
+        auto folder_path = PyUnicode_FromString(c2pool::filesystem::getSubDir_c("/util"));
         PyList_Append(sys_path, folder_path);
 
         // Загрузка py файла
