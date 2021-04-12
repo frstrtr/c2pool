@@ -10,7 +10,7 @@ using std::tuple;
 #define COMMAND_LENGTH 12
 #define PAYLOAD_LENGTH 4           //len(payload)
 #define CHECKSUM_LENGTH 4          //sha256(sha256(payload))[:4]
-#define MAX_PAYLOAD_LENGTH 8000000 //max len payload
+// #define MAX_PAYLOAD_LENGTH 8000000 //max len payload
 
 namespace coind::p2p::python{
     class PyPackCoindTypes;
@@ -35,17 +35,12 @@ namespace coind::p2p::messages
         char command[COMMAND_LENGTH + 1];
         char length[PAYLOAD_LENGTH + 1];
         char checksum[CHECKSUM_LENGTH + 1];
-        char payload[MAX_PAYLOAD_LENGTH + 1];
-        char data[COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH + MAX_PAYLOAD_LENGTH]; //full message without prefix //TODO
+        char* payload;
+        char* data;//[COMMAND_LENGTH + PAYLOAD_LENGTH + CHECKSUM_LENGTH]; //full message without prefix //TODO
     public:
         coind_converter() : prefix(NULL) {}
 
         coind_converter(const char *_command) : prefix(NULL) { set_command(_command); }
-
-        coind_converter(std::shared_ptr<coind_converter> _empty) : prefix(NULL)
-        {
-            set_command(_empty->get_command());
-        }
 
         ~coind_converter()
         {
@@ -87,14 +82,14 @@ namespace coind::p2p::messages
 
         virtual bool isEmpty() { return false; }
 
-        void set_unpacked_len(char *packed_len = nullptr);
+        void set_unpacked_len();
         int get_unpacked_len();
 
         int get_length();
         int set_length(char *data_);
 
     private:
-        unsigned int _unpacked_length = 0;
+        unsigned int _unpacked_length = -1;
 
     public:
     };

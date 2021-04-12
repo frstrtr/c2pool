@@ -390,7 +390,11 @@ class Type(object):
 
     def _unpack(self, data, ignore_trailing=False):
         obj = self.read(data)
+        print(obj)
         if not ignore_trailing and remaining(data):
+            print(ignore_trailing)
+            print(data)
+            print(remaining(data))
             raise LateEnd()
         return obj
 
@@ -535,8 +539,6 @@ class StructType(Type):
     def read(self, file):
         data = file.read(self.length)
         result = struct.unpack(self.desc, data)[0]
-        if (self.length == 8):
-            result = str(result)
         return result
 
     def write(self, file, item):
@@ -589,12 +591,16 @@ class IPV6AddressType(Type):
         print("dataIPV6Addr: {0}".format(data))
         if data[:12] == codecs.decode('00000000000000000000ffff', 'hex'):
             return '.'.join(str(x) for x in data[12:])
-        #BUG:
         return b':'.join(codecs.encode(data[i*2:(i+1)*2], 'hex') for i in range(8))
 
     def write(self, file, item):
-        if ':' in item:
-            data = codecs.decode(''.join(item.replace(':', '')), 'hex')
+        symb = ":"
+        if isinstance(item, bytes):
+            symb = b":"
+        if symb in item:
+            item2 = bytes.decode(item, 'utf-8')
+            new_item2 = bytes(''.join(item2.replace(':', '')), 'utf-8')
+            data = codecs.decode(new_item2, 'hex')
         else:
             bits = list(map(int, item.split('.')))
             if len(bits) != 4:
@@ -664,8 +670,9 @@ def get_record(fields):
 class ComposedType(Type):
     def __init__(self, fields):
         self.fields = list(fields)
-        self.field_names = set(k for k, v in fields)
-        self.record_type = get_record(k for k, v in self.fields)
+        #@ - необязательный элемент
+        self.field_names = set(k for k, v in fields if not "@" in k )
+        self.record_type = get_record(k for k, v in self.fields if not "@" in k)
 
     def read(self, file):
         item = self.record_type()
@@ -676,7 +683,11 @@ class ComposedType(Type):
     def write(self, file, item):
         assert set(item.keys()) >= self.field_names
         for key, type_ in self.fields:
-            type_.write(file, item[key])
+            try:
+                type_.write(file, item[key])
+            except KeyError:
+                if "@" in key:
+                    continue
 
 
 class PossiblyNoneType(Type):
@@ -905,6 +916,7 @@ class TYPE:
         ('nonce', IntType(64)),
         ('sub_version_num', VarStrType()),
         ('start_height', IntType(32)),
+        ('@relay', PossiblyNoneType(0, IntType(8)))
     ])
 
     message_verack = ComposedType([])
@@ -1000,7 +1012,7 @@ class TYPE:
 
     # @classmethod
     # def get_value_version(cls, json_value):
-    #     json_value["best_share_hash"] = int(json_value["best_share_hash"], 16)
+    #     json_value["nonce"] = int(json_value["nonce"])
     #     return json_value
 
 #==============================
@@ -1023,6 +1035,8 @@ class TYPE:
         else:
             value = value_func(_json_dict["value"])
 
+        print(name_type)
+        print(value)
         return name_type, value
 
     # @classmethod
@@ -1053,15 +1067,16 @@ def serialize_msg(raw_json):
     name_type, value = TYPE.get_json_dict(raw_json)
     # print("name_type = {0}, value = {1}".format(name_type, value))
     _type = TYPE.get_type("message_"+name_type)
+    print(_type)
 
     # if error command
     if _type is None:
         return 'ERROR'
     command = bytes(name_type, encoding='ISO-8859-1')
-
+    print(command)
     payload = _type.pack(value)
-
-    # print('SEND_PAYLOAD: {0}'.format(payload))
+    print(payload)
+    print('SEND_PAYLOAD: {0}'.format(payload))
 
     result = struct.pack('<12sI', command, len(
         payload)) + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload
@@ -1083,11 +1098,10 @@ def deserialize(name_type, _bytes_array):
     result = str(_obj_dict)
     return result
 
-
 def deserialize_msg(_command, checksum, payload):
-    # print('_command = {0}'.format(_command))
-    # print('checksum = {0}'.format(checksum))
-    # print('payload = {0}'.format(payload))
+    print('_command = {0}'.format(_command))
+    print('checksum = {0}'.format(checksum))
+    print('payload = {0}'.format(payload))
 
     command = _command.rstrip('\0')
     # payload = bytes(_payload, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
@@ -1105,14 +1119,16 @@ def deserialize_msg(_command, checksum, payload):
         print("type not found")
         return generate_error_json(command, "message type not founded")
 
+    print(type_)
     value = type_.unpack(payload)
     result = {
         'name_type': TYPE.message_command_number[command],
         'value': value
     }
-    #print(result)
+    print(result)
     return str(result).replace("\'", "\"")
 
+deserialize_msg("version", b"e\xd4\x8c\x1d", b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00~kt`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00C~/k\xe3\xef\x1a\xac\x11/DigiByte:7.17.2/\x91\xa5\xc2\x00\x01")
 #deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 
 def packed_size(raw_json):
@@ -1301,5 +1317,22 @@ print(tx_type.packed_size({
 
 #-------------------------------------
 
-msg_version = TYPE.get_type("message_version").pack({'version':70017, "services":1, "time":123, "addr_to":{"services":1, "address":"91.108.24.119", "port":25565}, "addr_from":{"services":1, "address":"91.108.24.119", "port":25565}, "nonce":123456, "sub_version_num":"pool", "start_height":0})
+# msg_version = TYPE.get_type("message_version").pack({'version':70017, "services":1, "time":123, "addr_to":{"services":1, "address":"91.108.24.119", "port":25565}, "addr_from":{"services":1, "address":"91.108.24.119", "port":25565}, "nonce":123456, "sub_version_num":"pool", "start_height":0})
+# print(msg_version)
+
+# msg_version = TYPE.get_type("message_version").pack({'version': 70017, 'services': 1, 'time': 1618232760, 'addr_to': {'services': 1, 'address': '217.72.6.241', 'port': 12024}, 'addr_from': {'services': 1, 'address': '192.168.0.104', 'port': 40732}, 'nonce': 269192454932752171, 'sub_version_num': 'C2Pool:v0.1', 'start_height': 0})
+
+# _payload = b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00\x08\x82t`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19\xcc_M]O\"\xbd\x11/DigiByte:7.17.2/\x17\xa7\xc2\x00\x01"
+# print(_payload)
+# des_msg = deserialize_msg("version", hashlib.sha256(hashlib.sha256(_payload).digest()).digest()[:4], _payload)
+# print(des_msg)
+
+# deserialize_msg("version", b"e\xd4\x8c\x1d", b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00~kt`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00C~/k\xe3\xef\x1a\xac\x11/DigiByte:7.17.2/\x91\xa5\xc2\x00\x01")
+#----------
+
+msg_version = TYPE.get_type("message_version").pack({"@relay":1, 'addr_from': {'address': b'0000:0000:0000:0000:0000:0000:0000:0000', 'port': 0, 'services': 1037}, 'addr_to': {'address': b'0000:0000:0000:0000:0000:0000:0000:0000', 'port': 0, 'services': 0}, 'nonce': 12401488283952971331, 'services': 1037, 'start_height': 12756369, 'sub_version_num': '/DigiByte:7.17.2/', 'time': 1618242430, 'version': 70017})
 print(msg_version)
+
+# _payload = b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00\x0f\x8ct`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05n\xa4\x15\x9e\r\x98Y\x11/DigiByte:7.17.2/\xc5\xa7\xc2\x00\x01"
+# des_msg = deserialize_msg("version", hashlib.sha256(hashlib.sha256(_payload).digest()).digest()[:4], _payload)
+# print(des_msg)

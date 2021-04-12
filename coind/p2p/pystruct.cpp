@@ -63,7 +63,7 @@ namespace coind::p2p::python
 
     //PyPackCoindTypes
 
-    const char *PyPackCoindTypes::filepath = "/util";
+    const char *PyPackCoindTypes::filepath = "/coind/p2p";
 
     char *PyPackCoindTypes::encode(UniValue json_msg)
     {

@@ -196,7 +196,7 @@ namespace coind::p2p::messages
             ss_services << services_str;
             ss_services >> services;
 
-            timestamp = value["timestamp"].get_int64();
+            timestamp = value["time"].get_int64();
 
             LOG_TRACE << "1";
             addr_to = value["addr_to"].get_obj();
@@ -209,7 +209,7 @@ namespace coind::p2p::messages
             ss_nonce >> nonce;
 
             LOG_TRACE << "1";
-            sub_version = value["sub_version"].get_str();
+            sub_version = value["sub_version_num"].get_str();
             LOG_TRACE << "1";
             start_height = value["start_height"].get_int();
             LOG_TRACE << "1";
@@ -223,11 +223,11 @@ namespace coind::p2p::messages
 
             result.pushKV("version", version);
             result.pushKV("services", services);
-            result.pushKV("timestamp", timestamp);
+            result.pushKV("time", timestamp);
             result.pushKV("addr_to", addr_to);
             result.pushKV("addr_from", addr_from);
             result.pushKV("nonce", (uint64_t)nonce);
-            result.pushKV("sub_version", sub_version);
+            result.pushKV("sub_version_num", sub_version);
             result.pushKV("start_height", start_height);
 
             return result;
