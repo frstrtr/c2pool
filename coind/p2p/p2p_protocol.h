@@ -121,6 +121,7 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_version> msg)
         {
+            LOG_TRACE << "HANDLED Message_version!";
         }
 
         void handle(shared_ptr<message_verack> msg)

@@ -100,14 +100,17 @@ namespace coind::p2p::python
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->get_unpacked_len());
 
         auto raw_result = GetCallFunctionResult(pVal);
-        // LOG_TRACE << "raw_result: " << raw_result;
+        LOG_TRACE << "raw_result: " << raw_result;
         result.read(raw_result);
         if(result.exists("error_text")){
             LOG_TRACE << "error text exists";
             return generate_error_json(result);
         }
         //result.read("{"name_type": 0, "value": {"addr_from": {"address": "10.10.10.10", "port": 5024, "services": 0}, "addr_to": {"address": "10.10.10.1", "port": 6736, "services": 0}, "best_share_hash": \"40867716461082619671918594213535070784980289528248303516486975277206795153061\", \"mode\": 1, \"nonce\": 2713422397866666268, \"services\": 0, \"sub_version\": b\"fa6c7cd-dirty-c2pool\", \"version\": 3301}}")
-        // LOG_TRACE << "result :" << result.write();
+        //UniValue test;
+        //test.read("{\"name_type\": 0, \"value\": {\"addr_from\": {\"address\": b\"0000:0000:0000:0000:0000:0000:0000:0000\", \"port\": 0, \"services\": 1037}, \"addr_to\": {\"address\": b\"0000:0000:0000:0000:0000:0000:0000:0000", "port": 0, "services": 0}, "nonce": 2564803462370669259, "services": 1037, "start_height": 12757414, "sub_version_num": "/DigiByte:7.17.2/", "time": 1618257536, "version": 70017}}");
+
+        LOG_TRACE << "result :" << result.write();
         return result;
     }
 

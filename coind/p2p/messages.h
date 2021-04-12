@@ -191,6 +191,23 @@ namespace coind::p2p::messages
             LOG_TRACE << "1";
             version = value["version"].get_int();
             LOG_TRACE << "1";
+//
+
+unsigned long long _t1 = 18446744073709551615;
+int64_t _t2 = _t1;
+unsigned long long _t3 = _t2;
+LOG_TRACE << "_t3: " << _t3;
+
+
+LOG_TRACE << "t2 test";
+unsigned long long t1 = 18446744073709551615;
+unsigned long long t2;
+UniValue test(t1);
+t2 = test.get_uint64();
+LOG_TRACE << "t2: " << t2;
+
+//
+
             auto services_str = value["services"].get_str();
             std::stringstream ss_services;
             ss_services << services_str;
