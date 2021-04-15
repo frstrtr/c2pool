@@ -188,48 +188,14 @@ namespace coind::p2p::messages
 
         message_version &operator=(UniValue value)
         {
-            LOG_TRACE << "1";
             version = value["version"].get_int();
-            LOG_TRACE << "1";
-//
-
-unsigned long long _t1 = 18446744073709551615;
-int64_t _t2 = _t1;
-unsigned long long _t3 = _t2;
-LOG_TRACE << "_t3: " << _t3;
-
-
-LOG_TRACE << "t2 test";
-unsigned long long t1 = 18446744073709551615;
-unsigned long long t2;
-UniValue test(t1);
-t2 = test.get_uint64();
-LOG_TRACE << "t2: " << t2;
-
-//
-
-            auto services_str = value["services"].get_str();
-            std::stringstream ss_services;
-            ss_services << services_str;
-            ss_services >> services;
-
+            services = value["services"].get_uint64();
             timestamp = value["time"].get_int64();
-
-            LOG_TRACE << "1";
             addr_to = value["addr_to"].get_obj();
-            LOG_TRACE << "1";
             addr_from = value["addr_from"].get_obj();
-            LOG_TRACE << "1";
-            auto str_nonce = value["nonce"].get_str();
-            std::stringstream ss_nonce;
-            ss_nonce << str_nonce;
-            ss_nonce >> nonce;
-
-            LOG_TRACE << "1";
+            nonce = value["nonce"].get_uint64();
             sub_version = value["sub_version_num"].get_str();
-            LOG_TRACE << "1";
             start_height = value["start_height"].get_int();
-            LOG_TRACE << "1";
             return *this;
         }
 
@@ -278,12 +244,14 @@ LOG_TRACE << "t2: " << t2;
     public:
         message_ping() : base_message("ping") {}
 
+        message_ping(uint64_t _nonce) : base_message("ping")
+        {
+            nonce = _nonce;
+        }
+
         message_ping &operator=(UniValue value)
         {
-            auto str_nonce = value["nonce"].get_str();
-            std::stringstream ss_nonce;
-            ss_nonce << str_nonce;
-            ss_nonce >> nonce;
+            nonce = value["nonce"].get_uint64();
             return *this;
         }
 
@@ -304,12 +272,14 @@ LOG_TRACE << "t2: " << t2;
     public:
         message_pong() : base_message("pong") {}
 
+        message_pong(uint64_t _nonce) : base_message("pong")
+        {
+            nonce = _nonce;
+        }
+
         message_pong &operator=(UniValue value)
         {
-            auto str_nonce = value["nonce"].get_str();
-            std::stringstream ss_nonce;
-            ss_nonce << str_nonce;
-            ss_nonce >> nonce;
+            nonce = value["nonce"].get_uint64();
             return *this;
         }
 
@@ -351,8 +321,6 @@ LOG_TRACE << "t2: " << t2;
     class message_getaddr : public base_message
     {
     public:
-        uint64_t nonce;
-
     public:
         message_getaddr() : base_message("getaddr") {}
 

@@ -25,9 +25,18 @@ public:
     shared_ptr<coind::ParentNetwork> net;
 
 public:
+    std::shared_ptr<Event<uint256>> new_block;    //block_hash
+    std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
+    std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
+
+public:
     TestCoindNode() : _context(1), _resolver(_context)
     {
         net = make_shared<coind::DigibyteParentNetwork>();
+
+        new_block = std::make_shared<Event<uint256>>();
+        new_tx = std::make_shared<Event<UniValue>>();
+        new_headers = std::make_shared<Event<UniValue>>();
     }
 
     void start(string ip)
@@ -38,6 +47,7 @@ public:
             auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), net);
 
             protocol = make_shared<coind::p2p::CoindProtocol>(_socket, net);
+            protocol->init(new_block, new_tx, new_headers);
             _socket->init(endpoints, protocol);
         });
 

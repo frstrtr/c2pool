@@ -5,6 +5,7 @@
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <devcore/common.h>
+#include <devcore/logger.h>
 
 //todo: move all methods to types.cpp
 namespace c2pool::util::messages
@@ -28,7 +29,7 @@ namespace c2pool::util::messages
 
         address_type &operator=(UniValue value)
         {
-            services = c2pool::dev::str_to_int<unsigned long long>(value["services"].get_str());
+            services = value["services"].get_uint64();
 
             address = value["address"].get_str();
             port = value["port"].get_int();
@@ -97,8 +98,7 @@ namespace c2pool::util::messages
 
         addr &operator=(UniValue value)
         {
-            timestamp = c2pool::dev::str_to_int<int>(value["timestamp"].get_str());
-
+            timestamp = value["timestamp"].get_int();
 
             address = value["address"].get_obj();
             return *this;
@@ -119,7 +119,8 @@ namespace c2pool::util::messages
         friend bool operator!=(const addr &first, const addr &second);
     };
 
-    enum inventory_type{
+    enum inventory_type
+    {
         tx = 1,
         block = 2
     };
@@ -138,9 +139,19 @@ namespace c2pool::util::messages
 
         inventory(inventory_type _type, uint256 _hash);
 
+        inventory_type parse_inv_type(std::string type)
+        {
+            if (type == "tx")
+                return inventory_type::tx;
+            if (type == "block")
+                return inventory_type::block;
+            LOG_ERROR << "inv type don't parsed!";
+            return inventory_type::tx; //if error
+        }
+
         inventory &operator=(UniValue value)
         {
-            type = (inventory_type)value["type"].get_int();
+            type = parse_inv_type(value["type"].get_str());
             hash.SetHex(value["hash"].get_str());
             return *this;
         }
