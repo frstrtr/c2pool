@@ -577,6 +577,7 @@ class IntType(Type):
     def write(self, file, item, a2b_hex=binascii.a2b_hex):
         if self.bytes == 0:
             return None
+        print(type(item))
         if not 0 <= item < self.max:
             raise ValueError('invalid int value - %r' % (item,))
         file.write(a2b_hex(self.format_str % (item,))[::self.step])
@@ -1006,6 +1007,13 @@ class TYPE:
     #     json_value["nonce"] = int(json_value["nonce"])
     #     return json_value
 
+    @classmethod
+    def get_value_getdata(cls, json_value):
+        for req in json_value["requests"]:
+            req["type"] = {1:"tx", 2:"block"}[req["type"]]
+            req["hash"] = int(req["hash"])
+        return json_value
+
 #==============================
 
     @classmethod
@@ -1327,3 +1335,8 @@ print(tx_type.packed_size({
 # _payload = b"\x81\x11\x01\x00\r\x04\x00\x00\x00\x00\x00\x00\x0f\x8ct`\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05n\xa4\x15\x9e\r\x98Y\x11/DigiByte:7.17.2/\xc5\xa7\xc2\x00\x01"
 # des_msg = deserialize_msg("version", hashlib.sha256(hashlib.sha256(_payload).digest()).digest()[:4], _payload)
 # print(des_msg)
+
+# msg_getdata = TYPE.get_type("message_getdata").pack({'requests': [{'type': 1, 'hash': 9920845889973519748608052434415348669419547845707489763920444709}]})
+# print(msg_getdata)
+
+# TYPE.get_value_getdata({'requests': [{'type': 1, 'hash': '4556951046119051870330753174980198143034594426276604144901776515'}]})
