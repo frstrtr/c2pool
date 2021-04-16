@@ -49,6 +49,11 @@ namespace c2pool::libnet
             return _net;
         }
 
+        shared_ptr<coind::ParentNetwork> netParent() const
+        {
+            return _netParent;
+        }
+
         shared_ptr<c2pool::dev::coind_config> config() const
         {
             return _config;
@@ -66,12 +71,12 @@ namespace c2pool::libnet
 
     private:
         shared_ptr<c2pool::Network> _net;
+        shared_ptr<coind::ParentNetwork> _netParent; //TODO: init
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pnode;
         shared_ptr<coind::jsonrpc::Coind> _coind;
         shared_ptr<c2pool::libnet::CoindNode> coind_node; //TODO: init
         shared_ptr<c2pool::shares::tracker::ShareTracker> _tracker;
-        //TODO: parent[coind] network
     };
 } // namespace c2pool::libnet
