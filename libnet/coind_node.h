@@ -12,28 +12,43 @@ using namespace coind::jsonrpc;
 using namespace c2pool::shares::tracker;
 
 #include <memory>
+#include <thread>
 using std::make_shared;
-using std::shared_ptr;
-//, std::make_shared;
+using std::shared_ptr, std::unique_ptr;
+
+#include <boost/asio.hpp>
+namespace io = boost::asio;
+namespace ip = boost::asio::ip;
+
+namespace coind::p2p
+{
+    class CoindProtocol;
+}
 
 namespace c2pool::libnet
 {
     class CoindNode
     {
     public:
-    private:
-        shared_ptr<Coind> _coind;
-        shared_ptr<c2pool::Network> _net;
+        CoindNode(shared_ptr<NodeManager> node_manager);
 
-        shared_ptr<ShareTracker> _tracker; //init + move to NodeManager?
-        shared_ptr<NodeManager> _node_manager;
+        void start();
 
     public:
-        CoindNode(shared_ptr<NodeManager> node_manager)
-        {
-            _node_manager = node_manager;
-            _coind = _node_manager->coind();
-            _net = _node_manager->net();
-        }
+        std::shared_ptr<Event<uint256>> new_block;    //block_hash
+        std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
+        std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
+    private:
+        shared_ptr<Coind> _coind;
+        shared_ptr<coind::ParentNetwork> _net;
+        shared_ptr<NodeManager> _node_manager;
+
+        shared_ptr<coind::p2p::CoindProtocol> protocol;
+        shared_ptr<ShareTracker> _tracker; //init + move to NodeManager?
+
+    private:
+        unique_ptr<std::thread> _thread;
+        io::io_context _context;
+        ip::tcp::resolver _resolver;
     };
 }
