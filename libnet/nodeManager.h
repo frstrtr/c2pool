@@ -69,6 +69,16 @@ namespace c2pool::libnet
             return _coind;
         }
 
+        shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const
+        {
+            return p2pnode;
+        }
+
+        shared_ptr<c2pool::shares::tracker::ShareTracker> tracker() const
+        {
+            return _tracker;
+        }
+
     private:
         shared_ptr<c2pool::Network> _net;
         shared_ptr<coind::ParentNetwork> _netParent; //TODO: init

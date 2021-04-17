@@ -11,6 +11,9 @@ using namespace coind::jsonrpc;
 #include <sharechains/tracker.h>
 using namespace c2pool::shares::tracker;
 
+#include <util/events.h>
+using namespace c2pool::util::events;
+
 #include <memory>
 #include <thread>
 using std::make_shared;
@@ -34,10 +37,19 @@ namespace c2pool::libnet
 
         void start();
 
+        void set_best_share();
+        void clean_tracker();
+
     public:
+        std::shared_ptr<Event<>> stop;
+
         std::shared_ptr<Event<uint256>> new_block;    //block_hash
         std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
         std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
+
+        std::shared_ptr<Variable<coind::jsonrpc::data::getwork_result>> coind_work;
+    private:
+        void work_poller();
     private:
         shared_ptr<Coind> _coind;
         shared_ptr<coind::ParentNetwork> _net;

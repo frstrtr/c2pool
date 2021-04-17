@@ -17,12 +17,13 @@ namespace c2pool::util::events
     class Event
     {
         boost::signals2::signal<void(Args...)> sig;
+        int times;
 
     public:
         Event() {}
 
         template <typename _Func, typename... _BoundArgs>
-        void subscribe(_Func &&__f, _BoundArgs &&... __args)
+        void subscribe(_Func &&__f, _BoundArgs &&...__args)
         {
             sig.connect(std::bind(__f, __args...));
         }
@@ -32,7 +33,11 @@ namespace c2pool::util::events
             //TODO
         }
 
-        void happened(Args... args) const { sig(args...); }
+        void happened(Args... args) const
+        {
+            sig(args...);
+            times += 1;
+        }
     };
 } // namespace c2pool::util::events
 
