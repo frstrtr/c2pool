@@ -47,9 +47,13 @@ namespace c2pool::libnet
         std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
         std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
 
+        std::shared_ptr<Variable</*TODO*/>> best_share_var;
+        std::shared_ptr<Variable</*TODO*/>> best_block_header;
+
         std::shared_ptr<Variable<coind::jsonrpc::data::getwork_result>> coind_work;
     private:
         void work_poller();
+        void poll_header();
     private:
         shared_ptr<Coind> _coind;
         shared_ptr<coind::ParentNetwork> _net;

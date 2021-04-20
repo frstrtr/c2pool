@@ -91,6 +91,8 @@ namespace coind
         virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
 
         virtual bool version_check(int version) = 0;
+
+        virtual /*todo: type*/ POW_FUNC(/*todo: block_header_type.pack(uint256)*/);
     };
 
     class DigibyteParentNetwork : public ParentNetwork
@@ -102,5 +104,7 @@ namespace coind
         bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) override;
 
         bool version_check(int version) override;
+
+        /*todo: type*/ POW_FUNC(/*todo: type*/) override; //TODO: override 
     };
 }

@@ -55,4 +55,8 @@ namespace c2pool::shares::tracker
 
         lookbehind_items.push(share);
     }
+
+    TrackerThinkResult ShareTracker::think(){
+        
+    }
 }

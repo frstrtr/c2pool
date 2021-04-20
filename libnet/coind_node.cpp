@@ -35,6 +35,8 @@ namespace c2pool::libnet
             work_poller();
 
             //PEER:
+            coind_work->changed.subscribe(&CoindNode::poll_header, this);
+
             //TODO:
             _context.run();
         }));
@@ -46,6 +48,23 @@ namespace c2pool::libnet
         //TODO:
     }
 
+    void CoindNode::poll_header()
+    {
+        //TODO: check for coind p2p connection, if true:
+        uint256 block_header = protocol->get_block_header(coind_work->value.previous_block); //new_header
+        auto _block_header_type = block_header;                                              //TODO: bitcoin_data.block_header_type.pack(new_header)
+        if (_net->POW_FUNC(_block_header_type) <= coind_work->value.bits) //bits.target?
+        {
+            return;
+        }
+
+        auto coind_best_block = coind_work->value.previous_block;
+        if ((best_block_header->value == nullptr) ||
+                (block_header.previous_block == coind_best_block && hash256(/*todo: pack for block_header*/))){
+
+        }
+    }
+
     void CoindNode::set_best_share()
     {
         auto tracker_think_result = _tracker.think(/*TODO: self.get_height_rel_highest, self.coind_work.value['previous_block'], self.coind_work.value['bits'], self.known_txs_var.value*/);
@@ -53,20 +72,21 @@ namespace c2pool::libnet
         best_share_var = tracker_think_result.best;
         //TODO: self.desired_var.set(desired)
 
-        if (_node_manager->p2pNode() != nullptr)
-        {
-            for (auto bad_peer_address : bad_peer_addresses)
-            {
-                for (auto peer : _node_manager->p2pNode()->peers)
-                {
-                    if (peer.addr == bad_peer_address)
-                    {
-                        peer.badPeerHappened();
-                        break;
-                    }
-                }
-            }
-        }
+        //TODO:
+        // if (_node_manager->p2pNode() != nullptr)
+        // {
+        //     for (auto bad_peer_address : bad_peer_addresses)
+        //     {
+        //         for (auto peer : _node_manager->p2pNode()->peers)
+        //         {
+        //             if (peer.addr == bad_peer_address)
+        //             {
+        //                 peer.badPeerHappened();
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // }
     }
 
     void CoindNode::clean_tracker()

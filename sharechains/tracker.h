@@ -7,6 +7,10 @@
 #include <devcore/logger.h>
 
 #include <map>
+#include <vector>
+#include <set>
+#include <tuple>
+#include <string>
 #include <queue>
 #include <memory>
 using std::map;
@@ -24,6 +28,14 @@ using namespace c2pool::shares::share;
 
 namespace c2pool::shares::tracker
 {
+    struct TrackerThinkResult
+    {
+        uint256 best_hash;
+        std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
+        std::vector<uint256> decorated_heads; //TODO: TYPE???
+        std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
+    };
+
     class LookbehindDelta
     {
     private:
@@ -51,5 +63,7 @@ namespace c2pool::shares::tracker
         ShareTracker();
 
         void add(shared_ptr<BaseShare> share);
+
+        TrackerThinkResult think();
     };
 } // namespace c2pool::shares::tracker
