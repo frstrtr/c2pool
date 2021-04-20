@@ -31,8 +31,15 @@ namespace coind::p2p
             LOG_TRACE << "PINGER!";
             auto msg_ping = make_message<coind::p2p::messages::message_ping>(1234);
             _socket->write(msg_ping);
-            LOG_TRACE << "status server: " << _socket->isConnected(); 
+            LOG_TRACE << "status server: " << _socket->isConnected();
             pinger(delay);
         });
+    }
+
+    void CoindProtocol::get_block_header(uint256 hash)
+    {
+        std::vector<uint256> _have;
+        auto _msg = make_message<coind::p2p::messages::message_getheaders>(1, _have, hash);
+        _socket->write(_msg);
     }
 }

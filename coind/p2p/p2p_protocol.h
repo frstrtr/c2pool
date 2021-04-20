@@ -46,7 +46,8 @@ namespace coind::p2p
     private:
         std::shared_ptr<boost::asio::steady_timer> pinger_timer;
         void pinger(int delay);
-
+    public:
+        void get_block_header(uint256 hash);
     public:
         shared_ptr<raw_message> make_raw_message()
         {
