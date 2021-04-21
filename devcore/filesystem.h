@@ -12,15 +12,12 @@ namespace c2pool::filesystem
 
     //full path to main project folder
     std::string getProjectDir();
+    const char *getProjectDir_c();
 
     path getProjectPath();
     auto createDirectory(std::string directoryName);
-    auto createFile(std::string fileName);
     auto findFile(std::string fileName);
-    auto getPath();
-    
-
-    const char *getProjectDir_c();
+    auto getFile(std::string fileName);
 
     //full subdirection path.
     std::string getSubDir(std::string path);
