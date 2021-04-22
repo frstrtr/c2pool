@@ -14,6 +14,5 @@ set(sources
     compat/endian.h
     )
 
-add_subdirectory(secp256k1)
 add_library(btclibs ${sources}) #${SOURCE} ${HEADER})
 target_include_directories(btclibs PUBLIC util crypto compat)
