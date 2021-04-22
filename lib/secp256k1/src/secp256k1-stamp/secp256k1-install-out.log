@@ -1,0 +1,34 @@
+gmake[4]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+gmake[5]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+gmake[6]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+Scanning dependencies of target gen_context
+gmake[6]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+gmake[6]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+[ 25%] Building C object CMakeFiles/gen_context.dir/src/gen_context.c.o
+[ 50%] Linking C executable gen_context
+gmake[6]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+[ 50%] Built target gen_context
+gmake[6]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+Scanning dependencies of target ecmult_static_context
+gmake[6]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+gmake[6]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+gmake[6]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+[ 50%] Built target ecmult_static_context
+gmake[6]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+Scanning dependencies of target secp256k1
+gmake[6]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+gmake[6]: Entering directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+[ 75%] Building C object CMakeFiles/secp256k1.dir/src/secp256k1.c.o
+[100%] Linking C static library libsecp256k1.a
+gmake[6]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+[100%] Built target secp256k1
+gmake[5]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'
+Install the project...
+-- Install configuration: ""
+-- Installing: /home/sl33n/c2pool/lib/secp256k1/lib/libsecp256k1.a
+-- Up-to-date: /home/sl33n/c2pool/lib/secp256k1/include
+-- Installing: /home/sl33n/c2pool/lib/secp256k1/include/secp256k1.h
+-- Installing: /home/sl33n/c2pool/lib/secp256k1/include/secp256k1_recovery.h
+-- Installing: /home/sl33n/c2pool/lib/secp256k1/include/secp256k1_ecdh.h
+-- Installing: /home/sl33n/c2pool/lib/secp256k1/include/secp256k1_sha256.h
+gmake[4]: Leaving directory '/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build'

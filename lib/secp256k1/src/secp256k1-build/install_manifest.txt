@@ -1,0 +1,5 @@
+/home/sl33n/c2pool/lib/secp256k1/lib/libsecp256k1.a
+/home/sl33n/c2pool/lib/secp256k1/include/secp256k1.h
+/home/sl33n/c2pool/lib/secp256k1/include/secp256k1_recovery.h
+/home/sl33n/c2pool/lib/secp256k1/include/secp256k1_ecdh.h
+/home/sl33n/c2pool/lib/secp256k1/include/secp256k1_sha256.h
