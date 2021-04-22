@@ -1,6 +1,6 @@
 file(GLOB sources "*.h" "*.cpp")
 
-find_library(dl NAMES dl )
+find_library(dl NAMES dl)
 
 add_library(devcore ${sources})
 target_link_libraries(devcore Boost::log Boost::log_setup ${Python3_LIBRARIES} univalue ${dl})

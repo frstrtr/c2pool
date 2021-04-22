@@ -1,21 +1,3 @@
-set(HEADER 
-    util/strencodings.h
-    util/str.h
-    crypto/common.h
-    compat/endian.h
-    compat/byteswap.h
-    uint256.h
-    attributes.h
-    tinyformat.h
-    arith_uint256.h
-)
-set(SOURCE
-    util/strencodings.cpp
-    util/str.cpp
-    uint256.cpp
-    arith_uint256.cpp
-)
-
 set(sources 
     uint256.h
     uint256.cpp
@@ -32,5 +14,6 @@ set(sources
     compat/endian.h
     )
 
+add_subdirectory(secp256k1)
 add_library(btclibs ${sources}) #${SOURCE} ${HEADER})
 target_include_directories(btclibs PUBLIC util crypto compat)
