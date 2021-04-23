@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-
+#include <iostream>
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
 
@@ -17,7 +17,7 @@ namespace c2pool::filesystem
     path getProjectPath();
     auto createDirectory(std::string directoryName);
     auto findFile(std::string fileName);
-    auto getFile(std::string fileName);
+    auto getFile(std::string fileName, std::ios_base::openmode openMode);
 
     //full subdirection path.
     std::string getSubDir(std::string path);

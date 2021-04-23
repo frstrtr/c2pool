@@ -3,6 +3,8 @@
 #include <cstring>
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
+#include <iostream>
+#include <fstream>
 
 using namespace boost::dll;
 using namespace boost::filesystem;
@@ -39,12 +41,12 @@ namespace c2pool::filesystem
         }
     }
 
-    auto getFile(std::string filePath)
+    auto getFile(std::string filePath, std::ios_base::openmode openMode = (std::ios_base::in | std::ios_base::out))
     {
         path _filePath = filePath;
         path _path = getSubDir(_filePath.parent_path().string());
-        path fullPath =  _path / _filePath.filename();
-        std::ofstream file(fullPath.string());
+        path fullPath = _path / _filePath.filename();
+        std::fstream file(fullPath.string(), openMode);
         return file;
     }
 
