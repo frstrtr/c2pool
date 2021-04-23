@@ -16,8 +16,9 @@ namespace c2pool::filesystem
 
     path getProjectPath();
     auto createDirectory(std::string directoryName);
-    auto findFile(std::string fileName);
-    std::fstream getFile(std::string fileName, std::ios_base::openmode openMode = (std::ios_base::in | std::ios_base::out));
+    path findFile(std::string fileName);
+    std::fstream getFile(std::string fileName, std::ios_base::openmode openMode = std::ios_base::out);
+    std::fstream closeFile(std::fstream file);
 
     //full subdirection path.
     std::string getSubDir(std::string path);
