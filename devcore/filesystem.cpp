@@ -3,6 +3,8 @@
 #include <cstring>
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
+#include <iostream>
+#include <fstream>
 
 using namespace boost::dll;
 using namespace boost::filesystem;
@@ -29,30 +31,9 @@ namespace c2pool::filesystem
         //return RESOURCES_DIR; //TODO: boost::filesystem
     }
 
-    //full subdirection path.
-    std::string getSubDir(std::string path)
-    {
-        auto _path = getProjectPath();
-        _path /= path;
-        if (exists(_path))
-        {
-            return _path.string();
-        }
-        else
-        {
-            return "";
-        }
-    }
-
-    auto getPath()
-    {
-        path full_path(program_location().parent_path());
-        return full_path;
-    }
-
     auto createDirectory(std::string directoryName)
     {
-        path full_path = getPath();
+        path full_path = getProjectPath();
         full_path /= directoryName;
         if (!exists(full_path))
         {
@@ -60,42 +41,39 @@ namespace c2pool::filesystem
         }
     }
 
-    auto createFile(std::string fileName)
+    auto getFile(std::string filePath, std::ios_base::openmode openMode = (std::ios_base::in | std::ios_base::out))
     {
-        path full_path = getPath();
-        full_path /= fileName;
-        if (!exists(full_path))
-        {
-            std::ofstream file{full_path.string()};
-        }
+        path _filePath = filePath;
+        path _path = getSubDir(_filePath.parent_path().string());
+        path fullPath = _path / _filePath.filename();
+        std::fstream file(fullPath.string(), openMode);
+        return file;
     }
 
-    auto findFile(std::string fileName)
+    auto findFile(std::string filePath)
     {
-        path full_path = getPath();
-        full_path /= fileName;
+        path full_path = getProjectPath();
+        full_path /= filePath;
         if (exists(full_path))
         {
             return full_path;
         }
     }
+    //full subdirection path.
+    std::string getSubDir(std::string path)
+    {
+        auto _path = getProjectPath();
+        _path /= path;
+        if (!exists(_path))
+        {
+            create_directories(_path);
+        }
+        return _path.string();
+    }
 
     const char *getSubDir_c(std::string path)
     {
-        /*std::string str = getSubDir(path);
-        char *cstr = new char[str.length() + 1];
-        std::strcpy(cstr, str.c_str());
-        return cstr;*/
-        auto _path = getProjectPath();
-        _path /= path;
-        if (exists(_path))
-        {
-            return _path.string().c_str();
-        }
-        else
-        {
-            return "";
-        }
+        return getSubDir(path).c_str();
     }
 
 } // namespace c2pool::filesystem
