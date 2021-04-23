@@ -15,6 +15,8 @@ set(sources
     util/strencodings.cpp
     compat/byteswap.h
     compat/endian.h
+    compat/cpuid.h
+    span.h
     ${crypto_sources}
     )
 
