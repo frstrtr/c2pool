@@ -26,10 +26,10 @@ namespace c2pool::dev
         //exist file
         if (AddrsFile)
         {
-            string json;
-            //Если будет баг с тем, что файл как-то не так читается, то винить эту строку, не меня.
-            //Кто же знал, что вы будете разделять json файл на кучу строк.
-            AddrsFile >> json;
+            std::stringstream tmp;
+            tmp << AddrsFile.rdbuf();
+            string json = tmp.str();
+
             FromJSON(json);
         }
         else
