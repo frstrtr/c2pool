@@ -10,10 +10,11 @@
 #include "crypto/common.h"
 #include "crypto/ripemd160.h"
 #include "sha256.h"
-#include <prevector.h>
-#include <serialize.h>
-#include <uint256.h>
-#include <version.h>
+//#include <prevector.h>
+//#include <serialize.h>
+#include "uint256.h"
+//#include <version.h>
+#include "span.h"
 
 #include <string>
 #include <vector>
@@ -144,57 +145,57 @@ public:
         return ReadLE64(result.begin());
     }
 
-    template<typename T>
-    CHashWriter& operator<<(const T& obj) {
-        // Serialize to this stream
-        ::Serialize(*this, obj);
-        return (*this);
-    }
+    // template<typename T>
+    // CHashWriter& operator<<(const T& obj) {
+    //     // Serialize to this stream
+    //     ::Serialize(*this, obj);
+    //     return (*this);
+    // }
 };
 
-/** Reads data from an underlying stream, while hashing the read data. */
-template<typename Source>
-class CHashVerifier : public CHashWriter
-{
-private:
-    Source* source;
+// /** Reads data from an underlying stream, while hashing the read data. */
+// template<typename Source>
+// class CHashVerifier : public CHashWriter
+// {
+// private:
+//     Source* source;
 
-public:
-    explicit CHashVerifier(Source* source_) : CHashWriter(source_->GetType(), source_->GetVersion()), source(source_) {}
+// public:
+//     explicit CHashVerifier(Source* source_) : CHashWriter(source_->GetType(), source_->GetVersion()), source(source_) {}
 
-    void read(char* pch, size_t nSize)
-    {
-        source->read(pch, nSize);
-        this->write(pch, nSize);
-    }
+//     void read(char* pch, size_t nSize)
+//     {
+//         source->read(pch, nSize);
+//         this->write(pch, nSize);
+//     }
 
-    void ignore(size_t nSize)
-    {
-        char data[1024];
-        while (nSize > 0) {
-            size_t now = std::min<size_t>(nSize, 1024);
-            read(data, now);
-            nSize -= now;
-        }
-    }
+//     void ignore(size_t nSize)
+//     {
+//         char data[1024];
+//         while (nSize > 0) {
+//             size_t now = std::min<size_t>(nSize, 1024);
+//             read(data, now);
+//             nSize -= now;
+//         }
+//     }
 
-    template<typename T>
-    CHashVerifier<Source>& operator>>(T&& obj)
-    {
-        // Unserialize from this stream
-        ::Unserialize(*this, obj);
-        return (*this);
-    }
-};
+//     template<typename T>
+//     CHashVerifier<Source>& operator>>(T&& obj)
+//     {
+//         // Unserialize from this stream
+//         ::Unserialize(*this, obj);
+//         return (*this);
+//     }
+// };
 
-/** Compute the 256-bit hash of an object's serialization. */
-template<typename T>
-uint256 SerializeHash(const T& obj, int nType=SER_GETHASH, int nVersion=PROTOCOL_VERSION)
-{
-    CHashWriter ss(nType, nVersion);
-    ss << obj;
-    return ss.GetHash();
-}
+// /** Compute the 256-bit hash of an object's serialization. */
+// template<typename T>
+// uint256 SerializeHash(const T& obj, int nType=SER_GETHASH, int nVersion=PROTOCOL_VERSION)
+// {
+//     CHashWriter ss(nType, nVersion);
+//     ss << obj;
+//     return ss.GetHash();
+// }
 
 /** Single-SHA256 a 32-byte input (represented as uint256). */
 [[nodiscard]] uint256 SHA256Uint256(const uint256& input);
