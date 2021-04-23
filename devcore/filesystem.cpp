@@ -41,7 +41,7 @@ namespace c2pool::filesystem
         }
     }
 
-    auto getFile(std::string filePath, std::ios_base::openmode openMode = (std::ios_base::in | std::ios_base::out))
+    std::fstream getFile(std::string filePath, std::ios_base::openmode openMode)
     {
         path _filePath = filePath;
         path _path = getSubDir(_filePath.parent_path().string());
@@ -58,6 +58,8 @@ namespace c2pool::filesystem
         {
             return full_path;
         }
+        full_path.clear();
+        return full_path;
     }
     //full subdirection path.
     std::string getSubDir(std::string path)
