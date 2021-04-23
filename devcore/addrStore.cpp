@@ -9,7 +9,7 @@
 #include <memory>
 
 #include "filesystem.h"
-using c2pool::filesystem;
+using namespace c2pool::filesystem;
 using std::shared_ptr;
 using std::string;
 
