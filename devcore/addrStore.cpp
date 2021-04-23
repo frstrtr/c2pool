@@ -8,8 +8,10 @@
 #include <string>
 #include <memory>
 
-using std::string;
+#include "filesystem.h"
+using c2pool::filesystem;
 using std::shared_ptr;
+using std::string;
 
 namespace c2pool::dev
 {
@@ -18,7 +20,7 @@ namespace c2pool::dev
     AddrStore::AddrStore(string path, shared_ptr<c2pool::Network> net)
     {
         filePath = path;
-        std::fstream AddrsFile(path, std::ios_base::in);
+        std::fstream AddrsFile = getFile(path);
 
         //FILE
         //exist file
@@ -59,7 +61,7 @@ namespace c2pool::dev
 
     void AddrStore::SaveToFile()
     {
-        std::fstream AddrsFile(filePath, std::ios_base::out);
+        std::fstream AddrsFile = getFile(filePath);
         AddrsFile << ToJSON();
 
         AddrsFile.close();
@@ -85,7 +87,8 @@ namespace c2pool::dev
     std::vector<std::pair<ADDR, AddrValue>> AddrStore::GetAll()
     {
         std::vector<std::pair<ADDR, AddrValue>> res;
-        for (auto kv : store){
+        for (auto kv : store)
+        {
             res.push_back(kv);
         }
         return res;

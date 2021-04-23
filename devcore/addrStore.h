@@ -6,6 +6,12 @@
 #include <vector>
 #include <memory>
 
+#include <boost/dll.hpp>
+#include <boost/filesystem.hpp>
+
+using namespace boost::dll;
+using namespace boost::filesystem;
+
 using std::shared_ptr;
 using std::map;
 using std::string;
