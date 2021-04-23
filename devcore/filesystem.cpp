@@ -50,7 +50,7 @@ namespace c2pool::filesystem
         return file;
     }
 
-    auto findFile(std::string filePath)
+    path findFile(std::string filePath)
     {
         path full_path = getProjectPath();
         full_path /= filePath;
