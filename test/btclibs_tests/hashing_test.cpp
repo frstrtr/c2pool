@@ -10,148 +10,7 @@
 #include <btclibs/util/strencodings.h>
 using namespace std;
 
-TEST(secp256k1TEST, HashTest)
-{
-    //string s = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    //string s = "fffffffffffffffffffffffffffffffffff22fffffffffffffffffffffffffff";
-    string s = "1";
-    uint256 first;
-    first.SetHex(s);
-    cout << first.GetHex() << endl;
-    std::vector<unsigned char> vch(first.begin(), first.end());
-    //std::vector<unsigned char> vch {1, 2, 3, 4};
-
-    cout << "vch: ";
-    for (auto &item : vch)
-    {
-        cout << (int)item << " ";
-    }
-    cout << "\n";
-
-    auto _span = MakeUCharSpan(vch);
-
-    cout << "_span: ";
-    for (auto &item : _span)
-    {
-        cout << (int)item << " ";
-    }
-    cout << "\n";
-
-    auto res = Hash(_span);
-
-    cout << res.GetHex() << endl;
-
-    //ASSERT_EQ(first.ToString(), s);
-}
-
-TEST(secp256k1TEST, Sha256Test)
-{
-    //string s = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    string s = "fffffffffffffffffffffffffffffffffff22fffffffffffffffffffffffffff";
-    //string s = "1";
-    uint256 first;
-    first.SetHex("0x7b");
-    //first.SetHex(s);
-    cout << first.GetHex() << endl;
-    for (auto &item : first)
-    {
-        cout << (int)item << " ";
-    }
-    cout << "\n";
-    // std::vector<unsigned char> vch(first.begin(), first.end());
-    // //std::vector<unsigned char> vch {1, 2, 3, 4};
-
-    // cout <<"vch: ";
-    // for (auto& item : vch){
-    //     cout << (int)item << " ";
-    // }
-    // cout << "\n";
-
-    // auto _span = MakeUCharSpan(vch);
-
-    // cout <<"_span: ";
-    // for (auto& item : _span){
-    //     cout << (int)item << " ";
-    // }
-    // cout << "\n";
-
-    unsigned char *data = new unsigned char[32]{123, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-
-    uint256 result;
-    CSHA256().Write(data, 32).Finalize(result.begin());
-    cout << "result " << result.GetHex() << endl;
-    //CSHA256().Write(input.begin(), 32).Finalize(result.begin());
-
-    auto res = SHA256Uint256(first);
-
-    // auto res = Hash(_span);
-
-    cout << res.GetHex() << endl;
-
-    //ASSERT_EQ(first.ToString(), s);
-}
-
-TEST(secp256k1TEST, HashTest3)
-{
-    //string s = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    string s = "abc";
-    //string s = "1";
-    uint256 first;
-    first.SetHex(s);
-    cout << first.GetHex() << endl;
-    std::vector<unsigned char> vch(first.begin(), first.end());
-    //std::vector<unsigned char> vch {1, 2, 3, 4};
-
-    cout << "vch: ";
-    for (auto &item : vch)
-    {
-        cout << (int)item << " ";
-    }
-    cout << "\n";
-
-    auto _span = MakeUCharSpan(vch);
-
-    cout << "_span: ";
-    for (auto &item : _span)
-    {
-        cout << (int)item << " ";
-    }
-    cout << "\n";
-
-    //auto res = Hash(_span);
-    std::vector<unsigned char> hash_result;
-    hash_result.resize(_span.size());
-
-    CHash256().Write(_span).Finalize(hash_result);
-
-    uint256 res(hash_result);
-
-    cout << res.GetHex() << endl;
-
-    //ASSERT_EQ(first.ToString(), s);
-}
-
-TEST(secp256k1TEST, HashTest4)
-{
-    string s = "abc";
-
-    vector<unsigned char> res;
-    res.resize(32);
-            //   Write((unsigned char*)&in[0], in.size())
-    CSHA256().Write((unsigned char*)&s[0], s.size()).Finalize(&res[0]);
-
-    uint256 result(res);
-    
-    cout << result.GetHex() << endl;
-    for (auto r : res){
-        cout << (int)r << " ";
-    }
-    cout << endl;
-    //ASSERT_EQ(first.ToString(), s);
-}
-
-//------------------------
-
+//method from bitcoin core
 template<typename Hasher, typename In, typename Out>
 static Out TestVector(const Hasher &h, const In &in, const Out &out) {
     Out hash;
@@ -189,6 +48,7 @@ TEST(secp256k1TEST, HashTest5)
 {
     auto res = TestSHA256("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     uint256 uint_res(res);
+    
     cout << uint_res.GetHex() << endl;
     cout << HexStr(res) << endl;
 
