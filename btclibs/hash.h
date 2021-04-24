@@ -76,7 +76,11 @@ template<typename T>
 inline uint256 Hash(const T& in1)
 {
     uint256 result;
-    CHash256().Write(MakeUCharSpan(in1)).Finalize(result);
+    std::vector<unsigned char> vec_result(result.begin(), result.end());
+    auto _span = MakeUCharSpan(vec_result);
+    CHash256().Write(MakeUCharSpan(in1)).Finalize(_span);
+    std::vector<unsigned char> vec_span(_span.begin(), _span.end());
+    result = uint256(vec_span);
     return result;
 }
 
