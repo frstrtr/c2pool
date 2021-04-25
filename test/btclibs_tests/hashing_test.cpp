@@ -44,15 +44,17 @@ static Out TestVector(const Hasher &h, const In &in, const Out &out) {
 
 static vector<unsigned char> TestSHA256(const std::string &in, const std::string &hexout) { return TestVector(CSHA256(), in, ParseHex(hexout));}
 
-TEST(secp256k1TEST, HashTest5)
+TEST(secp256k1TEST, HashTest)
 {
     auto res = TestSHA256("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    uint256 uint_res(res);
+    // uint256 uint_res(res);
+    // cout << uint_res.GetHex() << endl;
     
-    cout << uint_res.GetHex() << endl;
-    cout << HexStr(res) << endl;
+    uint256 uint_res;
+    // cout << HexStr(res) << endl;
 
-    uint256 uint_res2;
     uint_res.SetHex(HexStr(res));
-    cout << uint_res.GetHex() << endl;
+    // cout << uint_res.GetHex() << endl;
+
+    ASSERT_EQ(uint_res.GetHex(), HexStr(res));
 }

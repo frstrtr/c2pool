@@ -9,10 +9,17 @@ using namespace std;
 namespace c2pool
 {
 
-    Network::Network()
+    Network::Network(std::string name) : net_name(name)
     {
         //TODO
         //LOG_INFO << "Created Network Config.";
     }
 
 } // namespace c2pool::config
+
+namespace coind
+{
+    ParentNetwork::ParentNetwork(std::string name) : net_name(name)
+    {
+    }
+}

@@ -24,6 +24,7 @@ namespace coind::data::python
 
         static uint256 average_attempts_to_target(uint256 average_attempts);
 
+        //TODO: using uint256.SetCompact | https://bitcoin.stackexchange.com/questions/30467/what-are-the-equations-to-convert-between-bits-and-difficulty
         static double target_to_difficulty(uint256 target);
 
         static uint256 difficulty_to_target(uint256 difficulty);

@@ -10,7 +10,7 @@ using std::shared_ptr;
 
 namespace coind
 {
-    DigibyteParentNetwork::DigibyteParentNetwork() : ParentNetwork()
+    DigibyteParentNetwork::DigibyteParentNetwork() : ParentNetwork("DGB")
     {
         PREFIX_LENGTH = 4;
         PREFIX = new unsigned char[PREFIX_LENGTH]{0xfa, 0xc3, 0xb6, 0xda};
