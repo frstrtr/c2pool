@@ -20,6 +20,8 @@ namespace c2pool
     class Network
     {
     public:
+        const std::string net_name;
+    public:
         //std::tuple<std::string, std::string> = ADDR
         std::vector<std::tuple<std::string, std::string>> BOOTSTRAP_ADDRS; //217.72.6.241
         int PREFIX_LENGTH;
@@ -39,7 +41,7 @@ namespace c2pool
         uint256 MAX_TARGET;
 
     protected:
-        Network();
+        Network(std::string name);
     };
 
     class DigibyteNetwork : public Network
@@ -63,10 +65,7 @@ namespace c2pool
 
 namespace coind
 {
-    class ParentNetwork
-    {
-
-        /*
+    /*
     template for test config:
     class TestParentNetwork : ParentNetwork{
     public:
@@ -77,6 +76,11 @@ namespace coind
         }
     }
     */
+    class ParentNetwork
+    {
+    public:
+        const std::string net_name;
+        
     public:
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
@@ -88,6 +92,8 @@ namespace coind
         int RPC_PORT;
 
     public:
+        ParentNetwork(std::string name);
+
         virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
 
         virtual bool version_check(int version) = 0;
@@ -105,6 +111,6 @@ namespace coind
 
         bool version_check(int version) override;
 
-        /*todo: type*/ POW_FUNC(/*todo: type*/) override; //TODO: override 
+        /*todo: type*/ POW_FUNC(/*todo: type*/) override; //TODO: override
     };
 }
