@@ -5,6 +5,8 @@ using namespace c2pool::shares::share;
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <devcore/logger.h>
+#include <devcore/common.h>
+
 
 #include <map>
 #include <queue>
@@ -12,6 +14,8 @@ using namespace c2pool::shares::share;
 using std::map;
 using std::queue;
 using std::shared_ptr;
+
+#include <boost/format.hpp>
 
 namespace c2pool::shares::tracker
 {
@@ -36,6 +40,18 @@ namespace c2pool::shares::tracker
 {
     ShareTracker::ShareTracker() {}
 
+    shared_ptr<BaseShare> ShareTracker::get(uint256 hash){
+        try
+        {
+            auto share = items.at(hash);
+            return share;
+        }
+        catch(const std::out_of_range& e)
+        {
+            return nullptr;
+        }
+    }
+
     void ShareTracker::add(shared_ptr<BaseShare> share)
     {
         if (!share)
@@ -56,7 +72,30 @@ namespace c2pool::shares::tracker
         lookbehind_items.push(share);
     }
 
-    TrackerThinkResult ShareTracker::think(){
-        
+    bool ShareTracker::attempt_verify(BaseShare share)
+    {
+        if (verified.find(share.hash) != verified.end())
+        {
+            return true;
+        }
+
+        try
+        {
+            if (share.timestamp > (c2pool::dev::timestamp() + 600))
+            {
+                throw std::invalid_argument((boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} % (share.timestamp - c2pool::dev::timestamp())).str());
+            }
+            
+            if (share.pre)
+        }
+        catch (const std::invalid_argument &e)
+        {
+            LOG_WARNING << e.what() << '\n';
+            return false;
+        }
+    }
+
+    TrackerThinkResult ShareTracker::think()
+    {
     }
 }
