@@ -5,13 +5,8 @@
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context)
+    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context),INodeManager(node_manager)
     {
-        _node_manager = node_manager;
-        _coind = _node_manager->coind();
-        _net = _node_manager->netParent();
-        _tracker = _node_manager->tracker();
-
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<UniValue>>();
         new_headers = std::make_shared<Event<UniValue>>();
@@ -21,17 +16,17 @@ namespace c2pool::libnet
     {
         LOG_INFO << "... CoindNode starting..."; //TODO: log coind name
         _thread.reset(new std::thread([&]() {
-            _resolver.async_resolve(_net->P2P_ADDRESS, std::to_string(_net->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
+            _resolver.async_resolve(coind()->P2P_ADDRESS, std::to_string(coind()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                 ip::tcp::socket socket(_context);
-                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), _net);
+                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), coind());
 
-                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, _net);
+                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, coind());
                 protocol->init(new_block, new_tx, new_headers);
                 _socket->init(endpoints, protocol);
             });
 
             //COIND:
-            coind_work = std::make_shared<Variable<coind::jsonrpc::data::getwork_result>>(_coind->getwork());
+            coind_work = std::make_shared<Variable<coind::jsonrpc::data::getwork_result>>(coind()->getwork());
             work_poller();
 
             //PEER:
@@ -67,7 +62,7 @@ namespace c2pool::libnet
 
     void CoindNode::set_best_share()
     {
-        auto tracker_think_result = _tracker.think(/*TODO: self.get_height_rel_highest, self.coind_work.value['previous_block'], self.coind_work.value['bits'], self.known_txs_var.value*/);
+        auto tracker_think_result = coind()->think(/*TODO: self.get_height_rel_highest, self.coind_work.value['previous_block'], self.coind_work.value['bits'], self.known_txs_var.value*/);
 
         best_share_var = tracker_think_result.best;
         //TODO: self.desired_var.set(desired)
