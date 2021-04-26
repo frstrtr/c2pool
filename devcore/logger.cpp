@@ -15,6 +15,8 @@ using std::shared_ptr;
 #include <boost/log/sources/record_ostream.hpp>
 #include <boost/log/utility/setup/console.hpp>
 
+#include <devcore/filesystem.h>
+
 namespace logging = boost::log;
 namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
@@ -26,7 +28,7 @@ namespace c2pool::console
     {
         logging::add_file_log(
             keywords::file_name = "log_%N.log", /*< file name pattern >*/
-            keywords::target = "logs",
+            keywords::target = c2pool::filesystem::getSubDir("logs"),
             keywords::rotation_size = 10 * 1024 * 1024,                                   /*< rotate files every 10 MiB... >*/
             keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at midnight >*/
             keywords::format = "[%TimeStamp%]<%Severity%>: %Message%"                     /*< log record format >*/

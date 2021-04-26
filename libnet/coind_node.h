@@ -3,7 +3,7 @@
 #include <networks/network.h>
 #include <devcore/logger.h>
 #include "nodeManager.h"
-using c2pool::libnet::NodeManager;
+using c2pool::libnet;
 
 #include <coind/jsonrpc/coind.h>
 using namespace coind::jsonrpc;
@@ -30,7 +30,7 @@ namespace coind::p2p
 
 namespace c2pool::libnet
 {
-    class CoindNode
+    class CoindNode:INodeMember
     {
     public:
         CoindNode(shared_ptr<NodeManager> node_manager);
@@ -55,12 +55,7 @@ namespace c2pool::libnet
         void work_poller();
         void poll_header();
     private:
-        shared_ptr<Coind> _coind;
-        shared_ptr<coind::ParentNetwork> _net;
-        shared_ptr<NodeManager> _node_manager;
-
         shared_ptr<coind::p2p::CoindProtocol> protocol;
-        shared_ptr<ShareTracker> _tracker; //init + move to NodeManager?
 
     private:
         unique_ptr<std::thread> _thread;
