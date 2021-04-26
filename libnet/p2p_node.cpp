@@ -23,10 +23,10 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), _manager(_mngr)
+    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), INodeMember(_mngr)
     {
         node_id = c2pool::random::RandomNonce();
-        _config = _mngr->config();
+        
         _auto_connect_timer = std::make_shared<io::steady_timer>(_context);
     }
 

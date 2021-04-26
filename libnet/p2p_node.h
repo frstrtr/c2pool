@@ -25,6 +25,7 @@ namespace c2pool
     namespace libnet
     {
         class NodeManager;
+        class INodeMember;
     }
 
     namespace dev
@@ -45,7 +46,7 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    class P2PNode
+    class P2PNode:public c2pool::libnet::INodeMember
     {
     public:
         P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
