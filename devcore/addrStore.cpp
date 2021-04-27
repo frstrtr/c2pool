@@ -15,8 +15,6 @@ using std::string;
 
 namespace c2pool::dev
 {
-    //todo: boost::filesystem
-    //template path — "data//bitcoin//addrs"
     AddrStore::AddrStore(string path, shared_ptr<c2pool::Network> net)
     {
         filePath = path;
