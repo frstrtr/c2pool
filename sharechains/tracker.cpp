@@ -86,7 +86,11 @@ namespace c2pool::shares::tracker
                 throw std::invalid_argument((boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} % (share.timestamp - c2pool::dev::timestamp())).str());
             }
             
-            if (share.pre)
+            if (share.previous_hash.IsNull()){
+                auto previous_share = get(share.previous_hash);
+                //TODO: check previous_share != nullptr
+                if ()
+            }
         }
         catch (const std::invalid_argument &e)
         {

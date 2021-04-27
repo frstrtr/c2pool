@@ -40,6 +40,6 @@ namespace c2pool::shares::share
 
     public:
         string SerializeJSON() override;
-        void DeserializeJSON(std::string json) override;
+        void DeserializeJSON(std::string json) override; 
     };
 } // namespace c2pool::shares::share
