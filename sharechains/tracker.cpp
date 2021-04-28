@@ -17,6 +17,16 @@ using std::shared_ptr;
 
 #include <boost/format.hpp>
 
+namespace c2pool::shares::tracker{
+    void PrefixSumShare::reverse_add(uint256 hash, deque<PrefixSumShareElement>::iterator _it){
+            _reverse[hash] = _it;
+        }
+
+        void PrefixSumShare::reverse_remove(uint256 hash){
+            _reverse.erase(hash);
+        }
+}
+
 namespace c2pool::shares::tracker
 {
     void LookbehindDelta::push(shared_ptr<BaseShare> share)
