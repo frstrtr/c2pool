@@ -33,7 +33,7 @@ namespace c2pool::util::events
             //TODO
         }
 
-        void happened(Args... args) const
+        void happened(Args... args)
         {
             sig(args...);
             times += 1;
