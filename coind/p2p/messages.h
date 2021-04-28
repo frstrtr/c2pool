@@ -547,6 +547,8 @@ namespace coind::p2p::messages
     public:
         message_getheaders() : base_message("getheaders") {}
 
+        message_getheaders(uint32_t _version, std::vector<uint256> _have, uint256 _last) : base_message("getheaders"), version(_version), have(_have), last(_last) {}
+
         message_getheaders &operator=(UniValue value)
         {
             version = value["version"].get_int();
