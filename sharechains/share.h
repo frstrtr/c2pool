@@ -13,6 +13,9 @@ using dbshell::DBObject;
 using std::shared_ptr, std::string;
 using std::vector, std::tuple, std::map;
 
+class c2pool::shares::tracker::PrefixSumShare;
+
+
 namespace c2pool::shares::share
 {
     class BaseShare : public DBObject
@@ -41,5 +44,6 @@ namespace c2pool::shares::share
     public:
         string SerializeJSON() override;
         void DeserializeJSON(std::string json) override; 
-    };
+
+        operator c2pool::shares::tracker::PrefixSumShare() const;
 } // namespace c2pool::shares::share

@@ -40,7 +40,9 @@ namespace c2pool::shares::tracker
 
     struct PrefixSumShareElement
     {
-    public:
+        uint256 hash; //head
+        //TODO: ? uint256 previous_hash; //tail
+
         arith_uint256 work;
         arith_uint256 min_work;
         int height;
@@ -83,6 +85,7 @@ namespace c2pool::shares::tracker
     {
     protected:
         deque<PrefixSumShareElement> _sum;
+        map<uint256, deque<PrefixSumShareElement>::iterator> _reverse;
         int max_size;
         int real_max_size;
 
@@ -92,7 +95,7 @@ namespace c2pool::shares::tracker
             auto delta = _sum[max_size - 1];
             for (int i = 0; i < max_size; i++)
             {
-                //delta += sum.front();
+                reverse_remove(_sum.front().hash);
                 _sum.pop_front();
             }
             for (auto &item : _sum)
@@ -101,6 +104,10 @@ namespace c2pool::shares::tracker
             }
         }
 
+        void reverse_add(uint256 hash, deque<PrefixSumShareElement>::iterator _it);
+
+        void reverse_remove(uint256 hash);
+
     public:
         PrefixSumShare(int _max_size)
         {
@@ -108,17 +115,11 @@ namespace c2pool::shares::tracker
             real_max_size = max_size * 4;
         }
 
-        void init(vector<int> a)
+        void init(vector<PrefixSumShareElement> a)
         {
-            int i = 0;
-            if (_sum.empty())
+            for (auto item : a)
             {
-                _sum.push_back(a[i]);
-                i++;
-            }
-            for (; i < a.size(); i++)
-            {
-                _sum.push_back(_sum.back() + a[i]);
+                add(item);
             }
         }
 
@@ -132,7 +133,9 @@ namespace c2pool::shares::tracker
             {
                 v += _sum.back();
             }
+
             _sum.push_back(v);
+            reverse_add(v.hash, _sum.end()-1);
         }
 
         void remove(int index)
@@ -143,6 +146,7 @@ namespace c2pool::shares::tracker
             }
             if (_sum.size() - 1 == index)
             {
+                reverse_remove(_sum.back().hash);
                 _sum.pop_back();
             }
             else
@@ -160,8 +164,15 @@ namespace c2pool::shares::tracker
                 {
                     *item -= v;
                 }
-                _sum.erase(_sum.begin() + index);
+
+                auto it_for_remove = _sum.begin() + index;
+                reverse_remove(it_for_remove->hash);
+                _sum.erase(it_for_remove);
             }
+        }
+
+        size_t size(){
+            return _sum.size();
         }
     };
 

@@ -2,6 +2,7 @@
 
 #include <univalue.h>
 #include <devcore/logger.h>
+#include <sharechains/tracker.h>
 
 namespace c2pool::shares::share
 {
@@ -25,4 +26,8 @@ namespace c2pool::shares::share
         // LOG_DEBUG << TYPE;
         // contents = ShareValue["contents"].get_obj();
     }
+
+   operator c2pool::shares::tracker::PrefixSumShare() const{
+       return {hash, coind::data::target_to_average_attempts(share->target), coind::data::target_to_average_attempts(share->max_target), 1};
+   }
 }
