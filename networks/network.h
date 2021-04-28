@@ -98,7 +98,7 @@ namespace coind
 
         virtual bool version_check(int version) = 0;
 
-        virtual /*todo: type*/ POW_FUNC(/*todo: block_header_type.pack(uint256)*/);
+        //TODO: virtual /*todo: type*/ POW_FUNC(/*todo: block_header_type.pack(uint256)*/);
     };
 
     class DigibyteParentNetwork : public ParentNetwork
@@ -111,6 +111,6 @@ namespace coind
 
         bool version_check(int version) override;
 
-        /*todo: type*/ POW_FUNC(/*todo: type*/) override; //TODO: override
+        //TODO: /*todo: type*/ POW_FUNC(/*todo: type*/) override; //TODO: override
     };
 }

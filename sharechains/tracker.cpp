@@ -7,7 +7,6 @@ using namespace c2pool::shares::share;
 #include <devcore/logger.h>
 #include <devcore/common.h>
 
-
 #include <map>
 #include <queue>
 #include <memory>
@@ -16,16 +15,6 @@ using std::queue;
 using std::shared_ptr;
 
 #include <boost/format.hpp>
-
-namespace c2pool::shares::tracker{
-    void PrefixSumShare::reverse_add(uint256 hash, deque<PrefixSumShareElement>::iterator _it){
-            _reverse[hash] = _it;
-        }
-
-        void PrefixSumShare::reverse_remove(uint256 hash){
-            _reverse.erase(hash);
-        }
-}
 
 namespace c2pool::shares::tracker
 {
@@ -50,13 +39,14 @@ namespace c2pool::shares::tracker
 {
     ShareTracker::ShareTracker() {}
 
-    shared_ptr<BaseShare> ShareTracker::get(uint256 hash){
+    shared_ptr<BaseShare> ShareTracker::get(uint256 hash)
+    {
         try
         {
             auto share = items.at(hash);
             return share;
         }
-        catch(const std::out_of_range& e)
+        catch (const std::out_of_range &e)
         {
             return nullptr;
         }
@@ -95,11 +85,12 @@ namespace c2pool::shares::tracker
             {
                 throw std::invalid_argument((boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} % (share.timestamp - c2pool::dev::timestamp())).str());
             }
-            
-            if (share.previous_hash.IsNull()){
+
+            if (share.previous_hash.IsNull())
+            {
                 auto previous_share = get(share.previous_hash);
                 //TODO: check previous_share != nullptr
-                if ()
+                //if ()
             }
         }
         catch (const std::invalid_argument &e)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <coind/data.h>
 #include <btclibs/uint256.h>
 #include <dbshell/dbObject.h>
 using dbshell::DBObject;
@@ -13,8 +14,7 @@ using dbshell::DBObject;
 using std::shared_ptr, std::string;
 using std::vector, std::tuple, std::map;
 
-class c2pool::shares::tracker::PrefixSumShare;
-
+#include "prefsum_share.h"
 
 namespace c2pool::shares::share
 {
@@ -43,7 +43,12 @@ namespace c2pool::shares::share
 
     public:
         string SerializeJSON() override;
-        void DeserializeJSON(std::string json) override; 
+        void DeserializeJSON(std::string json) override;
 
-        operator c2pool::shares::tracker::PrefixSumShare() const;
-} // namespace c2pool::shares::share
+        operator c2pool::shares::tracker::PrefixSumShareElement() const
+        {
+            c2pool::shares::tracker::PrefixSumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
+            return prefsum_share;
+        }
+    }; 
+}// namespace c2pool::shares::share
