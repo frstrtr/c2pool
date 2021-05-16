@@ -10,8 +10,6 @@
 #include <string>
 #include <memory>
 #include <deque>
-using std::map;
-using std::shared_ptr;
 using namespace std;
 
 namespace c2pool::shares::tracker
@@ -73,7 +71,7 @@ namespace c2pool::shares::tracker
             return _reverse[hash]->height;
         }
 
-        get_height_and_last(uint256 hash)
+        tuple<int, uint256> get_height_and_last(uint256 hash)
         {
             //TODO:
         }

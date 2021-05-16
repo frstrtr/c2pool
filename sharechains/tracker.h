@@ -5,6 +5,7 @@
 #include <btclibs/arith_uint256.h>
 #include <coind/data.h>
 #include <devcore/logger.h>
+#include <libnet/nodeManager.h>
 
 #include <map>
 #include <vector>
@@ -65,7 +66,7 @@ namespace c2pool::shares::tracker
         void push(shared_ptr<BaseShare> share);
     };
 
-    class ShareTracker
+    class ShareTracker : public c2pool::libnet::INodeMember, public enable_shared_from_this<ShareTracker>
     {
     private:
         map<uint256, shared_ptr<BaseShare>> items;
@@ -74,7 +75,7 @@ namespace c2pool::shares::tracker
         map<uint256, bool> verified; //share.hash -> is verified
 
     public:
-        ShareTracker();
+        ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng);
 
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);
