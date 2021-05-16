@@ -37,7 +37,7 @@ namespace c2pool::shares::tracker
 
 namespace c2pool::shares::tracker
 {
-    ShareTracker::ShareTracker() {}
+    ShareTracker::ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng) : c2pool::libnet::INodeMember(mng) {}
 
     shared_ptr<BaseShare> ShareTracker::get(uint256 hash)
     {
@@ -81,17 +81,7 @@ namespace c2pool::shares::tracker
 
         try
         {
-            if (share.timestamp > (c2pool::dev::timestamp() + 600))
-            {
-                throw std::invalid_argument((boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} % (share.timestamp - c2pool::dev::timestamp())).str());
-            }
-
-            if (share.previous_hash.IsNull())
-            {
-                auto previous_share = get(share.previous_hash);
-                //TODO: check previous_share != nullptr
-                //if ()
-            }
+            share.check(shared_from_this());
         }
         catch (const std::invalid_argument &e)
         {
@@ -105,7 +95,7 @@ namespace c2pool::shares::tracker
     }
 
     //TODO: template method, where T1 = type(share)???
-    GeneratedShare ShareTracker::generate_share_transactions(auto share_data, auto block_target, auto desired_target, auto ref_merkle_link, auto desired_other_transaction_hashes_and_fees, auto known_txs=None, auto last_txout_nonce=0, auto base_subsidy=None, auto segwit_data=None)
+    GeneratedShare ShareTracker::generate_share_transactions(auto share_data, auto block_target, auto desired_target, auto ref_merkle_link, auto desired_other_transaction_hashes_and_fees, auto known_txs = None, auto last_txout_nonce = 0, auto base_subsidy = None, auto segwit_data = None)
     {
         //t0
         shared_ptr<BaseShare> previous_share;
@@ -120,6 +110,26 @@ namespace c2pool::shares::tracker
 
         //height, last
         auto get_height_and_last = get_height_and_last(share_data.previous_share_hash);
-        assert 
+        assert(height >= net->REAL_CHAIN_LENGTH) || (last == nullptr);
+
+        arith_uint256 pre_target3;
+        if (height < net->TARGET_LOOKBEHIND)
+        {
+            pre_target3 = net->MAX_TARGET;
+        }
+        else
+        {
+            auto attempts_per_second = get_pool_attempts_per_second(share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true, true);
+            //TODO: 
+            // pre_target = 2**256//(net.SHARE_PERIOD*attempts_per_second) - 1 if attempts_per_second else 2**256-1
+            // pre_target2 = math.clip(pre_target, (previous_share.max_target*9//10, previous_share.max_target*11//10))
+            // pre_target3 = math.clip(pre_target2, (net.MIN_TARGET, net.MAX_TARGET))
+        }
+        //TODO:
+        // max_bits = bitcoin_data.FloatingInteger.from_target_upper_bound(pre_target3)
+        // bits = bitcoin_data.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//30, pre_target3)))
+
+
+        return {share_info, gentx, other_transaction_hashes, get_share};
     }
 }

@@ -14,6 +14,8 @@ using dbshell::DBObject;
 using std::shared_ptr, std::string;
 using std::vector, std::tuple, std::map;
 
+class c2pool::shares::tracker::ShareTracker;
+
 #include "prefsum_share.h"
 
 namespace c2pool::shares::share
@@ -50,5 +52,7 @@ namespace c2pool::shares::share
             c2pool::shares::tracker::PrefixSumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
             return prefsum_share;
         }
+
+        void check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker/*, TODO: other_txs = None???*/);
     }; 
 }// namespace c2pool::shares::share
