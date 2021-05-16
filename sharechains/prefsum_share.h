@@ -67,6 +67,27 @@ namespace c2pool::shares::tracker
         int max_size;
         int real_max_size;
 
+    public:
+        int get_height(uint256 hash)
+        {
+            return _reverse[hash]->height;
+        }
+
+        get_height_and_last(uint256 hash)
+        {
+            //TODO:
+        }
+
+        uint256 get_work(uint256 hash)
+        {
+            //TODO:
+        }
+
+        uint256 get_last(uint256 hash)
+        {
+            //TODO:
+        }
+
     private:
         void resize()
         {

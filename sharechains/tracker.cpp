@@ -103,4 +103,23 @@ namespace c2pool::shares::tracker
     TrackerThinkResult ShareTracker::think()
     {
     }
+
+    //TODO: template method, where T1 = type(share)???
+    GeneratedShare ShareTracker::generate_share_transactions(auto share_data, auto block_target, auto desired_target, auto ref_merkle_link, auto desired_other_transaction_hashes_and_fees, auto known_txs=None, auto last_txout_nonce=0, auto base_subsidy=None, auto segwit_data=None)
+    {
+        //t0
+        shared_ptr<BaseShare> previous_share;
+        if (share_data.previous_share_hash)
+        {
+            previous_share = nullptr;
+        }
+        else
+        {
+            previous_share = items[share_data.previous_share_hash]
+        }
+
+        //height, last
+        auto get_height_and_last = get_height_and_last(share_data.previous_share_hash);
+        assert 
+    }
 }
