@@ -52,7 +52,7 @@ namespace c2pool::libnet::p2p
         P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
         void start();
 
-        std::vector<ADDR> get_good_peers(int max_count);
+        std::vector<addr> get_good_peers(int max_count);
 
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo

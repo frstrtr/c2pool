@@ -22,7 +22,7 @@ namespace c2pool
     public:
         const std::string net_name;
     public:
-        //std::tuple<std::string, std::string> = ADDR
+        //std::tuple<std::string, std::string> = addr
         std::vector<std::tuple<std::string, std::string>> BOOTSTRAP_ADDRS; //217.72.6.241
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x

@@ -17,7 +17,7 @@ using std::map;
 using std::string;
 using std::tuple;
 
-#define ADDR tuple<string, string>
+typedef tuple<string, string> addr;
 #define EMPTY_ADDR_VALUE {0, 0, 0}
 
 namespace c2pool{
@@ -39,19 +39,19 @@ namespace c2pool::dev
     public:
         AddrStore(string path, shared_ptr<c2pool::Network> net);
         void SaveToFile();
-        bool Check(ADDR addr);
+        bool Check(addr addr);
 
-        bool Add(ADDR key, AddrValue value);
-        bool Remove(ADDR key);
-        AddrValue Get(ADDR key);
-        std::vector<std::pair<ADDR, AddrValue>> GetAll();
+        bool Add(addr key, AddrValue value);
+        bool Remove(addr key);
+        AddrValue Get(addr key);
+        std::vector<std::pair<addr, AddrValue>> GetAll();
 
         string ToJSON();
         void FromJSON(string json);
         
         int len() { return store.size(); }
     private:
-        map<ADDR, AddrValue> store;
+        map<addr, AddrValue> store;
         std::string filePath;
     };
 
