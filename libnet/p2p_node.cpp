@@ -116,11 +116,11 @@ namespace c2pool::libnet::p2p
         });
     }
 
-    std::vector<ADDR> P2PNode::get_good_peers(int max_count)
+    std::vector<addr> P2PNode::get_good_peers(int max_count)
     {
         float t = c2pool::dev::timestamp();
 
-        std::vector<std::pair<float, ADDR>> values;
+        std::vector<std::pair<float, addr>> values;
         for (auto kv : _manager->addr_store()->GetAll())
         {
             values.push_back(
@@ -129,12 +129,12 @@ namespace c2pool::libnet::p2p
                     kv.first));
         }
 
-        std::sort(values.begin(), values.end(), [](std::pair<float, ADDR> a, std::pair<float, ADDR> b) {
+        std::sort(values.begin(), values.end(), [](std::pair<float, addr> a, std::pair<float, addr> b) {
             return a.first < b.first;
         });
 
         values.resize(min((int)values.size(), max_count));
-        std::vector<ADDR> result;
+        std::vector<addr> result;
         for (auto v : values)
         {
             result.push_back(v.second);

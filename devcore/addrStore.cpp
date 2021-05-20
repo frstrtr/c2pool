@@ -66,7 +66,7 @@ namespace c2pool::dev
         LOG_DEBUG << "Addrs saved in file!";
     }
 
-    bool AddrStore::Check(ADDR key)
+    bool AddrStore::Check(addr key)
     {
         if (store.find(key) != store.end())
             return true;
@@ -74,7 +74,7 @@ namespace c2pool::dev
             return false;
     }
 
-    AddrValue AddrStore::Get(ADDR key)
+    AddrValue AddrStore::Get(addr key)
     {
         if (Check(key))
             return store[key];
@@ -82,9 +82,9 @@ namespace c2pool::dev
             return EMPTY_ADDR_VALUE;
     }
 
-    std::vector<std::pair<ADDR, AddrValue>> AddrStore::GetAll()
+    std::vector<std::pair<addr, AddrValue>> AddrStore::GetAll()
     {
-        std::vector<std::pair<ADDR, AddrValue>> res;
+        std::vector<std::pair<addr, AddrValue>> res;
         for (auto kv : store)
         {
             res.push_back(kv);
@@ -92,16 +92,16 @@ namespace c2pool::dev
         return res;
     }
 
-    bool AddrStore::Add(ADDR key, AddrValue value)
+    bool AddrStore::Add(addr key, AddrValue value)
     {
         if (Check(key))
             return false;
-        store.insert(std::pair<ADDR, AddrValue>(key, value));
+        store.insert(std::pair<addr, AddrValue>(key, value));
         SaveToFile();
         return true;
     }
 
-    bool AddrStore::Remove(ADDR key)
+    bool AddrStore::Remove(addr key)
     {
         if (Check(key))
             return false;
@@ -138,7 +138,7 @@ namespace c2pool::dev
 
         for (int i = 0; i < AddrsValue.size(); i++)
         {
-            ADDR key = std::make_tuple(AddrsValue[i]["address"].get_str(),
+            addr key = std::make_tuple(AddrsValue[i]["address"].get_str(),
                                        AddrsValue[i]["port"].get_str());
             store[key] = {AddrsValue[i]["services"].get_int(),
                           AddrsValue[i]["first_seen"].get_real(),
