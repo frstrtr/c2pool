@@ -18,7 +18,8 @@ using std::vector, std::tuple, std::map;
 
 #include "shareTypes.h"
 
-namespace c2pool::shares::tracker{
+namespace c2pool::shares::tracker
+{
     class ShareTracker;
 }
 
@@ -67,6 +68,7 @@ namespace c2pool::shares::share
         shared_ptr<c2pool::Network> net;
         addr peer_addr;
         UniValue contents;
+
     public:
         BaseShare(int VERSION, shared_ptr<Network> _net, addr _peer_addr, UniValue _contents);
 
@@ -86,6 +88,7 @@ namespace c2pool::shares::share
         virtual void check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/);
     };
 
+    //17
     class Share : public BaseShare
     {
     public:
@@ -94,7 +97,7 @@ namespace c2pool::shares::share
         virtual void contents_load(UniValue contents) override;
     };
 
-
+    //32
     class PreSegwitShare : public BaseShare
     {
     public:
@@ -105,4 +108,42 @@ namespace c2pool::shares::share
 
         virtual void contents_load(UniValue contents) override;
     };
+
+#define MAKE_SHARE(CLASS)                                                           \
+    share_result = make_shared<CLASS>(net, peer_addr, share["contents"].get_obj()); \
+    break;
+
+    shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, addr peer_addr)
+    {
+        shared_ptr<BaseShare> share_result;
+        int type_version = 0;
+        if (share.exists("type"))
+        {
+            type_version = share["type"].get_int();
+        }
+        else
+        {
+            throw std::runtime_error("share data in load_share() without type!");
+        }
+
+        switch (type_version)
+        {
+        case 17:
+            MAKE_SHARE(Share) //TODO: TEST
+            // share_result = make_shared<Share>(net, peer_addr, share["contents"].get_obj());
+            // break;
+        case 32:
+            MAKE_SHARE(PreSegwitShare) //TODO: TEST
+        default:
+            if (type_version < 17)
+                throw std::runtime_error("sent an obsolete share");
+            else
+                throw std::runtime_error((boost::format("unkown share type: %1") % type_version).str());
+            break;
+        }
+
+        return share_result;
+    }
+
+#undef MAKE_SHARE
 } // namespace c2pool::shares::share
