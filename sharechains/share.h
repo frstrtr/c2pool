@@ -64,7 +64,7 @@ namespace c2pool::shares::share
         //TODO: header
         uint256 pow_hash;
         uint256 hash; //=header_hash
-        //TODO: remove? unsigned int time_seen;
+        int32_t time_seen;
 
         shared_ptr<c2pool::Network> net;
         addr peer_addr;
@@ -105,7 +105,13 @@ namespace c2pool::shares::share
         SegwitData segwit_data;
 
     public:
-        PreSegwitShare(shared_ptr<Network> _net, addr _peer_addr, UniValue _contents) : BaseShare(32, _net, _peer_addr, _contents) {}
+        PreSegwitShare(shared_ptr<Network> _net, addr _peer_addr, UniValue _contents) : BaseShare(32, _net, _peer_addr, _contents)
+        {
+            if (merkle_link.branch.size() > 16 || (is_segwit_activated() && segwit_data.txid_merkle_link.branch.size() > 16))
+            {
+                throw std::runtime_error("merkle branch too long!");
+            }
+        }
 
         virtual void contents_load(UniValue contents) override;
     };
