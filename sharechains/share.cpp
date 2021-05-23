@@ -94,12 +94,6 @@ namespace c2pool::shares::share
 
     BaseShare::BaseShare(int VERSION, shared_ptr<Network> _net, addr _peer_addr, UniValue _contents) : SHARE_VERSION(VERSION), net(_net), peer_addr(_peer_addr), contents(_contents)
     {
-        //TODO: remove
-        // min_header = contents["min_header"].get_obj();
-        // //TODO: share_info ?
-        // hash_link = contents["hash_link"].get_obj();
-        // merkle_link = contents["merkle_link"].get_obj();
-
         contents_load(contents);
 
         bool segwit_activated = is_segwit_activated();
@@ -109,10 +103,8 @@ namespace c2pool::shares::share
             throw std::runtime_error((boost::format("bad coinbase size! %1 bytes") % coinbase.length()).str());
         }
 
-        if (merkle_link.branch.size() > 16)
+        if (merkle_link.branch.size() > 16 && !is_segwit_activated())
         {
-            //TODO: or (segwit_activated and len(self.share_info['segwit_data']['txid_merkle_link']['branch']) > 16
-            //wanna check for segwit
             throw std::runtime_error("merkle branch too long!");
         }
 
@@ -133,6 +125,7 @@ namespace c2pool::shares::share
             throw std::runtime_error("share PoW invalid");
         }
 
+        time_seen = c2pool::dev::timestamp();
         //TODO: time_seen remove???
     }
 
