@@ -7,7 +7,7 @@ namespace c2pool::shares::share
 {
     enum StaleInfo
     {
-        None = 0,
+        unk = 0,
         orphan = 253,
         doa = 254
     };
