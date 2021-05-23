@@ -71,7 +71,8 @@ namespace c2pool::shares::share
 
         desired_version = share_data["desired_version"].get_uint64();
 
-        for (auto item : share_info["new_transaction_hashes"].getValues()) {
+        for (auto item : share_info["new_transaction_hashes"].getValues())
+        {
             uint256 tx_hash;
             tx_hash.SetHex(item.get_str());
             new_transaction_hashes.push_back(tx_hash);
@@ -114,6 +115,27 @@ namespace c2pool::shares::share
         {
             throw std::runtime_error("This is not a hardfork-supporting share!");
         }
+
+        /*
+        TODO: 
+        n = set()
+        for share_count, tx_count in self.iter_transaction_hash_refs():
+            assert share_count < 110
+            if share_count == 0:
+                n.add(tx_count)
+        assert n == set(range(len(self.share_info['new_transaction_hashes'])))
+        
+        self.gentx_hash = check_hash_link(
+            self.hash_link,
+            self.get_ref_hash(net, self.share_info, contents['ref_merkle_link']) + pack.IntType(64).pack(self.contents['last_txout_nonce']) + pack.IntType(32).pack(0),
+            self.gentx_before_refhash,
+        )
+        merkle_root = bitcoin_data.check_merkle_link(self.gentx_hash, self.share_info['segwit_data']['txid_merkle_link'] if segwit_activated else self.merkle_link)
+        self.header = dict(self.min_header, merkle_root=merkle_root)
+        self.pow_hash = net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(self.header))
+        self.hash = self.header_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(self.header))
+
+        */
 
         if (target.Compare(net->MAX_TARGET) > 0)
         {
