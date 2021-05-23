@@ -43,6 +43,7 @@ namespace c2pool::shares::share
         uint256 previous_hash;
         string coinbase;
         unsigned int nonce;
+        uint160 pubkey_hash;
         unsigned long long subsidy;
         unsigned short donation;
         StaleInfo stale_info;
@@ -54,8 +55,8 @@ namespace c2pool::shares::share
         uint256 far_share_hash;
         uint256 max_target; //from max_bits;
         uint256 target;     //from bits;
-        unsigned int timestamp;
-        unsigned int absheight;
+        int32_t timestamp;
+        int32_t absheight;
         uint128 abswork;
         //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
         //TODO: gentx_hash
