@@ -11,6 +11,11 @@ import os
 import hashlib
 import json
 
+#global vars
+SEGWIT_ACTIVATION_VERSION = 17
+
+#============
+
 # -------------------------------------------p2pool util/math---------------------------------------
 
 
@@ -831,6 +836,94 @@ class TransactionType(Type):
             return
         return tx_id_type.write(file, item)
 
+# ------------------------------------------ Share Types --------------------------------------------
+hash_link_type = ComposedType([
+    ('state', FixedStrType(32)),
+    ('extra_data', FixedStrType(0)), # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
+    ('length', VarIntType()),
+])
+
+def is_segwit_activated(version):
+    segwit_activation_version = SEGWIT_ACTIVATION_VERSION
+    return version >= segwit_activation_version and segwit_activation_version > 0
+
+class BaseShare(object):
+    VERSION = 0
+
+    small_block_header_type = ComposedType([
+        ('version', VarIntType()),
+        ('previous_block', PossiblyNoneType(0, IntType(256))),
+        ('timestamp', IntType(32)),
+        ('bits', FloatingIntegerType()),
+        ('nonce', IntType(32)),
+    ])
+
+    cached_types = None
+
+    @classmethod
+    def get_dynamic_types(cls):
+        if not cls.cached_types == None:
+            return cls.cached_types
+        t = dict(share_info_type=None, share_type=None, ref_type=None)
+        segwit_data = ('segwit_data', PossiblyNoneType(dict(txid_merkle_link=dict(branch=[], index=0), wtxid_merkle_root=2**256-1), ComposedType([
+            ('txid_merkle_link', ComposedType([
+                ('branch', ListType(IntType(256))),
+                ('index', IntType(0)), # it will always be 0
+            ])),
+            ('wtxid_merkle_root', IntType(256))
+        ])))
+        t['share_info_type'] = ComposedType([
+            ('share_data', ComposedType([
+                ('previous_share_hash', PossiblyNoneType(0, IntType(256))),
+                ('coinbase', VarStrType()),
+                ('nonce', IntType(32)),
+                ('pubkey_hash', IntType(160)),
+                ('subsidy', IntType(64)),
+                ('donation', IntType(16)),
+                ('stale_info', EnumType(IntType(8), dict((k, {0: None, 253: 'orphan', 254: 'doa'}.get(k, 'unk%i' % (k,))) for k in range(256)))),
+                ('desired_version', VarIntType()),
+            ]))] + ([segwit_data] if is_segwit_activated(cls.VERSION) else []) + [
+            ('new_transaction_hashes', ListType(IntType(256))),
+            ('transaction_hash_refs', ListType(VarIntType(), 2)), # pairs of share_count, tx_count
+            ('far_share_hash', PossiblyNoneType(0, IntType(256))),
+            ('max_bits', FloatingIntegerType()),
+            ('bits', FloatingIntegerType()),
+            ('timestamp', IntType(32)),
+            ('absheight', IntType(32)),
+            ('abswork', IntType(128)),
+        ])
+        t['share_type'] = ComposedType([
+            ('min_header', cls.small_block_header_type),
+            ('share_info', t['share_info_type']),
+            ('ref_merkle_link', ComposedType([
+                ('branch', ListType(IntType(256))),
+                ('index', IntType(0)),
+            ])),
+            ('last_txout_nonce', IntType(64)),
+            ('hash_link', hash_link_type),
+            ('merkle_link', ComposedType([
+                ('branch', ListType(IntType(256))),
+                ('index', IntType(0)), # it will always be 0
+            ])),
+        ])
+        t['ref_type'] = ComposedType([
+            ('identifier', FixedStrType(64//8)),
+            ('share_info', t['share_info_type']),
+        ])
+        cls.cached_types = t
+        return t
+
+class NewShare(BaseShare):
+    VERSION = 33
+
+
+class PreSegwitShare(BaseShare):
+    VERSION = 32
+
+class Share(BaseShare):
+    VERSION = 17
+
+share_versions = {s.VERSION:s for s in [NewShare, PreSegwitShare, Share]}
 
 # ------------------------------------------messages and types---------------------------------------
 # TODO:
@@ -889,6 +982,12 @@ class TYPE:
         ('count', IntType(32)),
     ])
 
+    #new
+
+    message_shares = ComposedType([
+        ('shares', ListType(share_type)),
+    ])
+
     message_command_number = {
         'error': 9990,
         'version': 0,
@@ -916,6 +1015,10 @@ class TYPE:
         json_value["best_share_hash"] = int(json_value["best_share_hash"], 16)
         return json_value
 
+    # @classmethod
+    # def get_value_shares(cls, json_value):
+
+    #     return json_value
 #==============================
 
     @classmethod
@@ -940,7 +1043,51 @@ class TYPE:
 
     # @classmethod
     # def
+#===============================|
+############shares##############|
+#===============================|
 
+    @classmethod
+    def error_load_share(cls, error_data):
+        return {"error":error_data}
+
+    @classmethod
+    def load_share(cls, share):
+        if share['type'] in share_versions:
+            return share_versions[share['type']].get_dynamic_types()['share_type'].unpack(share['contents'])
+        elif share['type'] < 17:
+            return cls.error_load_share("sent an obsolete share")
+        else:
+            return cls.error_load_share("unknown share type: {0}".format(share['type']))
+
+    @classmethod
+    def post_process_shares(cls, value):
+        result = dict()
+        result["type"] = value["type"]
+        result["contents"] = cls.load_share(value)
+        
+
+        return result
+
+#==============================
+
+    @classmethod
+    def post_process(cls, name_type, value):
+        '''
+        Обработка сообщений p2pool -> c2pool
+        '''
+        post_process_func = getattr(cls, "post_process_" + name_type, None)
+        if post_process_func:
+            value = post_process_func(value)
+        else:
+            pass
+            #print("post_process_func is None!")
+
+        return value
+
+
+
+#==============================
 # -------------------------------------------Methods--------------------------------------------------
 
 
@@ -996,7 +1143,6 @@ def deserialize(name_type, _bytes_array):
     result = str(_obj_dict)
     return result
 
-
 def deserialize_msg(_command, checksum, payload):
     # print('_command = {0}'.format(_command))
     # print('checksum = {0}'.format(checksum))
@@ -1018,7 +1164,8 @@ def deserialize_msg(_command, checksum, payload):
         print("type not found")
         return generate_error_json(command, "message type not founded")
 
-    value = type_.unpack(payload)
+    value = TYPE.post_process(command, type_.unpack(payload))
+
     result = {
         'name_type': TYPE.message_command_number[command],
         'value': value
@@ -1026,7 +1173,7 @@ def deserialize_msg(_command, checksum, payload):
     #print(result)
     return str(result).replace("\'", "\"")
 
-deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
+#deserialize_msg("version", b"\x95Y\xa8R", b'\xe5\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\x01\x9b\xdb\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\n\n\n\n\x13\xa0\x1cinfK\x03\xa8%\x14fa6c7cd-dirty-c2pool\x01\x00\x00\x00\x87^\xbd\xf1\x1c\x93y\xe9x\x1a\x16\xa6\xa8\x0b\x049\x99\xfe\x91\xf4\xe6xqW%"tT\x05p\x1a\x0e')
 
 def packed_size(raw_json):
     _json = TYPE.get_json_dict(raw_json)
@@ -1210,4 +1357,4 @@ print(tx_type.packed_size({
     'witness':[{'test_witne2323ss'}]
 }))
 '''
-# print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
+#print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))

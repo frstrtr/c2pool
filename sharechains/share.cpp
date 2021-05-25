@@ -52,6 +52,7 @@ namespace c2pool::shares::share
 
         auto share_info = contents["share_info"].get_obj();
         auto share_data = share_info["share_data"].get_obj();
+        
         previous_hash.SetHex(share_data.get_str());
         coinbase = share_data["coinbase"].get_str(); //TODO: script str?
         nonce = share_data["nonce"].get_int();
