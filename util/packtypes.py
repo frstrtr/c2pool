@@ -473,11 +473,11 @@ class VarStrType(Type):
 
     def read(self, file):
         length = self._inner_size.read(file)
-        return file.read(length).decode('ascii')
+        return file.read(length)#.decode('ascii')
 
     def write(self, file, item):
         self._inner_size.write(file, len(item))
-        file.write(item.encode())
+        file.write(item) #.encode())
 
 
 class EnumType(Type):
@@ -486,7 +486,7 @@ class EnumType(Type):
         self.pack_to_unpack = pack_to_unpack
 
         self.unpack_to_pack = {}
-        for k, v in pack_to_unpack.iteritems():
+        for k, v in pack_to_unpack.items():
             if v in self.unpack_to_pack:
                 raise ValueError('duplicate value in pack_to_unpack')
             self.unpack_to_pack[v] = k
@@ -1062,10 +1062,12 @@ class TYPE:
 
     @classmethod
     def post_process_shares(cls, value):
-        result = dict()
-        result["type"] = value["type"]
-        result["contents"] = cls.load_share(value)
-        
+        result = []
+        for _share in value["shares"]:
+            result_share = dict()
+            result_share["type"] = _share["type"]
+            result_share["contents"] = cls.load_share(_share)
+            result += [result_share]
 
         return result
 
@@ -1153,10 +1155,11 @@ def deserialize_msg(_command, checksum, payload):
     # checksum = bytes(checksum, encoding = 'ISO-8859-1').decode('unicode-escape').encode('ISO-8859-1')
 
     # checksum check
-    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
-        print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
-            hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
-        return generate_error_json(command, "checksum check = false")
+    if not checksum is None:
+        if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+            print("getted payload checksum:'{0}'; getted checksum:'{1}'; real checksum:'{2}'".format(
+                hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4], checksum, checksum_for_test_receive()))
+            return generate_error_json(command, "checksum check = false")
     # ------------
 
     type_ = TYPE.get_type('message_' + command)
@@ -1358,3 +1361,21 @@ print(tx_type.packed_size({
 }))
 '''
 #print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
+
+''' Share:
+21fd4301fe02000020f51da17b9b389c625fb68d63ececb186766af63f683870c9bc11626880a9f1213c92a9601bc07b1a0390d63c234a52db85860ff68e83b3291e4d9b08b16c6c39131a8d3f41fa83ac18b587413d042134c6002cfabe6d6d907d3076c59502c2afeef8f5ccd99382468eaa27e7b1f62c606d6b2bbecc7ff201000000000000000a5f5f6332706f6f6c5f5f93a04c5a8a641f36c1dcdd259b5a57c1e695337c32ae5ac79c8b801b0c0000000000002100000000000000000000000000000000000000000000000000000000000000000000007774782ad351e8c18e6fe1449482475a1e73709d77180af2b5b35c45f6336bcd5925011d3ec7091c3c92a960ea750b00a77f8f057902c201000000000000000000000000000f00000064abd00beb727b99596c96bd7c89722196b8589aa7ef932368426e563aebb7adfdce0200
+'''
+
+share_data = "21fd4301fe02000020f51da17b9b389c625fb68d63ececb186766af63f683870c9bc11626880a9f1213c92a9601bc07b1a0390d63c234a52db85860ff68e83b3291e4d9b08b16c6c39131a8d3f41fa83ac18b587413d042134c6002cfabe6d6d907d3076c59502c2afeef8f5ccd99382468eaa27e7b1f62c606d6b2bbecc7ff201000000000000000a5f5f6332706f6f6c5f5f93a04c5a8a641f36c1dcdd259b5a57c1e695337c32ae5ac79c8b801b0c0000000000002100000000000000000000000000000000000000000000000000000000000000000000007774782ad351e8c18e6fe1449482475a1e73709d77180af2b5b35c45f6336bcd5925011d3ec7091c3c92a960ea750b00a77f8f057902c201000000000000000000000000000f00000064abd00beb727b99596c96bd7c89722196b8589aa7ef932368426e563aebb7adfdce0200"
+bytes_share_data = bytes.fromhex(share_data)
+
+print(type(share_data))
+print(share_data)
+
+share_type_data = TYPE.share_type.unpack(bytes_share_data)
+print(share_type_data)
+
+msg_shares = TYPE.message_shares.pack({"shares":[share_type_data]})
+
+deserialized_msg_shares = deserialize_msg("shares", None, msg_shares)
+print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
