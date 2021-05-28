@@ -479,6 +479,17 @@ class VarStrType(Type):
         self._inner_size.write(file, len(item))
         file.write(item) #.encode())
 
+class FixedStrType(Type):
+    def __init__(self, length):
+        self.length = length
+
+    def read(self, file):
+        return file.read(self.length)
+
+    def write(self, file, item):
+        if len(item) != self.length:
+            raise ValueError('incorrect length item!')
+        file.write(item)
 
 class EnumType(Type):
     def __init__(self, inner, pack_to_unpack):
@@ -695,19 +706,6 @@ class PossiblyNoneType(Type):
         if item == self.none_value:
             raise ValueError('none_value used')
         self.inner.write(file, self.none_value if item is None else item)
-
-
-class FixedStrType(Type):
-    def __init__(self, length):
-        self.length = length
-
-    def read(self, file):
-        return file.read(self.length)
-
-    def write(self, file, item):
-        if len(item) != self.length:
-            raise ValueError('incorrect length item!')
-        file.write(item)
 
 
 class FloatingInteger(object):
@@ -1362,7 +1360,10 @@ print(tx_type.packed_size({
 '''
 #print(IntType(256).unpack(b'[P2POOL][P2POOL][P2POOL][P2POOL]'))
 
-''' Share:
+#===============================================================
+#message_shares test:
+''' 
+Share:
 21fd4301fe02000020f51da17b9b389c625fb68d63ececb186766af63f683870c9bc11626880a9f1213c92a9601bc07b1a0390d63c234a52db85860ff68e83b3291e4d9b08b16c6c39131a8d3f41fa83ac18b587413d042134c6002cfabe6d6d907d3076c59502c2afeef8f5ccd99382468eaa27e7b1f62c606d6b2bbecc7ff201000000000000000a5f5f6332706f6f6c5f5f93a04c5a8a641f36c1dcdd259b5a57c1e695337c32ae5ac79c8b801b0c0000000000002100000000000000000000000000000000000000000000000000000000000000000000007774782ad351e8c18e6fe1449482475a1e73709d77180af2b5b35c45f6336bcd5925011d3ec7091c3c92a960ea750b00a77f8f057902c201000000000000000000000000000f00000064abd00beb727b99596c96bd7c89722196b8589aa7ef932368426e563aebb7adfdce0200
 '''
 
@@ -1373,9 +1374,18 @@ print(type(share_data))
 print(share_data)
 
 share_type_data = TYPE.share_type.unpack(bytes_share_data)
-print(share_type_data)
+print("share_type_data:\n {0}".format(share_type_data))
 
 msg_shares = TYPE.message_shares.pack({"shares":[share_type_data]})
+manual_msg_shares = b"\x01!\xfdC\x01\xfe\x02\x00\x00 \xf5\x1d\xa1{\x9b8\x9cb_\xb6\x8dc\xec\xec\xb1\x86vj\xf6?h8p\xc9\xbc\x11bh\x80\xa9\xf1!<\x92\xa9`\x1b\xc0{\x1a\x03\x90\xd6<#JR\xdb\x85\x86\x0f\xf6\x8e\x83\xb3)\x1eM\x9b\x08\xb1ll9\x13\x1a\x8d?A\xfa\x83\xac\x18\xb5\x87A=\x04!4\xc6\x00,\xfa\xbemm\x90}0v\xc5\x95\x02\xc2\xaf\xee\xf8\xf5\xcc\xd9\x93\x82F\x8e\xaa'\xe7\xb1\xf6,`mk+\xbe\xcc\x7f\xf2\x01\x00\x00\x00\x00\x00\x00\x00\n__c2pool__\x93\xa0LZ\x8ad\x1f6\xc1\xdc\xdd%\x9bZW\xc1\xe6\x953|2\xaeZ\xc7\x9c\x8b\x80\x1b\x0c\x00\x00\x00\x00\x00\x00!\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00wtx*\xd3Q\xe8\xc1\x8eo\xe1D\x94\x82GZ\x1esp\x9dw\x18\n\xf2\xb5\xb3\\E\xf63k\xcdY%\x01\x1d>\xc7\t\x1c<\x92\xa9`\xeau\x0b\x00\xa7\x7f\x8f\x05y\x02\xc2\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0f\x00\x00\x00d\xab\xd0\x0b\xebr{\x99Yl\x96\xbd|\x89r!\x96\xb8X\x9a\xa7\xef\x93#hBnV:\xeb\xb7\xad\xfd\xce\x02\x00"
+if msg_shares == manual_msg_shares:
+    print("EQUAL!!!")
+print("msg_shares:\n {0}".format(msg_shares))
 
 deserialized_msg_shares = deserialize_msg("shares", None, msg_shares)
 print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
+
+json_deserialized_msg_shares = json.loads(deserialized_msg_shares)
+print(type(json_deserialized_msg_shares))
+
+print("VarStrType coinbase unpack:\n {0}".format(VarStrType.unpack(deserialized_msg_shares["value"][0]["contents"]["share_data"]["coinbase"])))
