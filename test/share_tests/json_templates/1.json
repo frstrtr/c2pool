@@ -1,0 +1,67 @@
+{
+    "name_type": 5,
+    "value": [
+        {
+            "type": 33,
+            "contents": {
+                "hash_link": {
+                    "extra_data": "",
+                    "length": 718,
+                    "state": "d«Р\\x0bлr{™Yl–Ѕ|‰r!–ёXљ§п“#hBnV:л·\\xad"
+                },
+                "last_txout_nonce": "64424509440",
+                "merkle_link": {
+                    "branch": [],
+                    "index": 0
+                },
+                "min_header": {
+                    "bits": {
+                        "bits": "0x1a7bc01b",
+                        "target": "0x7bc01b0000000000000000000000000000000000000000000000"
+                    },
+                    "nonce": 1020694531,
+                    "previous_block": "15353304002857984138476692027880378903240059663913014608799568491781273230837",
+                    "timestamp": 1621725756,
+                    "version": 536870914
+                },
+                "ref_merkle_link": {
+                    "branch": [],
+                    "index": 0
+                },
+                "share_info": {
+                    "absheight": 751082,
+                    "abswork": "126666458327383975",
+                    "bits": {
+                        "bits": "0x1c09c73e",
+                        "target": "0x9c73e00000000000000000000000000000000000000000000000000"
+                    },
+                    "far_share_hash": "92913545224016146691556374115806328700079513548612099784992904702106843772023",
+                    "max_bits": {
+                        "bits": "0x1d012559",
+                        "target": "0x125590000000000000000000000000000000000000000000000000000"
+                    },
+                    "new_transaction_hashes": [],
+                    "segwit_data": {
+                        "txid_merkle_link": {
+                            "branch": [],
+                            "index": 0
+                        },
+                        "wtxid_merkle_root": "0"
+                    },
+                    "share_data": {
+                        "coinbase": "_c2pool__",
+                        "desired_version": 33,
+                        "donation": 0,
+                        "nonce": 1514971283,
+                        "previous_share_hash": "29640109392952892817745749873405459696606713250689521160553301608961164855843",
+                        "pubkey_hash": "1138111405178774412713432910199181679177712493706",
+                        "stale_info": 0,
+                        "subsidy": "52001016732"
+                    },
+                    "timestamp": 1621725756,
+                    "transaction_hash_refs": []
+                }
+            }
+        }
+    ]
+}

@@ -477,19 +477,19 @@ class VarStrType(Type):
 
     def write(self, file, item):
         self._inner_size.write(file, len(item))
-        file.write(item)#.encode())
+        file.write(item).encode('cp1251')#.encode())
 
 class FixedStrType(Type):
     def __init__(self, length):
         self.length = length
 
     def read(self, file):
-        return file.read(self.length)#.decode('ascii')
+        return file.read(self.length).decode('cp1251')#.decode('ascii')
 
     def write(self, file, item):
         if len(item) != self.length:
             raise ValueError('incorrect length item!')
-        file.write(item)#.encode())
+        file.write(item).encode('cp1251')
 
 class EnumType(Type):
     def __init__(self, inner, pack_to_unpack):
@@ -747,8 +747,8 @@ class FloatingInteger(object):
         assert False
 
     def __repr__(self):
-        return 'FloatingInteger(bits=%s, target=%s)' % (hex(self.bits), hex(self.target))
-
+        # return 'FloatingInteger(bits=%s, target=%s)' % (hex(self.bits), hex(self.target))
+        return '{\"bits\":\"%s\", \"target\":\"%s\"}' % (hex(self.bits), hex(self.target))
 
 class FloatingIntegerType(Type):
     _inner = IntType(32)
@@ -1065,7 +1065,9 @@ class TYPE:
             result_share = dict()
             result_share["type"] = _share["type"]
             result_share["contents"] = cls.load_share(_share)
-            result_share["contents"]["hash_link"]["state"] = list(bytearray(result_share["contents"]["hash_link"]["state"])) #decode('cp1251')???
+            #result_share["contents"]["hash_link"]["state"] = list(bytearray(result_share["contents"]["hash_link"]["state"])) #decode('cp1251')???
+            result_share["contents"]["share_info"]["share_data"]["coinbase"] = result_share["contents"]["share_info"]["share_data"]["coinbase"].decode("cp1251")
+            result_share["contents"]["share_info"]["share_data"]["stale_info"] = {None:0, 'orphan':253 , 'doa':254 }.get(result_share["contents"]["share_info"]["share_data"]["stale_info"], 0)
             result += [result_share]
 
         return result
