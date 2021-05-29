@@ -137,8 +137,6 @@ namespace c2pool::shares::share
         {
         case 17:
             MAKE_SHARE(Share) //TODO: TEST
-            // share_result = make_shared<Share>(net, peer_addr, share["contents"].get_obj());
-            // break;
         case 32:
             MAKE_SHARE(PreSegwitShare) //TODO: TEST
         default:
