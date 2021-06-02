@@ -6,6 +6,8 @@
 #include <devcore/addrStore.h>
 #include "tracker.h"
 #include <stdexcept>
+#include <tuple>
+#include <set>
 
 #include <boost/format.hpp>
 
@@ -52,9 +54,9 @@ namespace c2pool::shares::share
 
         auto share_info = contents["share_info"].get_obj();
         auto share_data = share_info["share_data"].get_obj();
-        
+
         previous_hash.SetHex(share_data.get_str());
-        coinbase = share_data["coinbase"].get_str(); //TODO: script str?
+        coinbase = share_data["coinbase"].get_str();
         nonce = share_data["nonce"].get_int();
         pubkey_hash.SetHex(share_data["pubkey_hash"].get_str());
         subsidy = share_data["subsidy"].get_uint64();
@@ -79,7 +81,10 @@ namespace c2pool::shares::share
             new_transaction_hashes.push_back(tx_hash);
         }
 
-        //TODO: transaction_hahs_refs
+        for (auto tx_hash_ref : share_info["transaction_hash_refs"].getValues())
+        {
+            transaction_hash_refs.push_back(std::make_tuple<int, int>(tx_hash_ref[0].get_int(), tx_hash_ref[1].get_int()));
+        }
 
         far_share_hash.SetHex(share_info["far_share_hash"].get_str());
         max_target.SetHex(share_info["max_bits"].get_str());
@@ -117,6 +122,26 @@ namespace c2pool::shares::share
             throw std::runtime_error("This is not a hardfork-supporting share!");
         }
 
+        {
+            set<int> n;
+
+            for (auto tx_hash_ref : transaction_hash_refs)
+            {
+                int share_count = std::get<0>(tx_hash_ref);
+                int tx_count = std::get<1>(tx_hash_ref);
+                assert(share_count < 110);
+                if (share_count == 0)
+                {
+                    n.insert(tx_count);
+                }
+            }
+            set<int> set_new_tx_hashes;
+            for (int i = 0; i < new_transaction_hashes.size(); i++)
+            {
+                set_new_tx_hashes.insert(i);
+            }
+            assert(set_new_tx_hashes == n);
+        }
         /*
         TODO: 
         n = set()

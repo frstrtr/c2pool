@@ -1,6 +1,7 @@
 #pragma once
 
 #include <univalue.h>
+#include <shareTypes.h>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <coind/data.h>
@@ -31,7 +32,7 @@ using namespace c2pool::shares::share;
 //TODO: multi_index for more speed https://www.boost.org/doc/libs/1_76_0/libs/multi_index/doc/index.html
 namespace c2pool::shares::tracker
 {
-    typedef boost::function<BaseShare(/*TODO: args*/)> get_share_method;
+    typedef boost::function<shared_ptr<BaseShare>(/*TODO: args*/)> get_share_method;
 
     struct GeneratedShare
     {
@@ -84,7 +85,7 @@ namespace c2pool::shares::tracker
 
         TrackerThinkResult think();
 
-        ///in p2pool - generate_transaction
-        GeneratedShare generate_share_transactions(auto share_data, auto block_target, auto desired_target, auto ref_merkle_link, auto desired_other_transaction_hashes_and_fees, auto known_txs=None, auto last_txout_nonce=0, auto base_subsidy=None, auto segwit_data=None);
+        ///in p2pool - generate_transaction | segwit_data in other_data
+        GeneratedShare generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp, uint256 desired_target, MerkleLink ref_merkle_link, vector<tuple<uint256, int32_t>> desired_other_transaction_hashes_and_fees, map<uint256, UniValue> known_txs, unsigned long long last_txout_nonce, long long base_subsidy, UniValue other_data);
     };
 } // namespace c2pool::shares::tracker
