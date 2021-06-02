@@ -168,4 +168,50 @@ namespace c2pool::shares::share
             return result;
         }
     };
+
+    struct ShareData
+    {
+    public:
+        uint256 previous_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
+        std::string coinbase;
+        unsigned int nonce;         //pack.IntType(32)
+        uint160 pubkey_hash;        //pack.IntType(160)
+        unsigned long long subsidy; //pack.IntType(64)
+        unsigned short donation;    //pack.IntType(16)
+        StaleInfo stale_info;
+        unsigned long long desired_version; //pack.VarIntType()
+
+        friend bool operator==(const ShareData &first, const ShareData &second);
+        friend bool operator!=(const ShareData &first, const ShareData &second);
+
+        ShareData &operator=(UniValue value)
+        {
+            previous_share_hash.SetHex(value["previous_share_hash"].get_str());
+            coinbase = value["coinbase"].get_str();
+            nonce = value["nonce"].get_int64();
+            pubkey_hash.SetHex(value["pubkey_hash"].get_str());
+            subsidy = value["subsidy"].get_int64();
+            donation = value["donation"].get_int();
+            stale_info = (StaleInfo)value["stale_info"].get_int();
+            desired_version = value["desired_version"].get_int64();
+
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("previous_share_hash", previous_share_hash.GetHex());
+            result.pushKV("coinbase", coinbase);
+            result.pushKV("nonce", (uint64_t)nonce);
+            result.pushKV("pubkey_hash", pubkey_hash.GetHex());
+            result.pushKV("subsidy", (uint64_t)subsidy);
+            result.pushKV("donation", donation);
+            result.pushKV("stale_info", (int)stale_info);
+            result.pushKV("desired_version", (uint64_t)desired_version);
+
+            return result;
+        }
+    };
 }

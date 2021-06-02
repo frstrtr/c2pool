@@ -95,7 +95,7 @@ namespace c2pool::shares::tracker
     }
 
     //TODO: template method, where T1 = type(share)???
-    GeneratedShare ShareTracker::generate_share_transactions(auto share_data, auto block_target, auto desired_target, auto ref_merkle_link, auto desired_other_transaction_hashes_and_fees, auto known_txs = None, auto last_txout_nonce = 0, auto base_subsidy = None, auto segwit_data = None)
+    GeneratedShare ShareTracker::generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp, uint256 desired_target, MerkleLink ref_merkle_link, vector<tuple<uint256, int32_t>> desired_other_transaction_hashes_and_fees, map<uint256, UniValue> known_txs = map<uint256, UniValue>(), unsigned long long last_txout_nonce = 0, long long base_subsidy = 0, UniValue other_data)
     {
         //t0
         shared_ptr<BaseShare> previous_share;
@@ -128,6 +128,18 @@ namespace c2pool::shares::tracker
         //TODO:
         // max_bits = bitcoin_data.FloatingInteger.from_target_upper_bound(pre_target3)
         // bits = bitcoin_data.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//30, pre_target3)))
+
+        vector<uint256> new_transaction_hashes;
+        unsigned long long all_transaction_stripped_size = 0;
+        vector<tuple<int, int>> transaction_hash_refs;
+        vector<uint256> other_transaction_hashes;
+
+        //t1
+
+        auto past_shares = get_chain(share_data['previous_share_hash'])
+
+
+
 
 
         return {share_info, gentx, other_transaction_hashes, get_share};
