@@ -30,7 +30,8 @@ namespace c2pool::shares::share
     class BaseShare : public DBObject
     {
         const int SHARE_VERSION; //init in constructor
-
+    public:
+        static const int32_t gentx_size = 50000;
     public:
         SmallBlockHeaderType min_header;
 

@@ -1181,7 +1181,7 @@ def deserialize_msg(_command, checksum, payload):
 
 def packed_size(raw_json):
     _json = TYPE.get_json_dict(raw_json)
-    _type = TYPE.get_type(json['name_type'])
+    _type = TYPE.get_type(_json['name_type'])
     if _type is None:
         return 'error_type'
     result = _type.packed_size(_json['value'])

@@ -143,13 +143,7 @@ namespace c2pool::shares::share
             assert(set_new_tx_hashes == n);
         }
         /*
-        TODO: 
-        n = set()
-        for share_count, tx_count in self.iter_transaction_hash_refs():
-            assert share_count < 110
-            if share_count == 0:
-                n.add(tx_count)
-        assert n == set(range(len(self.share_info['new_transaction_hashes'])))
+        TODO:
         
         self.gentx_hash = check_hash_link(
             self.hash_link,
@@ -174,7 +168,6 @@ namespace c2pool::shares::share
         }
 
         time_seen = c2pool::dev::timestamp();
-        //TODO: time_seen remove???
     }
 
     void Share::contents_load(UniValue contents)
