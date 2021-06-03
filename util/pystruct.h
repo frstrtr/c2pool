@@ -44,10 +44,8 @@ namespace c2pool::python
 
         // static int payload_length(shared_ptr<c2pool::libnet::messages::base_message> msg);
 
-        //TODO: update
-        // //obj(c++) -> json -> bytes -> len(bytes)
-        // template <typename T>
-        // static unsigned int packed_size(char *name_type, T &value);
+        //json -> bytes -> len(bytes)
+        static int32_t packed_size(char *name_type, UniValue json_obj);
 
         static unsigned int receive_length(char *length_data);
 

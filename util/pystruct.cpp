@@ -158,31 +158,28 @@ namespace c2pool::python
     //     return result;
     // }
 
-    // template <typename T>
-    // unsigned int PyPackTypes::packed_size(char *name_type, T &value)
-    // {
-    //     unsigned int result = 0;
+    int32_t PyPackTypes::packed_size(char *name_type, UniValue json_obj)
+    {
+        int32_t result = 0;
 
-    //     auto methodObj = GetMethodObject("packed_size", filepath, "packtypes");
-    //     if (methodObj == nullptr)
-    //     {
-    //         return -1; //TODO обработка ситуации, если получено nullptr
-    //     }
-    //     UniValue msg(UniValue::VOBJ);
-    //     msg.pushKV("name_type", name_type);
-    //     UniValue msg_value(UniValue::VOBJ);
-    //     msg_value = value;
-    //     msg.pushKV("value", msg_value);
+        auto methodObj = GetMethodObject("packed_size", filepath, "packtypes");
+        if (methodObj == nullptr)
+        {
+            return -1; //TODO обработка ситуации, если получено nullptr
+        }
+        UniValue msg(UniValue::VOBJ);
+        msg.pushKV("name_type", name_type);
+        msg.pushKV("value", json_obj);
 
-    //     auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg.write());
-    //     auto raw_result = GetCallFunctionResult(pVal);
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg.write());
+        auto raw_result = GetCallFunctionResult(pVal);
 
-    //     stringstream ss;
-    //     ss << raw_result;
-    //     ss >> result;
+        stringstream ss;
+        ss << raw_result;
+        ss >> result;
 
-    //     return result;
-    // }
+        return result;
+    }
 
     unsigned int PyPackTypes::receive_length(char *length_data)
     {
