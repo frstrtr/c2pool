@@ -2,6 +2,7 @@
 
 #include <btclibs/uint256.h>
 #include <univalue.h>
+#include <boost/optional.hpp>
 
 namespace c2pool::shares::share
 {
@@ -214,4 +215,91 @@ namespace c2pool::shares::share
             return result;
         }
     };
+
+    struct ShareInfo
+    {
+    public:
+        ShareData share_data;
+        uint256 far_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
+        unsigned int max_bits;  //bitcoin_data.FloatingIntegerType() max_bits;
+        unsigned int bits;      //bitcoin_data.FloatingIntegerType() bits;
+        unsigned int timestamp; //pack.IntType(32)
+        std::vector<uint256> new_transaction_hashes;        //pack.ListType(pack.IntType(256))
+        std::vector<tuple<int, int>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
+        unsigned long absheigth; //pack.IntType(32)
+        uint128 abswork;         //pack.IntType(128)
+
+        boost::optional<SegwitData> segwit_data;
+    public:
+
+        ShareInfo(){};
+        ShareInfo(std::shared_ptr<ShareData> share_data, std::vector<uint256> new_transaction_hashes, std::vector<TransactionHashRef> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits, unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork, std::shared_ptr<SegwitData> segwit_data = nullptr);
+
+        friend bool operator==(const ShareInfo &first, const ShareInfo &second);
+        friend bool operator!=(const ShareInfo &first, const ShareInfo &second);
+
+        ShareInfo &operator=(UniValue value)
+        {
+            share_data = std::make_shared<ShareData>();
+            *share_data = value["share_data"].get_obj();
+
+            segwit_data = std::make_shared<SegwitData>();
+            *segwit_data = value["segwit_data"].get_obj();
+
+            for (auto hex_str : value["new_transaction_hashes"].get_array().getValues())
+            {
+                uint256 temp_uint256;
+                temp_uint256.SetHex(hex_str.get_str());
+                new_transaction_hashes.push_back(temp_uint256);
+            }
+
+            for (auto tx_hash_ref : value["transaction_hash_refs"].get_array().getValues())
+            {
+                TransactionHashRef temp_tx_hash_ref;
+                temp_tx_hash_ref = tx_hash_ref.get_obj();
+                transaction_hash_refs.push_back(temp_tx_hash_ref);
+            }
+
+            far_share_hash.SetHex(value["far_share_hash"].get_str());
+            max_bits = value["max_bits"].get_int64();
+            bits = value["bits"].get_int64();
+            timestamp = value["timestamp"].get_int64();
+            absheigth = value["absheigth"].get_int64();
+
+            abswork.SetHex(value["abswork"].get_str());
+            return *this;
+        }
+
+        operator UniValue()
+        {
+            UniValue result(UniValue::VOBJ);
+
+            result.pushKV("share_data", *share_data);
+            result.pushKV("segwit_data", *segwit_data);
+
+            UniValue new_transaction_hashes_array(UniValue::VARR);
+            for (auto hash : new_transaction_hashes)
+            {
+                new_transaction_hashes_array.push_back(hash.GetHex());
+            }
+            result.pushKV("new_transaction_hashes", new_transaction_hashes_array);
+
+            UniValue transaction_hash_refs_array(UniValue::VARR);
+            for (auto tx_hash_ref : transaction_hash_refs)
+            {
+                transaction_hash_refs_array.push_back(tx_hash_ref);
+            }
+            result.pushKV("transaction_hash_refs", transaction_hash_refs_array);
+
+            result.pushKV("far_share_hash", far_share_hash.GetHex());
+            result.pushKV("max_bits", (uint64_t)max_bits);
+            result.pushKV("bits", (uint64_t)bits);
+            result.pushKV("timestamp", (uint64_t)timestamp);
+            result.pushKV("absheigth", (uint64_t)absheigth);
+            result.pushKV("abswork", abswork.GetHex());
+
+            return result;
+        }
+    };
+
 }

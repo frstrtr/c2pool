@@ -86,6 +86,7 @@ namespace c2pool::shares::tracker
         TrackerThinkResult think();
 
         ///in p2pool - generate_transaction | segwit_data in other_data
-        GeneratedShare generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp, uint256 desired_target, MerkleLink ref_merkle_link, vector<tuple<uint256, int32_t>> desired_other_transaction_hashes_and_fees, map<uint256, UniValue> known_txs, unsigned long long last_txout_nonce, long long base_subsidy, UniValue other_data);
+        template <typename ShareType>
+        GeneratedShare generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp, uint256 desired_target, MerkleLink ref_merkle_link, vector<tuple<uint256, boost::optional<int32_t>>> desired_other_transaction_hashes_and_fees, map<uint256, UniValue> known_txs, unsigned long long last_txout_nonce, long long base_subsidy, UniValue other_data);
     };
 } // namespace c2pool::shares::tracker

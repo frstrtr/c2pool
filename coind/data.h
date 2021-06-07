@@ -34,6 +34,8 @@ namespace coind::data::python
 namespace coind::data
 {
 
+    bool is_segwit_tx(UniValue tx);
+
     uint256 target_to_average_attempts(uint256 target);
 
     uint256 average_attempts_to_target(uint256 average_attempts);

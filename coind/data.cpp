@@ -1,5 +1,6 @@
 #include "data.h"
 #include <btclibs/uint256.h>
+#include <univalue.h>
 #include <sstream>
 
 namespace coind::data::python
@@ -81,6 +82,14 @@ namespace coind::data::python
 
 namespace coind::data
 {
+
+    bool is_segwit_tx(UniValue tx)
+    {
+        if (tx.exists("marker") && tx.exists("flag"))
+        {
+            return tx["marker"].get_int() == 0 && tx["flag"].get_int() >= 1;
+        }
+    }
 
     uint256 target_to_average_attempts(uint256 target)
     {
