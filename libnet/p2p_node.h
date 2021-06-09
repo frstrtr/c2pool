@@ -46,7 +46,7 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    class P2PNode:public c2pool::libnet::INodeMember
+    class P2PNode:public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PNode>
     {
     public:
         P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
