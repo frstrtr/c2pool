@@ -1,6 +1,7 @@
 #include "p2p_socket.h"
 #include "messages.h"
 #include "p2p_protocol.h"
+#include "p2p_node.h"
 #include <devcore/logger.h>
 #include <devcore/str.h>
 #include <networks/network.h>
@@ -23,7 +24,7 @@ namespace c2pool::libnet::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network) : _socket(std::move(socket)), _net(_network)
+    P2PSocket::P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network, shared_ptr<P2PNode> node) : _socket(std::move(socket)), _net(_network), _node(node)
     {
     }
 

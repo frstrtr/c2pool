@@ -1,5 +1,6 @@
 #include "p2p_protocol.h"
 #include "p2p_socket.h"
+#include "p2p_node.h"
 #include "messages.h"
 using namespace c2pool::libnet::messages;
 
@@ -18,6 +19,10 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "Base protocol: "
                   << "start constuctor";
         _socket = _sct;
+    }
+
+    shared_ptr<P2PNode> Protocol::node(){
+        return _socket->get_node();
     }
 
     void initialize_network_protocol::handle(shared_ptr<raw_message> RawMSG_version)

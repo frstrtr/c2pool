@@ -208,7 +208,6 @@ namespace c2pool::libnet::messages
             ss_services << services_str;
             ss_services >> services;
 
-
             addr_to = value["addr_to"].get_obj();
 
             addr_from = value["addr_from"].get_obj();
@@ -217,7 +216,6 @@ namespace c2pool::libnet::messages
             std::stringstream ss_nonce;
             ss_nonce << str_nonce;
             ss_nonce >> nonce;
-
 
             sub_version = value["sub_version"].get_str();
 
@@ -382,23 +380,28 @@ namespace c2pool::libnet::messages
     class message_shares : public base_message
     {
     public:
-        std::vector<c2pool::shares::RawShare> shares;
+        std::vector<UniValue> raw_shares;
 
     public:
         message_shares() : base_message("shares") {}
 
-        message_shares(std::vector<c2pool::shares::RawShare> _shares) : base_message("shares")
+        message_shares(std::vector<UniValue> _shares) : base_message("shares")
         {
-            shares = _shares;
+            raw_shares = _shares;
         }
 
         message_shares &operator=(UniValue value)
         {
             for (auto arr_value : value["shares"].get_array().getValues())
             {
-                c2pool::shares::RawShare _temp_share;
-                _temp_share = arr_value;
-                shares.push_back(_temp_share);
+                if (arr_value.exists("type") && arr_value.exists("contents"))
+                {
+                    raw_shares.push_back(arr_value);
+                }
+                else
+                {
+                    LOG_WARNING << "Raw share in message_shares incorrect: " << arr_value.write();
+                }
             }
             return *this;
         }
@@ -409,7 +412,7 @@ namespace c2pool::libnet::messages
             UniValue result(UniValue::VOBJ);
 
             UniValue shares_array(UniValue::VARR);
-            for (auto _share : shares)
+            for (auto _share : raw_shares)
             {
                 shares_array.push_back(_share);
             }
@@ -500,12 +503,12 @@ namespace c2pool::libnet::messages
     public:
         uint256 id;
         ShareReplyResult result;
-        std::vector<c2pool::shares::RawShare> shares;
+        std::vector<UniValue> shares; //type + contents data
 
     public:
         message_sharereply() : base_message("sharereply") {}
 
-        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares) : base_message("sharereply")
+        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<UniValue> _shares) : base_message("sharereply")
         {
             id = _id;
             result = _result;
@@ -520,9 +523,14 @@ namespace c2pool::libnet::messages
 
             for (auto arr_value : value["shares"].get_array().getValues())
             {
-                c2pool::shares::RawShare _temp_share;
-                _temp_share = arr_value;
-                shares.push_back(_temp_share);
+                if (arr_value.exists("type") && arr_value.exists("contents"))
+                {
+                    shares.push_back(arr_value);
+                }
+                else
+                {
+                    LOG_WARNING << "Raw share in message_sharereply incorrect: " << arr_value.write();
+                }
             }
             return *this;
         }

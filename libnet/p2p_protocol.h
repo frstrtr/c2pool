@@ -11,10 +11,12 @@ using namespace c2pool::libnet::messages;
 
 #include <memory>
 using std::shared_ptr, std::weak_ptr, std::make_shared;
+using std::vector;
 
 namespace c2pool::libnet::p2p
 {
     class P2PSocket;
+    class P2PNode;
 }
 
 namespace c2pool::libnet::p2p
@@ -28,6 +30,9 @@ namespace c2pool::libnet::p2p
         std::string other_sub_version;
         int other_services; //TODO: int64? IntType(64)
         unsigned long long _nonce;
+
+    public:
+        shared_ptr<P2PNode> node();
 
     protected:
         shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
@@ -175,20 +180,18 @@ namespace c2pool::libnet::p2p
 
             if (other_version != -1)
             {
-                //TODO: DEBUG: raise PeerMisbehavingError('more than one version message')
+                LOG_DEBUG << "more than one version message";
             }
-            //TODO; if (msg->version < nodes->p2p_node->net()->MINIMUM_PROTOCOL_VERSION)
-            {
-                //TODO: DEBUG: raise PeerMisbehavingError('peer too old')
+            if (msg->version < net()->MINIMUM_PROTOCOL_VERSION){
+                LOG_DEBUG << "peer too old";
             }
 
             other_version = msg->version;
             other_sub_version = msg->sub_version;
             other_services = msg->services;
 
-            //TODO: if (msg->nonce == nodes->p2p_node->nonce) //TODO: add nonce in Node
-            {
-                //TODO: DEBUG: raise PeerMisbehavingError('was connected to self')
+            if (msg->nonce == node()->node_id){
+                LOG_DEBUG << "was connected to self";
             }
 
             //detect duplicate in node->peers
@@ -277,15 +280,86 @@ namespace c2pool::libnet::p2p
         }
         void handle(shared_ptr<message_shares> msg)
         {
-            //TODO:
+            //t0
+            vector<tuple<shared_ptr<BaseShare>, vector<UniValue>>> result; //share, txs
+            for (auto wrappedshare : msg->raw_shares)
+            {
+                int _type = wrappedshare["type"].get_int();
+                if (_type < 17) //TODO: 17 = minimum share version; move to macros
+                    continue;
+
+                shared_ptr<BaseShare> share = c2pool::shares::share::load_share(wrappedshare, _net, _socket->get_addr());
+                std::vector<UniValue> txs;
+                if (_type >= 13)
+                {
+                    for (auto tx_hash : share->new_transaction_hashes)
+                    {
+                        //TODO: txs
+                        /*
+                        for tx_hash in share.share_info['new_transaction_hashes']:
+                    if tx_hash in self.node.known_txs_var.value:
+                        tx = self.node.known_txs_var.value[tx_hash]
+                    else:
+                        for cache in self.known_txs_cache.itervalues():
+                            if tx_hash in cache:
+                                tx = cache[tx_hash]
+                                print 'Transaction %064x rescued from peer latency cache!' % (tx_hash,)
+                                break
+                        else:
+                            print >>sys.stderr, 'Peer referenced unknown transaction %064x, disconnecting' % (tx_hash,)
+                            self.disconnect()
+                            return
+                    txs.append(tx)
+                        */
+                    }
+                }
+                result.push_back(std::make_tuple(share, txs));
+            }
+            node()->handle_shares(result, shared_from_this());
+
+            /*t1
+            if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares))) */
         }
         void handle(shared_ptr<message_sharereq> msg)
         {
-            //TODO:
+            auto _shares = node()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());
+            vector<UniValue> packed_shares;
+            //msg data: //uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares
+            try
+            {
+                for (auto share : _shares)
+                {
+                    packed_shares.push_back(share); //TODO: pack share to UniValue[type + contents]
+                }
+                shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 0, _shares);
+                _socket->write(answer_msg);
+            }
+            catch (const std::invalid_argument &e) //TODO: when throw Payload too long
+            {
+                packed_shares.clear();
+                shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 1, _shares);
+                _socket->write(answer_msg);
+            }
         }
         void handle(shared_ptr<message_sharereply> msg)
         {
-            //TODO:
+            std::vector<shared_ptr<BaseShare>> res;
+            if (msg->result == 0)
+            {
+                for (auto share : msg->shares)
+                {
+                    if (share["type"].get_int() >= 17) //TODO: 17 = minimum share version; move to macros
+                    {
+                        shared_ptr<BaseShare> _share = c2pool::shares::share::load_share(share, _net, _socket->get_addr());
+                        res.push_back(_share);
+                    }
+                }
+            }
+            else
+            {
+                //TODO: res = failure.Failure(self.ShareReplyError(result))
+            }
+            //TODO: self.get_shares.got_response(id, res)
         }
         //TODO:
         // void handle(shared_ptr<message_best_block> msg){
