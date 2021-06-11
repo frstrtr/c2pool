@@ -1,0 +1,27 @@
+DISTANCE_SKIP_LIST:
+======================
+updates = {}
+pos = 10
+*args =
+    n = 10
+sol = (0, 10)
+judge(sol, args) = /*dist(0) < 10*/ = -1
+while:
+    skips[10] = (1, [((9), (10, 1, 9))])
+    skip_lenght = 1; skip = [((9), (10, 1, 9))]
+
+    //FILL PREVIOUS UPDATES SKIP IN FIRST TIME
+
+    for jump, delta in reversed(skip):
+            reversed(skip) = [((9), (10, 1, 9))]
+        //jump = 9, delta = (10, 1, 9):
+        sol_if = /*apply_delta(sol, delta, args) = apply_delta((0, 10), (10, 1, 9), 10) */ = (0 + 1, 9) = (1, 9)
+        decision = -1
+            -> sol = sol_if = (1, 9)
+        pos = jump = 9
+
+    //ADD TO UPDATE SKIPED
+
+------------------next cycle--------------
+
+        
