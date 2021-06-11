@@ -172,15 +172,12 @@ namespace c2pool::libnet::p2p
         void handle(shared_ptr<message_version> msg)
         {
             LOG_DEBUG << "handle message_version";
-
             LOG_TRACE << msg->best_share_hash.GetHex();
-
-            //--------
             LOG_INFO << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version << ", client version " << msg->sub_version;
 
             if (other_version != -1)
             {
-                LOG_DEBUG << "more than one version message";
+                LOG_DEBUG << "more than one version message"; 
             }
             if (msg->version < net()->MINIMUM_PROTOCOL_VERSION){
                 LOG_DEBUG << "peer too old";
