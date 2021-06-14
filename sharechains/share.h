@@ -60,7 +60,7 @@ namespace c2pool::shares::share
         int32_t timestamp;
         int32_t absheight;
         uint128 abswork;
-        //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
+        char* new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
         //TODO: gentx_hash
         //TODO: header
         uint256 pow_hash;

@@ -2,6 +2,7 @@
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <devcore/logger.h>
+#include <coind/data.h>
 
 #include <map>
 #include <vector>
@@ -11,6 +12,11 @@
 #include <memory>
 #include <deque>
 using namespace std;
+
+namespace c2pool::shares::share
+{
+    class BaseShare;
+}
 
 namespace c2pool::shares::tracker
 {
@@ -149,6 +155,193 @@ namespace c2pool::shares::tracker
             else
             {
                 PrefixSumShareElement v;
+                if (index - 1 < 0)
+                {
+                    v = _sum[index];
+                }
+                else
+                {
+                    v = _sum[index] - _sum[index - 1];
+                }
+                for (auto item = _sum.begin() + index + 1; item != _sum.end(); item++)
+                {
+                    *item -= v;
+                }
+
+                auto it_for_remove = _sum.begin() + index;
+                reverse_remove(it_for_remove->hash);
+                _sum.erase(it_for_remove);
+            }
+        }
+
+        size_t size()
+        {
+            return _sum.size();
+        }
+    };
+
+    //Weights
+
+    struct PrefixSumWeightsElement
+    {
+        uint256 hash;
+
+        std::map<char *, arith_uint256> weights;
+        arith_uint256 total_weight;
+        arith_uint256 total_donation_weight;
+
+        std::map<char *, arith_uint256> my_weights;
+        arith_uint256 my_total_weight;
+        arith_uint256 my_total_donation_weight;
+
+        PrefixSumWeightsElement()
+        {
+            hash.SetNull();
+        }
+
+        PrefixSumWeightsElement(std::shared_ptr<c2pool::shares::share::BaseShare> share);
+
+        PrefixSumWeightsElement &operator+=(const PrefixSumWeightsElement &rhs)
+        {
+            auto _weights = rhs.weights;
+            weights.merge(_weights);
+            for (auto weight_value : _weights)
+            {
+                weights[weight_value.first] += weight_value.second;
+            }
+
+            total_weight += rhs.total_weight;
+            total_donation_weight += rhs.total_donation_weight;
+            return *this;
+        }
+
+        PrefixSumWeightsElement &operator-=(const PrefixSumWeightsElement &rhs)
+        {
+            auto _weights = rhs.weights;
+            _weights.merge(weights);
+            for (auto vk : weights)
+            {
+                weights[vk.first] -= _weights[vk.first];
+            }
+
+            total_weight -= rhs.total_weight;
+            total_donation_weight -= rhs.total_donation_weight;
+            return *this;
+        }
+
+        friend PrefixSumWeightsElement operator-(PrefixSumWeightsElement lhs, const PrefixSumWeightsElement &rhs)
+        {
+            lhs -= rhs;
+            return lhs;
+        }
+
+        friend PrefixSumWeightsElement operator+(PrefixSumWeightsElement lhs, const PrefixSumWeightsElement &rhs)
+        {
+            lhs += rhs;
+            return lhs;
+        }
+    };
+
+    struct CumulativeWeights{
+        std::map<char *, arith_uint256> weights;
+        arith_uint256 total_weight;
+        arith_uint256 donation_weight;
+    };
+
+    class PrefixSumWeights
+    {
+    protected:
+        deque<PrefixSumWeightsElement> _sum;
+        map<uint256, deque<PrefixSumWeightsElement>::iterator> _reverse;
+
+        int max_size;
+        int real_max_size;
+
+    public:
+        CumulativeWeights get_cumulative_weights(uint256 start_hash, int32_t max_shares, arith_uint256 desired_weight)
+        {
+            PrefixSumWeightsElement result_element;
+            if (!_sum.empty())
+            {
+                if (_sum.size() <= max_shares)
+                {
+                    if ((_sum.end() - 1)->total_weight <= desired_weight)
+                    {
+                        result_element = *(_sum.end()-1);
+                    } else {
+                        // TODO: Случай, если вес больше ожидаемого
+                    }
+                } else {
+                    //TODO: Случаи, когда количество шар в трекере больше, чем нужно в запросе.
+                }
+            }
+
+            return CumulativeWeights(result_element.weights, result_element.total_weight, result_element.total_donation_weight);
+        }
+
+    private:
+        void resize()
+        {
+            auto delta = _sum[max_size - 1];
+            for (int i = 0; i < max_size; i++)
+            {
+                reverse_remove(_sum.front().hash);
+                _sum.pop_front();
+            }
+            for (auto &item : _sum)
+            {
+                item -= delta;
+            }
+        }
+
+        void reverse_add(uint256 hash, deque<PrefixSumWeightsElement>::iterator _it);
+
+        void reverse_remove(uint256 hash);
+
+    public:
+        PrefixSumWeights(int _max_size)
+        {
+            max_size = _max_size;
+            real_max_size = max_size * 4;
+        }
+
+        void init(vector<PrefixSumWeightsElement> a)
+        {
+            for (auto item : a)
+            {
+                add(item);
+            }
+        }
+
+        void add(PrefixSumWeightsElement v)
+        {
+            if (_sum.size() >= real_max_size)
+            {
+                resize();
+            }
+            if (!_sum.empty())
+            {
+                v += _sum.back();
+            }
+
+            _sum.push_back(v);
+            reverse_add(v.hash, _sum.end() - 1);
+        }
+
+        void remove(int index)
+        {
+            if ((_sum.size() <= index) && (index < 0))
+            {
+                throw std::out_of_range("size of sum < index in prefix_sum.remove");
+            }
+            if (_sum.size() - 1 == index)
+            {
+                reverse_remove(_sum.back().hash);
+                _sum.pop_back();
+            }
+            else
+            {
+                PrefixSumWeightsElement v;
                 if (index - 1 < 0)
                 {
                     v = _sum[index];
