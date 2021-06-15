@@ -13,11 +13,6 @@
 #include <deque>
 using namespace std;
 
-namespace c2pool::shares::share
-{
-    class BaseShare;
-}
-
 namespace c2pool::shares::tracker
 {
     struct PrefixSumShareElement
@@ -199,7 +194,17 @@ namespace c2pool::shares::tracker
             hash.SetNull();
         }
 
-        PrefixSumWeightsElement(std::shared_ptr<c2pool::shares::share::BaseShare> share);
+        PrefixSumWeightsElement(uint256 hash, uint256 target, char* new_script, uint256 donation);
+
+        PrefixSumWeightsElement(std::map<char *, arith_uint256>& _weights, arith_uint256& _total_weight, arith_uint256& _total_donation_weight){
+            weights = _weights;
+            total_weight = _total_weight;
+            total_donation_weight = _total_donation_weight;
+        }
+
+        PrefixSumWeightsElement my(){
+            return PrefixSumWeightsElement(my_weights, my_total_weight, my_total_donation_weight);
+        }
 
         PrefixSumWeightsElement &operator+=(const PrefixSumWeightsElement &rhs)
         {
@@ -296,9 +301,10 @@ namespace c2pool::shares::tracker
                                 auto new_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.weights[new_script] / (just_my.total_weight / 65535);
                                 std::map<char *, arith_uint256> new_weights = {{new_script, new_weight}};
 
-                                auto new_total_donation_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.my_total_donation_weight / (just_my.total_weight / 65535);
+                                arith_uint256 new_total_donation_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.my_total_donation_weight / (just_my.total_weight / 65535);
+                                arith_uint256 new_total_weight = desired_weight - req_weight_delta;
                                 //total_donation_weight1 + (desired_weight - total_weight1)//65535*total_donation_weight2//(total_weight2//65535)
-                                result_element += PrefixSumWeightsElement(new_weights, desired_weight - req_weight_delta, new_total_donation_weight);
+                                result_element += PrefixSumWeightsElement(new_weights, new_total_weight, new_total_donation_weight);
                                 break;
                             }
                         }
