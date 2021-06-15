@@ -283,7 +283,7 @@ namespace c2pool::shares::tracker
 
                             if (req_weight_delta == desired_weight)
                             {
-                                result_element -= *check_it; 
+                                result_element -= *check_it;
                                 result_element += check_it->my();
                                 break;
                             }
@@ -293,10 +293,10 @@ namespace c2pool::shares::tracker
                                 result_element -= *check_it;
                                 auto just_my = check_it->my();
                                 auto new_script = just_my.weights.begin()->first;
-                                auto new_weight = (desired_weight - result_element.total_weight)/65535*just_my.weights[new_script]/(just_my.total_weight/65535);
+                                auto new_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.weights[new_script] / (just_my.total_weight / 65535);
                                 std::map<char *, arith_uint256> new_weights = {{new_script, new_weight}};
 
-                                auto new_total_donation_weight = (desired_weight - result_element.total_weight)/65535*just_my.my_total_donation_weight/(just_my.total_weight/65535);
+                                auto new_total_donation_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.my_total_donation_weight / (just_my.total_weight / 65535);
                                 //total_donation_weight1 + (desired_weight - total_weight1)//65535*total_donation_weight2//(total_weight2//65535)
                                 result_element += PrefixSumWeightsElement(new_weights, desired_weight - req_weight_delta, new_total_donation_weight);
                                 break;
@@ -304,101 +304,100 @@ namespace c2pool::shares::tracker
                         }
                     }
                 }
+                else
+                {
+                    //TODO: Случаи, когда количество шар в трекере больше, чем нужно в запросе.
+                }
+            }
+
+            return CumulativeWeights(result_element.weights, result_element.total_weight, result_element.total_donation_weight);
+        }
+
+    private:
+        void resize()
+        {
+            auto delta = _sum[max_size - 1];
+            for (int i = 0; i < max_size; i++)
+            {
+                reverse_remove(_sum.front().hash);
+                _sum.pop_front();
+            }
+            for (auto &item : _sum)
+            {
+                item -= delta;
+            }
+        }
+
+        void reverse_add(uint256 hash, deque<PrefixSumWeightsElement>::iterator _it);
+
+        void reverse_remove(uint256 hash);
+
+    public:
+        PrefixSumWeights(int _max_size)
+        {
+            max_size = _max_size;
+            real_max_size = max_size * 4;
+        }
+
+        void init(vector<PrefixSumWeightsElement> a)
+        {
+            for (auto item : a)
+            {
+                add(item);
+            }
+        }
+
+        void add(PrefixSumWeightsElement v)
+        {
+            if (_sum.size() >= real_max_size)
+            {
+                resize();
+            }
+            if (!_sum.empty())
+            {
+                v += _sum.back();
+            }
+
+            _sum.push_back(v);
+            reverse_add(v.hash, _sum.end() - 1);
+        }
+
+        void remove(int index)
+        {
+            if ((_sum.size() <= index) && (index < 0))
+            {
+                throw std::out_of_range("size of sum < index in prefix_sum.remove");
+            }
+            if (_sum.size() - 1 == index)
+            {
+                reverse_remove(_sum.back().hash);
+                _sum.pop_back();
             }
             else
             {
-                //TODO: Случаи, когда количество шар в трекере больше, чем нужно в запросе.
+                PrefixSumWeightsElement v;
+                if (index - 1 < 0)
+                {
+                    v = _sum[index];
+                }
+                else
+                {
+                    v = _sum[index] - _sum[index - 1];
+                }
+                for (auto item = _sum.begin() + index + 1; item != _sum.end(); item++)
+                {
+                    *item -= v;
+                }
+
+                auto it_for_remove = _sum.begin() + index;
+                reverse_remove(it_for_remove->hash);
+                _sum.erase(it_for_remove);
             }
         }
 
-        return CumulativeWeights(result_element.weights, result_element.total_weight, result_element.total_donation_weight);
-    }
-
-    private : void
-              resize()
-    {
-        auto delta = _sum[max_size - 1];
-        for (int i = 0; i < max_size; i++)
+        size_t size()
         {
-            reverse_remove(_sum.front().hash);
-            _sum.pop_front();
+            return _sum.size();
         }
-        for (auto &item : _sum)
-        {
-            item -= delta;
-        }
-    }
-
-    void reverse_add(uint256 hash, deque<PrefixSumWeightsElement>::iterator _it);
-
-    void reverse_remove(uint256 hash);
-
-public:
-    PrefixSumWeights(int _max_size)
-    {
-        max_size = _max_size;
-        real_max_size = max_size * 4;
-    }
-
-    void init(vector<PrefixSumWeightsElement> a)
-    {
-        for (auto item : a)
-        {
-            add(item);
-        }
-    }
-
-    void add(PrefixSumWeightsElement v)
-    {
-        if (_sum.size() >= real_max_size)
-        {
-            resize();
-        }
-        if (!_sum.empty())
-        {
-            v += _sum.back();
-        }
-
-        _sum.push_back(v);
-        reverse_add(v.hash, _sum.end() - 1);
-    }
-
-    void remove(int index)
-    {
-        if ((_sum.size() <= index) && (index < 0))
-        {
-            throw std::out_of_range("size of sum < index in prefix_sum.remove");
-        }
-        if (_sum.size() - 1 == index)
-        {
-            reverse_remove(_sum.back().hash);
-            _sum.pop_back();
-        }
-        else
-        {
-            PrefixSumWeightsElement v;
-            if (index - 1 < 0)
-            {
-                v = _sum[index];
-            }
-            else
-            {
-                v = _sum[index] - _sum[index - 1];
-            }
-            for (auto item = _sum.begin() + index + 1; item != _sum.end(); item++)
-            {
-                *item -= v;
-            }
-
-            auto it_for_remove = _sum.begin() + index;
-            reverse_remove(it_for_remove->hash);
-            _sum.erase(it_for_remove);
-        }
-    }
-
-    size_t size()
-    {
-        return _sum.size();
-    }
-};
+    };
 }
