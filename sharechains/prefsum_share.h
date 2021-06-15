@@ -242,7 +242,8 @@ namespace c2pool::shares::tracker
         }
     };
 
-    struct CumulativeWeights{
+    struct CumulativeWeights
+    {
         std::map<char *, arith_uint256> weights;
         arith_uint256 total_weight;
         arith_uint256 donation_weight;
@@ -261,17 +262,46 @@ namespace c2pool::shares::tracker
         CumulativeWeights get_cumulative_weights(uint256 start_hash, int32_t max_shares, arith_uint256 desired_weight)
         {
             PrefixSumWeightsElement result_element;
+
+            //Если шары имеются.
             if (!_sum.empty())
             {
-                if (_sum.size() <= max_shares)
+                auto _it = _reverse[start_hash];
+                result_element = *_it;
+
+                //Если шар в трекере за заданной шарой, меньше или равен максимальному.
+                if (distance(_sum.begin(), _it) <= max_shares)
                 {
-                    if ((_sum.end() - 1)->total_weight <= desired_weight)
+                    if (_it->total_weight <= desired_weight)
                     {
-                        result_element = *(_sum.end()-1);
-                    } else {
-                        // TODO: Случай, если вес больше ожидаемого
+                        result_element = *_it;
                     }
-                } else {
+                    else
+                    {
+                        // Случай, если вес больше ожидаемого
+                        auto req_weight_delta = _it->total_weight;// - desired_weight;
+
+                        for (auto check_it = _sum.begin(); check_it < _it; check_it++)
+                        {
+                            req_weight_delta -= check_it->total_weight;
+
+                            if (req_weight_delta == desired_weight){
+                                break;
+                            }
+
+                            if (req_weight_delta < desired_weight) {
+                                
+                                break;
+                            }
+
+                            // if (check_it->total_weight <= desired_weight)
+                            // {
+                            // }
+                        }
+                    }
+                }
+                else
+                {
                     //TODO: Случаи, когда количество шар в трекере больше, чем нужно в запросе.
                 }
             }
