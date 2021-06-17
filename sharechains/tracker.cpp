@@ -75,7 +75,7 @@ namespace c2pool::shares::tracker
             LOG_WARNING << share->hash.ToString() << " item already present"; //TODO: for what???
         }
 
-        lookbehind_items.push(share);
+        lookbehind_items.add(*share);
     }
 
     bool ShareTracker::attempt_verify(BaseShare share)
@@ -118,7 +118,7 @@ namespace c2pool::shares::tracker
         //height, last
         auto get_height_and_last = get_height_and_last(share_data.previous_share_hash);
         auto height = std::get<0>(get_height_and_last);
-        auto height = std::get<1>(get_height_and_last);
+        auto last = std::get<1>(get_height_and_last);
         assert(height >= net->REAL_CHAIN_LENGTH) || (last == nullptr);
 
         arith_uint256 pre_target3;
