@@ -77,9 +77,9 @@ namespace c2pool::shares::share
         virtual string SerializeJSON() override;
         virtual void DeserializeJSON(std::string json) override;
 
-        operator c2pool::shares::tracker::PrefixSumShareElement() const
+        operator c2pool::shares::tracker::PrefsumShareElement() const
         {
-            c2pool::shares::tracker::PrefixSumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
+            c2pool::shares::tracker::PrefsumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
             return prefsum_share;
         }
 

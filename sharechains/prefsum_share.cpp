@@ -9,28 +9,28 @@ using namespace std;
 
 namespace c2pool::shares::tracker
 {
-    void PrefixSumShare::reverse_add(uint256 hash, deque<PrefixSumShareElement>::iterator _it)
+    void PrefsumShare::reverse_add(uint256 hash, deque<PrefsumShareElement>::iterator _it)
     {
         _reverse[hash] = _it;
     }
 
-    void PrefixSumShare::reverse_remove(uint256 hash)
+    void PrefsumShare::reverse_remove(uint256 hash)
     {
         _reverse.erase(hash);
     }
 
-    void PrefixSumWeights::reverse_add(uint256 hash, deque<PrefixSumWeightsElement>::iterator _it)
+    void PrefsumWeights::reverse_add(uint256 hash, deque<PrefsumWeightsElement>::iterator _it)
     {
         _reverse[hash] = _it;
     }
 
-    void PrefixSumWeights::reverse_remove(uint256 hash)
+    void PrefsumWeights::reverse_remove(uint256 hash)
     {
         _reverse.erase(hash);
     }
 
-    //PrefixSumWeightsElement::PrefixSumWeightsElement(shared_ptr<c2pool::shares::share::BaseShare> share)
-    PrefixSumWeightsElement::PrefixSumWeightsElement(uint256 hash, uint256 target, char* new_script, uint256 donation)
+    //PrefsumWeightsElement::PrefsumWeightsElement(shared_ptr<c2pool::shares::share::BaseShare> share)
+    PrefsumWeightsElement::PrefsumWeightsElement(uint256 hash, uint256 target, char* new_script, uint256 donation)
     {
         // share->hash; share->target; share->donation; share->new_script; share->donation
         arith_uint256 _donation = UintToArith256(donation);
