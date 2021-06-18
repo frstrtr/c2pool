@@ -1,16 +1,17 @@
+#pragma once
+
+#include <util/prefsum.h>
+
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <devcore/logger.h>
 #include <coind/data.h>
 
-#include <map>
 #include <vector>
-#include <set>
 #include <tuple>
 #include <string>
 #include <memory>
-#include <deque>
 using namespace std;
 
 namespace c2pool::shares::tracker
@@ -23,6 +24,11 @@ namespace c2pool::shares::tracker
         arith_uint256 work;
         arith_uint256 min_work;
         int height;
+
+        uint256 reverse_key()
+        {
+            return hash;
+        }
 
         PrefsumShareElement &operator+=(const PrefsumShareElement &rhs)
         {
@@ -58,19 +64,17 @@ namespace c2pool::shares::tracker
     };
 
     //https://en.wikipedia.org/wiki/Prefix_sum
-    class PrefsumShare
+    class PrefsumShare : public Prefsum<PrefsumShareElement, uint256>
     {
-    protected:
-        deque<PrefsumShareElement> _sum;
-        map<uint256, deque<PrefsumShareElement>::iterator> _reverse;
-        int max_size;
-        int real_max_size;
-
+        //TODO: ADD Prefsum<PrefsumShareElement, uint256> verified
+        //and override methods for that
     public:
         int get_height(uint256 hash)
         {
             return _reverse[hash]->height;
         }
+
+        //TODO: get_nth_parent
 
         tuple<int, uint256> get_height_and_last(uint256 hash)
         {
@@ -87,96 +91,14 @@ namespace c2pool::shares::tracker
             //TODO:
         }
 
-    private:
-        void resize()
-        {
-            auto delta = _sum[max_size - 1];
-            for (int i = 0; i < max_size; i++)
-            {
-                reverse_remove(_sum.front().hash);
-                _sum.pop_front();
-            }
-            for (auto &item : _sum)
-            {
-                item -= delta;
-            }
-        }
-
-        void reverse_add(uint256 hash, deque<PrefsumShareElement>::iterator _it);
-
-        void reverse_remove(uint256 hash);
-
     public:
-        PrefsumShare(int _max_size)
-        {
-            max_size = _max_size;
-            real_max_size = max_size * 4;
-        }
-
-        void init(vector<PrefsumShareElement> a)
-        {
-            for (auto item : a)
-            {
-                add(item);
-            }
-        }
-
-        void add(PrefsumShareElement v)
-        {
-            if (_sum.size() >= real_max_size)
-            {
-                resize();
-            }
-            if (!_sum.empty())
-            {
-                v += _sum.back();
-            }
-
-            _sum.push_back(v);
-            reverse_add(v.hash, _sum.end() - 1);
-        }
-
-        void remove(int index)
-        {
-            if ((_sum.size() <= index) && (index < 0))
-            {
-                throw std::out_of_range("size of sum < index in prefix_sum.remove");
-            }
-            if (_sum.size() - 1 == index)
-            {
-                reverse_remove(_sum.back().hash);
-                _sum.pop_back();
-            }
-            else
-            {
-                PrefsumShareElement v;
-                if (index - 1 < 0)
-                {
-                    v = _sum[index];
-                }
-                else
-                {
-                    v = _sum[index] - _sum[index - 1];
-                }
-                for (auto item = _sum.begin() + index + 1; item != _sum.end(); item++)
-                {
-                    *item -= v;
-                }
-
-                auto it_for_remove = _sum.begin() + index;
-                reverse_remove(it_for_remove->hash);
-                _sum.erase(it_for_remove);
-            }
-        }
-
-        size_t size()
-        {
-            return _sum.size();
-        }
+        PrefsumShare(int _max_size) : Prefsum(_max_size) {}
     };
+}
 
-    //Weights
-
+//========================Weights========================
+namespace c2pool::shares::tracker
+{
     struct PrefsumWeightsElement
     {
         uint256 hash;
@@ -189,20 +111,27 @@ namespace c2pool::shares::tracker
         arith_uint256 my_total_weight;
         arith_uint256 my_total_donation_weight;
 
+        uint256 reverse_key()
+        {
+            return hash;
+        }
+
         PrefsumWeightsElement()
         {
             hash.SetNull();
         }
 
-        PrefsumWeightsElement(uint256 hash, uint256 target, char* new_script, uint256 donation);
+        PrefsumWeightsElement(uint256 hash, uint256 target, char *new_script, uint256 donation);
 
-        PrefsumWeightsElement(std::map<char *, arith_uint256>& _weights, arith_uint256& _total_weight, arith_uint256& _total_donation_weight){
+        PrefsumWeightsElement(std::map<char *, arith_uint256> &_weights, arith_uint256 &_total_weight, arith_uint256 &_total_donation_weight)
+        {
             weights = _weights;
             total_weight = _total_weight;
             total_donation_weight = _total_donation_weight;
         }
 
-        PrefsumWeightsElement my(){
+        PrefsumWeightsElement my()
+        {
             return PrefsumWeightsElement(my_weights, my_total_weight, my_total_donation_weight);
         }
 
@@ -254,15 +183,8 @@ namespace c2pool::shares::tracker
         arith_uint256 donation_weight;
     };
 
-    class PrefsumWeights
+    class PrefsumWeights : public Prefsum<PrefsumWeightsElement, uint256>
     {
-    protected:
-        deque<PrefsumWeightsElement> _sum;
-        map<uint256, deque<PrefsumWeightsElement>::iterator> _reverse;
-
-        int max_size;
-        int real_max_size;
-
     public:
         CumulativeWeights get_cumulative_weights(uint256 start_hash, int32_t max_shares, arith_uint256 desired_weight)
         {
@@ -319,91 +241,7 @@ namespace c2pool::shares::tracker
             return CumulativeWeights(result_element.weights, result_element.total_weight, result_element.total_donation_weight);
         }
 
-    private:
-        void resize()
-        {
-            auto delta = _sum[max_size - 1];
-            for (int i = 0; i < max_size; i++)
-            {
-                reverse_remove(_sum.front().hash);
-                _sum.pop_front();
-            }
-            for (auto &item : _sum)
-            {
-                item -= delta;
-            }
-        }
-
-        void reverse_add(uint256 hash, deque<PrefsumWeightsElement>::iterator _it);
-
-        void reverse_remove(uint256 hash);
-
     public:
-        PrefsumWeights(int _max_size)
-        {
-            max_size = _max_size;
-            real_max_size = max_size * 4;
-        }
-
-        void init(vector<PrefsumWeightsElement> a)
-        {
-            for (auto item : a)
-            {
-                add(item);
-            }
-        }
-
-        void add(PrefsumWeightsElement v)
-        {
-            if (_sum.size() >= real_max_size)
-            {
-                resize();
-            }
-            if (!_sum.empty())
-            {
-                v += _sum.back();
-            }
-
-            _sum.push_back(v);
-            reverse_add(v.hash, _sum.end() - 1);
-        }
-
-        void remove(int index)
-        {
-            if ((_sum.size() <= index) && (index < 0))
-            {
-                throw std::out_of_range("size of sum < index in prefix_sum.remove");
-            }
-            if (_sum.size() - 1 == index)
-            {
-                reverse_remove(_sum.back().hash);
-                _sum.pop_back();
-            }
-            else
-            {
-                PrefsumWeightsElement v;
-                if (index - 1 < 0)
-                {
-                    v = _sum[index];
-                }
-                else
-                {
-                    v = _sum[index] - _sum[index - 1];
-                }
-                for (auto item = _sum.begin() + index + 1; item != _sum.end(); item++)
-                {
-                    *item -= v;
-                }
-
-                auto it_for_remove = _sum.begin() + index;
-                reverse_remove(it_for_remove->hash);
-                _sum.erase(it_for_remove);
-            }
-        }
-
-        size_t size()
-        {
-            return _sum.size();
-        }
+        PrefsumWeights(int _max_size) : Prefsum(_max_size) {}
     };
 }
