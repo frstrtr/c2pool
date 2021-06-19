@@ -73,8 +73,7 @@ namespace c2pool::shares::tracker
     private:
         map<uint256, shared_ptr<BaseShare>> items;
         PrefsumShare lookbehind_items;
-
-        map<uint256, bool> verified; //share.hash -> is verified
+        PrefsumVerifiedShare verified;
 
     public:
         ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng);
@@ -82,7 +81,7 @@ namespace c2pool::shares::tracker
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);
 
-        bool attempt_verify(BaseShare share);
+        bool attempt_verify(shared_ptr<BaseShare> share);
 
         TrackerThinkResult think();
 

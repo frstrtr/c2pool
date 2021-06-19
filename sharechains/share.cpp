@@ -34,7 +34,7 @@ namespace c2pool::shares::share
         // contents = ShareValue["contents"].get_obj();
     }
 
-    void BaseShare::check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/)
+    bool BaseShare::check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/)
     {
         if (timestamp > (c2pool::dev::timestamp() + 600))
         {
