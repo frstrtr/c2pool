@@ -78,22 +78,25 @@ namespace c2pool::shares::tracker
         lookbehind_items.add(*share);
     }
 
-    bool ShareTracker::attempt_verify(BaseShare share)
+    bool ShareTracker::attempt_verify(shared_ptr<BaseShare> share)
     {
-        if (verified.find(share.hash) != verified.end())
+        if (verified.exists(share->hash))
         {
             return true;
         }
 
         try
         {
-            share.check(shared_from_this());
+            share->check(shared_from_this());
         }
         catch (const std::invalid_argument &e)
         {
             LOG_WARNING << e.what() << '\n';
             return false;
         }
+
+        verified.add(*share);
+        return true;
     }
 
     TrackerThinkResult ShareTracker::think()
@@ -414,10 +417,11 @@ namespace c2pool::shares::tracker
             gentx['flag'] = 1
             gentx['witness'] = [[witness_reserved_value_str]] */
 
-        get_share_method get_share([=](SmallBlockHeaderType header, unsigned long long last_txout_nonce) {
-            auto min_header = header;
-            shared_ptr<BaseShare> share = std::make_shared<ShareType>(); //TODO: GENERATE SHARE IN CONSTUCTOR
-        });
+        get_share_method get_share([=](SmallBlockHeaderType header, unsigned long long last_txout_nonce)
+                                   {
+                                       auto min_header = header;
+                                       shared_ptr<BaseShare> share = std::make_shared<ShareType>(); //TODO: GENERATE SHARE IN CONSTUCTOR
+                                   });
 
         /*
             t5 = time.time()

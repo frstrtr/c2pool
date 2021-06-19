@@ -66,19 +66,10 @@ namespace c2pool::shares::tracker
     //https://en.wikipedia.org/wiki/Prefix_sum
     class PrefsumShare : public Prefsum<PrefsumShareElement, uint256>
     {
-        //TODO: ADD Prefsum<PrefsumShareElement, uint256> verified
-        //and override methods for that
     public:
         int get_height(uint256 hash)
         {
             return _reverse[hash]->height;
-        }
-
-        //TODO: get_nth_parent
-
-        tuple<int, uint256> get_height_and_last(uint256 hash)
-        {
-            //TODO:
         }
 
         uint256 get_work(uint256 hash)
@@ -91,8 +82,38 @@ namespace c2pool::shares::tracker
             //TODO:
         }
 
+        virtual uint256 get_nth_parent_hash(int32_t n)
+        {
+            if (n >= size())
+            {
+                //TODO: throw
+            }
+            return (_sum.begin() - (n + 1))->hash;
+        }
+
+        tuple<int, uint256> get_height_and_last(uint256 hash)
+        {
+            //TODO:
+        }
+
     public:
         PrefsumShare(int _max_size) : Prefsum(_max_size) {}
+    };
+
+    class PrefsumVerifiedShare : public PrefsumShare
+    {
+    protected:
+        PrefsumShare &prefsum_share;
+
+    public:
+        PrefsumVerifiedShare(int _max_size, PrefsumShare &_prefsum_share) : PrefsumShare(_max_size), prefsum_share(_prefsum_share)
+        {
+        }
+
+        uint256 get_nth_parent_hash(int32_t n) override
+        {
+            return prefsum_share.get_nth_parent_hash(n);
+        }
     };
 }
 

@@ -118,4 +118,12 @@ public:
         auto index_it = _reverse[key];
         remove(distance(_sum.begin(), index_it));
     }
+
+    bool exists(reverse_key k)
+    {
+        if (_reverse.find(k) != _reverse.end())
+            return true;
+        else
+            return false;
+    }
 };
