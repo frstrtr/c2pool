@@ -1,5 +1,5 @@
 #DistanceSkipList
-def distance_skip_list(start, n)
+def distance_skip_list(start, n):
     result = (0, start) #initial_solution
     pos = start
 

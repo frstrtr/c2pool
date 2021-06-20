@@ -1,12 +1,13 @@
 #pragma once
 
 #include <univalue.h>
-#include <shareTypes.h>
+#include "shareTypes.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <coind/data.h>
 #include <devcore/logger.h>
 #include <libnet/nodeManager.h>
+#include "prefsum_share.h"
 
 #include <map>
 #include <vector>
@@ -71,9 +72,8 @@ namespace c2pool::shares::tracker
     {
     private:
         map<uint256, shared_ptr<BaseShare>> items;
-        LookbehindDelta lookbehind_items;
-
-        map<uint256, bool> verified; //share.hash -> is verified
+        PrefsumShare lookbehind_items;
+        PrefsumVerifiedShare verified;
 
     public:
         ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng);
@@ -81,7 +81,7 @@ namespace c2pool::shares::tracker
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);
 
-        bool attempt_verify(BaseShare share);
+        bool attempt_verify(shared_ptr<BaseShare> share);
 
         TrackerThinkResult think();
 
