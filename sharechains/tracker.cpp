@@ -75,25 +75,28 @@ namespace c2pool::shares::tracker
             LOG_WARNING << share->hash.ToString() << " item already present"; //TODO: for what???
         }
 
-        lookbehind_items.push(share);
+        lookbehind_items.add(*share);
     }
 
-    bool ShareTracker::attempt_verify(BaseShare share)
+    bool ShareTracker::attempt_verify(shared_ptr<BaseShare> share)
     {
-        if (verified.find(share.hash) != verified.end())
+        if (verified.exists(share->hash))
         {
             return true;
         }
 
         try
         {
-            share.check(shared_from_this());
+            share->check(shared_from_this());
         }
         catch (const std::invalid_argument &e)
         {
             LOG_WARNING << e.what() << '\n';
             return false;
         }
+
+        verified.add(*share);
+        return true;
     }
 
     TrackerThinkResult ShareTracker::think()
@@ -118,7 +121,7 @@ namespace c2pool::shares::tracker
         //height, last
         auto get_height_and_last = get_height_and_last(share_data.previous_share_hash);
         auto height = std::get<0>(get_height_and_last);
-        auto height = std::get<1>(get_height_and_last);
+        auto last = std::get<1>(get_height_and_last);
         assert(height >= net->REAL_CHAIN_LENGTH) || (last == nullptr);
 
         arith_uint256 pre_target3;
@@ -414,10 +417,11 @@ namespace c2pool::shares::tracker
             gentx['flag'] = 1
             gentx['witness'] = [[witness_reserved_value_str]] */
 
-        get_share_method get_share([=](SmallBlockHeaderType header, unsigned long long last_txout_nonce) {
-            auto min_header = header;
-            shared_ptr<BaseShare> share = std::make_shared<ShareType>(); //TODO: GENERATE SHARE IN CONSTUCTOR
-        });
+        get_share_method get_share([=](SmallBlockHeaderType header, unsigned long long last_txout_nonce)
+                                   {
+                                       auto min_header = header;
+                                       shared_ptr<BaseShare> share = std::make_shared<ShareType>(); //TODO: GENERATE SHARE IN CONSTUCTOR
+                                   });
 
         /*
             t5 = time.time()
