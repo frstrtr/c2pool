@@ -1,291 +1,306 @@
-#pragma once
-
-#include <util/prefsum.h>
-
-#include <univalue.h>
+#include <map>
+#include <queue>
+#include <list>
+#include <memory>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
-#include <devcore/logger.h>
-#include <coind/data.h>
-#include <boost/optional.hpp>
-#include <boost/function.hpp>
-
-#include <vector>
-#include <tuple>
-#include <string>
-#include <memory>
+#include "share.h"
 using namespace std;
 
-namespace c2pool::shares::tracker
+class element_type
 {
-    class BaseShare;
-    class ShareTracker;
-}
+public:
+    map<uint256, element_type>::iterator prev;
+    list<map<uint256 element_type>::iterator> nexts;
+    shared_ptr<BaseShare> element;
 
-namespace c2pool::shares::tracker
+    int32_t height;
+    uint256 work;
+
+public:
+    element_type() {}
+    element_type(shared_ptr<BaseShare> _share)
+    {
+        element = _share;
+        work = _share->work;
+        height = 1;
+    }
+
+    int hash()
+    {
+        return element->hash;
+    }
+    int prev_hash()
+    {
+        if (element == nullptr)
+        {
+            cout << prev->second.hash() << endl;
+            return 0;
+        }
+        return element->prev_hash;
+    }
+
+    element_type operator+(const element_type &element)
+    {
+        element_type res = *this;
+        res.work += element.work;
+        res.height += element.height;
+        return res;
+    }
+
+    element_type operator-(const element_type &element)
+    {
+        element_type res = *this;
+        res.work -= element.work;
+        res.height -= element.height;
+        return res;
+    }
+
+    element_type operator+=(const element_type &element)
+    {
+        this->work += element.work;
+        this->height += element.height;
+        return *this;
+    }
+
+    element_type operator-=(const element_type &element)
+    {
+        this->work -= element.work;
+        this->height -= element.height;
+        return *this;
+    }
+
+    // static element_type get_null(){}
+};
+
+class element_delta_type
 {
+private:
+    bool _none;
 
-    struct PrefsumShareElement
+public:
+    uint256 head;
+    uint256 tail;
+    int32_t height;
+    arith_uint256 work;
+
+    element_delta_type(bool none = true)
     {
-        uint256 hash; //head
-        //TODO: ? uint256 previous_hash; //tail
+        _none = none;
+    }
 
-        arith_uint256 work;
-        arith_uint256 min_work;
-        int height;
-
-        uint256 reverse_key()
-        {
-            return hash;
-        }
-
-        PrefsumShareElement &operator+=(const PrefsumShareElement &rhs)
-        {
-            work += rhs.work;
-            min_work += rhs.min_work;
-            height += rhs.height;
-            return *this;
-        }
-
-        PrefsumShareElement &operator-=(const PrefsumShareElement &rhs)
-        {
-            work -= rhs.work;
-            min_work -= rhs.min_work;
-            height -= rhs.height;
-            return *this;
-        }
-
-        friend PrefsumShareElement operator-(PrefsumShareElement lhs, const PrefsumShareElement &rhs)
-        {
-            lhs.work -= rhs.work;
-            lhs.min_work -= rhs.min_work;
-            lhs.height -= rhs.height;
-            return lhs;
-        }
-
-        friend PrefsumShareElement operator+(PrefsumShareElement lhs, const PrefsumShareElement &rhs)
-        {
-            lhs.work += rhs.work;
-            lhs.min_work += rhs.min_work;
-            lhs.height += rhs.height;
-            return lhs;
-        }
-    };
-
-    //https://en.wikipedia.org/wiki/Prefix_sum
-    class PrefsumShare : public Prefsum<PrefsumShareElement, uint256>
+    element_delta_type(element_type &el)
     {
-    public:
-        typedef boost::function<shared_ptr<BaseShare>()> get_chain_generator;
+        head = el.hash();
+        tail = el.prev_hash();
+        height = el.height;
+        work = el.work;
+    }
 
-    protected:
-        shared_ptr<ShareTracker> tracker;
-
-    public:
-        int get_height(uint256 hash)
-        {
-            return _reverse[hash]->height;
-        }
-
-        uint256 get_work(uint256 hash)
-        {
-            //TODO:
-        }
-
-        uint256 get_last(uint256 hash)
-        {
-            //TODO:
-        }
-
-        virtual uint256 get_nth_parent_hash(uint256 hash, int32_t n)
-        {
-            //TODO update for hash (first argument)
-            if (n >= size())
-            {
-                //TODO: throw
-            }
-            return (_sum.begin() - (n + 1))->hash;
-        }
-
-        tuple<int, uint256> get_height_and_last(uint256 hash)
-        {
-            //TODO:
-        }
-
-        get_chain_generator get_chain(uint256 shart_hash, size_t length);
-
-    public:
-        PrefsumShare() : Prefsum(0) {}
-
-        PrefsumShare(int _max_size, shared_ptr<ShareTracker> _tracker) : Prefsum(_max_size), tracker(_tracker) {}
-    };
-
-    class PrefsumVerifiedShare : public PrefsumShare
+    element_delta_type operator-(const element_delta_type &el) const
     {
-    protected:
-        boost::optional<PrefsumShare> prefsum_share;
+        element_delta_type res = *this;
+        res.tail = el.head;
+        res.height -= el.height;
+        res.work -= el.work;
+        return res;
+    }
 
-    public:
-        PrefsumVerifiedShare() : PrefsumShare() {}
+    void operator-=(const element_delta_type &el)
+    {
+        tail = el.head;
+        height -= el.height;
+        work -= el.work;
+    }
 
-        PrefsumVerifiedShare(int _max_size, shared_ptr<ShareTracker> _tracker, PrefsumShare &_prefsum_share) : PrefsumShare(_max_size, _tracker), prefsum_share(_prefsum_share)
-        {
-        }
+    bool is_none()
+    {
+        return _none;
+    }
 
-        uint256 get_nth_parent_hash(uint256 hash, int32_t n) override
-        {
-            return prefsum_share->get_nth_parent_hash(hash, n);
-        }
-    };
-}
+    void set_none(bool none = true)
+    {
+        _none = none;
+    }
+};
 
-//========================Weights========================
-namespace c2pool::shares::tracker
+class PrefsumShare
 {
-    struct PrefsumWeightsElement
+public:
+    map<uint256, shared_ptr<BaseShare>> items;
+    map<uint256, element_type> sum;
+
+protected:
+    element_type make_element(shared_ptr<BaseShare> _share)
     {
-        uint256 hash;
+        element_type element(_share);
+        element.prev = sum.find(_share->prev_hash);
+        return element;
+    }
 
-        std::map<char *, arith_uint256> weights;
-        arith_uint256 total_weight;
-        arith_uint256 total_donation_weight;
+public:
+    void add(shared_ptr<BaseShare> _share)
+    {
+        //TODO: throw if share exists in items;
+        items[_share->hash] = _share;
 
-        std::map<char *, arith_uint256> my_weights;
-        arith_uint256 my_total_weight;
-        arith_uint256 my_total_donation_weight;
-
-        uint256 reverse_key()
+        element_type new_sum_element = make_element(_share); //only this element
+        if (new_sum_element.prev != sum.end())
         {
-            return hash;
+            new_sum_element += new_sum_element.prev->second;
+            sum[_share->hash] = new_sum_element;
+            new_sum_element.prev->second.nexts.push_back(sum.find(_share->hash));
         }
-
-        PrefsumWeightsElement()
+        else
         {
-            hash.SetNull();
+            sum[_share->hash] = new_sum_element;
         }
+    }
 
-        PrefsumWeightsElement(uint256 hash, uint256 target, char *new_script, uint256 donation);
+#define set_cur_it(new_value) \
+    cur_it = new_value;       \
+    cur_it_nexts = cur_it->second.nexts
 
-        PrefsumWeightsElement(std::map<char *, arith_uint256> &_weights, arith_uint256 &_total_weight, arith_uint256 &_total_donation_weight)
+#define get_q() \
+    q.front();  \
+    q.pop()
+
+    void remove(uint256 hash)
+    {
+        //TODO: throw if hash not exists in items;
+        auto _share = items[hash];
+        items.erase(hash);
+
+        queue<map<uint256, element_type>::iterator> q;
+        auto remover = sum[hash];
+
+        auto cur_it = sum.find(hash);
+        auto &cur_it_nexts = cur_it->second.nexts;
+
+        if (remover.nexts.empty())
         {
-            weights = _weights;
-            total_weight = _total_weight;
-            total_donation_weight = _total_donation_weight;
+            cur_it = sum.end();
         }
-
-        PrefsumWeightsElement my()
+        else
         {
-            return PrefsumWeightsElement(my_weights, my_total_weight, my_total_donation_weight);
-        }
-
-        PrefsumWeightsElement &operator+=(const PrefsumWeightsElement &rhs)
-        {
-            auto _weights = rhs.weights;
-            weights.merge(_weights);
-            for (auto weight_value : _weights)
+            for (auto item : cur_it_nexts)
             {
-                weights[weight_value.first] += weight_value.second;
+                item->second.prev = sum.end(); //remover.prev;
+                q.push(item);
             }
-
-            total_weight += rhs.total_weight;
-            total_donation_weight += rhs.total_donation_weight;
-            return *this;
+            auto new_it = get_q();
+            set_cur_it(new_it);
         }
-
-        PrefsumWeightsElement &operator-=(const PrefsumWeightsElement &rhs)
+        //добавлять все nexts в текущей cur_it в q и проходить их.
+        while (!q.empty() || (cur_it != sum.end()))
         {
-            auto _weights = rhs.weights;
-            _weights.merge(weights);
-            for (auto vk : weights)
+            if (cur_it != sum.end())
             {
-                weights[vk.first] -= _weights[vk.first];
-            }
-
-            total_weight -= rhs.total_weight;
-            total_donation_weight -= rhs.total_donation_weight;
-            return *this;
-        }
-
-        friend PrefsumWeightsElement operator-(PrefsumWeightsElement lhs, const PrefsumWeightsElement &rhs)
-        {
-            lhs -= rhs;
-            return lhs;
-        }
-
-        friend PrefsumWeightsElement operator+(PrefsumWeightsElement lhs, const PrefsumWeightsElement &rhs)
-        {
-            lhs += rhs;
-            return lhs;
-        }
-    };
-
-    struct CumulativeWeights
-    {
-        std::map<char *, arith_uint256> weights;
-        arith_uint256 total_weight;
-        arith_uint256 donation_weight;
-    };
-
-    class PrefsumWeights : public Prefsum<PrefsumWeightsElement, uint256>
-    {
-    public:
-        CumulativeWeights get_cumulative_weights(uint256 start_hash, int32_t max_shares, arith_uint256 desired_weight)
-        {
-            PrefsumWeightsElement result_element;
-
-            //Если шары имеются.
-            if (!_sum.empty())
-            {
-                auto _it = _reverse[start_hash];
-                result_element = *_it;
-
-                //Если шар в трекере за заданной шарой, меньше или равен максимальному.
-                if (distance(_sum.begin(), _it) <= max_shares)
+                cur_it->second -= remover;
+                for (auto item : cur_it_nexts)
                 {
-                    if (_it->total_weight > desired_weight)
-                    {
-                        // Случай, если вес больше ожидаемого
-                        auto req_weight_delta = _it->total_weight + desired_weight;
-
-                        for (auto check_it = _sum.begin(); check_it < _it; check_it++)
-                        {
-                            req_weight_delta -= check_it->total_weight;
-
-                            if (req_weight_delta == desired_weight)
-                            {
-                                result_element -= *check_it;
-                                result_element += check_it->my();
-                                break;
-                            }
-
-                            if (req_weight_delta < desired_weight)
-                            {
-                                result_element -= *check_it;
-                                auto just_my = check_it->my();
-                                auto new_script = just_my.weights.begin()->first;
-                                auto new_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.weights[new_script] / (just_my.total_weight / 65535);
-                                std::map<char *, arith_uint256> new_weights = {{new_script, new_weight}};
-
-                                arith_uint256 new_total_donation_weight = (desired_weight - result_element.total_weight) / 65535 * just_my.my_total_donation_weight / (just_my.total_weight / 65535);
-                                arith_uint256 new_total_weight = desired_weight - req_weight_delta;
-                                //total_donation_weight1 + (desired_weight - total_weight1)//65535*total_donation_weight2//(total_weight2//65535)
-                                result_element += PrefsumWeightsElement(new_weights, new_total_weight, new_total_donation_weight);
-                                break;
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    //TODO: Случаи, когда количество шар в трекере больше, чем нужно в запросе.
+                    q.push(item);
                 }
             }
+            if (!q.empty())
+            {
+                auto new_it = get_q();
+                set_cur_it(new_it);
+            }
+            else
+            {
+                break;
+            }
+        }
+        sum.erase(hash);
+    }
+#undef set_cur_it
+#undef get_q
 
-            //CumulativeWeights
-            return {result_element.weights, result_element.total_weight, result_element.total_donation_weight};
+    bool is_child_of(uint256 item_hash, uint256 possible_child_hash)
+    {
+        auto _it = sum.find(item_hash);
+        if (sum.find(possible_child_hash) == sum.end())
+        {
+            throw invalid_argument("is_child_of: possible_child_hash existn't in tracker");
+        }
+        while (_it != sum.end())
+        {
+            if (_it->second.prev->first == possible_child_hash)
+                return true;
+            else
+                _it = _it->second.prev;
+        }
+        return false;
+    }
+
+    element_delta_type get_delta(uint256 first_hash, uint256 second_hash)
+    {
+        if (sum.find(first_hash) == sum.end())
+        {
+            throw invalid_argument("first_hash in get_delta existn't in sum!");
+        }
+        if (sum.find(second_hash) == sum.end())
+        {
+            throw invalid_argument("second in get_delta existn't in sum!");
         }
 
-    public:
-        PrefsumWeights(int _max_size) : Prefsum(_max_size) {}
-    };
-}
+        if (!is_child_of(first_hash, second_hash))
+        {
+            throw invalid_argument("get_delta: second_hash is not child for first_hash!");
+            //return element_delta_type();
+        }
+
+        element_delta_type fir(sum[first_hash]);
+        element_delta_type sec(sum[second_hash]);
+        return fir - sec;
+    }
+
+    //todo: create optimization like get_last_iterator
+    int get_last(uint256 hash)
+    {
+        auto _it = sum.find(hash);
+        if (_it == sum.end())
+        {
+            throw invalid_argument("[get_last] hash not exists in sum");
+        }
+        //cout << _it->second.element;
+        auto last = _it->second.prev_hash();
+        while (_it != sum.end())
+        {
+            last = _it->second.prev_hash();
+            _it = _it->second.prev;
+            // this_thread::sleep_for(chrono::milliseconds(1));
+        }
+        return last;
+    }
+
+    element_delta_type get_delta_to_last(int hash)
+    {
+        auto el = sum.find(hash);
+        if (el == sum.end())
+        {
+            throw invalid_argument("[get_delta_to_last] hash not exists in sum");
+        }
+        element_delta_type delta(el->second);
+        delta.tail = get_last(hash);
+        return delta;
+    }
+
+    int get_test_best()
+    {
+        if (items.empty())
+        {
+            return 0;
+        }
+        auto best = items.begin()->second->hash;
+        for (auto item : items)
+        {
+            if (item.second->hash > best)
+                best = item.second->hash;
+        }
+        return best;
+    }
+
+    //todo: remove range
+};
