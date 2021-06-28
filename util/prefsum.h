@@ -1,6 +1,7 @@
 #pragma once
 #include <deque>
 #include <map>
+#include <vector>
 
 using namespace std;
 
@@ -52,7 +53,7 @@ public:
         return _sum.size();
     }
 
-    size_t max_size() const
+    size_t get_max_size() const
     {
         return max_size;
     }

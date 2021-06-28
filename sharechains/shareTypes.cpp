@@ -1,18 +1,12 @@
-#include <shareTypes.h>
+#include "shareTypes.h"
+
+#include <tuple>
+#include <vector>
+#include <memory>
+#include <btclibs/uint256.h>
+
 namespace c2pool::shares::share
 {
-    ShareData::ShareData(uint256 _previous_share_hash, std::string _coinbase, unsigned int _nonce, uint160 _pubkey_hash, unsigned long long _subsidy, unsigned short _donation, StaleInfo _stale_info, unsigned long long _desired_version)
-    {
-        previous_share_hash = _previous_share_hash;
-        coinbase = _coinbase;
-        nonce = _nonce;
-        pubkey_hash = _pubkey_hash;
-        subsidy = _subsidy;
-        donation = _donation;
-        stale_info = _stale_info;
-        desired_version = _desired_version;
-    };
-
     bool operator==(const ShareData &first, const ShareData &second)
     {
         if (first.previous_share_hash.Compare(second.previous_share_hash) != 0)
@@ -47,7 +41,7 @@ namespace c2pool::shares::share
         return !(first == second);
     }
 
-    ShareInfo::ShareInfo(std::shared_ptr<ShareData> _share_data, std::vector<uint256> _new_transaction_hashes, std::vector<TransactionHashRef> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork, std::shared_ptr<SegwitData> _segwit_data)
+    ShareInfo::ShareInfo(ShareData _share_data, std::vector<uint256> _new_transaction_hashes, std::vector<std::tuple<int, int>> _transaction_hash_refs, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth, uint128 _abswork, SegwitData _segwit_data)
     {
         share_data = _share_data;
         segwit_data = _segwit_data;
@@ -63,7 +57,7 @@ namespace c2pool::shares::share
 
     bool operator==(const ShareInfo &first, const ShareInfo &second)
     {
-        if (*first.share_data != *second.share_data)
+        if (first.share_data != second.share_data)
             return false;
 
         if (*first.segwit_data != *second.segwit_data)

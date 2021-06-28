@@ -8,8 +8,17 @@ using namespace std;
 
 namespace c2pool::shares::tracker
 {
+    get_chain_generator PrefsumShares::get_chain(uint256 shart_hash, size_t length)
+    {
+        assert(length <= get_height)
+
+            return [&]() {
+
+            }
+    }
+
     //PrefsumWeightsElement::PrefsumWeightsElement(shared_ptr<c2pool::shares::share::BaseShare> share)
-    PrefsumWeightsElement::PrefsumWeightsElement(uint256 hash, uint256 target, char* new_script, uint256 donation)
+    PrefsumWeightsElement::PrefsumWeightsElement(uint256 hash, uint256 target, char *new_script, uint256 donation)
     {
         // share->hash; share->target; share->donation; share->new_script; share->donation
         arith_uint256 _donation = UintToArith256(donation);
@@ -17,7 +26,7 @@ namespace c2pool::shares::tracker
         hash = hash;
         auto att = UintToArith256(coind::data::target_to_average_attempts(target));
 
-        char* new_script_copy = new char[strlen(new_script)];
+        char *new_script_copy = new char[strlen(new_script)];
         strcpy(new_script_copy, new_script);
 
         weights = {{new_script_copy, att * (65535 - _donation)}};

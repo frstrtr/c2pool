@@ -3,6 +3,7 @@
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <devcore/py_base.h>
+#include <univalue.h>
 
 #include <cstring>
 #include <vector>

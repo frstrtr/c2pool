@@ -7,6 +7,8 @@
 #include <btclibs/arith_uint256.h>
 #include <devcore/logger.h>
 #include <coind/data.h>
+#include <boost/optional.hpp>
+#include <boost/function.hpp>
 
 #include <vector>
 #include <tuple>
@@ -16,6 +18,13 @@ using namespace std;
 
 namespace c2pool::shares::tracker
 {
+    class BaseShare;
+    class ShareTracker;
+}
+
+namespace c2pool::shares::tracker
+{
+
     struct PrefsumShareElement
     {
         uint256 hash; //head
@@ -67,6 +76,12 @@ namespace c2pool::shares::tracker
     class PrefsumShare : public Prefsum<PrefsumShareElement, uint256>
     {
     public:
+        typedef boost::function<shared_ptr<BaseShare>()> get_chain_generator;
+
+    protected:
+        shared_ptr<ShareTracker> tracker;
+
+    public:
         int get_height(uint256 hash)
         {
             return _reverse[hash]->height;
@@ -82,8 +97,9 @@ namespace c2pool::shares::tracker
             //TODO:
         }
 
-        virtual uint256 get_nth_parent_hash(int32_t n)
+        virtual uint256 get_nth_parent_hash(uint256 hash, int32_t n)
         {
+            //TODO update for hash (first argument)
             if (n >= size())
             {
                 //TODO: throw
@@ -96,23 +112,29 @@ namespace c2pool::shares::tracker
             //TODO:
         }
 
+        get_chain_generator get_chain(uint256 shart_hash, size_t length);
+
     public:
-        PrefsumShare(int _max_size) : Prefsum(_max_size) {}
+        PrefsumShare() : Prefsum(0) {}
+
+        PrefsumShare(int _max_size, shared_ptr<ShareTracker> _tracker) : Prefsum(_max_size), tracker(_tracker) {}
     };
 
     class PrefsumVerifiedShare : public PrefsumShare
     {
     protected:
-        PrefsumShare &prefsum_share;
+        boost::optional<PrefsumShare> prefsum_share;
 
     public:
-        PrefsumVerifiedShare(int _max_size, PrefsumShare &_prefsum_share) : PrefsumShare(_max_size), prefsum_share(_prefsum_share)
+        PrefsumVerifiedShare() : PrefsumShare() {}
+
+        PrefsumVerifiedShare(int _max_size, shared_ptr<ShareTracker> _tracker, PrefsumShare &_prefsum_share) : PrefsumShare(_max_size, _tracker), prefsum_share(_prefsum_share)
         {
         }
 
-        uint256 get_nth_parent_hash(int32_t n) override
+        uint256 get_nth_parent_hash(uint256 hash, int32_t n) override
         {
-            return prefsum_share.get_nth_parent_hash(n);
+            return prefsum_share->get_nth_parent_hash(hash, n);
         }
     };
 }
@@ -259,7 +281,8 @@ namespace c2pool::shares::tracker
                 }
             }
 
-            return CumulativeWeights(result_element.weights, result_element.total_weight, result_element.total_donation_weight);
+            //CumulativeWeights
+            return {result_element.weights, result_element.total_weight, result_element.total_donation_weight};
         }
 
     public:
