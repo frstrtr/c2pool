@@ -190,7 +190,7 @@ namespace c2pool::shares::tracker
 
             tuple<int, int> _this;
             all_transaction_stripped_size += this_stripped_size;
-            all_transaction_real_size += this_real_size;
+            //all_transaction_real_size += this_real_size;
             all_transaction_weight += this_weight;
             if (tx_hash_to_this.find(tx_hash) != tx_hash_to_this.end())
             {
@@ -198,7 +198,7 @@ namespace c2pool::shares::tracker
             }
             else
             {
-                new_transaction_size += this_real_size;
+                //new_transaction_size += this_real_size;
                 new_transaction_weight += this_weight;
 
                 new_transaction_hashes.push_back(tx_hash);
@@ -328,14 +328,14 @@ namespace c2pool::shares::tracker
         }
         else
         {
-            far_share_hash = get_nth_parent_hash(share_data.previous_share_hash, 99);
+            far_share_hash = lookbehind_items.get_nth_parent_hash(share_data.previous_share_hash, 99);
         }
 
         int32_t result_timestamp;
 
         if (previous_share != nullptr)
         {
-            if (VERSION < 32)
+            if (ShareType::VERSION < 32)
             {
                 result_timestamp = std::clamp(desired_timestamp, previous_share->timestamp + 1, previous_share->timestamp + net()->SHARE_PERIOD * 2 - 1);
             }
@@ -377,17 +377,17 @@ namespace c2pool::shares::tracker
         {
             if (desired_timestamp > (previous_share->timestamp + 180))
             {
-                LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n
-                            Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n
-                            If your clock is more than 300 seconds behind, it can result in orphaned shares.\n
+                LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n \
+                            Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n \
+                            If your clock is more than 300 seconds behind, it can result in orphaned shares.\n \
                             (It's also possible that this share is just taking a long time to mine.)"
                 ) % (desired_timestamp - previous_share->timestamp)).str();
             }
 
             if (previous_share->timestamp > (c2pool::dev::timestamp() + 3))
             {
-                LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n
-                                              Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares."
+                LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n \
+                                              Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares." 
                                               ) %
                                 (previous_share->timestamp - c2pool::dev::timestamp()))
                                    .str();

@@ -44,8 +44,9 @@ namespace c2pool::shares::share
         if (!previous_hash.IsNull()) //TODO: or pack in share_data
         {
             auto previous_share = tracker->get(previous_hash);
-            if (tracker->get_height(share_data.previous_hash))
+            if (tracker->get_height(previous_hash))
         }
+        //TODO:
     }
 
     void BaseShare::contents_load(UniValue contents)

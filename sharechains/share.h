@@ -70,6 +70,7 @@ namespace c2pool::shares::share
         shared_ptr<c2pool::Network> net;
         addr peer_addr;
         UniValue contents;
+        //TODO: segwit ???
 
     public:
         BaseShare(int VERSION, shared_ptr<Network> _net, addr _peer_addr, UniValue _contents);
@@ -87,7 +88,7 @@ namespace c2pool::shares::share
 
         virtual void contents_load(UniValue contents);
 
-        virtual void check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/);
+        virtual bool check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/);
     };
 
     //17
