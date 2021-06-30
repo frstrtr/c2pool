@@ -5,7 +5,7 @@
 #include <univalue.h>
 #include <util/types.h>
 #include <btclibs/uint256.h>
-#include <sharechain/shareTypes.h>
+#include <sharechains/shareTypes.h>
 #include <networks/network.h>
 
 #include <sstream>
@@ -16,8 +16,7 @@
 #include <tuple>
 
 #include <devcore/logger.h>
-
-using namespace c2pool::util::messages;
+using namespace c2pool::messages;
 
 namespace c2pool::libnet::p2p
 {
@@ -339,12 +338,12 @@ namespace c2pool::libnet::messages
     class message_addrs : public base_message
     {
     public:
-        std::vector<addr> addrs;
+        std::vector<c2pool::messages::addr> addrs;
 
     public:
         message_addrs() : base_message("addrs") {}
 
-        message_addrs(std::vector<addr> _addrs) : base_message("addrs")
+        message_addrs(std::vector<c2pool::messages::addr> _addrs) : base_message("addrs")
         {
             addrs = _addrs;
         }
@@ -353,7 +352,7 @@ namespace c2pool::libnet::messages
         {
             for (auto arr_value : value["addrs"].get_array().getValues())
             {
-                addr _temp_addr;
+                c2pool::messages::addr _temp_addr;
                 _temp_addr = arr_value;
                 addrs.push_back(_temp_addr);
             }

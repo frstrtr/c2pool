@@ -9,6 +9,8 @@
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
 
+#include <util/types.h>
+
 using namespace boost::dll;
 using namespace boost::filesystem;
 
@@ -17,7 +19,6 @@ using std::map;
 using std::string;
 using std::tuple;
 
-typedef tuple<string, string> addr;
 #define EMPTY_ADDR_VALUE {0, 0, 0}
 
 namespace c2pool{
@@ -39,19 +40,19 @@ namespace c2pool::dev
     public:
         AddrStore(string path, shared_ptr<c2pool::Network> net);
         void SaveToFile();
-        bool Check(addr addr);
+        bool Check(c2pool::libnet::addr addr);
 
-        bool Add(addr key, AddrValue value);
-        bool Remove(addr key);
-        AddrValue Get(addr key);
-        std::vector<std::pair<addr, AddrValue>> GetAll();
+        bool Add(c2pool::libnet::addr key, AddrValue value);
+        bool Remove(c2pool::libnet::addr key);
+        AddrValue Get(c2pool::libnet::addr key);
+        std::vector<std::pair<c2pool::libnet::addr, AddrValue>> GetAll();
 
         string ToJSON();
         void FromJSON(string json);
         
         int len() { return store.size(); }
     private:
-        map<addr, AddrValue> store;
+        map<c2pool::libnet::addr, AddrValue> store;
         std::string filePath;
     };
 

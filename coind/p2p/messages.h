@@ -4,9 +4,8 @@
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
-//#include <sharechain/shareTypes.h>
 #include <util/types.h>
-using namespace c2pool::util::messages;
+using namespace c2pool::messages;
 #include <networks/network.h>
 
 #include <sstream>
@@ -340,12 +339,12 @@ namespace coind::p2p::messages
     class message_addr : public base_message
     {
     public:
-        std::vector<addr> addrs;
+        std::vector<c2pool::messages::addr> addrs;
 
     public:
         message_addr() : base_message("addr") {}
 
-        message_addr(std::vector<addr> _addrs) : base_message("addr")
+        message_addr(std::vector<c2pool::messages::addr> _addrs) : base_message("addr")
         {
             addrs = _addrs;
         }
@@ -354,7 +353,7 @@ namespace coind::p2p::messages
         {
             for (auto arr_value : value["addrs"].get_array().getValues())
             {
-                addr _temp_addr;
+                c2pool::messages::addr _temp_addr;
                 _temp_addr = arr_value;
                 addrs.push_back(_temp_addr);
             }
