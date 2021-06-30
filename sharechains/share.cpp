@@ -8,10 +8,11 @@
 #include <stdexcept>
 #include <tuple>
 #include <set>
+using namespace std;
 
 #include <boost/format.hpp>
 
-namespace c2pool::shares::share
+namespace c2pool::shares
 {
     std::string BaseShare::SerializeJSON()
     {
@@ -34,7 +35,7 @@ namespace c2pool::shares::share
         // contents = ShareValue["contents"].get_obj();
     }
 
-    bool BaseShare::check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/)
+    bool BaseShare::check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/)
     {
         if (timestamp > (c2pool::dev::timestamp() + 600))
         {
@@ -44,7 +45,7 @@ namespace c2pool::shares::share
         if (!previous_hash.IsNull()) //TODO: or pack in share_data
         {
             auto previous_share = tracker->get(previous_hash);
-            if (tracker->get_height(previous_hash))
+            //if (tracker->get_height(previous_hash))
         }
         //TODO:
     }
@@ -100,7 +101,7 @@ namespace c2pool::shares::share
         merkle_link = contents["merkle_link"].get_obj();
     }
 
-    BaseShare::BaseShare(int VERSION, shared_ptr<Network> _net, addr _peer_addr, UniValue _contents) : SHARE_VERSION(VERSION), net(_net), peer_addr(_peer_addr), contents(_contents)
+    BaseShare::BaseShare(int VERSION, shared_ptr<Network> _net, tuple<string, string> _peer_addr, UniValue _contents) : SHARE_VERSION(VERSION), net(_net), peer_addr(_peer_addr), contents(_contents)
     {
         contents_load(contents);
 

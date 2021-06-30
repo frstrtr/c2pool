@@ -8,7 +8,7 @@
 #include <tuple>
 #include <vector>
 
-namespace c2pool::shares::share
+namespace c2pool::shares
 {
     enum StaleInfo
     {

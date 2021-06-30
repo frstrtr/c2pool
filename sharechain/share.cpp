@@ -132,7 +132,7 @@ namespace c2pool::shares
     //TODO: write debug logs
     //TODO: return type
     template <int Version>
-    GeneratedTransaction BaseShare::generate_transaction(c2pool::shares::tracker::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
+    GeneratedTransaction BaseShare::generate_transaction(c2pool::shares::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
                                                          uint256 _block_target, unsigned int _desired_timestamp,
                                                          uint256 _desired_target, MerkleLink _ref_merkle_link,
                                                          vector<tuple<uint256, int>> desired_other_transaction_hashes_and_fees,

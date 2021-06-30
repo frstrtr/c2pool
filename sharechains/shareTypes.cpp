@@ -5,7 +5,7 @@
 #include <memory>
 #include <btclibs/uint256.h>
 
-namespace c2pool::shares::share
+namespace c2pool::shares
 {
     bool operator==(const ShareData &first, const ShareData &second)
     {

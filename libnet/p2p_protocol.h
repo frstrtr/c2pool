@@ -285,7 +285,7 @@ namespace c2pool::libnet::p2p
                 if (_type < 17) //TODO: 17 = minimum share version; move to macros
                     continue;
 
-                shared_ptr<BaseShare> share = c2pool::shares::share::load_share(wrappedshare, _net, _socket->get_addr());
+                shared_ptr<BaseShare> share = c2pool::shares::load_share(wrappedshare, _net, _socket->get_addr());
                 std::vector<UniValue> txs;
                 if (_type >= 13)
                 {
@@ -347,7 +347,7 @@ namespace c2pool::libnet::p2p
                 {
                     if (share["type"].get_int() >= 17) //TODO: 17 = minimum share version; move to macros
                     {
-                        shared_ptr<BaseShare> _share = c2pool::shares::share::load_share(share, _net, _socket->get_addr());
+                        shared_ptr<BaseShare> _share = c2pool::shares::load_share(share, _net, _socket->get_addr());
                         res.push_back(_share);
                     }
                 }

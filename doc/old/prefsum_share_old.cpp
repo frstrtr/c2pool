@@ -6,9 +6,9 @@
 
 using namespace std;
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
-    //PrefsumWeightsElement::PrefsumWeightsElement(shared_ptr<c2pool::shares::share::BaseShare> share)
+    //PrefsumWeightsElement::PrefsumWeightsElement(shared_ptr<c2pool::shares::BaseShare> share)
     PrefsumWeightsElement::PrefsumWeightsElement(uint256 hash, uint256 target, char* new_script, uint256 donation)
     {
         // share->hash; share->target; share->donation; share->new_script; share->donation

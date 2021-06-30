@@ -13,7 +13,7 @@ using c2pool::util::events::Event;
 using std::vector, std::tuple, std::set, std::map;
 
 //ProtoAttributeDelta //TODO: rename
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     template <typename item_type>
     ProtoAttributeDelta<item_type> operator+(const ProtoAttributeDelta<item_type> &a, const ProtoAttributeDelta<item_type> &b)
@@ -124,10 +124,10 @@ namespace c2pool::shares::tracker
         //TODO: Assertion Error
     }
 
-} // namespace c2pool::shares::tracker
+} // namespace c2pool::shares
 
 //TrackerView
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
 
     /*template <typename delta_type>
@@ -154,10 +154,10 @@ namespace c2pool::shares::tracker
         // delta_type delta = delta_type(item);
     }
 
-} // namespace c2pool::shares::tracker
+} // namespace c2pool::shares
 
 //Tracker
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
 
     template<template<typename> typename delta_type, typename item_type>
@@ -343,4 +343,4 @@ namespace c2pool::shares::tracker
 
         removed.happened(item);
     }
-} // namespace c2pool::shares::tracker
+} // namespace c2pool::shares

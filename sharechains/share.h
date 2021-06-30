@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/format.hpp>
 #include <coind/data.h>
 #include <btclibs/uint256.h>
 #include <dbshell/dbObject.h>
@@ -13,19 +14,17 @@ using dbshell::DBObject;
 #include <vector>
 #include <map>
 
-using std::shared_ptr, std::string;
+using std::shared_ptr, std::string, std::make_shared;
 using std::vector, std::tuple, std::map;
 
 #include "shareTypes.h"
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     class ShareTracker;
 }
 
-#include "prefsum_share.h"
-
-namespace c2pool::shares::share
+namespace c2pool::shares
 {
     class BaseShare : public DBObject
     {
@@ -68,27 +67,27 @@ namespace c2pool::shares::share
         int32_t time_seen;
 
         shared_ptr<c2pool::Network> net;
-        addr peer_addr;
+        tuple<string, string> peer_addr;
         UniValue contents;
         //TODO: segwit ???
 
     public:
-        BaseShare(int VERSION, shared_ptr<Network> _net, addr _peer_addr, UniValue _contents);
+        BaseShare(int VERSION, shared_ptr<Network> _net, tuple<string, string> _peer_addr, UniValue _contents);
 
         virtual string SerializeJSON() override;
         virtual void DeserializeJSON(std::string json) override;
 
-        operator c2pool::shares::tracker::PrefsumShareElement() const
-        {
-            c2pool::shares::tracker::PrefsumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
-            return prefsum_share;
-        }
+        // operator c2pool::shares::PrefsumShareElement() const
+        // {
+        //     c2pool::shares::PrefsumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
+        //     return prefsum_share;
+        // }
 
         bool is_segwit_activated() const { return SHARE_VERSION >= net->SEGWIT_ACTIVATION_VERSION; }
 
         virtual void contents_load(UniValue contents);
 
-        virtual bool check(shared_ptr<c2pool::shares::tracker::ShareTracker> tracker /*, TODO: other_txs = None???*/);
+        virtual bool check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/);
     };
 
     //17
@@ -153,4 +152,4 @@ namespace c2pool::shares::share
     }
 
 #undef MAKE_SHARE
-} // namespace c2pool::shares::share
+} // namespace c2pool::shares

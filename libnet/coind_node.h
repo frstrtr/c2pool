@@ -9,7 +9,7 @@ using c2pool::libnet;
 using namespace coind::jsonrpc;
 
 #include <sharechains/tracker.h>
-using namespace c2pool::shares::tracker;
+using namespace c2pool::shares;
 
 #include <util/events.h>
 using namespace c2pool::util::events;
