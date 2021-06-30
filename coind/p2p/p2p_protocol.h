@@ -187,7 +187,7 @@ namespace coind::p2p
                 case inventory_type::tx:
                 {
                     LOG_TRACE << "HANDLED TX";
-                    std::vector<c2pool::util::messages::inventory> inv_vec = {inv};
+                    std::vector<c2pool::messages::inventory> inv_vec = {inv};
                     auto msg_getdata = make_message<message_getdata>(inv_vec);
                     _socket->write(msg_getdata);
                 }

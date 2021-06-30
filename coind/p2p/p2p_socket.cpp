@@ -53,8 +53,8 @@ namespace coind::p2p
 
     void P2PSocket::connectionMade(boost::asio::ip::tcp::endpoint ep)
     {
-        c2pool::util::messages::address_type addr_to(1, ep.address().to_string(), ep.port());
-        c2pool::util::messages::address_type addr_from(1, _socket.local_endpoint().address().to_string(), _socket.local_endpoint().port());
+        c2pool::messages::address_type addr_to(1, ep.address().to_string(), ep.port());
+        c2pool::messages::address_type addr_from(1, _socket.local_endpoint().address().to_string(), _socket.local_endpoint().port());
         auto version_msg = _protocol.lock()->make_message<message_version>(
             70017,
             1,

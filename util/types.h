@@ -2,15 +2,16 @@
 
 #include <string>
 #include <sstream>
+#include <tuple>
+#include <string>
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <devcore/common.h>
 #include <devcore/logger.h>
 
 //todo: move all methods to types.cpp
-namespace c2pool::util::messages
+namespace c2pool::messages
 {
-
     class address_type
     {
     public:
@@ -167,3 +168,7 @@ namespace c2pool::util::messages
         }
     };
 } // namespace c2pool::messages
+
+namespace c2pool::libnet{
+    typedef std::tuple<std::string, std::string> addr;
+}

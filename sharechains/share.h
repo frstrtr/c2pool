@@ -6,6 +6,7 @@
 #include <dbshell/dbObject.h>
 #include <networks/network.h>
 #include <devcore/addrStore.h>
+#include <util/types.h>
 using dbshell::DBObject;
 
 #include <string>
@@ -67,12 +68,12 @@ namespace c2pool::shares
         int32_t time_seen;
 
         shared_ptr<c2pool::Network> net;
-        tuple<string, string> peer_addr;
+        c2pool::libnet::addr peer_addr;
         UniValue contents;
         //TODO: segwit ???
 
     public:
-        BaseShare(int VERSION, shared_ptr<Network> _net, tuple<string, string> _peer_addr, UniValue _contents);
+        BaseShare(int VERSION, shared_ptr<Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents);
 
         virtual string SerializeJSON() override;
         virtual void DeserializeJSON(std::string json) override;
@@ -94,7 +95,7 @@ namespace c2pool::shares
     class Share : public BaseShare
     {
     public:
-        Share(shared_ptr<Network> _net, addr _peer_addr, UniValue _contents) : BaseShare(17, _net, _peer_addr, _contents) {}
+        Share(shared_ptr<Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents) : BaseShare(17, _net, _peer_addr, _contents) {}
 
         virtual void contents_load(UniValue contents) override;
     };
@@ -106,7 +107,7 @@ namespace c2pool::shares
         SegwitData segwit_data;
 
     public:
-        PreSegwitShare(shared_ptr<Network> _net, addr _peer_addr, UniValue _contents) : BaseShare(32, _net, _peer_addr, _contents)
+        PreSegwitShare(shared_ptr<Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents) : BaseShare(32, _net, _peer_addr, _contents)
         {
             if (merkle_link.branch.size() > 16 || (is_segwit_activated() && segwit_data.txid_merkle_link.branch.size() > 16))
             {
@@ -121,7 +122,7 @@ namespace c2pool::shares
     share_result = make_shared<CLASS>(net, peer_addr, share["contents"].get_obj()); \
     break;
 
-    shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, addr peer_addr)
+    shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, c2pool::libnet::addr peer_addr)
     {
         shared_ptr<BaseShare> share_result;
         int type_version = 0;

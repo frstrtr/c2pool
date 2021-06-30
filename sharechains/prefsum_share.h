@@ -94,6 +94,7 @@ namespace c2pool::shares
         uint256 tail;
         int32_t height;
         arith_uint256 work;
+        arith_uint256 min_work;
 
         element_delta_type(bool none = true)
         {
@@ -106,6 +107,7 @@ namespace c2pool::shares
             tail = el.prev_hash();
             height = el.height;
             work = el.work;
+            min_work = el.min_work;
         }
 
         element_delta_type operator-(const element_delta_type &el) const
@@ -114,6 +116,7 @@ namespace c2pool::shares
             res.tail = el.head;
             res.height -= el.height;
             res.work -= el.work;
+            res.min_work -= el.min_work;
             return res;
         }
 
@@ -122,6 +125,7 @@ namespace c2pool::shares
             tail = el.head;
             height -= el.height;
             work -= el.work;
+            min_work -= el.min_work;
         }
 
         bool is_none()
