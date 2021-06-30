@@ -14,7 +14,7 @@
 #include <memory>
 using namespace std;
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     struct PrefsumShareElement
     {
@@ -118,7 +118,7 @@ namespace c2pool::shares::tracker
 }
 
 //========================Weights========================
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     struct PrefsumWeightsElement
     {

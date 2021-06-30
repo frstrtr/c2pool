@@ -1,12 +1,13 @@
 #include "tracker.h"
 #include "share.h"
-using namespace c2pool::shares::share;
+using namespace c2pool::shares;
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <devcore/logger.h>
 #include <devcore/common.h>
 #include <coind/data.h>
+#include <util/pystruct.h>
 
 #include <map>
 #include <queue>
@@ -22,7 +23,7 @@ using std::shared_ptr;
 
 #include <boost/format.hpp>
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     void LookbehindDelta::push(shared_ptr<BaseShare> share)
     {
@@ -41,7 +42,7 @@ namespace c2pool::shares::tracker
     }
 }
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     ShareTracker::ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng) : c2pool::libnet::INodeMember(mng) {}
 
@@ -49,7 +50,7 @@ namespace c2pool::shares::tracker
     {
         try
         {
-            auto share = items.at(hash);
+            auto share = shares.items.at(hash);
             return share;
         }
         catch (const std::out_of_range &e)
@@ -66,16 +67,14 @@ namespace c2pool::shares::tracker
             return;
         }
 
-        if (items.find(share->hash) != items.end())
+        if (!shares.exists(share->hash))
         {
-            items[share->hash] = share;
+            shares.add(share);
         }
         else
         {
             LOG_WARNING << share->hash.ToString() << " item already present"; //TODO: for what???
         }
-
-        lookbehind_items.add(*share);
     }
 
     bool ShareTracker::attempt_verify(shared_ptr<BaseShare> share)
@@ -95,7 +94,7 @@ namespace c2pool::shares::tracker
             return false;
         }
 
-        verified.add(*share);
+        verified.add(share);
         return true;
     }
 
@@ -105,7 +104,7 @@ namespace c2pool::shares::tracker
 
     //TODO: template method, where T1 = type(share)???
     template <typename ShareType>
-    GeneratedShare ShareTracker::generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp, uint256 desired_target, MerkleLink ref_merkle_link, vector<tuple<uint256, boost::optional<int32_t>>> desired_other_transaction_hashes_and_fees, map<uint256, UniValue> known_txs = map<uint256, UniValue>(), unsigned long long last_txout_nonce = 0, long long base_subsidy = 0, UniValue other_data = UniValue())
+    GeneratedShare ShareTracker::generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp, uint256 desired_target, MerkleLink ref_merkle_link, vector<tuple<uint256, boost::optional<int32_t>>> desired_other_transaction_hashes_and_fees, map<uint256, UniValue> known_txs, unsigned long long last_txout_nonce, long long base_subsidy, UniValue other_data)
     {
         //t0
         shared_ptr<BaseShare> previous_share;
@@ -115,23 +114,23 @@ namespace c2pool::shares::tracker
         }
         else
         {
-            previous_share = items[share_data.previous_share_hash]
+            previous_share = shares.items[share_data.previous_share_hash]
         }
 
         //height, last
-        auto get_height_and_last = get_height_and_last(share_data.previous_share_hash);
+        auto get_height_and_last = shares.get_height_and_last(share_data.previous_share_hash);
         auto height = std::get<0>(get_height_and_last);
         auto last = std::get<1>(get_height_and_last);
-        assert(height >= net->REAL_CHAIN_LENGTH) || (last == nullptr);
+        assert(height >= net()->REAL_CHAIN_LENGTH) || (last.IsNull());
 
         arith_uint256 pre_target3;
-        if (height < net->TARGET_LOOKBEHIND)
+        if (height < net()->TARGET_LOOKBEHIND)
         {
-            pre_target3 = net->MAX_TARGET;
+            pre_target3 = net()->MAX_TARGET;
         }
         else
         {
-            auto attempts_per_second = get_pool_attempts_per_second(share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true, true);
+            auto attempts_per_second = get_pool_attempts_per_second(share_data.previous_share_hash, net()->TARGET_LOOKBEHIND, true, true);
             //TODO:
             // pre_target = 2**256//(net.SHARE_PERIOD*attempts_per_second) - 1 if attempts_per_second else 2**256-1
             // pre_target2 = math.clip(pre_target, (previous_share.max_target*9//10, previous_share.max_target*11//10))
@@ -150,19 +149,24 @@ namespace c2pool::shares::tracker
 
         //t1
 
-        auto past_shares = get_chain(share_data['previous_share_hash'], std::min(height, 100));
+        auto past_shares_generator = shares.get_chain(previous_share->hash, std::min(height, 100));
         map<uint256, tuple<int, int>> tx_hash_to_this;
 
-        for (int i = 0; i < past_shares.size(); i++)
         {
-            auto _share = past_shares[i];
-            for (int j = 0; j < _share.new_transaction_hashes.size(); j++)
+            uint256 _hash;
+            int32_t i = 0;
+            while (past_shares_generator(_hash))
             {
-                auto tx_hash = _share.new_transaction_hashes[j];
-                if (tx_hash_to_this.find(tx_hash) == tx_hash_to_this.end())
+                auto _share = shares.items[_hash];
+                for (int j = 0; j < _share->new_transaction_hashes.size(); j++)
                 {
-                    tx_hash_to_this[tx_hash] = std::make_tuple(1 + i, j);
+                    auto tx_hash = _share->new_transaction_hashes[j];
+                    if (tx_hash_to_this.find(tx_hash) == tx_hash_to_this.end())
+                    {
+                        tx_hash_to_this[tx_hash] = std::make_tuple(1 + i, j);
+                    }
                 }
+                i += 1;
             }
         }
 
@@ -322,13 +326,13 @@ namespace c2pool::shares::tracker
         */
 
         uint256 far_share_hash;
-        if (last == nullptr && height < 99)
+        if (last.IsNull() && height < 99)
         {
             far_share_hash.SetNull();
         }
         else
         {
-            far_share_hash = lookbehind_items.get_nth_parent_hash(share_data.previous_share_hash, 99);
+            far_share_hash = shares.get_nth_parent_hash(share_data.previous_share_hash, 99);
         }
 
         int32_t result_timestamp;
@@ -341,7 +345,7 @@ namespace c2pool::shares::tracker
             }
             else
             {
-                result_timestamp = std::max(desired_timestamp, previous_share->timestamp + 1)
+                result_timestamp = std::max(desired_timestamp, previous_share->timestamp + 1);
             }
         }
         else
@@ -380,15 +384,15 @@ namespace c2pool::shares::tracker
                 LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n \
                             Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n \
                             If your clock is more than 300 seconds behind, it can result in orphaned shares.\n \
-                            (It's also possible that this share is just taking a long time to mine.)"
-                ) % (desired_timestamp - previous_share->timestamp)).str();
+                            (It's also possible that this share is just taking a long time to mine.)") %
+                                (desired_timestamp - previous_share->timestamp))
+                                   .str();
             }
 
             if (previous_share->timestamp > (c2pool::dev::timestamp() + 3))
             {
                 LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n \
-                                              Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares." 
-                                              ) %
+                                              Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
                                 (previous_share->timestamp - c2pool::dev::timestamp()))
                                    .str();
             }

@@ -4,7 +4,7 @@
 #include <sharechains/tracker.h>
 #include <boost/asio.hpp>
 using boost::asio::ip::tcp;
-using namespace c2pool::shares::tracker;
+using namespace c2pool::shares;
 
 namespace c2pool::libnet{
 

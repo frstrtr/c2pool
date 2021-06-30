@@ -5,10 +5,10 @@
 #include <memory>
 using std::shared_ptr;
 
-namespace c2pool::shares::share{
+namespace c2pool::shares{
     class BaseShare;
 }
-using c2pool::shares::share::BaseShare;
+using c2pool::shares::BaseShare;
 
 using dbshell::Database;
 

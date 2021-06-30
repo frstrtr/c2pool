@@ -1,6 +1,6 @@
 #include "shareStore.h"
 #include "share.h"
-using c2pool::shares::share::BaseShare;
+using c2pool::shares::BaseShare;
 
 #include <dbshell/db.h>
 

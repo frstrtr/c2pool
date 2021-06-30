@@ -281,6 +281,8 @@ public:
 
     friend uint256 ArithToUint256(const arith_uint256 &);
     friend arith_uint256 UintToArith256(const uint256 &);
+    
+    arith_uint256 operator=(const uint256& v);
 };
 
 uint256 ArithToUint256(const arith_uint256 &);

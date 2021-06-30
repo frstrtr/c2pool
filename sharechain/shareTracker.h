@@ -21,7 +21,7 @@ namespace c2pool::shares
     class BaseShare;
 }
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     //TODO: Rename по-человечески.
     template <typename item_type>
@@ -160,9 +160,9 @@ namespace c2pool::shares::tracker
         // SubsetProtoAttributeDelta& operator+(const SubsetProtoAttributeDelta& b);
         // SubsetProtoAttributeDelta& operator-(const SubsetProtoAttributeDelta& b);
     };
-} // namespace c2pool::shares::tracker
+} // namespace c2pool::shares
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     template <template <typename> typename delta_type, typename item_type>
     class Tracker
@@ -426,4 +426,4 @@ namespace c2pool::shares::tracker
 
         //TODO: def score(self, share_hash, block_rel_height_func)
     };
-} // namespace c2pool::shares::tracker
+} // namespace c2pool::shares

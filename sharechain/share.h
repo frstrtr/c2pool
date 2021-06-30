@@ -14,7 +14,7 @@ namespace c2pool::config
     class Network;
 }
 
-namespace c2pool::shares::tracker
+namespace c2pool::shares
 {
     class OkayTracker;
 }
@@ -118,7 +118,7 @@ namespace c2pool::shares
     public:
         //TODO: return type
         template <int Version>
-        static GeneratedTransaction generate_transaction(c2pool::shares::tracker::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
+        static GeneratedTransaction generate_transaction(c2pool::shares::OkayTracker _tracker, shared_ptr<ShareData> _share_data,
                                                          uint256 _block_target, unsigned int _desired_timestamp,
                                                          uint256 _desired_target, MerkleLink _ref_merkle_link,
                                                          vector<tuple<uint256, int>> desired_other_transaction_hashes_and_fees,
