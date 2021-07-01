@@ -2,6 +2,7 @@
 #include "nodeManager.h"
 #include "p2p_socket.h"
 #include "p2p_protocol.h"
+#include "node_member.h"
 
 #include <devcore/logger.h>
 #include <devcore/addrStore.h>
@@ -23,7 +24,7 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), INodeMember(_mngr)
+    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), c2pool::libnet::INodeMember(_mngr)
     {
         node_id = c2pool::random::RandomNonce();
         

@@ -1,11 +1,12 @@
 #include "coind_node.h"
+#include "node_member.h"
 #include <coind/p2p/p2p_socket.h>
 #include <coind/p2p/p2p_protocol.h>
 
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context),INodeManager(node_manager)
+    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context),c2pool::libnet::INodeMember(node_manager)
     {
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<UniValue>>();
@@ -16,11 +17,11 @@ namespace c2pool::libnet
     {
         LOG_INFO << "... CoindNode starting..."; //TODO: log coind name
         _thread.reset(new std::thread([&]() {
-            _resolver.async_resolve(coind()->P2P_ADDRESS, std::to_string(coind()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
+            _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                 ip::tcp::socket socket(_context);
-                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), coind());
+                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), this);
 
-                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, coind());
+                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, this);
                 protocol->init(new_block, new_tx, new_headers);
                 _socket->init(endpoints, protocol);
             });

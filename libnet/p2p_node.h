@@ -1,6 +1,7 @@
 #pragma once
 
 #include "p2p_protocol.h"
+#include "node_member.h"
 
 namespace c2pool::libnet::p2p
 {
