@@ -86,49 +86,4 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::CoindNode> coind_node; //TODO: init
         shared_ptr<c2pool::shares::ShareTracker> _tracker;
     };
-
-    class INodeMember
-    {
-    public:
-        const shared_ptr<c2pool::libnet::NodeManager> manager;
-        INodeMember(shared_ptr<c2pool::libnet::NodeManager> mng) : manager(mng)
-        {
-        }
-
-    public:
-        shared_ptr<c2pool::Network> net() const
-        {
-            return manager->net();
-        }
-
-        shared_ptr<coind::ParentNetwork> netParent() const
-        {
-            return manager->netParent();
-        }
-
-        shared_ptr<c2pool::dev::coind_config> config() const
-        {
-            return manager->config();
-        }
-
-        shared_ptr<c2pool::dev::AddrStore> addr_store() const
-        {
-            return manager->addr_store();
-        }
-
-        shared_ptr<coind::jsonrpc::Coind> coind() const
-        {
-            return manager->coind();
-        }
-
-        shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const
-        {
-            return manager->p2pNode();
-        }
-
-        shared_ptr<c2pool::shares::ShareTracker> tracker() const
-        {
-            return manager->tracker();
-        }
-    };
 } // namespace c2pool::libnet

@@ -2,6 +2,7 @@
 
 #include "messages.h"
 #include "converter.h"
+#include <libnet/node_member.h>
 #include <devcore/logger.h>
 #include <util/events.h>
 #include "p2p_socket.h"

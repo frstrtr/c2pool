@@ -3,7 +3,7 @@
 #include <networks/network.h>
 #include <devcore/logger.h>
 #include "nodeManager.h"
-using c2pool::libnet;
+#include "node_member.h"
 
 #include <coind/jsonrpc/coind.h>
 using namespace coind::jsonrpc;
@@ -30,7 +30,7 @@ namespace coind::p2p
 
 namespace c2pool::libnet
 {
-    class CoindNode:INodeMember
+    class CoindNode: public c2pool::libnet::INodeMember
     {
     public:
         CoindNode(shared_ptr<NodeManager> node_manager);
@@ -47,8 +47,8 @@ namespace c2pool::libnet
         std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
         std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
 
-        std::shared_ptr<Variable</*TODO*/>> best_share_var;
-        std::shared_ptr<Variable</*TODO*/>> best_block_header;
+        //TODO: std::shared_ptr<Variable</*TODO*/>> best_share_var;
+        //TODO: std::shared_ptr<Variable</*TODO*/>> best_block_header;
 
         std::shared_ptr<Variable<coind::jsonrpc::data::getwork_result>> coind_work;
     private:

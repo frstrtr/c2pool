@@ -24,11 +24,6 @@ using namespace coind::p2p::messages;
 namespace coind::p2p
 {
     //P2PSocket
-
-    P2PSocket::P2PSocket(ip::tcp::socket socket, shared_ptr<coind::ParentNetwork> _network) : _socket(std::move(socket)), _net(_network)
-    {
-    }
-
     void P2PSocket::init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto)
     {
         _protocol = proto;
@@ -149,7 +144,7 @@ namespace coind::p2p
                                     if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
                                     {
                                         LOG_TRACE << "compare prefix";
-                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
+                                        coind::p2p::python::other::debug_log(tempRawMessage->converter->prefix, netParent()->PREFIX_LENGTH);
                                         LOG_TRACE << "after debug_log";
                                         // LOG_INFO << "MSG: " << tempMessage->command;
                                         read_command(tempRawMessage);

@@ -10,6 +10,7 @@
 #include <libnet/nodeManager.h>
 #include "prefsum_share.h"
 #include <util/pystruct.h>
+#include <libnet/node_member.h>
 
 #include <map>
 #include <vector>

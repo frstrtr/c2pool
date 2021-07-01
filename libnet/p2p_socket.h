@@ -1,6 +1,7 @@
 #pragma once
 
 #include "messages.h"
+#include "node_member.h"
 using namespace c2pool::libnet::messages;
 namespace c2pool
 {
@@ -26,7 +27,7 @@ namespace c2pool::libnet::p2p
 {
     typedef boost::function<bool(std::shared_ptr<c2pool::libnet::p2p::Protocol>)> protocol_handle;
 
-    class P2PSocket : public std::enable_shared_from_this<P2PSocket>
+    class P2PSocket : public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PSocket>
     {
     public:
         //for receive

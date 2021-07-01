@@ -179,7 +179,7 @@ namespace c2pool::libnet::p2p
             {
                 LOG_DEBUG << "more than one version message"; 
             }
-            if (msg->version < net()->MINIMUM_PROTOCOL_VERSION){
+            if (msg->version < _net->MINIMUM_PROTOCOL_VERSION){
                 LOG_DEBUG << "peer too old";
             }
 
