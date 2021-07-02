@@ -31,7 +31,7 @@ namespace c2pool::libnet::p2p
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network, shared_ptr<P2PNode> _node);
+        P2PSocket(ip::tcp::socket socket, const c2pool::libnet::INodeMember &member);
 
         //for connect
         void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
@@ -56,10 +56,6 @@ namespace c2pool::libnet::p2p
             return std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
         }
 
-        std::shared_ptr<P2PNode> get_node(){
-            return _node;
-        }
-
         void write(std::shared_ptr<base_message> msg);
 
     private:
@@ -74,8 +70,6 @@ namespace c2pool::libnet::p2p
         void write_message_data(std::shared_ptr<base_message> msg);
 
     private:
-        std::shared_ptr<c2pool::Network> _net;
-        std::shared_ptr<P2PNode> _node;
         ip::tcp::socket _socket;
 
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;

@@ -6,7 +6,7 @@
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context),c2pool::libnet::INodeMember(node_manager)
+    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context), c2pool::libnet::INodeMember(node_manager)
     {
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<UniValue>>();

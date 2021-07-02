@@ -4,6 +4,10 @@
 #include "converter.h"
 #include <devcore/logger.h>
 #include "p2p_socket.h"
+#include "node_member.h"
+#include <sharechains/share.h>
+#include <util/types.h>
+#include "p2p_node.h"
 using namespace c2pool::libnet::messages;
 
 #include <univalue.h>
@@ -16,12 +20,11 @@ using std::vector;
 namespace c2pool::libnet::p2p
 {
     class P2PSocket;
-    class P2PNode;
 }
 
 namespace c2pool::libnet::p2p
 {
-    class Protocol
+    class Protocol : public INodeMember
     {
     public:
         const int version;
@@ -31,15 +34,11 @@ namespace c2pool::libnet::p2p
         int other_services; //TODO: int64? IntType(64)
         unsigned long long _nonce;
 
-    public:
-        shared_ptr<P2PNode> node();
-
     protected:
         shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
-        std::shared_ptr<c2pool::Network> _net;
 
     protected:
-        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, std::shared_ptr<c2pool::Network> _network);
+        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, const c2pool::libnet::INodeMember &member);
 
     public:
         virtual void handle(shared_ptr<raw_message> RawMSG) {}
@@ -61,7 +60,7 @@ namespace c2pool::libnet::p2p
         }
 
     public:
-        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle handle_obj, std::shared_ptr<c2pool::Network> _network) : Protocol(socket, _network), _handle(std::move(handle_obj))
+        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle handle_obj, const c2pool::libnet::INodeMember& member) : Protocol(socket, member), _handle(std::move(handle_obj))
         {
         }
 
@@ -71,7 +70,7 @@ namespace c2pool::libnet::p2p
         {
             auto raw_msg = make_shared<raw_message>();
             raw_msg->set_converter_type<p2pool_converter>();
-            raw_msg->set_prefix(_net);
+            raw_msg->set_prefix(net());
             return raw_msg;
         }
     };
@@ -81,7 +80,7 @@ namespace c2pool::libnet::p2p
     {
     public:
         //TODO: constructor (shared_ptr<initialize_network_protocol>)
-        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, shared_ptr<c2pool::Network> _network) : Protocol(socket, _network)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, const c2pool::libnet::INodeMember& member) : Protocol(socket, member)
         {
             LOG_TRACE << "P2P_Protcol: "
                       << "start constructor";
@@ -145,7 +144,7 @@ namespace c2pool::libnet::p2p
         {
             auto raw_msg = make_shared<raw_message>();
             raw_msg->set_converter_type<converter_type>();
-            raw_msg->set_prefix(_net);
+            raw_msg->set_prefix(net());
             return raw_msg;
         }
 
@@ -154,7 +153,7 @@ namespace c2pool::libnet::p2p
         {
             auto msg = std::make_shared<message_type>(args...);
             msg->template set_converter_type<converter_type>();
-            msg->set_prefix(_net);
+            msg->set_prefix(net());
             return msg;
         }
 
@@ -179,7 +178,7 @@ namespace c2pool::libnet::p2p
             {
                 LOG_DEBUG << "more than one version message"; 
             }
-            if (msg->version < _net->MINIMUM_PROTOCOL_VERSION){
+            if (msg->version < net()->MINIMUM_PROTOCOL_VERSION){
                 LOG_DEBUG << "peer too old";
             }
 
@@ -187,7 +186,7 @@ namespace c2pool::libnet::p2p
             other_sub_version = msg->sub_version;
             other_services = msg->services;
 
-            if (msg->nonce == node()->node_id){
+            if (msg->nonce == p2pNode()->get_nonce()){
                 LOG_DEBUG << "was connected to self";
             }
 
@@ -244,8 +243,8 @@ namespace c2pool::libnet::p2p
             int ver = version;
             std::string test_sub_ver = "16";
             unsigned long long test_nonce = 6535423;
-            c2pool::util::messages::address_type addrs1(3, "4.5.6.7", 8);
-            c2pool::util::messages::address_type addrs2(9, "10.11.12.13", 14);
+            c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
+            c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
             uint256 best_hash_test_answer;
             best_hash_test_answer.SetHex("0123");
             shared_ptr<message_version> answer_msg = make_message<message_version>(ver, 0, addrs1, addrs2, test_nonce, test_sub_ver, 18, best_hash_test_answer);
@@ -278,14 +277,14 @@ namespace c2pool::libnet::p2p
         void handle(shared_ptr<message_shares> msg)
         {
             //t0
-            vector<tuple<shared_ptr<BaseShare>, vector<UniValue>>> result; //share, txs
+            vector<tuple<shared_ptr<c2pool::shares::BaseShare>, vector<UniValue>>> result; //share, txs
             for (auto wrappedshare : msg->raw_shares)
             {
                 int _type = wrappedshare["type"].get_int();
                 if (_type < 17) //TODO: 17 = minimum share version; move to macros
                     continue;
 
-                shared_ptr<BaseShare> share = c2pool::shares::load_share(wrappedshare, _net, _socket->get_addr());
+                shared_ptr<c2pool::shares::BaseShare> share = c2pool::shares::load_share(wrappedshare, net(), _socket->get_addr());
                 std::vector<UniValue> txs;
                 if (_type >= 13)
                 {
@@ -312,14 +311,14 @@ namespace c2pool::libnet::p2p
                 }
                 result.push_back(std::make_tuple(share, txs));
             }
-            node()->handle_shares(result, shared_from_this());
+            p2pNode()->handle_shares(result, shared_from_this()); //TODO: create handle_shares in p2p_node
 
             /*t1
             if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares))) */
         }
         void handle(shared_ptr<message_sharereq> msg)
         {
-            auto _shares = node()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());
+            auto _shares = p2pNode()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());//TODO: handle_get_shares
             vector<UniValue> packed_shares;
             //msg data: //uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares
             try
@@ -340,14 +339,14 @@ namespace c2pool::libnet::p2p
         }
         void handle(shared_ptr<message_sharereply> msg)
         {
-            std::vector<shared_ptr<BaseShare>> res;
+            std::vector<shared_ptr<c2pool::shares::BaseShare>> res;
             if (msg->result == 0)
             {
                 for (auto share : msg->shares)
                 {
                     if (share["type"].get_int() >= 17) //TODO: 17 = minimum share version; move to macros
                     {
-                        shared_ptr<BaseShare> _share = c2pool::shares::load_share(share, _net, _socket->get_addr());
+                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(share, net(), _socket->get_addr());
                         res.push_back(_share);
                     }
                 }

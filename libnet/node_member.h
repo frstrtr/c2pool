@@ -40,7 +40,7 @@ namespace c2pool::libnet
         const shared_ptr<c2pool::libnet::NodeManager> manager;
 
         INodeMember(shared_ptr<c2pool::libnet::NodeManager> mng);
-        INodeMember(INodeMember &member);
+        INodeMember(const INodeMember &member);
 
     public:
         shared_ptr<c2pool::Network> net() const;
