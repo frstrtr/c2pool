@@ -1,6 +1,5 @@
 #pragma once
 
-#include "p2p_protocol.h"
 #include "node_member.h"
 
 namespace c2pool::libnet::p2p
@@ -27,6 +26,10 @@ namespace c2pool
     {
         class NodeManager;
         class INodeMember;
+        namespace p2p
+        {
+            class P2PSocket;
+        }
     }
 
     namespace dev
@@ -47,16 +50,17 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    class P2PNode:public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PNode>
+    class P2PNode : public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PNode>
     {
     public:
         P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
+        unsigned long long get_nonce();
 
     private:
-        bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo
+        bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);        //todo
         bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo
 
         void listen();

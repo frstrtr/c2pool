@@ -24,7 +24,7 @@ namespace c2pool::libnet::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket, shared_ptr<c2pool::Network> _network, shared_ptr<P2PNode> node) : _socket(std::move(socket)), _net(_network), _node(node)
+    P2PSocket::P2PSocket(ip::tcp::socket socket, const c2pool::libnet::INodeMember &member) : _socket(std::move(socket)), c2pool::libnet::INodeMember(member)
     {
     }
 
@@ -55,7 +55,7 @@ namespace c2pool::libnet::p2p
 
         //if p2pool:
         //create P2P_Protocol<c2pool::libnet::messages::p2pool_converter>
-        initialize_protocol = std::make_shared<initialize_network_protocol>(shared_from_this(), handle, _net);
+        initialize_protocol = std::make_shared<initialize_network_protocol>(shared_from_this(), handle, this);
 
         //if c2pool:
         //create P2P_Protocol<c2pool::libnet::messages::c2pool_converter>
@@ -71,7 +71,7 @@ namespace c2pool::libnet::p2p
     void P2PSocket::set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version)
     {
         LOG_TRACE << "Set new protocol type!";
-        std::shared_ptr<c2pool::libnet::p2p::Protocol> temp_protocol = std::make_shared<protocol_type>(shared_from_this(), _net);
+        std::shared_ptr<c2pool::libnet::p2p::Protocol> temp_protocol = std::make_shared<protocol_type>(shared_from_this(), this);
         LOG_TRACE << "Called handle";
         LOG_TRACE << handle;
         if (handle.empty())

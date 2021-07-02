@@ -39,7 +39,6 @@ add_subdirectory(btclibs)
 add_subdirectory(coind)
 add_subdirectory(dbshell)
 add_subdirectory(networks)
-# add_subdirectory(p2p)
 add_subdirectory(sharechains) #ver. 2
 add_subdirectory(util)
 add_subdirectory(devcore)

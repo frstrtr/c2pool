@@ -10,7 +10,7 @@ namespace c2pool::libnet
     {
     }
 
-    INodeMember::INodeMember(INodeMember &member) : manager(member.manager())
+    INodeMember::INodeMember(const INodeMember &member) : manager(member.manager)
     {
     }
 

@@ -49,7 +49,7 @@ namespace c2pool::libnet::p2p
             if (!ec)
             {
                 //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
-                auto _socket = std::make_shared<P2PSocket>(std::move(socket), _manager->net(), shared_from_this());
+                auto _socket = std::make_shared<P2PSocket>(std::move(socket), net(), shared_from_this());
 
                 server_attempts.insert(_socket);
 
@@ -141,6 +141,10 @@ namespace c2pool::libnet::p2p
             result.push_back(v.second);
         }
         return result;
+    }
+
+    unsigned long long P2PNode::get_nonce(){
+        return node_id;
     }
 
     bool P2PNode::protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
