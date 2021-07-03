@@ -25,25 +25,6 @@ using std::shared_ptr;
 
 namespace c2pool::shares
 {
-    void LookbehindDelta::push(shared_ptr<BaseShare> share)
-    {
-        if (_queue.size() == LOOKBEHIND)
-        {
-            shared_ptr<BaseShare> temp = _queue.front();
-
-            work = work - coind::data::target_to_average_attempts(temp->target);
-            min_work = min_work - coind::data::target_to_average_attempts(temp->max_target);
-            _queue.pop();
-        }
-
-        _queue.push(share);
-        work = work + coind::data::target_to_average_attempts(share->target);
-        min_work = min_work + coind::data::target_to_average_attempts(share->max_target);
-    }
-}
-
-namespace c2pool::shares
-{
     ShareTracker::ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng) : c2pool::libnet::INodeMember(mng), verified(shares)
     {
     }
