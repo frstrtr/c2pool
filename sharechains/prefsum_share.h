@@ -302,6 +302,16 @@ namespace c2pool::shares
             return delta;
         }
 
+        uint256 get_work(uint256 hash)
+        {
+            return ArithToUint256(get_delta_to_last(hash).work);
+        }
+
+        int32_t get_height(uint256 hash)
+        {
+            return get_delta_to_last(hash).height;
+        }
+
         //todo: get_best
         uint256 get_test_best()
         {

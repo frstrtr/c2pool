@@ -49,7 +49,7 @@ namespace c2pool::libnet
         //TODO: check for coind p2p connection, if true:
         uint256 block_header = protocol->get_block_header(coind_work->value.previous_block); //new_header
         auto _block_header_type = block_header;                                              //TODO: bitcoin_data.block_header_type.pack(new_header)
-        if (_net->POW_FUNC(_block_header_type) <= coind_work->value.bits) //bits.target?
+        if (netParent()->POW_FUNC(_block_header_type) <= coind_work->value.bits) //bits.target?
         {
             return;
         }

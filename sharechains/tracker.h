@@ -39,7 +39,7 @@ namespace c2pool::shares
     struct GeneratedShare
     {
         ShareInfo share_info; //TODO: sharechain[v1]::ShareTypes.h::ShareInfoType
-        UniValue gentx;          //TODO: just tx
+        UniValue gentx;       //TODO: just tx
         vector<uint256> other_transaction_hashes;
         get_share_method get_share;
     };
@@ -50,23 +50,6 @@ namespace c2pool::shares
         std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
         std::vector<uint256> decorated_heads; //TODO: TYPE???
         std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
-    };
-
-    class LookbehindDelta
-    {
-    private:
-        queue<shared_ptr<BaseShare>> _queue;
-
-        arith_uint256 work;
-        arith_uint256 min_work;
-
-    public:
-        size_t size()
-        {
-            return _queue.size();
-        }
-
-        void push(shared_ptr<BaseShare> share);
     };
 
     class ShareTracker : public c2pool::libnet::INodeMember, public enable_shared_from_this<ShareTracker>
@@ -354,8 +337,8 @@ namespace c2pool::shares
 
             ShareInfo share_info = {share_data,
                                     far_share_hash,
-                                    0,//TODO:max_bits,
-                                    0,//TODO:bits,
+                                    0, //TODO:max_bits,
+                                    0, //TODO:bits,
                                     result_timestamp,
                                     new_transaction_hashes,
                                     transaction_hash_refs,
@@ -382,7 +365,7 @@ namespace c2pool::shares
                                        .str();
                 }
             }
-        UniValue gentx; //TODO: remove
+            UniValue gentx; //TODO: remove
             /*TODO: SEGWIT
         
         if (segwit_activated){
@@ -424,6 +407,27 @@ namespace c2pool::shares
         */
 
             return {share_info, gentx, other_transaction_hashes, get_share};
+        }
+
+        std::tuple<int32_t, uint256> score(uint256 share_hash)
+        {
+            uint256 score_res;
+            score_res.SetNull();
+            auto head_height = verified.get_height(share_hash);
+            if (head_height < net()->CHAIN_LENGTH)
+            {
+                return std::make_tuple(head_height, score_res);
+            }
+
+            auto end_point = verified.get_nth_parent_hash(share_hash, net()->CHAIN_LENGTH * 15 / 16);
+
+            boost::optional<int32_t> block_height;
+            auto gen_verif_chain = verified.get_chain(end_point, net()->CHAIN_LENGTH / 16);
+            uint256 hash;
+            while (gen_verif_chain(hash))
+            {
+                //TODO: 
+            }
         }
     };
 } // namespace c2pool::shares

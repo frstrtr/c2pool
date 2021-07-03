@@ -98,6 +98,7 @@ namespace coind
 
         virtual bool version_check(int version) = 0;
 
+        virtual uint256 POW_FUNC(char* packed_block_header) = 0;
         //TODO: virtual /*todo: type*/ POW_FUNC(/*todo: block_header_type.pack(uint256)*/);
     };
 
@@ -111,6 +112,6 @@ namespace coind
 
         bool version_check(int version) override;
 
-        //TODO: /*todo: type*/ POW_FUNC(/*todo: type*/) override; //TODO: override
+        virtual uint256 POW_FUNC(char* packed_block_header) override;
     };
 }

@@ -45,4 +45,9 @@ namespace coind
             return false;
         }
     }
+
+    uint256 DigibyteParentNetwork::POW_FUNC(char *packed_block_header)
+    {
+        //TODO: +тест сравнения хэшей.
+    }
 } // namespace c2pool
