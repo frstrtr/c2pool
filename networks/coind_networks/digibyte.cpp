@@ -8,6 +8,8 @@
 #include <memory>
 using std::shared_ptr;
 
+#include "dgb/scrypt.h"
+
 namespace coind
 {
     DigibyteParentNetwork::DigibyteParentNetwork() : ParentNetwork("DGB")
@@ -48,6 +50,8 @@ namespace coind
 
     uint256 DigibyteParentNetwork::POW_FUNC(char *packed_block_header)
     {
-        //TODO: +тест сравнения хэшей.
+        uint256 result;
+        scrypt_1024_1_1_256(packed_block_header, ((char*)&result));
+        return result;
     }
 } // namespace c2pool
