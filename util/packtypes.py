@@ -1396,3 +1396,8 @@ print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
 #print("VarStrType coinbase unpack:\n {0}".format(VarStrType.unpack(deserialized_msg_shares["value"][0]["contents"]["share_data"]["coinbase"])))
 '''
 #===============================================================
+# import hashlib
+# _data = b"1"
+# res_pow_func_test = IntType(256).unpack(hashlib.sha256(hashlib.sha256(_data).digest()).digest())
+# print(res_pow_func_test)
+#===============================================================
