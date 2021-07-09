@@ -126,3 +126,25 @@ TEST(Btclibs, UINT128_SERIALIZE)
 
     ASSERT_EQ(first.ToString(), second.ToString());
 }
+
+TEST(Btclibs, UINT256_SERIALIZE_BYTES){
+    string s = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
+    uint256 first;
+    first.SetHex(s);
+
+    stringstream ss;
+    ss << first;
+
+    std::cout << ss.str().c_str() << std::endl;
+    for (auto c = first.begin(); c != first.end(); c++){
+        std::cout << (unsigned int)*c << " ";
+    }
+    std::cout << std::endl;
+    std::cout << "max:" << UINT32_MAX << std::endl;
+
+    unsigned char* T = reinterpret_cast<unsigned char*>(&first);
+    for (int i = 0; i < sizeof(T)/sizeof(*T); i++){
+        cout << (unsigned int)T[i] << " ";
+    }
+    cout << endl;
+}
