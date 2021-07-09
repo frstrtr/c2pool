@@ -102,6 +102,15 @@ namespace c2pool::shares
         }
     };
 
+    class BlockHeaderType : public SmallBlockHeaderType
+    {
+    public:
+        
+    public:
+        BlockHeaderType() : SmallBlockHeaderType(){};
+        BlockHeaderType(SmallBlockHeaderType min_header, )
+    };
+
     class HashLinkType
     {
     public:
@@ -224,24 +233,23 @@ namespace c2pool::shares
     {
     public:
         ShareData share_data;
-        uint256 far_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
-        unsigned int max_bits;  //bitcoin_data.FloatingIntegerType() max_bits;
-        unsigned int bits;      //bitcoin_data.FloatingIntegerType() bits;
-        unsigned int timestamp; //pack.IntType(32)
-        std::vector<uint256> new_transaction_hashes;        //pack.ListType(pack.IntType(256))
+        uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
+        unsigned int max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
+        unsigned int bits;                                       //bitcoin_data.FloatingIntegerType() bits;
+        unsigned int timestamp;                                  //pack.IntType(32)
+        std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
         std::vector<std::tuple<int, int>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        unsigned long absheigth; //pack.IntType(32)
-        uint128 abswork;         //pack.IntType(128)
+        unsigned long absheigth;                                 //pack.IntType(32)
+        uint128 abswork;                                         //pack.IntType(128)
 
         boost::optional<SegwitData> segwit_data;
-    public:
 
+    public:
         ShareInfo(){};
         ShareInfo(ShareData share_data, std::vector<uint256> new_transaction_hashes, std::vector<std::tuple<int, int>> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits, unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork, SegwitData segwit_data);
-        
+
         friend bool operator==(const ShareInfo &first, const ShareInfo &second);
         friend bool operator!=(const ShareInfo &first, const ShareInfo &second);
-
 
         //TODO: remove or create just obj -> json;
         // ShareInfo &operator=(UniValue value)

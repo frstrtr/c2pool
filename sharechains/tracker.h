@@ -409,7 +409,7 @@ namespace c2pool::shares
             return {share_info, gentx, other_transaction_hashes, get_share};
         }
 
-        std::tuple<int32_t, uint256> score(uint256 share_hash)
+        std::tuple<int32_t, uint256> score(uint256 share_hash, )
         {
             uint256 score_res;
             score_res.SetNull();
@@ -426,6 +426,8 @@ namespace c2pool::shares
             uint256 hash;
             while (gen_verif_chain(hash))
             {
+                auto share = verified.items[hash];
+                
                 //TODO: 
             }
         }

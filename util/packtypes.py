@@ -1401,3 +1401,18 @@ print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
 # res_pow_func_test = IntType(256).unpack(hashlib.sha256(hashlib.sha256(_data).digest()).digest())
 # print(res_pow_func_test)
 #===============================================================
+
+packed_int256 = IntType(256).pack(int('ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc', 16))
+res = b''
+for x in packed_int256:
+    print(int(x))
+print(" ")
+for x in '252 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 15'.split(' '):
+    print(int(x, 10))
+    print(bytes([int(x,10)]))
+    res += bytes([int(x,10)])
+print(res)
+print(packed_int256)
+print('Equal: {0}'.format(res == packed_int256))
+print(IntType(256).unpack(res))
+print(IntType(256).unpack(packed_int256))
