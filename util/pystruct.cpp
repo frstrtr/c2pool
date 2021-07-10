@@ -1,6 +1,5 @@
 #include "pystruct.h"
 #include "Python.h"
-//#include "messages.h"
 #include "univalue.h"
 #include <tuple>
 #include <iostream>
@@ -62,6 +61,28 @@ namespace c2pool::python
 
     //PyPackTypes
 
+    bool PyPackTypes::is_worked()
+    {
+        auto methodObj = GetMethodObject("is_worked", filepath, "packtypes");
+        if (methodObj == nullptr)
+        {
+            LOG_WARNING << "method is_worked not founded";
+            return false;
+        }
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"()");
+        auto result = GetCallFunctionResult(pVal);
+
+        stringstream ss;
+        ss << result;
+        int res;
+        ss >> res;
+
+        if (9001 == res)
+            return true;
+        else
+            return false;
+    }
+
     const char *PyPackTypes::filepath = "/util";
 
     // template <typename T>
@@ -108,7 +129,7 @@ namespace c2pool::python
         return c2pool::dev::from_bytes_to_strChar(result);
     }
 
-    UniValue PyPackTypes::decode(char* command, char* checksum, char* payload, int32_t unpacked_len)
+    UniValue PyPackTypes::decode(char *command, char *checksum, char *payload, int32_t unpacked_len)
     {
         UniValue result(UniValue::VOBJ);
         auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");

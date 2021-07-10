@@ -1209,6 +1209,8 @@ def receive_length(msg):
 def debug_log(char_array):
     print("debug_log: {0}".format(str(char_array)))
 
+def is_worked():
+    return 9001
 # ------------------------------------------FOR-UNIT-TESTS-C++-----------------------------
 
 def IntType256_test(value_hex):
