@@ -7,11 +7,6 @@
 
 using namespace std;
 
-namespace c2pool::messages
-{
-    class message;
-}
-
 namespace c2pool::python
 {
     class other
@@ -26,6 +21,8 @@ namespace c2pool::python
         static const char *filepath;
 
     public:
+        static bool is_worked();
+
         //obj(c++) -> json -> bytes -> unsigned_char*
         // template <typename T>
         // static char *serialize(char *name_type, T &value);

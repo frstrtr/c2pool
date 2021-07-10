@@ -32,8 +32,28 @@ namespace c2pool::python
             auto sys = PyImport_ImportModule("sys");
             auto sys_path = PyObject_GetAttrString(sys, "path");
             // Путь до наших исходников Python
-            auto folder_path = PyUnicode_FromString(c2pool::filesystem::getSubDir_c(filepath));
+            auto _filepath = c2pool::filesystem::getSubDir_c(filepath);
+            std::cout << "forder path: " << _filepath << std::endl;
+            auto folder_path = PyUnicode_FromString(_filepath);
+            std::cout << "forder path: " << _filepath << std::endl;
             PyList_Append(sys_path, folder_path);
+
+            //========================
+
+            char *ret = NULL;
+            if (sys_path != NULL)
+            {
+                PyObject *pResultRepr = PyObject_Repr(sys_path);
+
+                // Если полученную строку не скопировать, то после очистки ресурсов Python её не будет.
+                // Для начала pResultRepr нужно привести к массиву байтов.
+                ret = strdup(PyBytes_AS_STRING(PyUnicode_AsEncodedString(pResultRepr, "utf-8", "ERROR")));
+
+                Py_XDECREF(pResultRepr);
+            }
+            std::cout << ret << std::endl;
+
+            //========================
 
             // Загрузка py файла
             auto pName = PyUnicode_FromString(filename);
@@ -62,7 +82,8 @@ namespace c2pool::python
             pObjct = PyDict_GetItemString(pDict, method_name);
             if (!pObjct)
             {
-                LOG_ERROR << "Method \"" << method_name << "\""<< " is not founded!";
+                LOG_ERROR << "Method \"" << method_name << "\""
+                          << " is not founded!";
                 return pObjct;
             }
 
