@@ -221,7 +221,7 @@ namespace c2pool::python::for_test
         auto methodObj = GetMethodObject("IntType256_test", filepath, "packtypes");
         if (methodObj == nullptr)
         {
-            LOG_WARNING << "serialize_msg not founded";
+            LOG_WARNING << "IntType256_test not founded!";
             return nullptr; //TODO обработка ситуации, если получено nullptr
         }
         const char *hex_str = hex_value.c_str();

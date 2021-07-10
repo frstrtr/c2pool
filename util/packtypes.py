@@ -565,7 +565,7 @@ class IntType(Type):
 
     def _pack(self, obj):
         f = BytesIO()  # StringIO.StringIO()
-        print('_pack int type')
+        # print('_pack int type')
         self.write(f, obj)
         return f.getvalue()
 
@@ -1206,11 +1206,17 @@ def receive_length(msg):
 
 # ------------------------------------------FOR C++ DEBUG----------------------------------
 
-
 def debug_log(char_array):
     print("debug_log: {0}".format(str(char_array)))
 
 # ------------------------------------------FOR-UNIT-TESTS-C++-----------------------------
+
+def IntType256_test(value_hex):
+    num = int(value_hex, 16)
+    packed = IntType(256).pack(num)
+    return bytes_to_char_stringstream(packed)
+
+#print(IntType256_test("fffffff"))
 
 
 # ------------------------------------------TESTS------------------------------------------
@@ -1402,17 +1408,17 @@ print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
 # print(res_pow_func_test)
 #===============================================================
 
-packed_int256 = IntType(256).pack(int('ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc', 16))
-res = b''
-for x in packed_int256:
-    print(int(x))
-print(" ")
-for x in '252 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 15'.split(' '):
-    print(int(x, 10))
-    print(bytes([int(x,10)]))
-    res += bytes([int(x,10)])
-print(res)
-print(packed_int256)
-print('Equal: {0}'.format(res == packed_int256))
-print(IntType(256).unpack(res))
-print(IntType(256).unpack(packed_int256))
+# packed_int256 = IntType(256).pack(int('ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc', 16))
+# res = b''
+# for x in packed_int256:
+#     print(int(x))
+# print(" ")
+# for x in '252 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 15'.split(' '):
+#     print(int(x, 10))
+#     print(bytes([int(x,10)]))
+#     res += bytes([int(x,10)])
+# print(res)
+# print(packed_int256)
+# print('Equal: {0}'.format(res == packed_int256))
+# print(IntType(256).unpack(res))
+# print(IntType(256).unpack(packed_int256))
