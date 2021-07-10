@@ -1,7 +1,6 @@
 #pragma once
 
 #include <devcore/py_base.h>
-#include <libnet/messages.h>
 #include <string>
 #include <univalue.h>
 #include <memory>
@@ -36,7 +35,7 @@ namespace c2pool::python
         //unsigned char* -> bytes -> json -> obj(c++)
         // static UniValue deserialize(char *command, char *checksum, char *payload, int unpacked_length); //length = len(value)
 
-        static UniValue decode(shared_ptr<c2pool::libnet::messages::p2pool_converter> converter); //length = len(value)
+        static UniValue decode(char* command, char* checksum, char* payload, int32_t unpacked_len); //length = len(value)
 
         //(def name: deserialize_msg)
         //msg.[unsigned char*] -> bytes -> json -> obj(c++)
@@ -55,8 +54,12 @@ namespace c2pool::python
 
 namespace c2pool::python::for_test
 {
-    class pymessage
+    class PyType : public c2pool::python::PythonBase
     {
+    protected:
+        static const char *filepath;
+
     public:
+        static char *IntType256_test(std::string hex_num);
     };
 } // namespace c2pool::python::for_test

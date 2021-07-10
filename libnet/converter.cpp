@@ -84,7 +84,7 @@ namespace c2pool::libnet::messages
     UniValue p2pool_converter::decode()
     {
         LOG_TRACE << "p2pool_converter::decode() called!";
-        return c2pool::python::PyPackTypes::decode(shared_from_this());
+        return c2pool::python::PyPackTypes::decode(command, checksum, payload, get_unpacked_len()); //TODO: test
     }
 
     void p2pool_converter::set_data(char *data_)

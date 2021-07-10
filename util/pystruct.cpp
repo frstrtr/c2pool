@@ -7,7 +7,6 @@
 #include <sstream>
 #include <devcore/py_base.h>
 #include <devcore/str.h>
-#include <libnet/messages.h>
 #include <devcore/logger.h>
 
 using namespace std;
@@ -96,7 +95,7 @@ namespace c2pool::python
         }
         //auto msg_json_str = "{\"name_type\":\"version\",\"value\":{\"version\":3301,\"services\":0,\"addr_to\":{\"services\":3,\"address\":\"4.5.6.7\",\"port\":8},\"addr_from\":{\"services\":9,\"address\":\"10.11.12.13\",\"port\":14},\"nonce\":6535423,\"sub_version\":\"16\",\"mode\":18,\"best_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000123\"}}";//json_msg.write().c_str();
         string str = json_msg.write();
-        const char* msg_json_str = str.c_str();
+        const char *msg_json_str = str.c_str();
         auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", msg_json_str);
         auto result = GetCallFunctionResult(pVal);
         if (c2pool::dev::compare_str(result, "ERROR", 5))
@@ -109,7 +108,7 @@ namespace c2pool::python
         return c2pool::dev::from_bytes_to_strChar(result);
     }
 
-    UniValue PyPackTypes::decode(shared_ptr<c2pool::libnet::messages::p2pool_converter> converter)
+    UniValue PyPackTypes::decode(char* command, char* checksum, char* payload, int32_t unpacked_len)
     {
         UniValue result(UniValue::VOBJ);
         auto methodObj = GetMethodObject("deserialize_msg", filepath, "packtypes");
@@ -118,12 +117,13 @@ namespace c2pool::python
             result.setNull();
             return result; //TODO: проверка на Null на выходе функции.
         }
-        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->get_unpacked_len());
-
+        //auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", converter->command, converter->checksum, 4, converter->payload, converter->get_unpacked_len());
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(sy#y#)", command, checksum, 4, payload, unpacked_len);
         auto raw_result = GetCallFunctionResult(pVal);
         // LOG_TRACE << "raw_result: " << raw_result;
         result.read(raw_result);
-        if(result.exists("error_text")){
+        if (result.exists("error_text"))
+        {
             LOG_TRACE << "error text exists";
             return generate_error_json(result);
         }
@@ -201,8 +201,9 @@ namespace c2pool::python
 
         return result;
     }
-    
-    UniValue PyPackTypes::generate_error_json(UniValue json){
+
+    UniValue PyPackTypes::generate_error_json(UniValue json)
+    {
         auto result = UniValue(UniValue::VOBJ);
         result.pushKV("name_type", 9999);
         result.pushKV("value", json);
@@ -213,5 +214,20 @@ namespace c2pool::python
 
 namespace c2pool::python::for_test
 {
+    const char *PyType::filepath = "/util";
 
+    char *PyType::IntType256_test(std::string hex_value)
+    {
+        auto methodObj = GetMethodObject("IntType256_test", filepath, "packtypes");
+        if (methodObj == nullptr)
+        {
+            LOG_WARNING << "serialize_msg not founded";
+            return nullptr; //TODO обработка ситуации, если получено nullptr
+        }
+        const char *hex_str = hex_value.c_str();
+        auto pVal = PyObject_CallFunction(methodObj, (char *)"(s)", hex_str);
+        auto result = GetCallFunctionResult(pVal);
+
+        return c2pool::dev::from_bytes_to_strChar(result);
+    }
 } // namespace c2pool::python::for_test
