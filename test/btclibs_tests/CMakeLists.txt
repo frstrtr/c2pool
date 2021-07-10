@@ -6,4 +6,4 @@ add_executable(btclibs_test ${BTCLIBS_TESTS_SOURCE})
 
 # target_compile_definitions(runBtclibsTests PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
 target_link_libraries(btclibs_test gtest gtest_main)
-target_link_libraries(btclibs_test btclibs Secp256k1)
+target_link_libraries(btclibs_test btclibs Secp256k1 util)

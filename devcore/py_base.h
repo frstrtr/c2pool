@@ -2,6 +2,7 @@
 #include <Python.h>
 #include <iostream>
 #include "filesystem.h"
+#include "logger.h"
 
 namespace c2pool::python
 {
@@ -38,6 +39,7 @@ namespace c2pool::python
             auto pName = PyUnicode_FromString(filename);
             if (!pName)
             {
+                LOG_ERROR << "File is not founded!";
                 return pObjct;
             }
 
@@ -45,6 +47,7 @@ namespace c2pool::python
             auto pModule = PyImport_Import(pName);
             if (!pModule)
             {
+                LOG_ERROR << "Module \"" << filename << "\" is not founded!";
                 return pObjct;
             }
 
@@ -52,12 +55,14 @@ namespace c2pool::python
             auto pDict = PyModule_GetDict(pModule);
             if (!pDict)
             {
+                LOG_ERROR << "Objects dict from module is not founded!";
                 return pObjct;
             }
 
             pObjct = PyDict_GetItemString(pDict, method_name);
             if (!pObjct)
             {
+                LOG_ERROR << "Method \"" << method_name << "\""<< " is not founded!";
                 return pObjct;
             }
 

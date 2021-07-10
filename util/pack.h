@@ -56,7 +56,7 @@ namespace c2pool
         template <typename T>
         static T *unpack(SerializedData &_data)
         {
-            return SerializedData::unpack(_data.data);
+            return SerializedData::unpack<T>(_data.data);
         }
     };
 }

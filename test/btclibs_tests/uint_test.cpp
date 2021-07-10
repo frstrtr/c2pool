@@ -5,6 +5,7 @@
 #include <sstream>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
+#include <util/pystruct.h>
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)
@@ -141,6 +142,31 @@ TEST(Btclibs, UINT256_SERIALIZE_BYTES){
     }
     std::cout << std::endl;
     std::cout << "max:" << UINT32_MAX << std::endl;
+
+    unsigned char* T = reinterpret_cast<unsigned char*>(&first);
+    for (int i = 0; i < sizeof(T)/sizeof(*T); i++){
+        cout << (unsigned int)T[i] << " ";
+    }
+    cout << endl;
+}
+
+TEST(Btclibs, UINT256_SERIALIZE_BYTES_COMPARE_PYTHON){
+    string s = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
+    uint256 first;
+    first.SetHex(s);
+    
+    auto second = c2pool::python::for_test::PyType::IntType256_test(s);
+    cout << "second: " << endl;
+    for (auto c = first.begin(); c != first.end(); c++){
+        std::cout << (unsigned int)*c << " ";
+    }
+    cout << endl;
+
+    cout << "first: " << endl;
+    for (auto c = first.begin(); c != first.end(); c++){
+        std::cout << (unsigned int)*c << " ";
+    }
+    std::cout << std::endl;
 
     unsigned char* T = reinterpret_cast<unsigned char*>(&first);
     for (int i = 0; i < sizeof(T)/sizeof(*T); i++){
