@@ -75,7 +75,10 @@ namespace c2pool::filesystem
 
     const char *getSubDir_c(std::string path)
     {
-        return getSubDir(path).c_str();
+        auto subdir = getSubDir(path);
+        char* result = new char[subdir.length()];
+        strcpy(result, subdir.c_str());
+        return result;
     }
 
 } // namespace c2pool::filesystem

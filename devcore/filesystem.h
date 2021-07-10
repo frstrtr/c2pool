@@ -25,4 +25,6 @@ namespace c2pool::filesystem
 
     const char *getSubDir_c(std::string path);
 
+    bool copy_file(const char* from, const char* to, copy_option options = copy_option::overwrite_if_exists);
+
 } // namespace c2pool::filesystem
