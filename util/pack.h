@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <btclibs/uint256.h>
 
 /*
 template T for pack:
@@ -59,4 +60,11 @@ namespace c2pool
             return SerializedData::unpack<T>(_data.data);
         }
     };
+
+    template<>
+    SerializedData SerializedData::pack(uint256 &_data){
+        unsigned char* bytes_temp = reinterpret_cast<unsigned char*>(&_data);
+        int32_t _length = std::distance(_data.begin(), _data.end());
+        return SerializedData(bytes_temp, _length);
+    }
 }
