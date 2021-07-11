@@ -20,7 +20,7 @@ namespace c2pool::python
         auto sys = PyImport_ImportModule("sys");
         auto sys_path = PyObject_GetAttrString(sys, "path");
         // Путь до наших исходников Python
-        auto folder_path = PyUnicode_FromString(c2pool::filesystem::getSubDir_c("/util"));
+        auto folder_path = PyUnicode_FromString(c2pool::filesystem::getSubDir_c("/scripts"));
         PyList_Append(sys_path, folder_path);
 
         // Загрузка py файла
@@ -83,7 +83,7 @@ namespace c2pool::python
             return false;
     }
 
-    const char *PyPackTypes::filepath = "/util";
+    const char *PyPackTypes::filepath = "/scripts";
 
     // template <typename T>
     // char *PyPackTypes::serialize(char *name_type, T &value)
@@ -235,7 +235,7 @@ namespace c2pool::python
 
 namespace c2pool::python::for_test
 {
-    const char *PyType::filepath = "/util";
+    const char *PyType::filepath = "/scripts";
 
     char *PyType::IntType256_test(std::string hex_value)
     {
