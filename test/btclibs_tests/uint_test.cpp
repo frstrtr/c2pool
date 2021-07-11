@@ -6,6 +6,7 @@
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <util/pystruct.h>
+#include <util/pack.h>
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)
@@ -156,9 +157,10 @@ TEST(Btclibs, UINT256_SERIALIZE_BYTES_COMPARE_PYTHON){
     first.SetHex(s);
     
     auto second = c2pool::python::for_test::PyType::IntType256_test(s);
+    unsigned char* second_unsig = (unsigned char*)second;
     cout << "second: " << endl;
-    for (auto c = first.begin(); c != first.end(); c++){
-        std::cout << (unsigned int)*c << " ";
+    for (int c = 0; c <= strlen(second); c++){
+        std::cout << (unsigned int)second_unsig[c] << " ";
     }
     cout << endl;
 
@@ -169,8 +171,18 @@ TEST(Btclibs, UINT256_SERIALIZE_BYTES_COMPARE_PYTHON){
     std::cout << std::endl;
 
     unsigned char* T = reinterpret_cast<unsigned char*>(&first);
-    for (int i = 0; i < sizeof(T)/sizeof(*T); i++){
+    for (int i = 0; i < std::distance(first.begin(), first.end()); i++){
         cout << (unsigned int)T[i] << " ";
     }
     cout << endl;
+
+    auto packed_first = c2pool::SerializedData::pack(first);
+    for (int i = 0; i < packed_first.length; i++){
+        cout << (unsigned int)packed_first.data[i] << " ";
+    }
+    cout << endl;
+
+    auto unpacked_first = c2pool::SerializedData::unpack<uint256>(packed_first);
+    cout << unpacked_first->GetHex() << endl;
+    ASSERT_EQ(first, *unpacked_first);
 }
