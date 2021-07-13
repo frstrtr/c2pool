@@ -58,3 +58,30 @@ TEST(secp256k1TEST, HashTest)
 
     ASSERT_EQ(uint_res.GetHex(), HexStr(res));
 }
+
+TEST(secp256k1TEST, Hash256Test)
+{
+    auto res = TestSHA256("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // uint256 uint_res(res);
+    // cout << uint_res.GetHex() << endl;
+
+
+    vector<unsigned char> out;
+    uint256 out_res;
+    out.resize(CSHA256::OUTPUT_SIZE);
+    uint256 in;
+    in.SetHex(HexStr(res));
+    string in2 = in.GetHex(); //= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    CSHA256().Write((unsigned char*)&in2[0], in2.size()).Finalize(&out[0]);
+    out_res.SetHex(HexStr(out));
+
+    uint256 uint_res;
+    // cout << HexStr(res) << endl;
+
+    uint_res.SetHex(HexStr(res));
+    // cout << uint_res.GetHex() << endl;
+
+    ASSERT_EQ(out_res.GetHex(), "dfe7a23fefeea519e9bbfdd1a6be94c4b2e4529dd6b7cbea83f9959c2621b13c");
+
+
+}
