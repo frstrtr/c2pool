@@ -1,0 +1,19 @@
+{
+    "right": 6,
+    "left": {
+        "right": 5,
+        "left": {
+            "right": 4,
+            "left": {
+                "right": 3,
+                "left": {
+                    "right": 2,
+                    "left": {
+                        "right": 1,
+                        "left": 1000
+                    }
+                }
+            }
+        }
+    }
+}
