@@ -834,6 +834,11 @@ class TransactionType(Type):
             return
         return tx_id_type.write(file, item)
 
+merkle_record_type = ComposedType([
+    ('left', IntType(256)),
+    ('right', IntType(256)),
+])
+
 # ------------------------------------------ Share Types --------------------------------------------
 hash_link_type = ComposedType([
     ('state', FixedStrType(32)),
@@ -1424,3 +1429,23 @@ print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
 # print('Equal: {0}'.format(res == packed_int256))
 # print(IntType(256).unpack(res))
 # print(IntType(256).unpack(packed_int256))
+#===============================================================
+
+# first = int("fffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+# second = int("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc", 16)
+# _packed = merkle_record_type.pack(dict(left=first, right=second))
+# res = []
+
+# for x in _packed:
+#     res += [x]
+# print(res)
+
+# #p2pool
+# res1 = ' '.join([str(x) for x in res])
+# #c2pool
+# res2 = "255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 15 0 0 0 0 0 0 0 252 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 0"
+# res_b = res2.split(" ")
+# print(res1 == res2)
+
+# print(res1)
+# print(res2)
