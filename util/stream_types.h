@@ -18,6 +18,11 @@ struct ListType
         l.insert(l.end(), arr, arr + len);
     }
 
+    ListType(vector<T> arr)
+    {
+        l = vector<T>(arr);
+    }
+
     PackStream &write(PackStream &stream) const
     {
         LOG_TRACE << "ListType Worked!";
@@ -28,6 +33,19 @@ struct ListType
             stream << v;
         }
 
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        auto len = 0;
+        stream >> len;
+        for (int i = 0; i < len; i++)
+        {
+            T temp;
+            stream >> temp;
+            l.push_back(temp);
+        }
         return stream;
     }
 };
@@ -47,6 +65,15 @@ struct StrType
 
         stream << list_s;
 
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        ListType<char> list_s;
+        stream >> list_s;
+
+        str = string(list_s.l.begin(), list_s.l.end());
         return stream;
     }
 };
@@ -88,6 +115,22 @@ struct IntType
 
         return stream;
     }
+
+    PackStream &read(PackStream &stream)
+    {
+        unsigned char *packed = new unsigned char[CALC_SIZE(INT_T)];
+        //int32_t len = sizeof(value2) / sizeof(*packed);
+
+        for (int i = 0; i < CALC_SIZE(INT_T); i++)
+        {
+            packed[i] = stream.data[i];
+            stream.data.erase(stream.data.begin(), stream.data.begin() + 1);
+        }
+        auto *_value = reinterpret_cast<INT_T *>(packed);
+        value = *_value;
+
+        return stream;
+    }
 };
 
 #define INT8 uint8_t
@@ -119,8 +162,18 @@ struct EnumType
     {
         LOG_TRACE << "EnumType Worked!";
 
-        PACK_TYPE v((typename PACK_TYPE::value_type) value);
+        PACK_TYPE v((typename PACK_TYPE::value_type)value);
         stream << v;
+
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        PACK_TYPE v;
+        stream >> v;
+
+        value = (ENUM_T)v.value;
 
         return stream;
     }
@@ -146,6 +199,18 @@ public:
         else
         {
             none_value.write(stream);
+        }
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        ObjType *_value;
+        stream >> *_value;
+
+        if (*_value != none_value)
+        {
+            value.make_optional(*_value);
         }
         return stream;
     }
