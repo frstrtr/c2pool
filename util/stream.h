@@ -12,7 +12,11 @@ concept StreamObjType = requires(T a, PackStream &stream)
 {
     {
         a.write(stream)
-    } -> PackStream &;
+        } -> PackStream &;
+
+    {
+        a.read(stream)
+        } -> PackStream &;
 };
 
 template <typename T>
@@ -102,6 +106,74 @@ struct PackStream
     }
 #undef ADDING_INT
 
+#define CALC_SIZE(T) (sizeof(T))
+
+    PackStream &operator>>(PackStream &val)
+    {
+        val.data.insert(val.data.end(), data.begin(), data.end());
+        return *this;
+    }
+
+    template <typename T>
+    PackStream &operator>>(T &val)
+    {
+        unsigned char *packed = new unsigned char[CALC_SIZE(T)];
+        for (int i = 0; i < CALC_SIZE(T); i++)
+        {
+            packed[i] = data[i];
+            data.erase(data.begin(), data.begin() + 1);
+        }
+        auto *res = reinterpret_cast<T *>(packed);
+        val = *res;
+        return *this;
+    }
+
+    template <StreamObjType T>
+    PackStream &operator>>(T &val)
+    {
+        val.read(*this);
+        return *this;
+    }
+
+#define GET_INT(num_type)                                  \
+    auto _size = CALC_SIZE(num_type);                      \
+    unsigned char *packed = new unsigned char[_size];      \
+    for (int i = 0; i < _size; i++)                        \
+    {                                                      \
+        packed[i] = data[i];                               \
+    }                                                      \
+    num_type *val2 = reinterpret_cast<num_type *>(packed); \
+    val = *val2;                                           \
+    data.erase(data.begin(), data.begin() + _size);        \
+    delete packed;                                         \
+    return *this;
+
+    template <StreamIntType T>
+    PackStream &operator>>(T &val)
+    {
+        unsigned char code = data.front();
+        data.erase(data.begin(), data.begin() + 1);
+        if (code < 0xfd)
+        {
+            val = code;
+        }
+        else if (code == 0xfd)
+        {
+            GET_INT(uint16_t)
+        }
+        else if (code == 0xfe)
+        {
+            GET_INT(uint32_t)
+        }
+        else if (code == 0xff)
+        {
+            GET_INT(uint64_t)
+        }
+
+        return *this;
+        //throw std::invalid_argument();
+    }
+
     unsigned char *bytes() const
     {
         unsigned char *result = new unsigned char[data.size()];
@@ -114,3 +186,5 @@ struct PackStream
         return data.size();
     }
 };
+
+#undef GET_INT
