@@ -11,7 +11,6 @@ namespace c2pool
     {
         class P2PNode;
         class Protocol;
-        class initialize_network_protocol;
     }
 } // namespace c2pool
 
@@ -21,6 +20,7 @@ namespace c2pool
 #include <networks/network.h>
 #include <boost/asio.hpp>
 #include <boost/function.hpp>
+#include <util/stream.h>
 namespace ip = boost::asio::ip;
 
 namespace c2pool::libnet::p2p
@@ -51,7 +51,8 @@ namespace c2pool::libnet::p2p
             return _socket.remote_endpoint(ec);
         }
 
-        std::tuple<std::string, std::string> get_addr(){
+        std::tuple<std::string, std::string> get_addr()
+        {
             auto ep = endpoint();
             return std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
         }
@@ -73,7 +74,41 @@ namespace c2pool::libnet::p2p
         ip::tcp::socket _socket;
 
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
-
-        std::shared_ptr<initialize_network_protocol> initialize_protocol;
     };
+
+    struct SendMessageData
+    {
+        char *prefix;
+        char *command;
+        char *length;
+        char *checksum;
+        char *payload;
+
+        SendMessageData(shared_ptr<base_message> msg, shared_ptr<c2pool::Network> _net)
+        {
+            prefix = new char[_net->PREFIX_LENGTH];
+            memcpy(prefix, _net->PREFIX_LENGTH, _net->PREFIX/_LENGTH);
+
+            const char* temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
+            command = new char[12]{'\0'};
+            memcpy(command, temp_cmp, strlen(temp_cmd));
+
+            PackStream stream;
+            stream << *msg;
+
+            //TODO:
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << command << error_text;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> command >> error_text;
+            return stream;
+        }
+    }
 } // namespace c2pool::p2p

@@ -141,6 +141,30 @@ struct IntType
 
 #define IntType(bytes) IntType<INT##bytes>
 
+struct VarIntType
+{
+    uint64_t value;
+
+    VarIntType(uint64_t _v)
+    {
+        value = _v;
+    }
+
+    PackStream &write(PackStream &stream) const
+    {
+        stream << value;
+
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        stream >> value;
+
+        return stream;
+    }
+};
+
 template <StreamEnumType ENUM_T, StreamObjType PACK_TYPE = IntType(32)>
 struct EnumType
 {

@@ -6,6 +6,8 @@
 #include <devcore/str.h>
 #include <networks/network.h>
 #include <util/pystruct.h>
+#include <util/stream.h>
+#include <util/stream_types.h>
 
 #include <memory>
 #include <tuple>
@@ -35,10 +37,6 @@ namespace c2pool::libnet::p2p
             LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
             if (!ec)
             {
-                // c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
-                // c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
-                // c2pool::messages::message* firstMsg = new c2pool::messages::message_version(version, 0, addrs1, addrs2, nodes->p2p_node->nonce, "16", 1, 18);
-                // send(firstMsg);
                 init(handle);
             }
             else
@@ -53,27 +51,8 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
 
-        //if p2pool:
-        //create P2P_Protocol<c2pool::libnet::messages::p2pool_converter>
-        initialize_protocol = std::make_shared<initialize_network_protocol>(shared_from_this(), handle, this);
+        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), this);
 
-        //if c2pool:
-        //create P2P_Protocol<c2pool::libnet::messages::c2pool_converter>
-        //TODO: temp_protocol = make_shared<c2pool_protocol>(shared_from_this());
-
-        _protocol = initialize_protocol;
-
-        //start reading in socket:
-        start_read();
-    }
-
-    template <class protocol_type>
-    void P2PSocket::set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version)
-    {
-        LOG_TRACE << "Set new protocol type!";
-        std::shared_ptr<c2pool::libnet::p2p::Protocol> temp_protocol = std::make_shared<protocol_type>(shared_from_this(), this);
-        LOG_TRACE << "Called handle";
-        LOG_TRACE << handle;
         if (handle.empty())
         {
             LOG_TRACE << "handle empty";
@@ -82,16 +61,38 @@ namespace c2pool::libnet::p2p
         {
             LOG_TRACE << "handle not empty";
         }
-
         LOG_TRACE << "Called handle";
-        handle(temp_protocol); // <---------------bug there!!!!!!!!!
-        LOG_TRACE << "Set new protocol like main!";
-        _protocol = temp_protocol;
-        _protocol.lock()->handle(raw_message_version);
-        LOG_TRACE << "set_protocol_type_and_version ended!";
+        handle(proto); // <---------------bug there!!!!!!!!!?????
+
+        _protocol = proto;
+        //start reading in socket:
+        start_read();
     }
 
-    template void P2PSocket::set_protocol_type_and_version<p2pool_protocol>(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version);
+    //TODO: remove
+    // template <class protocol_type>
+    // void P2PSocket::set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version)
+    // {
+    //     LOG_TRACE << "Set new protocol type!";
+    //     std::shared_ptr<c2pool::libnet::p2p::Protocol> temp_protocol = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), this);
+    //     LOG_TRACE << "Called handle";
+    //     LOG_TRACE << handle;
+    //     if (handle.empty())
+    //     {
+    //         LOG_TRACE << "handle empty";
+    //     }
+    //     else
+    //     {
+    //         LOG_TRACE << "handle not empty";
+    //     }
+
+    //     LOG_TRACE << "Called handle";
+    //     handle(temp_protocol); // <---------------bug there!!!!!!!!!
+    //     LOG_TRACE << "Set new protocol like main!";
+    //     _protocol = temp_protocol;
+    //     _protocol.lock()->handle(raw_message_version);
+    //     LOG_TRACE << "set_protocol_type_and_version ended!";
+    // }
 
     void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
