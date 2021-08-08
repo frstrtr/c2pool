@@ -1,9 +1,8 @@
 #pragma once
 
-#include "converter.h"
-
 #include <univalue.h>
 #include <util/types.h>
+#include <util/stream_types.h>
 #include <btclibs/uint256.h>
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
@@ -25,7 +24,6 @@ namespace c2pool::libnet::p2p
 
 namespace c2pool::libnet::messages
 {
-
     enum commands
     {
         cmd_error = 9999,
@@ -44,88 +42,110 @@ namespace c2pool::libnet::messages
         cmd_losing_tx
     };
 
+    const std::map<commands, const char *> _string_commands = {
+        {cmd_error, "error"},
+        {cmd_version, "version"},
+        {cmd_ping, "ping"},
+        {cmd_addrme, "addrme"},
+        {cmd_addrs, "addrs"},
+        {cmd_getaddrs, "getaddrs"},
+        //
+        {cmd_shares, "shares"},
+        {cmd_sharereq, "sharereq"},
+        {cmd_sharereply, "sharereply"},
+        {cmd_best_block, "best_block"},
+        {cmd_have_tx, "have_tx"},
+        {cmd_losing_tx, "losing_tx"}};
+
+    const std::map<const char *, commands> _reverse_string_commands = {
+        {"error", cmd_error},
+        {"version", cmd_version},
+        {"ping", cmd_ping},
+        {"addrme", cmd_addrme},
+        {"addrs", cmd_addrs},
+        {"getaddrs", cmd_getaddrs},
+        //
+        {"shares", cmd_shares},
+        {"sharereq", cmd_sharereq},
+        {"sharereply", cmd_sharereply},
+        {"best_block", cmd_best_block},
+        {"have_tx", cmd_have_tx},
+        {"losing_tx", cmd_losing_tx}};
+
+    const char *string_commands(commands cmd) const
+    {
+        try
+        {
+            return _string_commands.at(cmd);
+        }
+        catch (const std::out_of_range &e)
+        {
+            LOG_WARNING << (int)cmd << " out of range in string_commands";
+            return "error";
+        }
+    }
+
+    commands reverse_string_commands(const char *key) const
+    {
+        try
+        {
+            return _reverse_string_commands.at(cmd);
+        }
+        catch (const std::out_of_range &e)
+        {
+            LOG_WARNING << key << " out of range in reverse_string_commands";
+            return commands::cmd_error;
+        }
+    }
+
     //base_message type for handle
     class raw_message
     {
         friend c2pool::libnet::p2p::P2PSocket;
 
     public:
-        c2pool::libnet::messages::commands name_type;
-        UniValue value;
-
-    protected:
-        std::shared_ptr<bytes_converter> converter;
+        EnumType<c2pool::libnet::messages::commands> name_type;
+        PackStream value;
 
     public:
         raw_message()
         {
-            converter = std::make_shared<empty_converter>();
         }
 
-        template <class converter_type>
-        void set_converter_type()
+        PackStream &write(PackStream &stream) const
         {
-            converter = std::make_shared<converter_type>(converter);
+            stream << name_type << value;
+            return stream;
         }
 
-        void set_prefix(std::shared_ptr<c2pool::Network> _net)
+        PackStream &read(PackStream &stream)
         {
-            converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
-        }
-
-        void deserialize()
-        {
-            UniValue _value = converter->decode();
-            LOG_TRACE << "deserialize value :" << _value.write();
-            name_type = (c2pool::libnet::messages::commands)_value["name_type"].get_int();
-            value = _value["value"].get_obj();
+            stream >> name_type;
+            value = PackStream(stream);
+            return stream;
         }
     };
 
     class base_message
     {
-        friend class c2pool::python::PyPackTypes;
-
-    protected:
-        std::shared_ptr<bytes_converter> converter;
-
-        virtual UniValue json_pack() = 0;
+    public:
+        commands cmd;
 
     public:
         base_message(const char *_cmd)
         {
-            converter = std::make_shared<empty_converter>(_cmd);
+            cmd = reverse_string_commands(_cmd);
         }
 
-        template <class converter_type>
-        void set_converter_type()
+        base_message(commands _cmd)
         {
-            converter = std::make_shared<converter_type>(converter);
+            cmd = _cmd;
         }
 
-        void set_prefix(std::shared_ptr<c2pool::Network> _net)
-        {
-            converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
-        }
+    public:
+        virtual PackStream &write(PackStream &stream) = 0;
 
-        std::tuple<char *, int> get_prefix()
-        {
-            auto res = std::make_tuple<char *, int>(converter->get_prefix(), converter->get_prefix_len());
-            return res;
-        }
-
-        //base_message -> bytes; msg = self
-        std::tuple<char *, int> serialize()
-        {
-            LOG_TRACE << "start serialize msg";
-            UniValue json_msg(UniValue::VOBJ);
-            json_msg.pushKV("name_type", converter->get_command());
-            UniValue msg_value(UniValue::VOBJ);
-            msg_value = json_pack();
-            json_msg.pushKV("value", msg_value);
-            LOG_TRACE << "before encode message in serialize";
-            return converter->encode(json_msg);
-        }
+        virtual PackStream &read(PackStream &stream) = 0;
     };
 
     /*
@@ -140,25 +160,22 @@ namespace c2pool::libnet::messages
     class message_error : public base_message
     {
     public:
-        std::string command;
-        std::string error_text;
+        StrType command;
+        StrType error_text;
 
     public:
         message_error() : base_message("error") {}
 
-        message_error &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            command = value["command"].get_str();
-            error_text = value["error_text"].get_str();
-            return *this;
+            stream << command << error_text;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            return result;
+            stream >> command >> error_text;
+            return stream;
         }
     };
 
@@ -171,15 +188,16 @@ namespace c2pool::libnet::messages
     class message_version : public base_message
     {
     public:
-        int version;
-        int services;
+        IntType(32) version;
+        IntType(64) services;
         address_type addr_to;
         address_type addr_from;
-        unsigned long long nonce;
-        std::string sub_version;
-        int mode; //# always 1 for legacy compatibility
-        uint256 best_share_hash;
-        PoolVersion pool_version;
+        IntType(64) nonce;
+        StrType sub_version;
+        IntType(32) mode; //# always 1 for legacy compatibility
+        /*uint256*/
+        PossibleNoneType<IntType(256)> best_share_hash;
+        //PoolVersion pool_version;
 
     public:
         message_version() : base_message("version") {}
@@ -194,62 +212,19 @@ namespace c2pool::libnet::messages
             sub_version = sub_ver;
             mode = _mode;
             best_share_hash = best_hash;
-            pool_version = pool_ver;
+            //pool_version = pool_ver;
         }
 
-        message_version &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-
-            version = value["version"].get_int();
-
-            auto services_str = value["services"].get_str();
-            std::stringstream ss_services;
-            ss_services << services_str;
-            ss_services >> services;
-
-            addr_to = value["addr_to"].get_obj();
-
-            addr_from = value["addr_from"].get_obj();
-
-            auto str_nonce = value["nonce"].get_str();
-            std::stringstream ss_nonce;
-            ss_nonce << str_nonce;
-            ss_nonce >> nonce;
-
-            sub_version = value["sub_version"].get_str();
-
-            mode = value["mode"].get_int();
-
-            best_share_hash.SetHex(value["best_share_hash"].get_str());
-
-            if (value.exists("pool_version"))
-            {
-                int pool_ver_temp = value["pool_version"].get_int();
-                pool_version = (PoolVersion)pool_ver_temp;
-            }
-            else
-            {
-                pool_version = PoolVersion::None;
-            }
-
-            return *this;
+            stream << version << services << addr_to << addr_from << nonce << sub_version << mode << best_share_hash;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("version", version);
-            result.pushKV("services", services);
-            result.pushKV("addr_to", addr_to);
-            result.pushKV("addr_from", addr_from);
-            result.pushKV("nonce", (uint64_t)nonce);
-            result.pushKV("sub_version", sub_version);
-            result.pushKV("mode", mode);
-            result.pushKV("best_share_hash", best_share_hash.GetHex());
-
-            return result;
+            stream >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
+            return stream;
         }
     };
 
@@ -258,24 +233,21 @@ namespace c2pool::libnet::messages
     public:
         message_ping() : base_message("ping") {}
 
-        message_ping &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            return *this;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            return result;
+            return stream;
         }
     };
 
     class message_addrme : public base_message
     {
     public:
-        int port;
+        IntType(16) port;
 
     public:
         message_addrme() : base_message("addrme") {}
@@ -285,28 +257,23 @@ namespace c2pool::libnet::messages
             port = _port;
         }
 
-        message_addrme &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            port = value["port"].get_int();
-
-            return *this;
+            stream << port;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("port", port);
-
-            return result;
+            stream >> port;
+            return stream;
         }
     };
 
     class message_getaddrs : public base_message
     {
     public:
-        int count;
+        IntType(32) count;
 
     public:
         message_getaddrs() : base_message("getaddrs") {}
@@ -316,29 +283,23 @@ namespace c2pool::libnet::messages
             count = cnt;
         }
 
-        message_getaddrs &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-
-            count = value["count"].get_int();
-
-            return *this;
+            stream << count;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("count", count);
-
-            return result;
+            stream >> count;
+            return stream;
         }
     };
 
     class message_addrs : public base_message
     {
     public:
-        std::vector<c2pool::messages::addr> addrs;
+        ListType<c2pool::messages::addr> addrs;
 
     public:
         message_addrs() : base_message("addrs") {}
@@ -348,34 +309,20 @@ namespace c2pool::libnet::messages
             addrs = _addrs;
         }
 
-        message_addrs &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["addrs"].get_array().getValues())
-            {
-                c2pool::messages::addr _temp_addr;
-                _temp_addr = arr_value;
-                addrs.push_back(_temp_addr);
-            }
-            return *this;
+            stream << addrs;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue addrs_array(UniValue::VARR);
-
-            for (auto _addr : addrs)
-            {
-                addrs_array.push_back(_addr);
-            }
-            result.pushKV("addrs", addrs_array);
-
-            return result;
+            stream >> addrs;
+            return stream;
         }
     };
 
+    //TODO
     class message_shares : public base_message
     {
     public:
@@ -389,45 +336,26 @@ namespace c2pool::libnet::messages
             raw_shares = _shares;
         }
 
-        message_shares &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["shares"].get_array().getValues())
-            {
-                if (arr_value.exists("type") && arr_value.exists("contents"))
-                {
-                    raw_shares.push_back(arr_value);
-                }
-                else
-                {
-                    LOG_WARNING << "Raw share in message_shares incorrect: " << arr_value.write();
-                }
-            }
-            return *this;
+            stream << raw_shares;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue shares_array(UniValue::VARR);
-            for (auto _share : raw_shares)
-            {
-                shares_array.push_back(_share);
-            }
-            result.pushKV("shares", shares_array);
-
-            return result;
+            stream >> raw_shares;
+            return stream;
         }
     };
 
     class message_sharereq : public base_message
     {
     public:
-        uint256 id;
-        std::vector<uint256> hashes;
-        unsigned long long parents;
-        std::vector<uint256> stops;
+        IntType(256) id;
+        ListType<IntType(256)> hashes;
+        VarIntType parents;
+        ListType<IntType(256)> stops;
 
     public:
         message_sharereq() : base_message("sharereq") {}
@@ -440,49 +368,16 @@ namespace c2pool::libnet::messages
             stops = _stops;
         }
 
-        message_sharereq &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            id.SetHex(value["id"].get_str());
-            for (auto arr_value : value["hashes"].get_array().getValues())
-            {
-                uint256 _temp_hash;
-                _temp_hash.SetHex(arr_value.get_str());
-                hashes.push_back(_temp_hash);
-            }
-            parents = value["parents"].get_int64();
-            for (auto arr_value : value["stops"].get_array().getValues())
-            {
-                uint256 _temp_stop;
-                _temp_stop.SetHex(arr_value.get_str());
-                stops.push_back(_temp_stop);
-            }
-            return *this;
+            stream << id << hashes << parents << stops;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("id", id.GetHex());
-
-            UniValue hashes_array(UniValue::VARR);
-            for (auto _hash : hashes)
-            {
-                hashes_array.push_back(_hash.GetHex());
-            }
-            result.pushKV("hashes", hashes_array);
-
-            result.pushKV("parents", (uint64_t)parents);
-
-            UniValue stops_array(UniValue::VARR);
-            for (auto _stop : stops)
-            {
-                hashes_array.push_back(_stop.GetHex());
-            }
-            result.pushKV("stops", stops_array);
-
-            return result;
+            stream >> id >> hashes >> parents >> stops;
+            return stream;
         }
     };
 
@@ -500,9 +395,9 @@ namespace c2pool::libnet::messages
     class message_sharereply : public base_message
     {
     public:
-        uint256 id;
-        ShareReplyResult result;
-        std::vector<UniValue> shares; //type + contents data
+        IntType(256) id;
+        EnumType<ShareReplyResult, VarIntType> result;
+        ListType<UniValue> shares; //type + contents data
 
     public:
         message_sharereply() : base_message("sharereply") {}
@@ -514,50 +409,23 @@ namespace c2pool::libnet::messages
             shares = _shares;
         }
 
-        message_sharereply &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            id.SetHex(value["id"].get_str());
-
-            result = (ShareReplyResult)value["result"].get_int();
-
-            for (auto arr_value : value["shares"].get_array().getValues())
-            {
-                if (arr_value.exists("type") && arr_value.exists("contents"))
-                {
-                    shares.push_back(arr_value);
-                }
-                else
-                {
-                    LOG_WARNING << "Raw share in message_sharereply incorrect: " << arr_value.write();
-                }
-            }
-            return *this;
+            stream << id << result << shares;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue _result(UniValue::VOBJ);
-
-            _result.pushKV("id", id.GetHex());
-
-            _result.pushKV("result", (int)result);
-
-            UniValue shares_array(UniValue::VARR);
-            for (auto _share : shares)
-            {
-                shares_array.push_back(_share);
-            }
-            _result.pushKV("shares", shares_array);
-
-            return result;
+            stream >> id >> result >> shares;
+            return stream;
         }
     };
 
     class message_have_tx : public base_message
     {
     public:
-        std::vector<uint256> tx_hashes;
+        ListType<IntType(256)> tx_hashes;
 
     public:
         message_have_tx() : base_message("have_tx") {}
@@ -567,37 +435,23 @@ namespace c2pool::libnet::messages
             tx_hashes = _tx_hashes;
         }
 
-        message_have_tx &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["tx_hashes"].get_array().getValues())
-            {
-                uint256 _temp_tx_hash;
-                _temp_tx_hash.SetHex(arr_value.get_str());
-                tx_hashes.push_back(_temp_tx_hash);
-            }
-            return *this;
+            stream << tx_hashes;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue tx_hashes_array(UniValue::VARR);
-            for (auto _tx_hash : tx_hashes)
-            {
-                tx_hashes_array.push_back(_tx_hash.GetHex());
-            }
-            result.pushKV("tx_hashes", tx_hashes_array);
-
-            return result;
+            stream >> tx_hashes;
+            return stream;
         }
     };
 
     class message_losing_tx : public base_message
     {
     public:
-        std::vector<uint256> tx_hashes;
+        ListType<IntType(256)> tx_hashes;
 
     public:
         message_losing_tx() : base_message("losing_tx") {}
@@ -607,30 +461,16 @@ namespace c2pool::libnet::messages
             tx_hashes = _tx_hashes;
         }
 
-        message_losing_tx &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["tx_hashes"].get_array().getValues())
-            {
-                uint256 _temp_tx_hash;
-                _temp_tx_hash.SetHex(arr_value.get_str());
-                tx_hashes.push_back(_temp_tx_hash);
-            }
-            return *this;
+            stream << tx_hashes;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue tx_hashes_array(UniValue::VARR);
-            for (auto _tx_hash : tx_hashes)
-            {
-                tx_hashes_array.push_back(_tx_hash.GetHex());
-            }
-            result.pushKV("tx_hashes", tx_hashes_array);
-
-            return result;
+            stream >> tx_hashes;
+            return stream;
         }
     };
 
