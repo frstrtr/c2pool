@@ -33,17 +33,18 @@ namespace c2pool::libnet::p2p
     void P2PSocket::connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints)
     {
         //auto self = shared_from_this();
-        boost::asio::async_connect(_socket, endpoints, [this, handle](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep) {
-            LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
-            if (!ec)
-            {
-                init(handle);
-            }
-            else
-            {
-                LOG_ERROR << "async_connect: " << ec << " " << ec.message();
-            }
-        });
+        boost::asio::async_connect(_socket, endpoints, [this, handle](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep)
+                                   {
+                                       LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
+                                       if (!ec)
+                                       {
+                                           init(handle);
+                                       }
+                                       else
+                                       {
+                                           LOG_ERROR << "async_connect: " << ec << " " << ec.message();
+                                       }
+                                   });
     }
 
     void P2PSocket::init(protocol_handle handle)
@@ -69,46 +70,17 @@ namespace c2pool::libnet::p2p
         start_read();
     }
 
-    //TODO: remove
-    // template <class protocol_type>
-    // void P2PSocket::set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version)
-    // {
-    //     LOG_TRACE << "Set new protocol type!";
-    //     std::shared_ptr<c2pool::libnet::p2p::Protocol> temp_protocol = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), this);
-    //     LOG_TRACE << "Called handle";
-    //     LOG_TRACE << handle;
-    //     if (handle.empty())
-    //     {
-    //         LOG_TRACE << "handle empty";
-    //     }
-    //     else
-    //     {
-    //         LOG_TRACE << "handle not empty";
-    //     }
-
-    //     LOG_TRACE << "Called handle";
-    //     handle(temp_protocol); // <---------------bug there!!!!!!!!!
-    //     LOG_TRACE << "Set new protocol like main!";
-    //     _protocol = temp_protocol;
-    //     _protocol.lock()->handle(raw_message_version);
-    //     LOG_TRACE << "set_protocol_type_and_version ended!";
-    // }
-
     void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
-        //TODO-----------------------------------<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>
-        //['83', 'e6', '5d', '2c', '81', 'bf', '6d', '68'] PREFIX insert
-
-        write_prefix(msg);        
-
-        
+        // auto msg_data = std::make_shared<StreamMessageData>(msg, net());
+        write_prefix(msg);
     }
 
     void P2PSocket::write_prefix(std::shared_ptr<base_message> msg)
     {
-        auto prefix_data = msg->get_prefix();
-        boost::asio::async_write(_socket, boost::asio::buffer(std::get<0>(prefix_data), std::get<1>(prefix_data)),
-                                 [this, msg](boost::system::error_code _ec, std::size_t length) {
+        boost::asio::async_write(_socket, boost::asio::buffer(net()->PREFIX, net()->PREFIX_LENGTH),
+                                 [this, msg](boost::system::error_code _ec, std::size_t length)
+                                 {
                                      if (_ec)
                                      {
                                          LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
@@ -118,12 +90,60 @@ namespace c2pool::libnet::p2p
                                  });
     }
 
-    void P2PSocket::write_message_data(std::shared_ptr<base_message> msg)
+    struct SendPackedMsg
     {
-        auto msg_data = msg->serialize(); //tuple<char*, int>(data, len)
-        boost::asio::async_write(_socket, boost::asio::buffer(std::get<0>(msg_data), std::get<1>(msg_data)),
+
+        char *data;
+        int32_t len;
+
+        SendPackedMsg(std::shared_prt<base_message> msg)
+        {
+            PackStream value;
+
+            //command [+]
+            const char *temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
+            auto command = new char[12]{'\0'};
+            memcpy(command, temp_cmp, strlen(temp_cmd));
+            PackStream s_command(command, 12);
+            value << s_command;
+            delete command;
+
+            //-----
+            PackStream payload_stream;
+            payload_stream << *msg;
+
+            //len [+]
+            IntType(32) unpacked_len(payload_stream.size());
+            value << unpacked_len;
+
+            //checksum [-]
+            //TODO: sha256(sha256(payload))
+
+            //payload [+]
+            value << payload_stream;
+
+            //result
+            data = new char[value.size()];
+            memcpy(data, value.bytes(), value.size());
+            len = value.size();
+        }
+
+        ~SendPackedMsg()
+        {
+            if (data != nullptr)
+            {
+                delete data;
+            }
+        }
+    };
+
+    void P2PSocket::write_message_data(std::shared_ptr<base_message> _msg)
+    {
+        SendPackedMsg msg(msg);
+        boost::asio::async_write(_socket, boost::asio::buffer(msg.data, msg.len),
                                  //TODO: this -> shared_this()
-                                 [this](boost::system::error_code _ec, std::size_t length) {
+                                 [this](boost::system::error_code _ec, std::size_t length)
+                                 {
                                      if (_ec)
                                      {
                                          LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
@@ -150,7 +170,8 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->prefix, 8),
-                                [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t length)
+                                {
                                     LOG_TRACE << "try to read prefix";
                                     if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
                                     {
@@ -176,7 +197,8 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "protocol count in read_command" << _protocol.lock().use_count();
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->command, COMMAND_LENGTH),
-                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/)
+                                {
                                     if (!ec)
                                     {
                                         LOG_TRACE << "try to read command";
@@ -196,7 +218,8 @@ namespace c2pool::libnet::p2p
     {
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->length, PAYLOAD_LENGTH),
-                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/)
+                                {
                                     if (!ec)
                                     {
                                         LOG_TRACE << "try to read length";
@@ -217,7 +240,8 @@ namespace c2pool::libnet::p2p
     {
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->checksum, CHECKSUM_LENGTH),
-                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t /*length*/)
+                                {
                                     if (!ec)
                                     {
                                         LOG_TRACE << "try to read checksum";
@@ -237,7 +261,8 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "read_payload";
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len()),
-                                [this, tempRawMessage](boost::system::error_code ec, std::size_t length) {
+                                [this, tempRawMessage](boost::system::error_code ec, std::size_t length)
+                                {
                                     if (!ec)
                                     {
                                         c2pool::python::other::debug_log(tempRawMessage->converter->payload, tempRawMessage->converter->get_unpacked_len());

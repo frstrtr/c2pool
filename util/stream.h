@@ -39,6 +39,12 @@ struct PackStream
         data = vector<unsigned char>(value, value + len);
     }
 
+    PackStream(char *value, int32_t len)
+    {
+        auto temp = (unsigned char)value;
+        data = vector<unsigned char>(temp, temp + len);
+    }
+
     PackStream &operator<<(PackStream &val)
     {
         data.insert(data.end(), val.data.begin(), val.data.end());

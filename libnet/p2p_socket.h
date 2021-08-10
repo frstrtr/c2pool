@@ -76,27 +76,45 @@ namespace c2pool::libnet::p2p
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
     };
 
-    struct SendMessageData
+    struct StreamMessageData
     {
         char *prefix;
+        int32_t prefix_len;
         char *command;
         char *length;
         char *checksum;
         char *payload;
 
-        SendMessageData(shared_ptr<base_message> msg, shared_ptr<c2pool::Network> _net)
+        StreamMessageData(shared_ptr<base_message> msg, shared_ptr<c2pool::Network> _net)
         {
+            //prefix
             prefix = new char[_net->PREFIX_LENGTH];
+            prefix_len = _net->PREFIX_LENGTH;
             memcpy(prefix, _net->PREFIX_LENGTH, _net->PREFIX/_LENGTH);
-
+            
+            //command
             const char* temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
             command = new char[12]{'\0'};
             memcpy(command, temp_cmp, strlen(temp_cmd));
 
-            PackStream stream;
-            stream << *msg;
+            //payload
+            PackStream payload_stream;
+            payload_stream << *msg;
+            payload = new char[payload_stream.size()];
+            auto temp_payload = payload_stream.bytes();
+            memcpy(payload, temp_payload, payload_stream.size());
 
-            //TODO:
+            //len
+            PackStream stream2;
+            IntType(32) unpacked_len (payload_stream.size());
+            stream2 << IntType(32);
+            auto temp_len = stream2.bytes();
+            length = new char[4];
+            memcpy(length, temp_len, 4);
+
+            //checksum
+            //TODO: sha256(sha256(payload))
+            
         }
 
         PackStream &write(PackStream &stream) override
