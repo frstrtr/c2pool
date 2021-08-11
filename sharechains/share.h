@@ -7,6 +7,7 @@
 #include <networks/network.h>
 #include <devcore/addrStore.h>
 #include <util/types.h>
+#include <util/stream.h>
 using dbshell::DBObject;
 
 #include <string>
@@ -89,6 +90,11 @@ namespace c2pool::shares
         virtual void contents_load(UniValue contents);
 
         virtual bool check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/);
+
+        static PackStream get_ref_hash(shared_ptr<Network> _net, ShareInfo _share_info, MerkleLink _ref_merkle_link){
+            IntType(256) res;
+            coind::data::check_merkle_link(coind::data::hash256())
+        }
     };
 
     //17

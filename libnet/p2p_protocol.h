@@ -48,7 +48,6 @@ namespace c2pool::libnet::p2p
     class P2P_Protocol : public Protocol
     {
     public:
-        //TODO: constructor (shared_ptr<initialize_network_protocol>)
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, const c2pool::libnet::INodeMember& member) : Protocol(socket, member)
         {
             LOG_TRACE << "P2P_Protocol: "
