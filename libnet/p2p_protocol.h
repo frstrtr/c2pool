@@ -1,7 +1,6 @@
 #pragma once
 
 #include "messages.h"
-#include "converter.h"
 #include <devcore/logger.h>
 #include "p2p_socket.h"
 #include "node_member.h"
@@ -31,7 +30,7 @@ namespace c2pool::libnet::p2p
 
         unsigned int other_version = -1;
         std::string other_sub_version;
-        int other_services; //TODO: int64? IntType(64)
+        uint64_t other_services;
         unsigned long long _nonce;
 
     protected:
@@ -46,56 +45,20 @@ namespace c2pool::libnet::p2p
         virtual shared_ptr<raw_message> make_raw_message() { return make_shared<raw_message>(); }
     };
 
-    //protocol for init network type [c2pool/p2pool]; user only for message_version
-    class initialize_network_protocol : public Protocol, public std::enable_shared_from_this<initialize_network_protocol>
-    {
-    private:
-        protocol_handle _handle;
-
-        //true = c2pool; false = p2pool
-        bool check_c2pool(UniValue &raw_message_version_json)
-        {
-            //todo
-            return false;
-        }
-
-    public:
-        initialize_network_protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, protocol_handle handle_obj, const c2pool::libnet::INodeMember& member) : Protocol(socket, member), _handle(std::move(handle_obj))
-        {
-        }
-
-        void handle(shared_ptr<raw_message> RawMSG_version) override;
-
-        shared_ptr<raw_message> make_raw_message() override
-        {
-            auto raw_msg = make_shared<raw_message>();
-            raw_msg->set_converter_type<p2pool_converter>();
-            raw_msg->set_prefix(net());
-            return raw_msg;
-        }
-    };
-
-    template <class converter_type>
     class P2P_Protocol : public Protocol
     {
     public:
-        //TODO: constructor (shared_ptr<initialize_network_protocol>)
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, const c2pool::libnet::INodeMember& member) : Protocol(socket, member)
         {
-            LOG_TRACE << "P2P_Protcol: "
+            LOG_TRACE << "P2P_Protocol: "
                       << "start constructor";
         }
 
         void handle(shared_ptr<raw_message> RawMSG) override
         {
             LOG_DEBUG << "called HANDLE msg in p2p_protocol";
-            //В Python скрипте, команда передается, как int, эквивалентный commands
-            RawMSG->deserialize();
-            LOG_TRACE << "rawmsg value = " << RawMSG->value.isNull();
-            LOG_TRACE << "RawMSG->value: " << RawMSG->value.write();
-            UniValue json_value = RawMSG->value;
 
-            switch (RawMSG->name_type) //todo: switch -> if (" " == cmd)
+            switch (RawMSG->name_type.get())
             {
             case commands::cmd_version:
                 handle(GenerateMsg<message_version>(json_value));
@@ -140,20 +103,10 @@ namespace c2pool::libnet::p2p
             }
         }
 
-        shared_ptr<raw_message> make_raw_message() override
-        {
-            auto raw_msg = make_shared<raw_message>();
-            raw_msg->set_converter_type<converter_type>();
-            raw_msg->set_prefix(net());
-            return raw_msg;
-        }
-
         template <class message_type, class... Args>
         shared_ptr<message_type> make_message(Args &&...args)
         {
             auto msg = std::make_shared<message_type>(args...);
-            msg->template set_converter_type<converter_type>();
-            msg->set_prefix(net());
             return msg;
         }
 
@@ -163,7 +116,6 @@ namespace c2pool::libnet::p2p
         shared_ptr<MsgType> GenerateMsg(UniValue &value)
         {
             shared_ptr<MsgType> msg = make_shared<MsgType>();
-            msg->template set_converter_type<converter_type>();
             *msg = value;
             return msg;
         }
@@ -370,8 +322,4 @@ namespace c2pool::libnet::p2p
             //TODO:
         }
     };
-
-    typedef P2P_Protocol<c2pool::libnet::messages::p2pool_converter> p2pool_protocol;
-    //TODO: typedef P2P_Protocol<c2pool::libnet::messages::c2pool_converter> c2pool_protocol;
-
 } // namespace c2pool::p2p

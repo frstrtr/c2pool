@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 
-set(command "/usr/bin/cmake;-DCMAKE_INSTALL_PREFIX=/home/sl33n/c2pool/lib/secp256k1;-DCMAKE_POSITION_INDEPENDENT_CODE=;-DCMAKE_C_COMPILER=/bin/gcc-8;-DCMAKE_CXX_COMPILER=/bin/g++-8;-GUnix Makefiles;/home/sl33n/c2pool/lib/secp256k1/src/secp256k1")
+set(command "/usr/bin/cmake;-DCMAKE_INSTALL_PREFIX=/home/sl33n/c2pool/lib/secp256k1;-DCMAKE_POSITION_INDEPENDENT_CODE=;-DCMAKE_C_COMPILER=/bin/gcc-8;-DCMAKE_CXX_COMPILER=/bin/g++-8;-GNinja;/home/sl33n/c2pool/lib/secp256k1/src/secp256k1")
 set(log_merged "")
 set(log_output_on_failure "")
 set(stdout_log "/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-out.log")
