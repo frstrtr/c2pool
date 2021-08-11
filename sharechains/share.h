@@ -89,6 +89,8 @@ namespace c2pool::shares
         virtual void contents_load(UniValue contents);
 
         virtual bool check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/);
+
+        static c2pool::SerializedData get_ref_hash(shared_ptr<Network> _net, UniValue share_info, MerkleLink ref_merkle_link);
     };
 
     //17

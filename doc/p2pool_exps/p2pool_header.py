@@ -4,7 +4,7 @@ self.gentx_hash = check_hash_link(
     self.get_ref_hash(net, self.share_info, contents['ref_merkle_link']) + pack.IntType(64).pack(self.contents['last_txout_nonce']) + pack.IntType(32).pack(0),
     self.gentx_before_refhash,
 )
-#===
+#===+
     def check_hash_link(hash_link, data, const_ending=''):
         extra_length = hash_link['length'] % (512//8)
         assert len(hash_link['extra_data']) == max(0, extra_length - len(const_ending))
@@ -30,13 +30,6 @@ self.gentx_hash = check_hash_link(
                     dict(left=h, right=c) if (link['index'] >> i) & 1 else
                     dict(left=c, right=h)
                 )), enumerate(link['branch']), tip_hash)
-
-
-
-
-
-
-
 
 
 
