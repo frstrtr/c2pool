@@ -11,5 +11,6 @@ namespace c2pool::shares
         auto extra_length = hash_link.length % (512 / 8);
         //TODO: assert len(hash_link['extra_data']) == max(0, extra_length - len(const_ending))
         auto extra = hash_link.extra_data + const_ending;
+        //TODO: 
     }
 }
