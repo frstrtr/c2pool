@@ -20,31 +20,4 @@ namespace c2pool::libnet::p2p
                   << "start constuctor";
         _socket = _sct;
     }
-
-    void initialize_network_protocol::handle(shared_ptr<raw_message> RawMSG_version)
-    {
-        LOG_DEBUG << "called handle in initialize_network_protocol.";
-        RawMSG_version->deserialize();
-
-        UniValue json_value = RawMSG_version->value;
-        LOG_TRACE << "initialize_network_protocol name_type: " << RawMSG_version->name_type;
-        if (RawMSG_version->name_type == commands::cmd_version)
-        {
-            if (check_c2pool(json_value))
-            {
-                //c2pool
-                //_socket->get_protocol_type<>
-            }
-            else
-            {
-                LOG_TRACE << "Set p2pool protocol in initialize_network_protocol";
-                //p2pool
-                _socket->set_protocol_type_and_version<p2pool_protocol>(_handle, RawMSG_version);
-            }
-        }
-        else
-        {
-            LOG_WARNING << "initialize_network_protocol get not message_version";
-        }
-    }
 }

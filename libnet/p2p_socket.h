@@ -11,7 +11,6 @@ namespace c2pool
     {
         class P2PNode;
         class Protocol;
-        class initialize_network_protocol;
     }
 } // namespace c2pool
 
@@ -21,6 +20,7 @@ namespace c2pool
 #include <networks/network.h>
 #include <boost/asio.hpp>
 #include <boost/function.hpp>
+#include <util/stream.h>
 namespace ip = boost::asio::ip;
 
 namespace c2pool::libnet::p2p
@@ -38,9 +38,6 @@ namespace c2pool::libnet::p2p
 
         void init(protocol_handle handle);
 
-        template <class protocol_type>
-        void set_protocol_type_and_version(protocol_handle handle, std::shared_ptr<raw_message> raw_message_version);
-
         bool isConnected() const { return _socket.is_open(); }
         ip::tcp::socket &get() { return _socket; }
         void disconnect() { _socket.close(); }
@@ -51,7 +48,8 @@ namespace c2pool::libnet::p2p
             return _socket.remote_endpoint(ec);
         }
 
-        std::tuple<std::string, std::string> get_addr(){
+        std::tuple<std::string, std::string> get_addr()
+        {
             auto ep = endpoint();
             return std::make_tuple(ep.address().to_string(), std::to_string(ep.port()));
         }
@@ -60,11 +58,12 @@ namespace c2pool::libnet::p2p
 
     private:
         void start_read();
-        void read_prefix(std::shared_ptr<raw_message> tempRawMessage);
-        void read_command(std::shared_ptr<raw_message> tempRawMessage);
-        void read_length(std::shared_ptr<raw_message> tempRawMessage);
-        void read_checksum(shared_ptr<raw_message> tempRawMessage);
-        void read_payload(std::shared_ptr<raw_message> tempRawMessage);
+        void read_prefix(std::shared_ptr<ReadPackedMsg> msg);
+        void read_command(std::shared_ptr<ReadPackedMsg> msg);
+        void read_length(std::shared_ptr<ReadPackedMsg> msg);
+        void read_checksum(std::shared_ptr<ReadPackedMsg> msg);
+        void read_payload(std::shared_ptr<ReadPackedMsg> msg);
+        void final_read_message(std::shared_ptr<ReadPackedMsg> msg)
 
         void write_prefix(std::shared_ptr<base_message> msg);
         void write_message_data(std::shared_ptr<base_message> msg);
@@ -73,7 +72,5 @@ namespace c2pool::libnet::p2p
         ip::tcp::socket _socket;
 
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
-
-        std::shared_ptr<initialize_network_protocol> initialize_protocol;
     };
 } // namespace c2pool::p2p

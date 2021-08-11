@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 
-set(command "${make};install")
+set(command "/usr/bin/cmake;--build;.;--target;install")
 set(log_merged "")
 set(log_output_on_failure "")
 set(stdout_log "/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-install-out.log")

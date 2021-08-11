@@ -1,5 +1,5 @@
-set(HEADER_FILES pystruct.h types.h events.h prefsum.h pack.h)
-set(SOURCE_FILES pystruct.cpp types.cpp prefsum.cpp pack.cpp)
+set(HEADER_FILES pystruct.h types.h events.h prefsum.h pack.h stream.h stream_types.h)
+set(SOURCE_FILES pystruct.cpp types.cpp prefsum.cpp pack.cpp stream.cpp)
 
 add_library(util STATIC ${SOURCE_FILES} ${HEADER_FILES})
 message("py3_lib = ${Python3_LIBRARIES}")
