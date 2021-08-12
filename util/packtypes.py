@@ -1451,3 +1451,6 @@ print('deserialized_msg_shares:\n {0}'.format(deserialized_msg_shares))
 # print(res2)
 
 #print([ x for x in IntType(16).pack(100)])
+
+# print(IntType(0).pack(2**568))
+# print(FixedStrType(1).pack(b"s"))

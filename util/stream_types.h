@@ -78,6 +78,50 @@ struct StrType
     }
 };
 
+//TODO: TEST
+template <int SIZE>
+struct FixedStrType
+{
+    string str;
+
+    FixedStrType()
+    {
+    }
+
+    FixedStrType(string _str)
+    {
+        if (_str.length() != SIZE)
+        {
+            throw std::invalid_argument("Incorrect length str in FixedStrType");
+        }
+        str = _str;
+    }
+
+    PackStream &write(PackStream &stream) const
+    {
+        LOG_TRACE << "FixedStrType Worked!";
+
+        for (auto c : str)
+        {
+            stream << c;
+        }
+
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        char *c_str = new char[SIZE];
+        for (int i = 0; i < SIZE; i++)
+        {
+            stream >> c_str[i];
+        }
+
+        str = string(c_str, c_str + SIZE);
+        return stream;
+    }
+};
+
 template <typename INT_T>
 struct IntType
 {
@@ -211,6 +255,18 @@ private:
 
 public:
     optional<ObjType> value;
+
+    ObjType get() const
+    {
+        if (value.has_value())
+        {
+            return value.value();
+        }
+        else
+        {
+            return none_value;
+        }
+    }
 
     PackStream &write(PackStream &stream) const
     {
