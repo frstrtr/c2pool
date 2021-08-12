@@ -12,17 +12,17 @@ self.gentx_hash = check_hash_link(
         assert len(extra) == extra_length
         return pack.IntType(256).unpack(hashlib.sha256(sha256.sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
 
-#=======
+#=======[+]
         @classmethod
-        def get_ref_hash(cls, net, share_info, ref_merkle_link):
+        def get_ref_hash(cls, net, share_info, ref_merkle_link): [+]
             return pack.IntType(256).pack(bitcoin_data.check_merkle_link(bitcoin_data.hash256(cls.get_dynamic_types(net)['ref_type'].pack(dict(
                 identifier=net.IDENTIFIER,
                 share_info=share_info,
             ))), ref_merkle_link))
 
-#===========
+#===========[+]
             # tip_hash = bitcoin_data.hash256 = int256
-            #link = ref_merkle_link
+            #link = ref_merkle_link 
             def check_merkle_link(tip_hash, link):
                 if link['index'] >= 2**len(link['branch']):
                     raise ValueError('index too large')

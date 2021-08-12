@@ -7,6 +7,7 @@
 #include <btclibs/util/strencodings.h>
 #include <devcore/py_base.h>
 #include <util/pack.h>
+#include <util/stream.h>
 #include <univalue.h>
 
 #include <cstring>
@@ -141,6 +142,15 @@ namespace coind::data
         return result;
     }
 
+    uint256 hash256(PackStream stream)
+    {
+        auto _bytes = stream.bytes();
+        string in(reinterpret_cast<char const *>(_bytes), stream.size());
+        return hash256(in);
+    }
+
+
+    //TODO: remove legacy:
     uint256 hash256(c2pool::SerializedData data)
     {
         string in(reinterpret_cast<char const *>(data.data), data.length);
