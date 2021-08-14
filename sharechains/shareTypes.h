@@ -3,6 +3,8 @@
 #include <btclibs/uint256.h>
 #include <univalue.h>
 #include <boost/optional.hpp>
+#include <util/stream_types.h>
+#include <util/stream.h>
 
 #include <set>
 #include <tuple>
@@ -15,6 +17,27 @@ namespace c2pool::shares
         unk = 0,
         orphan = 253,
         doa = 254
+    };
+
+    struct SmallBlockHeaderType_stream
+    {
+        VarIntType version;
+        PossibleNoneType<IntType(256)> previous_block;
+        IntType(32) timestamp;
+        FloatingIntegerType bits;
+        IntType(32) nonce;
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << version << previous_block << timestamp << bits << nonce;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> version >> previous_block >> timestamp >> bits >> nonce;
+            return stream;
+        }
     };
 
     class SmallBlockHeaderType
@@ -54,6 +77,25 @@ namespace c2pool::shares
             result.pushKV("nonce", (uint64_t)nonce);
 
             return result;
+        }
+    };
+
+    struct MerkleLink_stream
+    {
+        ListType<IntType(256)> branch;
+        //В p2pool используется костыль при пустой упаковке, но в этой реализации он не нужен.
+        //index
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << version << previous_block << timestamp << bits << nonce;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> version >> previous_block >> timestamp >> bits >> nonce;
+            return stream;
         }
     };
 
@@ -105,17 +147,36 @@ namespace c2pool::shares
     class BlockHeaderType : public SmallBlockHeaderType
     {
     public:
-        
     public:
         BlockHeaderType() : SmallBlockHeaderType(){};
         BlockHeaderType(SmallBlockHeaderType min_header, )
     };
 
+    struct HashLinkType_stream
+    {
+        FixedStrType<32> state;
+        //Костыль в p2pool, который не нужен.
+        //FixedStrType<0> extra_data
+        VarIntType length;
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << state << length;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> state >> length;
+            return stream;
+        }
+    };
+
     class HashLinkType
     {
     public:
-        std::string state;         //TODO: pack.FixedStrType(32)
-        std::string extra_data;    //TODO: pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
+        std::string state;         //pack.FixedStrType(32)
+        std::string extra_data;    //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
         unsigned long long length; //pack.VarIntType()
 
         HashLinkType() {}
@@ -141,6 +202,24 @@ namespace c2pool::shares
             result.pushKV("length", (uint64_t)length);
 
             return result;
+        }
+    };
+
+    struct SegwitData_stream
+    {
+        MerkleLink_stream txid_merkle_link;
+        IntType(256) wtxid_merkle_root;
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << txid_merkle_link << wtxid_merkle_root;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> txid_merkle_link >> wtxid_merkle_root;
+            return stream;
         }
     };
 
@@ -180,6 +259,30 @@ namespace c2pool::shares
             result.pushKV("wtxid_merkle_root", wtxid_merkle_root.GetHex());
 
             return result;
+        }
+    };
+
+    struct ShareData_stream
+    {
+        PossibleNoneType<IntType(256)> previous_share_hash;
+        VarStrType coinbase;
+        IntType(32) nonce;
+        IntType(160) pubkey_hash;
+        IntType(64) subsidy;
+        IntType(16) donation;
+        EnumType<StaleInfo, IntType(8)> stale_info;
+        VarIntType desired_version;
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << previous_share_hash << coinbase << nonce << pubkey_hash << subsidy << donation << stale_info << desired_version;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> previous_share_hash >> coinbase >> nonce >> pubkey_hash >> subsidy >> donation >> stale_info >> desired_version;
+            return stream;
         }
     };
 
@@ -226,6 +329,69 @@ namespace c2pool::shares
             result.pushKV("desired_version", (uint64_t)desired_version);
 
             return result;
+        }
+    };
+
+    struct transaction_hash_refs_stream
+    {
+        VarIntType share_count;
+        VarIntType tx_count;
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << share_count << tx_count;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> share_count >> tx_count;
+            return stream;
+        }
+    };
+
+    struct ShareInfo_stream
+    {
+        ShareData_stream share_data;
+        PossibleNoneType<SegwitData_stream> segwit_data;
+        ListType<IntType(256)> new_transaction_hashes;
+        ListType<transaction_hash_refs_stream> transaction_hash_refs;
+        PossibleNoneType<IntType(256)> far_share_hash;
+        FloatingIntegerType max_bits;
+        FloatingIntegerType bits;
+        IntType(32) timestamp;
+        IntType(32) absheight;
+        IntType(128) abswork;
+
+        virtual PackStream &write(PackStream &stream) = 0;
+
+        virtual PackStream &read(PackStream &stream) = 0;
+    };
+
+    template <int VERSION, int SEGWIT_VERSION>
+    struct ShareInfoVer_stream : ShareInfo_stream
+    {
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << share_data;
+            if (VERSION >= SEGWIT_VERSION)
+            {
+                stream << segwit_data.get();
+            }
+            stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp << absheight << abswork;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> share_data;
+            if (VERSION >= SEGWIT_VERSION)
+            {
+                stream >> segwit_data;
+            }
+            stream >> new_transaction_hashes >> transaction_hash_refs >> far_share_hash >> max_bits >> bits >> timestamp >> absheight >> abswork;
+            return stream;
         }
     };
 
@@ -298,7 +464,7 @@ namespace c2pool::shares
         //     }
         //     result.pushKV("new_transaction_hashes", new_transaction_hashes_array);
 
-        //     UniValue transaction_hash_refs_array(UniValue::VARR);
+        //     UniValue transaction_hash_refs_array(UniValue::VA[SRR);
         //     for (auto tx_hash_ref : transaction_hash_refs)
         //     {
         //         transaction_hash_refs_array.push_back(tx_hash_ref);
@@ -314,6 +480,25 @@ namespace c2pool::shares
 
         //     return result;
         // }
+    };
+
+    struct RefType
+    {
+        FixedStrType<8> identifier;
+        ShareInfo_stream share_info;
+
+        PackStream &write(PackStream &stream) const
+        {
+            stream << identifier << share_info;
+
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> identifier >> share_info;
+            return stream;
+        }
     };
 
 }
