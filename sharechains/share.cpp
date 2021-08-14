@@ -101,19 +101,7 @@ namespace c2pool::shares
         merkle_link = contents["merkle_link"].get_obj();
     }
 
-    c2pool::SerializedData BaseShare::get_ref_hash(shared_ptr<Network> _net, UniValue share_info, MerkleLink ref_merkle_link)
-    {
-        #pragma pack(push, 1)
-        struct ref_type {
-            const unsigned char *identifier;
-            unsigned char* share_info;
-        };
-        #pragma pack(pop)
-        ref_type ref = {_net->IDENTIFIER, c2pool::SerializedData::pack()}
-        auto packed_ref_type = c2pool::SerializedData::pack(ref)
-        uint256 coind::data::check_merkle_link()
-        auto packed_uint256 = SerializedData::pack()
-    }
+
 
     BaseShare::BaseShare(int VERSION, shared_ptr<Network> _net, tuple<string, string> _peer_addr, UniValue _contents) : SHARE_VERSION(VERSION), net(_net), peer_addr(_peer_addr), contents(_contents)
     {
@@ -158,6 +146,15 @@ namespace c2pool::shares
             }
             assert(set_new_tx_hashes == n);
         }
+
+        auto _ref_hash = get_ref_hash(net(), share_info, contents.ref_merkle_link);
+        _ref_hash << IntType(64)(contents.last_txout_nonce) << IntType(32)(0);
+
+        gentx_hash = check_hash_link(
+            hash_link,
+            _ref_hash,
+            gentx_before_refhash
+        );
         /*
         TODO:
         
