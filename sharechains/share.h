@@ -8,6 +8,7 @@
 #include <devcore/addrStore.h>
 #include <util/types.h>
 #include <util/stream.h>
+#include <util/stream_types.h>
 using dbshell::DBObject;
 
 #include <string>
@@ -20,6 +21,7 @@ using std::shared_ptr, std::string, std::make_shared;
 using std::vector, std::tuple, std::map;
 
 #include "shareTypes.h"
+#include "data.h"
 
 namespace c2pool::shares
 {
@@ -33,6 +35,7 @@ namespace c2pool::shares
         const int SHARE_VERSION; //init in constructor
     public:
         static const int32_t gentx_size = 50000;
+
     public:
         SmallBlockHeaderType min_header;
 
@@ -61,7 +64,7 @@ namespace c2pool::shares
         int32_t timestamp;
         int32_t absheight;
         uint128 abswork;
-        char* new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
+        char *new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
         //TODO: gentx_hash
         //TODO: header
         uint256 pow_hash;
@@ -79,21 +82,30 @@ namespace c2pool::shares
         virtual string SerializeJSON() override;
         virtual void DeserializeJSON(std::string json) override;
 
-        // operator c2pool::shares::PrefsumShareElement() const
-        // {
-        //     c2pool::shares::PrefsumShareElement prefsum_share = {hash, UintToArith256(coind::data::target_to_average_attempts(target)), UintToArith256(coind::data::target_to_average_attempts(max_target)), 1};
-        //     return prefsum_share;
-        // }
-
-        bool is_segwit_activated() const { return SHARE_VERSION >= net->SEGWIT_ACTIVATION_VERSION; }
+        bool is_segwit_activated() const
+        {
+            return c2pool::shares::is_segwit_activated(SHARE_VERSION, net);
+        }
 
         virtual void contents_load(UniValue contents);
 
         virtual bool check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/);
 
-        static PackStream get_ref_hash(shared_ptr<Network> _net, ShareInfo _share_info, MerkleLink _ref_merkle_link){
-            IntType(256) res;
-            coind::data::check_merkle_link(coind::data::hash256())
+        static PackStream get_ref_hash(shared_ptr<Network> _net, ShareInfo _share_info, MerkleLink _ref_merkle_link)
+        {
+            PackStream res;
+
+            RefType_stream ref_type_value(_net->IDENTIFIER, _share_info);
+            PackStream ref_type_stream;
+            ref_type_stream << ref_type_value;
+            auto ref_type_hash = coind::data::hash256(ref_type_stream);
+
+            auto unpacked_res = coind::data::check_merkle_link(ref_type_hash, _ref_merkle_link);
+
+            IntType(256) packed_res(unpacked_res);
+            res << packed_res;
+
+            return res;
         }
     };
 
