@@ -149,14 +149,6 @@ namespace coind::data
         return hash256(in);
     }
 
-
-    //TODO: remove legacy:
-    uint256 hash256(c2pool::SerializedData data)
-    {
-        string in(reinterpret_cast<char const *>(data.data), data.length);
-        return hash256(in);
-    }
-
     uint256 hash256(uint256 data)
     {
         string in = data.GetHex();
