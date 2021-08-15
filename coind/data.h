@@ -6,7 +6,6 @@
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/util/strencodings.h>
 #include <devcore/py_base.h>
-#include <util/pack.h>
 #include <util/stream.h>
 #include <univalue.h>
 
@@ -159,6 +158,18 @@ namespace coind::data
     {
         uint256 left;
         uint256 right;
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << left << right;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> left >> right;
+            return stream;
+        }
     };
 
     //link = MerkleLink from shareTypes.h
@@ -180,12 +191,16 @@ namespace coind::data
             if ((index >> i) & 1)
             {
                 auto merkle_rec = MerkleRecordType{h, cur};
-                cur = hash256(c2pool::SerializedData::pack(merkle_rec));
+                PackStream ps;
+                ps << merkle_rec;
+                cur = hash256(ps);
             }
             else
             {
                 auto merkle_rec = MerkleRecordType{cur, h};
-                cur = hash256(c2pool::SerializedData::pack(merkle_rec));
+                PackStream ps;
+                ps << merkle_rec;
+                cur = hash256(ps);
             }
         }
 
