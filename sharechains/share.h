@@ -95,7 +95,7 @@ namespace c2pool::shares
         {
             PackStream res;
 
-            RefType_stream ref_type_value(_net->IDENTIFIER, _share_info);
+            RefType ref_type_value(_net->IDENTIFIER, _share_info);
             PackStream ref_type_stream;
             ref_type_stream << ref_type_value;
             auto ref_type_hash = coind::data::hash256(ref_type_stream);

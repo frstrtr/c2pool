@@ -1,7 +1,7 @@
 #include <devcore/logger.h>
 #include <cstring>
 #include <vector>
-#include <uint256.h>
+#include <btclibs/uint256.h>
 #include <optional>
 #include "stream.h"
 using namespace std;

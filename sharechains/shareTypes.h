@@ -487,6 +487,14 @@ namespace c2pool::shares
         FixedStrType<8> identifier;
         ShareInfo_stream share_info;
 
+        RefType(const unsigned char *_ident, ShareInfo _share_info)
+        {
+            string str_ident(_ident, 8);
+            identifier = FixedStrType<8>(str_ident);
+
+            share_info = _share_info;
+        }
+
         PackStream &write(PackStream &stream) const
         {
             stream << identifier << share_info;

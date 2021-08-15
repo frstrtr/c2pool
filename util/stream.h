@@ -41,7 +41,7 @@ struct PackStream
 
     PackStream(char *value, int32_t len)
     {
-        auto temp = (unsigned char)value;
+        auto temp = (unsigned char*)value;
         data = vector<unsigned char>(temp, temp + len);
     }
 
