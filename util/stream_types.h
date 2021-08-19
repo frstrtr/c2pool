@@ -2,6 +2,7 @@
 #include <cstring>
 #include <vector>
 #include <btclibs/uint256.h>
+#include <btclibs/arith_uint256.h>
 #include <optional>
 #include "stream.h"
 using namespace std;
@@ -181,6 +182,7 @@ struct IntType
 #define INT16 uint16_t
 #define INT32 uint32_t
 #define INT64 uint64_t
+#define INT160 uint160
 #define INT256 uint256
 
 #define IntType(bytes) IntType<INT##bytes>
@@ -292,6 +294,55 @@ public:
         {
             value.make_optional(*_value);
         }
+        return stream;
+    }
+};
+
+//TODO: test
+
+struct FloatingInteger
+{
+
+    IntType(32) bits;
+
+    FloatingInteger()
+    {
+    }
+
+    FloatingInteger(IntType(32) _bits)
+    {
+        bits = _bits;
+    }
+
+    uint256 target(){
+        arith_uint256 res(bits.value && 0x00ffffff);
+        
+        res << (8 * ((bits.value >> 24) - 3));
+
+        return ArithToUint256(res);
+    }
+};
+
+//TODO: test
+struct FloatingIntegerType
+{
+
+    FloatingInteger bits;
+
+    PackStream &write(PackStream &stream) const
+    {
+        stream << bits.bits;
+        bits = v.bits;
+
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        IntType(32) _bits;
+        stream >> _bits;
+        bits = FloatingInteger(_bits);
+
         return stream;
     }
 };
