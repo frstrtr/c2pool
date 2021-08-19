@@ -1,4 +1,4 @@
-set(HEADER_FILES pystruct.h types.h events.h prefsum.h stream.h stream_types.h)
+set(HEADER_FILES pystruct.h types.h events.h prefsum.h stream.h stream_types.h math.h)
 set(SOURCE_FILES pystruct.cpp types.cpp prefsum.cpp stream.cpp)
 
 add_library(util STATIC ${SOURCE_FILES} ${HEADER_FILES})
