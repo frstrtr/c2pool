@@ -7,7 +7,9 @@
 #include <btclibs/util/strencodings.h>
 #include <devcore/py_base.h>
 #include <util/stream.h>
+#include <util/stream_types.h>
 #include <univalue.h>
+#include <networks.h>
 
 #include <cstring>
 #include <string>
@@ -205,5 +207,38 @@ namespace coind::data
         }
 
         return cur;
+    }
+
+    struct HumanAddressType
+    {
+        IntType(8) version;
+        IntType(160) pubkey_hash;
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << version << pubkey_hash;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> version >> pubkey_hash;
+            return stream;
+        }
+    };
+
+    auto pubkey_hash_to_address(auto pubkey_hash, shared_ptr<Network> _net)
+    {
+
+    }
+
+    auto pubkey_to_address(auto pubkey, shared_ptr<Network> _net)
+    {
+
+    }
+
+    auto address_to_pubkey_hash(auto address, shared_ptr<Network> _net)
+    {
+        
     }
 }
