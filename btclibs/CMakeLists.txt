@@ -17,6 +17,8 @@ set(sources
     compat/endian.h
     compat/cpuid.h
     span.h
+    base58.h
+    base58.cpp
     ${crypto_sources}
     )
 
