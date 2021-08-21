@@ -4,12 +4,15 @@
 #include <btclibs/arith_uint256.h>
 #include <btclibs/hash.h>
 #include <btclibs/crypto/sha256.h>
+#include <btclibs/crypto/ripemd160.h>
 #include <btclibs/util/strencodings.h>
+#include <btclibs/base58.h>
+#include <btclibs/span.h>
 #include <devcore/py_base.h>
 #include <util/stream.h>
 #include <util/stream_types.h>
 #include <univalue.h>
-#include <networks.h>
+#include <networks/network.h>
 
 #include <cstring>
 #include <string>
@@ -156,6 +159,36 @@ namespace coind::data
         return hash256(in);
     }
 
+    uint160 hash160(string data)
+    {
+        uint160 result;
+
+        vector<unsigned char> out1;
+        out1.resize(CSHA256::OUTPUT_SIZE);
+
+        vector<unsigned char> out2;
+        out2.resize(CRIPEMD160::OUTPUT_SIZE);
+
+        CSHA256().Write((unsigned char *)&data[0], data.length()).Finalize(&out1[0]);
+        CRIPEMD160().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
+        result.SetHex(HexStr(out2));
+
+        return result;
+    }
+
+    uint160 hash160(PackStream stream)
+    {
+        auto _bytes = stream.bytes();
+        string in(reinterpret_cast<char const *>(_bytes), stream.size());
+        return hash160(in);
+    }
+
+    uint160 hash160(uint160 data)
+    {
+        string in = data.GetHex();
+        return hash160(in);
+    }
+
     struct MerkleRecordType
     {
         uint256 left;
@@ -227,18 +260,38 @@ namespace coind::data
         }
     };
 
-    auto pubkey_hash_to_address(auto pubkey_hash, shared_ptr<Network> _net)
+    std::string pubkey_hash_to_address(auto pubkey_hash, shared_ptr<c2pool::Network> _net)
     {
-
+        HumanAddressType human_addr{IntType(8)(_net->ADDRESS_VERSION), IntType(160)(pubkey_hash)};
+        PackStream stream;
+        stream << human_addr;
+        Span<unsigned char> _span(stream.data);
+        auto result = EncodeBase58(_span);
+        return result;
     }
 
-    auto pubkey_to_address(auto pubkey, shared_ptr<Network> _net)
+    auto pubkey_to_address(auto pubkey, shared_ptr<c2pool::Network> _net)
     {
-
+        return pubkey_to_address(hash160(pubkey), _net);
     }
 
-    auto address_to_pubkey_hash(auto address, shared_ptr<Network> _net)
+    auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
     {
-        
+        vector<unsigned char> decoded_addr;
+        if (!DecodeBase58(address, decoded_addr, 64))
+        {
+            throw ("Error address in decode");
+        }
+        PackStream stream(decoded_addr.data(), decoded_addr.size());
+
+        HumanAddressType human_addr;
+        stream >> human_addr;
+
+        if (human_addr.version.value != _net->ADDRESS_VERSION)
+        {
+            throw("address not for this net!");
+        }
+
+        return human_addr.pubkey_hash.value;
     }
 }

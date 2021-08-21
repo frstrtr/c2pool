@@ -89,6 +89,7 @@ namespace coind::data
         {
             return tx["marker"].get_int() == 0 && tx["flag"].get_int() >= 1;
         }
+        return false;
     }
 
     uint256 target_to_average_attempts(uint256 target)
