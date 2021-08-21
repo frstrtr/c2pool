@@ -332,7 +332,6 @@ struct FloatingIntegerType
     PackStream &write(PackStream &stream) const
     {
         stream << bits.bits;
-        bits = v.bits;
 
         return stream;
     }
