@@ -1,3 +1,5 @@
+#pragma once
+
 #include <devcore/logger.h>
 #include <cstring>
 #include <vector>
@@ -51,6 +53,7 @@ struct ListType
     }
 };
 
+//In p2pool - VarStrType
 struct StrType
 {
     string str;
@@ -147,7 +150,7 @@ struct IntType
         return value;
     }
 
-    PackStream &write(PackStream &stream) const
+    PackStream &write(PackStream &stream)
     {
         LOG_TRACE << "IntType Worked!";
 
@@ -161,7 +164,7 @@ struct IntType
         return stream;
     }
 
-    PackStream &read(PackStream &stream)
+    virtual PackStream &read(PackStream &stream)
     {
         unsigned char *packed = new unsigned char[CALC_SIZE(INT_T)];
         //int32_t len = sizeof(value2) / sizeof(*packed);
@@ -178,25 +181,83 @@ struct IntType
     }
 };
 
-#define INT8 uint8_t
-#define INT16 uint16_t
-#define INT32 uint32_t
-#define INT64 uint64_t
-#define INT160 uint160
-#define INT256 uint256
+template <typename INT_T>
+struct ULongIntType
+{
+    typedef INT_T value_type;
+    INT_T value;
 
-#define IntType(bytes) IntType<INT##bytes>
+    ULongIntType() {}
+
+    ULongIntType(INT_T _value)
+    {
+        value = _value;
+    }
+
+    ULongIntType<INT_T> &set(const INT_T &_value)
+    {
+        value = _value;
+        return *this;
+    }
+
+    ULongIntType get() const
+    {
+        return value;
+    }
+
+    virtual PackStream &write(PackStream &stream)
+    {
+        LOG_TRACE << "ULongIntType Worked!";
+
+        INT_T value2 = value;
+        unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
+        int32_t len = std::distance(value2.begin(), value.end());
+
+        PackStream s(packed, len);
+        stream << s;
+
+        return stream;
+    }
+
+    virtual PackStream &read(PackStream &stream)
+    {
+        unsigned char *packed = new unsigned char[value_type::WIDTH];
+        //int32_t len = sizeof(value2) / sizeof(*packed);
+
+        for (int i = 0; i < value_type::WIDTH; i++)
+        {
+            packed[i] = stream.data[i];
+            stream.data.erase(stream.data.begin(), stream.data.begin() + 1);
+        }
+        auto *_value = reinterpret_cast<INT_T *>(packed);
+        value = *_value;
+
+        return stream;
+    }
+};
+
+#define INT8 IntType<uint8_t>
+#define INT16 IntType<uint16_t>
+#define INT32 IntType<uint32_t>
+#define INT64 IntType<uint64_t>
+#define INT160 ULongIntType<uint160>
+#define INT128 ULongIntType<uint128>
+#define INT256 ULongIntType<uint256>
+
+#define IntType(bytes) INT##bytes
 
 struct VarIntType
 {
     uint64_t value;
+
+    VarIntType() {}
 
     VarIntType(uint64_t _v)
     {
         value = _v;
     }
 
-    PackStream &write(PackStream &stream) const
+    PackStream &write(PackStream &stream)
     {
         stream << value;
 
@@ -228,7 +289,7 @@ struct EnumType
         value = _value;
     }
 
-    PackStream &write(PackStream &stream) const
+    PackStream &write(PackStream &stream)
     {
         LOG_TRACE << "EnumType Worked!";
 
@@ -270,13 +331,13 @@ public:
         }
     }
 
-    PackStream &write(PackStream &stream) const
+    PackStream &write(PackStream &stream)
     {
         cout << "NonValueType Worked!" << endl;
 
         if (value.has_value())
         {
-            value.value.write(stream);
+            value.value().write(stream);
         }
         else
         {
@@ -290,10 +351,7 @@ public:
         ObjType *_value;
         stream >> *_value;
 
-        if (*_value != none_value)
-        {
-            value.make_optional(*_value);
-        }
+        value = make_optional(*_value);
         return stream;
     }
 };
@@ -314,9 +372,10 @@ struct FloatingInteger
         bits = _bits;
     }
 
-    uint256 target(){
+    uint256 target()
+    {
         arith_uint256 res(bits.value && 0x00ffffff);
-        
+
         res << (8 * ((bits.value >> 24) - 3));
 
         return ArithToUint256(res);
@@ -329,7 +388,7 @@ struct FloatingIntegerType
 
     FloatingInteger bits;
 
-    PackStream &write(PackStream &stream) const
+    PackStream &write(PackStream &stream)
     {
         stream << bits.bits;
 

@@ -27,7 +27,7 @@ namespace c2pool::shares
         FloatingIntegerType bits;
         IntType(32) nonce;
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << version << previous_block << timestamp << bits << nonce;
             return stream;
@@ -86,15 +86,15 @@ namespace c2pool::shares
         //В p2pool используется костыль при пустой упаковке, но в этой реализации он не нужен.
         //index
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
-            stream << version << previous_block << timestamp << bits << nonce;
+            stream << branch;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
-            stream >> version >> previous_block >> timestamp >> bits >> nonce;
+            stream >> branch;
             return stream;
         }
     };
@@ -149,7 +149,7 @@ namespace c2pool::shares
     public:
     public:
         BlockHeaderType() : SmallBlockHeaderType(){};
-        BlockHeaderType(SmallBlockHeaderType min_header, )
+        BlockHeaderType(SmallBlockHeaderType min_header ){} //TODO:
     };
 
     struct HashLinkType_stream
@@ -159,7 +159,7 @@ namespace c2pool::shares
         //FixedStrType<0> extra_data
         VarIntType length;
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << state << length;
             return stream;
@@ -210,7 +210,7 @@ namespace c2pool::shares
         MerkleLink_stream txid_merkle_link;
         IntType(256) wtxid_merkle_root;
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << txid_merkle_link << wtxid_merkle_root;
             return stream;
@@ -265,7 +265,7 @@ namespace c2pool::shares
     struct ShareData_stream
     {
         PossibleNoneType<IntType(256)> previous_share_hash;
-        VarStrType coinbase;
+        StrType coinbase;
         IntType(32) nonce;
         IntType(160) pubkey_hash;
         IntType(64) subsidy;
@@ -273,7 +273,7 @@ namespace c2pool::shares
         EnumType<StaleInfo, IntType(8)> stale_info;
         VarIntType desired_version;
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << previous_share_hash << coinbase << nonce << pubkey_hash << subsidy << donation << stale_info << desired_version;
             return stream;
@@ -337,7 +337,7 @@ namespace c2pool::shares
         VarIntType share_count;
         VarIntType tx_count;
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << share_count << tx_count;
             return stream;
@@ -377,7 +377,7 @@ namespace c2pool::shares
             stream << share_data;
             if (VERSION >= SEGWIT_VERSION)
             {
-                stream << segwit_data.get();
+                stream << segwit_data;
             }
             stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp << absheight << abswork;
             return stream;
@@ -485,17 +485,17 @@ namespace c2pool::shares
     struct RefType
     {
         FixedStrType<8> identifier;
-        ShareInfo_stream share_info;
+        shared_ptr<ShareInfo_stream> share_info;
 
         RefType(const unsigned char *_ident, ShareInfo _share_info)
         {
-            string str_ident(_ident, 8);
+            string str_ident((const char*)_ident, 8);
             identifier = FixedStrType<8>(str_ident);
 
-            share_info = _share_info;
+            //TODO: *share_info = _share_info;
         }
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << identifier << share_info;
 
