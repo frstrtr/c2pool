@@ -112,7 +112,7 @@ namespace c2pool::libnet::messages
         {
         }
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << name_type << value;
             return stream;
