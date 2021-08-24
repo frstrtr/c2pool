@@ -19,6 +19,7 @@ namespace coind
         P2P_PORT = 12024;
         ADDRESS_VERSION = 30;
         RPC_PORT = 14024;
+        BLOCK_PERIOD = 150;
     }
 
     bool DigibyteParentNetwork::jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind)
