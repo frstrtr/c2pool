@@ -72,7 +72,7 @@ namespace c2pool::libnet::messages
         {"have_tx", cmd_have_tx},
         {"losing_tx", cmd_losing_tx}};
 
-    const char *string_commands(commands cmd) const
+    const char *string_commands(commands cmd)
     {
         try
         {
@@ -85,11 +85,11 @@ namespace c2pool::libnet::messages
         }
     }
 
-    commands reverse_string_commands(const char *key) const
+    commands reverse_string_commands(const char *key)
     {
         try
         {
-            return _reverse_string_commands.at(cmd);
+            return _reverse_string_commands.at(key);
         }
         catch (const std::out_of_range &e)
         {
@@ -209,7 +209,7 @@ namespace c2pool::libnet::messages
             addr_to = to;
             addr_from = from;
             nonce = _nonce;
-            sub_version = sub_ver;
+            sub_version.str = sub_ver;
             mode = _mode;
             best_share_hash = best_hash;
             //pool_version = pool_ver;
@@ -432,7 +432,7 @@ namespace c2pool::libnet::messages
 
         message_have_tx(std::vector<uint256> _tx_hashes) : base_message("have_tx")
         {
-            tx_hashes = _tx_hashes;
+            tx_hashes = ListType<IntType(256)>(_tx_hashes);
         }
 
         PackStream &write(PackStream &stream) override
