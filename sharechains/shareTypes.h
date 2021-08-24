@@ -103,7 +103,7 @@ namespace c2pool::shares
     {
     public:
         std::vector<uint256> branch;
-        int index;
+        int32_t index;
 
         MerkleLink()
         {
@@ -147,9 +147,14 @@ namespace c2pool::shares
     class BlockHeaderType : public SmallBlockHeaderType
     {
     public:
+        uint256 merkle_root;
+
     public:
         BlockHeaderType() : SmallBlockHeaderType(){};
-        BlockHeaderType(SmallBlockHeaderType min_header ){} //TODO:
+        BlockHeaderType(SmallBlockHeaderType _min_header, uint256 _merkle_root) : SmallBlockHeaderType(_min_header)
+        {
+            merkle_root = _merkle_root;
+        }
     };
 
     struct HashLinkType_stream
@@ -489,7 +494,7 @@ namespace c2pool::shares
 
         RefType(const unsigned char *_ident, ShareInfo _share_info)
         {
-            string str_ident((const char*)_ident, 8);
+            string str_ident((const char *)_ident, 8);
             identifier = FixedStrType<8>(str_ident);
 
             //TODO: *share_info = _share_info;

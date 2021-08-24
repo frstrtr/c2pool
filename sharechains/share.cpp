@@ -147,14 +147,16 @@ namespace c2pool::shares
             assert(set_new_tx_hashes == n);
         }
 
-        auto _ref_hash = get_ref_hash(net(), share_info, contents.ref_merkle_link);
-        _ref_hash << IntType(64)(contents.last_txout_nonce) << IntType(32)(0);
 
-        gentx_hash = check_hash_link(
-            hash_link,
-            _ref_hash,
-            gentx_before_refhash
-        );
+        //TODO: 
+        // auto _ref_hash = BaseShare::get_ref_hash(net, share_info, contents["ref_merkle_link"]); //TODO: contents remake
+        // _ref_hash << IntType(64)(contents.last_txout_nonce) << IntType(32)(0);
+
+        // gentx_hash = check_hash_link(
+        //     hash_link,
+        //     _ref_hash,
+        //     gentx_before_refhash
+        // );
         /*
         TODO:
         
