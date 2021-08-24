@@ -26,6 +26,12 @@ struct ListType
         l = vector<T>(arr);
     }
 
+    auto &operator=(vector<T> _value)
+    {
+        l = _value;
+        return *this;
+    }
+
     PackStream &write(PackStream &stream) const
     {
         LOG_TRACE << "ListType Worked!";
@@ -150,6 +156,12 @@ struct IntType
         return value;
     }
 
+    auto &operator=(INT_T &_value)
+    {
+        value = _value;
+        return *this;
+    }
+
     PackStream &write(PackStream &stream)
     {
         LOG_TRACE << "IntType Worked!";
@@ -203,6 +215,12 @@ struct ULongIntType
     ULongIntType get() const
     {
         return value;
+    }
+
+    auto &operator=(INT_T &_value)
+    {
+        value = _value;
+        return *this;
     }
 
     virtual PackStream &write(PackStream &stream)
@@ -329,6 +347,12 @@ public:
         {
             return none_value;
         }
+    }
+
+    auto &operator=(ObjType &obj)
+    {
+        value = obj;
+        return *this;
     }
 
     PackStream &write(PackStream &stream)
