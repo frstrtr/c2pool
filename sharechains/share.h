@@ -39,6 +39,8 @@ namespace c2pool::shares
     public:
         SmallBlockHeaderType min_header;
 
+        ShareInfo share_info;
+
         MerkleLink ref_merkle_link; //FOR?
         unsigned long long last_txout_nonce;
         HashLinkType hash_link;
@@ -66,7 +68,7 @@ namespace c2pool::shares
         uint128 abswork;
         char *new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
         //TODO: gentx_hash
-        //TODO: header
+        BlockHeaderType header;
         uint256 pow_hash;
         uint256 hash; //=header_hash
         int32_t time_seen;
@@ -100,7 +102,7 @@ namespace c2pool::shares
             ref_type_stream << ref_type_value;
             auto ref_type_hash = coind::data::hash256(ref_type_stream);
 
-            auto unpacked_res = coind::data::check_merkle_link(ref_type_hash, _ref_merkle_link);
+            auto unpacked_res = coind::data::check_merkle_link(ref_type_hash, std::make_tuple(_ref_merkle_link.branch, _ref_merkle_link.index));
 
             IntType(256) packed_res(unpacked_res);
             res << packed_res;
