@@ -266,6 +266,7 @@ struct ULongIntType : Maker<INT_T>
 
 struct VarIntType : Maker<uint64_t>
 {
+    typedef uint64_t value_type;
     uint64_t value;
 
     VarIntType() {}
