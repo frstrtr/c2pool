@@ -10,7 +10,7 @@
 using namespace std;
 
 template <typename T>
-struct ListType
+struct ListType : Maker<T>
 {
     vector<T> l;
 
@@ -60,7 +60,7 @@ struct ListType
 };
 
 //In p2pool - VarStrType
-struct StrType
+struct StrType : Maker<string>
 {
     string str;
 
@@ -90,7 +90,7 @@ struct StrType
 
 //TODO: TEST
 template <int SIZE>
-struct FixedStrType
+struct FixedStrType : Maker<string>
 {
     string str;
 
@@ -133,7 +133,7 @@ struct FixedStrType
 };
 
 template <typename INT_T>
-struct IntType
+struct IntType : Maker<INT_T>
 {
     typedef INT_T value_type;
     INT_T value;
@@ -156,7 +156,7 @@ struct IntType
         return value;
     }
 
-    auto &operator=(INT_T &_value)
+    auto &operator=(INT_T _value)
     {
         value = _value;
         return *this;
@@ -194,7 +194,7 @@ struct IntType
 };
 
 template <typename INT_T>
-struct ULongIntType
+struct ULongIntType : Maker<INT_T>
 {
     typedef INT_T value_type;
     INT_T value;
@@ -217,7 +217,7 @@ struct ULongIntType
         return value;
     }
 
-    auto &operator=(INT_T &_value)
+    auto &operator=(INT_T _value)
     {
         value = _value;
         return *this;
@@ -264,7 +264,7 @@ struct ULongIntType
 
 #define IntType(bytes) INT##bytes
 
-struct VarIntType
+struct VarIntType : Maker<uint64_t>
 {
     uint64_t value;
 
@@ -291,7 +291,7 @@ struct VarIntType
 };
 
 template <StreamEnumType ENUM_T, StreamObjType PACK_TYPE = IntType(32)>
-struct EnumType
+struct EnumType : Maker<ENUM_T>
 {
     ENUM_T value;
 
@@ -329,7 +329,7 @@ struct EnumType
 };
 
 template <StreamObjType ObjType>
-class PossibleNoneType
+class PossibleNoneType : public Maker<ObjType>
 {
 private:
     ObjType none_value;
@@ -349,7 +349,7 @@ public:
         }
     }
 
-    auto &operator=(ObjType &obj)
+    auto &operator=(ObjType obj)
     {
         value = obj;
         return *this;
