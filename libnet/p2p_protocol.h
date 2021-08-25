@@ -58,47 +58,47 @@ namespace c2pool::libnet::p2p
         {
             LOG_DEBUG << "called HANDLE msg in p2p_protocol";
 
-            switch (RawMSG->name_type.get())
+            switch (RawMSG->name_type.value)
             {
             case commands::cmd_version:
-                handle(GenerateMsg<message_version>(json_value));
+                handle(GenerateMsg<message_version>(RawMSG->value));
                 break;
             case commands::cmd_ping:
-                handle(GenerateMsg<message_ping>(json_value));
+                handle(GenerateMsg<message_ping>(RawMSG->value));
                 break;
             case commands::cmd_addrme:
-                handle(GenerateMsg<message_addrme>(json_value));
+                handle(GenerateMsg<message_addrme>(RawMSG->value));
                 break;
             case commands::cmd_addrs:
                 LOG_TRACE << "addrs1";
-                handle(GenerateMsg<message_addrs>(json_value));
+                handle(GenerateMsg<message_addrs>(RawMSG->value));
                 LOG_TRACE << "addrs2";
                 break;
             case commands::cmd_getaddrs:
-                handle(GenerateMsg<message_getaddrs>(json_value));
+                handle(GenerateMsg<message_getaddrs>(RawMSG->value));
                 break;
             //new:
             case commands::cmd_shares:
-                handle(GenerateMsg<message_shares>(json_value));
+                handle(GenerateMsg<message_shares>(RawMSG->value));
                 break;
             case commands::cmd_sharereq:
-                handle(GenerateMsg<message_sharereq>(json_value));
+                handle(GenerateMsg<message_sharereq>(RawMSG->value));
                 break;
             case commands::cmd_sharereply:
-                handle(GenerateMsg<message_sharereply>(json_value));
+                handle(GenerateMsg<message_sharereply>(RawMSG->value));
                 break;
             //TODO:
             // case commands::cmd_best_block:
-            //     handle(GenerateMsg<message_best_block>(json_value));
+            //     handle(GenerateMsg<message_best_block>(RawMSG->value));
             //     break;
             case commands::cmd_have_tx:
-                handle(GenerateMsg<message_have_tx>(json_value));
+                handle(GenerateMsg<message_have_tx>(RawMSG->value));
                 break;
             case commands::cmd_losing_tx:
-                handle(GenerateMsg<message_losing_tx>(json_value));
+                handle(GenerateMsg<message_losing_tx>(RawMSG->value));
                 break;
             case commands::cmd_error:
-                handle(GenerateMsg<message_error>(json_value));
+                handle(GenerateMsg<message_error>(RawMSG->value));
                 break;
             }
         }
@@ -113,32 +113,32 @@ namespace c2pool::libnet::p2p
     protected:
         template <class MsgType>
         //template <class MsgType<>, class ct = converter_type>
-        shared_ptr<MsgType> GenerateMsg(UniValue &value)
+        shared_ptr<MsgType> GenerateMsg(PackStream &stream)
         {
             shared_ptr<MsgType> msg = make_shared<MsgType>();
-            *msg = value;
+            stream >> *msg;
             return msg;
         }
 
         void handle(shared_ptr<message_version> msg)
         {
             LOG_DEBUG << "handle message_version";
-            LOG_TRACE << msg->best_share_hash.GetHex();
-            LOG_INFO << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version << ", client version " << msg->sub_version;
+            LOG_TRACE << msg->best_share_hash.get().get().GetHex();
+            LOG_INFO << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version.get() << ", client version " << msg->sub_version.get();
 
             if (other_version != -1)
             {
                 LOG_DEBUG << "more than one version message"; 
             }
-            if (msg->version < net()->MINIMUM_PROTOCOL_VERSION){
+            if (msg->version.get() < net()->MINIMUM_PROTOCOL_VERSION){
                 LOG_DEBUG << "peer too old";
             }
 
-            other_version = msg->version;
-            other_sub_version = msg->sub_version;
-            other_services = msg->services;
+            other_version = msg->version.get() ;
+            other_sub_version = msg->sub_version.get();
+            other_services = msg->services.get() ;
 
-            if (msg->nonce == p2pNode()->get_nonce()){
+            if (msg->nonce.get() == p2pNode()->get_nonce()){
                 LOG_DEBUG << "was connected to self";
             }
 
@@ -153,7 +153,7 @@ namespace c2pool::libnet::p2p
             //     }
             // }
 
-            _nonce = msg->nonce;
+            _nonce = msg->nonce.get();
             //connected2 = true; //?
 
             //TODO: safe thrade cancel
@@ -224,7 +224,7 @@ namespace c2pool::libnet::p2p
         }
         void handle(shared_ptr<message_error> msg)
         {
-            LOG_WARNING << "Handled message_error! command = " << msg->command << " ; error_text = " << msg->error_text;
+            LOG_WARNING << "Handled message_error! command = " << msg->command.get() << " ; error_text = " << msg->error_text.get();
         }
         void handle(shared_ptr<message_shares> msg)
         {
@@ -263,38 +263,39 @@ namespace c2pool::libnet::p2p
                 }
                 result.push_back(std::make_tuple(share, txs));
             }
-            p2pNode()->handle_shares(result, shared_from_this()); //TODO: create handle_shares in p2p_node
+            //TODO: p2pNode()->handle_shares(result, shared_from_this()); //TODO: create handle_shares in p2p_node
 
             /*t1
             if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares))) */
         }
         void handle(shared_ptr<message_sharereq> msg)
         {
-            auto _shares = p2pNode()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());//TODO: handle_get_shares
-            vector<UniValue> packed_shares;
-            //msg data: //uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares
-            try
-            {
-                for (auto share : _shares)
-                {
-                    packed_shares.push_back(share); //TODO: pack share to UniValue[type + contents]
-                }
-                shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 0, _shares);
-                _socket->write(answer_msg);
-            }
-            catch (const std::invalid_argument &e) //TODO: when throw Payload too long
-            {
-                packed_shares.clear();
-                shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 1, _shares);
-                _socket->write(answer_msg);
-            }
+            //TODO:
+            // auto _shares = p2pNode()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());//TODO: handle_get_shares
+            // vector<UniValue> packed_shares;
+            // //msg data: //uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares
+            // try
+            // {
+            //     for (auto share : _shares)
+            //     {
+            //         packed_shares.push_back(share); //TODO: pack share to UniValue[type + contents]
+            //     }
+            //     shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 0, _shares);
+            //     _socket->write(answer_msg);
+            // }
+            // catch (const std::invalid_argument &e) //TODO: when throw Payload too long
+            // {
+            //     packed_shares.clear();
+            //     shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 1, _shares);
+            //     _socket->write(answer_msg);
+            // }
         }
         void handle(shared_ptr<message_sharereply> msg)
         {
             std::vector<shared_ptr<c2pool::shares::BaseShare>> res;
-            if (msg->result == 0)
+            if (msg->result.value == 0)
             {
-                for (auto share : msg->shares)
+                for (auto share : msg->shares.l)
                 {
                     if (share["type"].get_int() >= 17) //TODO: 17 = minimum share version; move to macros
                     {
