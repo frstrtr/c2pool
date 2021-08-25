@@ -86,6 +86,11 @@ struct StrType : Maker<string>
         str = string(list_s.l.begin(), list_s.l.end());
         return stream;
     }
+
+    string get()
+    {
+        return str;
+    }
 };
 
 //TODO: TEST
@@ -212,7 +217,7 @@ struct ULongIntType : Maker<INT_T>
         return *this;
     }
 
-    ULongIntType get() const
+    INT_T get() const
     {
         return value;
     }
