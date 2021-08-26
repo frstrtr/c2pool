@@ -8,6 +8,7 @@
 #include "p2p_socket.h"
 using namespace coind::p2p::messages;
 using namespace c2pool::util::events;
+using namespace c2pool::libnet;
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
@@ -26,14 +27,13 @@ namespace coind::p2p
 namespace coind::p2p
 {
     //https://en.bitcoin.it/wiki/Protocol_documentation
-    class CoindProtocol
+    class CoindProtocol : public INodeMember
     {
     protected:
         shared_ptr<coind::p2p::P2PSocket> _socket;
-        std::shared_ptr<coind::ParentNetwork> _net;
 
     public:
-        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, std::shared_ptr<coind::ParentNetwork> _network);
+        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, const c2pool::libnet::INodeMember &member);
     public:
         std::shared_ptr<Event<uint256>> new_block; //block_hash
         std::shared_ptr<Event<UniValue>> new_tx; //bitcoin_data.tx_type
@@ -53,7 +53,7 @@ namespace coind::p2p
         shared_ptr<raw_message> make_raw_message()
         {
             auto raw_msg = make_shared<raw_message>();
-            raw_msg->set_prefix(_net);
+            raw_msg->set_prefix(netParent());
             return raw_msg;
         }
 
@@ -125,7 +125,7 @@ namespace coind::p2p
         shared_ptr<message_type> make_message(Args &&...args)
         {
             auto msg = std::make_shared<message_type>(args...);
-            msg->set_prefix(_net);
+            msg->set_prefix(netParent());
             return msg;
         }
 

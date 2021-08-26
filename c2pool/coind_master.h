@@ -20,10 +20,12 @@ namespace c2pool::master
         //Networks/Configs
         auto DGB_net = std::make_shared<c2pool::DigibyteNetwork>();
         auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
-        //ShareTracker
-        auto share_tracker = std::make_shared<ShareTracker>();//TODO:
         //NodeManager
-        auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_cfg, share_tracker);
+        auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_cfg);
+        //ShareTracker
+        auto share_tracker = std::make_shared<ShareTracker>(DGB);
+
+        //run manager
         DGB->run();
         if (DGB)
             LOG_INFO << "DGB started!";

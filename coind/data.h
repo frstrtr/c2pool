@@ -8,7 +8,6 @@
 #include <btclibs/util/strencodings.h>
 #include <btclibs/base58.h>
 #include <btclibs/span.h>
-#include <devcore/py_base.h>
 #include <util/stream.h>
 #include <util/stream_types.h>
 #include <univalue.h>
@@ -22,24 +21,25 @@
 
 using std::vector, std::tuple, std::string;
 
-namespace coind::data::python
-{
-    class PyBitcoindData : c2pool::python::PythonBase
-    {
-    protected:
-        static const char *filepath;
+//TODO: REMOVE
+// namespace coind::data::python
+// {
+//     class PyBitcoindData : c2pool::python::PythonBase
+//     {
+//     protected:
+//         static const char *filepath;
 
-    public:
-        static uint256 target_to_average_attempts(uint256 target);
+//     public:
+//         static uint256 target_to_average_attempts(uint256 target);
 
-        static uint256 average_attempts_to_target(uint256 average_attempts);
+//         static uint256 average_attempts_to_target(uint256 average_attempts);
 
-        //TODO: using uint256.SetCompact | https://bitcoin.stackexchange.com/questions/30467/what-are-the-equations-to-convert-between-bits-and-difficulty
-        static double target_to_difficulty(uint256 target);
+//         //TODO: using uint256.SetCompact | https://bitcoin.stackexchange.com/questions/30467/what-are-the-equations-to-convert-between-bits-and-difficulty
+//         static double target_to_difficulty(uint256 target);
 
-        static uint256 difficulty_to_target(uint256 difficulty);
-    };
-} // namespace coind::data::python
+//         static uint256 difficulty_to_target(uint256 difficulty);
+//     };
+// } // namespace coind::data::python
 
 namespace coind::data
 {
@@ -129,65 +129,17 @@ namespace coind::data
 namespace coind::data
 {
     //TODO: want 4 optimization???
-    uint256 hash256(string data)
-    {
-        uint256 result;
+    uint256 hash256(std::string data);
 
-        vector<unsigned char> out1;
-        out1.resize(CSHA256::OUTPUT_SIZE);
+    uint256 hash256(PackStream stream);
 
-        vector<unsigned char> out2;
-        out2.resize(CSHA256::OUTPUT_SIZE);
+    uint256 hash256(uint256 data);
 
-        CSHA256().Write((unsigned char *)&data[0], data.length()).Finalize(&out1[0]);
-        CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
-        result.SetHex(HexStr(out2));
+    uint160 hash160(string data);
 
-        return result;
-    }
+    uint160 hash160(PackStream stream);
 
-    uint256 hash256(PackStream stream)
-    {
-        auto _bytes = stream.bytes();
-        string in(reinterpret_cast<char const *>(_bytes), stream.size());
-        return hash256(in);
-    }
-
-    uint256 hash256(uint256 data)
-    {
-        string in = data.GetHex();
-        return hash256(in);
-    }
-
-    uint160 hash160(string data)
-    {
-        uint160 result;
-
-        vector<unsigned char> out1;
-        out1.resize(CSHA256::OUTPUT_SIZE);
-
-        vector<unsigned char> out2;
-        out2.resize(CRIPEMD160::OUTPUT_SIZE);
-
-        CSHA256().Write((unsigned char *)&data[0], data.length()).Finalize(&out1[0]);
-        CRIPEMD160().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
-        result.SetHex(HexStr(out2));
-
-        return result;
-    }
-
-    uint160 hash160(PackStream stream)
-    {
-        auto _bytes = stream.bytes();
-        string in(reinterpret_cast<char const *>(_bytes), stream.size());
-        return hash160(in);
-    }
-
-    uint160 hash160(uint160 data)
-    {
-        string in = data.GetHex();
-        return hash160(in);
-    }
+    uint160 hash160(uint160 data);
 
     struct MerkleRecordType
     {
@@ -208,39 +160,7 @@ namespace coind::data
     };
 
     //link = MerkleLink from shareTypes.h
-    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link)
-    {
-        auto branch = std::get<0>(link);
-        auto index = std::get<1>(link);
-
-        if (index >= pow(2, branch.size()))
-        {
-            throw std::invalid_argument("index too large");
-        }
-
-        auto cur = tip_hash;
-
-        int i = 0;
-        for (auto h : branch)
-        {
-            if ((index >> i) & 1)
-            {
-                auto merkle_rec = MerkleRecordType{h, cur};
-                PackStream ps;
-                ps << merkle_rec;
-                cur = hash256(ps);
-            }
-            else
-            {
-                auto merkle_rec = MerkleRecordType{cur, h};
-                PackStream ps;
-                ps << merkle_rec;
-                cur = hash256(ps);
-            }
-        }
-
-        return cur;
-    }
+    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link);
 
     struct HumanAddressType
     {

@@ -33,7 +33,7 @@ namespace c2pool::libnet
     class NodeManager : public std::enable_shared_from_this<NodeManager>
     {
     public:
-        NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg, shared_ptr<c2pool::shares::ShareTracker> _shares_tracker) : _net(_network), _config(_cfg), _tracker(_shares_tracker)
+        NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
         {
             _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network); //TODO: boost::filesystem path
         }
