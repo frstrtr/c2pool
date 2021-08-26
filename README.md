@@ -12,11 +12,7 @@ Some technical details - https://bitcointalk.org/index.php?topic=457574
 p2pool sharechain based temporal levelled blockchain DEX/mining pool/hr marketplace and more... written in c++ using LevelDB.
 
 ![Time Hybrid Evaluation](/doc/concepts/THE%20coin.png)
-<<<<<<< HEAD
 Time Hybrid Evaluation coin (THE coin - (experimental feature)) for node maintainers/owners
-=======
-Time Hybrid Evaluation coin (THE coin)
->>>>>>> 8c328f6bee906c6fff8db16eb824a2c4270e84c9
 
 ## Donations towards further development of с2pool implementation in C++
 
@@ -29,7 +25,6 @@ Telegram:
 ### t.me/c2pool
 
 Discord:
-<<<<<<< HEAD
 
 ### https://discord.gg/bK6ZA6AT3w
 
@@ -41,6 +36,3 @@ git clone --recursive https://github.com/frstrtr/c2pool.git
 or after cloning
 
 git submodule update --init
-=======
-### https://discord.gg/bK6ZA6AT3w
->>>>>>> 8c328f6bee906c6fff8db16eb824a2c4270e84c9
