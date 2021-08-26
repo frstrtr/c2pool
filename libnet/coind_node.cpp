@@ -19,9 +19,9 @@ namespace c2pool::libnet
         _thread.reset(new std::thread([&]() {
             _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                 ip::tcp::socket socket(_context);
-                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), this);
+                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), *this);
 
-                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, this);
+                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, *this);
                 protocol->init(new_block, new_tx, new_headers);
                 _socket->init(endpoints, protocol);
             });

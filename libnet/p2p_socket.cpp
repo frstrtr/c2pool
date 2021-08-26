@@ -52,7 +52,7 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
 
-        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), this);
+        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), *this);
 
         if (handle.empty())
         {

@@ -72,31 +72,9 @@ namespace c2pool::libnet::messages
         {"have_tx", cmd_have_tx},
         {"losing_tx", cmd_losing_tx}};
 
-    const char *string_commands(commands cmd)
-    {
-        try
-        {
-            return _string_commands.at(cmd);
-        }
-        catch (const std::out_of_range &e)
-        {
-            LOG_WARNING << (int)cmd << " out of range in string_commands";
-            return "error";
-        }
-    }
+    const char *string_commands(commands cmd);
 
-    commands reverse_string_commands(const char *key)
-    {
-        try
-        {
-            return _reverse_string_commands.at(key);
-        }
-        catch (const std::out_of_range &e)
-        {
-            LOG_WARNING << key << " out of range in reverse_string_commands";
-            return commands::cmd_error;
-        }
-    }
+    commands reverse_string_commands(const char *key);
 
     //base_message type for handle
     class raw_message
@@ -143,9 +121,9 @@ namespace c2pool::libnet::messages
         }
 
     public:
-        virtual PackStream &write(PackStream &stream) = 0;
+        virtual PackStream &write(PackStream &stream) { return stream; };
 
-        virtual PackStream &read(PackStream &stream) = 0;
+        virtual PackStream &read(PackStream &stream) { return stream; };
     };
 
     /*

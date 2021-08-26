@@ -18,7 +18,7 @@ set(coind_tool_sources
         data.cpp)
 
 add_library(coind_tool STATIC ${coind_tool_sources})
-target_link_libraries(coind_tool btclibs devcore)
+target_link_libraries(coind_tool btclibs devcore networks)
 
 #coind_p2p
 set(coind_p2p_sources
