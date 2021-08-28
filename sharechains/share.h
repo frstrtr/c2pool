@@ -39,6 +39,8 @@ namespace c2pool::shares
     public:
         SmallBlockHeaderType min_header;
 
+        ShareInfo share_info;
+
         MerkleLink ref_merkle_link; //FOR?
         unsigned long long last_txout_nonce;
         HashLinkType hash_link;
@@ -66,7 +68,7 @@ namespace c2pool::shares
         uint128 abswork;
         char *new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
         //TODO: gentx_hash
-        //TODO: header
+        BlockHeaderType header;
         uint256 pow_hash;
         uint256 hash; //=header_hash
         int32_t time_seen;
@@ -100,7 +102,7 @@ namespace c2pool::shares
             ref_type_stream << ref_type_value;
             auto ref_type_hash = coind::data::hash256(ref_type_stream);
 
-            auto unpacked_res = coind::data::check_merkle_link(ref_type_hash, _ref_merkle_link);
+            auto unpacked_res = coind::data::check_merkle_link(ref_type_hash, std::make_tuple(_ref_merkle_link.branch, _ref_merkle_link.index));
 
             IntType(256) packed_res(unpacked_res);
             res << packed_res;
@@ -136,39 +138,5 @@ namespace c2pool::shares
         virtual void contents_load(UniValue contents) override;
     };
 
-#define MAKE_SHARE(CLASS)                                                           \
-    share_result = make_shared<CLASS>(net, peer_addr, share["contents"].get_obj()); \
-    break;
-
-    shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, c2pool::libnet::addr peer_addr)
-    {
-        shared_ptr<BaseShare> share_result;
-        int type_version = 0;
-        if (share.exists("type"))
-        {
-            type_version = share["type"].get_int();
-        }
-        else
-        {
-            throw std::runtime_error("share data in load_share() without type!");
-        }
-
-        switch (type_version)
-        {
-        case 17:
-            MAKE_SHARE(Share) //TODO: TEST
-        case 32:
-            MAKE_SHARE(PreSegwitShare) //TODO: TEST
-        default:
-            if (type_version < 17)
-                throw std::runtime_error("sent an obsolete share");
-            else
-                throw std::runtime_error((boost::format("unkown share type: %1") % type_version).str());
-            break;
-        }
-
-        return share_result;
-    }
-
-#undef MAKE_SHARE
+    shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, c2pool::libnet::addr peer_addr);
 } // namespace c2pool::shares

@@ -15,7 +15,7 @@ using std::shared_ptr, std::weak_ptr, std::make_shared;
 
 namespace coind::p2p
 {
-    CoindProtocol::CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, std::shared_ptr<coind::ParentNetwork> _network) : _net(_network)
+    CoindProtocol::CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, const c2pool::libnet::INodeMember &member) : c2pool::libnet::INodeMember(member)
     {
         LOG_TRACE << "CoindProtocol: "
                   << "start constuctor";

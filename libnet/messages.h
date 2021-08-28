@@ -72,31 +72,9 @@ namespace c2pool::libnet::messages
         {"have_tx", cmd_have_tx},
         {"losing_tx", cmd_losing_tx}};
 
-    const char *string_commands(commands cmd) const
-    {
-        try
-        {
-            return _string_commands.at(cmd);
-        }
-        catch (const std::out_of_range &e)
-        {
-            LOG_WARNING << (int)cmd << " out of range in string_commands";
-            return "error";
-        }
-    }
+    const char *string_commands(commands cmd);
 
-    commands reverse_string_commands(const char *key) const
-    {
-        try
-        {
-            return _reverse_string_commands.at(cmd);
-        }
-        catch (const std::out_of_range &e)
-        {
-            LOG_WARNING << key << " out of range in reverse_string_commands";
-            return commands::cmd_error;
-        }
-    }
+    commands reverse_string_commands(const char *key);
 
     //base_message type for handle
     class raw_message
@@ -112,7 +90,7 @@ namespace c2pool::libnet::messages
         {
         }
 
-        PackStream &write(PackStream &stream) const
+        PackStream &write(PackStream &stream)
         {
             stream << name_type << value;
             return stream;
@@ -143,9 +121,9 @@ namespace c2pool::libnet::messages
         }
 
     public:
-        virtual PackStream &write(PackStream &stream) = 0;
+        virtual PackStream &write(PackStream &stream) { return stream; };
 
-        virtual PackStream &read(PackStream &stream) = 0;
+        virtual PackStream &read(PackStream &stream) { return stream; };
     };
 
     /*
@@ -209,9 +187,9 @@ namespace c2pool::libnet::messages
             addr_to = to;
             addr_from = from;
             nonce = _nonce;
-            sub_version = sub_ver;
+            sub_version.str = sub_ver;
             mode = _mode;
-            best_share_hash = best_hash;
+            best_share_hash = PossibleNoneType<IntType(256)>::make_type(best_hash);
             //pool_version = pool_ver;
         }
 
@@ -363,9 +341,9 @@ namespace c2pool::libnet::messages
         message_sharereq(uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops) : base_message("sharereq")
         {
             id = _id;
-            hashes = _hashes;
+            hashes = hashes.make_list_type(_hashes);
             parents = _parents;
-            stops = _stops;
+            stops = stops.make_list_type(_stops);
         }
 
         PackStream &write(PackStream &stream) override
@@ -432,7 +410,7 @@ namespace c2pool::libnet::messages
 
         message_have_tx(std::vector<uint256> _tx_hashes) : base_message("have_tx")
         {
-            tx_hashes = _tx_hashes;
+            tx_hashes = tx_hashes.make_list_type(_tx_hashes);
         }
 
         PackStream &write(PackStream &stream) override
@@ -458,7 +436,7 @@ namespace c2pool::libnet::messages
 
         message_losing_tx(std::vector<uint256> _tx_hashes) : base_message("losing_tx")
         {
-            tx_hashes = _tx_hashes;
+            tx_hashes = tx_hashes.make_list_type(_tx_hashes);
         }
 
         PackStream &write(PackStream &stream) override

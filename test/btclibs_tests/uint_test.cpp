@@ -6,7 +6,6 @@
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <util/pystruct.h>
-#include <util/pack.h>
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)
@@ -151,76 +150,76 @@ TEST(Btclibs, UINT256_SERIALIZE_BYTES)
     cout << endl;
 }
 
-TEST(Btclibs, UINT256_SERIALIZE_BYTES_COMPARE_PYTHON)
-{
-    string s = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
-    uint256 first;
-    first.SetHex(s);
+// TEST(Btclibs, UINT256_SERIALIZE_BYTES_COMPARE_PYTHON)
+// {
+//     string s = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
+//     uint256 first;
+//     first.SetHex(s);
 
-    auto second = c2pool::python::for_test::PyType::IntType256_test(s);
-    unsigned char *second_unsig = (unsigned char *)second;
-    cout << "second: " << endl;
-    for (int c = 0; c <= strlen(second); c++)
-    {
-        std::cout << (unsigned int)second_unsig[c] << " ";
-    }
-    cout << endl;
+//     auto second = c2pool::python::for_test::PyType::IntType256_test(s);
+//     unsigned char *second_unsig = (unsigned char *)second;
+//     cout << "second: " << endl;
+//     for (int c = 0; c <= strlen(second); c++)
+//     {
+//         std::cout << (unsigned int)second_unsig[c] << " ";
+//     }
+//     cout << endl;
 
-    cout << "first: " << endl;
-    for (auto c = first.begin(); c != first.end(); c++)
-    {
-        std::cout << (unsigned int)*c << " ";
-    }
-    std::cout << std::endl;
+//     cout << "first: " << endl;
+//     for (auto c = first.begin(); c != first.end(); c++)
+//     {
+//         std::cout << (unsigned int)*c << " ";
+//     }
+//     std::cout << std::endl;
 
-    unsigned char *T = reinterpret_cast<unsigned char *>(&first);
-    for (int i = 0; i < std::distance(first.begin(), first.end()); i++)
-    {
-        cout << (unsigned int)T[i] << " ";
-    }
-    cout << endl;
+//     unsigned char *T = reinterpret_cast<unsigned char *>(&first);
+//     for (int i = 0; i < std::distance(first.begin(), first.end()); i++)
+//     {
+//         cout << (unsigned int)T[i] << " ";
+//     }
+//     cout << endl;
 
-    auto packed_first = c2pool::SerializedData::pack(first);
-    for (int i = 0; i < packed_first.length; i++)
-    {
-        cout << (unsigned int)packed_first.data[i] << " ";
-    }
-    cout << endl;
+//     auto packed_first = c2pool::SerializedData::pack(first);
+//     for (int i = 0; i < packed_first.length; i++)
+//     {
+//         cout << (unsigned int)packed_first.data[i] << " ";
+//     }
+//     cout << endl;
 
-    auto unpacked_first = c2pool::SerializedData::unpack<uint256>(packed_first);
-    cout << unpacked_first->GetHex() << endl;
-    ASSERT_EQ(first, *unpacked_first);
-}
+//     auto unpacked_first = c2pool::SerializedData::unpack<uint256>(packed_first);
+//     cout << unpacked_first->GetHex() << endl;
+//     ASSERT_EQ(first, *unpacked_first);
+// }
 
-#pragma pack(push, 1)
-struct TestUINT256Struct
-{
-    uint256 first;
-    uint256 second;
-};
-#pragma pack(pop)
+// #pragma pack(push, 1)
+// struct TestUINT256Struct
+// {
+//     uint256 first;
+//     uint256 second;
+// };
+// #pragma pack(pop)
 
-TEST(Btclibs, UINT256_SERIALIZE_STRUCT)
-{
-    unsigned char* python_packed = new unsigned char[64]{255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 15, 0, 0, 0, 0, 0, 0, 0, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0};
+// TEST(Btclibs, UINT256_SERIALIZE_STRUCT)
+// {
+//     unsigned char* python_packed = new unsigned char[64]{255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 15, 0, 0, 0, 0, 0, 0, 0, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0};
 
-    string f = "fffffffffffffffffffffffffffffffffffffffffffffffff";
-    uint256 first;
-    first.SetHex(f);
+//     string f = "fffffffffffffffffffffffffffffffffffffffffffffffff";
+//     uint256 first;
+//     first.SetHex(f);
 
-    string s = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
-    uint256 second;
-    second.SetHex(s);
+//     string s = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
+//     uint256 second;
+//     second.SetHex(s);
 
-    TestUINT256Struct _struct = {first, second};
+//     TestUINT256Struct _struct = {first, second};
 
-    auto packed_struct = c2pool::SerializedData::pack(_struct);
+//     auto packed_struct = c2pool::SerializedData::pack(_struct);
 
-    for (int i = 0; i < packed_struct.length; i++)
-    {
-        cout << (unsigned int)packed_struct.data[i] << " ";
-    }
-    cout << endl;
+//     for (int i = 0; i < packed_struct.length; i++)
+//     {
+//         cout << (unsigned int)packed_struct.data[i] << " ";
+//     }
+//     cout << endl;
 
-    ASSERT_EQ(memcmp(packed_struct.data, python_packed, packed_struct.length), 0);
-}
+//     ASSERT_EQ(memcmp(packed_struct.data, python_packed, packed_struct.length), 0);
+// }

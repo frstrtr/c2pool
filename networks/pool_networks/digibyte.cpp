@@ -32,5 +32,6 @@ namespace c2pool
         REAL_CHAIN_LENGTH = 24 * 60 * 60 / 10;
         CHAIN_LENGTH = 24 * 60 * 60 / 10;
         SPREAD = 30;
+        ADDRESS_VERSION = 30;
     }
 } // namespace c2pool

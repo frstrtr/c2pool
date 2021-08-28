@@ -25,6 +25,41 @@ namespace ip = boost::asio::ip;
 
 namespace c2pool::libnet::p2p
 {
+    struct ReadPackedMsg
+    {
+        const int COMMAND_LEN = 12;
+        const int LEN_LEN = 4;
+        const int CHECKSUM_LEN = 4;
+
+        char *prefix;
+        char *command;
+        char *len;
+        char *checksum;
+        char *payload;
+
+        int32_t unpacked_len;
+
+        ReadPackedMsg(int32_t pref_len)
+        {
+            prefix = new char[pref_len];
+            command = new char[COMMAND_LEN];
+            len = new char[LEN_LEN];
+            checksum = new char[CHECKSUM_LEN];
+        }
+
+        ~ReadPackedMsg()
+        {
+            delete prefix;
+            delete command;
+            delete len;
+            delete checksum;
+            delete payload;
+        }
+    };
+}
+
+namespace c2pool::libnet::p2p
+{
     typedef boost::function<bool(std::shared_ptr<c2pool::libnet::p2p::Protocol>)> protocol_handle;
 
     class P2PSocket : public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PSocket>
@@ -63,7 +98,7 @@ namespace c2pool::libnet::p2p
         void read_length(std::shared_ptr<ReadPackedMsg> msg);
         void read_checksum(std::shared_ptr<ReadPackedMsg> msg);
         void read_payload(std::shared_ptr<ReadPackedMsg> msg);
-        void final_read_message(std::shared_ptr<ReadPackedMsg> msg)
+        void final_read_message(std::shared_ptr<ReadPackedMsg> msg);
 
         void write_prefix(std::shared_ptr<base_message> msg);
         void write_message_data(std::shared_ptr<base_message> msg);
