@@ -256,7 +256,6 @@ def string_to_natural(s, alphabet=None):
         assert not s.startswith(alphabet[0])
         return sum(alphabet.index(char) * len(alphabet)**i for i, char in enumerate(reversed(s)))
 
-
 class RateMonitor(object):
     def __init__(self, max_lookback_time):
         self.max_lookback_time = max_lookback_time
@@ -713,53 +712,50 @@ class FloatingInteger(object):
 
     @classmethod
     def from_target_upper_bound(cls, target):
-        n = natural_to_string(target)
+        n = math.natural_to_string(target)
         if n and ord(n[0]) >= 128:
             n = '\x00' + n
         bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
         bits = IntType(32).unpack(bits2)
         return cls(bits)
-
+    
     def __init__(self, bits, target=None):
         self.bits = bits
         self._target = None
         if target is not None and self.target != target:
             raise ValueError('target does not match')
-
+    
     @property
     def target(self):
         res = self._target
         if res is None:
-            res = self._target = shift_left(
-                self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
+            res = self._target = math.shift_left(self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
         return res
-
+    
     def __hash__(self):
         return hash(self.bits)
-
+    
     def __eq__(self, other):
         return self.bits == other.bits
-
+    
     def __ne__(self, other):
         return not (self == other)
-
+    
     def __cmp__(self, other):
         assert False
-
+    
     def __repr__(self):
-        # return 'FloatingInteger(bits=%s, target=%s)' % (hex(self.bits), hex(self.target))
-        return '{\"bits\":\"%s\", \"target\":\"%s\"}' % (hex(self.bits), hex(self.target))
+        return 'FloatingInteger(bits=%s, target=%s)' % (hex(self.bits), hex(self.target))
 
 class FloatingIntegerType(Type):
     _inner = IntType(32)
-
+    
     def read(self, file):
         bits = self._inner.read(file)
         return FloatingInteger(bits)
-
+    
     def write(self, file, item):
         return self._inner.write(file, item.bits)
-
 # ---new
 
 
@@ -1024,28 +1020,6 @@ class TYPE:
     #     return json_value
 #==============================
 
-    @classmethod
-    def get_json_dict(cls, raw_json):
-        '''
-            json_str -> dict
-            +
-            Пост-обработка спецефичных структур
-        '''
-        _json_dict = json.loads(raw_json)
-        name_type = _json_dict["name_type"]
-        value_func = getattr(cls, "get_value_" + name_type, None)
-
-        value = {}
-        if value_func is None:
-            print("value_func is None!")
-            value = _json_dict["value"]
-        else:
-            value = value_func(_json_dict["value"])
-
-        return name_type, value
-
-    # @classmethod
-    # def
 #===============================|
 ############shares##############|
 #===============================|
@@ -1082,7 +1056,7 @@ class TYPE:
     @classmethod
     def post_process(cls, name_type, value):
         '''
-        Обработка сообщений p2pool -> c2pool
+        
         '''
         post_process_func = getattr(cls, "post_process_" + name_type, None)
         if post_process_func:
@@ -1197,7 +1171,7 @@ def payload_length(raw_json):
     _json = TYPE.get_json_dict(raw_json)
     _type = TYPE.get_type(json['name_type'])
     if _type is None:
-        return '-1'  # todo: обработка
+        return '-1'  # todo: 
     result = len(_type.pack(_json['value']))
     return str(result)
 
@@ -1228,25 +1202,39 @@ def IntType256_test(value_hex):
 
 # ------------------------------------------TESTS------------------------------------------
 
-# list_type = ListType(IntType(32))
-# list_val = list_type.pack([2, 3])
-# print(list_val)
-_str = 'test!!'
-str_type_packed = VarStrType().pack(_str)
-print(str_type_packed)
-str_type_packed_nums = [x for x in str_type_packed]
-print(str_type_packed_nums)
+# # list_type = ListType(IntType(32))
+# # list_val = list_type.pack([2, 3])
+# # print(list_val)
+# _str = 'test!!'
+# str_type_packed = VarStrType().pack(_str)
+# print(str_type_packed)
+# str_type_packed_nums = [x for x in str_type_packed]
+# print(str_type_packed_nums)
 
-# __packed_str = [10,104,101,108,108,111,0,0,0,0,0]
-# _packed_str = [bytes([x]) for x in __packed_str]
-# packed_str = b''.join(_packed_str)
-# str_type_unpacked = VarStrType().unpack(packed_str)
-# print(str_type_unpacked)
+# # __packed_str = [10,104,101,108,108,111,0,0,0,0,0]
+# # _packed_str = [bytes([x]) for x in __packed_str]
+# # packed_str = b''.join(_packed_str)
+# # str_type_unpacked = VarStrType().unpack(packed_str)
+# # print(str_type_unpacked)
 
-_a = VarIntType().pack(0xffffffff-1)
-print(_a)
-print([x for x in _a])
+# _a = VarIntType().pack(0xffffffff-1)
+# print(_a)
+# print([x for x in _a])
 
-_b = IntType(16).pack(123)
-print(_b)
-print([x for x in _b])
+# _b = IntType(16).pack(123)
+# print(_b)
+# print([x for x in _b])
+
+
+FI = FloatingInteger(2**32-1)
+p = FloatingIntegerType().pack(FI)
+print(p)
+
+natur = 2**16-2**8
+
+nts = natural_to_string(natur)
+print(nts)
+
+
+stn = string_to_natural(nts)
+print(stn)
