@@ -4,9 +4,25 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fconcepts")
 project(c2pool)
 
 #check lib's
-if (NOT EXISTS ${CMAKE_SOURCE_DIR}/lib/googletest/.git OR NOT EXISTS ${CMAKE_SOURCE_DIR}/lib/leveldb/.git OR NOT EXISTS ${CMAKE_SOURCE_DIR}/lib/univalue/.git)
-    message(FATAL_ERROR "Git submodules not initialized, execute:\n  git submodule update --init")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git/modules")
+    # Update submodules as needed
+    OPTION(GIT_SUBMODULE "Check submodules during build" ON)
+
+    if(GIT_SUBMODULE)
+        message(STATUS "Git submodules found - updating")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                RESULT_VARIABLE GIT_SUBMOD_RESULT
+        )
+
+        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
+            message(FATAL_ERROR "The command 'git submodule update --init --recursive' failed with ${GIT_SUBMOD_RESULT}, please checkout any existing submodules")
+        endif()
+    endif()
 endif()
+
 
 #init packages
 set(Boost_USE_STATIC_LIBS ON)
