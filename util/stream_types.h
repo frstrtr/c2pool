@@ -2,11 +2,14 @@
 
 #include <devcore/logger.h>
 #include <cstring>
+#include <string>
 #include <vector>
+#include <list>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <optional>
 #include "stream.h"
+#include "math.h"
 using namespace std;
 
 template <typename T>
@@ -413,12 +416,35 @@ struct FloatingInteger
     //TODO: test
     static FloatingInteger from_target_upper_bound(uint256 target)
     {
-        auto n = c2pool::math::natural_to_string(target);
-        if (n.length() > 0 && n[0] >= 128)
+        std::string str_n = c2pool::math::natural_to_string(target);
+        list<unsigned char> n;
+        n.insert(n.end(), str_n.begin(), str_n.end());
+
+        if (n.size() > 0 && *n.begin() >= 128)
         {
-            n = string("\x00") + n;
+            n.push_front('\0');
         }
-        auto bits2 = (char) n.length() + 
+
+        list<unsigned char> bits2;
+        bits2.push_back((unsigned char)n.size());
+        {
+            list<unsigned char> temp_bits(n);
+            for (int i = 0; i < 3; i++)
+                temp_bits.push_back('\0');
+            auto vi = temp_bits.begin();
+            std::advance(vi, 3);
+            bits2.insert(bits2.end(), temp_bits.begin(), vi);
+        }
+        bits2.reverse();
+
+        IntType(32) unpacked_bits;
+
+        unsigned char* bits = new unsigned char[bits2.size()];
+        std::copy(bits2.begin(), bits2.end(), bits);
+        PackStream stream(bits, bits2.size());
+        stream >> unpacked_bits;
+
+        return FloatingInteger(unpacked_bits);
     }
 };
 

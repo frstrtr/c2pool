@@ -75,15 +75,7 @@ namespace c2pool::math
     }
 
     //without alphabet arg for base58
-    string natural_to_string(uint256 n)
-    {
-        auto s = n.GetHex();
-        if (s.length() % 2)
-        {
-            s = string("0") + s;
-        }
-        return s;
-    }
+    string natural_to_string(uint256 n);
 
     // string_to_natural
 
