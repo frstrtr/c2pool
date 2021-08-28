@@ -5,7 +5,7 @@ project(c2pool)
 
 #check lib's
 find_package(Git QUIET)
-if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git/modules")
+if(GIT_FOUND) #AND EXISTS "${PROJECT_SOURCE_DIR}/.git/modules")
     # Update submodules as needed
     OPTION(GIT_SUBMODULE "Check submodules during build" ON)
 
