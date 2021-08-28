@@ -1,5 +1,4 @@
 [![Total alerts](https://img.shields.io/lgtm/alerts/g/frstrtr/c2pool.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/frstrtr/c2pool/alerts/)
-[![Total alerts](https://img.shields.io/lgtm/alerts/g/frstrtr/c2pool.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/frstrtr/c2pool/alerts/)
 
 # c2pool - p2pool rebirth in c++
 (started 02.02.2020)
