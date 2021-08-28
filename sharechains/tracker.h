@@ -68,6 +68,11 @@ namespace c2pool::shares
 
         TrackerThinkResult think();
 
+       
+        int32_t get_height_rel_highest(uint256 prev_block_hash){
+             //TODO:
+        }
+
         uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
         ///in p2pool - generate_transaction | segwit_data in other_data
@@ -409,7 +414,7 @@ namespace c2pool::shares
             return {share_info, gentx, other_transaction_hashes, get_share};
         }
 
-        std::tuple<int32_t, uint256> score(uint256 share_hash, )
+        std::tuple<int32_t, uint256> score(uint256 share_hash)
         {
             uint256 score_res;
             score_res.SetNull();
@@ -423,13 +428,28 @@ namespace c2pool::shares
 
             boost::optional<int32_t> block_height;
             auto gen_verif_chain = verified.get_chain(end_point, net()->CHAIN_LENGTH / 16);
+
             uint256 hash;
             while (gen_verif_chain(hash))
             {
                 auto share = verified.items[hash];
-                
-                //TODO: 
+
+                auto block_height_temp = get_height_rel_highest(share->header.previous_block);
+                if (!block_height.has_value())
+                {
+                    block_height = block_height_temp;
+                }
+                else
+                {
+                    if (block_height.value() > block_height_temp)
+                    {
+                        block_height = block_height_temp;
+                    }
+                }
             }
+
+            score_res = ArithToUint256(verified.get_delta(share_hash, end_point).work / ((-block_height.value() + 1)*netParent()->BLOCK_PERIOD));
+            return std::make_tuple(net()->CHAIN_LENGTH, score_res);
         }
     };
 } // namespace c2pool::shares

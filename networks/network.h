@@ -37,6 +37,7 @@ namespace c2pool
         int REAL_CHAIN_LENGTH;
         int CHAIN_LENGTH;
         int SPREAD;
+        int ADDRESS_VERSION;
 
         uint256 MAX_TARGET;
 
@@ -86,6 +87,7 @@ namespace coind
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
         const unsigned char *PREFIX;
 
+        int32_t BLOCK_PERIOD;
         std::string P2P_ADDRESS;
         int P2P_PORT;
         int ADDRESS_VERSION;

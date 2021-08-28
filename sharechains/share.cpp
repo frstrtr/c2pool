@@ -147,14 +147,16 @@ namespace c2pool::shares
             assert(set_new_tx_hashes == n);
         }
 
-        auto _ref_hash = get_ref_hash(net(), share_info, contents.ref_merkle_link);
-        _ref_hash << IntType(64)(contents.last_txout_nonce) << IntType(32)(0);
 
-        gentx_hash = check_hash_link(
-            hash_link,
-            _ref_hash,
-            gentx_before_refhash
-        );
+        //TODO: 
+        // auto _ref_hash = BaseShare::get_ref_hash(net, share_info, contents["ref_merkle_link"]); //TODO: contents remake
+        // _ref_hash << IntType(64)(contents.last_txout_nonce) << IntType(32)(0);
+
+        // gentx_hash = check_hash_link(
+        //     hash_link,
+        //     _ref_hash,
+        //     gentx_before_refhash
+        // );
         /*
         TODO:
         
@@ -194,4 +196,39 @@ namespace c2pool::shares
         if (is_segwit_activated())
             segwit_data = contents["share_info"]["segwit_data"].get_obj();
     }
+
+#define MAKE_SHARE(CLASS)                                                           \
+    share_result = make_shared<CLASS>(net, peer_addr, share["contents"].get_obj()); \
+    break;
+
+    shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, c2pool::libnet::addr peer_addr)
+    {
+        shared_ptr<BaseShare> share_result;
+        int type_version = 0;
+        if (share.exists("type"))
+        {
+            type_version = share["type"].get_int();
+        }
+        else
+        {
+            throw std::runtime_error("share data in load_share() without type!");
+        }
+
+        switch (type_version)
+        {
+        case 17:
+            MAKE_SHARE(Share) //TODO: TEST
+        case 32:
+            MAKE_SHARE(PreSegwitShare) //TODO: TEST
+        default:
+            if (type_version < 17)
+                throw std::runtime_error("sent an obsolete share");
+            else
+                throw std::runtime_error((boost::format("unkown share type: %1") % type_version).str());
+            break;
+        }
+
+        return share_result;
+    }
+    #undef MAKE_SHARE
 }

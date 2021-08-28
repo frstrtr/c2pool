@@ -28,6 +28,59 @@ concept StreamIntType = !C_STRING<T> && std::numeric_limits<T>::is_integer;
 template <typename T>
 concept StreamEnumType = std::is_enum_v<T>;
 
+struct BaseMaker //TIP, HACK, КОСТЫЛЬ
+{
+};
+
+template <typename T>
+concept bool MakerType = std::is_base_of_v<BaseMaker, T>;
+
+template <typename T>
+struct Maker : BaseMaker
+{
+    template <typename SUB_TYPE>
+    static T make_type(SUB_TYPE v)
+    {
+        return T(v);
+    }
+
+    template <typename SUB_TYPE>
+    static vector<T> make_list_type(vector<SUB_TYPE> v)
+    {
+        vector<T> res;
+
+        for (auto _v : v)
+        {
+            auto res_value = T(_v);
+            res.push_back(res_value);
+        }
+        return res;
+    }
+};
+
+template <MakerType T>
+struct Maker<T> : BaseMaker
+{
+    template <typename SUB_TYPE>
+    static T make_type(SUB_TYPE v)
+    {
+        return Maker<SUB_TYPE>::make_type(v);
+    }
+
+    template <typename SUB_TYPE>
+    static vector<T> make_list_type(vector<SUB_TYPE> v)
+    {
+        vector<T> res;
+
+        for (auto _v : v)
+        {
+            auto res_value = Maker<SUB_TYPE>::make_type(_v);
+            res.push_back(res_value);
+        }
+        return res;
+    }
+};
+
 struct PackStream
 {
     vector<unsigned char> data;
