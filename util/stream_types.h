@@ -302,7 +302,6 @@ public:
 
 struct FloatingInteger
 {
-
     IntType(32) bits;
 
     FloatingInteger()
@@ -314,19 +313,30 @@ struct FloatingInteger
         bits = _bits;
     }
 
-    uint256 target(){
+    uint256 target()
+    {
         arith_uint256 res(bits.value && 0x00ffffff);
-        
+
         res << (8 * ((bits.value >> 24) - 3));
 
         return ArithToUint256(res);
+    }
+
+    //TODO: test
+    static FloatingInteger from_target_upper_bound(uint256 target)
+    {
+        auto n = c2pool::math::natural_to_string(target);
+        if (n.length() > 0 && n[0] >= 128)
+        {
+            n = string("\x00") + n;
+        }
+        auto bits2 = (char) n.length() + 
     }
 };
 
 //TODO: test
 struct FloatingIntegerType
 {
-
     FloatingInteger bits;
 
     PackStream &write(PackStream &stream) const
