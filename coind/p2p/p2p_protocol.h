@@ -1,7 +1,6 @@
 #pragma once
 
 #include "messages.h"
-#include "converter.h"
 #include <libnet/node_member.h>
 #include <devcore/logger.h>
 #include <util/events.h>
@@ -148,7 +147,7 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_ping> msg)
         {
-            auto msg_pong = make_message<message_pong>(msg->nonce);
+            auto msg_pong = make_message<message_pong>(msg->nonce.get());
             _socket->write(msg_pong);
         }
 
@@ -173,7 +172,7 @@ namespace coind::p2p
         void handle(shared_ptr<message_inv> msg)
         {
             LOG_TRACE << "HANDLED INV";
-            for (auto inv : msg->invs)
+            for (auto inv : msg->invs.l)
             {
                 switch (inv.type)
                 {
@@ -219,7 +218,7 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_tx> msg)
         {
-            new_tx->happened(msg->tx); //self.factory.new_tx.happened(tx)
+            //TODO: new_tx->happened(msg->tx); //self.factory.new_tx.happened(tx)
         }
 
         void handle(shared_ptr<message_block> msg)
@@ -243,7 +242,7 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_error> msg)
         {
-            LOG_WARNING << "Handled message_error! command = " << msg->command << " ; error_text = " << msg->error_text;
+            LOG_WARNING << "Handled message_error! command = " << msg->command.get() << " ; error_text = " << msg->error_text.get();
         }
     };
 } // namespace c2pool::p2p

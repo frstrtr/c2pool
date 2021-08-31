@@ -99,7 +99,6 @@ namespace coind::p2p
 
     void P2PSocket::write_prefix(std::shared_ptr<base_message> msg)
     {
-        auto prefix_data = msg->get_prefix();
         boost::asio::async_write(_socket, boost::asio::buffer(netParent()->PREFIX, netParent()->PREFIX_LENGTH),
                                  [this, msg](boost::system::error_code _ec, std::size_t length)
                                  {
