@@ -3,7 +3,6 @@
 #include "messages.h"
 using namespace coind::p2p::messages;
 
-#include "converter.h"
 #include <devcore/logger.h>
 
 #include <univalue.h>

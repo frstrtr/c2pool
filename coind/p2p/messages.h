@@ -92,7 +92,7 @@ namespace coind::p2p::messages
         friend coind::p2p::P2PSocket;
 
     public:
-        coind::p2p::messages::commands name_type;
+        EnumType<coind::p2p::messages::commands> name_type;
         PackStream value;
 
     public:
@@ -458,7 +458,9 @@ namespace coind::p2p::messages
         message_getheaders(uint32_t _version, std::vector<uint256> _have, uint256 _last) : base_message("getheaders")
         {
             version = _version;
-            have = _have;
+
+            auto have_list = have.make_list_type(_have);
+            have = have_list;
             last = _last;
         }
 

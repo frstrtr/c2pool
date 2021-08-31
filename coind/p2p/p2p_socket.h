@@ -1,7 +1,7 @@
 #pragma once
 
 #include "messages.h"
-#inlcude <util/networks.h>
+#include <networks/network.h>
 #include <libnet/node_member.h>
 using namespace coind::p2p::messages;
 

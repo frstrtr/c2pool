@@ -67,6 +67,12 @@ struct StrType : Maker<string>
 {
     string str;
 
+    auto &operator=(std::string _str)
+    {
+        str = _str;
+        return *this;
+    }
+
     PackStream &write(PackStream &stream) const
     {
         LOG_TRACE << "StrType Worked!";
@@ -439,7 +445,7 @@ struct FloatingInteger
 
         IntType(32) unpacked_bits;
 
-        unsigned char* bits = new unsigned char[bits2.size()];
+        unsigned char *bits = new unsigned char[bits2.size()];
         std::copy(bits2.begin(), bits2.end(), bits);
         PackStream stream(bits, bits2.size());
         stream >> unpacked_bits;
