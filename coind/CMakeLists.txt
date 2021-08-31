@@ -22,16 +22,12 @@ target_link_libraries(coind_tool btclibs devcore networks)
 
 #coind_p2p
 set(coind_p2p_sources
-        p2p/converter.h
-        p2p/converter.cpp
         p2p/messages.h
         p2p/messages.cpp
         p2p/p2p_protocol.h
         p2p/p2p_protocol.cpp
         p2p/p2p_socket.h
-        p2p/p2p_socket.cpp
-        p2p/pystruct.h
-        p2p/pystruct.cpp)
+        p2p/p2p_socket.cpp)
 
 message("py3_lib in coind::p2p = ${Python3_LIBRARIES} \n
         py3_include = ${Python3_INCLUDE_DIRS}
