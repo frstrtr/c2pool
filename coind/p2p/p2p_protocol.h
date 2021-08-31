@@ -34,89 +34,82 @@ namespace coind::p2p
 
     public:
         CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, const c2pool::libnet::INodeMember &member);
+
     public:
-        std::shared_ptr<Event<uint256>> new_block; //block_hash
-        std::shared_ptr<Event<UniValue>> new_tx; //bitcoin_data.tx_type
+        std::shared_ptr<Event<uint256>> new_block;    //block_hash
+        std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
         std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
 
-        void init(std::shared_ptr<Event<uint256>> _new_block, std::shared_ptr<Event<UniValue>> _new_tx, std::shared_ptr<Event<UniValue>> _new_headers){
+        void init(std::shared_ptr<Event<uint256>> _new_block, std::shared_ptr<Event<UniValue>> _new_tx, std::shared_ptr<Event<UniValue>> _new_headers)
+        {
             new_block = _new_block;
             new_tx = _new_tx;
             new_headers = _new_headers;
         }
+
     private:
         std::shared_ptr<boost::asio::steady_timer> pinger_timer;
         void pinger(int delay);
+
     public:
         void get_block_header(uint256 hash);
-    public:
-        shared_ptr<raw_message> make_raw_message()
-        {
-            auto raw_msg = make_shared<raw_message>();
-            raw_msg->set_prefix(netParent());
-            return raw_msg;
-        }
 
-        //----------------------------------------------------------------------------
+    public:
+        shared_ptr<raw_message> make_raw_message() { return make_shared<raw_message>(); }
 
         void handle(shared_ptr<raw_message> RawMSG)
         {
             LOG_DEBUG << "called HANDLE msg in p2p_protocol";
-            //В Python скрипте, команда передается, как int, эквивалентный commands
-            RawMSG->deserialize();
-            LOG_TRACE << "rawmsg value = " << RawMSG->value.isNull();
-            LOG_TRACE << "RawMSG->value: " << RawMSG->value.write();
-            UniValue json_value = RawMSG->value;
 
-            switch (RawMSG->name_type) //todo: switch -> if (" " == cmd)
+            switch (RawMSG->name_type.value)
             {
             case commands::cmd_version:
-                handle(GenerateMsg<message_version>(json_value));
+                handle(GenerateMsg<message_version>(RawMSG->value));
                 break;
             case commands::cmd_verack:
-                handle(GenerateMsg<message_verack>(json_value));
+                handle(GenerateMsg<message_verack>(RawMSG->value));
                 break;
             case commands::cmd_ping:
-                handle(GenerateMsg<message_ping>(json_value));
+                handle(GenerateMsg<message_ping>(RawMSG->value));
                 break;
             case commands::cmd_pong:
-                handle(GenerateMsg<message_pong>(json_value));
+                handle(GenerateMsg<message_pong>(RawMSG->value));
                 break;
             case commands::cmd_alert:
-                handle(GenerateMsg<message_alert>(json_value));
+                handle(GenerateMsg<message_alert>(RawMSG->value));
                 break;
             case commands::cmd_getaddr:
-                handle(GenerateMsg<message_getaddr>(json_value));
+                handle(GenerateMsg<message_getaddr>(RawMSG->value));
                 break;
             case commands::cmd_addr:
-                handle(GenerateMsg<message_addr>(json_value));
+                handle(GenerateMsg<message_addr>(RawMSG->value));
                 break;
             case commands::cmd_inv:
-                handle(GenerateMsg<message_inv>(json_value));
+                handle(GenerateMsg<message_inv>(RawMSG->value));
                 break;
             case commands::cmd_getdata:
-                handle(GenerateMsg<message_getdata>(json_value));
+                handle(GenerateMsg<message_getdata>(RawMSG->value));
                 break;
             case commands::cmd_reject:
-                handle(GenerateMsg<message_reject>(json_value));
+                handle(GenerateMsg<message_reject>(RawMSG->value));
                 break;
             case commands::cmd_getblocks:
-                handle(GenerateMsg<message_getblocks>(json_value));
+                handle(GenerateMsg<message_getblocks>(RawMSG->value));
                 break;
             case commands::cmd_getheaders:
-                handle(GenerateMsg<message_getheaders>(json_value));
+                handle(GenerateMsg<message_getheaders>(RawMSG->value));
                 break;
             case commands::cmd_tx:
-                handle(GenerateMsg<message_tx>(json_value));
+                handle(GenerateMsg<message_tx>(RawMSG->value));
                 break;
             case commands::cmd_block:
-                handle(GenerateMsg<message_block>(json_value));
+                handle(GenerateMsg<message_block>(RawMSG->value));
                 break;
             case commands::cmd_headers:
-                handle(GenerateMsg<message_headers>(json_value));
+                handle(GenerateMsg<message_headers>(RawMSG->value));
                 break;
             case commands::cmd_error:
-                handle(GenerateMsg<message_error>(json_value));
+                handle(GenerateMsg<message_error>(RawMSG->value));
                 break;
             }
         }
@@ -125,16 +118,15 @@ namespace coind::p2p
         shared_ptr<message_type> make_message(Args &&...args)
         {
             auto msg = std::make_shared<message_type>(args...);
-            msg->set_prefix(netParent());
             return msg;
         }
 
     protected:
         template <class MsgType>
-        shared_ptr<MsgType> GenerateMsg(UniValue &value)
+        shared_ptr<MsgType> GenerateMsg(PackStream &stream)
         {
             shared_ptr<MsgType> msg = make_shared<MsgType>();
-            *msg = value;
+            stream >> *msg;
             return msg;
         }
 
@@ -232,7 +224,7 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_block> msg)
         {
-           //TODO!?:
+            //TODO!?:
             /*
             block_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header']))
             self.get_block.got_response(block_hash, block)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "messages.h"
+#inlcude <util/networks.h>
 #include <libnet/node_member.h>
 using namespace coind::p2p::messages;
 
@@ -16,13 +17,46 @@ namespace ip = boost::asio::ip;
 
 namespace coind::p2p
 {
+    struct ReadPackedMsg
+    {
+        const int COMMAND_LEN = 12;
+        const int LEN_LEN = 4;
+        const int CHECKSUM_LEN = 4;
+
+        char *prefix;
+        char *command;
+        char *len;
+        char *checksum;
+        char *payload;
+
+        int32_t unpacked_len;
+
+        ReadPackedMsg(int32_t pref_len)
+        {
+            prefix = new char[pref_len];
+            command = new char[COMMAND_LEN];
+            len = new char[LEN_LEN];
+            checksum = new char[CHECKSUM_LEN];
+        }
+
+        ~ReadPackedMsg()
+        {
+            delete prefix;
+            delete command;
+            delete len;
+            delete checksum;
+            delete payload;
+        }
+    };
+}
+
+namespace coind::p2p
+{
     class P2PSocket : public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PSocket>
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, c2pool::libnet::INodeMember node_member) : _socket(std::move(socket)), c2pool::libnet::INodeMember(node_member)
-        {
-        }
+        P2PSocket(ip::tcp::socket socket, const c2pool::libnet::INodeMember &member);
 
         //for connect
         void init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto);
@@ -42,17 +76,17 @@ namespace coind::p2p
 
     private:
         void start_read();
-        void read_prefix(std::shared_ptr<raw_message> tempRawMessage);
-        void read_command(std::shared_ptr<raw_message> tempRawMessage);
-        void read_length(std::shared_ptr<raw_message> tempRawMessage);
-        void read_checksum(shared_ptr<raw_message> tempRawMessage);
-        void read_payload(std::shared_ptr<raw_message> tempRawMessage);
+        void read_prefix(std::shared_ptr<ReadPackedMsg> msg);
+        void read_command(std::shared_ptr<ReadPackedMsg> msg);
+        void read_length(std::shared_ptr<ReadPackedMsg> msg);
+        void read_checksum(std::shared_ptr<ReadPackedMsg> msg);
+        void read_payload(std::shared_ptr<ReadPackedMsg> msg);
+        void final_read_message(std::shared_ptr<ReadPackedMsg> msg);
 
         void write_prefix(std::shared_ptr<base_message> msg);
         void write_message_data(std::shared_ptr<base_message> msg);
 
     private:
-        // std::shared_ptr<coind::ParentNetwork> _net; //Parent network
         ip::tcp::socket _socket;
 
         std::weak_ptr<coind::p2p::CoindProtocol> _protocol;

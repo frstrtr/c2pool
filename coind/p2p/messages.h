@@ -1,12 +1,12 @@
 #pragma once
 
-#include "converter.h"
-
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <util/types.h>
 using namespace c2pool::messages;
 #include <networks/network.h>
+#include <util/stream.h>
+#include <util/stream_types.h>
 
 #include <sstream>
 #include <string>
@@ -14,6 +14,7 @@ using namespace c2pool::messages;
 #include <vector>
 #include <memory>
 #include <tuple>
+#include <map>
 
 #include <devcore/logger.h>
 
@@ -45,6 +46,46 @@ namespace coind::p2p::messages
         cmd_headers
     };
 
+    const std::map<commands, const char *> _string_commands = {
+        {cmd_error, "error"},
+        {cmd_version, "version"},
+        {cmd_verack, "verack"},
+        {cmd_ping, "ping"},
+        {cmd_pong, "pong"},
+        {cmd_alert, "alert"},
+        {cmd_getaddr, "getaddr"},
+        {cmd_addr, "addr"},
+        {cmd_inv, "inv"},
+        {cmd_getdata, "getdata"},
+        {cmd_reject, "reject"},
+        {cmd_getblocks, "getblocks"},
+        {cmd_getheaders, "getheaders"},
+        {cmd_tx, "tx"},
+        {cmd_block, "block"},
+        {cmd_headers, "headers"}};
+
+    const std::map<const char *, commands> _reverse_string_commands = {
+        {"error", cmd_error},
+        {"version", cmd_version},
+        {"verack", cmd_verack},
+        {"ping", cmd_ping},
+        {"pong", cmd_pong},
+        {"alert", cmd_alert},
+        {"getaddr", cmd_getaddr},
+        {"addr", cmd_addr},
+        {"inv", cmd_inv},
+        {"getdata", cmd_getdata},
+        {"reject", cmd_reject},
+        {"getblocks", cmd_getblocks},
+        {"getheaders", cmd_getheaders},
+        {"tx", cmd_tx},
+        {"block", cmd_block},
+        {"headers", cmd_headers}};
+
+    const char *string_commands(commands cmd);
+
+    commands reverse_string_commands(const char *key);
+
     //base_message type for handle
     class raw_message
     {
@@ -52,70 +93,47 @@ namespace coind::p2p::messages
 
     public:
         coind::p2p::messages::commands name_type;
-        UniValue value;
-
-    protected:
-        std::shared_ptr<coind_converter> converter;
+        PackStream value;
 
     public:
         raw_message()
         {
-            converter = std::make_shared<coind_converter>();
         }
 
-        void set_prefix(std::shared_ptr<coind::ParentNetwork> _net)
+        PackStream &write(PackStream &stream)
         {
-            //TODO: correct prefix set!
-            converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
+            stream << name_type << value;
+            return stream;
         }
 
-        void deserialize()
+        PackStream &read(PackStream &stream)
         {
-            UniValue _value = converter->decode();
-            LOG_TRACE << "deserialize value :" << _value.write();
-            name_type = (coind::p2p::messages::commands)_value["name_type"].get_int();
-            value = _value["value"].get_obj();
+            stream >> name_type;
+            value = PackStream(stream);
+            return stream;
         }
     };
 
     class base_message
     {
-        friend class coind::p2p::python::PyPackCoindTypes;
-
-    protected:
-        std::shared_ptr<coind_converter> converter;
-
-        virtual UniValue json_pack() = 0;
+    public:
+        commands cmd;
 
     public:
         base_message(const char *_cmd)
         {
-            converter = std::make_shared<coind_converter>(_cmd);
+            cmd = reverse_string_commands(_cmd);
         }
 
-        void set_prefix(std::shared_ptr<coind::ParentNetwork> _net)
+        base_message(commands _cmd)
         {
-            converter->set_prefix((const char *)_net->PREFIX, _net->PREFIX_LENGTH);
+            cmd = _cmd;
         }
 
-        std::tuple<char *, int> get_prefix()
-        {
-            auto res = std::make_tuple<char *, int>(converter->get_prefix(), converter->get_prefix_len());
-            return res;
-        }
+    public:
+        virtual PackStream &write(PackStream &stream) { return stream; };
 
-        //base_message -> bytes; msg = self
-        std::tuple<char *, int> serialize()
-        {
-            LOG_TRACE << "start serialize msg";
-            UniValue json_msg(UniValue::VOBJ);
-            json_msg.pushKV("name_type", converter->get_command());
-            UniValue msg_value(UniValue::VOBJ);
-            msg_value = json_pack();
-            json_msg.pushKV("value", msg_value);
-            LOG_TRACE << "before encode message in serialize";
-            return converter->encode(json_msg);
-        }
+        virtual PackStream &read(PackStream &stream) { return stream; };
     };
 
     /*
@@ -130,25 +148,22 @@ namespace coind::p2p::messages
     class message_error : public base_message
     {
     public:
-        std::string command;
-        std::string error_text;
+        StrType command;
+        StrType error_text;
 
     public:
         message_error() : base_message("error") {}
 
-        message_error &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            command = value["command"].get_str();
-            error_text = value["error_text"].get_str();
-            return *this;
+            stream << command << error_text;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            return result;
+            stream >> command >> error_text;
+            return stream;
         }
     };
 
@@ -161,14 +176,14 @@ namespace coind::p2p::messages
     class message_version : public base_message
     {
     public:
-        int32_t version;
-        uint64_t services;
-        int64_t timestamp;
+        IntType(32) version;
+        IntType(64) services;
+        IntType(64) timestamp;
         address_type addr_to;
         address_type addr_from;
-        unsigned long long nonce;
-        std::string sub_version;
-        int32_t start_height;
+        IntType(64) nonce;
+        StrType sub_version;
+        IntType(32) start_height;
 
     public:
         message_version() : base_message("version") {}
@@ -185,34 +200,16 @@ namespace coind::p2p::messages
             start_height = _start_height;
         }
 
-        message_version &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            version = value["version"].get_int();
-            services = value["services"].get_uint64();
-            timestamp = value["time"].get_int64();
-            addr_to = value["addr_to"].get_obj();
-            addr_from = value["addr_from"].get_obj();
-            nonce = value["nonce"].get_uint64();
-            sub_version = value["sub_version_num"].get_str();
-            start_height = value["start_height"].get_int();
-            return *this;
+            stream << version << services << timestamp << addr_to << addr_from << nonce << sub_version << start_height;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("version", version);
-            result.pushKV("services", services);
-            result.pushKV("time", timestamp);
-            result.pushKV("addr_to", addr_to);
-            result.pushKV("addr_from", addr_from);
-            result.pushKV("nonce", (uint64_t)nonce);
-            result.pushKV("sub_version_num", sub_version);
-            result.pushKV("start_height", start_height);
-
-            return result;
+            stream >> version >> services >> timestamp >> addr_to >> addr_from >> nonce >> sub_version >> start_height;
+            return stream;
         }
     };
 
@@ -221,24 +218,21 @@ namespace coind::p2p::messages
     public:
         message_verack() : base_message("verack") {}
 
-        message_verack &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            return *this;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            return result;
+            return stream;
         }
     };
 
     class message_ping : public base_message
     {
     public:
-        uint64_t nonce;
+        IntType(64) nonce;
 
     public:
         message_ping() : base_message("ping") {}
@@ -248,18 +242,16 @@ namespace coind::p2p::messages
             nonce = _nonce;
         }
 
-        message_ping &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            nonce = value["nonce"].get_uint64();
-            return *this;
+            stream << nonce;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("nonce", (uint64_t)nonce);
-            return result;
+            stream >> nonce;
+            return stream;
         }
     };
 
@@ -276,44 +268,38 @@ namespace coind::p2p::messages
             nonce = _nonce;
         }
 
-        message_pong &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            nonce = value["nonce"].get_uint64();
-            return *this;
+            stream << nonce;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("nonce", (uint64_t)nonce);
-            return result;
+            stream >> nonce;
+            return stream;
         }
     };
 
     class message_alert : public base_message
     {
     public:
-        std::string message;
-        std::string signature;
+        StrType message;
+        StrType signature;
 
     public:
         message_alert() : base_message("alert") {}
 
-        message_alert &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            message = value["message"].get_str();
-            signature = value["signature"].get_str();
-            return *this;
+            stream << message << signature;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("message", message);
-            result.pushKV("signature", signature);
-            return result;
+            stream >> message >> signature;
+            return stream;
         }
     };
 
@@ -323,23 +309,21 @@ namespace coind::p2p::messages
     public:
         message_getaddr() : base_message("getaddr") {}
 
-        message_getaddr &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            return *this;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            return result;
+            return stream;
         }
     };
 
     class message_addr : public base_message
     {
     public:
-        std::vector<c2pool::messages::addr> addrs;
+        ListType<c2pool::messages::addr> addrs;
 
     public:
         message_addr() : base_message("addr") {}
@@ -349,38 +333,23 @@ namespace coind::p2p::messages
             addrs = _addrs;
         }
 
-        message_addr &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["addrs"].get_array().getValues())
-            {
-                c2pool::messages::addr _temp_addr;
-                _temp_addr = arr_value;
-                addrs.push_back(_temp_addr);
-            }
-            return *this;
+            stream << addrs;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue addrs_array(UniValue::VARR);
-
-            for (auto _addr : addrs)
-            {
-                addrs_array.push_back(_addr);
-            }
-            result.pushKV("addrs", addrs_array);
-
-            return result;
+            stream >> addrs;
+            return stream;
         }
     };
 
     class message_inv : public base_message
     {
     public:
-        std::vector<inventory> invs;
+        ListType<inventory> invs;
 
     public:
         message_inv() : base_message("inv") {}
@@ -390,38 +359,23 @@ namespace coind::p2p::messages
             invs = _invs;
         }
 
-        message_inv &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["invs"].get_array().getValues())
-            {
-                inventory _temp_inv;
-                _temp_inv = arr_value;
-                invs.push_back(_temp_inv);
-            }
-            return *this;
+            stream << invs;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue inventory_array(UniValue::VARR);
-
-            for (auto _inv : invs)
-            {
-                inventory_array.push_back(_inv);
-            }
-            result.pushKV("invs", inventory_array);
-
-            return result;
+            stream >> invs;
+            return stream;
         }
     };
 
     class message_getdata : public base_message
     {
     public:
-        std::vector<inventory> requests;
+        ListType<inventory> requests;
 
     public:
         message_getdata() : base_message("getdata") {}
@@ -431,245 +385,174 @@ namespace coind::p2p::messages
             requests = _reqs;
         }
 
-        message_getdata &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            for (auto arr_value : value["requests"].get_array().getValues())
-            {
-                inventory _temp_inv;
-                _temp_inv = arr_value;
-                requests.push_back(_temp_inv);
-            }
-            return *this;
+            stream << requests;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue inventory_array(UniValue::VARR);
-
-            for (auto _inv : requests)
-            {
-                inventory_array.push_back(_inv);
-            }
-            result.pushKV("requests", inventory_array);
-
-            return result;
+            stream >> requests;
+            return stream;
         }
     };
 
     class message_reject : public base_message
     {
     public:
-        std::string message;
-        char ccode;
-        std::string reason;
-        uint256 data;
+        StrType message;
+        IntType(8) ccode;
+        StrType reason;
+        IntType(256) data;
 
     public:
         message_reject() : base_message("reject") {}
 
-        message_reject &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            message = value["message"].get_str();
-            ccode = value["ccode"].get_str()[0];
-            reason = value["reason"].get_str();
-            data.SetHex(value["data"].get_str());
-            return *this;
+            stream << message << ccode << reason << data;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("message", message);
-            result.pushKV("ccode", ccode);
-            result.pushKV("reason", reason);
-            result.pushKV("data", data.GetHex());
-            return result;
+            stream >> message >> ccode >> reason >> data;
+            return stream;
         }
     };
 
     class message_getblocks : public base_message
     {
     public:
-        uint32_t version;
-        std::vector<uint256> have;
-        uint256 last;
+        IntType(32) version;
+        ListType<IntType(256)> have;
+        IntType(256) last;
 
     public:
         message_getblocks() : base_message("getblocks") {}
 
-        message_getblocks &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            version = value["version"].get_int();
-
-            for (auto arr_value : value["have"].get_array().getValues())
-            {
-                uint256 _temp_hash;
-                _temp_hash.SetHex(arr_value.get_str());
-                have.push_back(_temp_hash);
-            }
-
-            last.SetHex(value["last"].get_str());
-
-            return *this;
+            stream << version << have << last;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("version", (int)version);
-
-            UniValue have_array(UniValue::VARR);
-
-            for (auto _hash : have)
-            {
-                have_array.push_back(_hash.GetHex());
-            }
-            result.pushKV("have", have_array);
-
-            result.pushKV("last", last.GetHex());
-            return result;
+            stream >> version >> have >> last;
+            return stream;
         }
     };
 
     class message_getheaders : public base_message
     {
     public:
-        uint32_t version;
-        std::vector<uint256> have;
-        uint256 last;
+        IntType(32) version;
+        ListType<IntType(256)> have;
+        IntType(256) last;
 
     public:
         message_getheaders() : base_message("getheaders") {}
 
-        message_getheaders(uint32_t _version, std::vector<uint256> _have, uint256 _last) : base_message("getheaders"), version(_version), have(_have), last(_last) {}
-
-        message_getheaders &operator=(UniValue value)
+        message_getheaders(uint32_t _version, std::vector<uint256> _have, uint256 _last) : base_message("getheaders")
         {
-            version = value["version"].get_int();
-
-            for (auto arr_value : value["have"].get_array().getValues())
-            {
-                uint256 _temp_hash;
-                _temp_hash.SetHex(arr_value.get_str());
-                have.push_back(_temp_hash);
-            }
-
-            last.SetHex(value["last"].get_str());
-
-            return *this;
+            version = _version;
+            have = _have;
+            last = _last;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &write(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("version", (int)version);
+            stream << version << have << last;
+            return stream;
+        }
 
-            UniValue have_array(UniValue::VARR);
-
-            for (auto _hash : have)
-            {
-                have_array.push_back(_hash.GetHex());
-            }
-            result.pushKV("have", have_array);
-
-            result.pushKV("last", last.GetHex());
-            return result;
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> version >> have >> last;
+            return stream;
         }
     };
 
     class message_tx : public base_message
     {
     public:
+        //TODO:
         /*
         message_tx = pack.ComposedType([
         ('tx', bitcoin_data.tx_type),
         ])
         */
-        UniValue tx;
+        //TODO:UniValue tx;
 
     public:
         message_tx() : base_message("tx") {}
 
-        message_tx &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            tx = value["tx"].get_obj();
-
-            return *this;
+            //TODO: stream << tx;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("tx", tx);
-
-            return result;
+            //TODO: stream >> tx;
+            return stream;
         }
     };
 
     class message_block : public base_message
     {
     public:
+        //TODO:
         /*
         message_block = pack.ComposedType([
         ('block', bitcoin_data.block_type),
         ])
         */
-        UniValue block;
+        //TODO:UniValue block;
 
     public:
         message_block() : base_message("block") {}
 
-        message_block &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            block = value["block"].get_obj();
-
-            return *this;
+            //TODO: stream << block;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("block", block);
-
-            return result;
+            //TODO: stream >> block;
+            return stream;
         }
     };
 
     class message_headers : public base_message
     {
     public:
+        //TODO:
         /*
         message_headers = pack.ComposedType([
         ('headers', pack.ListType(bitcoin_data.block_type)),
         ])
         */
-        UniValue headers;
+        //TODO: UniValue headers;
 
     public:
         message_headers() : base_message("headers") {}
 
-        message_headers &operator=(UniValue value)
+        PackStream &write(PackStream &stream) override
         {
-            headers = value["headers"].get_obj();
-
-            return *this;
+            //TODO: stream << headers;
+            return stream;
         }
 
-    protected:
-        UniValue json_pack() override
+        PackStream &read(PackStream &stream) override
         {
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("headers", headers);
-
-            return result;
+            //TODO: stream >> headers;
+            return stream;
         }
     };
 } // namespace c2pool::libnet::messages
