@@ -5,7 +5,6 @@
 #include <devcore/logger.h>
 #include <devcore/str.h>
 #include <networks/network.h>
-#include <util/pystruct.h>
 #include <util/stream.h>
 #include <util/stream_types.h>
 
@@ -137,7 +136,7 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::write_message_data(std::shared_ptr<base_message> _msg)
     {
-        SendPackedMsg msg(msg);
+        SendPackedMsg msg(_msg);
         boost::asio::async_write(_socket, boost::asio::buffer(msg.data, msg.len),
                                  //TODO?: this -> shared_this()
                                  [this](boost::system::error_code _ec, std::size_t length)
@@ -273,10 +272,11 @@ namespace c2pool::libnet::p2p
                                 });
     }
 
-    void P2PSocket::final_read_message(shared_ptr<ReadPackedMsg> msg){
+    void P2PSocket::final_read_message(shared_ptr<ReadPackedMsg> msg)
+    {
         //checksum check
         //TODO: !!!
-        
+
         //Make raw message
         PackStream stream_RawMsg;
 
