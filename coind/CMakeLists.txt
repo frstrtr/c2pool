@@ -6,7 +6,9 @@ set(jsonrpc_sources
         jsonrpc/coind.h 
         jsonrpc/requests.h 
         jsonrpc/results.h 
-        jsonrpc/coind.cpp)
+        jsonrpc/coind.cpp
+        jsonrpc/stratum.h
+        jsonrpc/stratum.cpp)
 
 add_library(coind_jsonrpc STATIC ${jsonrpc_sources})
 target_link_libraries(coind_jsonrpc univalue btclibs util networks ${CURL_LIBRARIES})

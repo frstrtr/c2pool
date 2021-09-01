@@ -8,7 +8,7 @@
 #include <memory>
 using std::shared_ptr;
 
-namespace c2pool::libnet::worker
+namespace c2pool::libnet
 {
     class WorkerBridge
     {
