@@ -13,3 +13,7 @@ set_target_properties(coind_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BI
 
 target_link_libraries(coind_test gtest gtest_main)
 target_link_libraries(coind_test devcore networks coind_tool coind_jsonrpc coind_p2p)
+
+
+add_executable(stratum_test_exec stratum_test_exec.cpp)
+target_link_libraries(stratum_test_exec devcore networks coind_tool coind_jsonrpc coind_p2p)
