@@ -16,8 +16,36 @@ namespace coind::jsonrpc
         }
     }
 
+    Proxy::Proxy(shared_ptr<coind::jsonrpc::StratumRPC> _rpc) : rpc(_rpc)
+    {
+    }
+
+    void Proxy::send(std::string method, UniValue params)
+    {
+        int32_t _id = 0; //TODO: ?
+
+        UniValue data(UniValue::VOBJ);
+        data.pushKV("jsonrpc", "2.0");
+        data.pushKV("method", method);
+        data.pushKV("params", params);
+        data.pushKV("id", _id);
+
+        string data_str = data.write();
+        boost::asio::async_write(rpc.lock()->_socket, boost::asio::buffer(data_str, data_str.size()), [](const boost::system::error_code &ec, std::size_t len)
+                                 {
+                                     if (!ec)
+                                     {
+                                     }
+                                     else
+                                     {
+                                         cout << "Proxy::send async_write error: " << ec.message() << endl;
+                                     }
+                                 });
+    }
+
     StratumRPC::StratumRPC(ip::tcp::socket __socket) : _socket(std::move(__socket))
     {
+        cout << "1" << endl;
         read();
     }
 
