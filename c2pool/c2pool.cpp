@@ -3,7 +3,7 @@
 #include <devcore/config.h>
 #include <devcore/logger.h>
 #include <devcore/common.h>
-#include <libnet/nodeManager.h>
+#include <libnet/node_manager.h>
 #include <networks/network.h>
 using namespace c2pool::dev;
 using namespace c2pool::libnet;

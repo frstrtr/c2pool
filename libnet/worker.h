@@ -1,27 +1,25 @@
 #pragma once
-#include "nodeManager.h"
+
+#include <memory>
+
+#include "node_member.h"
 #include <sharechains/tracker.h>
 #include <networks/network.h>
 #include <coind/jsonrpc/coind.h>
 
-
-#include <memory>
 using std::shared_ptr;
 
 namespace c2pool::libnet
 {
-    class WorkerBridge
+    class WorkerBridge : public c2pool::libnet::INodeMember
     {
-        private:
-            shared_ptr<NodeManager> _node_manager;
+    private:
+        shared_ptr<coind::jsonrpc::Coind> _coind;
 
-            shared_ptr<c2pool::Network> _net; //TODO: parent network
-            shared_ptr<coind::jsonrpc::Coind> _coind;
-        public:
-            WorkerBridge(shared_ptr<NodeManager> node_manager){
-                _node_manager = node_manager;
-                _net = _node_manager->net();
-                _coind = _node_manager->coind();
-            }
+    public:
+        WorkerBridge(shared_ptr<NodeManager> node_manager);
+
+        //TODO: return type
+        void get_work();
     };
 } // namespace c2pool::libnet::worker

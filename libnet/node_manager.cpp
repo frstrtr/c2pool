@@ -1,0 +1,89 @@
+#include "node_manager.h"
+
+#include <boost/asio.hpp>
+
+#include "worker.h"
+#include "p2p_node.h"
+#include "coind_node.h"
+#include <sharechains/tracker.h>
+#include <coind/jsonrpc/coind.h>
+
+using boost::asio::ip::tcp;
+using namespace c2pool::shares;
+
+namespace c2pool::libnet
+{
+
+    void NodeManager::run()
+    {
+        tcp::endpoint listen_endpoint(tcp::v4(), _config->listenPort); //atoi(_port.c_str()));
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(shared_from_this(), listen_endpoint);
+        _p2pnode->start();
+    }
+
+    shared_ptr<c2pool::Network> NodeManager::net() const
+    {
+        return _net;
+    }
+
+    shared_ptr<coind::ParentNetwork> NodeManager::netParent() const
+    {
+        return _netParent;
+    }
+
+    shared_ptr<c2pool::dev::coind_config> NodeManager::config() const
+    {
+        return _config;
+    }
+
+    shared_ptr<c2pool::dev::AddrStore> NodeManager::addr_store() const
+    {
+        return _addr_store;
+    }
+
+    shared_ptr<c2pool::libnet::p2p::P2PNode> NodeManager::p2pNode() const
+    {
+        return _p2pnode;
+    }
+
+    shared_ptr<coind::jsonrpc::Coind> NodeManager::coind() const
+    {
+        return _coind;
+    }
+
+    shared_ptr<c2pool::libnet::CoindNode> NodeManager::coind_node() const
+    {
+        return _coind_node;
+    }
+
+    shared_ptr<c2pool::shares::ShareTracker> NodeManager::tracker() const
+    {
+        return _tracker;
+    }
+
+    shared_ptr<c2pool::libnet::WorkerBridge> NodeManager::worker() const
+    {
+        return _worker;
+    }
+}
+
+namespace c2pool::libnet
+{
+#define create_set_method(type, var_name)                      \
+    void TestNodeManager::set##var_name(shared_ptr<type> _val) \
+    {                                                          \
+        var_name = _val;                                       \
+    }
+
+    create_set_method(c2pool::Network, _net);
+    create_set_method(coind::ParentNetwork, _netParent);
+    create_set_method(c2pool::dev::coind_config, _config);
+    create_set_method(c2pool::dev::AddrStore, _addr_store);
+    create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
+    create_set_method(coind::jsonrpc::Coind, _coind);
+    create_set_method(c2pool::libnet::CoindNode, _coind_node);
+    create_set_method(c2pool::shares::ShareTracker, _tracker);
+    create_set_method(c2pool::libnet::WorkerBridge, _worker);
+
+#undef create_set_method
+}

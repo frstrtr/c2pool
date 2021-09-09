@@ -1,25 +1,24 @@
 #pragma once
 
-#include <networks/network.h>
-#include <devcore/logger.h>
-#include "nodeManager.h"
-#include "node_member.h"
-
-#include <coind/jsonrpc/coind.h>
-using namespace coind::jsonrpc;
-
-#include <sharechains/tracker.h>
-using namespace c2pool::shares;
-
-#include <util/events.h>
-using namespace c2pool::util::events;
-
 #include <memory>
 #include <thread>
+
+#include <boost/asio.hpp>
+
+#include "node_member.h"
+#include <networks/network.h>
+#include <devcore/logger.h>
+#include <coind/jsonrpc/coind.h>
+#include <sharechains/tracker.h>
+#include <util/events.h>
+
+using namespace coind::jsonrpc;
+using namespace c2pool::shares;
+using namespace c2pool::util::events;
+
 using std::make_shared;
 using std::shared_ptr, std::unique_ptr;
 
-#include <boost/asio.hpp>
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
@@ -30,7 +29,7 @@ namespace coind::p2p
 
 namespace c2pool::libnet
 {
-    class CoindNode: public c2pool::libnet::INodeMember
+    class CoindNode : public c2pool::libnet::INodeMember
     {
     public:
         CoindNode(shared_ptr<NodeManager> node_manager);

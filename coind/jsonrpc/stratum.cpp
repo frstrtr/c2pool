@@ -117,4 +117,13 @@ namespace coind::jsonrpc
                                      cout << "Writed data: " << ec.message() << endl;
                                  });
     }
+
+    StratumNode::StratumNode(const ip::tcp::endpoint &listen_ep, const c2pool::libnet::INodeMember &member) : INodeMember(member), _context(1), _acceptor(_context, listen_ep)
+    {
+        _thread.reset(new std::thread([&]()
+                                      {
+                                          start();
+                                          _context.run();
+                                      }));
+    }
 }

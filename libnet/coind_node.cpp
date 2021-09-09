@@ -1,4 +1,5 @@
 #include "coind_node.h"
+#include "node_manager.h"
 #include "node_member.h"
 #include <coind/p2p/p2p_socket.h>
 #include <coind/p2p/p2p_protocol.h>

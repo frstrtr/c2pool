@@ -38,6 +38,7 @@ namespace c2pool
         int CHAIN_LENGTH;
         int SPREAD;
         int ADDRESS_VERSION;
+        bool PERSIST;
 
         uint256 MAX_TARGET;
 

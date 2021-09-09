@@ -1,8 +1,20 @@
 #pragma once
 
+#include <memory>
+#include <string>
+#include <tuple>
+
+#include <boost/asio.hpp>
+#include <boost/function.hpp>
+
 #include "messages.h"
 #include "node_member.h"
+#include <networks/network.h>
+#include <util/stream.h>
+
 using namespace c2pool::libnet::messages;
+namespace ip = boost::asio::ip;
+
 namespace c2pool
 {
     class Network;
@@ -13,15 +25,6 @@ namespace c2pool
         class Protocol;
     }
 } // namespace c2pool
-
-#include <memory>
-#include <string>
-#include <tuple>
-#include <networks/network.h>
-#include <boost/asio.hpp>
-#include <boost/function.hpp>
-#include <util/stream.h>
-namespace ip = boost::asio::ip;
 
 namespace c2pool::libnet::p2p
 {

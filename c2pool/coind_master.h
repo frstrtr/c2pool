@@ -1,7 +1,7 @@
 #include <devcore/config.h>
 #include <devcore/logger.h>
 #include <devcore/common.h>
-#include <libnet/nodeManager.h>
+#include <libnet/node_manager.h>
 #include <networks/network.h>
 #include <sharechains/tracker.h>
 using namespace c2pool::dev;
