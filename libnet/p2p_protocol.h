@@ -1,18 +1,19 @@
 #pragma once
 
-#include "messages.h"
-#include <devcore/logger.h>
-#include "p2p_socket.h"
-#include "node_member.h"
-#include <sharechains/share.h>
-#include <util/types.h>
-#include "p2p_node.h"
-using namespace c2pool::libnet::messages;
+#include <memory>
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
 
-#include <memory>
+#include "messages.h"
+#include "p2p_node.h"
+#include "p2p_socket.h"
+#include "node_member.h"
+#include <devcore/logger.h>
+#include <sharechains/share.h>
+#include <util/types.h>
+
+using namespace c2pool::libnet::messages;
 using std::shared_ptr, std::weak_ptr, std::make_shared;
 using std::vector;
 

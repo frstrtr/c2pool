@@ -1,33 +1,28 @@
 #pragma once
 
-#include "node_member.h"
-
-namespace c2pool::libnet::p2p
-{
-    class Protocol;
-}
-
-#include <boost/asio.hpp>
-namespace io = boost::asio;
-namespace ip = boost::asio::ip;
-
 #include <set>
 #include <tuple>
 #include <map>
 #include <memory>
+
+#include <boost/asio.hpp>
+
+#include "node_member.h"
+#include <devcore/addrStore.h>
+
+namespace io = boost::asio;
+namespace ip = boost::asio::ip;
 using std::set, std::tuple, std::map;
 using std::shared_ptr, std::unique_ptr;
-
-#include <devcore/addrStore.h>
 
 namespace c2pool
 {
     namespace libnet
     {
         class NodeManager;
-        class INodeMember;
         namespace p2p
         {
+            class Protocol;
             class P2PSocket;
         }
     }
@@ -58,6 +53,7 @@ namespace c2pool::libnet::p2p
 
         std::vector<addr> get_good_peers(int max_count);
         unsigned long long get_nonce();
+        bool is_connected() const;
 
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);        //todo

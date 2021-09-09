@@ -1,4 +1,12 @@
 #include "p2p_socket.h"
+
+#include <memory>
+#include <tuple>
+#include <string>
+
+#include <boost/asio.hpp>
+#include <boost/function.hpp>
+
 #include "messages.h"
 #include "p2p_protocol.h"
 #include "p2p_node.h"
@@ -8,16 +16,9 @@
 #include <util/stream.h>
 #include <util/stream_types.h>
 
-#include <memory>
-#include <tuple>
-#include <string>
 using std::string;
 using std::tuple;
-
-#include <boost/asio.hpp>
-#include <boost/function.hpp>
 namespace ip = boost::asio::ip;
-
 using namespace c2pool::libnet::p2p;
 using namespace c2pool::libnet::messages;
 

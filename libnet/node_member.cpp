@@ -1,5 +1,6 @@
 #include "node_member.h"
-#include "nodeManager.h"
+#include "node_manager.h"
+#include "p2p_node.h"
 #include <memory>
 
 using namespace std;

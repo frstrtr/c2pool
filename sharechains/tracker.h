@@ -7,7 +7,7 @@
 #include <coind/data.h>
 #include <devcore/logger.h>
 #include <devcore/common.h>
-#include <libnet/nodeManager.h>
+#include <libnet/node_manager.h>
 #include "prefsum_share.h"
 #include <util/pystruct.h>
 #include <libnet/node_member.h>

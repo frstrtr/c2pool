@@ -1,14 +1,16 @@
 #include <memory>
 #include <iostream>
 #include <string>
-#include <boost/asio.hpp>
 #include <thread>
 #include <string>
 #include <set>
 #include <tuple>
-#include <libnet/node_member.h>
-#include <univalue.h>
+
+#include <boost/asio.hpp>
 #include <boost/algorithm/string.hpp>
+
+#include <univalue.h>
+#include <libnet/node_member.h>
 #include <btclibs/uint256.h>
 
 namespace io = boost::asio;
@@ -221,7 +223,7 @@ namespace coind::jsonrpc
         }
     };
 
-    class StratumNode
+    class StratumNode : public c2pool::libnet::INodeMember
     {
         std::unique_ptr<std::thread> _thread;
         io::io_context _context;
@@ -250,13 +252,6 @@ namespace coind::jsonrpc
                                    });
         }
 
-        StratumNode(const ip::tcp::endpoint &listen_ep) : _context(1), _acceptor(_context, listen_ep)
-        {
-            _thread.reset(new std::thread([&]()
-                                          {
-                                              start();
-                                              _context.run();
-                                          }));
-        }
+        StratumNode(const ip::tcp::endpoint &listen_ep, const c2pool::libnet::INodeMember& member);
     };
 }

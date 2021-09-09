@@ -1,9 +1,10 @@
 #include "messages.h"
-#include "p2p_socket.h"
 
 #include <devcore/logger.h>
 #include <devcore/str.h>
 #include <util/pystruct.h>
+
+#include "p2p_socket.h"
 
 namespace c2pool::libnet::messages
 {

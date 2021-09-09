@@ -1,12 +1,5 @@
 #pragma once
 
-#include <univalue.h>
-#include <util/types.h>
-#include <util/stream_types.h>
-#include <btclibs/uint256.h>
-#include <sharechains/shareTypes.h>
-#include <networks/network.h>
-
 #include <sstream>
 #include <string>
 #include <sstream>
@@ -14,7 +7,14 @@
 #include <memory>
 #include <tuple>
 
+#include <univalue.h>
+#include <util/types.h>
+#include <util/stream_types.h>
+#include <btclibs/uint256.h>
+#include <sharechains/shareTypes.h>
+#include <networks/network.h>
 #include <devcore/logger.h>
+
 using namespace c2pool::messages;
 
 namespace c2pool::libnet::p2p
