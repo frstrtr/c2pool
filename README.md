@@ -32,9 +32,7 @@ Discord:
 
 # Install:
 
-1. 
-git clone --recursive https://github.com/frstrtr/c2pool.git
-
-or after cloning
-
-git submodule update --init
+sudo apt-get update && sudo apt-get install libcurl4-openssl-dev
+sudo apt install gcc-8 g++-8
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 --slave /usr/bin/g++ g++ /usr/bin/g++-8
+sudo apt-get update && sudo apt-get install -yq libboost-filesystem1.71-dev && sudo apt-get install -yq libboost1.71-all-dev
