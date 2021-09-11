@@ -8,7 +8,7 @@
 #include "messages.h"
 #include "p2p_node.h"
 #include "p2p_socket.h"
-#include "node_member.h"
+#include "node_manager.h"
 #include <devcore/logger.h>
 #include <sharechains/share.h>
 #include <util/types.h>
@@ -24,7 +24,7 @@ namespace c2pool::libnet::p2p
 
 namespace c2pool::libnet::p2p
 {
-    class Protocol : public INodeMember
+    class Protocol : public NodeMember
     {
     public:
         const int version;
@@ -38,7 +38,7 @@ namespace c2pool::libnet::p2p
         shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
 
     protected:
-        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, const c2pool::libnet::INodeMember &member);
+        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, const c2pool::libnet::NodeMember &member);
 
     public:
         virtual void handle(shared_ptr<raw_message> RawMSG) {}
@@ -49,7 +49,7 @@ namespace c2pool::libnet::p2p
     class P2P_Protocol : public Protocol
     {
     public:
-        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, const c2pool::libnet::INodeMember& member) : Protocol(socket, member)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, const c2pool::libnet::NodeMember& member) : Protocol(socket, member)
         {
             LOG_TRACE << "P2P_Protocol: "
                       << "start constructor";

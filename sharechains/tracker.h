@@ -10,7 +10,7 @@
 #include <libnet/node_manager.h>
 #include "prefsum_share.h"
 #include <util/pystruct.h>
-#include <libnet/node_member.h>
+#include <libnet/node_manager.h>
 
 #include <map>
 #include <vector>
@@ -52,7 +52,7 @@ namespace c2pool::shares
         std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
     };
 
-    class ShareTracker : public c2pool::libnet::INodeMember, public enable_shared_from_this<ShareTracker>
+    class ShareTracker : public c2pool::libnet::NodeMember, public enable_shared_from_this<ShareTracker>
     {
     private:
         PrefsumShare shares;

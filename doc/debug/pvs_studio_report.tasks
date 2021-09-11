@@ -121,8 +121,8 @@ pvs-studio.com/en/docs/warnings/	1	err	Help: The documentation for all analyzer 
 /home/sl33n/c2pool/libnet/p2p_socket.h	42	err	V730 Not all members of a class are initialized inside the constructor. Consider inspecting: payload, unpacked_len.
 /home/sl33n/c2pool/libnet/node_manager.cpp.PVS-Studio.stacktrace.txt	1	err	V003 Unrecognized error found: stacktrace was written to the file '/home/sl33n/c2pool/libnet/node_manager.cpp.PVS-Studio.stacktrace.txt' 
 /home/sl33n/c2pool/libnet/node_manager.cpp	1	err	V003 Analyzer exited unexpectedly when trying to analyze '/home/sl33n/c2pool/libnet/node_manager.cpp' file with exit code 139
-/home/sl33n/c2pool/libnet/node_member.cpp.PVS-Studio.stacktrace.txt	1	err	V003 Unrecognized error found: stacktrace was written to the file '/home/sl33n/c2pool/libnet/node_member.cpp.PVS-Studio.stacktrace.txt' 
-/home/sl33n/c2pool/libnet/node_member.cpp	1	err	V003 Analyzer exited unexpectedly when trying to analyze '/home/sl33n/c2pool/libnet/node_member.cpp' file with exit code 139
+/home/sl33n/c2pool/libnet/node_manager.cpp.PVS-Studio.stacktrace.txt	1	err	V003 Unrecognized error found: stacktrace was written to the file '/home/sl33n/c2pool/libnet/node_manager.cpp.PVS-Studio.stacktrace.txt' 
+/home/sl33n/c2pool/libnet/node_manager.cpp	1	err	V003 Analyzer exited unexpectedly when trying to analyze '/home/sl33n/c2pool/libnet/node_manager.cpp' file with exit code 139
 /home/sl33n/c2pool/libnet/p2p_node.cpp.PVS-Studio.stacktrace.txt	1	err	V003 Unrecognized error found: stacktrace was written to the file '/home/sl33n/c2pool/libnet/p2p_node.cpp.PVS-Studio.stacktrace.txt' 
 /home/sl33n/c2pool/libnet/p2p_node.cpp	1	err	V003 Analyzer exited unexpectedly when trying to analyze '/home/sl33n/c2pool/libnet/p2p_node.cpp' file with exit code 139
 /home/sl33n/c2pool/libnet/p2p_protocol.h	241	warn	V547 Expression '_type >= 13' is always true.
