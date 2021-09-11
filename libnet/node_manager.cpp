@@ -2,18 +2,17 @@
 
 #include <boost/asio.hpp>
 
-#include "worker.h"
 #include "p2p_node.h"
 #include "coind_node.h"
-#include <sharechains/tracker.h>
+#include "worker.h"
 #include <coind/jsonrpc/coind.h>
+#include <sharechains/tracker.h>
 
 using boost::asio::ip::tcp;
 using namespace c2pool::shares;
 
 namespace c2pool::libnet
 {
-
     void NodeManager::run()
     {
         tcp::endpoint listen_endpoint(tcp::v4(), _config->listenPort); //atoi(_port.c_str()));
@@ -86,4 +85,61 @@ namespace c2pool::libnet
     create_set_method(c2pool::libnet::WorkerBridge, _worker);
 
 #undef create_set_method
+}
+
+namespace c2pool::libnet
+{
+    INodeMember::INodeMember(shared_ptr<c2pool::libnet::NodeManager> mng) : manager(mng)
+    {
+    }
+
+    INodeMember::INodeMember(const INodeMember &member) : manager(member.manager)
+    {
+    }
+
+    shared_ptr<c2pool::Network> INodeMember::net() const
+    {
+        return manager->net();
+    }
+
+    shared_ptr<coind::ParentNetwork> INodeMember::netParent() const
+    {
+        return manager->netParent();
+    }
+
+    shared_ptr<c2pool::dev::coind_config> INodeMember::config() const
+    {
+        return manager->config();
+    }
+
+    shared_ptr<c2pool::libnet::p2p::P2PNode> INodeMember::p2pNode() const
+    {
+        return manager->p2pNode();
+    }
+
+    shared_ptr<c2pool::dev::AddrStore> INodeMember::addr_store() const
+    {
+        return manager->addr_store();
+    }
+
+    shared_ptr<coind::jsonrpc::Coind> INodeMember::coind() const
+    {
+        return manager->coind();
+    }
+
+    shared_ptr<c2pool::libnet::CoindNode> INodeMember::coind_node() const
+    {
+        return manager->coind_node();
+    }
+
+    shared_ptr<c2pool::shares::ShareTracker> INodeMember::tracker() const
+    {
+        return manager->tracker();
+    }
+
+    shared_ptr<c2pool::libnet::WorkerBridge> INodeMember::worker() const
+    {
+        return manager->worker();
+    }
+
 }
