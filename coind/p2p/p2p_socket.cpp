@@ -22,7 +22,7 @@ using namespace coind::p2p::messages;
 
 namespace coind::p2p
 {
-    P2PSocket::P2PSocket(ip::tcp::socket socket, const c2pool::libnet::INodeMember &member) : _socket(std::move(socket)), c2pool::libnet::INodeMember(member)
+    P2PSocket::P2PSocket(ip::tcp::socket socket, const c2pool::libnet::NodeMember &member) : _socket(std::move(socket)), c2pool::libnet::NodeMember(member)
     {
     }
 

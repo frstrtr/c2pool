@@ -1,7 +1,7 @@
 #pragma once
 
 #include "messages.h"
-#include <libnet/node_member.h>
+#include <libnet/node_manager.h>
 #include <devcore/logger.h>
 #include <util/events.h>
 #include "p2p_socket.h"
@@ -26,13 +26,13 @@ namespace coind::p2p
 namespace coind::p2p
 {
     //https://en.bitcoin.it/wiki/Protocol_documentation
-    class CoindProtocol : public INodeMember
+    class CoindProtocol : public NodeMember
     {
     protected:
         shared_ptr<coind::p2p::P2PSocket> _socket;
 
     public:
-        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, const c2pool::libnet::INodeMember &member);
+        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, const c2pool::libnet::NodeMember &member);
 
     public:
         std::shared_ptr<Event<uint256>> new_block;    //block_hash

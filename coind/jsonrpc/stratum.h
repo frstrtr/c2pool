@@ -10,7 +10,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include <univalue.h>
-#include <libnet/node_member.h>
+#include <libnet/node_manager.h>
 #include <btclibs/uint256.h>
 
 namespace io = boost::asio;
@@ -223,7 +223,7 @@ namespace coind::jsonrpc
         }
     };
 
-    class StratumNode : public c2pool::libnet::INodeMember
+    class StratumNode : public c2pool::libnet::NodeMember
     {
         std::unique_ptr<std::thread> _thread;
         io::io_context _context;
@@ -252,6 +252,6 @@ namespace coind::jsonrpc
                                    });
         }
 
-        StratumNode(const ip::tcp::endpoint &listen_ep, const c2pool::libnet::INodeMember& member);
+        StratumNode(const ip::tcp::endpoint &listen_ep, const c2pool::libnet::NodeMember& member);
     };
 }

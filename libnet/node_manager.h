@@ -90,13 +90,13 @@ namespace c2pool::libnet
 
 namespace c2pool::libnet
 {
-    class INodeMember
+    class NodeMember
     {
     public:
         const shared_ptr<c2pool::libnet::NodeManager> manager;
 
-        INodeMember(shared_ptr<c2pool::libnet::NodeManager> mng);
-        INodeMember(const INodeMember &member);
+        NodeMember(shared_ptr<c2pool::libnet::NodeManager> mng);
+        NodeMember(const NodeMember &member);
 
     public:
         shared_ptr<c2pool::Network> net() const;

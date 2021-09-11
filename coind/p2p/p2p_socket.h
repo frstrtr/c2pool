@@ -2,7 +2,7 @@
 
 #include "messages.h"
 #include <networks/network.h>
-#include <libnet/node_member.h>
+#include <libnet/node_manager.h>
 using namespace coind::p2p::messages;
 
 namespace coind::p2p
@@ -52,11 +52,11 @@ namespace coind::p2p
 
 namespace coind::p2p
 {
-    class P2PSocket : public c2pool::libnet::INodeMember, public std::enable_shared_from_this<P2PSocket>
+    class P2PSocket : public c2pool::libnet::NodeMember, public std::enable_shared_from_this<P2PSocket>
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, const c2pool::libnet::INodeMember &member);
+        P2PSocket(ip::tcp::socket socket, const c2pool::libnet::NodeMember &member);
 
         //for connect
         void init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto);

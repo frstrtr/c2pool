@@ -5,7 +5,7 @@
 
 #include <boost/asio.hpp>
 
-#include "node_member.h"
+#include "node_manager.h"
 #include <networks/network.h>
 #include <devcore/logger.h>
 #include <coind/jsonrpc/coind.h>
@@ -29,7 +29,7 @@ namespace coind::p2p
 
 namespace c2pool::libnet
 {
-    class CoindNode : public c2pool::libnet::INodeMember
+    class CoindNode : public c2pool::libnet::NodeMember
     {
     public:
         CoindNode(shared_ptr<NodeManager> node_manager);

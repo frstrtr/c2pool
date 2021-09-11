@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include "node_member.h"
+#include "node_manager.h"
 #include <sharechains/tracker.h>
 #include <networks/network.h>
 #include <coind/jsonrpc/coind.h>
@@ -11,7 +11,7 @@ using std::shared_ptr;
 
 namespace c2pool::libnet
 {
-    class WorkerBridge : public c2pool::libnet::INodeMember
+    class WorkerBridge : public c2pool::libnet::NodeMember
     {
     private:
         shared_ptr<coind::jsonrpc::Coind> _coind;

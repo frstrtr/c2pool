@@ -5,7 +5,7 @@
 
 namespace c2pool::libnet
 {
-    WorkerBridge::WorkerBridge(shared_ptr<NodeManager> node_manager) : c2pool::libnet::INodeMember(node_manager)
+    WorkerBridge::WorkerBridge(shared_ptr<NodeManager> node_manager) : c2pool::libnet::NodeMember(node_manager)
     {
     }
 
