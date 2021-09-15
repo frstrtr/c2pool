@@ -11,10 +11,12 @@
 #include <coind/jsonrpc/coind.h>
 #include <sharechains/tracker.h>
 #include <util/events.h>
+#include <coind/jsonrpc/results.h>
 
 using namespace coind::jsonrpc;
 using namespace c2pool::shares;
 using namespace c2pool::util::events;
+using namespace coind::jsonrpc::data;
 
 using std::make_shared;
 using std::shared_ptr, std::unique_ptr;
@@ -40,18 +42,20 @@ namespace c2pool::libnet
         void clean_tracker();
 
     public:
-        std::shared_ptr<Event<>> stop;
+        Event<> stop;
 
-        std::shared_ptr<Event<uint256>> new_block;    //block_hash
-        std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
-        std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
+        Event<uint256> new_block;    //block_hash
+        Event<UniValue> new_tx;      //bitcoin_data.tx_type
+        Event<UniValue> new_headers; //bitcoin_data.block_header_type
 
         //TODO: std::shared_ptr<Variable</*TODO*/>> best_share_var;
         //TODO: std::shared_ptr<Variable</*TODO*/>> best_block_header;
 
-        std::shared_ptr<Variable<coind::jsonrpc::data::getwork_result>> coind_work;
+        Variable<coind::jsonrpc::data::getwork_result> coind_work;
+        Variable<c2pool::shares::BlockHeaderType> best_block_header;
     private:
         void work_poller();
+        void handle_header();
         void poll_header();
     private:
         shared_ptr<coind::p2p::CoindProtocol> protocol;
