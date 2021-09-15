@@ -3,6 +3,7 @@
 #include <boost/signals2.hpp>
 #include <map>
 #include <vector>
+#include <functional>
 
 namespace c2pool::util::events
 {
@@ -26,6 +27,19 @@ namespace c2pool::util::events
         void subscribe(_Func &&__f, _BoundArgs &&...__args)
         {
             sig.connect(std::bind(__f, __args...));
+        }
+
+        //for std::function/lambda
+        template <typename Lambda>
+        void subscribe(Lambda _f)
+        {
+            sig.connect(_f);
+        }
+
+        void run_and_subscribe(std::function<void()> _f)
+        {
+            _f();
+            subscribe(_f);
         }
 
         void unsubscribe()
