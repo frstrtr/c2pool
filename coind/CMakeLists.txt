@@ -17,10 +17,12 @@ target_include_directories(coind_jsonrpc PRIVATE ${CURL_INCLUDE_DIR})
 #coind_tool
 set(coind_tool_sources 
         data.h
-        data.cpp)
+        data.cpp
+        transaction.h
+        transaction.cpp)
 
 add_library(coind_tool STATIC ${coind_tool_sources})
-target_link_libraries(coind_tool btclibs devcore networks)
+target_link_libraries(coind_tool btclibs devcore networks util)
 
 #coind_p2p
 set(coind_p2p_sources

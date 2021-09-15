@@ -3,6 +3,7 @@
 #include <univalue.h>
 #include <sstream>
 
+#include "transaction.h"
 
 //TODO: REMOVE
 // namespace coind::data::python
@@ -90,6 +91,16 @@ namespace coind::data
         if (tx.exists("marker") && tx.exists("flag"))
         {
             return tx["marker"].get_int() == 0 && tx["flag"].get_int() >= 1;
+        }
+        return false;
+    }
+
+    bool is_segwit_tx(std::shared_ptr<TransactionType> tx)
+    {
+        auto cast_tx = std::dynamic_pointer_cast<WitnessTransactionType>(tx);
+        if (cast_tx)
+        {
+            return cast_tx->marker == 0 && cast_tx->flag >= 1;
         }
         return false;
     }
