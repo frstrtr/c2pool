@@ -18,6 +18,8 @@ namespace c2pool::libnet
     {
         LOG_INFO << "... CoindNode starting..."; //TODO: log coind name
         _thread.reset(new std::thread([&]() {
+            //TODO: stop signal
+
             _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                 ip::tcp::socket socket(_context);
                 auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), *this);
@@ -28,19 +30,48 @@ namespace c2pool::libnet
             });
 
             //COIND:
-            coind_work = std::make_shared<Variable<coind::jsonrpc::data::getwork_result>>(coind()->getwork());
+            coind_work = Variable<coind::jsonrpc::data::getwork_result>(coind()->getwork()); //yield?
             work_poller();
 
             //PEER:
-            coind_work->changed.subscribe(&CoindNode::poll_header, this);
+            coind_work.changed.subscribe(&CoindNode::poll_header, this);
+            poll_header();
 
-            //TODO:
+            //BEST SHARE
+            coind_work.changed.subscribe(&CoindNode::set_best_share, this);
+            set_best_share();
+            
+            // p2p logic and join p2pool network
+        
+            // update mining_txs according to getwork results
+            coind_work.changed.run_and_subscribe([&]()
+            {
+                /* TODO:
+                    new_mining_txs = {}
+                    new_known_txs = dict(self.known_txs_var.value)
+                    for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
+                        new_mining_txs[tx_hash] = tx
+                        new_known_txs[tx_hash] = tx
+                    self.mining_txs_var.set(new_mining_txs)
+                    self.known_txs_var.set(new_known_txs)
+                */  
+               auto new_mining_txs;
+               auto new_known_txs;
+
+            });
+
+
             _context.run();
         }));
         LOG_INFO << "... CoindNode started!"; //TODO: log coind name
     }
 
     void CoindNode::work_poller()
+    {
+        //TODO:
+    }
+
+    void CoindNode::handle_header()
     {
         //TODO:
     }
