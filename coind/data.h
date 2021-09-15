@@ -18,8 +18,9 @@
 #include <vector>
 #include <tuple>
 #include <iostream>
+#include <memory>
 
-using std::vector, std::tuple, std::string;
+using std::vector, std::tuple, std::string, std::shared_ptr;
 
 //TODO: REMOVE
 // namespace coind::data::python
@@ -41,10 +42,15 @@ using std::vector, std::tuple, std::string;
 //     };
 // } // namespace coind::data::python
 
+namespace coind::data{
+    class TransactionType;
+}
+
 namespace coind::data
 {
-
     bool is_segwit_tx(UniValue tx);
+
+    bool is_segwit_tx(shared_ptr<coind::data::TransactionType> tx);
 
     uint256 target_to_average_attempts(uint256 target);
 
@@ -54,76 +60,6 @@ namespace coind::data
 
     uint256 difficulty_to_target(uint256 difficulty);
 
-    class PreviousOutput
-    {
-    public:
-        uint256 hash;
-        unsigned long index;
-
-        PreviousOutput()
-        {
-            hash.SetNull();
-            index = 4294967295;
-        }
-
-        PreviousOutput(uint256 _hash, unsigned long _index)
-        {
-            hash = _hash;
-            index = _index;
-        }
-    };
-
-    class tx_in_type
-    {
-    public:
-        PreviousOutput previous_output;
-        char *script;
-        unsigned long sequence;
-
-        tx_in_type()
-        {
-            sequence = 4294967295;
-        }
-
-        tx_in_type(PreviousOutput _previous_output, char *_script, unsigned long _sequence)
-        {
-            previous_output = _previous_output;
-            script = _script;
-            sequence = _sequence;
-        }
-    };
-
-    class tx_out_type
-    {
-    public:
-        unsigned long long value;
-        char *script;
-
-        tx_out_type(unsigned long long _value, char *_script)
-        {
-            value = _value;
-            script = _script;
-        }
-    };
-
-    class tx_id_type
-    {
-    public:
-        unsigned long version;
-        vector<tx_in_type> tx_ins;
-        vector<tx_out_type> tx_outs;
-        unsigned long lock_time;
-    };
-
-    class TransactionType
-    {
-    public:
-        int version;
-        int marker;
-        int flag;
-        vector<tx_in_type> tx_ins;
-        vector<tx_out_type> tx_outs;
-    };
 } // namespace coind::data
 
 namespace coind::data
