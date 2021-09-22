@@ -1,7 +1,7 @@
 #include "common.h"
 namespace c2pool::dev
 {
-    int timestamp()
+    time_t timestamp()
     {
         return std::time(nullptr);
     }

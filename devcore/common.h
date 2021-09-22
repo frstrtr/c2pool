@@ -18,7 +18,7 @@ namespace c2pool::dev
     }
 
     //TODO: create timestamp class
-    int timestamp();
+    time_t timestamp();
 
     template <typename Derived, typename Base, typename Del>
     std::unique_ptr<Derived, Del>
