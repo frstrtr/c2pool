@@ -3,10 +3,15 @@
 using namespace coind::jsonrpc::data;
 
 #include "univalue.h"
+#include <coind/data.h>
+#include <util/stream.h>
+#include <btclibs/util/strencodings.h>
+#include <coind/transaction.h>
 
 #include <iostream>
 #include <set>
 #include <string>
+#include <functional>
 using std::set, std::string;
 
 namespace coind::jsonrpc
@@ -74,10 +79,15 @@ namespace coind::jsonrpc
         }
     }
 
-    getwork_result Coind::getwork(bool use_getblocktemplate)
+    getwork_result Coind::getwork(TXIDCache &txidcache, map<uint256, shared_ptr<coind::data::TransactionType>> known_txs, bool use_getblocktemplate)
     {
         UniValue work;
         UniValue getblocktemplate_result;
+
+        time_t start;
+        time_t end;
+        
+        start = c2pool::dev::timestamp();
         if (use_getblocktemplate)
         {
             GetBlockTemplateRequest *req = new GetBlockTemplateRequest();
@@ -89,12 +99,14 @@ namespace coind::jsonrpc
         {
             getblocktemplate_result = getmemorypool(); //TODO
         }
+        end = c2pool::dev::timestamp();
 
         int check_error_res = check_error(getblocktemplate_result);
         if (!check_error_res)
         {
             if (check_error_res == coind_error_codes::MethodNotFound)
             {
+                start = c2pool::dev::timestamp();
                 if (!use_getblocktemplate)
                 {
                     GetBlockTemplateRequest *req = new GetBlockTemplateRequest();
@@ -106,6 +118,7 @@ namespace coind::jsonrpc
                 {
                     getblocktemplate_result = getmemorypool(); //TODO
                 }
+                end = c2pool::dev::timestamp();
 
                 check_error_res = check_error(getblocktemplate_result);
                 if (!check_error_res)
@@ -118,7 +131,72 @@ namespace coind::jsonrpc
         work = getblocktemplate_result["result"].get_obj();
 
         //packed_tx
+        if (!txidcache.is_started())
+            txidcache.start();
+
         vector<UniValue> packed_transactions = work["transactions"].getValues();
+
+        vector<uint256> txhashes;
+        vector<shared_ptr<coind::data::TransactionType>> unpacked_transactions;
+        for (auto _x : packed_transactions)
+        {
+            PackStream packed;
+            uint256 txid;
+            string x;
+            if (_x.exists("data"))
+                x = _x["data"].get_str();
+            else
+                x = _x.get_str();
+
+            if (txidcache.exist(x))
+            {
+                txid = txidcache[x];
+                txhashes.push_back(txid);
+            }
+            else
+            {
+                packed = PackStream(ParseHex(x)); //TODO: TEST
+                txid = coind::data::hash256(packed);
+                txidcache.add(x, txid);
+                txhashes.push_back(txid);
+            }
+
+            shared_ptr<coind::data::TransactionType> unpacked;
+            if (known_txs.find(txid) != known_txs.end())
+            {
+                unpacked = known_txs[txid];
+            }
+            else
+            {
+                if (packed.isNull())
+                {
+                    packed = PackStream(ParseHex(x)); //TODO: TEST
+                }
+                coind::data::stream::TransactionType_stream _unpacked;
+                packed >> _unpacked;
+                unpacked = _unpacked.tx;
+            }
+            unpacked_transactions.push_back(unpacked);
+        }
+
+        if ((c2pool::dev::timestamp() - txidcache.time()) > 1800)
+        {
+            map<string, uint256> keepers;
+            for (int i = 0; i < txhashes.size(); i++)
+            {
+                string x;
+                if (packed_transactions[i].exists("data"))
+                    x = packed_transactions[i]["data"].get_str();
+                else
+                    x = packed_transactions[i].get_str();
+
+                uint256 txid = txhashes[i];
+                keepers[x] = txid;
+            }
+            txidcache.clear();
+            txidcache.add(keepers);
+        }
+
         if (!work.exists("height"))
         {
             uint256 previous_block_hash;
@@ -131,7 +209,7 @@ namespace coind::jsonrpc
         // elif p2pool.DEBUG:
         // assert work['height'] == (yield bitcoind.rpc_getblock(work['previousblockhash']))['height'] + 1
 
-        getwork_result result(work, packed_transactions);
+        getwork_result result(work, unpacked_transactions, txhashes, use_getblocktemplate, end-start);
         return result;
     }
 }
