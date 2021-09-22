@@ -87,6 +87,11 @@ struct PackStream
 
     PackStream() {}
 
+    PackStream(vector<unsigned char> value)
+    {
+        data = value;
+    }
+
     PackStream(unsigned char *value, int32_t len)
     {
         data = vector<unsigned char>(value, value + len);
@@ -94,7 +99,7 @@ struct PackStream
 
     PackStream(char *value, int32_t len)
     {
-        auto temp = (unsigned char*)value;
+        auto temp = (unsigned char *)value;
         data = vector<unsigned char>(temp, temp + len);
     }
 
@@ -243,6 +248,10 @@ struct PackStream
     size_t size() const
     {
         return data.size();
+    }
+
+    bool isNull() const{
+        return data.size() > 0;
     }
 };
 
