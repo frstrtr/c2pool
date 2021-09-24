@@ -16,7 +16,6 @@ using std::set, std::string;
 
 namespace coind::jsonrpc
 {
-
     bool Coind::check()
     {
         if (!net->jsonrpc_check(shared_from_this()))
@@ -79,14 +78,14 @@ namespace coind::jsonrpc
         }
     }
 
-    getwork_result Coind::getwork(TXIDCache &txidcache, map<uint256, shared_ptr<coind::data::TransactionType>> known_txs, bool use_getblocktemplate)
+    getwork_result Coind::getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs, bool use_getblocktemplate)
     {
         UniValue work;
         UniValue getblocktemplate_result;
 
         time_t start;
         time_t end;
-        
+
         start = c2pool::dev::timestamp();
         if (use_getblocktemplate)
         {
@@ -137,7 +136,7 @@ namespace coind::jsonrpc
         vector<UniValue> packed_transactions = work["transactions"].getValues();
 
         vector<uint256> txhashes;
-        vector<shared_ptr<coind::data::TransactionType>> unpacked_transactions;
+        vector<coind::data::tx_type> unpacked_transactions;
         for (auto _x : packed_transactions)
         {
             PackStream packed;
@@ -161,10 +160,10 @@ namespace coind::jsonrpc
                 txhashes.push_back(txid);
             }
 
-            shared_ptr<coind::data::TransactionType> unpacked;
+            coind::data::tx_type unpacked;
             if (known_txs.find(txid) != known_txs.end())
             {
-                unpacked = known_txs[txid];
+                unpacked = known_txs.at(txid);
             }
             else
             {
@@ -209,7 +208,7 @@ namespace coind::jsonrpc
         // elif p2pool.DEBUG:
         // assert work['height'] == (yield bitcoind.rpc_getblock(work['previousblockhash']))['height'] + 1
 
-        getwork_result result(work, unpacked_transactions, txhashes, use_getblocktemplate, end-start);
+        getwork_result result(work, unpacked_transactions, txhashes, use_getblocktemplate, end - start);
         return result;
     }
 }

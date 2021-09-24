@@ -258,7 +258,7 @@ namespace coind::jsonrpc
 
         bool check_block_header(uint256);
 
-        getwork_result getwork(TXIDCache &txidcache, const map<uint256, shared_ptr<coind::data::TransactionType>> known_txs, bool use_getblocktemplate = false);
+        getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type>& known_txs = map<uint256, coind::data::tx_type>(), bool use_getblocktemplate = false);
 
     public:
         //https://bitcoin-rpc.github.io/en/doc/0.17.99/rpc/blockchain/getblockchaininfo/
