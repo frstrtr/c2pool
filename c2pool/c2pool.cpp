@@ -132,7 +132,7 @@ int main(int ac, char *av[])
     ExitSignalHandler exitSignalHandler;
     signal(SIGINT, &ExitSignalHandler::handler);
     signal(SIGTERM, &ExitSignalHandler::handler);
-    signal(SIGINT, &ExitSignalHandler::handler);
+    // signal(SIGINT, &ExitSignalHandler::handler);
 
     while (exitSignalHandler.working())
     {
