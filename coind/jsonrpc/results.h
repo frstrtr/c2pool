@@ -1,18 +1,17 @@
 #pragma once
 
-#include <btclibs/uint256.h>
-#include <univalue.h>
-#include <coind/transaction.h>
-
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
 #include <optional>
+#include <algorithm>
 
-//TODO: for debug
-#include <iostream>
-using namespace std;
+#include <univalue.h>
+#include <btclibs/uint256.h>
+#include <btclibs/util/strencodings.h>
+#include <coind/transaction.h>
+#include <util/stream_types.h>
 
 namespace coind::jsonrpc::data
 {
@@ -22,16 +21,16 @@ namespace coind::jsonrpc::data
         uint256 previous_block;
         vector<shared_ptr<coind::data::TransactionType>> transactions;
         vector<uint256> transaction_hashes;
-        vector<optional<uint64_t>> transaction_fees; //=[x.get('fee', None) if isinstance(x, dict) else None for x in work['transactions']],
+        vector<optional<uint64_t>> transaction_fees;
         int64_t subsidy;
-        time_t time;               //=work['time'] if 'time' in work else work['curtime'],
-        uint256 bits;              //=bitcoin_data.FloatingIntegerType().unpack(work['bits'].decode('hex')[::-1]) if isinstance(work['bits'], (str, unicode)) else bitcoin_data.FloatingInteger(work['bits']),
-        PackStream coinbaseflags;  //todo: uint256??? =work['coinbaseflags'].decode('hex') if 'coinbaseflags' in work else ''.join(x.decode('hex') for x in work['coinbaseaux'].itervalues()) if 'coinbaseaux' in work else '',
-        int32_t height;            //=work['height'],
-        vector<string> rules;      //=work.get('rules', []),
-        time_t last_update;        //=time.time(),
-        bool use_getblocktemplate; //=use_getblocktemplate,
-        time_t latency;            //=end - start,
+        time_t time;
+        FloatingInteger bits;
+        PackStream coinbaseflags;
+        int32_t height;
+        vector<string> rules;
+        time_t last_update;
+        bool use_getblocktemplate;
+        time_t latency;
 
         getwork_result() {}
 
@@ -93,8 +92,18 @@ namespace coind::jsonrpc::data
                     }
                 }
             }
-            //TODO: ===================
-            // bits=bitcoin_data.FloatingIntegerType().unpack(work['bits'].decode('hex')[::-1]) if isinstance(work['bits'], (str, unicode)) else bitcoin_data.FloatingInteger(work['bits']),
+
+            //TODO: test
+            if (work["bits"].isStr())
+            {
+                auto _bits_v = ParseHex(work["bits"].get_str());
+                std::reverse(_bits_v.begin(), _bits_v.end());
+                PackStream _bits_stream(_bits_v);
+                FloatingIntegerType _bits;
+                _bits_stream >> _bits;
+                bits = _bits.bits;
+            }
+            //TODO: ? else bitcoin_data.FloatingInteger(work['bits']),
 
             height = work["height"].get_int();
             for (auto rule : work["rules"].getValues())

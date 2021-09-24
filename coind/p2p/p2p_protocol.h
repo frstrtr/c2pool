@@ -5,6 +5,8 @@
 #include <devcore/logger.h>
 #include <util/events.h>
 #include "p2p_socket.h"
+#include <coind/transaction.h>
+#include <sharechains/data.h>
 using namespace coind::p2p::messages;
 using namespace c2pool::util::events;
 using namespace c2pool::libnet;
@@ -14,6 +16,7 @@ using namespace c2pool::libnet;
 
 #include <vector>
 #include <memory>
+#include <optional>
 using std::shared_ptr, std::weak_ptr, std::make_shared;
 
 #include <boost/asio.hpp>
@@ -36,10 +39,10 @@ namespace coind::p2p
 
     public:
         std::shared_ptr<Event<uint256>> new_block;    //block_hash
-        std::shared_ptr<Event<UniValue>> new_tx;      //bitcoin_data.tx_type
-        std::shared_ptr<Event<UniValue>> new_headers; //bitcoin_data.block_header_type
+        std::shared_ptr<Event<coind::data::tx_type>> new_tx;      //bitcoin_data.tx_type
+        std::shared_ptr<Event<c2pool::shares::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
-        void init(std::shared_ptr<Event<uint256>> _new_block, std::shared_ptr<Event<UniValue>> _new_tx, std::shared_ptr<Event<UniValue>> _new_headers)
+        void init(std::shared_ptr<Event<uint256>> _new_block, std::shared_ptr<Event<coind::data::tx_type>> _new_tx, std::shared_ptr<Event<c2pool::shares::BlockHeaderType>> _new_headers)
         {
             new_block = _new_block;
             new_tx = _new_tx;

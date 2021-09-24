@@ -384,4 +384,6 @@ namespace coind::data
             }
         }
     };
+
+    typedef shared_ptr<TransactionType> tx_type;
 }
