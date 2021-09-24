@@ -410,6 +410,11 @@ struct FloatingInteger
         bits = _bits;
     }
 
+    FloatingInteger(int32_t _bits)
+    {
+        bits = _bits;
+    }
+
     uint256 target()
     {
         arith_uint256 res(bits.value && 0x00ffffff);
@@ -473,5 +478,15 @@ struct FloatingIntegerType
         bits = FloatingInteger(_bits);
 
         return stream;
+    }
+
+    auto &operator=(int32_t v)
+    {
+        bits.bits = v;
+    }
+
+    int32_t get() const
+    {
+        return bits.bits.get();
     }
 };
