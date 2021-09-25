@@ -1,14 +1,16 @@
 #include <networks/network.h>
-#include <btclibs/uint256.h>
-#include <coind/jsonrpc/coind.h>
 
 #include <vector>
 #include <string>
 #include <tuple>
 #include <memory>
-using std::shared_ptr;
 
+#include <btclibs/uint256.h>
+#include <coind/jsonrpc/coind.h>
+#include <coind/data.h>
 #include "dgb/scrypt.h"
+
+using std::shared_ptr;
 
 namespace coind
 {
@@ -49,10 +51,8 @@ namespace coind
         }
     }
 
-    uint256 DigibyteParentNetwork::POW_FUNC(char *packed_block_header)
+    uint256 DigibyteParentNetwork::POW_FUNC(PackStream packed_block_header)
     {
-        uint256 result;
-        scrypt_1024_1_1_256(packed_block_header, ((char*)&result));
-        return result;
+        return coind::data::hash256(packed_block_header);
     }
 } // namespace c2pool
