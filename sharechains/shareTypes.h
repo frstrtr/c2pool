@@ -19,6 +19,12 @@ namespace c2pool::shares
         doa = 254
     };
 
+#define PackShareType(type, data, out_data) \
+    {                                       \
+        type##_stream __pack_data(data);    \
+        out_data << __pack_data;            \
+    }
+
     struct SmallBlockHeaderType_stream
     {
         VarIntType version;
@@ -154,6 +160,39 @@ namespace c2pool::shares
         BlockHeaderType(SmallBlockHeaderType _min_header, uint256 _merkle_root) : SmallBlockHeaderType(_min_header)
         {
             merkle_root = _merkle_root;
+        }
+    };
+
+    struct BlockHeaderType_stream
+    {
+        VarIntType version;
+        PossibleNoneType<IntType(256)> previous_block;
+        IntType(256) merkle_root;
+        IntType(32) timestamp;
+        FloatingIntegerType bits;
+        IntType(32) nonce;
+
+        BlockHeaderType_stream() {}
+        BlockHeaderType_stream(const BlockHeaderType &value)
+        {
+            version = value.version;
+            previous_block = value.previous_block;
+            merkle_root = value.merkle_root;
+            timestamp = value.timestamp;
+            bits = value.bits;
+            nonce = value.nonce;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << version << previous_block << merkle_root << timestamp << bits << nonce;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> version >> previous_block >> merkle_root >> timestamp >> bits >> nonce;
+            return stream;
         }
     };
 
@@ -513,5 +552,4 @@ namespace c2pool::shares
             return stream;
         }
     };
-
 }
