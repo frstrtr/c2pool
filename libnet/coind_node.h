@@ -2,12 +2,14 @@
 
 #include <memory>
 #include <thread>
+#include <optional>
 
 #include <boost/asio.hpp>
 
 #include "node_manager.h"
 #include <networks/network.h>
 #include <devcore/logger.h>
+#include <devcore/common.h>
 #include <coind/jsonrpc/coind.h>
 #include <sharechains/tracker.h>
 #include <util/events.h>
@@ -42,21 +44,29 @@ namespace c2pool::libnet
         void clean_tracker();
 
     public:
+        coind::jsonrpc::TXIDCache txidcache;
         Event<> stop;
 
-        Event<uint256> new_block;    //block_hash
-        Event<UniValue> new_tx;      //bitcoin_data.tx_type
-        Event<UniValue> new_headers; //bitcoin_data.block_header_type
+        VariableDict<uint256, coind::data::tx_type> known_txs;
+        Variable<map<uint256, coind::data::tx_type>> mining_txs;
+        Variable<map<uint256, coind::data::tx_type>> mining2_txs;
+        Variable<uint256> best_share;
+        Variable<c2pool::libnet::addr> desired;
 
-        //TODO: std::shared_ptr<Variable</*TODO*/>> best_share_var;
-        //TODO: std::shared_ptr<Variable</*TODO*/>> best_block_header;
+        shared_ptr<Event<uint256>> new_block;    //block_hash
+        shared_ptr<Event<coind::data::tx_type>> new_tx;      //bitcoin_data.tx_type
+        shared_ptr<Event<c2pool::shares::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
         Variable<coind::jsonrpc::data::getwork_result> coind_work;
-        Variable<c2pool::shares::BlockHeaderType> best_block_header;
+        Variable<std::optional<c2pool::shares::BlockHeaderType>> best_block_header;
+
     private:
+        boost::asio::deadline_timer work_poller_t;
         void work_poller();
-        void handle_header();
+    
+        void handle_header(const BlockHeaderType& new_header);
         void poll_header();
+
     private:
         shared_ptr<coind::p2p::CoindProtocol> protocol;
 
@@ -64,5 +74,7 @@ namespace c2pool::libnet
         unique_ptr<std::thread> _thread;
         io::io_context _context;
         ip::tcp::resolver _resolver;
+
+        c2pool::dev::ExitSignalHandler exitSignalHandler;
     };
 }

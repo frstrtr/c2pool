@@ -1,24 +1,26 @@
 #include "coind_node.h"
-#include "node_manager.h"
+
 #include "node_manager.h"
 #include <coind/p2p/p2p_socket.h>
 #include <coind/p2p/p2p_protocol.h>
+#include <devcore/common.h>
+#include <btclibs/arith_uint256.h>
 
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context), c2pool::libnet::NodeMember(node_manager)
+    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context), c2pool::libnet::NodeMember(node_manager), work_poller_t(_context)
     {
         new_block = std::make_shared<Event<uint256>>();
-        new_tx = std::make_shared<Event<UniValue>>();
-        new_headers = std::make_shared<Event<UniValue>>();
+        new_tx = std::make_shared<Event<coind::data::tx_type>>();
+        new_headers = std::make_shared<Event<c2pool::shares::BlockHeaderType>>();
     }
 
     void CoindNode::start()
     {
         LOG_INFO << "... CoindNode starting..."; //TODO: log coind name
-        _thread.reset(new std::thread([&]() {
-            //TODO: stop signal
+        _thread.reset(new std::thread([&]() 
+        {
 
             _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
                 ip::tcp::socket socket(_context);
@@ -30,7 +32,11 @@ namespace c2pool::libnet
             });
 
             //COIND:
-            coind_work = Variable<coind::jsonrpc::data::getwork_result>(coind()->getwork()); //yield?
+            coind_work = Variable<coind::jsonrpc::data::getwork_result>(coind()->getwork(txidcache));
+            new_block->subscribe([&]()
+            {
+                work_poller_t.expires_from_now(boost::posix_time::seconds(15)); //Если получаем новый блок, то обновляем таймер
+            });
             work_poller();
 
             //PEER:
@@ -44,21 +50,21 @@ namespace c2pool::libnet
             // p2p logic and join p2pool network
         
             // update mining_txs according to getwork results
-            coind_work.changed.run_and_subscribe([&]()
-            {
-                /* TODO:
-                    new_mining_txs = {}
-                    new_known_txs = dict(self.known_txs_var.value)
-                    for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
-                        new_mining_txs[tx_hash] = tx
-                        new_known_txs[tx_hash] = tx
-                    self.mining_txs_var.set(new_mining_txs)
-                    self.known_txs_var.set(new_known_txs)
-                */  
-               auto new_mining_txs;
-               auto new_known_txs;
+            // coind_work.changed.run_and_subscribe([&]()
+            // {
+            //     /* TODO:
+            //         new_mining_txs = {}
+            //         new_known_txs = dict(self.known_txs_var.value)
+            //         for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
+            //             new_mining_txs[tx_hash] = tx
+            //             new_known_txs[tx_hash] = tx
+            //         self.mining_txs_var.set(new_mining_txs)
+            //         self.known_txs_var.set(new_known_txs)
+            //     */  
+            //    auto new_mining_txs;
+            //    auto new_known_txs;
 
-            });
+            // });
 
 
             _context.run();
@@ -66,32 +72,44 @@ namespace c2pool::libnet
         LOG_INFO << "... CoindNode started!"; //TODO: log coind name
     }
 
+    //Каждые 15 секунд или получение ивента new_block, вызываем getwork у coind'a.
     void CoindNode::work_poller()
     {
-        //TODO:
+        coind_work = coind()->getwork(txidcache, known_txs.value, coind_work.value.use_getblocktemplate);
+        work_poller_t.expires_from_now(boost::posix_time::seconds(5));
+        work_poller_t.async_wait(work_poller);
     }
 
-    void CoindNode::handle_header()
+    //TODO: test
+    void CoindNode::handle_header(const BlockHeaderType& new_header)
     {
-        //TODO:
+        PackStream packed_new_header;
+        PackShareType(BlockHeaderType, new_header, packed_new_header);
+
+        arith_uint256 hash_header = UintToArith256(netParent()->POW_FUNC(packed_new_header));
+        //check that header matches current target
+        if (! (hash_header <= UintToArith256(coind_work.value.bits.target())))
+            return;
+
+        auto coind_best_block = coind_work.value.previous_block;
+        
+        PackStream packed_best_block_header;
+        PackShareType(BlockHeaderType, best_block_header.value.value(), packed_best_block_header);
+
+        if (!best_block_header.value.has_value() || 
+            ((new_header.previous_block == coind_best_block) && (coind::data::hash256(packed_best_block_header) == coind_best_block)) ||
+            ((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header.value->previous_block != coind_best_block))
+            )
+        {
+            best_block_header = new_header;
+        }
     }
 
     void CoindNode::poll_header()
     {
-        //TODO: remake
-        // //TODO: check for coind p2p connection, if true:
-        // uint256 block_header = protocol->get_block_header(coind_work->value.previous_block); //new_header
-        // auto _block_header_type = block_header;                                              //TODO: bitcoin_data.block_header_type.pack(new_header)
-        // if (netParent()->POW_FUNC(_block_header_type) <= coind_work->value.bits) //bits.target?
-        // {
-        //     return;
-        // }
-
-        // auto coind_best_block = coind_work->value.previous_block;
-        // if ((best_block_header->value == nullptr) ||
-        //         (block_header.previous_block == coind_best_block && hash256(/*todo: pack for block_header*/))){
-
-        // }
+        if (!protocol)
+            return;
+        handle_header(protocol->get_block_header(coind_work.value.previous_block));
     }
 
     void CoindNode::set_best_share()
