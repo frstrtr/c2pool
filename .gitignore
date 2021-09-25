@@ -57,5 +57,5 @@ vc140.pdb
 /test/coind_tests/pass.h
 
 #lib/secp256k1 temp files
-/lib/secp256k1/src/secp256k1-stamp
+lib/secp256k1/src/secp256k1-stamp/
 /lib/secp256k1/tmp
