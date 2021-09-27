@@ -1,11 +1,11 @@
 
 cmake_minimum_required(VERSION 3.15)
 
-set(command "/usr/bin/cmake;-DCMAKE_INSTALL_PREFIX=/home/sl33n/c2pool/lib/secp256k1;-DCMAKE_POSITION_INDEPENDENT_CODE=;-DCMAKE_C_COMPILER=/bin/gcc-8;-DCMAKE_CXX_COMPILER=/bin/g++-8;-GUnix Makefiles;/home/sl33n/c2pool/lib/secp256k1/src/secp256k1")
+set(command "/usr/bin/cmake;-DCMAKE_INSTALL_PREFIX=/home/sl33n/rep/c2pool/lib/secp256k1;-DCMAKE_POSITION_INDEPENDENT_CODE=;-DCMAKE_C_COMPILER=/bin/x86_64-linux-gnu-gcc-8;-DCMAKE_CXX_COMPILER=/bin/x86_64-linux-gnu-g++-8;-GUnix Makefiles;/home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1")
 set(log_merged "")
 set(log_output_on_failure "")
-set(stdout_log "/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-out.log")
-set(stderr_log "/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-err.log")
+set(stdout_log "/home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-out.log")
+set(stderr_log "/home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-err.log")
 execute_process(
   COMMAND ${command}
   RESULT_VARIABLE result
@@ -31,7 +31,7 @@ if(result)
   if (${log_merged})
     set(msg "${msg}\nSee also\n  ${stderr_log}")
   else()
-    set(msg "${msg}\nSee also\n  /home/sl33n/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-*.log")
+    set(msg "${msg}\nSee also\n  /home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-*.log")
   endif()
   if (${log_output_on_failure})
     message(SEND_ERROR "${msg}")
@@ -49,6 +49,6 @@ if(result)
     message(FATAL_ERROR "${msg}")
   endif()
 else()
-  set(msg "secp256k1 configure command succeeded.  See also /home/sl33n/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-*.log")
+  set(msg "secp256k1 configure command succeeded.  See also /home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1-stamp/secp256k1-configure-*.log")
   message(STATUS "${msg}")
 endif()
