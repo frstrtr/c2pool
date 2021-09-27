@@ -1,7 +1,7 @@
 # Make file names absolute:
 #
-get_filename_component(filename "/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-ac8ccf29.tar.gz" ABSOLUTE)
-get_filename_component(directory "/home/sl33n/c2pool/lib/secp256k1/src/secp256k1" ABSOLUTE)
+get_filename_component(filename "/home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1-ac8ccf29.tar.gz" ABSOLUTE)
+get_filename_component(directory "/home/sl33n/rep/c2pool/lib/secp256k1/src/secp256k1" ABSOLUTE)
 
 message(STATUS "extracting...
      src='${filename}'

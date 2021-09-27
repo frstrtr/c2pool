@@ -1,9 +1,0 @@
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/install/strip.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/install/local.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/install.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/list_install_components.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/rebuild_cache.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/edit_cache.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/secp256k1.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/ecmult_static_context.dir
-/home/sl33n/c2pool/lib/secp256k1/src/secp256k1-build/CMakeFiles/gen_context.dir
