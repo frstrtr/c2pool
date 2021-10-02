@@ -27,7 +27,7 @@ endif()
 #init packages
 set(Boost_USE_STATIC_LIBS ON)
 
-find_package(Boost 1.71.0 COMPONENTS program_options log log_setup REQUIRED)
+find_package(Boost 1.71.0 COMPONENTS program_options log log_setup coroutine REQUIRED)
 #set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY})
 if(Boost_FOUND)
 	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")

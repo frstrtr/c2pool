@@ -31,12 +31,6 @@ namespace c2pool
     {
         class coind_config;
     }
-
-    //TODO: Protocol;
-    // namespace p2p
-    // {
-    //     class Protocol;
-    // }
 } // namespace c2pool
 
 #define HOST_IDENT std::string
@@ -48,7 +42,7 @@ namespace c2pool::libnet::p2p
     class P2PNode : public c2pool::libnet::NodeMember, public std::enable_shared_from_this<P2PNode>
     {
     public:
-        P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep);
+        P2PNode(shared_ptr<NodeManager> _mngr);
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
@@ -56,8 +50,8 @@ namespace c2pool::libnet::p2p
         bool is_connected() const;
 
     private:
-        bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);        //todo
-        bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol); //todo
+        bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
+        bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
 
         void listen();
         void auto_connect();
@@ -65,11 +59,9 @@ namespace c2pool::libnet::p2p
     private:
         shared_ptr<NodeManager> _manager;
         shared_ptr<c2pool::dev::coind_config> _config;
-        unique_ptr<std::thread> _thread;
         shared_ptr<io::steady_timer> _auto_connect_timer;
-        const std::chrono::milliseconds auto_connect_interval{1000L};
+        constexpr std::chrono::seconds auto_connect_interval{std::chrono_literals::1s};
 
-        io::io_context _context;
         //client
         ip::tcp::resolver _resolver;
         //server

@@ -76,7 +76,7 @@ namespace c2pool::libnet
     void CoindNode::work_poller()
     {
         coind_work = coind()->getwork(txidcache, known_txs.value, coind_work.value.use_getblocktemplate);
-        work_poller_t.expires_from_now(boost::posix_time::seconds(5));
+        work_poller_t.expires_from_now(boost::posix_time::seconds(15));
         work_poller_t.async_wait(work_poller);
     }
 
