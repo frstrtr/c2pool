@@ -35,12 +35,21 @@ namespace c2pool::libnet
     public:
         NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
         {
+            _context = make_shared<boost::asio::io_context>(2);
             _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network); //TODO: boost::filesystem path
         }
+
+        void start()
+        {
+            
+        }
+
+        //TODO: ~NodeManager();
 
         void run();
 
     public:
+        shared_ptr<boost::asio::io_context> context() const;
         shared_ptr<c2pool::Network> net() const;
         shared_ptr<coind::ParentNetwork> netParent() const;
         shared_ptr<c2pool::dev::coind_config> config() const;
@@ -52,6 +61,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::WorkerBridge> worker() const;
 
     protected:
+        shared_ptr<boost::asio::io_context> _context;
         shared_ptr<c2pool::Network> _net;
         shared_ptr<coind::ParentNetwork> _netParent; //TODO: init
         shared_ptr<c2pool::dev::coind_config> _config;
@@ -75,6 +85,7 @@ namespace c2pool::libnet
         TestNodeManager() : NodeManager() {}
 
     public:
+        create_set_method(boost::asio::io_context, _context);
         create_set_method(c2pool::Network, _net);
         create_set_method(coind::ParentNetwork, _netParent);
         create_set_method(c2pool::dev::coind_config, _config);
@@ -99,6 +110,8 @@ namespace c2pool::libnet
         NodeMember(const NodeMember &member);
 
     public:
+        shared_ptr<boost::asio::io_context> context() const;
+
         shared_ptr<c2pool::Network> net() const;
 
         shared_ptr<coind::ParentNetwork> netParent() const;

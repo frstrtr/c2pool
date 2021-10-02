@@ -74,7 +74,5 @@ namespace c2pool::libnet
         unique_ptr<std::thread> _thread;
         io::io_context _context;
         ip::tcp::resolver _resolver;
-
-        c2pool::dev::ExitSignalHandler exitSignalHandler;
     };
 }

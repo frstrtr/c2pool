@@ -5,6 +5,7 @@
 #include <devcore/common.h>
 #include <libnet/node_manager.h>
 #include <networks/network.h>
+#include <boost/asio/thread_pool.hpp>
 using namespace c2pool::dev;
 using namespace c2pool::libnet;
 
@@ -120,13 +121,16 @@ int main(int ac, char *av[])
     //============================================================
     c2pool::console::Logger::Init();
     LOG_INFO << "Start c2pool...";
+    // каждый второй поток для coind'a/stratum'a
+    boost::asio::thread_pool coind_threads(thread::hardware_concurrency()/2); //TODO: количество через аргументы запуска.
 
     //Creating and initialization coinds network, config and NodeManager
 
     //##########################DGB###############################
-    auto DGB = c2pool::master::Make_DGB();
+    auto DGB = c2pool::master::Make_DGB(coind_threads);
     //############################################################
 
+    
 
     //Init exit handler
     ExitSignalHandler exitSignalHandler;

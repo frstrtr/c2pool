@@ -4,6 +4,8 @@
 #include <libnet/node_manager.h>
 #include <networks/network.h>
 #include <sharechains/tracker.h>
+#include <boost/asio/thread_pool.hpp>
+#include <boost/asio/post.hpp>
 using namespace c2pool::dev;
 using namespace c2pool::libnet;
 using namespace c2pool::shares;
@@ -14,7 +16,7 @@ using namespace std;
 
 namespace c2pool::master
 {
-    shared_ptr<NodeManager> Make_DGB()
+    shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool)
     {
         LOG_INFO << "Starting DGB initialization...";
         //Networks/Configs
@@ -25,9 +27,11 @@ namespace c2pool::master
         //ShareTracker
         auto share_tracker = std::make_shared<ShareTracker>(DGB);
 
-        //run manager
-        DGB->run();
-        if (DGB)
+        //run manager in another thread from thread_pool.
+        boost::asio::post(thread_pool, [&]()
+                          { DGB->run(); });
+
+        if (DGB) //TODO: check loading
             LOG_INFO << "DGB started!";
         return DGB;
     }

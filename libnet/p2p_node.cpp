@@ -24,24 +24,25 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr, const ip::tcp::endpoint &listen_ep) : _context(1), _resolver(_context), _acceptor(_context, listen_ep), c2pool::libnet::NodeMember(_mngr)
+    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr) : c2pool::libnet::NodeMember(_mngr), _resolver(*context()), _acceptor(*context()), _auto_connect_timer(*context())
     {
         node_id = c2pool::random::RandomNonce();
+        ip::tcp::endpoint listen_ep(ip::tcp::v4(), config()->listenPort);
 
-        _auto_connect_timer = std::make_shared<io::steady_timer>(_context);
+        _acceptor.open(listen_ep.protocol());
+        _acceptor.set_option(socket_base::reuse_address(true));
+        _acceptor.bind(listen_ep);
+        _acceptor.listen();
     }
 
     void P2PNode::start()
     {
-        LOG_INFO << "... P2PNode starting..."; //TODO: logging name thread
-        _thread.reset(new std::thread([&]()
-                                      {
-                                          listen();
-                                          auto_connect();
+        LOG_INFO << "... P2PNode starting...";
 
-                                          _context.run();
-                                      }));
-        LOG_INFO << "... P2PNode started!"; //TODO: logging name thread
+        listen();
+        auto_connect();
+
+        LOG_INFO << "... P2PNode started!";
     }
 
     void P2PNode::listen()
@@ -52,9 +53,7 @@ namespace c2pool::libnet::p2p
                                    {
                                        //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket), *this);
-
                                        server_attempts.insert(_socket);
-
                                        _socket->init(boost::bind(&P2PNode::protocol_listen_connected, this, _1));
                                    }
                                    else
@@ -73,43 +72,39 @@ namespace c2pool::libnet::p2p
                                             //LOG_TRACE << "auto connect timer";
                                             if (!_ec)
                                             {
-                                                //LOG_TRACE << "auto connect _ec false";
-                                                //LOG_TRACE << client_connections.size() << " < " << _config->desired_conns;
-                                                if ((client_connections.size() < _config->desired_conns) && (_manager->addr_store()->len() > 0) && (client_attempts.size() <= _config->max_attempts))
+                                                if (!((client_connections.size() < _config->desired_conns) && (_manager->addr_store()->len() > 0) && (client_attempts.size() <= _config->max_attempts)))
+                                                    return;
+                                                for (auto addr : get_good_peers(1))
                                                 {
-                                                    //LOG_TRACE << "if true";
-                                                    for (auto addr : get_good_peers(1))
+                                                    //LOG_TRACE << "for not empty";
+                                                    if (client_attempts.find(std::get<0>(addr)) == client_attempts.end())
                                                     {
-                                                        //LOG_TRACE << "for not empty";
-                                                        if (client_attempts.find(std::get<0>(addr)) == client_attempts.end())
-                                                        {
 
-                                                            std::string ip = std::get<0>(addr);
-                                                            std::string port = std::get<1>(addr);
-                                                            LOG_TRACE << "try to connect: " << ip << ":" << port;
-                                                            try
-                                                            {
-                                                                _resolver.async_resolve(ip, port,
-                                                                                        [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
-                                                                                        {
-                                                                                            ip::tcp::socket socket(_context);
-                                                                                            auto _socket = std::make_shared<P2PSocket>(std::move(socket), *this);
-
-                                                                                            client_attempts[ip] = _socket;
-                                                                                            protocol_handle handle = [this](shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
-                                                                                            { return protocol_connected(protocol); };
-                                                                                            _socket->connector_init(std::move(handle), endpoints);
-                                                                                        });
-                                                            }
-                                                            catch (const std::exception &e)
-                                                            {
-                                                                std::cerr << "Exception Client::connect(): " << e.what() << std::endl;
-                                                            }
-                                                        }
-                                                        else
+                                                        std::string ip = std::get<0>(addr);
+                                                        std::string port = std::get<1>(addr);
+                                                        LOG_TRACE << "try to connect: " << ip << ":" << port;
+                                                        try
                                                         {
-                                                            //TODO: [UNCOMMENT] LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+                                                            _resolver.async_resolve(ip, port,
+                                                                                    [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
+                                                                                    {
+                                                                                        ip::tcp::socket socket(*context());
+                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket), *this);
+
+                                                                                        client_attempts[ip] = _socket;
+                                                                                        protocol_handle handle = [this](shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
+                                                                                        { return protocol_connected(protocol); };
+                                                                                        _socket->connector_init(std::move(handle), endpoints);
+                                                                                    });
                                                         }
+                                                        catch (const std::exception &e)
+                                                        {
+                                                            std::cerr << "Exception Client::connect(): " << e.what() << std::endl;
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        //TODO: [UNCOMMENT] LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
                                                     }
                                                 }
                                             }

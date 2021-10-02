@@ -15,9 +15,13 @@ namespace c2pool::libnet
 {
     void NodeManager::run()
     {
-        tcp::endpoint listen_endpoint(tcp::v4(), _config->listenPort); //atoi(_port.c_str()));
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(shared_from_this(), listen_endpoint);
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(shared_from_this());
         _p2pnode->start();
+    }
+
+    shared_ptr<boost::asio::io_context> NodeManager::context() const
+    {
+        return _context;
     }
 
     shared_ptr<c2pool::Network> NodeManager::net() const
@@ -74,6 +78,7 @@ namespace c2pool::libnet
         var_name = _val;                                       \
     }
 
+    create_set_method(boost::asio::io_context, _context);
     create_set_method(c2pool::Network, _net);
     create_set_method(coind::ParentNetwork, _netParent);
     create_set_method(c2pool::dev::coind_config, _config);
@@ -95,6 +100,11 @@ namespace c2pool::libnet
 
     NodeMember::NodeMember(const NodeMember &member) : manager(member.manager)
     {
+    }
+
+    shared_ptr<boost::asio::io_context> NodeMember::context() const
+    {
+        return manager->context();
     }
 
     shared_ptr<c2pool::Network> NodeMember::net() const
