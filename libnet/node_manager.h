@@ -36,12 +36,40 @@ namespace c2pool::libnet
         NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
         {
             _context = make_shared<boost::asio::io_context>(2);
-            _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network); //TODO: boost::filesystem path
+
+            //0:    COIND
+            //1:    Determining payout address
+            //2:    ShareStore
+
+            //Init work:
+            //3:    CoindNode
+            //3.1:  CoindNode.start?
+            //4:    ShareTracker
+            //4.1:  Save shares every 60 seconds
+            //...success!
+
+            //Joing c2pool/p2pool network:
+            //5:    AddrStore
+            //5.1:  Bootstrap_addrs
+            //5.2:  Parse CLI args for addrs
+            //6:    P2PNode
+            //6.1:  P2PNode.start?
+            //7:    Save addrs every 60 seconds
+            //...success!
+
+            //Start listening for workers with a JSON-RPC server:
+            //8:    Worker
+            //9:    Stratum
+            //10:   WebRoot
+            //...success!
+
+            _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network);
+
         }
 
         void start()
         {
-            
+
         }
 
         //TODO: ~NodeManager();
