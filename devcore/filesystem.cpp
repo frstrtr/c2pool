@@ -16,7 +16,6 @@ namespace c2pool::filesystem
     {
         path full_path(program_location().parent_path());
         return full_path.string();
-        //return RESOURCES_DIR; //TODO: boost::filesystem
     }
 
     path getProjectPath()

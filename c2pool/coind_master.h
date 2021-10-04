@@ -24,8 +24,6 @@ namespace c2pool::master
         auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
         //NodeManager
         auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_cfg);
-        //ShareTracker
-        auto share_tracker = std::make_shared<ShareTracker>(DGB);
 
         //run manager in another thread from thread_pool.
         boost::asio::post(thread_pool, [&]()

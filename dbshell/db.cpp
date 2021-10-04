@@ -7,7 +7,7 @@
 namespace dbshell
 {
 
-    Database::Database(const std::string /*TODO: boost::filesystem*/ filepath, bool reset)
+    Database::Database(const std::string filepath, bool reset)
     {
         options.create_if_missing = true;
 

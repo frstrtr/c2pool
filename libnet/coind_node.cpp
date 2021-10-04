@@ -1,6 +1,7 @@
 #include "coind_node.h"
 
 #include "node_manager.h"
+#include <networks/network.h>
 #include <coind/p2p/p2p_socket.h>
 #include <coind/p2p/p2p_protocol.h>
 #include <devcore/common.h>
@@ -9,7 +10,7 @@
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : _context(1), _resolver(_context), c2pool::libnet::NodeMember(node_manager), work_poller_t(_context)
+    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : c2pool::libnet::NodeMember(node_manager), _resolver(*context()), work_poller_t(*context())
     {
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<coind::data::tx_type>>();
@@ -18,57 +19,52 @@ namespace c2pool::libnet
 
     void CoindNode::start()
     {
-        LOG_INFO << "... CoindNode starting..."; //TODO: log coind name
-        _thread.reset(new std::thread([&]() 
-        {
+        LOG_INFO << "... CoindNode<" << netParent()->net_name << ">starting...";
 
-            _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints) {
-                ip::tcp::socket socket(_context);
-                auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), *this);
+        _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
+                                {
+                                    ip::tcp::socket socket(_context);
+                                    auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), *this);
 
-                protocol = make_shared<coind::p2p::CoindProtocol>(_socket, *this);
-                protocol->init(new_block, new_tx, new_headers);
-                _socket->init(endpoints, protocol);
-            });
+                                    protocol = make_shared<coind::p2p::CoindProtocol>(_socket, *this);
+                                    protocol->init(new_block, new_tx, new_headers);
+                                    _socket->init(endpoints, protocol);
+                                });
 
-            //COIND:
-            coind_work = Variable<coind::jsonrpc::data::getwork_result>(coind()->getwork(txidcache));
-            new_block->subscribe([&]()
-            {
-                work_poller_t.expires_from_now(boost::posix_time::seconds(15)); //Если получаем новый блок, то обновляем таймер
-            });
-            work_poller();
+        //COIND:
+        coind_work = Variable<coind::jsonrpc::data::getwork_result>(coind()->getwork(txidcache));
+        new_block->subscribe([&]()
+                             {
+                work_poller_t.expires_from_now(boost::posix_time::seconds(15)); //Если получаем новый блок, то обновляем таймер });
+        work_poller();
 
-            //PEER:
-            coind_work.changed.subscribe(&CoindNode::poll_header, this);
-            poll_header();
+        //PEER:
+        coind_work.changed.subscribe(&CoindNode::poll_header, this);
+        poll_header();
 
-            //BEST SHARE
-            coind_work.changed.subscribe(&CoindNode::set_best_share, this);
-            set_best_share();
-            
-            // p2p logic and join p2pool network
-        
-            // update mining_txs according to getwork results
-            // coind_work.changed.run_and_subscribe([&]()
-            // {
-            //     /* TODO:
-            //         new_mining_txs = {}
-            //         new_known_txs = dict(self.known_txs_var.value)
-            //         for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
-            //             new_mining_txs[tx_hash] = tx
-            //             new_known_txs[tx_hash] = tx
-            //         self.mining_txs_var.set(new_mining_txs)
-            //         self.known_txs_var.set(new_known_txs)
-            //     */  
-            //    auto new_mining_txs;
-            //    auto new_known_txs;
+        //BEST SHARE
+        coind_work.changed.subscribe(&CoindNode::set_best_share, this);
+        set_best_share();
 
-            // });
+        // p2p logic and join p2pool network
 
+        // update mining_txs according to getwork results
+        // coind_work.changed.run_and_subscribe([&]()
+        // {
+        //     /* TODO:
+        //         new_mining_txs = {}
+        //         new_known_txs = dict(self.known_txs_var.value)
+        //         for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
+        //             new_mining_txs[tx_hash] = tx
+        //             new_known_txs[tx_hash] = tx
+        //         self.mining_txs_var.set(new_mining_txs)
+        //         self.known_txs_var.set(new_known_txs)
+        //     */
+        //    auto new_mining_txs;
+        //    auto new_known_txs;
 
-            _context.run();
-        }));
+        // });
+
         LOG_INFO << "... CoindNode started!"; //TODO: log coind name
     }
 
@@ -81,25 +77,24 @@ namespace c2pool::libnet
     }
 
     //TODO: test
-    void CoindNode::handle_header(const BlockHeaderType& new_header)
+    void CoindNode::handle_header(const BlockHeaderType &new_header)
     {
         PackStream packed_new_header;
         PackShareType(BlockHeaderType, new_header, packed_new_header);
 
         arith_uint256 hash_header = UintToArith256(netParent()->POW_FUNC(packed_new_header));
         //check that header matches current target
-        if (! (hash_header <= UintToArith256(coind_work.value.bits.target())))
+        if (!(hash_header <= UintToArith256(coind_work.value.bits.target())))
             return;
 
         auto coind_best_block = coind_work.value.previous_block;
-        
+
         PackStream packed_best_block_header;
         PackShareType(BlockHeaderType, best_block_header.value.value(), packed_best_block_header);
 
-        if (!best_block_header.value.has_value() || 
+        if (!best_block_header.value.has_value() ||
             ((new_header.previous_block == coind_best_block) && (coind::data::hash256(packed_best_block_header) == coind_best_block)) ||
-            ((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header.value->previous_block != coind_best_block))
-            )
+            ((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header.value->previous_block != coind_best_block)))
         {
             best_block_header = new_header;
         }

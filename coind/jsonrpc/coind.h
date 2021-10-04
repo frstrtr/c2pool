@@ -109,7 +109,7 @@ namespace coind::jsonrpc
         Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net) : net(_net)
         {
             curl = curl_easy_init();
-
+            //TODO: try/catch
             if (curl)
             {
                 struct curl_slist *headers = NULL;

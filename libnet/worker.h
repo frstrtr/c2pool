@@ -20,9 +20,7 @@ namespace c2pool::libnet
     class WorkerBridge : public c2pool::libnet::NodeMember
     {
     private:
-        shared_ptr<coind::jsonrpc::Coind> _coind;
 
-    public:
     public:
         WorkerBridge(shared_ptr<NodeManager> node_manager);
 
