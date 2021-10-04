@@ -1,17 +1,21 @@
 #include "shareStore.h"
-#include "share.h"
-using c2pool::shares::BaseShare;
-
-#include <dbshell/db.h>
 
 #include <memory>
+
+#include "share.h"
+#include <dbshell/db.h>
+#include <devcore/filesystem.h>
+
+using c2pool::shares::BaseShare;
 using std::shared_ptr;
 
 namespace c2pool::shares
 {
 
-    ShareStore::ShareStore(const std::string /*TODO: boost::filesystem*/ filepath /*, net, share_cb, verifiedHashCB*/) : Database(filepath)
+    //
+    ShareStore::ShareStore(/*, net, share_cb, verifiedHashCB*/) : Database(filepath)
     {
+
         // self.net = net
 
         // start = time.time()

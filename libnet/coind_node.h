@@ -33,7 +33,7 @@ namespace coind::p2p
 
 namespace c2pool::libnet
 {
-    class CoindNode : public c2pool::libnet::NodeMember
+    class CoindNode : c2pool::libnet::NodeMember
     {
     public:
         CoindNode(shared_ptr<NodeManager> node_manager);
@@ -71,8 +71,6 @@ namespace c2pool::libnet
         shared_ptr<coind::p2p::CoindProtocol> protocol;
 
     private:
-        unique_ptr<std::thread> _thread;
-        io::io_context _context;
         ip::tcp::resolver _resolver;
     };
 }

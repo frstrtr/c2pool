@@ -23,7 +23,7 @@ namespace c2pool::shares
         ShareStore(const std::string /*TODO: boost::filesystem*/ filepath /*, net, share_cb, verifiedHashCB*/);
 
         void add_share(shared_ptr<BaseShare> share);
-        void forget_share(uint256 share_hash); //TODO: Type for hash
+        void forget_share(uint256 share_hash);
 
     //----------------
 
