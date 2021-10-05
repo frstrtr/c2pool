@@ -97,7 +97,7 @@ namespace coind::data
 
     bool is_segwit_tx(std::shared_ptr<TransactionType> tx)
     {
-        auto cast_tx = std::dynamic_pointer_cast<WitnessTransactionType>(tx);
+        auto cast_tx = std::static_pointer_cast<WitnessTransactionType>(tx);
         if (cast_tx)
         {
             return cast_tx->marker == 0 && cast_tx->flag >= 1;

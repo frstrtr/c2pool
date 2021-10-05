@@ -4,6 +4,7 @@
 #include <networks/network.h>
 #include <devcore/config.h>
 #include <devcore/addrStore.h>
+#include <boost/asio/io_context.hpp>
 
 using std::shared_ptr;
 
@@ -104,7 +105,7 @@ namespace c2pool::libnet
         create_set_method(c2pool::shares::ShareTracker, _tracker);
         create_set_method(c2pool::shares::ShareStore, _share_store);
         create_set_method(c2pool::libnet::WorkerBridge, _worker);
-        create_set_method(coind::jsonrpc::StratumNode, _stratum)
+        create_set_method(coind::jsonrpc::StratumNode, _stratum);
     };
 #undef create_set_method
 } // namespace c2pool::libnet

@@ -61,6 +61,5 @@ namespace c2pool::libnet
         vector<int32_t> transaction_fees; //TODO
         c2pool::shares::MerkleLink merkle_link;
         int64_t subsidy;
-        int32_t timestamp;
     };
 }

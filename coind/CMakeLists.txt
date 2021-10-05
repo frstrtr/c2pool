@@ -11,7 +11,7 @@ set(jsonrpc_sources
         jsonrpc/stratum.cpp)
 
 add_library(coind_jsonrpc STATIC ${jsonrpc_sources})
-target_link_libraries(coind_jsonrpc univalue btclibs util networks ${CURL_LIBRARIES})
+target_link_libraries(coind_jsonrpc devcore univalue btclibs util networks ${CURL_LIBRARIES})
 target_include_directories(coind_jsonrpc PRIVATE ${CURL_INCLUDE_DIR})
 
 #coind_tool

@@ -12,6 +12,7 @@
 #include <btclibs/util/strencodings.h>
 #include <coind/transaction.h>
 #include <util/stream_types.h>
+#include <devcore/common.h>
 
 namespace coind::jsonrpc::data
 {
