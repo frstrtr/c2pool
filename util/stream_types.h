@@ -483,6 +483,7 @@ struct FloatingIntegerType
     auto &operator=(int32_t v)
     {
         bits.bits = v;
+        return *this;
     }
 
     int32_t get() const

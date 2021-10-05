@@ -68,7 +68,7 @@ namespace c2pool::util::events
     public:
         Variable() {}
 
-        Variable(VarType _value)
+        Variable(const VarType &_value)
         {
             value = _value;
         }
@@ -110,9 +110,8 @@ namespace c2pool::util::events
         Event<MapType> removed;
 
         VariableDict() {}
-        VariableDict(const MapType &_value)
+        VariableDict(const MapType &_value) : Variable<std::map<KeyType, VarType>>(_value)
         {
-            value = _value;
         }
 
         void add(const MapType &_values)
@@ -120,25 +119,25 @@ namespace c2pool::util::events
             MapType new_items;
             for (auto item : _values)
             {
-                if ((value.find(item.first) == value.end()) || (value[item.first] != item.second))
+                if ((this->value.find(item.first) == this->value.end()) || (this->value[item.first] != item.second))
                 {
-                    new_item[item.first] = item.second;
+                    new_items[item.first] = item.second;
                 }
             }
-            value.insert(_values.begin(), _values.end());
+            this->value.insert(this->value.begin(), _values.begin(), _values.end());
             added.happened(new_items);
         }
 
-        void add(const KeyType &_key, const ValueType &_value)
+        void add(const KeyType &_key, const VarType &_value)
         {
             MapType new_items;
             auto item = std::make_pair(_key, _value);
-            if ((value.find(item.first) == value.end()) || (value[item.first] != item.second))
+            if ((this->value.find(item.first) == this->value.end()) || (this->value[item.first] != item.second))
             {
-                new_item[item.first] = item.second;
+                new_items[item.first] = item.second;
             }
-
-            value.insert(_values.begin(), _values.end());
+            std::map<int, int> a;
+            this->value.insert(this->value.begin(), item);
             added.happened(new_items);
         }
 
@@ -147,27 +146,13 @@ namespace c2pool::util::events
             std::map<KeyType, VarType> gone_items;
             for (auto item : _values)
             {
-                if (value.find(item.first) != value.end())
+                if (this->value.find(item.first) != this->value.end())
                 {
                     gone_items[item.first] = item.second;
-                    value.erase(item.first);
+                    this->value.erase(item.first);
                 }
             }
-            removed.happened(gone_items)
-        }
-        
-        void remove(std::map<KeyType, VarType> _values)
-        {
-            std::map<KeyType, VarType> gone_items;
-            for (auto item : _values)
-            {
-                if (value.find(item.first) != value.end())
-                {
-                    gone_items[item.first] = item.second;
-                    value.erase(item.first);
-                }
-            }
-            removed.happened(gone_items)
+            removed.happened(gone_items);
         }
     };
 } // namespace c2pool::util::events

@@ -51,7 +51,7 @@ namespace coind
         }
     }
 
-    uint256 DigibyteParentNetwork::POW_FUNC(PackStream packed_block_header)
+    uint256 DigibyteParentNetwork::POW_FUNC(PackStream& packed_block_header)
     {
         return coind::data::hash256(packed_block_header);
     }
