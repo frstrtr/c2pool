@@ -35,49 +35,55 @@ struct BaseMaker //TIP, HACK, КОСТЫЛЬ
 template <typename T>
 concept bool MakerType = std::is_base_of_v<BaseMaker, T>;
 
-template <typename T>
+template <typename T, typename SUB_T>
 struct Maker : BaseMaker
 {
-    template <typename SUB_TYPE>
-    static T make_type(SUB_TYPE v)
+    template <typename LAST_T>
+    static T make_type(LAST_T v)
     {
         return T(v);
     }
 
-    template <typename SUB_TYPE>
-    static vector<T> make_list_type(vector<SUB_TYPE> v)
+    template <typename LAST_T>
+    static vector<T> make_list_type(vector<LAST_T> v_arr)
     {
         vector<T> res;
-
-        for (auto _v : v)
+        for (auto v : v_arr)
         {
-            auto res_value = T(_v);
-            res.push_back(res_value);
+            res.push_back(make_type(v));
         }
         return res;
     }
 };
 
-template <MakerType T>
-struct Maker<T> : BaseMaker
+template <typename T, MakerType SUB_T>
+struct Maker<T, SUB_T> : BaseMaker
 {
-    template <typename SUB_TYPE>
-    static T make_type(SUB_TYPE v)
+    template <typename LAST_T>
+    static T make_type(LAST_T v)
     {
-        return Maker<SUB_TYPE>::make_type(v);
+        return SUB_T::make_type(v);
     }
 
-    template <typename SUB_TYPE>
-    static vector<T> make_list_type(vector<SUB_TYPE> v)
+    template <typename LAST_T>
+    static vector<T> make_list_type(vector<LAST_T> v_arr)
     {
         vector<T> res;
-
-        for (auto _v : v)
+        for (auto v : v_arr)
         {
-            auto res_value = Maker<SUB_TYPE>::make_type(_v);
-            res.push_back(res_value);
+            res.push_back(make_type(v));
         }
         return res;
+    }
+};
+
+template <MakerType LIST_TYPE>
+struct MakerListType : BaseMaker
+{
+    template <typename SUB_EL_TYPE>
+    static vector<LIST_TYPE> make_type(vector<SUB_EL_TYPE> values)
+    {
+        return LIST_TYPE::make_list_type(values);
     }
 };
 

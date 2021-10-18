@@ -13,7 +13,7 @@
 using namespace std;
 
 template <typename T>
-struct ListType : Maker<T>
+struct ListType : MakerListType<T>
 {
     vector<T> l;
 
@@ -63,9 +63,16 @@ struct ListType : Maker<T>
 };
 
 //In p2pool - VarStrType
-struct StrType : Maker<string>
+struct StrType : Maker<StrType, string>
 {
     string str;
+
+    StrType() = default;
+
+    StrType(const string _str)
+    {
+        str = _str;
+    }
 
     auto &operator=(std::string _str)
     {
@@ -104,7 +111,7 @@ struct StrType : Maker<string>
 
 //TODO: TEST
 template <int SIZE>
-struct FixedStrType : Maker<string>
+struct FixedStrType : Maker<FixedStrType<SIZE>>, string >
 {
     string str;
 
@@ -147,7 +154,7 @@ struct FixedStrType : Maker<string>
 };
 
 template <typename INT_T>
-struct IntType : Maker<INT_T>
+struct IntType : Maker<IntType<INT_T>, INT_T>
 {
     typedef INT_T value_type;
     INT_T value;
@@ -208,7 +215,7 @@ struct IntType : Maker<INT_T>
 };
 
 template <typename INT_T>
-struct ULongIntType : Maker<INT_T>
+struct ULongIntType : Maker<ULongIntType<INT_T>, INT_T>
 {
     typedef INT_T value_type;
     INT_T value;
@@ -278,7 +285,7 @@ struct ULongIntType : Maker<INT_T>
 
 #define IntType(bytes) INT##bytes
 
-struct VarIntType : Maker<uint64_t>
+struct VarIntType : Maker<VarIntType, uint64_t>
 {
     typedef uint64_t value_type;
     uint64_t value;
@@ -306,7 +313,7 @@ struct VarIntType : Maker<uint64_t>
 };
 
 template <StreamEnumType ENUM_T, StreamObjType PACK_TYPE = IntType(32)>
-struct EnumType : Maker<ENUM_T>
+struct EnumType : Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
 {
     ENUM_T value;
 
@@ -344,13 +351,20 @@ struct EnumType : Maker<ENUM_T>
 };
 
 template <StreamObjType ObjType>
-class PossibleNoneType : public Maker<ObjType>
+class PossibleNoneType : public Maker<PossibleNoneType<ObjType>, ObjType>
 {
 private:
-    ObjType none_value;
+    ObjType none_value; //TODO: init
 
 public:
     optional<ObjType> value;
+
+    PossibleNoneType() = default;
+
+    PossibleNoneType(ObjType _value)
+    {
+        value = _value;
+    }
 
     ObjType get() const
     {
