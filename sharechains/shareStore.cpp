@@ -13,7 +13,7 @@ namespace c2pool::shares
 {
 
     //
-    ShareStore::ShareStore(/*, net, share_cb, verifiedHashCB*/) : Database(filepath)
+    ShareStore::ShareStore(const std::string /*TODO: boost::filesystem*/ filepath/*, net, share_cb, verifiedHashCB*/) : Database(filepath)
     {
 
         // self.net = net
