@@ -38,6 +38,9 @@ concept bool MakerType = std::is_base_of_v<BaseMaker, T>;
 template <typename T, typename SUB_T>
 struct Maker : BaseMaker
 {
+    typedef T to;
+    typedef SUB_T from;
+
     template <typename LAST_T>
     static T make_type(LAST_T v)
     {
@@ -59,6 +62,9 @@ struct Maker : BaseMaker
 template <typename T, MakerType SUB_T>
 struct Maker<T, SUB_T> : BaseMaker
 {
+    typedef T to;
+    typedef SUB_T from;
+
     template <typename LAST_T>
     static T make_type(LAST_T v)
     {
@@ -77,8 +83,17 @@ struct Maker<T, SUB_T> : BaseMaker
     }
 };
 
-template <MakerType LIST_TYPE>
+template <typename LIST_TYPE>
 struct MakerListType : BaseMaker
+{
+    static vector<LIST_TYPE> make_type(vector<LIST_TYPE> values)
+    {
+        return values;
+    }
+};
+
+template <MakerType LIST_TYPE>
+struct MakerListType<LIST_TYPE> : BaseMaker
 {
     template <typename SUB_EL_TYPE>
     static vector<LIST_TYPE> make_type(vector<SUB_EL_TYPE> values)
@@ -256,7 +271,8 @@ struct PackStream
         return data.size();
     }
 
-    bool isNull() const{
+    bool isNull() const
+    {
         return data.size() > 0;
     }
 };

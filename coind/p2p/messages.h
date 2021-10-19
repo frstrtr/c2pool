@@ -459,7 +459,7 @@ namespace coind::p2p::messages
         {
             version = _version;
 
-            auto have_list = have.make_list_type(_have);
+            auto have_list = have.make_type(_have);
             have = have_list;
             last = _last;
         }
