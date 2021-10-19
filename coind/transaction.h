@@ -118,7 +118,7 @@ namespace coind::data
 
         WitnessTransactionType() : TransactionType() {}
 
-        WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<vector<StrType>> _witness, uint32_t _locktime);
+        WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<ListType<StrType>> _witness, uint32_t _locktime);
     };
 
     typedef shared_ptr<TransactionType> tx_type;
