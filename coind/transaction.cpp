@@ -43,8 +43,7 @@ namespace coind::data::stream
             WTXType next;
             stream >> next;
 
-            //vector<WitnessType> _witness;
-            vector<vector<StrType>>
+            vector<WitnessType> _witness;
             for (int i = 0; i < next.tx_ins.l.size(); i++)
             {
                 WitnessType _wit;
@@ -185,7 +184,7 @@ namespace coind::data::stream
     }
 }
 
-coind::data::WitnessTransactionType::WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<vector<StrType>> _witness, uint32_t _locktime) : TransactionType(_version, _tx_ins, _tx_outs, _locktime)
+coind::data::WitnessTransactionType::WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<ListType<StrType>> _witness, uint32_t _locktime) : TransactionType(_version, _tx_ins, _tx_outs, _locktime)
 {
     marker = _marker;
     flag = _flag;
@@ -193,7 +192,7 @@ coind::data::WitnessTransactionType::WitnessTransactionType(uint32_t _version, u
     for (auto v_list : _witness)
     {
         vector<string> _wit_tx;
-        for (auto _v : v_list)
+        for (auto _v : v_list.l)
         {
             _wit_tx.push_back(_v.get());
         }
