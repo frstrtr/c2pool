@@ -4,6 +4,7 @@
 #include <tuple>
 #include <map>
 #include <memory>
+#include <chrono>
 
 #include <boost/asio.hpp>
 
@@ -60,7 +61,7 @@ namespace c2pool::libnet::p2p
         shared_ptr<NodeManager> _manager;
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<io::steady_timer> _auto_connect_timer;
-        constexpr std::chrono::seconds auto_connect_interval{std::chrono_literals::1s};
+        static constexpr auto auto_connect_interval = std::chrono_literals::1s;
 
         //client
         ip::tcp::resolver _resolver;

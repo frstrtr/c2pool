@@ -9,4 +9,4 @@ set(SOURCE
 )
 
 add_library(dbshell ${HEADER} ${SOURCE})
-target_link_libraries(dbshell univalue leveldb devcore)
+target_link_libraries(dbshell PUBLIC univalue leveldb devcore)
