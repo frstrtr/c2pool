@@ -17,108 +17,25 @@ namespace coind::data
     class WitnessTransactionType;
     struct TxInType;
     struct TxOutType;
+    struct TxIDType;
 }
-
 namespace coind::data::stream
 {
-    using namespace coind::data;
-
-    struct PreviousOutput_stream
-    {
-        IntType(256) hash;
-        IntType(32) index;
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-    struct TxInType_stream
-    {
-        PossibleNoneType<PreviousOutput_stream> previous_output;
-        StrType script;
-        PossibleNoneType<IntType(32)> sequence;
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-    struct TxOutType_stream
-    {
-        IntType(64) value;
-        StrType script;
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-    struct TxIDType_stream
-    {
-        IntType(32) version;
-        ListType<TxInType_stream> tx_ins;
-        ListType<TxOutType_stream> tx_outs;
-        IntType(32) lock_time;
-
-        TxIDType_stream() {}
-        TxIDType_stream(int32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, int32_t _locktime);
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-    struct WTXType
-    {
-        IntType(8) flag;
-        ListType<TxInType_stream> tx_ins;
-        ListType<TxOutType_stream> tx_outs;
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-    struct NTXType
-    {
-        ListType<TxOutType_stream> tx_outs;
-        IntType(32) lock_time;
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-    struct TxWriteType{
-        IntType(32) version;
-        IntType(8) marker;
-        IntType(8) flag;
-        ListType<TxInType_stream> tx_ins;
-        ListType<TxOutType_stream> tx_outs;
-
-        TxWriteType() {}
-        TxWriteType(shared_ptr<WitnessTransactionType> tx);
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-#define WitnessType ListType<StrType>
-
-    struct TransactionType_stream
-    {
-        std::shared_ptr<coind::data::TransactionType> tx;
-
-        PackStream &write(PackStream &stream);
-
-        PackStream &read(PackStream &stream);
-    };
-
-#undef WitnessType
+    struct PreviousOutput_stream;
+    struct TxInType_stream;
+    struct TxOutType_stream;
+    struct TxIDType_stream;
+    struct WTXType;
+    struct NTXType;
+    struct TxWriteType;
+    struct TransactionType_stream;
 }
-
+//
+//
+//
+//
+//
+//
 namespace coind::data
 {
     struct PreviousOutput
@@ -180,26 +97,158 @@ namespace coind::data
 
     struct TransactionType
     {
-        int32_t version;
+        uint32_t version;
         vector<TxInType> tx_ins;
         vector<TxOutType> tx_outs;
-        int32_t lock_time;
+        uint32_t lock_time;
 
         TransactionType() = default;
 
-        TransactionType(int32_t _version, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, int32_t _locktime);
+        TransactionType(uint32_t _version, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, uint32_t _locktime);
     };
 
     struct WitnessTransactionType : TransactionType
     {
-        int8_t marker{};
-        int8_t flag{};
+        
+        uint64_t marker{};
+        //TODO:?
+        // int8_t marker{};
+        uint8_t flag{};
         vector<vector<string>> witness;
 
         WitnessTransactionType() : TransactionType() {}
 
-        WitnessTransactionType(int32_t _version, int8_t _marker, int8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<vector<StrType>> _witness, int32_t _locktime);
+        WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<vector<StrType>> _witness, uint32_t _locktime);
     };
 
     typedef shared_ptr<TransactionType> tx_type;
+}
+
+namespace coind::data::stream
+{
+    using namespace coind::data;
+
+    struct PreviousOutput_stream : public Maker<PreviousOutput_stream, PreviousOutput>
+    {
+        IntType(256) hash;
+        IntType(32) index;
+
+        PreviousOutput_stream() = default;
+        PreviousOutput_stream(PreviousOutput val){
+            hash = IntType(256)::make_type(val.hash);
+            index = IntType(32)::make_type(val.index);
+        }
+
+        PackStream &write(PackStream &stream);
+        PackStream &read(PackStream &stream);
+    };
+
+    struct TxInType_stream : public Maker<TxInType_stream, TxInType>
+    {
+        PossibleNoneType<PreviousOutput_stream> previous_output;
+        StrType script;
+        PossibleNoneType<IntType(32)> sequence;
+
+        TxInType_stream() = default;
+        TxInType_stream(TxInType val)
+        {
+            previous_output = PossibleNoneType<PreviousOutput_stream>(PreviousOutput_stream::make_type(val.previous_output));
+            script = StrType::make_type(val.script);
+            sequence = sequence.make_type(val.sequence);
+        }
+
+        PackStream &write(PackStream &stream);
+        PackStream &read(PackStream &stream);
+    };
+
+    struct TxOutType_stream : public Maker<TxOutType_stream, TxOutType>
+    {
+        IntType(64) value;
+        StrType script;
+
+        TxOutType_stream() = default;
+        TxOutType_stream(TxOutType val){
+            value = IntType(64)::make_type(val.value);
+            script = StrType::make_type(val.script);
+        }
+
+        PackStream &write(PackStream &stream);
+        PackStream &read(PackStream &stream);
+    };
+
+    struct TxIDType_stream : public Maker<TxIDType_stream, TxIDType>
+    {
+        IntType(32) version;
+        ListType<TxInType_stream> tx_ins;
+        ListType<TxOutType_stream> tx_outs;
+        IntType(32) lock_time;
+
+        TxIDType_stream() = default;
+        TxIDType_stream(int32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, int32_t _locktime);
+        TxIDType_stream(TxIDType val){
+            version = IntType(32)::make_type(val.version);
+            tx_ins = tx_ins.make_type(val.tx_ins);
+            tx_outs = tx_outs.make_type(val.tx_outs);
+            lock_time = IntType(32)::make_type(val.lock_time);
+        }
+
+        PackStream &write(PackStream &stream);
+
+        PackStream &read(PackStream &stream);
+    };
+
+    struct WTXType
+    {
+        IntType(8) flag;
+        ListType<TxInType_stream> tx_ins;
+        ListType<TxOutType_stream> tx_outs;
+
+        PackStream &write(PackStream &stream);
+
+        PackStream &read(PackStream &stream);
+    };
+
+    struct NTXType
+    {
+        ListType<TxOutType_stream> tx_outs;
+        IntType(32) lock_time;
+
+        PackStream &write(PackStream &stream);
+
+        PackStream &read(PackStream &stream);
+    };
+
+    struct TxWriteType
+    {
+        IntType(32) version;
+        IntType(8) marker;
+        IntType(8) flag;
+        ListType<TxInType_stream> tx_ins;
+        ListType<TxOutType_stream> tx_outs;
+
+        TxWriteType() {}
+        TxWriteType(shared_ptr<WitnessTransactionType> tx);
+
+        PackStream &write(PackStream &stream);
+
+        PackStream &read(PackStream &stream);
+    };
+
+#define WitnessType ListType<StrType>
+
+    struct TransactionType_stream// : public Maker<TransactionType_stream, TransactionType>
+    {
+        std::shared_ptr<coind::data::TransactionType> tx;
+
+        TransactionType_stream() = default;
+        //TODO:
+        // TransactionType_stream(TransactionType val){
+        //     tx = std::make_shared
+        // }
+
+        PackStream &write(PackStream &stream);
+        PackStream &read(PackStream &stream);
+    };
+
+#undef WitnessType
 }

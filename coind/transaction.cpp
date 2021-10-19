@@ -17,7 +17,7 @@ namespace coind::data::stream
             for (auto v : _tx->witness)
             {
                 WitnessType _witness;
-                _witness = WitnessType::make_list_type(v);
+                _witness = WitnessType::make_type(v);
                 stream << _witness;
             }
 
@@ -30,7 +30,8 @@ namespace coind::data::stream
         return stream;
     }
 
-    PackStream &TransactionType_stream::read(PackStream &stream) {
+    PackStream &TransactionType_stream::read(PackStream &stream)
+    {
         IntType(32) version;
         stream >> version;
 
@@ -42,12 +43,13 @@ namespace coind::data::stream
             WTXType next;
             stream >> next;
 
-            vector<WitnessType> witness;
+            //vector<WitnessType> _witness;
+            vector<vector<StrType>>
             for (int i = 0; i < next.tx_ins.l.size(); i++)
             {
                 WitnessType _wit;
                 stream >> _wit;
-                witness.push_back(_wit);
+                _witness.push_back(_wit);
             }
 
             IntType(32) locktime;
@@ -55,7 +57,7 @@ namespace coind::data::stream
 
             //coind::data::TransactionType* test_tx = new coind::data::TransactionType(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, witness, locktime.value);
 
-            tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, witness, locktime.value);
+            tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, _witness, locktime.value);
         }
         else
         {
@@ -78,72 +80,85 @@ namespace coind::data::stream
 
 #undef WitnessType
 
-    PackStream &PreviousOutput_stream::write(PackStream &stream) {
+    PackStream &PreviousOutput_stream::write(PackStream &stream)
+    {
         stream << hash << index;
         return stream;
     }
 
-    PackStream &PreviousOutput_stream::read(PackStream &stream) {
+    PackStream &PreviousOutput_stream::read(PackStream &stream)
+    {
         stream >> hash >> index;
         return stream;
     }
 
-    PackStream &TxInType_stream::write(PackStream &stream) {
+    PackStream &TxInType_stream::write(PackStream &stream)
+    {
         stream << previous_output << script << sequence;
         return stream;
     }
 
-    PackStream &TxInType_stream::read(PackStream &stream) {
+    PackStream &TxInType_stream::read(PackStream &stream)
+    {
         stream >> previous_output >> script >> sequence;
         return stream;
     }
 
-    PackStream &TxOutType_stream::write(PackStream &stream) {
+    PackStream &TxOutType_stream::write(PackStream &stream)
+    {
         stream << value << script;
         return stream;
     }
 
-    PackStream &TxOutType_stream::read(PackStream &stream) {
+    PackStream &TxOutType_stream::read(PackStream &stream)
+    {
         stream >> value >> script;
         return stream;
     }
 
     TxIDType_stream::TxIDType_stream(int32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs,
-                                     int32_t _locktime) {
+                                     int32_t _locktime)
+    {
         version = _version;
 
-        tx_ins = ListType<TxInType_stream>(ListType<TxInType_stream>::make_list_type(_tx_ins));
-        tx_outs = ListType<TxOutType_stream>(ListType<TxOutType_stream>::make_list_type(_tx_outs));
+        tx_ins = ListType<TxInType_stream>(ListType<TxInType_stream>::make_type(_tx_ins));
+        tx_outs = ListType<TxOutType_stream>(ListType<TxOutType_stream>::make_type(_tx_outs));
 
         lock_time = _locktime;
     }
 
-    PackStream &TxIDType_stream::write(PackStream &stream) {
+    PackStream &TxIDType_stream::write(PackStream &stream)
+    {
         stream << version << tx_ins << tx_outs << lock_time;
         return stream;
     }
 
-    PackStream &TxIDType_stream::read(PackStream &stream) {
+    PackStream &TxIDType_stream::read(PackStream &stream)
+    {
         stream >> version >> tx_ins >> tx_outs >> lock_time;
         return stream;
     }
 
-    PackStream &WTXType::write(PackStream &stream) {
+    PackStream &WTXType::write(PackStream &stream)
+    {
         stream << flag << tx_ins << tx_outs;
         return stream;
     }
 
-    PackStream &WTXType::read(PackStream &stream) {
+    PackStream &WTXType::read(PackStream &stream)
+    {
         stream >> flag >> tx_ins >> tx_outs;
         return stream;
     }
 
-    PackStream &NTXType::write(PackStream &stream) {
+    PackStream &NTXType::write(PackStream &stream)
+    {
         stream << tx_outs << lock_time;
         return stream;
     }
 
-    PackStream &NTXType::read(PackStream &stream) {
+    PackStream &NTXType::read(PackStream &stream)
+    {
         stream >> tx_outs >> lock_time;
         return stream;
     }
@@ -153,25 +168,24 @@ namespace coind::data::stream
         version.set(tx->version);
         marker.set(tx->marker);
         flag.set(tx->flag);
-        tx_ins = ListType<TxInType_stream>::make_list_type(tx->tx_ins);
-        tx_outs = ListType<TxOutType_stream>::make_list_type(tx->tx_outs);
+        tx_ins = ListType<TxInType_stream>::make_type(tx->tx_ins);
+        tx_outs = ListType<TxOutType_stream>::make_type(tx->tx_outs);
     }
 
-    PackStream &TxWriteType::write(PackStream &stream) {
+    PackStream &TxWriteType::write(PackStream &stream)
+    {
         stream << version << marker << flag << tx_ins << tx_outs;
         return stream;
     }
 
-    PackStream &TxWriteType::read(PackStream &stream) {
+    PackStream &TxWriteType::read(PackStream &stream)
+    {
         stream >> version >> marker >> flag >> tx_ins >> tx_outs;
         return stream;
     }
 }
 
-coind::data::WitnessTransactionType::WitnessTransactionType(int32_t _version, int8_t _marker, int8_t _flag,
-                                                            vector<stream::TxInType_stream> _tx_ins,
-                                                            vector<stream::TxOutType_stream> _tx_outs,
-                                                            vector<vector<StrType>> _witness, int32_t _locktime) : TransactionType(_version, _tx_ins, _tx_outs, _locktime)
+coind::data::WitnessTransactionType::WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<vector<StrType>> _witness, uint32_t _locktime) : TransactionType(_version, _tx_ins, _tx_outs, _locktime)
 {
     marker = _marker;
     flag = _flag;
@@ -187,8 +201,8 @@ coind::data::WitnessTransactionType::WitnessTransactionType(int32_t _version, in
     }
 }
 
-coind::data::TransactionType::TransactionType(int32_t _version, vector<stream::TxInType_stream> _tx_ins,
-                                              vector<stream::TxOutType_stream> _tx_outs, int32_t _locktime) {
+coind::data::TransactionType::TransactionType(uint32_t _version, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, uint32_t _locktime)
+{
     version = _version;
 
     for (auto v : _tx_ins)
@@ -207,14 +221,16 @@ coind::data::TransactionType::TransactionType(int32_t _version, vector<stream::T
 }
 
 coind::data::TxIDType::TxIDType(int32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs,
-                                int32_t _locktime) {
+                                int32_t _locktime)
+{
     version = _version;
     tx_ins = _tx_ins;
     tx_outs = _tx_outs;
     lock_time = _locktime;
 }
 
-coind::data::TxIDType::TxIDType(coind::data::stream::TxIDType_stream obj) {
+coind::data::TxIDType::TxIDType(coind::data::stream::TxIDType_stream obj)
+{
     version = obj.version.value;
 
     for (auto v : obj.tx_ins.l)
@@ -232,35 +248,41 @@ coind::data::TxIDType::TxIDType(coind::data::stream::TxIDType_stream obj) {
     lock_time = obj.lock_time.get();
 }
 
-coind::data::TxOutType::TxOutType(int64_t _value, string _script) {
+coind::data::TxOutType::TxOutType(int64_t _value, string _script)
+{
     value = _value;
     script = _script;
 }
 
-coind::data::TxOutType::TxOutType(coind::data::stream::TxOutType_stream obj) {
+coind::data::TxOutType::TxOutType(coind::data::stream::TxOutType_stream obj)
+{
     value = obj.value.value;
     script = obj.script.get();
 }
 
-coind::data::TxInType::TxInType() {
+coind::data::TxInType::TxInType()
+{
     previous_output.hash.SetNull();
     previous_output.index = 4294967295;
     sequence = 4294967295;
 }
 
-coind::data::TxInType::TxInType(coind::data::PreviousOutput _previous_output, char *_script, unsigned long _sequence) {
+coind::data::TxInType::TxInType(coind::data::PreviousOutput _previous_output, char *_script, unsigned long _sequence)
+{
     previous_output = _previous_output;
     script = _script;
     sequence = _sequence;
 }
 
-coind::data::TxInType::TxInType(coind::data::stream::TxInType_stream obj) {
+coind::data::TxInType::TxInType(coind::data::stream::TxInType_stream obj)
+{
     previous_output = PreviousOutput(obj.previous_output.get());
     script = obj.script.get();
     sequence = obj.sequence.get().value;
 }
 
-coind::data::PreviousOutput::PreviousOutput(coind::data::stream::PreviousOutput_stream obj) {
+coind::data::PreviousOutput::PreviousOutput(coind::data::stream::PreviousOutput_stream obj)
+{
     hash = obj.hash.value;
     index = obj.index.value;
 }
