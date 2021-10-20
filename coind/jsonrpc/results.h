@@ -116,5 +116,16 @@ namespace coind::jsonrpc::data
             use_getblocktemplate = _use_getblocktemplate;
             latency = _latency;
         }
+
+        bool operator==(getwork_result const &val)
+        {
+            //TODO: for Events::Variable
+            return false;
+        }
+        bool operator!=(getwork_result const &val)
+        {
+            //TODO: for Events::Variable
+            return true;
+        }
     };
 } // namespace coind::jsonrpc::data

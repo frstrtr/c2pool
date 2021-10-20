@@ -23,7 +23,7 @@ namespace c2pool::libnet
 
         _resolver.async_resolve(netParent()->P2P_ADDRESS, std::to_string(netParent()->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
                                 {
-                                    ip::tcp::socket socket(_context);
+                                    ip::tcp::socket socket(*context());
                                     auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), *this);
 
                                     protocol = make_shared<coind::p2p::CoindProtocol>(_socket, *this);
@@ -33,9 +33,11 @@ namespace c2pool::libnet
 
         //COIND:
         coind_work = Variable<coind::jsonrpc::data::getwork_result>(coind()->getwork(txidcache));
-        new_block->subscribe([&]()
+        new_block->subscribe([&](uint256 _value)
                              {
-                work_poller_t.expires_from_now(boost::posix_time::seconds(15)); //Если получаем новый блок, то обновляем таймер });
+                                 //Если получаем новый блок, то обновляем таймер
+                                 work_poller_t.expires_from_now(boost::posix_time::seconds(15));
+                             });
         work_poller();
 
         //PEER:
@@ -73,7 +75,7 @@ namespace c2pool::libnet
     {
         coind_work = coind()->getwork(txidcache, known_txs.value, coind_work.value.use_getblocktemplate);
         work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-        work_poller_t.async_wait(work_poller);
+        work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
     }
 
     //TODO: test
@@ -104,7 +106,7 @@ namespace c2pool::libnet
     {
         if (!protocol)
             return;
-        handle_header(protocol->get_block_header(coind_work.value.previous_block));
+        //TODO: handle_header(protocol->get_block_header(coind_work.value.previous_block));
     }
 
     void CoindNode::set_best_share()

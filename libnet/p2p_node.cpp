@@ -30,7 +30,7 @@ namespace c2pool::libnet::p2p
         ip::tcp::endpoint listen_ep(ip::tcp::v4(), config()->listenPort);
 
         _acceptor.open(listen_ep.protocol());
-        _acceptor.set_option(socket_base::reuse_address(true));
+        _acceptor.set_option(io::socket_base::reuse_address(true));
         _acceptor.bind(listen_ep);
         _acceptor.listen();
     }
@@ -66,8 +66,8 @@ namespace c2pool::libnet::p2p
 
     void P2PNode::auto_connect()
     {
-        _auto_connect_timer->expires_after(auto_connect_interval);
-        _auto_connect_timer->async_wait([this](boost::system::error_code const &_ec)
+        _auto_connect_timer.expires_after(auto_connect_interval);
+        _auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
                                         {
                                             //LOG_TRACE << "auto connect timer";
                                             if (!_ec)

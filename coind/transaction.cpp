@@ -30,53 +30,6 @@ namespace coind::data::stream
         return stream;
     }
 
-    PackStream &TransactionType_stream::read(PackStream &stream)
-    {
-        IntType(32) version;
-        stream >> version;
-
-        VarIntType marker;
-        stream >> marker;
-
-        if (marker.value == 0)
-        {
-            WTXType next;
-            stream >> next;
-
-            vector<WitnessType> _witness;
-            for (int i = 0; i < next.tx_ins.l.size(); i++)
-            {
-                WitnessType _wit;
-                stream >> _wit;
-                _witness.push_back(_wit);
-            }
-
-            IntType(32) locktime;
-            stream >> locktime;
-
-            //coind::data::TransactionType* test_tx = new coind::data::TransactionType(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, witness, locktime.value);
-
-            tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, _witness, locktime.value);
-        }
-        else
-        {
-            vector<TxInType_stream> tx_ins;
-            for (int i = 0; i < marker.value; i++)
-            {
-                TxInType_stream tx_in;
-                stream >> tx_in;
-
-                tx_ins.push_back(tx_in);
-            }
-
-            NTXType next;
-            stream >> next;
-            tx = std::make_shared<coind::data::TransactionType>(version.get(), tx_ins, next.tx_outs.l, next.lock_time.value);
-        }
-
-        return stream;
-    }
-
 #undef WitnessType
 
     PackStream &PreviousOutput_stream::write(PackStream &stream)
