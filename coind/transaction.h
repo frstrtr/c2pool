@@ -109,7 +109,7 @@ namespace coind::data
 
     struct WitnessTransactionType : TransactionType
     {
-        
+
         uint64_t marker{};
         //TODO:?
         // int8_t marker{};
@@ -134,7 +134,8 @@ namespace coind::data::stream
         IntType(32) index;
 
         PreviousOutput_stream() = default;
-        PreviousOutput_stream(PreviousOutput val){
+        PreviousOutput_stream(PreviousOutput val)
+        {
             hash = IntType(256)::make_type(val.hash);
             index = IntType(32)::make_type(val.index);
         }
@@ -167,7 +168,8 @@ namespace coind::data::stream
         StrType script;
 
         TxOutType_stream() = default;
-        TxOutType_stream(TxOutType val){
+        TxOutType_stream(TxOutType val)
+        {
             value = IntType(64)::make_type(val.value);
             script = StrType::make_type(val.script);
         }
@@ -185,7 +187,8 @@ namespace coind::data::stream
 
         TxIDType_stream() = default;
         TxIDType_stream(int32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, int32_t _locktime);
-        TxIDType_stream(TxIDType val){
+        TxIDType_stream(TxIDType val)
+        {
             version = IntType(32)::make_type(val.version);
             tx_ins = tx_ins.make_type(val.tx_ins);
             tx_outs = tx_outs.make_type(val.tx_outs);
@@ -236,7 +239,7 @@ namespace coind::data::stream
 
 #define WitnessType ListType<StrType>
 
-    struct TransactionType_stream// : public Maker<TransactionType_stream, TransactionType>
+    struct TransactionType_stream // : public Maker<TransactionType_stream, TransactionType>
     {
         std::shared_ptr<coind::data::TransactionType> tx;
 
@@ -247,7 +250,52 @@ namespace coind::data::stream
         // }
 
         PackStream &write(PackStream &stream);
-        PackStream &read(PackStream &stream);
+        PackStream &read(PackStream &stream)
+        {
+            IntType(32) version;
+            stream >> version;
+
+            VarIntType marker;
+            stream >> marker;
+
+            if (marker.value == 0)
+            {
+                WTXType next;
+                stream >> next;
+
+                vector<WitnessType> _witness;
+                for (int i = 0; i < next.tx_ins.l.size(); i++)
+                {
+                    WitnessType _wit;
+                    stream >> _wit;
+                    _witness.push_back(_wit);
+                }
+
+                IntType(32) locktime;
+                stream >> locktime;
+
+                //coind::data::TransactionType* test_tx = new coind::data::TransactionType(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, witness, locktime.value);
+
+                tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, _witness, locktime.value);
+            }
+            else
+            {
+                vector<TxInType_stream> tx_ins;
+                for (int i = 0; i < marker.value; i++)
+                {
+                    TxInType_stream tx_in;
+                    stream >> tx_in;
+
+                    tx_ins.push_back(tx_in);
+                }
+
+                NTXType next;
+                stream >> next;
+                tx = std::make_shared<coind::data::TransactionType>(version.get(), tx_ins, next.tx_outs.l, next.lock_time.value);
+            }
+
+            return stream;
+        }
     };
 
 #undef WitnessType

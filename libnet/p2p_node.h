@@ -60,8 +60,8 @@ namespace c2pool::libnet::p2p
     private:
         shared_ptr<NodeManager> _manager;
         shared_ptr<c2pool::dev::coind_config> _config;
-        shared_ptr<io::steady_timer> _auto_connect_timer;
-        static constexpr auto auto_connect_interval = std::chrono_literals::1s;
+        io::steady_timer _auto_connect_timer;
+        const std::chrono::seconds auto_connect_interval{std::chrono::seconds(1)};
 
         //client
         ip::tcp::resolver _resolver;

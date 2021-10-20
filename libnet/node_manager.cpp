@@ -27,7 +27,7 @@ namespace c2pool::libnet
         _coind = std::make_shared<coind::jsonrpc::Coind>(coind_username, coind_password, coind_address, _netParent);
         //1:    Determining payout address
         //2:    ShareStore
-        share_store = std::make_shared<c2pool::shares::ShareStore>(); //TODO: init
+        _share_store = std::make_shared<c2pool::shares::ShareStore>("dgb"); //TODO: init
         //Init work:
         //3:    CoindNode
         _coind_node = std::make_shared<c2pool::libnet::CoindNode>(shared_from_this());

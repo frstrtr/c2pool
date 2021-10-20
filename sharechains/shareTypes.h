@@ -58,19 +58,17 @@ namespace c2pool::shares
         SmallBlockHeaderType(){};
         SmallBlockHeaderType(unsigned long long version, uint256 previous_block, unsigned int timeStamp, unsigned int bits, unsigned int nonce);
 
-        friend bool operator==(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second);
-        friend bool operator!=(const SmallBlockHeaderType &first, const SmallBlockHeaderType &second);
-
-        SmallBlockHeaderType &operator=(UniValue value)
+        bool operator==(const SmallBlockHeaderType &value)
         {
-            version = value["version"].get_int64();
-            previous_block.SetHex(value["previous_block"].get_str());
-            timestamp = value["timestamp"].get_int64();
-            bits = value["bits"].get_int64();
-            nonce = value["nonce"].get_int64();
-
-            return *this;
+            return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
+                   timestamp == value.timestamp && bits == value.bits && nonce == value.nonce;
         }
+        bool operator!=(const SmallBlockHeaderType &value)
+        {
+            return !(*this == value);
+        }
+
+        SmallBlockHeaderType &operator=(UniValue value);
 
         operator UniValue()
         {
@@ -117,8 +115,14 @@ namespace c2pool::shares
         };
         MerkleLink(std::vector<uint256> branch, int index);
 
-        friend bool operator==(const MerkleLink &first, const MerkleLink &second);
-        friend bool operator!=(const MerkleLink &first, const MerkleLink &second);
+        bool operator==(const MerkleLink &value)
+        {
+            return branch == value.branch && index == value.index;
+        }
+        bool operator!=(const MerkleLink &value)
+        {
+            return !(*this == value);
+        }
 
         MerkleLink &operator=(UniValue value)
         {
@@ -160,6 +164,17 @@ namespace c2pool::shares
         BlockHeaderType(SmallBlockHeaderType _min_header, uint256 _merkle_root) : SmallBlockHeaderType(_min_header)
         {
             merkle_root = _merkle_root;
+        }
+
+        bool operator==(const BlockHeaderType &value) const
+        {
+            return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
+                   timestamp == value.timestamp && bits == value.bits && nonce == value.nonce && merkle_root.Compare(value.merkle_root) == 0;
+        }
+
+        bool operator!=(const BlockHeaderType &value) const
+        {
+            return !(*this == value);
         }
     };
 
@@ -226,8 +241,14 @@ namespace c2pool::shares
         HashLinkType() {}
         HashLinkType(std::string state, std::string extra_data, unsigned long long length);
 
-        friend bool operator==(const HashLinkType &first, const HashLinkType &second);
-        friend bool operator!=(const HashLinkType &first, const HashLinkType &second);
+        bool operator==(const HashLinkType &value)
+        {
+            return state == value.state && extra_data == value.extra_data && length == value.length;
+        }
+        bool operator!=(const HashLinkType &value)
+        {
+            return !(*this == value);
+        }
 
         HashLinkType &operator=(UniValue value)
         {
@@ -283,8 +304,14 @@ namespace c2pool::shares
 
         SegwitData(MerkleLink txid_merkle_link, uint256 wtxid_merkle_root);
 
-        friend bool operator==(const SegwitData &first, const SegwitData &second);
-        friend bool operator!=(const SegwitData &first, const SegwitData &second);
+        bool operator==(const SegwitData &value)
+        {
+            return txid_merkle_link == value.txid_merkle_link && wtxid_merkle_root == value.wtxid_merkle_root;
+        }
+        bool operator!=(const SegwitData &value)
+        {
+            return !(*this == value);
+        }
 
         SegwitData &operator=(UniValue value)
         {
@@ -342,8 +369,14 @@ namespace c2pool::shares
         StaleInfo stale_info;
         unsigned long long desired_version; //pack.VarIntType()
 
-        friend bool operator==(const ShareData &first, const ShareData &second);
-        friend bool operator!=(const ShareData &first, const ShareData &second);
+        bool operator==(const ShareData &value)
+        {
+            return previous_share_hash == value.previous_share_hash && coinbase == value.coinbase && nonce == value.nonce && pubkey_hash == value.pubkey_hash && subsidy == value.subsidy && donation == value.donation && stale_info == value.stale_info && desired_version == value.desired_version;
+        }
+        bool operator!=(const ShareData &value)
+        {
+            return !(*this == value);
+        }
 
         ShareData &operator=(UniValue value)
         {
@@ -458,8 +491,14 @@ namespace c2pool::shares
         ShareInfo(){};
         ShareInfo(ShareData share_data, std::vector<uint256> new_transaction_hashes, std::vector<std::tuple<int, int>> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits, unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork, SegwitData segwit_data);
 
-        friend bool operator==(const ShareInfo &first, const ShareInfo &second);
-        friend bool operator!=(const ShareInfo &first, const ShareInfo &second);
+        bool operator==(const ShareInfo &value)
+        {
+            return share_data == value.share_data && far_share_hash == value.far_share_hash && max_bits == value.max_bits && bits == value.bits && timestamp == value.timestamp && new_transaction_hashes == value.new_transaction_hashes && transaction_hash_refs == value.transaction_hash_refs && absheigth == value.absheigth && abswork == value.abswork;
+        }
+        bool operator!=(const ShareInfo &value)
+        {
+            return !(*this == value);
+        }
 
         //TODO: remove or create just obj -> json;
         // ShareInfo &operator=(UniValue value)
