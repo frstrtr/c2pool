@@ -104,7 +104,15 @@ namespace coind::data
 
         TransactionType() = default;
 
-        TransactionType(uint32_t _version, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, uint32_t _locktime);
+        TransactionType(uint32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, uint32_t _locktime)
+        {
+            version = _version;
+
+            tx_ins = _tx_ins;
+            tx_outs = _tx_outs;
+
+            lock_time = _locktime;
+        }
     };
 
     struct WitnessTransactionType : TransactionType
@@ -118,7 +126,21 @@ namespace coind::data
 
         WitnessTransactionType() : TransactionType() {}
 
-        WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<stream::TxInType_stream> _tx_ins, vector<stream::TxOutType_stream> _tx_outs, vector<ListType<StrType>> _witness, uint32_t _locktime);
+        WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, vector<ListType<StrType>> _witness, uint32_t _locktime) : TransactionType(_version, _tx_ins, _tx_outs, _locktime)
+        {
+            marker = _marker;
+            flag = _flag;
+
+            for (auto v_list : _witness)
+            {
+                vector<string> _wit_tx;
+                for (auto _v : v_list.l)
+                {
+                    _wit_tx.push_back(_v.get());
+                }
+                witness.push_back(_wit_tx);
+            }
+        }
     };
 
     typedef shared_ptr<TransactionType> tx_type;
@@ -140,8 +162,16 @@ namespace coind::data::stream
             index = IntType(32)::make_type(val.index);
         }
 
-        PackStream &write(PackStream &stream);
-        PackStream &read(PackStream &stream);
+        PackStream &write(PackStream &stream)
+        {
+            stream << hash << index;
+            return stream;
+        }
+        PackStream &read(PackStream &stream)
+        {
+            stream >> hash >> index;
+            return stream;
+        }
     };
 
     struct TxInType_stream : public Maker<TxInType_stream, TxInType>
@@ -158,8 +188,16 @@ namespace coind::data::stream
             sequence = sequence.make_type(val.sequence);
         }
 
-        PackStream &write(PackStream &stream);
-        PackStream &read(PackStream &stream);
+        PackStream &write(PackStream &stream)
+        {
+            stream << previous_output << script << sequence;
+            return stream;
+        }
+        PackStream &read(PackStream &stream)
+        {
+            stream >> previous_output >> script >> sequence;
+            return stream;
+        }
     };
 
     struct TxOutType_stream : public Maker<TxOutType_stream, TxOutType>
@@ -174,8 +212,17 @@ namespace coind::data::stream
             script = StrType::make_type(val.script);
         }
 
-        PackStream &write(PackStream &stream);
-        PackStream &read(PackStream &stream);
+        PackStream &write(PackStream &stream)
+        {
+            stream << value << script;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> value >> script;
+            return stream;
+        }
     };
 
     struct TxIDType_stream : public Maker<TxIDType_stream, TxIDType>
@@ -206,9 +253,17 @@ namespace coind::data::stream
         ListType<TxInType_stream> tx_ins;
         ListType<TxOutType_stream> tx_outs;
 
-        PackStream &write(PackStream &stream);
+        PackStream &write(PackStream &stream)
+        {
+            stream << flag << tx_ins << tx_outs;
+            return stream;
+        }
 
-        PackStream &read(PackStream &stream);
+        PackStream &read(PackStream &stream)
+        {
+            stream >> flag >> tx_ins >> tx_outs;
+            return stream;
+        }
     };
 
     struct NTXType
@@ -216,9 +271,17 @@ namespace coind::data::stream
         ListType<TxOutType_stream> tx_outs;
         IntType(32) lock_time;
 
-        PackStream &write(PackStream &stream);
+        PackStream &write(PackStream &stream)
+        {
+            stream << tx_outs << lock_time;
+            return stream;
+        }
 
-        PackStream &read(PackStream &stream);
+        PackStream &read(PackStream &stream)
+        {
+            stream >> tx_outs >> lock_time;
+            return stream;
+        }
     };
 
     struct TxWriteType
@@ -274,24 +337,44 @@ namespace coind::data::stream
                 IntType(32) locktime;
                 stream >> locktime;
 
-                //coind::data::TransactionType* test_tx = new coind::data::TransactionType(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, witness, locktime.value);
+                vector<TxInType> tx_ins;
+                for (auto tx_ins_stream : next.tx_ins.l)
+                {
+                    TxInType tx_in(tx_ins_stream);
+                    tx_ins.push_back(tx_in);
+                }
 
-                tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, next.tx_ins.l, next.tx_outs.l, _witness, locktime.value);
+                vector<TxOutType> tx_outs;
+                for (auto tx_out_stream : next.tx_outs.l)
+                {
+                    TxOutType tx_out(tx_out_stream);
+                    tx_outs.push_back(tx_out);
+                }
+
+                tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, tx_ins, tx_outs, _witness, locktime.value);
             }
             else
             {
-                vector<TxInType_stream> tx_ins;
+                vector<TxInType> tx_ins;
                 for (int i = 0; i < marker.value; i++)
                 {
-                    TxInType_stream tx_in;
-                    stream >> tx_in;
-
+                    TxInType_stream tx_in_stream;
+                    stream >> tx_in_stream;
+                    TxInType_stream tx_in(tx_in_stream);
                     tx_ins.push_back(tx_in);
                 }
 
                 NTXType next;
                 stream >> next;
-                tx = std::make_shared<coind::data::TransactionType>(version.get(), tx_ins, next.tx_outs.l, next.lock_time.value);
+
+                vector<TxOutType> tx_outs;
+                for (auto tx_out_stream : next.tx_outs.l)
+                {
+                    TxOutType tx_out(tx_out_stream);
+                    tx_outs.push_back(tx_out);
+                }
+
+                tx = std::make_shared<coind::data::TransactionType>(version.get(), tx_ins, tx_outs, next.lock_time.value);
             }
 
             return stream;
