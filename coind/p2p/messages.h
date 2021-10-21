@@ -82,9 +82,31 @@ namespace coind::p2p::messages
         {"block", cmd_block},
         {"headers", cmd_headers}};
 
-    const char *string_commands(commands cmd);
+    inline const char *string_coind_commands(commands cmd)
+    {
+        try
+        {
+            return _string_commands.at(cmd);
+        }
+        catch (const std::out_of_range &e)
+        {
+            LOG_WARNING << (int)cmd << " out of range in string_coind_commands";
+            return "error";
+        }
+    }
 
-    commands reverse_string_commands(const char *key);
+    inline commands reverse_string_commands(const char *key)
+    {
+        try
+        {
+            return _reverse_string_commands.at(key);
+        }
+        catch (const std::out_of_range &e)
+        {
+            LOG_WARNING << key << " out of range in reverse_string_commands";
+            return commands::cmd_error;
+        }
+    }
 
     //base_message type for handle
     class raw_message

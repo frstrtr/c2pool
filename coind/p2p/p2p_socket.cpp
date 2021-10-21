@@ -121,7 +121,7 @@ namespace coind::p2p
             PackStream value;
 
             //command [+]
-            const char *temp_cmd = coind::p2p::messages::string_commands(msg->cmd);
+            const char *temp_cmd = coind::p2p::messages::string_coind_commands(msg->cmd);
             auto command = new char[12]{'\0'};
             memcpy(command, temp_cmd, strlen(temp_cmd));
             PackStream s_command(command, 12);
