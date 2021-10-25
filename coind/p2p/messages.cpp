@@ -3,7 +3,7 @@
 
 #include <devcore/logger.h>
 #include <devcore/str.h>
-#include <util/pystruct.h>
+#include <devcore/pystruct.h>
 
 namespace c2pool::libnet::messages
 {

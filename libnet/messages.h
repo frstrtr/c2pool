@@ -8,8 +8,8 @@
 #include <tuple>
 
 #include <univalue.h>
-#include <util/types.h>
-#include <util/stream_types.h>
+#include <devcore/types.h>
+#include <devcore/stream_types.h>
 #include <btclibs/uint256.h>
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>

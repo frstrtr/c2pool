@@ -1,7 +1,6 @@
 #include "p2p_node.h"
 
 #include <iostream>
-#include <utility>
 #include <tuple>
 #include <algorithm>
 

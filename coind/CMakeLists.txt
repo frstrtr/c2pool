@@ -5,7 +5,7 @@ set(coind_tool_sources
         transaction.h
         transaction.cpp)
 
-add_library(coind_tool STATIC ${coind_tool_sources})
+add_library(coind_tool ${coind_tool_sources})
 target_link_libraries(coind_tool btclibs devcore networks util)
 
 #jsonrpc-coind
@@ -20,7 +20,7 @@ set(jsonrpc_sources
         jsonrpc/stratum.h
         jsonrpc/stratum.cpp)
 
-add_library(coind_jsonrpc STATIC ${jsonrpc_sources})
+add_library(coind_jsonrpc ${jsonrpc_sources})
 target_link_libraries(coind_jsonrpc devcore univalue btclibs util networks ${CURL_LIBRARIES})
 target_include_directories(coind_jsonrpc PRIVATE ${CURL_INCLUDE_DIR})
 

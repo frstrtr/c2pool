@@ -9,7 +9,7 @@
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
 
-#include <util/types.h>
+#include "types.h"
 
 using namespace boost::dll;
 using namespace boost::filesystem;

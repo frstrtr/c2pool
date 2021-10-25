@@ -12,7 +12,7 @@
 #include <devcore/common.h>
 #include <coind/jsonrpc/coind.h>
 #include <sharechains/tracker.h>
-#include <util/events.h>
+#include <devcore/events.h>
 #include <coind/jsonrpc/results.h>
 
 using namespace coind::jsonrpc;

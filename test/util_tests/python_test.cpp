@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <iostream>
-#include <util/pystruct.h>
+#include <devcore/pystruct.h>
 using namespace std;
 
 TEST(Py, TestWorkPyPackTypes)
