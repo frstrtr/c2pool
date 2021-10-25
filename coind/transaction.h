@@ -66,7 +66,7 @@ namespace coind::data
 
         TxInType(PreviousOutput _previous_output, char *_script, unsigned long _sequence);
 
-        TxInType(stream::TxInType_stream obj);
+        TxInType(std::shared_ptr<stream::TxInType_stream> obj);
     };
 
     struct TxOutType
@@ -78,7 +78,7 @@ namespace coind::data
 
         TxOutType(int64_t _value, string _script);
 
-        TxOutType(stream::TxOutType_stream obj);
+        TxOutType(std::shared_ptr<stream::TxOutType_stream> obj);
     };
 
     struct TxIDType
@@ -338,16 +338,18 @@ namespace coind::data::stream
                 stream >> locktime;
 
                 vector<TxInType> tx_ins;
-                for (auto tx_ins_stream : next.tx_ins.l)
+                for (auto tx_in_stream : next.tx_ins.l)
                 {
-                    TxInType tx_in(tx_ins_stream);
+                    auto ptr_tx_in = make_shared<coind::data::stream::TxInType_stream>(tx_in_stream);
+                    TxInType tx_in(ptr_tx_in);
                     tx_ins.push_back(tx_in);
                 }
 
                 vector<TxOutType> tx_outs;
                 for (auto tx_out_stream : next.tx_outs.l)
                 {
-                    TxOutType tx_out(tx_out_stream);
+                    auto ptr_tx_out = make_shared<coind::data::stream::TxOutType_stream>(tx_out_stream);
+                    TxOutType tx_out(ptr_tx_out);
                     tx_outs.push_back(tx_out);
                 }
 
@@ -360,7 +362,9 @@ namespace coind::data::stream
                 {
                     TxInType_stream tx_in_stream;
                     stream >> tx_in_stream;
-                    TxInType_stream tx_in(tx_in_stream);
+
+                    auto ptr_tx_in = make_shared<coind::data::stream::TxInType_stream>(tx_in_stream);
+                    TxInType tx_in(ptr_tx_in);
                     tx_ins.push_back(tx_in);
                 }
 
@@ -370,7 +374,8 @@ namespace coind::data::stream
                 vector<TxOutType> tx_outs;
                 for (auto tx_out_stream : next.tx_outs.l)
                 {
-                    TxOutType tx_out(tx_out_stream);
+                    auto ptr_tx_out = make_shared<coind::data::stream::TxOutType_stream>(tx_out_stream);
+                    TxOutType tx_out(ptr_tx_out);
                     tx_outs.push_back(tx_out);
                 }
 
