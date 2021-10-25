@@ -3,12 +3,12 @@
 #include <boost/format.hpp>
 #include <coind/data.h>
 #include <btclibs/uint256.h>
-#include <dbshell/dbObject.h>
+#include <devcore/dbObject.h>
 #include <networks/network.h>
 #include <devcore/addrStore.h>
-#include <util/types.h>
-#include <util/stream.h>
-#include <util/stream_types.h>
+#include <devcore/types.h>
+#include <devcore/stream.h>
+#include <devcore/stream_types.h>
 using dbshell::DBObject;
 
 #include <string>

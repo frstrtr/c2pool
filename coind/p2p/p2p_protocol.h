@@ -3,7 +3,7 @@
 #include "messages.h"
 #include <libnet/node_manager.h>
 #include <devcore/logger.h>
-#include <util/events.h>
+#include <devcore/events.h>
 #include "p2p_socket.h"
 #include <coind/transaction.h>
 #include <sharechains/data.h>

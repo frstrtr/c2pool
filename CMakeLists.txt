@@ -52,10 +52,11 @@ add_subdirectory(lib)
 
 include_directories(${CMAKE_SOURCE_DIR})
 
-add_subdirectory(util)
+#legacy util
+#add_subdirectory(util)
+
 add_subdirectory(btclibs)
 add_subdirectory(coind)
-add_subdirectory(dbshell)
 add_subdirectory(networks)
 add_subdirectory(sharechains) #ver. 2
 add_subdirectory(devcore)

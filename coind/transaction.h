@@ -5,8 +5,8 @@
 #include <string>
 
 #include "univalue.h"
-#include <util/stream.h>
-#include <util/stream_types.h>
+#include <devcore/stream.h>
+#include <devcore/stream_types.h>
 #include <btclibs/uint256.h>
 
 using std::vector, std::string;

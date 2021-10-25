@@ -2,11 +2,11 @@
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
-#include <util/types.h>
+#include <devcore/types.h>
 using namespace c2pool::messages;
 #include <networks/network.h>
-#include <util/stream.h>
-#include <util/stream_types.h>
+#include <devcore/stream.h>
+#include <devcore/stream_types.h>
 
 #include <sstream>
 #include <string>

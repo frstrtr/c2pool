@@ -5,7 +5,7 @@
 #include <sstream>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
-#include <util/pystruct.h>
+#include <devcore/pystruct.h>
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)

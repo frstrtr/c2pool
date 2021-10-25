@@ -9,7 +9,7 @@
 #include <devcore/common.h>
 #include <libnet/node_manager.h>
 #include "prefsum_share.h"
-#include <util/pystruct.h>
+#include <devcore/pystruct.h>
 #include <libnet/node_manager.h>
 
 #include <map>

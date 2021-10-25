@@ -4,7 +4,7 @@ using namespace coind::jsonrpc::data;
 
 #include "univalue.h"
 #include <coind/data.h>
-#include <util/stream.h>
+#include <devcore/stream.h>
 #include <btclibs/util/strencodings.h>
 #include <coind/transaction.h>
 

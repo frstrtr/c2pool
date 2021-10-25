@@ -2,7 +2,7 @@
 #include "dbObject.h"
 #include "dbBatch.h"
 #include <string>
-#include <devcore/logger.h>
+#include "logger.h"
 
 namespace dbshell
 {

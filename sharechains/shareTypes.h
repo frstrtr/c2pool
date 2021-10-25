@@ -3,8 +3,8 @@
 #include <btclibs/uint256.h>
 #include <univalue.h>
 #include <boost/optional.hpp>
-#include <util/stream_types.h>
-#include <util/stream.h>
+#include <devcore/stream_types.h>
+#include <devcore/stream.h>
 
 #include <set>
 #include <tuple>

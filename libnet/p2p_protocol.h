@@ -11,7 +11,7 @@
 #include "node_manager.h"
 #include <devcore/logger.h>
 #include <sharechains/share.h>
-#include <util/types.h>
+#include <devcore/types.h>
 
 using namespace c2pool::libnet::messages;
 using std::shared_ptr, std::weak_ptr, std::make_shared;

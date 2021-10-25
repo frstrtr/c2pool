@@ -3,7 +3,7 @@
 #include <memory>
 
 #include "share.h"
-#include <dbshell/db.h>
+#include <devcore/db.h>
 #include <devcore/filesystem.h>
 
 using c2pool::shares::BaseShare;

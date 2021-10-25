@@ -13,8 +13,8 @@
 #include <devcore/logger.h>
 #include <devcore/str.h>
 #include <networks/network.h>
-#include <util/stream.h>
-#include <util/stream_types.h>
+#include <devcore/stream.h>
+#include <devcore/stream_types.h>
 
 using std::string;
 using std::tuple;

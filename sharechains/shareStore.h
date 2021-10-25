@@ -1,5 +1,5 @@
 #pragma once
-#include <dbshell/db.h>
+#include <devcore/db.h>
 #include <btclibs/uint256.h>
 
 #include <memory>

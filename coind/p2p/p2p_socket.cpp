@@ -1,7 +1,7 @@
 #include "p2p_socket.h"
 #include "messages.h"
 #include "p2p_protocol.h"
-#include <util/types.h>
+#include <devcore/types.h>
 #include <devcore/logger.h>
 #include <devcore/str.h>
 #include <devcore/random.h>
