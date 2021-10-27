@@ -3,8 +3,8 @@
 #include <memory>
 
 #include "share.h"
-#include <devcore/db.h>
-#include <devcore/filesystem.h>
+#include <libdevcore/db.h>
+#include <libdevcore/filesystem.h>
 
 using c2pool::shares::BaseShare;
 using std::shared_ptr;

@@ -10,7 +10,7 @@
 #include "messages.h"
 #include "node_manager.h"
 #include <networks/network.h>
-#include <devcore/stream.h>
+#include <libdevcore/stream.h>
 
 using namespace c2pool::libnet::messages;
 namespace ip = boost::asio::ip;

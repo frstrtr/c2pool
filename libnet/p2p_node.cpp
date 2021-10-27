@@ -11,10 +11,10 @@
 #include "node_manager.h"
 #include "p2p_socket.h"
 #include "p2p_protocol.h"
-#include <devcore/logger.h>
-#include <devcore/addrStore.h>
-#include <devcore/common.h>
-#include <devcore/random.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/addrStore.h>
+#include <libdevcore/common.h>
+#include <libdevcore/random.h>
 
 using std::max, std::min;
 namespace io = boost::asio;

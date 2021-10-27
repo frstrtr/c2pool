@@ -6,7 +6,7 @@
 #include <memory>
 
 #include "btclibs/uint256.h"
-#include <devcore/stream.h>
+#include <libdevcore/stream.h>
 
 using std::shared_ptr;
 

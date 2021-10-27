@@ -8,12 +8,12 @@
 #include <tuple>
 
 #include <univalue.h>
-#include <devcore/types.h>
-#include <devcore/stream_types.h>
+#include <libdevcore/types.h>
+#include <libdevcore/stream_types.h>
 #include <btclibs/uint256.h>
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
-#include <devcore/logger.h>
+#include <libdevcore/logger.h>
 
 using namespace c2pool::messages;
 

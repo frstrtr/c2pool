@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <iostream>
-#include <devcore/deferred.h>
+#include <libdevcore/deferred.h>
 using namespace c2pool::util::deferred;
 
 TEST(Deferred, Deferred_system)

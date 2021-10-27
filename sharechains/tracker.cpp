@@ -4,10 +4,10 @@ using namespace c2pool::shares;
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
-#include <devcore/logger.h>
-#include <devcore/common.h>
-#include <coind/data.h>
-#include <devcore/pystruct.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
+#include <libcoind/data.h>
+#include <libdevcore/pystruct.h>
 
 #include <map>
 #include <queue>

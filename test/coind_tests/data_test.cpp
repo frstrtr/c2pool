@@ -6,7 +6,7 @@
 
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
-#include <coind/data.h>
+#include <libcoind/data.h>
 
 using namespace std;
 

@@ -6,8 +6,8 @@
 #include <memory>
 
 #include <btclibs/uint256.h>
-#include <coind/jsonrpc/coind.h>
-#include <coind/data.h>
+#include <libcoind/jsonrpc/coind.h>
+#include <libcoind/data.h>
 #include "dgb/scrypt.h"
 
 using std::shared_ptr;

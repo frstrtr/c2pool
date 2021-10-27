@@ -5,8 +5,8 @@
 #include "p2p_node.h"
 #include "coind_node.h"
 #include "worker.h"
-#include <coind/jsonrpc/coind.h>
-#include <coind/jsonrpc/stratum.h>
+#include <libcoind/jsonrpc/coind.h>
+#include <libcoind/jsonrpc/stratum.h>
 #include <sharechains/tracker.h>
 #include <sharechains/shareStore.h>
 

@@ -2,10 +2,10 @@
 
 #include "messages.h"
 #include <libnet/node_manager.h>
-#include <devcore/logger.h>
-#include <devcore/events.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/events.h>
 #include "p2p_socket.h"
-#include <coind/transaction.h>
+#include <libcoind/transaction.h>
 #include <sharechains/data.h>
 using namespace coind::p2p::messages;
 using namespace c2pool::util::events;

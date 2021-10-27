@@ -1,14 +1,14 @@
 #pragma once
 
 #include <boost/format.hpp>
-#include <coind/data.h>
+#include <libcoind/data.h>
 #include <btclibs/uint256.h>
-#include <devcore/dbObject.h>
+#include <libdevcore/dbObject.h>
 #include <networks/network.h>
-#include <devcore/addrStore.h>
-#include <devcore/types.h>
-#include <devcore/stream.h>
-#include <devcore/stream_types.h>
+#include <libdevcore/addrStore.h>
+#include <libdevcore/types.h>
+#include <libdevcore/stream.h>
+#include <libdevcore/stream_types.h>
 using dbshell::DBObject;
 
 #include <string>

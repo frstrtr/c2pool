@@ -2,8 +2,8 @@
 
 #include <memory>
 #include <networks/network.h>
-#include <devcore/config.h>
-#include <devcore/addrStore.h>
+#include <libdevcore/config.h>
+#include <libdevcore/addrStore.h>
 #include <boost/asio/io_context.hpp>
 
 using std::shared_ptr;

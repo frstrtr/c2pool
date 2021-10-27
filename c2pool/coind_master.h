@@ -1,6 +1,6 @@
-#include <devcore/config.h>
-#include <devcore/logger.h>
-#include <devcore/common.h>
+#include <libdevcore/config.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
 #include <libnet/node_manager.h>
 #include <networks/network.h>
 #include <sharechains/tracker.h>

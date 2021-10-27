@@ -9,7 +9,7 @@
 #include <boost/asio.hpp>
 
 #include "node_manager.h"
-#include <devcore/addrStore.h>
+#include <libdevcore/addrStore.h>
 
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;

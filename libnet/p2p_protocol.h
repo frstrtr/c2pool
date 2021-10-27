@@ -9,9 +9,9 @@
 #include "p2p_node.h"
 #include "p2p_socket.h"
 #include "node_manager.h"
-#include <devcore/logger.h>
+#include <libdevcore/logger.h>
 #include <sharechains/share.h>
-#include <devcore/types.h>
+#include <libdevcore/types.h>
 
 using namespace c2pool::libnet::messages;
 using std::shared_ptr, std::weak_ptr, std::make_shared;

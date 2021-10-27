@@ -8,12 +8,12 @@
 
 #include "node_manager.h"
 #include <networks/network.h>
-#include <devcore/logger.h>
-#include <devcore/common.h>
-#include <coind/jsonrpc/coind.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
+#include <libcoind/jsonrpc/coind.h>
 #include <sharechains/tracker.h>
-#include <devcore/events.h>
-#include <coind/jsonrpc/results.h>
+#include <libdevcore/events.h>
+#include <libcoind/jsonrpc/results.h>
 
 using namespace coind::jsonrpc;
 using namespace c2pool::shares;

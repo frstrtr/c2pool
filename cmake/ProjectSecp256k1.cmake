@@ -6,7 +6,7 @@ if (MSVC)
 endif()
 
 #set(prefix "${CMAKE_BINARY_DIR}/deps")
-set(prefix "${CMAKE_CURRENT_SOURCE_DIR}/lib/secp256k1")
+set(prefix "${CMAKE_CURRENT_SOURCE_DIR}/libs/secp256k1")
 set(SECP256K1_LIBRARY "${prefix}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}secp256k1${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(SECP256K1_INCLUDE_DIR "${prefix}/include")
 

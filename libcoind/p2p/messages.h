@@ -2,11 +2,11 @@
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
-#include <devcore/types.h>
+#include <libdevcore/types.h>
 using namespace c2pool::messages;
 #include <networks/network.h>
-#include <devcore/stream.h>
-#include <devcore/stream_types.h>
+#include <libdevcore/stream.h>
+#include <libdevcore/stream_types.h>
 
 #include <sstream>
 #include <string>
@@ -16,7 +16,7 @@ using namespace c2pool::messages;
 #include <tuple>
 #include <map>
 
-#include <devcore/logger.h>
+#include <libdevcore/logger.h>
 
 namespace coind::p2p
 {

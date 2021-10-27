@@ -5,7 +5,7 @@
 #include <sstream>
 #include <iostream>
 
-#include <coind/jsonrpc/coind.h>
+#include <libcoind/jsonrpc/coind.h>
 
 #ifdef PASS_EXIST
 #include "pass.h"

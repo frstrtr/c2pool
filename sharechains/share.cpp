@@ -1,9 +1,9 @@
 #include "share.h"
 
 #include <univalue.h>
-#include <devcore/logger.h>
-#include <devcore/common.h>
-#include <devcore/addrStore.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
+#include <libdevcore/addrStore.h>
 #include "tracker.h"
 #include <stdexcept>
 #include <tuple>

@@ -1,6 +1,6 @@
 #include <iostream>
 #include <boost/asio.hpp>
-#include <coind/jsonrpc/stratum.h>
+#include <libcoind/jsonrpc/stratum.h>
 #include <libnet/node_manager.h>
 
 using namespace std;
