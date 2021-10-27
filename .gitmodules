@@ -1,6 +1,6 @@
-[submodule "lib/googletest"]
-	path = lib/googletest
+[submodule "libs/googletest"]
+	path = libs/googletest
 	url = https://github.com/frstrtr/googletest.git
-[submodule "lib/univalue"]
-	path = lib/univalue
+[submodule "libs/univalue"]
+	path = libs/univalue
 	url = https://github.com/frstrtr/univalue.git

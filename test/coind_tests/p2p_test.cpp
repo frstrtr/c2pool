@@ -11,8 +11,8 @@ using namespace std;
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
-#include <coind/p2p/p2p_socket.h>
-#include <coind/p2p/p2p_protocol.h>
+#include <libcoind/p2p/p2p_socket.h>
+#include <libcoind/p2p/p2p_protocol.h>
 
 #include <networks/network.h>
 

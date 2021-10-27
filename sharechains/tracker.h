@@ -4,12 +4,12 @@
 #include "shareTypes.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
-#include <coind/data.h>
-#include <devcore/logger.h>
-#include <devcore/common.h>
+#include <libcoind/data.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
 #include <libnet/node_manager.h>
 #include "prefsum_share.h"
-#include <devcore/pystruct.h>
+#include <libdevcore/pystruct.h>
 #include <libnet/node_manager.h>
 
 #include <map>

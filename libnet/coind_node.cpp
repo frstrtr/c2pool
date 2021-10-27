@@ -2,9 +2,9 @@
 
 #include "node_manager.h"
 #include <networks/network.h>
-#include <coind/p2p/p2p_socket.h>
-#include <coind/p2p/p2p_protocol.h>
-#include <devcore/common.h>
+#include <libcoind/p2p/p2p_socket.h>
+#include <libcoind/p2p/p2p_protocol.h>
+#include <libdevcore/common.h>
 #include <btclibs/arith_uint256.h>
 
 namespace c2pool::libnet

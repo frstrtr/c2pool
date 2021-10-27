@@ -10,11 +10,11 @@
 #include "messages.h"
 #include "p2p_protocol.h"
 #include "p2p_node.h"
-#include <devcore/logger.h>
-#include <devcore/str.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/str.h>
 #include <networks/network.h>
-#include <devcore/stream.h>
-#include <devcore/stream_types.h>
+#include <libdevcore/stream.h>
+#include <libdevcore/stream_types.h>
 
 using std::string;
 using std::tuple;

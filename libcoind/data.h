@@ -8,8 +8,8 @@
 #include <btclibs/util/strencodings.h>
 #include <btclibs/base58.h>
 #include <btclibs/span.h>
-#include <devcore/stream.h>
-#include <devcore/stream_types.h>
+#include <libdevcore/stream.h>
+#include <libdevcore/stream_types.h>
 #include <univalue.h>
 #include <networks/network.h>
 

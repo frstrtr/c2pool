@@ -1,6 +1,5 @@
 #include <networks/network.h>
 #include <btclibs/uint256.h>
-#include <coind/jsonrpc/coind.h>
 
 #include <vector>
 #include <string>

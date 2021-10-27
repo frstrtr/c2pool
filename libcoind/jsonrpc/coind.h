@@ -4,7 +4,7 @@
 #include "results.h"
 #include "univalue.h"
 #include <networks/network.h>
-#include <devcore/common.h>
+#include <libdevcore/common.h>
 
 #include <stdio.h>
 
@@ -16,7 +16,7 @@
 #include <memory>
 #include <map>
 
-//#include <devcore/logger.h>
+//#include <libdevcore/logger.h>
 
 using std::shared_ptr, std::make_shared;
 using std::string, std::map;

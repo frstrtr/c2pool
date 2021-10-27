@@ -5,8 +5,8 @@
 #include <iostream>
 #include <fstream>
 
-#include <devcore/filesystem.h>
-#include <devcore/addrStore.h>
+#include <libdevcore/filesystem.h>
+#include <libdevcore/addrStore.h>
 
 using namespace std;
 

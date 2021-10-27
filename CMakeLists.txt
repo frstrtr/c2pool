@@ -47,19 +47,16 @@ include_directories(${Python3_INCLUDE_DIRS})
 set (CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(ProjectSecp256k1)
 
-add_subdirectory(lib)
+add_subdirectory(libs)
 #---------------
 
 include_directories(${CMAKE_SOURCE_DIR})
 
-#legacy util
-#add_subdirectory(util)
-
 add_subdirectory(btclibs)
-add_subdirectory(coind)
+add_subdirectory(libcoind)
 add_subdirectory(networks)
 add_subdirectory(sharechains) #ver. 2
-add_subdirectory(devcore)
+add_subdirectory(libdevcore)
 add_subdirectory(libnet)
 
 add_subdirectory(c2pool)

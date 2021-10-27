@@ -7,7 +7,7 @@
 #include <tuple>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
-#include <coind/data.h>
+#include <libcoind/data.h>
 #include <boost/function.hpp>
 #include "share.h"
 using namespace std;

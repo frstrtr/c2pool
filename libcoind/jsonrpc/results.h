@@ -10,9 +10,9 @@
 #include <univalue.h>
 #include <btclibs/uint256.h>
 #include <btclibs/util/strencodings.h>
-#include <coind/transaction.h>
-#include <devcore/stream_types.h>
-#include <devcore/common.h>
+#include <libcoind/transaction.h>
+#include <libdevcore/stream_types.h>
+#include <libdevcore/common.h>
 
 namespace coind::jsonrpc::data
 {

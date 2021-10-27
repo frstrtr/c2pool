@@ -7,8 +7,8 @@
 #include <sharechains/tracker.h>
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
-#include <coind/jsonrpc/coind.h>
-#include <devcore/events.h>
+#include <libcoind/jsonrpc/coind.h>
+#include <libdevcore/events.h>
 #include <btclibs/uint256.h>
 
 using std::shared_ptr;

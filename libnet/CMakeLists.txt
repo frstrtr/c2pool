@@ -16,4 +16,4 @@ set(libnet_sources coind_node.h
 
 add_library(libnet ${libnet_sources})
 
-target_link_libraries(libnet univalue networks devcore util sharechains coind_jsonrpc coind_p2p)
+target_link_libraries(libnet univalue networks devcore sharechains coind_jsonrpc coind_p2p)

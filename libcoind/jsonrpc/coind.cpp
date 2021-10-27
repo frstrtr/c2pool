@@ -3,10 +3,10 @@
 using namespace coind::jsonrpc::data;
 
 #include "univalue.h"
-#include <coind/data.h>
-#include <devcore/stream.h>
+#include <libcoind/data.h>
+#include <libdevcore/stream.h>
 #include <btclibs/util/strencodings.h>
-#include <coind/transaction.h>
+#include <libcoind/transaction.h>
 
 #include <iostream>
 #include <set>

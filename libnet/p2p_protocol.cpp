@@ -4,7 +4,7 @@
 #include "messages.h"
 using namespace c2pool::libnet::messages;
 
-#include <devcore/logger.h>
+#include <libdevcore/logger.h>
 
 #include <univalue.h>
 
