@@ -10,7 +10,7 @@
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(shared_ptr<NodeManager> node_manager) : c2pool::libnet::NodeMember(node_manager), _resolver(*context()), work_poller_t(*context())
+    CoindNode::CoindNode() : _resolver(*context()), work_poller_t(*context())
     {
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<coind::data::tx_type>>();

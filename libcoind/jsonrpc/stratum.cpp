@@ -118,7 +118,7 @@ namespace coind::jsonrpc
                                  });
     }
 
-    StratumNode::StratumNode(const ip::tcp::endpoint &listen_ep, const c2pool::libnet::NodeMember &member) : NodeMember(member), _context(1), _acceptor(_context, listen_ep)
+    StratumNode::StratumNode(const ip::tcp::endpoint &listen_ep) : _context(1), _acceptor(_context, listen_ep)
     {
         _thread.reset(new std::thread([&]()
                                       {

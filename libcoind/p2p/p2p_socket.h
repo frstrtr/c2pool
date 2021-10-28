@@ -52,11 +52,11 @@ namespace coind::p2p
 
 namespace coind::p2p
 {
-    class P2PSocket : public c2pool::libnet::NodeMember, public std::enable_shared_from_this<P2PSocket>
+    class P2PSocket : public std::enable_shared_from_this<P2PSocket>
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, const c2pool::libnet::NodeMember &member);
+        P2PSocket(ip::tcp::socket socket);
 
         //for connect
         void init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto);

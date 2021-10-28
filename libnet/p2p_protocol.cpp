@@ -13,7 +13,7 @@ using std::shared_ptr, std::weak_ptr, std::make_shared;
 
 namespace c2pool::libnet::p2p
 {
-    Protocol::Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, const c2pool::libnet::NodeMember &member) : version(3301), c2pool::libnet::NodeMember(member) //TODO: init version
+    Protocol::Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct) : version(3301) //TODO: init version
     {
         LOG_TRACE << "Base protocol: "
                   << "start constuctor";

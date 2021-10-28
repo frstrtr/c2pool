@@ -109,29 +109,3 @@ namespace c2pool::libnet
     };
 #undef create_set_method
 } // namespace c2pool::libnet
-
-namespace c2pool::libnet
-{
-    class NodeMember
-    {
-    public:
-        const shared_ptr<c2pool::libnet::NodeManager> manager;
-
-        NodeMember(shared_ptr<c2pool::libnet::NodeManager> mng);
-        NodeMember(const NodeMember &member);
-
-    public:
-        shared_ptr<boost::asio::io_context> context() const;
-        shared_ptr<c2pool::Network> net() const;
-        shared_ptr<coind::ParentNetwork> netParent() const;
-        shared_ptr<c2pool::dev::coind_config> config() const;
-        shared_ptr<c2pool::dev::AddrStore> addr_store() const;
-        shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const;
-        shared_ptr<coind::jsonrpc::Coind> coind() const;
-        shared_ptr<c2pool::libnet::CoindNode> coind_node() const;
-        shared_ptr<c2pool::shares::ShareTracker> tracker() const;
-        shared_ptr<c2pool::shares::ShareStore> share_store() const;
-        shared_ptr<c2pool::libnet::WorkerBridge> worker() const;
-        shared_ptr<coind::jsonrpc::StratumNode> stratum() const;
-    };
-} // namespace c2pool::libnet

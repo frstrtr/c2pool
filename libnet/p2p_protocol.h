@@ -24,7 +24,7 @@ namespace c2pool::libnet::p2p
 
 namespace c2pool::libnet::p2p
 {
-    class Protocol : public NodeMember
+    class Protocol
     {
     public:
         const int version;
@@ -38,7 +38,7 @@ namespace c2pool::libnet::p2p
         shared_ptr<c2pool::libnet::p2p::P2PSocket> _socket;
 
     protected:
-        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct, const c2pool::libnet::NodeMember &member);
+        Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> _sct);
 
     public:
         virtual void handle(shared_ptr<raw_message> RawMSG) {}
@@ -49,7 +49,7 @@ namespace c2pool::libnet::p2p
     class P2P_Protocol : public Protocol
     {
     public:
-        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, const c2pool::libnet::NodeMember& member) : Protocol(socket, member)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
         {
             LOG_TRACE << "P2P_Protocol: "
                       << "start constructor";

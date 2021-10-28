@@ -23,7 +23,7 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    P2PNode::P2PNode(shared_ptr<NodeManager> _mngr) : c2pool::libnet::NodeMember(_mngr), _resolver(*context()), _acceptor(*context()), _auto_connect_timer(*context())
+    P2PNode::P2PNode() : _resolver(*context()), _acceptor(*context()), _auto_connect_timer(*context())
     {
         node_id = c2pool::random::RandomNonce();
         ip::tcp::endpoint listen_ep(ip::tcp::v4(), config()->listenPort);

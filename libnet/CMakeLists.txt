@@ -2,8 +2,6 @@ set(libnet_sources coind_node.h
     coind_node.cpp
     messages.h
     messages.cpp
-    node_manager.h
-    node_manager.cpp
     p2p_node.h
     p2p_node.cpp
     p2p_protocol.h

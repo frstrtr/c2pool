@@ -20,7 +20,6 @@ namespace c2pool
 {
     namespace libnet
     {
-        class NodeManager;
         namespace p2p
         {
             class Protocol;
@@ -40,10 +39,10 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    class P2PNode : public c2pool::libnet::NodeMember, public std::enable_shared_from_this<P2PNode>
+    class P2PNode : public std::enable_shared_from_this<P2PNode>
     {
     public:
-        P2PNode(shared_ptr<NodeManager> _mngr);
+        P2PNode();
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
@@ -58,7 +57,6 @@ namespace c2pool::libnet::p2p
         void auto_connect();
 
     private:
-        shared_ptr<NodeManager> _manager;
         shared_ptr<c2pool::dev::coind_config> _config;
         io::steady_timer _auto_connect_timer;
         const std::chrono::seconds auto_connect_interval{std::chrono::seconds(1)};
