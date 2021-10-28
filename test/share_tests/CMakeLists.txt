@@ -10,9 +10,3 @@ set_target_properties(sharechains_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CM
 target_compile_definitions(sharechains_test PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
 target_link_libraries(sharechains_test gtest gtest_main)
 target_link_libraries(sharechains_test btclibs networks sharechain)
-# target_include_directories(runUtilTests PUBLIC ${Python3_INCLUDE_DIRS})
-
-# if(WIN32)
-#     target_link_libraries(runUtilTests ws2_32) #возник баг, без этого не компилится boost код.
-#     target_link_libraries(runUtilTests wsock32) #возник баг, без этого не компилится boost код.
-# endif()

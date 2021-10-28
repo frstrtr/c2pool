@@ -9,7 +9,7 @@ set(devcore_sources addrStore.h addrStore.cpp common.h common.cpp config.h confi
 set(devcore_sources ${devcore_sources} db.h dbObject.h dbBatch.h db.cpp dbBatch.cpp)
 
 #from util
-set(devcore_sources ${devcore_sources} pystruct.h types.h events.h prefsum.h stream.h stream_types.h math.h deferred.h pystruct.cpp types.cpp prefsum.cpp stream.cpp math.cpp deferred.cpp)
+set(devcore_sources ${devcore_sources} types.h events.h prefsum.h stream.h stream_types.h math.h deferred.h types.cpp prefsum.cpp stream.cpp math.cpp deferred.cpp)
 find_library(dl NAMES dl)
 
 add_library(devcore ${devcore_sources})

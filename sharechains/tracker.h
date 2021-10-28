@@ -9,7 +9,6 @@
 #include <libdevcore/common.h>
 #include <libnet/node_manager.h>
 #include "prefsum_share.h"
-#include <libdevcore/pystruct.h>
 #include <libnet/node_manager.h>
 
 #include <map>
@@ -155,8 +154,8 @@ namespace c2pool::shares
                 int32_t this_weight = 0;
                 if (!known_txs.empty())
                 {
-                    this_stripped_size = c2pool::python::PyPackTypes::packed_size("tx_id_type", known_txs[tx_hash]);
-                    this_real_size = c2pool::python::PyPackTypes::packed_size("tx_type", known_txs[tx_hash]);
+                    // this_stripped_size = c2pool::python::PyPackTypes::packed_size("tx_id_type", known_txs[tx_hash]); //TODO:
+                    // this_real_size = c2pool::python::PyPackTypes::packed_size("tx_type", known_txs[tx_hash]); //TODO:
                     this_weight = this_real_size + 3 * this_stripped_size;
                 }
 

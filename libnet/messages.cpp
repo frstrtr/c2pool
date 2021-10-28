@@ -2,7 +2,6 @@
 
 #include <libdevcore/logger.h>
 #include <libdevcore/str.h>
-#include <libdevcore/pystruct.h>
 
 #include "p2p_socket.h"
 

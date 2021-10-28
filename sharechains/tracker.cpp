@@ -7,7 +7,6 @@ using namespace c2pool::shares;
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <libcoind/data.h>
-#include <libdevcore/pystruct.h>
 
 #include <map>
 #include <queue>
