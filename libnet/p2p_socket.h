@@ -65,11 +65,11 @@ namespace c2pool::libnet::p2p
 {
     typedef boost::function<bool(std::shared_ptr<c2pool::libnet::p2p::Protocol>)> protocol_handle;
 
-    class P2PSocket : public c2pool::libnet::NodeMember, public std::enable_shared_from_this<P2PSocket>
+    class P2PSocket : public std::enable_shared_from_this<P2PSocket>
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, const c2pool::libnet::NodeMember &member);
+        P2PSocket(ip::tcp::socket socket);
 
         //for connect
         void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);

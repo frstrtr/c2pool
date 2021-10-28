@@ -223,7 +223,7 @@ namespace coind::jsonrpc
         }
     };
 
-    class StratumNode : public c2pool::libnet::NodeMember
+    class StratumNode
     {
         std::unique_ptr<std::thread> _thread;
         io::io_context _context;
@@ -252,6 +252,6 @@ namespace coind::jsonrpc
                                    });
         }
 
-        StratumNode(const ip::tcp::endpoint &listen_ep, const c2pool::libnet::NodeMember& member);
+        StratumNode(const ip::tcp::endpoint &listen_ep);
     };
 }

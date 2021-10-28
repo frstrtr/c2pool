@@ -25,7 +25,7 @@ using std::shared_ptr;
 
 namespace c2pool::shares
 {
-    ShareTracker::ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng) : c2pool::libnet::NodeMember(mng), verified(shares)
+    ShareTracker::ShareTracker() : verified(shares)
     {
     }
 

@@ -26,7 +26,7 @@ namespace c2pool::libnet::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket, const c2pool::libnet::NodeMember &member) : _socket(std::move(socket)), c2pool::libnet::NodeMember(member)
+    P2PSocket::P2PSocket(ip::tcp::socket socket) : _socket(std::move(socket))
     {
     }
 

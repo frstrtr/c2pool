@@ -11,8 +11,7 @@ int main()
     cout << "test" << endl;
     boost::asio::ip::tcp::endpoint ep(boost::asio::ip::tcp::v4(), 5025);
     std::shared_ptr<c2pool::libnet::TestNodeManager> manager;
-    c2pool::libnet::NodeMember member(manager);
-    coind::jsonrpc::StratumNode node(ep, member);
+    coind::jsonrpc::StratumNode node(ep, member); //TODO: fix
     
     while (true)
     {

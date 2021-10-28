@@ -52,14 +52,14 @@ namespace c2pool::shares
         std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
     };
 
-    class ShareTracker : public c2pool::libnet::NodeMember, public enable_shared_from_this<ShareTracker>
+    class ShareTracker : public enable_shared_from_this<ShareTracker>
     {
     private:
         PrefsumShare shares;
         PrefsumVerifiedShare verified;
 
     public:
-        ShareTracker(shared_ptr<c2pool::libnet::NodeManager> mng);
+        ShareTracker();
 
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);

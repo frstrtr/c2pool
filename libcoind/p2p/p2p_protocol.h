@@ -29,13 +29,13 @@ namespace coind::p2p
 namespace coind::p2p
 {
     //https://en.bitcoin.it/wiki/Protocol_documentation
-    class CoindProtocol : public NodeMember
+    class CoindProtocol
     {
     protected:
         shared_ptr<coind::p2p::P2PSocket> _socket;
 
     public:
-        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct, const c2pool::libnet::NodeMember &member);
+        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct);
 
     public:
         std::shared_ptr<Event<uint256>> new_block;    //block_hash

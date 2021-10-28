@@ -33,10 +33,10 @@ namespace coind::p2p
 
 namespace c2pool::libnet
 {
-    class CoindNode : public c2pool::libnet::NodeMember
+    class CoindNode
     {
     public:
-        CoindNode(shared_ptr<NodeManager> node_manager);
+        CoindNode();
 
         void start();
 

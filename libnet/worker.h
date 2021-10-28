@@ -17,12 +17,12 @@ namespace c2pool::libnet
 {
     class Work;
 
-    class WorkerBridge : public c2pool::libnet::NodeMember
+    class WorkerBridge
     {
     private:
 
     public:
-        WorkerBridge(shared_ptr<NodeManager> node_manager);
+        WorkerBridge();
 
         //TODO: return type
         void get_work();
