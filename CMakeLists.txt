@@ -28,21 +28,12 @@ endif()
 set(Boost_USE_STATIC_LIBS ON)
 
 find_package(Boost 1.71.0 COMPONENTS program_options log log_setup coroutine REQUIRED)
-#set(PROJECT_LIB ${PROJECT_LIB} ${Boost_LOG_LIBRARY})
 if(Boost_FOUND)
 	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
     MESSAGE( STATUS "Boost_LIBRARIES = ${BOOST_LIBRARYDIR}.")
     MESSAGE( STATUS "Boost_LIB_VERSION = ${Boost_LIB_VERSION}.")
 endif()
 include_directories(${Boost_INCLUDE_DIRS})
-
-find_package(Python3 REQUIRED Development) #cmake --help-module FindPython
-message("
-    PyLibs:
-    Python3_INCLUDE_DIRS=${Python3_INCLUDE_DIRS}
-    Python3_LIBRARIES=${Python3_LIBRARIES}
-")
-include_directories(${Python3_INCLUDE_DIRS})
 
 set (CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(ProjectSecp256k1)

@@ -22,26 +22,6 @@
 
 using std::vector, std::tuple, std::string, std::shared_ptr;
 
-//TODO: REMOVE
-// namespace coind::data::python
-// {
-//     class PyBitcoindData : c2pool::python::PythonBase
-//     {
-//     protected:
-//         static const char *filepath;
-
-//     public:
-//         static uint256 target_to_average_attempts(uint256 target);
-
-//         static uint256 average_attempts_to_target(uint256 average_attempts);
-
-//         //TODO: using uint256.SetCompact | https://bitcoin.stackexchange.com/questions/30467/what-are-the-equations-to-convert-between-bits-and-difficulty
-//         static double target_to_difficulty(uint256 target);
-
-//         static uint256 difficulty_to_target(uint256 difficulty);
-//     };
-// } // namespace coind::data::python
-
 namespace coind::data{
     class TransactionType;
 }

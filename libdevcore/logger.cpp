@@ -15,7 +15,7 @@ using std::shared_ptr;
 #include <boost/log/sources/record_ostream.hpp>
 #include <boost/log/utility/setup/console.hpp>
 
-#include <devcore/filesystem.h>
+#include "filesystem.h"
 
 namespace logging = boost::log;
 namespace src = boost::log::sources;

@@ -4,10 +4,12 @@
 #include <sstream>
 #include <tuple>
 #include <string>
+
 #include <univalue.h>
 #include <btclibs/uint256.h>
-#include <devcore/common.h>
-#include <devcore/logger.h>
+
+#include "common.h"
+#include "logger.h"
 
 //todo: move all methods to types.cpp
 namespace c2pool::messages
