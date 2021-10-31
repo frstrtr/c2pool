@@ -100,13 +100,13 @@ namespace coind::jsonrpc
     {
     private:
         CURL *curl;
-        shared_ptr<coind::ParentNetwork> net;
+        shared_ptr<coind::ParentNetwork> _parent_net;
 
         const char *dataFormat =
             "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": %s }";
 
     public:
-        Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net) : net(_net)
+        Coind(const char *username, const char *password, const char *address, shared_ptr<coind::ParentNetwork> parent_net) : _parent_net(parent_net)
         {
             curl = curl_easy_init();
             //TODO: try/catch

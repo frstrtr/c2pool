@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include <thread>
 using namespace std;
 
 #include <libdevcore/config.h>
@@ -23,17 +24,25 @@ namespace c2pool::master
     {
         LOG_INFO << "Starting DGB initialization...";
         //Networks/Configs
+        LOG_INFO << "DGB_net initialization...";
         auto DGB_net = std::make_shared<c2pool::DigibyteNetwork>();
+        LOG_INFO << "DGB_parent_net initialization...";
+        auto DGB_parent_net = std::make_shared<coind::DigibyteParentNetwork>();
+        LOG_INFO << "DGB_cfg initialization...";
         auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
         //NodeManager
-        auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_cfg);
+        LOG_INFO << "DGB NodeManager initialization...";
+        auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_parent_net, DGB_cfg);
 
         //run manager in another thread from thread_pool.
         boost::asio::post(thread_pool, [&]()
                           { DGB->run(); });
 
-        if (DGB) //TODO: check loading
-            LOG_INFO << "DGB started!";
+        while (!DGB->is_loaded()){
+            using namespace chrono_literals;
+            std::this_thread::sleep_for(100ms);
+        }
+        LOG_INFO << "DGB started!";
         return DGB;
     }
 }

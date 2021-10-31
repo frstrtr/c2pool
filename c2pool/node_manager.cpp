@@ -15,25 +15,35 @@ using namespace c2pool::shares;
 
 namespace c2pool::libnet
 {
-    NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _config(_cfg)
+    NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<coind::DigibyteParentNetwork> _parent_network, shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _parent_net(_parent_network), _config(_cfg)
     {
-        _context = make_shared<boost::asio::io_context>(2);
+    }
+
+    void NodeManager::run()
+    {
+        LOG_INFO << "Making asio io_context in NodeManager...";
+        _context = make_shared<boost::asio::io_context>(4);
 
         //0:    COIND
-        char *coind_username; //TODO: from args
-        char *coind_password; //TODO: from args
-        char *coind_address;  //TODO: from args
+        LOG_INFO << "Init Coind...";
+        const char *coind_username = "123"; //TODO: from args
+        const char *coind_password = "456"; //TODO: from args
+        const char *coind_address = "789";  //TODO: from args
         //Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net)
-        _coind = std::make_shared<coind::jsonrpc::Coind>(coind_username, coind_password, coind_address, _netParent);
+        _coind = std::make_shared<coind::jsonrpc::Coind>(coind_username, coind_password, coind_address, _parent_net);
         //1:    Determining payout address
         //2:    ShareStore
+        LOG_INFO << "ShareStore initialization...";
         _share_store = std::make_shared<c2pool::shares::ShareStore>("dgb"); //TODO: init
         //Init work:
         //3:    CoindNode
-        _coind_node = std::make_shared<c2pool::libnet::CoindNode>();
+        LOG_INFO << "CoindNode initialization...";
+        _coind_node = std::make_shared<c2pool::libnet::CoindNode>(_context, _parent_net, _coind);
         //3.1:  CoindNode.start?
+        LOG_INFO << "CoindNode starting...";
         coind_node()->start();
         //4:    ShareTracker
+        LOG_INFO << "ShareTracker initialization...";
         _tracker = std::make_shared<ShareTracker>();
         //4.1:  Save shares every 60 seconds
         //TODO: timer in _tracker constructor
@@ -41,11 +51,11 @@ namespace c2pool::libnet
 
         //Joing c2pool/p2pool network:
         //5:    AddrStore
-        _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _network);
+        _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _net);
         //5.1:  Bootstrap_addrs
         //5.2:  Parse CLI args for addrs
         //6:    P2PNode
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>();
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context);
         //6.1:  P2PNode.start?
         p2pNode()->start();
         //7:    Save addrs every 60 seconds
@@ -59,12 +69,12 @@ namespace c2pool::libnet
 
         //10:   WebRoot
         //...success!
+        _is_loaded = true;
     }
 
-    void NodeManager::run()
+    bool NodeManager::is_loaded() const
     {
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>();
-        _p2pnode->start();
+        return _is_loaded;
     }
 
     shared_ptr<boost::asio::io_context> NodeManager::context() const
@@ -77,9 +87,9 @@ namespace c2pool::libnet
         return _net;
     }
 
-    shared_ptr<coind::ParentNetwork> NodeManager::netParent() const
+    shared_ptr<coind::ParentNetwork> NodeManager::parent_net() const
     {
-        return _netParent;
+        return _parent_net;
     }
 
     shared_ptr<c2pool::dev::coind_config> NodeManager::config() const
@@ -138,7 +148,7 @@ namespace c2pool::libnet
 
     create_set_method(boost::asio::io_context, _context);
     create_set_method(c2pool::Network, _net);
-    create_set_method(coind::ParentNetwork, _netParent);
+    create_set_method(coind::ParentNetwork, _parent_net);
     create_set_method(c2pool::dev::coind_config, _config);
     create_set_method(c2pool::dev::AddrStore, _addr_store);
     create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
