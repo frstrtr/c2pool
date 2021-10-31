@@ -1,22 +1,21 @@
 #pragma once
 
-#include <univalue.h>
-#include "shareTypes.h"
-#include <btclibs/uint256.h>
-#include <btclibs/arith_uint256.h>
-#include <libcoind/data.h>
-#include <libdevcore/logger.h>
-#include <libdevcore/common.h>
-#include <libnet/node_manager.h>
-#include "prefsum_share.h"
-#include <libnet/node_manager.h>
-
 #include <map>
 #include <vector>
 #include <string>
 #include <memory>
 #include <set>
 #include <tuple>
+
+#include <univalue.h>
+#include "shareTypes.h"
+#include "prefsum_share.h"
+#include <btclibs/uint256.h>
+#include <btclibs/arith_uint256.h>
+#include <libcoind/data.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
+#include <networks/network.h>
 
 using namespace std;
 
@@ -56,7 +55,9 @@ namespace c2pool::shares
     private:
         PrefsumShare shares;
         PrefsumVerifiedShare verified;
-
+    public:
+        shared_ptr<c2pool::Network> net;
+        shared_ptr<coind::ParentNetwork> parent_net;
     public:
         ShareTracker();
 
@@ -93,16 +94,16 @@ namespace c2pool::shares
             auto get_height_and_last = shares.get_height_and_last(share_data.previous_share_hash);
             auto height = std::get<0>(get_height_and_last);
             auto last = std::get<1>(get_height_and_last);
-            assert(height >= net()->REAL_CHAIN_LENGTH) || (last.IsNull());
+            assert(height >= net->REAL_CHAIN_LENGTH) || (last.IsNull());
 
             arith_uint256 pre_target3;
-            if (height < net()->TARGET_LOOKBEHIND)
+            if (height < net->TARGET_LOOKBEHIND)
             {
-                pre_target3 = net()->MAX_TARGET;
+                pre_target3 = net->MAX_TARGET;
             }
             else
             {
-                auto attempts_per_second = get_pool_attempts_per_second(share_data.previous_share_hash, net()->TARGET_LOOKBEHIND, true);
+                auto attempts_per_second = get_pool_attempts_per_second(share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true);
                 //TODO:
                 // pre_target = 2**256//(net.SHARE_PERIOD*attempts_per_second) - 1 if attempts_per_second else 2**256-1
                 // pre_target2 = math.clip(pre_target, (previous_share.max_target*9//10, previous_share.max_target*11//10))
@@ -159,9 +160,9 @@ namespace c2pool::shares
                     this_weight = this_real_size + 3 * this_stripped_size;
                 }
 
-                if (all_transaction_stripped_size + this_stripped_size + 80 + BaseShare::gentx_size + 500 > net()->BLOCK_MAX_SIZE)
+                if (all_transaction_stripped_size + this_stripped_size + 80 + BaseShare::gentx_size + 500 > net->BLOCK_MAX_SIZE)
                     break;
-                if (all_transaction_weight + this_weight + 4 * 80 + BaseShare::gentx_size + 2000 > net()->BLOCK_MAX_WEIGHT)
+                if (all_transaction_weight + this_weight + 4 * 80 + BaseShare::gentx_size + 2000 > net->BLOCK_MAX_WEIGHT)
                     break;
 
                 tuple<int, int> _this;
@@ -313,7 +314,7 @@ namespace c2pool::shares
             {
                 if (ShareType::VERSION < 32)
                 {
-                    result_timestamp = std::clamp(desired_timestamp, previous_share->timestamp + 1, previous_share->timestamp + net()->SHARE_PERIOD * 2 - 1);
+                    result_timestamp = std::clamp(desired_timestamp, previous_share->timestamp + 1, previous_share->timestamp + net->SHARE_PERIOD * 2 - 1);
                 }
                 else
                 {
@@ -418,15 +419,15 @@ namespace c2pool::shares
             uint256 score_res;
             score_res.SetNull();
             auto head_height = verified.get_height(share_hash);
-            if (head_height < net()->CHAIN_LENGTH)
+            if (head_height < net->CHAIN_LENGTH)
             {
                 return std::make_tuple(head_height, score_res);
             }
 
-            auto end_point = verified.get_nth_parent_hash(share_hash, net()->CHAIN_LENGTH * 15 / 16);
+            auto end_point = verified.get_nth_parent_hash(share_hash, net->CHAIN_LENGTH * 15 / 16);
 
             boost::optional<int32_t> block_height;
-            auto gen_verif_chain = verified.get_chain(end_point, net()->CHAIN_LENGTH / 16);
+            auto gen_verif_chain = verified.get_chain(end_point, net->CHAIN_LENGTH / 16);
 
             uint256 hash;
             while (gen_verif_chain(hash))
@@ -447,8 +448,8 @@ namespace c2pool::shares
                 }
             }
 
-            score_res = ArithToUint256(verified.get_delta(share_hash, end_point).work / ((-block_height.value() + 1)*netParent()->BLOCK_PERIOD));
-            return std::make_tuple(net()->CHAIN_LENGTH, score_res);
+            score_res = ArithToUint256(verified.get_delta(share_hash, end_point).work / ((-block_height.value() + 1)*parent_net->BLOCK_PERIOD));
+            return std::make_tuple(net->CHAIN_LENGTH, score_res);
         }
     };
 } // namespace c2pool::shares

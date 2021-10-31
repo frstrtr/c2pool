@@ -1,7 +1,12 @@
+#pragma once
+
+#include <string>
+#include <memory>
+using namespace std;
+
 #include <libdevcore/config.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
-#include <libnet/node_manager.h>
 #include <networks/network.h>
 #include <sharechains/tracker.h>
 #include <boost/asio/thread_pool.hpp>
@@ -10,9 +15,7 @@ using namespace c2pool::dev;
 using namespace c2pool::libnet;
 using namespace c2pool::shares;
 
-#include <string>
-#include <memory>
-using namespace std;
+#include "node_manager.h"
 
 namespace c2pool::master
 {

@@ -2,7 +2,6 @@
 
 #include <vector>
 
-#include "node_manager.h"
 #include "p2p_node.h"
 #include <btclibs/uint256.h>
 
@@ -17,7 +16,7 @@ namespace c2pool::libnet
     //TODO: return type
     void WorkerBridge::get_work()
     {
-        if (((p2pNode() == nullptr) || p2pNode()->is_connected()) && (net()->PERSIST))
+        if (((_p2p_node == nullptr) || _p2p_node->is_connected()) && (_net->PERSIST))
         {
             //TODO: raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
         }

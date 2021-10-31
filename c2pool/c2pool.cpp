@@ -1,14 +1,5 @@
 #include "coind_master.h"
 
-#include <libdevcore/config.h>
-#include <libdevcore/logger.h>
-#include <libdevcore/common.h>
-#include <libnet/node_manager.h>
-#include <networks/network.h>
-#include <boost/asio/thread_pool.hpp>
-using namespace c2pool::dev;
-using namespace c2pool::libnet;
-
 #include <iostream>
 #include <cstring>
 #include <string>
@@ -18,9 +9,19 @@ using namespace c2pool::libnet;
 using std::cout, std::endl;
 using std::string;
 
+#include <boost/asio/thread_pool.hpp>
+using namespace c2pool::dev;
+using namespace c2pool::libnet;
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
+
+#include <libdevcore/config.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/common.h>
+#include <networks/network.h>
+
+#include "node_manager.h"
 
 //TODO: move macros to other.h
 #define fmt(TEMPL, DATA) (boost::format{TEMPL} % DATA).str()

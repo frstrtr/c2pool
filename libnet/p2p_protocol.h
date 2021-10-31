@@ -8,7 +8,7 @@
 #include "messages.h"
 #include "p2p_node.h"
 #include "p2p_socket.h"
-#include "node_manager.h"
+#include <networks/network.h>
 #include <libdevcore/logger.h>
 #include <sharechains/share.h>
 #include <libdevcore/types.h>
@@ -48,6 +48,9 @@ namespace c2pool::libnet::p2p
 
     class P2P_Protocol : public Protocol
     {
+    private:
+        std::shared_ptr<c2pool::Network> _net;
+        std::shared_ptr<libnet::p2p::P2PNode> _p2p_node;
     public:
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
         {
@@ -131,7 +134,7 @@ namespace c2pool::libnet::p2p
             {
                 LOG_DEBUG << "more than one version message"; 
             }
-            if (msg->version.get() < net()->MINIMUM_PROTOCOL_VERSION){
+            if (msg->version.get() < _net->MINIMUM_PROTOCOL_VERSION){
                 LOG_DEBUG << "peer too old";
             }
 
@@ -139,7 +142,7 @@ namespace c2pool::libnet::p2p
             other_sub_version = msg->sub_version.get();
             other_services = msg->services.get() ;
 
-            if (msg->nonce.get() == p2pNode()->get_nonce()){
+            if (msg->nonce.get() == _p2p_node->get_nonce()){
                 LOG_DEBUG << "was connected to self";
             }
 
@@ -237,7 +240,7 @@ namespace c2pool::libnet::p2p
                 if (_type < 17) //TODO: 17 = minimum share version; move to macros
                     continue;
 
-                shared_ptr<c2pool::shares::BaseShare> share = c2pool::shares::load_share(wrappedshare, net(), _socket->get_addr());
+                shared_ptr<c2pool::shares::BaseShare> share = c2pool::shares::load_share(wrappedshare, _net, _socket->get_addr());
                 std::vector<UniValue> txs;
                 if (_type >= 13)
                 {
@@ -300,7 +303,7 @@ namespace c2pool::libnet::p2p
                 {
                     if (share["type"].get_int() >= 17) //TODO: 17 = minimum share version; move to macros
                     {
-                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(share, net(), _socket->get_addr());
+                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(share, _net, _socket->get_addr());
                         res.push_back(_share);
                     }
                 }

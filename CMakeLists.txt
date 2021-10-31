@@ -44,8 +44,8 @@ add_subdirectory(libs)
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_subdirectory(btclibs)
-add_subdirectory(libcoind)
 add_subdirectory(networks)
+add_subdirectory(libcoind)
 add_subdirectory(sharechains) #ver. 2
 add_subdirectory(libdevcore)
 add_subdirectory(libnet)

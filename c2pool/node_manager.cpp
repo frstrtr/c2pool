@@ -2,9 +2,9 @@
 
 #include <boost/asio.hpp>
 
-#include "p2p_node.h"
-#include "coind_node.h"
-#include "worker.h"
+#include <libnet/p2p_node.h>
+#include <libnet/coind_node.h>
+#include <libnet/worker.h>
 #include <libcoind/jsonrpc/coind.h>
 #include <libcoind/jsonrpc/stratum.h>
 #include <sharechains/tracker.h>
@@ -30,11 +30,11 @@ namespace c2pool::libnet
         _share_store = std::make_shared<c2pool::shares::ShareStore>("dgb"); //TODO: init
         //Init work:
         //3:    CoindNode
-        _coind_node = std::make_shared<c2pool::libnet::CoindNode>(shared_from_this());
+        _coind_node = std::make_shared<c2pool::libnet::CoindNode>();
         //3.1:  CoindNode.start?
         coind_node()->start();
         //4:    ShareTracker
-        _tracker = std::make_shared<ShareTracker>(shared_from_this());
+        _tracker = std::make_shared<ShareTracker>();
         //4.1:  Save shares every 60 seconds
         //TODO: timer in _tracker constructor
         //...success!
@@ -45,7 +45,7 @@ namespace c2pool::libnet
         //5.1:  Bootstrap_addrs
         //5.2:  Parse CLI args for addrs
         //6:    P2PNode
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(shared_from_this());
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>();
         //6.1:  P2PNode.start?
         p2pNode()->start();
         //7:    Save addrs every 60 seconds
@@ -54,7 +54,7 @@ namespace c2pool::libnet
 
         //Start listening for workers with a JSON-RPC server:
         //8:    Worker
-        _worker = std::make_shared<c2pool::libnet::WorkerBridge>(shared_from_this());
+        _worker = std::make_shared<c2pool::libnet::WorkerBridge>();
         //9:    Stratum
 
         //10:   WebRoot
@@ -63,7 +63,7 @@ namespace c2pool::libnet
 
     void NodeManager::run()
     {
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(shared_from_this());
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>();
         _p2pnode->start();
     }
 
