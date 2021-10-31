@@ -25,19 +25,21 @@ namespace coind
     }
 
     //TODO:
-    // bool DigibyteParentNetwork::jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind)
-    // {
-    //     // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
-    //     //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
-    //     //     (yield bitcoind.rpc_getblockchaininfo())['chain'] != 'test'
-    //     // ))
-    //     uint256 blockheader;
-    //     blockheader.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
+    bool DigibyteParentNetwork::jsonrpc_check()
+    {
+        // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
+        //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
+        //     (yield bitcoind.rpc_getblockchaininfo())['chain'] != 'test'
+        // ))
+        //##############################
+        // uint256 blockheader;
+        // blockheader.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
 
-    //     bool check_header = coind->check_block_header(blockheader);
-    //     auto chain_type = coind->GetBlockChainInfo()["chain"].get_str();
-    //     return check_header && (chain_type != "test");
-    // }
+        // bool check_header = coind->check_block_header(blockheader);
+        // auto chain_type = coind->GetBlockChainInfo()["chain"].get_str();
+        // return check_header && (chain_type != "test");
+        return true;
+    }
 
     bool DigibyteParentNetwork::version_check(int version)
     {

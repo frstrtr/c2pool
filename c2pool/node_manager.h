@@ -43,7 +43,7 @@ namespace c2pool::libnet
         NodeManager() {}
 
     public:
-        NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg);
+        NodeManager(shared_ptr<c2pool::Network> _network,  shared_ptr<coind::DigibyteParentNetwork> _parent_network, shared_ptr<c2pool::dev::coind_config> _cfg);
 
         void start()
         {
@@ -53,10 +53,12 @@ namespace c2pool::libnet
 
         void run();
 
+        bool is_loaded() const;
+
     public:
         shared_ptr<boost::asio::io_context> context() const;
         shared_ptr<c2pool::Network> net() const;
-        shared_ptr<coind::ParentNetwork> netParent() const;
+        shared_ptr<coind::ParentNetwork> parent_net() const;
         shared_ptr<c2pool::dev::coind_config> config() const;
         shared_ptr<c2pool::dev::AddrStore> addr_store() const;
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const;
@@ -70,7 +72,7 @@ namespace c2pool::libnet
     protected:
         shared_ptr<boost::asio::io_context> _context;
         shared_ptr<c2pool::Network> _net;
-        shared_ptr<coind::ParentNetwork> _netParent;
+        shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::libnet::p2p::P2PNode> _p2pnode;
@@ -80,6 +82,9 @@ namespace c2pool::libnet
         shared_ptr<c2pool::shares::ShareStore> _share_store;
         shared_ptr<c2pool::libnet::WorkerBridge> _worker;
         shared_ptr<coind::jsonrpc::StratumNode> _stratum;
+
+    private:
+        std::atomic<bool> _is_loaded = false;
     };
 } // namespace c2pool::libnet
 
@@ -96,7 +101,7 @@ namespace c2pool::libnet
     public:
         create_set_method(boost::asio::io_context, _context);
         create_set_method(c2pool::Network, _net);
-        create_set_method(coind::ParentNetwork, _netParent);
+        create_set_method(coind::ParentNetwork, _parent_net);
         create_set_method(c2pool::dev::coind_config, _config);
         create_set_method(c2pool::dev::AddrStore, _addr_store);
         create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);

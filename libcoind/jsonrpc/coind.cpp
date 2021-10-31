@@ -18,14 +18,14 @@ namespace coind::jsonrpc
 {
     bool Coind::check()
     {
-        if (!net->jsonrpc_check(shared_from_this()))
+        if (!_parent_net->jsonrpc_check())
         {
             std::cout << "Check failed! Make sure that you're connected to the right bitcoind with --bitcoind-rpc-port, and that it has finished syncing!" << std::endl;
             //TODO LOG: Check failed! Make sure that you're connected to the right bitcoind with --bitcoind-rpc-port, and that it has finished syncing!
             return false;
         }
 
-        bool version_check_result = net->version_check(GetNetworkInfo()["version"].get_int());
+        bool version_check_result = _parent_net->version_check(GetNetworkInfo()["version"].get_int());
         if (!version_check_result)
         {
             std::cout << "Coin daemon too old! Upgrade!" << std::endl;

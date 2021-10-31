@@ -41,7 +41,7 @@ namespace c2pool::libnet::p2p
     class P2PNode : public std::enable_shared_from_this<P2PNode>
     {
     public:
-        P2PNode();
+        P2PNode(std::shared_ptr<io::io_context> __context);
         void start();
 
         std::vector<addr> get_good_peers(int max_count);

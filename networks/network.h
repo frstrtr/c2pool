@@ -99,7 +99,9 @@ namespace coind
     public:
         ParentNetwork(std::string name);
 
-        virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
+        //TODO:
+        // virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
+        virtual bool jsonrpc_check() = 0;
 
         virtual bool version_check(int version) = 0;
 
@@ -113,7 +115,8 @@ namespace coind
         DigibyteParentNetwork();
 
     public:
-        bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) override;
+        //TODO:
+        bool jsonrpc_check() override;
 
         bool version_check(int version) override;
 

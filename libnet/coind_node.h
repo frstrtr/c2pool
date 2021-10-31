@@ -35,7 +35,7 @@ namespace c2pool::libnet
     class CoindNode
     {
     public:
-        CoindNode();
+        CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::jsonrpc::Coind> __coind);
 
         void start();
 
