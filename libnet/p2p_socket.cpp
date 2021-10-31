@@ -52,7 +52,7 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
 
-        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), *this);
+        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this());
 
         if (handle.empty())
         {
@@ -77,7 +77,7 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::write_prefix(std::shared_ptr<base_message> msg)
     {
-        boost::asio::async_write(_socket, boost::asio::buffer(net()->PREFIX, net()->PREFIX_LENGTH),
+        boost::asio::async_write(_socket, boost::asio::buffer(_net->PREFIX, _net->PREFIX_LENGTH),
                                  [this, msg](boost::system::error_code _ec, std::size_t length)
                                  {
                                      if (_ec)
@@ -154,7 +154,7 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "START READING!:";
         //make raw_message for reading data
         LOG_TRACE << "protocol count" << _protocol.lock().use_count();
-        shared_ptr<ReadPackedMsg> msg = std::make_shared<ReadPackedMsg>(net()->PREFIX_LENGTH);
+        shared_ptr<ReadPackedMsg> msg = std::make_shared<ReadPackedMsg>(_net->PREFIX_LENGTH);
         LOG_TRACE << "created temp_raw_message";
         //Socket started for reading!
         read_prefix(msg);
@@ -164,7 +164,7 @@ namespace c2pool::libnet::p2p
     {
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
-                                boost::asio::buffer(msg->prefix, net()->PREFIX_LENGTH),
+                                boost::asio::buffer(msg->prefix, _net->PREFIX_LENGTH),
                                 [this, msg](boost::system::error_code ec, std::size_t length)
                                 {
                                     LOG_TRACE << "try to read prefix";

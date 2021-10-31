@@ -7,14 +7,13 @@
 #include <boost/bind.hpp>
 #include <boost/asio.hpp>
 
-#include "node_manager.h"
-#include "node_manager.h"
 #include "p2p_socket.h"
 #include "p2p_protocol.h"
 #include <libdevcore/logger.h>
 #include <libdevcore/addrStore.h>
 #include <libdevcore/common.h>
 #include <libdevcore/random.h>
+#include <libdevcore/config.h>
 
 using std::max, std::min;
 namespace io = boost::asio;
@@ -23,10 +22,10 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    P2PNode::P2PNode() : _resolver(*context()), _acceptor(*context()), _auto_connect_timer(*context())
+    P2PNode::P2PNode() : _resolver(*_context), _acceptor(*_context), _auto_connect_timer(*_context)
     {
         node_id = c2pool::random::RandomNonce();
-        ip::tcp::endpoint listen_ep(ip::tcp::v4(), config()->listenPort);
+        ip::tcp::endpoint listen_ep(ip::tcp::v4(), _config->listenPort);
 
         _acceptor.open(listen_ep.protocol());
         _acceptor.set_option(io::socket_base::reuse_address(true));
@@ -51,7 +50,7 @@ namespace c2pool::libnet::p2p
                                    if (!ec)
                                    {
                                        //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
-                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket), *this);
+                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket));
                                        server_attempts.insert(_socket);
                                        _socket->init(boost::bind(&P2PNode::protocol_listen_connected, this, _1));
                                    }
@@ -71,7 +70,7 @@ namespace c2pool::libnet::p2p
                                             //LOG_TRACE << "auto connect timer";
                                             if (!_ec)
                                             {
-                                                if (!((client_connections.size() < _config->desired_conns) && (_manager->addr_store()->len() > 0) && (client_attempts.size() <= _config->max_attempts)))
+                                                if (!((client_connections.size() < _config->desired_conns) && (_addr_store->len() > 0) && (client_attempts.size() <= _config->max_attempts)))
                                                     return;
                                                 for (auto addr : get_good_peers(1))
                                                 {
@@ -87,8 +86,8 @@ namespace c2pool::libnet::p2p
                                                             _resolver.async_resolve(ip, port,
                                                                                     [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
                                                                                     {
-                                                                                        ip::tcp::socket socket(*context());
-                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket), *this);
+                                                                                        ip::tcp::socket socket(*_context);
+                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket));
 
                                                                                         client_attempts[ip] = _socket;
                                                                                         protocol_handle handle = [this](shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
@@ -121,7 +120,7 @@ namespace c2pool::libnet::p2p
         float t = c2pool::dev::timestamp();
 
         std::vector<std::pair<float, addr>> values;
-        for (auto kv : _manager->addr_store()->GetAll())
+        for (auto kv : _addr_store->GetAll())
         {
             values.push_back(
                 std::make_pair(

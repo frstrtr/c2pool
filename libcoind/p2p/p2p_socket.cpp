@@ -99,7 +99,7 @@ namespace coind::p2p
 
     void P2PSocket::write_prefix(std::shared_ptr<base_message> msg)
     {
-        boost::asio::async_write(_socket, boost::asio::buffer(netParent()->PREFIX, netParent()->PREFIX_LENGTH),
+        boost::asio::async_write(_socket, boost::asio::buffer(_parent_net->PREFIX, _parent_net->PREFIX_LENGTH),
                                  [this, msg](boost::system::error_code _ec, std::size_t length)
                                  {
                                      if (_ec)
@@ -175,7 +175,7 @@ namespace coind::p2p
     {
         LOG_TRACE << "START READING!:";
         //make raw_message for reading data
-        shared_ptr<ReadPackedMsg> msg = std::make_shared<ReadPackedMsg>(netParent()->PREFIX_LENGTH);
+        shared_ptr<ReadPackedMsg> msg = std::make_shared<ReadPackedMsg>(_parent_net->PREFIX_LENGTH);
         LOG_TRACE << "created temp_raw_message";
         //Socket started for reading!
         read_prefix(msg);
@@ -185,7 +185,7 @@ namespace coind::p2p
     {
         LOG_TRACE << "socket status: " << _socket.is_open();
         boost::asio::async_read(_socket,
-                                boost::asio::buffer(msg->prefix, netParent()->PREFIX_LENGTH),
+                                boost::asio::buffer(msg->prefix, _parent_net->PREFIX_LENGTH),
                                 [this, msg](boost::system::error_code ec, std::size_t length)
                                 {
                                     LOG_TRACE << "try to read prefix";

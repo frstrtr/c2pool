@@ -10,7 +10,6 @@
 #include <boost/algorithm/string.hpp>
 
 #include <univalue.h>
-#include <libnet/node_manager.h>
 #include <btclibs/uint256.h>
 
 namespace io = boost::asio;

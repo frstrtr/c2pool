@@ -12,8 +12,8 @@ set(devcore_sources ${devcore_sources} db.h dbObject.h dbBatch.h db.cpp dbBatch.
 set(devcore_sources ${devcore_sources} types.h events.h prefsum.h stream.h stream_types.h math.h deferred.h types.cpp prefsum.cpp stream.cpp math.cpp deferred.cpp)
 find_library(dl NAMES dl)
 
-add_library(devcore ${devcore_sources})
-target_link_libraries(devcore Boost::log Boost::log_setup univalue ${dl})
-target_link_libraries(devcore btclibs Threads::Threads Boost::coroutine leveldb)
+add_library(libdevcore ${devcore_sources})
+target_link_libraries(libdevcore Boost::log Boost::log_setup univalue ${dl})
+target_link_libraries(libdevcore btclibs Threads::Threads Boost::coroutine leveldb)
 
-target_compile_definitions(devcore PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
+target_compile_definitions(libdevcore PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")

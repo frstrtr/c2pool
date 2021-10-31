@@ -8,7 +8,6 @@
 
 #include <boost/asio.hpp>
 
-#include "node_manager.h"
 #include <libdevcore/addrStore.h>
 
 namespace io = boost::asio;
@@ -58,6 +57,8 @@ namespace c2pool::libnet::p2p
 
     private:
         shared_ptr<c2pool::dev::coind_config> _config;
+        shared_ptr<io::io_context> _context; //From NodeManager;
+        shared_ptr<c2pool::dev::AddrStore> _addr_store;
         io::steady_timer _auto_connect_timer;
         const std::chrono::seconds auto_connect_interval{std::chrono::seconds(1)};
 

@@ -3,7 +3,6 @@
 #include <memory>
 #include <string>
 
-#include "node_manager.h"
 #include <sharechains/tracker.h>
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
@@ -13,6 +12,12 @@
 
 using std::shared_ptr;
 
+namespace c2pool{
+    namespace libnet::p2p{
+        class P2PNode;
+    }
+}
+
 namespace c2pool::libnet
 {
     class Work;
@@ -20,7 +25,8 @@ namespace c2pool::libnet
     class WorkerBridge
     {
     private:
-
+        std::shared_ptr<c2pool::Network> _net;
+        std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
     public:
         WorkerBridge();
 

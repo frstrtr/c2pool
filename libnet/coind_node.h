@@ -6,7 +6,6 @@
 
 #include <boost/asio.hpp>
 
-#include "node_manager.h"
 #include <networks/network.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
@@ -68,9 +67,12 @@ namespace c2pool::libnet
         void poll_header();
 
     private:
+        shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<coind::p2p::CoindProtocol> protocol;
+        shared_ptr<coind::jsonrpc::Coind> _coind;
 
     private:
+        std::shared_ptr<io::io_context> _context; //From NodeManager
         ip::tcp::resolver _resolver;
     };
 }

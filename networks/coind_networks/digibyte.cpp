@@ -6,8 +6,8 @@
 #include <memory>
 
 #include <btclibs/uint256.h>
-#include <libcoind/jsonrpc/coind.h>
-#include <libcoind/data.h>
+// #include <libcoind/jsonrpc/coind.h>
+// #include <libcoind/data.h>
 #include "dgb/scrypt.h"
 
 using std::shared_ptr;
@@ -24,19 +24,20 @@ namespace coind
         BLOCK_PERIOD = 150;
     }
 
-    bool DigibyteParentNetwork::jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind)
-    {
-        // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
-        //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
-        //     (yield bitcoind.rpc_getblockchaininfo())['chain'] != 'test'
-        // ))
-        uint256 blockheader;
-        blockheader.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
+    //TODO:
+    // bool DigibyteParentNetwork::jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind)
+    // {
+    //     // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
+    //     //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
+    //     //     (yield bitcoind.rpc_getblockchaininfo())['chain'] != 'test'
+    //     // ))
+    //     uint256 blockheader;
+    //     blockheader.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
 
-        bool check_header = coind->check_block_header(blockheader);
-        auto chain_type = coind->GetBlockChainInfo()["chain"].get_str();
-        return check_header && (chain_type != "test");
-    }
+    //     bool check_header = coind->check_block_header(blockheader);
+    //     auto chain_type = coind->GetBlockChainInfo()["chain"].get_str();
+    //     return check_header && (chain_type != "test");
+    // }
 
     bool DigibyteParentNetwork::version_check(int version)
     {
@@ -53,6 +54,6 @@ namespace coind
 
     uint256 DigibyteParentNetwork::POW_FUNC(PackStream& packed_block_header)
     {
-        return coind::data::hash256(packed_block_header);
+        //TODO: return coind::data::hash256(packed_block_header);
     }
 } // namespace c2pool

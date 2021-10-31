@@ -8,7 +8,6 @@
 #include <boost/function.hpp>
 
 #include "messages.h"
-#include "node_manager.h"
 #include <networks/network.h>
 #include <libdevcore/stream.h>
 
@@ -109,6 +108,7 @@ namespace c2pool::libnet::p2p
     private:
         ip::tcp::socket _socket;
 
+        std::shared_ptr<c2pool::Network> _net;
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
     };
 } // namespace c2pool::p2p

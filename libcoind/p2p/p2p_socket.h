@@ -2,7 +2,6 @@
 
 #include "messages.h"
 #include <networks/network.h>
-#include <libnet/node_manager.h>
 using namespace coind::p2p::messages;
 
 namespace coind::p2p
@@ -90,5 +89,6 @@ namespace coind::p2p
         ip::tcp::socket _socket;
 
         std::weak_ptr<coind::p2p::CoindProtocol> _protocol;
+        std::shared_ptr<coind::ParentNetwork> _parent_net;
     };
 } // namespace c2pool::p2p

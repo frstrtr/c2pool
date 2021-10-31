@@ -1,7 +1,6 @@
 #pragma once
 
 #include "messages.h"
-#include <libnet/node_manager.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
 #include "p2p_socket.h"

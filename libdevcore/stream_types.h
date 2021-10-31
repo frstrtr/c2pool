@@ -1,15 +1,17 @@
 #pragma once
 
-#include <devcore/logger.h>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <list>
+#include <optional>
+
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
-#include <optional>
+
 #include "stream.h"
 #include "math.h"
+#include "logger.h"
 using namespace std;
 
 template <typename T>
