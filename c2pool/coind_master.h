@@ -35,13 +35,15 @@ namespace c2pool::master
         auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_parent_net, DGB_cfg);
 
         //run manager in another thread from thread_pool.
-        boost::asio::post(thread_pool, [&]()
-                          { DGB->run(); });
+        // boost::asio::post(thread_pool, [&]()
+        //                   { DGB->run(); });
+        //for test
+        DGB->run();
 
-        while (!DGB->is_loaded()){
-            using namespace chrono_literals;
-            std::this_thread::sleep_for(100ms);
-        }
+        // while (!DGB->is_loaded()){
+        //     using namespace chrono_literals;
+        //     std::this_thread::sleep_for(100ms);
+        // }
         LOG_INFO << "DGB started!";
         return DGB;
     }
