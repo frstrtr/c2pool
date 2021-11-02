@@ -11,6 +11,7 @@ namespace c2pool::libnet
 
     CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::jsonrpc::Coind> __coind) : _context(__context), _parent_net(__parent_net), _coind(__coind), _resolver(*_context), work_poller_t(*_context)
     {
+        LOG_TRACE << "CoindNode constructor";
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<coind::data::tx_type>>();
         new_headers = std::make_shared<Event<c2pool::shares::BlockHeaderType>>();
@@ -35,7 +36,7 @@ namespace c2pool::libnet
         new_block->subscribe([&](uint256 _value)
                              {
                                  //Если получаем новый блок, то обновляем таймер
-                                 work_poller_t.expires_from_now(boost::posix_time::seconds(15));
+                                 //work_poller_t.expires_from_now(boost::posix_time::seconds(15));
                              });
         work_poller();
 
@@ -73,8 +74,8 @@ namespace c2pool::libnet
     void CoindNode::work_poller()
     {
         coind_work = _coind->getwork(txidcache, known_txs.value, coind_work.value.use_getblocktemplate);
-        work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-        work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
+        // work_poller_t.expires_from_now(boost::posix_time::seconds(15));
+        // work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
     }
 
     //TODO: test

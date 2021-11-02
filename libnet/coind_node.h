@@ -34,6 +34,10 @@ namespace c2pool::libnet
 {
     class CoindNode
     {
+    private:
+        std::shared_ptr<io::io_context> _context; //From NodeManager
+        ip::tcp::resolver _resolver;
+
     public:
         CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::jsonrpc::Coind> __coind);
 
@@ -52,8 +56,8 @@ namespace c2pool::libnet
         Variable<uint256> best_share;
         Variable<c2pool::libnet::addr> desired;
 
-        shared_ptr<Event<uint256>> new_block;    //block_hash
-        shared_ptr<Event<coind::data::tx_type>> new_tx;      //bitcoin_data.tx_type
+        shared_ptr<Event<uint256>> new_block;                           //block_hash
+        shared_ptr<Event<coind::data::tx_type>> new_tx;                 //bitcoin_data.tx_type
         shared_ptr<Event<c2pool::shares::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
         Variable<coind::jsonrpc::data::getwork_result> coind_work;
@@ -62,17 +66,13 @@ namespace c2pool::libnet
     private:
         boost::asio::deadline_timer work_poller_t;
         void work_poller();
-    
-        void handle_header(const BlockHeaderType& new_header);
+
+        void handle_header(const BlockHeaderType &new_header);
         void poll_header();
 
     private:
         shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<coind::p2p::CoindProtocol> protocol;
         shared_ptr<coind::jsonrpc::Coind> _coind;
-
-    private:
-        std::shared_ptr<io::io_context> _context; //From NodeManager
-        ip::tcp::resolver _resolver;
     };
 }
