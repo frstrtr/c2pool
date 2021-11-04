@@ -20,6 +20,7 @@ Time Hybrid Evaluation coin (THE coin - (experimental feature)) for node maintai
   
   <summary>Donations towards further development of с2pool implementation in C++</summary>
 
+  
 BTC:
 
 ### 1C2PooLktmeKwx7Sp7aRoDiyUy3y7TMofw
