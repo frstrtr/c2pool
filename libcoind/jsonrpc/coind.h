@@ -108,12 +108,13 @@ namespace coind::jsonrpc
     public:
         Coind(const char *username, const char *password, const char *address, shared_ptr<coind::ParentNetwork> parent_net) : _parent_net(parent_net)
         {
+            curl_global_init(CURL_GLOBAL_ALL);
             curl = curl_easy_init();
             //TODO: try/catch
             if (curl)
             {
                 struct curl_slist *headers = NULL;
-                headers = curl_slist_append(headers, "content-type: text/plain;");
+                headers = curl_slist_append(headers, "content-type: application/json;");
                 curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
                 curl_easy_setopt(curl, CURLOPT_URL, address); //"http://127.0.0.1:8332/"
@@ -160,7 +161,7 @@ namespace coind::jsonrpc
             }
             if (curl)
             {
-                long data_length = strlen(dataFormat) + 1 + command.length();
+                long data_length = strlen(dataFormat) + command.length() + 1;
                 if (req)
                     data_length += req->get_length();
                 data = new char[data_length];
@@ -196,8 +197,15 @@ namespace coind::jsonrpc
             {
                 return result;
             }
-            //std::cout << json_answer << std::endl; //TODO: DEBUG LOG
+
+            // std::cout << json_answer << std::endl; //TODO: DEBUG LOG
+            for (auto v : json_answer)
+            {
+                std::cout << v;
+            }
+            std::cout << std::endl;
             result.read(json_answer);
+            std::cout << "Result readed" << std::endl;
 
             return result;
         }
@@ -258,7 +266,7 @@ namespace coind::jsonrpc
 
         bool check_block_header(uint256);
 
-        getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type>& known_txs = map<uint256, coind::data::tx_type>(), bool use_getblocktemplate = false);
+        getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>(), bool use_getblocktemplate = false);
 
     public:
         //https://bitcoin-rpc.github.io/en/doc/0.17.99/rpc/blockchain/getblockchaininfo/
