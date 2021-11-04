@@ -18,7 +18,7 @@ Time Hybrid Evaluation coin (THE coin - (experimental feature)) for node maintai
 
 <details>
   
-  <summary>## Donations towards further development of с2pool implementation in C++</summary>
+  <summary>### Donations towards further development of с2pool implementation in C++</summary>
 
 BTC:
 
@@ -34,7 +34,7 @@ Dogecoin:
 
 Chia (XCH):
 
-### 
+### xch120duz2pn97053lrd0ym4vxqe4hlv2awslc9pf4ld5vf7nvagv46s2t0azk
 
 </details>
 
