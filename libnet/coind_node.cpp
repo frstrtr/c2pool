@@ -11,7 +11,7 @@ namespace c2pool::libnet
 
     CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::jsonrpc::Coind> __coind) : _context(__context), _parent_net(__parent_net), _coind(__coind), _resolver(*_context), work_poller_t(*_context)
     {
-        LOG_TRACE << "CoindNode constructor";
+        LOG_INFO << "CoindNode constructor";
         new_block = std::make_shared<Event<uint256>>();
         new_tx = std::make_shared<Event<coind::data::tx_type>>();
         new_headers = std::make_shared<Event<c2pool::shares::BlockHeaderType>>();
@@ -20,7 +20,7 @@ namespace c2pool::libnet
     void CoindNode::start()
     {
         LOG_INFO << "... CoindNode<" << _parent_net->net_name << ">starting...";
-
+        std::cout << 1 << std::endl;
         _resolver.async_resolve(_parent_net->P2P_ADDRESS, std::to_string(_parent_net->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
                                 {
                                     ip::tcp::socket socket(*_context);
@@ -30,23 +30,32 @@ namespace c2pool::libnet
                                     protocol->init(new_block, new_tx, new_headers);
                                     _socket->init(endpoints, protocol);
                                 });
-
+        std::cout << 1 << std::endl;
         //COIND:
         coind_work = Variable<coind::jsonrpc::data::getwork_result>(_coind->getwork(txidcache));
+        std::cout << 1 << std::endl;
         new_block->subscribe([&](uint256 _value)
                              {
                                  //Если получаем новый блок, то обновляем таймер
                                  //work_poller_t.expires_from_now(boost::posix_time::seconds(15));
                              });
+                             std::cout << 1 << std::endl;
         work_poller();
+        std::cout << 1 << std::endl;
 
         //PEER:
+        std::cout << 1 << std::endl;
         coind_work.changed.subscribe(&CoindNode::poll_header, this);
+        std::cout << 1 << std::endl;
         poll_header();
+        std::cout << 1 << std::endl;
 
         //BEST SHARE
+        std::cout << 1 << std::endl;
         coind_work.changed.subscribe(&CoindNode::set_best_share, this);
+        std::cout << 1 << std::endl;
         set_best_share();
+        std::cout << 1 << std::endl;
 
         // p2p logic and join p2pool network
 

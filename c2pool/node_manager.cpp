@@ -26,9 +26,9 @@ namespace c2pool::libnet
 
         //0:    COIND
         LOG_INFO << "Init Coind...";
-        const char *coind_username = "123"; //TODO: from args
-        const char *coind_password = "456"; //TODO: from args
-        const char *coind_address = "789";  //TODO: from args
+        const char *coind_username = "user"; //TODO: from args
+        const char *coind_password = "VeryVeryLongPass123"; //TODO: from args
+        const char *coind_address = "http://192.168.10.10:14024";  //TODO: from args
         //Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net)
         _coind = std::make_shared<coind::jsonrpc::Coind>(coind_username, coind_password, coind_address, _parent_net);
         //1:    Determining payout address
