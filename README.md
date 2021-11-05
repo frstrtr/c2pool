@@ -16,11 +16,28 @@ p2pool sharechain based temporal levelled blockchain DEX/mining pool/hr marketpl
 ![Time Hybrid Evaluation](/doc/concepts/THE%20coin.png)
 Time Hybrid Evaluation coin (THE coin - (experimental feature)) for node maintainers/owners
 
-## Donations towards further development of с2pool implementation in C++
+<details>
+  
+  <summary>Donations towards further development of с2pool implementation in C++</summary>
 
+  
 BTC:
 
 ### 1C2PooLktmeKwx7Sp7aRoDiyUy3y7TMofw
+
+DGB:
+
+### DJKrhVNZtTggUFHJ4CKCkmyWDSRUewyqm3
+
+Dogecoin:
+
+### DNJx6HYka3mncLBaw1TLUARtXxe2BgjHf6
+
+Chia (XCH):
+
+### xch120duz2pn97053lrd0ym4vxqe4hlv2awslc9pf4ld5vf7nvagv46s2t0azk
+
+</details>
 
 Telegram:
 
