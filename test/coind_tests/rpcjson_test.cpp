@@ -102,7 +102,6 @@ TEST(BoostBeast, jsonrpc)
     const char *login = "user:VeryVeryLongPass123";
     char *encoded_login = new char[64];
     boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
-    ;
     char *login_data = new char[6 + strlen(encoded_login) + 1];
     sprintf(login_data, "Basic %s", encoded_login);
     delete[] encoded_login;
@@ -113,13 +112,20 @@ TEST(BoostBeast, jsonrpc)
     std::cout << req << ".END" << std::endl;
 
     // Send the HTTP request to the remote host
-    http::write(stream, req);
+	http::write(stream, req);
+
+//	std::cout << "before async write" << std::endl;
+//    http::async_write(
+//        stream, req,
+//        [](const boost::system::error_code &ec, std::size_t bytes_transferred) {
+//          std::cout << "WRITED" << std::endl;
+//        });
+//	std::cout << "after async write" << std::endl;
 
     { // This buffer is used for reading and must be persisted
         beast::flat_buffer buffer;
 
         boost::beast::http::response<boost::beast::http::dynamic_body> res;
-        res.set(http::field::content_type, "application/json");
 
         boost::beast::http::read(stream, buffer, res);
 
