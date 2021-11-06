@@ -31,25 +31,20 @@ using namespace std;
 class Bitcoind_JSONRPC : public ::testing::Test
 {
 protected:
-    Coind *coind;
+	std::shared_ptr<coind::JSONRPC_Coind> coind;
 
 protected:
-    template <typename UINT_TYPE>
-    UINT_TYPE CreateUINT(string hex)
-    {
-        UINT_TYPE _number;
-        _number.SetHex(hex);
-        return _number;
-    }
 
     virtual void SetUp()
     {
 #ifdef PASS_EXIST
-        auto _pass = get_pass();
-        char *username = std::get<0>(_pass);
-        char *password = std::get<1>(_pass);
-        char *addr = std::get<2>(_pass);
-        coind = new Coind(username, password, addr, std::make_shared<coind::DigibyteParentNetwork>());
+		auto context = std::make_shared<boost::asio::io_context>(2);
+
+		auto _pass = get_pass();
+		char *login = std::get<0>(_pass);
+		char *addr = std::get<1>(_pass);
+		char *port = std::get<2>(_pass);
+		coind = std::make_shared<coind::JSONRPC_Coind>(context, std::make_shared<coind::DigibyteParentNetwork>(), addr, port, login);
 
 #else
         coind = new Coind("bitcoin", "B1TC01ND", "http://127.0.0.1:8332/", std::make_shared<c2pool::DigibyteNetwork>());
@@ -58,22 +53,11 @@ protected:
 
     virtual void TearDown()
     {
-        delete coind;
+
     }
 };
 
-static size_t Writer(char *buffer, size_t size, size_t nmemb, std::string *html)
-{
-    int result = 0;
-
-    if (buffer != NULL)
-    {
-        html->append(buffer, size * nmemb);
-        result = size * nmemb;
-    }
-    return result;
-}
-
+/* Worked
 TEST(BoostBeast, jsonrpc)
 {
     // auto context = std::make_shared<boost::asio::io_context>(3);
@@ -163,7 +147,9 @@ TEST(BoostBeast, jsonrpc)
     if (ec && ec != beast::errc::not_connected)
         throw beast::system_error{ec};
 }
+*/
 
+/*
 TEST(JSONRPC_COIND, getblockchaininfo)
 {
 	auto context = std::make_shared<boost::asio::io_context>(2);
@@ -175,6 +161,21 @@ TEST(JSONRPC_COIND, getblockchaininfo)
 	auto coind = std::make_shared<coind::JSONRPC_Coind>(context, std::make_shared<coind::DigibyteParentNetwork>(), addr, port, login); // (username, password, addr, std::make_shared<coind::DigibyteParentNetwork>());
 
 	std::cout << coind->getblockchaininfo().write() << std::endl;
+}
+*/
+
+TEST_F(Bitcoind_JSONRPC, getblockchaininfo)
+{
+	std::cout << coind->getblockchaininfo().write() << std::endl;
+}
+
+TEST_F(Bitcoind_JSONRPC, getblock)
+{
+	uint256 block_hash;
+	block_hash.SetHex("36643871691af2e0b6bfc7898a4399133c6e6e4885a67f9d9fe36942c2513772");
+	auto getblock_req = std::make_shared<GetBlockRequest>(block_hash);
+
+	std::cout << coind->getblock(getblock_req).write() << std::endl;
 }
 
 /*
