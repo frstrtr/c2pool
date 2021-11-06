@@ -12,6 +12,9 @@ using tcp = io::ip::tcp;
 #include <networks/network.h>
 #include <libdevcore/logger.h>
 
+#include "requests.h"
+using namespace coind::jsonrpc::data;
+
 namespace coind
 {
 	class JSONRPC_Coind
@@ -27,11 +30,11 @@ namespace coind
 
 	private:
 		//TODO: template request params
-		UniValue _request(const char *method_name);
+		UniValue _request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
-		UniValue request(const char *method_name);
+		UniValue request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
-		UniValue request_with_error(const char* method_name);
+		UniValue request_with_error(const char* method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
 	public:
 
@@ -80,7 +83,7 @@ namespace coind
 
 		bool check();
 
-		//TODO: bool check_block_header(uint256 header);
+		bool check_block_header(uint256 header);
 
 		//TODO: getwork
 
@@ -98,7 +101,6 @@ namespace coind
 			return request("getnetworkinfo");
 		}
 
-		/* TODO:
 		UniValue getblock(std::shared_ptr<GetBlockRequest> req)
 		{
 			return request("getblock", req);
@@ -128,7 +130,7 @@ namespace coind
 			else
 				return request("getmemorypool");
 		}
-		*/
+
 	};
 
 } // namespace coind
