@@ -28,6 +28,9 @@ namespace coind
 		const char *req_format = "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": %s }";
 		http::request<http::string_body> req;
 
+		char *authorization;
+		char *host;
+
 	private:
 		//TODO: template request params
 		UniValue _request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
@@ -46,16 +49,16 @@ namespace coind
 			//Request
 			req = {http::verb::post, "/", 11};
 
-			char *host = new char[strlen(ip) + strlen(port) + 2];
+			host = new char[strlen(ip) + strlen(port) + 2];
 			sprintf(host, "%s:%s", ip, port);
 			req.set(http::field::host, host);
 
 			req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
 			req.set(http::field::content_type, "application/json");
 
-			char *encoded_login = new char[64];
+			char *encoded_login = new char[32];
 			boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
-			char *authorization = new char[6 + strlen(encoded_login) + 1];
+			authorization = new char[6 + strlen(encoded_login) + 1];
 			sprintf(authorization, "Basic %s", encoded_login);
 			req.set(http::field::authorization, authorization);
 
@@ -63,9 +66,7 @@ namespace coind
 			auto const results = resolver.resolve(ip, port);
 			stream.connect(results);
 
-			delete[] host;
 			delete[] encoded_login;
-			delete[] authorization;
 		}
 
 		~JSONRPC_Coind()
@@ -76,6 +77,9 @@ namespace coind
 			{
 				//TODO:
 			}
+
+			delete[] host;
+			delete[] authorization;
 		}
 
 	public:

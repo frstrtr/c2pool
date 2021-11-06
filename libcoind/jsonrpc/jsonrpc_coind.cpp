@@ -6,7 +6,6 @@ using std::set;
 
 UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
 {
-	//new
 	char* params;
 	size_t params_len;
 	if (req_params)
@@ -25,6 +24,7 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
 	sprintf(request_body, req_format, method_name, params);
 	req.body() = request_body;
 	req.prepare_payload();
+
 	http::write(stream, req);
 
 	beast::flat_buffer buffer;
@@ -34,6 +34,9 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
 	UniValue result(UniValue::VOBJ);
 	result.read(json_result);
+
+	delete[] params;
+	delete[] request_body;
 	return result;
 }
 
