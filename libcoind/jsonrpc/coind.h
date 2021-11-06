@@ -29,69 +29,69 @@ namespace coind::data
 
 namespace coind::jsonrpc
 {
-    class TXIDCache
-    {
-    public:
-        map<string, uint256> cache; //getblocktemplate.transacions[].data; hash256(packed data)
-    private:
-        bool _started = false;
+	class TXIDCache
+	{
+	public:
+		map<string, uint256> cache; //getblocktemplate.transacions[].data; hash256(packed data)
+	private:
+		bool _started = false;
 
-        time_t time_started = 0;
+		time_t time_started = 0;
 
-    public:
-        bool is_started() const
-        {
-            return _started;
-        }
+	public:
+		bool is_started() const
+		{
+			return _started;
+		}
 
-        bool exist(const string &key)
-        {
-            return (cache.find(key) != cache.end());
-        }
+		bool exist(const string &key)
+		{
+			return (cache.find(key) != cache.end());
+		}
 
-        uint256 operator[](const string &key)
-        {
-            if (exist(key))
-            {
-                return cache[key];
-            }
-            else
-            {
-                uint256 null_value;
-                null_value.SetNull();
-                return null_value;
-            }
-        }
+		uint256 operator[](const string &key)
+		{
+			if (exist(key))
+			{
+				return cache[key];
+			}
+			else
+			{
+				uint256 null_value;
+				null_value.SetNull();
+				return null_value;
+			}
+		}
 
-        void add(const string &key, const uint256 &value)
-        {
-            cache[key] = value;
-        }
+		void add(const string &key, const uint256 &value)
+		{
+			cache[key] = value;
+		}
 
-        void add(map<string, uint256> v)
-        {
-            for (auto _v : v)
-            {
-                cache[_v.first] = _v.second;
-            }
-        }
+		void add(map<string, uint256> v)
+		{
+			for (auto _v : v)
+			{
+				cache[_v.first] = _v.second;
+			}
+		}
 
-        void clear()
-        {
-            cache.clear();
-        }
+		void clear()
+		{
+			cache.clear();
+		}
 
-        void start()
-        {
-            time_started = c2pool::dev::timestamp();
-            _started = true;
-        }
+		void start()
+		{
+			time_started = c2pool::dev::timestamp();
+			_started = true;
+		}
 
-        time_t time()
-        {
-            return time_started;
-        }
-    };
+		time_t time()
+		{
+			return time_started;
+		}
+	};
 }
 
 namespace coind::jsonrpc
