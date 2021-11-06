@@ -11,12 +11,14 @@
 #include <boost/beast/version.hpp>
 #include <boost/beast.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/buffer.hpp>
 namespace beast = boost::beast;
 namespace http = beast::http; // from <boost/beast/http.hpp>
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
 #include <libcoind/jsonrpc/coind.h>
+#include <libcoind/jsonrpc/jsonrpc_coind.h>
 
 #ifdef PASS_EXIST
 #include "pass.h"
@@ -144,11 +146,11 @@ TEST(BoostBeast, jsonrpc)
         beast::flat_buffer buffer;
 
         boost::beast::http::response<boost::beast::http::dynamic_body> res;
-        res.set(http::field::content_type, "application/json");
 
         boost::beast::http::read(stream, buffer, res);
         // Write the message to standard out
-        std::cout << res << std::endl;
+		std::string result_str = boost::beast::buffers_to_string(res.body().data());
+        std::cout << "RESULT STR: " << result_str << std::endl;
     }
 
     // Gracefully close the socket
@@ -161,6 +163,20 @@ TEST(BoostBeast, jsonrpc)
     if (ec && ec != beast::errc::not_connected)
         throw beast::system_error{ec};
 }
+
+TEST(JSONRPC_COIND, getblockchaininfo)
+{
+	auto context = std::make_shared<boost::asio::io_context>(2);
+
+	auto _pass = get_pass();
+	char *login = std::get<0>(_pass);
+	char *addr = std::get<1>(_pass);
+	char *port = std::get<2>(_pass);
+	auto coind = std::make_shared<coind::JSONRPC_Coind>(context, std::make_shared<coind::DigibyteParentNetwork>(), addr, port, login); // (username, password, addr, std::make_shared<coind::DigibyteParentNetwork>());
+
+	std::cout << coind->getblockchaininfo().write() << std::endl;
+}
+
 /*
 TEST(Libcurl, init)
 {
