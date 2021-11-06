@@ -4,10 +4,25 @@
 #include <iostream>
 using std::set;
 
-UniValue coind::JSONRPC_Coind::_request(const char *method_name)
+UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
 {
-	char* request_body = new char[strlen(req_format) + strlen(method_name) + 2 + 1];
-	sprintf(request_body, req_format, method_name, "[]");
+	//new
+	char* params;
+	size_t params_len;
+	if (req_params)
+	{
+		params_len = req_params->get_params().length();
+		params = new char[params_len+1];
+		strcpy(params, req_params->get_params().c_str());
+	} else
+	{
+		params_len = 2;
+		params = new char[params_len + 1];
+		strcpy(params, "[]");
+	}
+
+	char* request_body = new char[strlen(req_format) + strlen(method_name) + params_len + 1];
+	sprintf(request_body, req_format, method_name, params);
 	req.body() = request_body;
 	req.prepare_payload();
 	http::write(stream, req);
@@ -17,29 +32,24 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name)
 	boost::beast::http::read(stream, buffer, response);
 
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
-	std::cout << "Request result: " << json_result << std::endl;
 	UniValue result(UniValue::VOBJ);
 	result.read(json_result);
-	std::cout << "After parsing: " << result.write()  << std::endl;
 	return result;
 }
 
-UniValue coind::JSONRPC_Coind::request(const char *method_name)
+UniValue coind::JSONRPC_Coind::request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
 {
-	auto result =  _request(method_name);
+	auto result =  _request(method_name, req_params);
 	if (!result["error"].isNull())
 	{
 		LOG_ERROR << "Error in request JSONRPC_COIND[" << parent_net->net_name << "]: " << result["error"].get_str();
 	}
-	std::cout << "AFTER ERROR" << std::endl;
-	std::cout << result.write() << std::endl;
-	std::cout << "result: " << result["result"].type() << std::endl;
 	return result["result"].get_obj();
 }
 
-UniValue coind::JSONRPC_Coind::request_with_error(const char *method_name)
+UniValue coind::JSONRPC_Coind::request_with_error(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
 {
-	return _request(method_name);
+	return _request(method_name, req_params);
 }
 
 bool coind::JSONRPC_Coind::check()
@@ -89,17 +99,16 @@ bool coind::JSONRPC_Coind::check()
 	return true;
 }
 
-//TODO:
-//bool coind::JSONRPC_Coind::check_block_header(uint256 header)
-//{
-//	GetBlockHeaderRequest *req = new GetBlockHeaderRequest(blockhash);
-//	UniValue result = getblockheader(req, true);
-//	if (result["error"].isNull())
-//	{
-//		return true;
-//	}
-//	else
-//	{
-//		return false;
-//	}
-//}
+bool coind::JSONRPC_Coind::check_block_header(uint256 header)
+{
+	std::shared_ptr<jsonrpc::data::GetBlockHeaderRequest> req = std::make_shared<jsonrpc::data::GetBlockHeaderRequest>(header);
+	UniValue result = getblockheader(req, true);
+	if (result["error"].isNull())
+	{
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
