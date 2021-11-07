@@ -18,24 +18,6 @@ TEST(DEVCORE_TEST, pack_uint256)
 		ASSERT_EQ(*v, stream.data[i]);
 		i++;
 	}
-	std::cout << i << std::endl;
-	//========================================
-/*
-	unsigned char *packed = new unsigned char[uint256::WIDTH];
-	//int32_t len = sizeof(value2) / sizeof(*packed);
-
-	for (int i = 0; i < uint256::WIDTH; i++)
-	{
-		packed[i] = stream.data[i];
-		//stream.data.erase(stream.data.begin(), stream.data.begin() + 1);
-	}
-	auto *_value = reinterpret_cast<uint256 *>(packed);
-	uint256 value = *_value;
-
-	ASSERT_EQ(num.GetHex(), value.GetHex());
-
-*/
-	//========================================
 
 	INT256 unpacked_num;
 	stream >> unpacked_num;
