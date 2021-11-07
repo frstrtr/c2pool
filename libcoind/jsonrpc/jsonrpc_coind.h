@@ -13,6 +13,9 @@ using tcp = io::ip::tcp;
 #include <libdevcore/logger.h>
 
 #include "requests.h"
+#include "txidcache.h"
+#include "results.h"
+#include <libcoind/data.h>
 using namespace coind::jsonrpc::data;
 
 namespace coind
@@ -38,6 +41,37 @@ namespace coind
 		UniValue request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
 		UniValue request_with_error(const char* method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
+
+		enum coind_error_codes
+		{
+			MethodNotFound = -32601
+		};
+
+		//https://github.com/bitcoin/bitcoin/blob/master/src/rpc/protocol.h
+		//0 = OK!
+		int check_error(UniValue result)
+		{
+			if (result.exists("error"))
+			{
+				if (result["error"].empty())
+				{
+					return 0;
+				}
+			}
+			else
+			{
+				return 0;
+			}
+
+			//-----------
+			auto error_obj = result["error"].get_obj();
+			int actual_error_code = error_obj["code"].get_int();
+			string actual_error_msg = error_obj["message"].get_str();
+
+			//TODO: log actual_error_msg!
+
+			return actual_error_code;
+		}
 
 	public:
 
@@ -89,7 +123,7 @@ namespace coind
 
 		bool check_block_header(uint256 header);
 
-		//TODO: getwork
+		getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>(), bool use_getblocktemplate = false);
 
 	public:
 		UniValue getblockchaininfo(bool full = false)
@@ -98,6 +132,11 @@ namespace coind
 				return request_with_error("getblockchaininfo");
 			else
 				return request("getblockchaininfo");
+		}
+
+		UniValue getmininginfo()
+		{
+			return request("getmininginfo");
 		}
 
 		UniValue getnetworkinfo()
