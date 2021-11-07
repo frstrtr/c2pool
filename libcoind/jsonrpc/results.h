@@ -14,7 +14,7 @@
 #include <libdevcore/stream_types.h>
 #include <libdevcore/common.h>
 
-namespace coind::jsonrpc::data
+namespace coind
 {
     struct getwork_result
     {

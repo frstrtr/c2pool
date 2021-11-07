@@ -5,7 +5,7 @@
 #include <map>
 using std::map, std::string;
 
-#include <uint256.h>
+#include <btclibs/uint256.h>
 #include <libdevcore/common.h>
 
 namespace coind{
