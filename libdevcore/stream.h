@@ -202,12 +202,13 @@ struct PackStream
     template <typename T>
     PackStream &operator>>(T &val)
     {
-        unsigned char *packed = new unsigned char[CALC_SIZE(T)];
-        for (int i = 0; i < CALC_SIZE(T); i++)
+		auto _size = CALC_SIZE(T);
+        unsigned char *packed = new unsigned char[_size];
+        for (int i = 0; i < _size; i++)
         {
             packed[i] = data[i];
-            data.erase(data.begin(), data.begin() + 1);
         }
+		data.erase(data.begin(), data.begin() + _size);
         auto *res = reinterpret_cast<T *>(packed);
         val = *res;
         return *this;
