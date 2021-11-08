@@ -252,7 +252,7 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
 
         INT_T value2 = value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
-        int32_t len = std::distance(value2.begin(), value.end());
+        int32_t len = std::distance(value2.begin(), value2.end());
 
         PackStream s(packed, len);
         stream << s;
@@ -261,20 +261,20 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
     }
 
     virtual PackStream &read(PackStream &stream)
-    {
-        unsigned char *packed = new unsigned char[value_type::WIDTH];
-        //int32_t len = sizeof(value2) / sizeof(*packed);
+	{
+		unsigned char *packed = new unsigned char[value_type::WIDTH];
+		//int32_t len = sizeof(value2) / sizeof(*packed);
 
-        for (int i = 0; i < value_type::WIDTH; i++)
-        {
-            packed[i] = stream.data[i];
-            stream.data.erase(stream.data.begin(), stream.data.begin() + 1);
-        }
-        auto *_value = reinterpret_cast<INT_T *>(packed);
-        value = *_value;
+		for (int i = 0; i < value_type::WIDTH; i++)
+		{
+			packed[i] = stream.data[i];
+		}
+		stream.data.erase(stream.data.begin(), stream.data.begin() + value_type::WIDTH);
+		auto *_value = reinterpret_cast<INT_T *>(packed);
+		value = *_value;
 
-        return stream;
-    }
+		return stream;
+	}
 };
 
 #define INT8 IntType<uint8_t>
