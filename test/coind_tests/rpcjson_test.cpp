@@ -78,5 +78,14 @@ TEST_F(Bitcoind_JSONRPC, getwork)
 {
 	coind::TXIDCache txidcache;
 	map<uint256, coind::data::tx_type> known_txs;
-	auto result = coind->getwork(txidcache, known_txs, false);
+	auto result = coind->getwork(txidcache, known_txs);
+
+	std::cout << "version: " <<  result.version << std::endl;
+	std::cout << "previous_block: " <<  result.previous_block.GetHex() << std::endl;
+	std::cout << "transactions: ";
+	for (auto v : result.transactions){
+		std::cout << v->version << std::endl;
+	}
+	std::cout << std::endl;
+	
 }

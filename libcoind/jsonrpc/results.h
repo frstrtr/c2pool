@@ -30,12 +30,12 @@ namespace coind
         int32_t height;
         vector<string> rules;
         time_t last_update;
-        bool use_getblocktemplate;
         time_t latency;
+		//use_getblocktemplate = true always
 
         getwork_result() {}
 
-        getwork_result(UniValue work, vector<shared_ptr<coind::data::TransactionType>> unpacked_txs, vector<uint256> txhashes, bool _use_getblocktemplate, time_t _latency)
+        getwork_result(UniValue work, vector<shared_ptr<coind::data::TransactionType>> unpacked_txs, vector<uint256> txhashes, time_t _latency)
         {
             /*
                 version=work['version'],
@@ -113,7 +113,6 @@ namespace coind
             }
 
             last_update = c2pool::dev::timestamp();
-            use_getblocktemplate = _use_getblocktemplate;
             latency = _latency;
         }
 

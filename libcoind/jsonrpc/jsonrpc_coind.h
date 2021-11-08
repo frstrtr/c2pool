@@ -123,7 +123,7 @@ namespace coind
 
 		bool check_block_header(uint256 header);
 
-		getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>(), bool use_getblocktemplate = false);
+		getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
 
 	public:
 		UniValue getblockchaininfo(bool full = false)
@@ -164,14 +164,6 @@ namespace coind
 				return request_with_error("getblocktemplate", req);
 			else
 				return request("getblocktemplate", req);
-		}
-
-		UniValue getmemorypool(bool full = false)
-		{
-			if (full)
-				return request_with_error("getmemorypool");
-			else
-				return request("getmemorypool");
 		}
 
 	};
