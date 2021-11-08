@@ -261,6 +261,7 @@ namespace coind::data::stream
 
         PackStream &read(PackStream &stream)
         {
+			//bug here
             stream >> flag >> tx_ins >> tx_outs;
             return stream;
         }
@@ -323,7 +324,7 @@ namespace coind::data::stream
 
             if (marker.value == 0)
             {
-                WTXType next;
+                WTXType next; //TODO: bug here
                 stream >> next;
 
                 vector<WitnessType> _witness;
