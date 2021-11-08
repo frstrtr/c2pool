@@ -12,7 +12,11 @@ add_executable(coind_test ${COIND_TESTS_SOURCE})
 set_target_properties(coind_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 target_link_libraries(coind_test gtest gtest_main)
-target_link_libraries(coind_test libdevcore networks libcoind)
+target_link_libraries(coind_test libdevcore networks libcoind btclibs util)
+
+add_executable(tx_test tx_test.cpp)
+target_link_libraries(tx_test gtest gtest_main)
+target_link_libraries(tx_test libdevcore networks libcoind btclibs util)
 
 
 add_executable(stratum_test_exec stratum_test_exec.cpp)

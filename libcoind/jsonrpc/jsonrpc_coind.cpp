@@ -116,8 +116,7 @@ bool coind::JSONRPC_Coind::check_block_header(uint256 header)
 	}
 }
 
-coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs,
-											 bool use_getblocktemplate)
+coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs)
 {
 	UniValue work;
 	UniValue getblocktemplate_result;
@@ -126,45 +125,20 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 	time_t end;
 
 	start = c2pool::dev::timestamp();
-	if (use_getblocktemplate)
-	{
-		auto req = std::make_shared<GetBlockTemplateRequest>();
-		req->mode = "template";
-		req->rules.push_back("segwit");
-		getblocktemplate_result = getblocktemplate(req, true);
-	}
-	else
-	{
-		getblocktemplate_result = getmemorypool(); //TODO
-	}
+
+	auto req = std::make_shared<GetBlockTemplateRequest>();
+	req->mode = "template";
+	req->rules.push_back("segwit");
+	getblocktemplate_result = getblocktemplate(req, true);
+	std::cout << getblocktemplate_result.write() << std::endl;
+
 	end = c2pool::dev::timestamp();
 
 	int check_error_res = check_error(getblocktemplate_result);
 	if (!check_error_res)
 	{
-		if (check_error_res == coind_error_codes::MethodNotFound)
-		{
-			start = c2pool::dev::timestamp();
-			if (!use_getblocktemplate)
-			{
-				auto req = std::make_shared<GetBlockTemplateRequest>();
-				req->mode = "template";
-				req->rules.push_back("segwit");
-				getblocktemplate_result = getblocktemplate(req, true);
-			}
-			else
-			{
-				getblocktemplate_result = getmemorypool(); //TODO
-			}
-			end = c2pool::dev::timestamp();
-
-			check_error_res = check_error(getblocktemplate_result);
-			if (!check_error_res)
-			{
-				//TODO: LOG ERROR 'Error: Bitcoin version too old! Upgrade to v0.5 or newer!'
-				//raise
-			}
-		}
+		//TODO: LOG ERROR 'Error: Bitcoin version too old! Upgrade to v0.5 or newer!'
+		//raise
 	}
 	work = getblocktemplate_result["result"].get_obj();
 
@@ -172,11 +146,12 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 	if (!txidcache.is_started())
 		txidcache.start();
 
+//	std::cout << work.write() << std::endl;
 	vector<UniValue> packed_transactions = work["transactions"].getValues();
 
 	vector<uint256> txhashes;
 	vector<coind::data::tx_type> unpacked_transactions;
-	for (auto _x : packed_transactions)
+	for (auto _x: packed_transactions)
 	{
 		PackStream packed;
 		uint256 txid;
@@ -190,25 +165,24 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 		{
 			txid = txidcache[x];
 			txhashes.push_back(txid);
-		}
-		else
+		} else
 		{
-			packed = PackStream(ParseHex(x)); //TODO: TEST
+			packed = PackStream(ParseHex(x));
 			txid = coind::data::hash256(packed);
 			txidcache.add(x, txid);
 			txhashes.push_back(txid);
 		}
+		//-------------
 
 		coind::data::tx_type unpacked;
 		if (known_txs.find(txid) != known_txs.end())
 		{
 			unpacked = known_txs.at(txid);
-		}
-		else
+		} else
 		{
 			if (packed.isNull())
 			{
-				packed = PackStream(ParseHex(x)); //TODO: TEST
+				packed = PackStream(ParseHex(x));
 			}
 			coind::data::stream::TransactionType_stream _unpacked;
 			packed >> _unpacked;
@@ -247,6 +221,6 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 	// elif p2pool.DEBUG:
 	// assert work['height'] == (yield bitcoind.rpc_getblock(work['previousblockhash']))['height'] + 1
 
-	getwork_result result(work, unpacked_transactions, txhashes, use_getblocktemplate, end - start);
+	getwork_result result(work, unpacked_transactions, txhashes, end - start);
 	return result;
 }

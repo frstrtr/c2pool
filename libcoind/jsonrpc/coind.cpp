@@ -208,7 +208,7 @@ namespace coind::jsonrpc
         // elif p2pool.DEBUG:
         // assert work['height'] == (yield bitcoind.rpc_getblock(work['previousblockhash']))['height'] + 1
 
-        getwork_result result(work, unpacked_transactions, txhashes, use_getblocktemplate, end - start);
+        getwork_result result(work, unpacked_transactions, txhashes, end - start);
         return result;
     }
 }
