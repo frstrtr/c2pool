@@ -32,7 +32,7 @@ namespace c2pool::libnet
                                 });
         std::cout << 1 << std::endl;
         //COIND:
-        coind_work = Variable<coind::jsonrpc::data::getwork_result>(_coind->getwork(txidcache));
+        coind_work = Variable<coind::getwork_result>(_coind->getwork(txidcache));
         std::cout << 1 << std::endl;
         new_block->subscribe([&](uint256 _value)
                              {
@@ -82,7 +82,7 @@ namespace c2pool::libnet
     //Каждые 15 секунд или получение ивента new_block, вызываем getwork у coind'a.
     void CoindNode::work_poller()
     {
-        coind_work = _coind->getwork(txidcache, known_txs.value, coind_work.value.use_getblocktemplate);
+        coind_work = _coind->getwork(txidcache, known_txs.value);
         // work_poller_t.expires_from_now(boost::posix_time::seconds(15));
         // work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
     }
