@@ -60,7 +60,7 @@ namespace c2pool::libnet
         shared_ptr<Event<coind::data::tx_type>> new_tx;                 //bitcoin_data.tx_type
         shared_ptr<Event<c2pool::shares::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
-        Variable<coind::jsonrpc::data::getwork_result> coind_work;
+        Variable<coind::getwork_result> coind_work;
         Variable<std::optional<c2pool::shares::BlockHeaderType>> best_block_header;
 
     private:
