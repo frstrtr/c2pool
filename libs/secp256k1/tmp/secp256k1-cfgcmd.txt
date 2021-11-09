@@ -1,1 +1,1 @@
-cmd='/usr/bin/cmake;-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>;-DCMAKE_POSITION_INDEPENDENT_CODE=;-DCMAKE_C_COMPILER=/bin/x86_64-linux-gnu-gcc-8;-DCMAKE_CXX_COMPILER=/bin/x86_64-linux-gnu-g++-8;-GUnix Makefiles;<SOURCE_DIR><SOURCE_SUBDIR>'
+cmd='/snap/clion/169/bin/cmake/linux/bin/cmake;-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>;-DCMAKE_POSITION_INDEPENDENT_CODE=;-DCMAKE_C_COMPILER=/usr/bin/cc;-DCMAKE_CXX_COMPILER=/usr/bin/c++;-GCodeBlocks - Unix Makefiles;<SOURCE_DIR><SOURCE_SUBDIR>'

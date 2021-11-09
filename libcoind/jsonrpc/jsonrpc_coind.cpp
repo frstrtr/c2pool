@@ -32,6 +32,7 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
 	boost::beast::http::read(stream, buffer, response);
 
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
+    std::cout << json_result << std::endl;
 	UniValue result(UniValue::VOBJ);
 	result.read(json_result);
 

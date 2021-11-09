@@ -9,7 +9,6 @@
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-#include <libcoind/jsonrpc/coind.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 
 #ifdef PASS_EXIST
