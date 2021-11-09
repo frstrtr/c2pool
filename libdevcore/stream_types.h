@@ -405,10 +405,11 @@ public:
 
     PackStream &read(PackStream &stream)
     {
-        ObjType *_value;
+        ObjType *_value = new ObjType();
         stream >> *_value;
 
         value = make_optional(*_value);
+		delete _value;
         return stream;
     }
 };
