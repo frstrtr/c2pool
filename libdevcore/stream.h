@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <sstream>
 #include <vector>
 #include <numeric>
@@ -217,6 +218,11 @@ struct PackStream
     template <StreamObjType T>
     PackStream &operator>>(T &val)
     {
+		std::cout << "[";
+		for (int i = 0; i < 32; i++){
+			std::cout << (unsigned int) data[i] << ", ";
+		}
+		std::cout << "]" << std::endl;
         val.read(*this);
         return *this;
     }
@@ -254,10 +260,11 @@ struct PackStream
         else if (code == 0xff)
         {
             GET_INT(uint64_t)
-        }
-
+        } else
+		{
+			throw std::runtime_error("error in code StreamIntType");
+		}
         return *this;
-        //throw std::invalid_argument();
     }
 
     unsigned char *bytes() const

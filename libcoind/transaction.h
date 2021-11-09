@@ -169,7 +169,10 @@ namespace coind::data::stream
         }
         PackStream &read(PackStream &stream)
         {
-            stream >> hash >> index;
+			std::cout << "prevout read" << std::endl;
+            stream >> hash;
+			stream >> index;
+			std::cout << "GG" << std::endl;
             return stream;
         }
     };
@@ -193,9 +196,12 @@ namespace coind::data::stream
             stream << previous_output << script << sequence;
             return stream;
         }
+
         PackStream &read(PackStream &stream)
         {
-            stream >> previous_output >> script >> sequence;
+            stream >> previous_output;
+			stream >> script;
+			stream >> sequence;
             return stream;
         }
     };
@@ -262,7 +268,10 @@ namespace coind::data::stream
         PackStream &read(PackStream &stream)
         {
 			//bug here
-            stream >> flag >> tx_ins >> tx_outs;
+			stream >> flag;
+			stream >> tx_ins;
+			stream >> tx_outs;
+//            stream >> flag >> tx_ins >> tx_outs;
             return stream;
         }
     };

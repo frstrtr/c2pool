@@ -64,7 +64,7 @@ namespace coind
                 optional<uint64_t> fee;
                 if (x.exists("fee"))
                 {
-                    fee = x.get_uint64();
+                    fee = x["fee"].get_int64();
                 }
                 transaction_fees.push_back(fee);
             }
