@@ -5,7 +5,7 @@
 #include <libnet/p2p_node.h>
 #include <libnet/coind_node.h>
 #include <libnet/worker.h>
-#include <libcoind/jsonrpc/coind.h>
+#include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/jsonrpc/stratum.h>
 #include <sharechains/tracker.h>
 #include <sharechains/shareStore.h>
@@ -26,11 +26,10 @@ namespace c2pool::libnet
 
         //0:    COIND
         LOG_INFO << "Init Coind...";
-        const char *coind_username = "user"; //TODO: from args
-        const char *coind_password = "VeryVeryLongPass123"; //TODO: from args
-        const char *coind_address = "http://192.168.10.10:14024";  //TODO: from args
-        //Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net)
-        _coind = std::make_shared<coind::jsonrpc::Coind>(coind_username, coind_password, coind_address, _parent_net);
+        const char *coind_login = "user:VeryVeryLongPass123"; //TODO: from args
+        const char *coind_address = "192.168.10.10"; //TODO: from args
+        const char *coind_port = "14024"; //TODO: from args
+        _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, coind_address, coind_port, coind_login);
         //1:    Determining payout address
         //2:    ShareStore
         LOG_INFO << "ShareStore initialization...";
@@ -107,7 +106,7 @@ namespace c2pool::libnet
         return _p2pnode;
     }
 
-    shared_ptr<coind::jsonrpc::Coind> NodeManager::coind() const
+    shared_ptr<coind::JSONRPC_Coind> NodeManager::coind() const
     {
         return _coind;
     }
@@ -152,7 +151,7 @@ namespace c2pool::libnet
     create_set_method(c2pool::dev::coind_config, _config);
     create_set_method(c2pool::dev::AddrStore, _addr_store);
     create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
-    create_set_method(coind::jsonrpc::Coind, _coind);
+    create_set_method(coind::JSONRPC_Coind, _coind);
     create_set_method(c2pool::libnet::CoindNode, _coind_node);
     create_set_method(c2pool::shares::ShareTracker, _tracker);
     create_set_method(c2pool::shares::ShareStore, _share_store);
