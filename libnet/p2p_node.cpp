@@ -22,7 +22,7 @@ using namespace c2pool::libnet;
 
 namespace c2pool::libnet::p2p
 {
-    P2PNode::P2PNode(std::shared_ptr<io::io_context> __context) : _context(__context), _resolver(*_context), _acceptor(*_context), _auto_connect_timer(*_context)
+    P2PNode::P2PNode(std::shared_ptr<io::io_context> __context, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<c2pool::dev::coind_config> __config, shared_ptr<c2pool::dev::AddrStore> __addr_store) : _context(__context), _net(__net), _config(__config), _addr_store(__addr_store), _resolver(*_context), _acceptor(*_context), _auto_connect_timer(*_context)
     {
         node_id = c2pool::random::RandomNonce();
         ip::tcp::endpoint listen_ep(ip::tcp::v4(), _config->listenPort);
@@ -50,7 +50,7 @@ namespace c2pool::libnet::p2p
                                    if (!ec)
                                    {
                                        //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
-                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket));
+                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket), _net);
                                        server_attempts.insert(_socket);
                                        _socket->init(boost::bind(&P2PNode::protocol_listen_connected, this, _1));
                                    }
@@ -64,10 +64,11 @@ namespace c2pool::libnet::p2p
 
     void P2PNode::auto_connect()
     {
+        LOG_DEBUG << "AUTO CONNECT";
         _auto_connect_timer.expires_after(auto_connect_interval);
         _auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
                                         {
-                                            //LOG_TRACE << "auto connect timer";
+                                            LOG_TRACE << "auto connect timer";
                                             if (!_ec)
                                             {
                                                 if (!((client_connections.size() < _config->desired_conns) && (_addr_store->len() > 0) && (client_attempts.size() <= _config->max_attempts)))
@@ -87,7 +88,7 @@ namespace c2pool::libnet::p2p
                                                                                     [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
                                                                                     {
                                                                                         ip::tcp::socket socket(*_context);
-                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket));
+                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket), _net);
 
                                                                                         client_attempts[ip] = _socket;
                                                                                         protocol_handle handle = [this](shared_ptr<c2pool::libnet::p2p::Protocol> protocol)

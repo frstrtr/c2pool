@@ -59,7 +59,7 @@ namespace c2pool::shares
         shared_ptr<c2pool::Network> net;
         shared_ptr<coind::ParentNetwork> parent_net;
     public:
-        ShareTracker();
+        ShareTracker(shared_ptr<c2pool::Network> _net, shared_ptr<coind::ParentNetwork> _parent_net);
 
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);

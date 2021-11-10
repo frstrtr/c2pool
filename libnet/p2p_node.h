@@ -9,11 +9,13 @@
 #include <boost/asio.hpp>
 
 #include <libdevcore/addrStore.h>
-
+#include <libdevcore/config.h>
+#include <networks/network.h>
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 using std::set, std::tuple, std::map;
 using std::shared_ptr, std::unique_ptr;
+
 
 namespace c2pool
 {
@@ -24,11 +26,6 @@ namespace c2pool
             class Protocol;
             class P2PSocket;
         }
-    }
-
-    namespace dev
-    {
-        class coind_config;
     }
 } // namespace c2pool
 
@@ -41,7 +38,7 @@ namespace c2pool::libnet::p2p
     class P2PNode : public std::enable_shared_from_this<P2PNode>
     {
     public:
-        P2PNode(std::shared_ptr<io::io_context> __context);
+        P2PNode(std::shared_ptr<io::io_context> __context, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<c2pool::dev::coind_config> __config, shared_ptr<c2pool::dev::AddrStore> __addr_store);
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
@@ -56,6 +53,7 @@ namespace c2pool::libnet::p2p
         void auto_connect();
 
     private:
+        std::shared_ptr<c2pool::Network> _net;
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<io::io_context> _context; //From NodeManager;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;

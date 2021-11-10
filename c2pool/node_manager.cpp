@@ -43,7 +43,7 @@ namespace c2pool::libnet
         coind_node()->start();
         //4:    ShareTracker
         LOG_INFO << "ShareTracker initialization...";
-        _tracker = std::make_shared<ShareTracker>();
+        _tracker = std::make_shared<ShareTracker>(_net, _parent_net);
         //4.1:  Save shares every 60 seconds
         //TODO: timer in _tracker constructor
         //...success!
@@ -54,7 +54,7 @@ namespace c2pool::libnet
         //5.1:  Bootstrap_addrs
         //5.2:  Parse CLI args for addrs
         //6:    P2PNode
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context);
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context, _net, _config, _addr_store);
         //6.1:  P2PNode.start?
         p2pNode()->start();
         //7:    Save addrs every 60 seconds
@@ -69,6 +69,7 @@ namespace c2pool::libnet
         //10:   WebRoot
         //...success!
         _is_loaded = true;
+        _context->run();
     }
 
     bool NodeManager::is_loaded() const

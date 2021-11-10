@@ -24,7 +24,7 @@ using std::shared_ptr;
 
 namespace c2pool::shares
 {
-    ShareTracker::ShareTracker() : verified(shares)
+    ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net, shared_ptr<coind::ParentNetwork> _parent_net) : verified(shares), net(_net), parent_net(_parent_net)
     {
     }
 
