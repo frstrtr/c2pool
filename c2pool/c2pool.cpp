@@ -56,7 +56,7 @@ int main(int ac, char *av[])
     desc.add_options()("version", "version");
     desc.add_options()("debug", po::value<c2pool::dev::DebugState>(&c2pool_config::get()->debug)->default_value(c2pool::dev::normal), "enable debugging mode");
     desc.add_options()("testnet", po::value<bool>()->default_value(false), "use the network's testnet");
-    desc.add_options()("net", po::value<string>()->default_value("bitcoin"), "use specified network (default: bitcoin)");
+    desc.add_options()("net", po::value<string>()->default_value("digibyte"), "use specified network (default: bitcoin)");
 
     desc.add_options()("address,a", po::value<string>()->default_value(""), "generate payouts to this address (default: <address requested from bitcoind>), or (dynamic)");
     desc.add_options()("numaddresses,i", po::value<int>()->default_value(2), "number of bitcoin auto-generated addresses to maintain for getwork dynamic address allocation");
@@ -123,8 +123,8 @@ int main(int ac, char *av[])
     c2pool::console::Logger::Init();
     LOG_INFO << "Start c2pool...";
     // каждый второй поток для coind'a/stratum'a
-    boost::asio::thread_pool coind_threads(thread::hardware_concurrency()/2); //TODO: количество через аргументы запуска.
-
+    //boost::asio::thread_pool coind_threads(thread::hardware_concurrency()/2); //TODO: количество через аргументы запуска.
+    boost::asio::thread_pool coind_threads(1);
     //Creating and initialization coinds network, config and NodeManager
 
     //##########################DGB###############################
@@ -142,7 +142,7 @@ int main(int ac, char *av[])
     while (exitSignalHandler.working())
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(10000)); //todo: std::chrono::milliseconds(100)
-        std::cout << "main thread" << std::endl;
+        std::cout << "main thread: " << (DGB == nullptr) << std::endl;
     }
 
     return C2PoolErrors::success;

@@ -52,7 +52,7 @@ namespace c2pool::libnet::p2p
         std::shared_ptr<c2pool::Network> _net;
         std::shared_ptr<libnet::p2p::P2PNode> _p2p_node;
     public:
-        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket) : Protocol(socket)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, std::shared_ptr<c2pool::Network> __net) : Protocol(socket), _net(__net)
         {
             LOG_TRACE << "P2P_Protocol: "
                       << "start constructor";

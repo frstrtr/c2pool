@@ -55,7 +55,7 @@ namespace coind::p2p
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket);
+        P2PSocket(ip::tcp::socket socket, std::shared_ptr<coind::ParentNetwork> __parent_net);
 
         //for connect
         void init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto);

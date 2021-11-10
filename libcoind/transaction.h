@@ -169,10 +169,7 @@ namespace coind::data::stream
         }
         PackStream &read(PackStream &stream)
         {
-			std::cout << "prevout read" << std::endl;
-            stream >> hash;
-			stream >> index;
-			std::cout << "GG" << std::endl;
+            stream >> hash >> index;
             return stream;
         }
     };

@@ -21,10 +21,12 @@ namespace c2pool::libnet
     {
         LOG_INFO << "... CoindNode<" << _parent_net->net_name << ">starting...";
         std::cout << 1 << std::endl;
-        _resolver.async_resolve(_parent_net->P2P_ADDRESS, std::to_string(_parent_net->P2P_PORT), [this](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
+        _resolver.async_resolve(_parent_net->P2P_ADDRESS, std::to_string(_parent_net->P2P_PORT),
+                                [this](const boost::system::error_code &er,
+                                       const boost::asio::ip::tcp::resolver::results_type endpoints)
                                 {
                                     ip::tcp::socket socket(*_context);
-                                    auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket));
+                                    auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), _parent_net);
 
                                     protocol = make_shared<coind::p2p::CoindProtocol>(_socket);
                                     protocol->init(new_block, new_tx, new_headers);
@@ -37,11 +39,11 @@ namespace c2pool::libnet
         new_block->subscribe([&](uint256 _value)
                              {
                                  //Если получаем новый блок, то обновляем таймер
-                                 //work_poller_t.expires_from_now(boost::posix_time::seconds(15));
+                                 work_poller_t.expires_from_now(boost::posix_time::seconds(15));
                              });
-                             std::cout << 1 << std::endl;
-        work_poller();
         std::cout << 1 << std::endl;
+        work_poller();
+        std::cout << 1 << " (after work_poller calling)" << std::endl;
 
         //PEER:
         std::cout << 1 << std::endl;
@@ -83,8 +85,8 @@ namespace c2pool::libnet
     void CoindNode::work_poller()
     {
         coind_work = _coind->getwork(txidcache, known_txs.value);
-        // work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-        // work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
+        work_poller_t.expires_from_now(boost::posix_time::seconds(15));
+        work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
     }
 
     //TODO: test

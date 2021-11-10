@@ -131,7 +131,6 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 	req->mode = "template";
 	req->rules.push_back("segwit");
 	getblocktemplate_result = getblocktemplate(req, true);
-	std::cout << getblocktemplate_result.write() << std::endl;
 
 	end = c2pool::dev::timestamp();
 

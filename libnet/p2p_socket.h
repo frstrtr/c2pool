@@ -41,7 +41,7 @@ namespace c2pool::libnet::p2p
 
         int32_t unpacked_len;
 
-        ReadPackedMsg(int32_t pref_len)
+        ReadPackedMsg(int32_t pref_len) : payload(NULL)
         {
             prefix = new char[pref_len];
             command = new char[COMMAND_LEN];
@@ -55,7 +55,10 @@ namespace c2pool::libnet::p2p
             delete command;
             delete len;
             delete checksum;
-            delete payload;
+            if (payload)
+            {
+                delete payload;
+            }
         }
     };
 }
@@ -68,7 +71,7 @@ namespace c2pool::libnet::p2p
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket);
+        P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net);
 
         //for connect
         void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
