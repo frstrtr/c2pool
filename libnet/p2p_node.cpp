@@ -64,11 +64,10 @@ namespace c2pool::libnet::p2p
 
     void P2PNode::auto_connect()
     {
-        LOG_DEBUG << "AUTO CONNECT";
         _auto_connect_timer.expires_after(auto_connect_interval);
         _auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
                                         {
-                                            LOG_TRACE << "auto connect timer";
+                                            //LOG_DEBUG << "AUTO CONNECT";
                                             if (!_ec)
                                             {
                                                 if (!((client_connections.size() < _config->desired_conns) && (_addr_store->len() > 0) && (client_attempts.size() <= _config->max_attempts)))
