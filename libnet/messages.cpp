@@ -7,7 +7,7 @@
 
 namespace c2pool::libnet::messages
 {
-    const char *string_commands(commands cmd)
+    std::string string_commands(commands cmd)
     {
         try
         {
@@ -20,7 +20,7 @@ namespace c2pool::libnet::messages
         }
     }
 
-    commands reverse_string_commands(const char *key)
+    commands reverse_string_commands(std::string key)
     {
         try
         {

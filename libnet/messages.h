@@ -42,7 +42,7 @@ namespace c2pool::libnet::messages
         cmd_losing_tx
     };
 
-    const std::map<commands, const char *> _string_commands = {
+    const std::map<commands, std::string> _string_commands = {
         {cmd_error, "error"},
         {cmd_version, "version"},
         {cmd_ping, "ping"},
@@ -57,7 +57,7 @@ namespace c2pool::libnet::messages
         {cmd_have_tx, "have_tx"},
         {cmd_losing_tx, "losing_tx"}};
 
-    const std::map<const char *, commands> _reverse_string_commands = {
+    const std::map<std::string, commands> _reverse_string_commands = {
         {"error", cmd_error},
         {"version", cmd_version},
         {"ping", cmd_ping},
@@ -72,9 +72,9 @@ namespace c2pool::libnet::messages
         {"have_tx", cmd_have_tx},
         {"losing_tx", cmd_losing_tx}};
 
-    const char *string_commands(commands cmd);
+    std::string string_commands(commands cmd);
 
-    commands reverse_string_commands(const char *key);
+    commands reverse_string_commands(std::string key);
 
     //base_message type for handle
     class raw_message
@@ -82,23 +82,24 @@ namespace c2pool::libnet::messages
         friend c2pool::libnet::p2p::P2PSocket;
 
     public:
-        EnumType<c2pool::libnet::messages::commands> name_type;
+        std::string command;
+        // c2pool::libnet::messages::commands name_type;
+        // EnumType<c2pool::libnet::messages::commands> name_type;
         PackStream value;
 
     public:
-        raw_message()
+        raw_message(std::string  _command) : command(_command)
         {
         }
 
         PackStream &write(PackStream &stream)
         {
-            stream << name_type << value;
+            stream << value;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
-            stream >> name_type;
             value = PackStream(stream);
             return stream;
         }
@@ -168,8 +169,8 @@ namespace c2pool::libnet::messages
     public:
         IntType(32) version;
         IntType(64) services;
-        address_type addr_to;
-        address_type addr_from;
+        stream::address_type_stream addr_to;
+        stream::address_type_stream addr_from;
         IntType(64) nonce;
         StrType sub_version;
         IntType(32) mode; //# always 1 for legacy compatibility

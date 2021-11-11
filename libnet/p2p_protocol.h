@@ -43,7 +43,7 @@ namespace c2pool::libnet::p2p
     public:
         virtual void handle(shared_ptr<raw_message> RawMSG) {}
 
-        virtual shared_ptr<raw_message> make_raw_message() { return make_shared<raw_message>(); }
+        virtual shared_ptr<raw_message> make_raw_message(std::string cmd) { return make_shared<raw_message>(cmd); }
     };
 
     class P2P_Protocol : public Protocol
@@ -60,9 +60,8 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<raw_message> RawMSG) override
         {
-            LOG_DEBUG << "called HANDLE msg in p2p_protocol";
-
-            switch (RawMSG->name_type.value)
+            LOG_DEBUG << "called HANDLE msg in p2p_protocol" << ", with name_type = " << RawMSG->command;
+            switch (reverse_string_commands(RawMSG->command.c_str()))
             {
             case commands::cmd_version:
                 handle(GenerateMsg<message_version>(RawMSG->value));
@@ -128,7 +127,7 @@ namespace c2pool::libnet::p2p
         {
             LOG_DEBUG << "handle message_version";
             LOG_TRACE << msg->best_share_hash.get().get().GetHex();
-            LOG_INFO << "Peer " << msg->addr_from.address << ":" << msg->addr_from.port << " says protocol version is " << msg->version.get() << ", client version " << msg->sub_version.get();
+            LOG_INFO << "Peer " << msg->addr_from.address.get() << ":" << msg->addr_from.port.get() << " says protocol version is " << msg->version.get() << ", client version " << msg->sub_version.get();
 
             if (other_version != -1)
             {
