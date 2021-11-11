@@ -72,6 +72,7 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
+        LOG_DEBUG << "P2PSocket::write, msg->cmd = "<< (int)msg->cmd;
         write_prefix(msg);
     }
 

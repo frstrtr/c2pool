@@ -141,9 +141,9 @@ int main(int ac, char *av[])
 
     while (exitSignalHandler.working())
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10000)); //todo: std::chrono::milliseconds(100)
-        std::cout << "main thread: " << (DGB == nullptr) << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); //todo: std::chrono::milliseconds(100)
+//        std::cout << "main thread: " << (DGB == nullptr) << std::endl;
     }
-
+    std::cout << "FINAL" << std::endl;
     return C2PoolErrors::success;
 }
