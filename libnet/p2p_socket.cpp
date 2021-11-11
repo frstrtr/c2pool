@@ -100,9 +100,9 @@ namespace c2pool::libnet::p2p
             PackStream value;
 
             //command [+]
-            const char *temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
+            std::string temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
             auto command = new char[12]{'\0'};
-            memcpy(command, temp_cmd, strlen(temp_cmd));
+            memcpy(command, temp_cmd.c_str(), temp_cmd.size());
             PackStream s_command(command, 12);
             value << s_command;
             delete command;
@@ -195,7 +195,7 @@ namespace c2pool::libnet::p2p
                                 {
                                     if (!ec)
                                     {
-                                        LOG_TRACE << "try to read command";
+                                        LOG_TRACE << "try to read command: " << msg->command;
                                         //LOG_INFO << "read_command";
                                         read_length(msg);
                                     }
@@ -254,6 +254,8 @@ namespace c2pool::libnet::p2p
         IntType(32) payload_len;
         stream_len >> payload_len;
         msg->unpacked_len = payload_len.get();
+        msg->payload = new char[msg->unpacked_len+1];
+        LOG_DEBUG << "unpacked_len: " << msg->unpacked_len;
 
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(msg->payload, msg->unpacked_len),
@@ -268,7 +270,7 @@ namespace c2pool::libnet::p2p
                                     }
                                     else
                                     {
-                                        LOG_ERROR << ec << " " << ec.message();
+                                        LOG_ERROR << "read_payload: " << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });
@@ -282,12 +284,14 @@ namespace c2pool::libnet::p2p
         //Make raw message
         PackStream stream_RawMsg;
 
-        PackStream stream_command(msg->command, msg->COMMAND_LEN);
+//        PackStream stream_command(msg->command, msg->COMMAND_LEN);
+        std::string cmd(msg->command);
         PackStream stream_payload(msg->payload, msg->unpacked_len);
 
-        stream_RawMsg << stream_command << stream_payload;
+        stream_RawMsg << stream_payload;
 
-        shared_ptr<raw_message> RawMessage = _protocol.lock()->make_raw_message();
+        shared_ptr<raw_message> RawMessage = _protocol.lock()->make_raw_message(cmd);
+        //RawMessage->name_type = reverse_string_commands(msg->command);
         stream_RawMsg >> *RawMessage;
 
         //Protocol handle message

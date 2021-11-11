@@ -10,10 +10,12 @@
 
 #include "common.h"
 #include "logger.h"
+#include "stream_types.h"
 
 //todo: move all methods to types.cpp
 namespace c2pool::messages
 {
+    //TODO: stream_type
     class address_type
     {
     public:
@@ -170,6 +172,40 @@ namespace c2pool::messages
         }
     };
 } // namespace c2pool::messages
+
+namespace c2pool::messages::stream
+{
+    struct address_type_stream
+    {
+        IntType(64) services;
+        StrType address; //IPV6AddressType
+        IntType(16) port;
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << services << address << port;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> services >> address >> port;
+            return stream;
+        }
+
+        address_type_stream& operator =(const address_type& val)
+        {
+            services = val.services;
+            address = StrType::make_type(val.address);
+            port = val.port;
+        }
+
+        address_type get()
+        {
+            return address_type(services.get(), address.get(), port.get());
+        }
+    };
+}
 
 namespace c2pool::libnet{
     typedef std::tuple<std::string, std::string> addr;

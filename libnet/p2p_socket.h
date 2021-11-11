@@ -51,13 +51,13 @@ namespace c2pool::libnet::p2p
 
         ~ReadPackedMsg()
         {
-            delete prefix;
-            delete command;
-            delete len;
-            delete checksum;
+            delete[] prefix;
+            delete[] command;
+            delete[] len;
+            delete[] checksum;
             if (payload)
             {
-                delete payload;
+                delete[] payload;
             }
         }
     };
