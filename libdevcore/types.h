@@ -7,6 +7,8 @@
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
+#include <boost/algorithm/string.hpp>
+#include <boost/lexical_cast.hpp>
 
 #include "common.h"
 #include "logger.h"
@@ -175,10 +177,66 @@ namespace c2pool::messages
 
 namespace c2pool::messages::stream
 {
+    struct IPV6AddressType
+    {
+        std::string value;
+
+        IPV6AddressType()
+        {
+
+        }
+
+        IPV6AddressType(std::string _value) : value(_value)
+        {
+
+        }
+
+        //TODO: test
+        PackStream &write(PackStream &stream)
+        {
+            //TODO: IPV6
+//            if ':' in item:
+//                data = ''.join(item.replace(':', '')).decode('hex')
+//            else
+
+            std::vector<std::string> split_res;
+            boost::algorithm::split(split_res, value, boost::is_any_of("."));
+            if (split_res.size() != 4) {
+                throw (std::runtime_error("Invalid address in IPV6AddressType"));
+            }
+
+            vector<unsigned int> bits;
+            for (auto bit: split_res) {
+                int bit_int = 0;
+                try {
+                    bit_int = boost::lexical_cast<unsigned int>(bit);
+                } catch (boost::bad_lexical_cast const &) {
+                    LOG_ERROR << "Error lexical cast in IPV6AddressType";
+                }
+                bits.push_back(bit_int);
+            }
+
+            vector<unsigned char> data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+            for (auto x: bits) {
+                data.push_back((unsigned char) x);
+            }
+
+            PackStream _data(data);
+            stream << _data;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            //TODO: finish
+            return stream;
+        }
+    };
+
     struct address_type_stream
     {
         IntType(64) services;
-        StrType address; //IPV6AddressType
+        IPV6AddressType address; //IPV6AddressType
         IntType(16) port;
 
         PackStream &write(PackStream &stream)
