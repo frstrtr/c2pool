@@ -2,6 +2,8 @@
 #include <btclibs/uint256.h>
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
+#include <libdevcore/types.h>
+#include <iostream>
 
 //const char* hex_num = "21c9716491c93e9a531f6ea06051bf16311dce9ac8c6d4fb606eedcc0e52106a";
 const char* hex_num = "00032a417a23fcd43a983a44b35da54becf63e847231b8ec8518e25c1fcd31a0";
@@ -63,6 +65,17 @@ TEST(Devcore_stream, list_type_uint256)
 	// Unpack stream to unpacked_nums
 	ListType<IntType(256)> unpacked_nums;
 	stream >> unpacked_nums;
+}
 
+TEST(Devcore_stream, type_IPV6AddressType){
+    std::string ip1 = "192.168.50.31";
+    c2pool::messages::stream::IPV6AddressType pack_ip(ip1);
 
+    PackStream stream;
+    stream << pack_ip;
+
+    c2pool::messages::stream::IPV6AddressType unpack_ip;
+    stream >> unpack_ip;
+
+    ASSERT_EQ(ip1, unpack_ip.value);
 }
