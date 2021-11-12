@@ -50,7 +50,7 @@ namespace c2pool::libnet::p2p
                                    if (!ec)
                                    {
                                        //c2pool::libnet::p2p::protocol_handle f = protocol_connected;
-                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket), _net);
+                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket), _net, shared_from_this());
                                        server_attempts.insert(_socket);
                                        _socket->init(boost::bind(&P2PNode::protocol_listen_connected, this, _1));
                                    }
@@ -87,7 +87,7 @@ namespace c2pool::libnet::p2p
                                                                                     [this, ip, port](const boost::system::error_code &er, const boost::asio::ip::tcp::resolver::results_type endpoints)
                                                                                     {
                                                                                         ip::tcp::socket socket(*_context);
-                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket), _net);
+                                                                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket), _net, shared_from_this());
 
                                                                                         client_attempts[ip] = _socket;
                                                                                         protocol_handle handle = [this](shared_ptr<c2pool::libnet::p2p::Protocol> protocol)
