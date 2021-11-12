@@ -201,14 +201,15 @@ struct IntType : public Maker<IntType<INT_T>, INT_T>
 
     virtual PackStream &read(PackStream &stream)
     {
-        unsigned char *packed = new unsigned char[CALC_SIZE(INT_T)];
+        size_t _len = CALC_SIZE(INT_T);
+        unsigned char *packed = new unsigned char[_len];
         //int32_t len = sizeof(value2) / sizeof(*packed);
 
-        for (int i = 0; i < CALC_SIZE(INT_T); i++)
+        for (int i = 0; i < _len; i++)
         {
             packed[i] = stream.data[i];
-            stream.data.erase(stream.data.begin(), stream.data.begin() + 1);
         }
+        stream.data.erase(stream.data.begin(), stream.data.begin() + _len);
         auto *_value = reinterpret_cast<INT_T *>(packed);
         value = *_value;
 
