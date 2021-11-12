@@ -17,7 +17,6 @@
 //todo: move all methods to types.cpp
 namespace c2pool::messages
 {
-    //TODO: stream_type
     class address_type
     {
     public:
@@ -191,7 +190,15 @@ namespace c2pool::messages::stream
 
         }
 
-        //TODO: test
+        IPV6AddressType& operator=(std::string _value){
+            value = _value;
+            return *this;
+        }
+
+        std::string get() const{
+            return value;
+        }
+
         PackStream &write(PackStream &stream)
         {
             //TODO: IPV6
@@ -228,7 +235,31 @@ namespace c2pool::messages::stream
 
         PackStream &read(PackStream &stream)
         {
-            //TODO: finish
+            vector<unsigned char> hex_data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+            if (stream.size() >= 16) {
+                vector<unsigned char> data{stream.data.begin(), stream.data.begin()+16};
+                stream.data.erase(stream.data.begin(), stream.data.begin()+16);
+                bool ipv4 = true;
+                for (int i = 0; i < 12; i++){
+                    if (data[i] != hex_data[i]){
+                        ipv4 = false;
+                        break;
+                    }
+                }
+
+                if (ipv4){
+                    vector<std::string> nums;
+                    for (int i = 12; i < 16; i++){
+                        auto num = std::to_string((unsigned int)data[i]);
+                        nums.push_back(num);
+                    }
+                    value = boost::algorithm::join(nums,".");
+                } else {
+                    //TODO: IPV6
+                }
+            } else {
+                throw std::runtime_error("Invalid address!");
+            }
             return stream;
         }
     };
@@ -254,8 +285,9 @@ namespace c2pool::messages::stream
         address_type_stream& operator =(const address_type& val)
         {
             services = val.services;
-            address = StrType::make_type(val.address);
+            address = val.address;
             port = val.port;
+            return *this;
         }
 
         address_type get()
