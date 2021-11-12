@@ -71,7 +71,7 @@ namespace c2pool::libnet::p2p
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net);
+        P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node);
 
         //for connect
         void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
@@ -112,6 +112,7 @@ namespace c2pool::libnet::p2p
         ip::tcp::socket _socket;
 
         std::shared_ptr<c2pool::Network> _net;
+        std::shared_ptr<libnet::p2p::P2PNode> _p2p_node;
         std::weak_ptr<c2pool::libnet::p2p::Protocol> _protocol;
     };
 } // namespace c2pool::p2p

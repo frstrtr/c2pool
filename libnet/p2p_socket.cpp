@@ -26,7 +26,7 @@ namespace c2pool::libnet::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net) : _socket(std::move(socket)), _net(__net)
+    P2PSocket::P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node) : _socket(std::move(socket)), _net(__net), _p2p_node(__p2p_node)
     {
     }
 
@@ -52,7 +52,7 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
 
-        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), _net);
+        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), _net, _p2p_node);
 
         if (handle.empty())
         {
