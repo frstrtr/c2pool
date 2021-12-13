@@ -63,13 +63,13 @@ namespace c2pool::libnet::p2p
                       << "start constructor";
 
 
-            c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
-            c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
+            c2pool::messages::address_type addrs1(3, "192.168.10.10", 8);
+            c2pool::messages::address_type addrs2(9, "192.168.10.11", 9999);
 
             uint256 best_hash_test_answer;
             best_hash_test_answer.SetHex("06abb7263fc73665f1f5b129959d90419fea5b1fdbea6216e8847bcc286c14e9");
-            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, _p2p_node->get_nonce(), "c2pool-test", 1, best_hash_test_answer);
-
+//            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, _p2p_node->get_nonce(), "c2pool-test", 1, best_hash_test_answer);
+            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, 254, "c2pool-test", 1, best_hash_test_answer);
             write(msg);
         }
 

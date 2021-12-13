@@ -268,7 +268,7 @@ namespace c2pool::messages::stream
     {
         IntType(64) services;
         IPV6AddressType address; //IPV6AddressType
-        IntType(16) port;
+        IntType<uint16_t, true> port;
 
         PackStream &write(PackStream &stream)
         {
