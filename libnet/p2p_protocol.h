@@ -220,7 +220,7 @@ namespace c2pool::libnet::p2p
             shared_ptr<message_version> answer_msg = make_message<message_version>(ver, 0, addrs1, addrs2, test_nonce, test_sub_ver, 18, best_hash_test_answer);
             LOG_TRACE << "set converter type for answer msg";
             LOG_TRACE << "write answer msg for socket";
-            _socket->write(answer_msg);
+//            _socket->write(answer_msg);
             // _socket->write()
             //TODO:
         }

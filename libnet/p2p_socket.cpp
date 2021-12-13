@@ -141,16 +141,24 @@ namespace c2pool::libnet::p2p
             std::cout << "\n";
 
             auto __checksum = coind::data::hash256(payload_checksum_stream);
+            std::cout << "__checksum: " << __checksum.GetHex() << std::endl;
             IntType(256) checksum_full(__checksum);
+            std::cout << "checksum_full: " << checksum_full.value.GetHex() << std::endl;
             PackStream _packed_checksum;
             _packed_checksum << checksum_full;
-            vector <unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
+            //TODO: почему результат реверснутый?
 
-
+            vector<unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
+            std::reverse(packed_checksum.begin(), packed_checksum.end());
+            std::cout << "_packed_checksum: ";
+            for (auto v : _packed_checksum.data){
+                std::cout << (unsigned int)v << " " ;
+            }
+            std::cout << "\n";
 
             std::cout << "_packed_checksum: ";
             for (auto v : _packed_checksum.data){
-                std::cout << v;
+                std::cout << v << " " ;
             }
             std::cout << "\n";
 
