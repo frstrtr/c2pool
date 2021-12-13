@@ -1340,3 +1340,7 @@ print(tx_type.packed_size({
 # print(msg_getdata)
 
 # TYPE.get_value_getdata({'requests': [{'type': 1, 'hash': '4556951046119051870330753174980198143034594426276604144901776515'}]})
+
+
+msg_version = TYPE.get_type("message_version").pack({'addr_from': {'address': "4.5.6.7", 'port': 8, 'services': 3}, 'addr_to': {'address': "10.11.12.13", 'port': 14, 'services': 9}, 'nonce': 616662625, 'services': 1037, 'start_height': 12756369, 'sub_version_num': '/DigiByte:7.17.2/', 'time': 1618242430, 'version': 70017})
+print(msg_version)

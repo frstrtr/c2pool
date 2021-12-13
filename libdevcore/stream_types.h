@@ -155,8 +155,8 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
     }
 };
 
-template <typename INT_T>
-struct IntType : public Maker<IntType<INT_T>, INT_T>
+template <typename INT_T, bool BIG_ENDIAN = false>
+struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
 {
     typedef INT_T value_type;
     INT_T value;
@@ -192,6 +192,9 @@ struct IntType : public Maker<IntType<INT_T>, INT_T>
         INT_T value2 = value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
         int32_t len = sizeof(value2) / sizeof(*packed);
+
+        if (BIG_ENDIAN)
+            std::reverse(packed, packed+len);
 
         PackStream s(packed, len);
         stream << s;
