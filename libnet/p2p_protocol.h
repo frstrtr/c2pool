@@ -141,7 +141,6 @@ namespace c2pool::libnet::p2p
         void handle(shared_ptr<message_version> msg)
         {
             LOG_DEBUG << "handle message_version";
-            LOG_TRACE << msg->best_share_hash.get().get().GetHex();
             LOG_INFO << "Peer " << msg->addr_from.address.get() << ":" << msg->addr_from.port.get() << " says protocol version is " << msg->version.get() << ", client version " << msg->sub_version.get();
 
             if (other_version != -1)
@@ -157,72 +156,33 @@ namespace c2pool::libnet::p2p
             other_services = msg->services.get() ;
 
             if (msg->nonce.get() == _p2p_node->get_nonce()){
-                LOG_DEBUG << "was connected to self";
+                LOG_WARNING << "was connected to self";
+                //TODO: assert
             }
 
             //detect duplicate in node->peers
-            // for (auto _peer : nodes->p2p_node->peers)
-            // {
-            //     if (_peer.first == msg->nonce)
-            //     {
-            //         LOG_WARNING << "Detected duplicate connection, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
-            //         disconnect();
-            //         return;
-            //     }
-            // }
+            if (_p2p_node->get_peers().find(msg->nonce.get()) != _p2p_node->get_peers().end()){
+
+            }
+            if (_p2p_node->get_peers().count(msg->nonce.get()) != 0){
+                auto addr = _socket->get_addr();
+                LOG_WARNING << "Detected duplicate connection, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
+                _socket->disconnect();
+                return;
+            }
 
             _nonce = msg->nonce.get();
-            //connected2 = true; //?
+            //TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
+            //*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
 
-            //TODO: safe thrade cancel
-            //todo: timeout_delayed.cancel();
-            //timeout_delayed = new boost::asio::steady_timer(io, boost::asio::chrono::seconds(100)); //todo: timer io from constructor
-            //todo: timeout_delayed.async_wait(boost::bind(_timeout, boost::asio::placeholders::error)); //todo: thread
-            //_____________
+            //TODO: send_ping, раз в random.expovariate(1/100)
 
-            /* TODO: TIMER + DELEGATE
-             old_dataReceived = self.dataReceived
-        def new_dataReceived(data):
-            if self.timeout_delayed is not None:
-                self.timeout_delayed.reset(100)
-            old_dataReceived(data)
-        self.dataReceived = new_dataReceived
-             */
+            //TODO: if (p2p_node->advertise_ip):
+            //TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
 
-            // factory->protocol_connected(shared_from_this());
+            //TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
 
-            /* TODO: thread (coroutine?):
-             self._stop_thread = deferral.run_repeatedly(lambda: [
-            self.send_ping(),
-        random.expovariate(1/100)][-1])
-
-             if self.node.advertise_ip:
-            self._stop_thread2 = deferral.run_repeatedly(lambda: [
-                self.sendAdvertisement(),
-            random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
-             */
-
-            //best_hash = 0 default?
-            // if (best_hash != -1)
-            // {                                                 // -1 = None
-            //     node->handle_share_hashes([best_hash], this); //TODO: best_share_hash in []?
-            // }
-            //--------
-
-            // message_version* msg = new message_version()
-            int ver = version;
-            std::string test_sub_ver = "16";
-            unsigned long long test_nonce = 6535423;
-            c2pool::messages::address_type addrs1(3, "4.5.6.7", 8);
-            c2pool::messages::address_type addrs2(9, "10.11.12.13", 14);
-            uint256 best_hash_test_answer;
-            best_hash_test_answer.SetHex("0123");
-            shared_ptr<message_version> answer_msg = make_message<message_version>(ver, 0, addrs1, addrs2, test_nonce, test_sub_ver, 18, best_hash_test_answer);
-            LOG_TRACE << "set converter type for answer msg";
-            LOG_TRACE << "write answer msg for socket";
-//            _socket->write(answer_msg);
-            // _socket->write()
-            //TODO:
+            //TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
         }
         void handle(shared_ptr<message_addrs> msg)
         {
