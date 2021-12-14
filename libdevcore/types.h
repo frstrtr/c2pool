@@ -190,12 +190,14 @@ namespace c2pool::messages::stream
 
         }
 
-        IPV6AddressType& operator=(std::string _value){
+        IPV6AddressType &operator=(std::string _value)
+        {
             value = _value;
             return *this;
         }
 
-        std::string get() const{
+        std::string get() const
+        {
             return value;
         }
 
@@ -237,23 +239,23 @@ namespace c2pool::messages::stream
         {
             vector<unsigned char> hex_data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
             if (stream.size() >= 16) {
-                vector<unsigned char> data{stream.data.begin(), stream.data.begin()+16};
-                stream.data.erase(stream.data.begin(), stream.data.begin()+16);
+                vector<unsigned char> data{stream.data.begin(), stream.data.begin() + 16};
+                stream.data.erase(stream.data.begin(), stream.data.begin() + 16);
                 bool ipv4 = true;
-                for (int i = 0; i < 12; i++){
-                    if (data[i] != hex_data[i]){
+                for (int i = 0; i < 12; i++) {
+                    if (data[i] != hex_data[i]) {
                         ipv4 = false;
                         break;
                     }
                 }
 
-                if (ipv4){
+                if (ipv4) {
                     vector<std::string> nums;
-                    for (int i = 12; i < 16; i++){
-                        auto num = std::to_string((unsigned int)data[i]);
+                    for (int i = 12; i < 16; i++) {
+                        auto num = std::to_string((unsigned int) data[i]);
                         nums.push_back(num);
                     }
-                    value = boost::algorithm::join(nums,".");
+                    value = boost::algorithm::join(nums, ".");
                 } else {
                     //TODO: IPV6
                 }
@@ -293,6 +295,36 @@ namespace c2pool::messages::stream
         address_type get()
         {
             return address_type(services.get(), address.get(), port.get());
+        }
+    };
+
+    struct addr_stream
+    {
+        IntType(64) timestamp;
+        address_type_stream address;
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << timestamp << address;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> timestamp >> address;
+            return stream;
+        }
+
+        addr_stream& operator =(const addr& val)
+        {
+            timestamp = val.timestamp;
+            address = val.address;
+            return *this;
+        }
+
+        addr get()
+        {
+            return addr(timestamp.get(), address.services.get(), address.address.get(),address.port.get());
         }
     };
 }

@@ -278,12 +278,12 @@ namespace c2pool::libnet::messages
     class message_addrs : public base_message
     {
     public:
-        ListType<c2pool::messages::addr> addrs;
+        ListType<c2pool::messages::stream::addr_stream> addrs;
 
     public:
         message_addrs() : base_message("addrs") {}
 
-        message_addrs(std::vector<c2pool::messages::addr> _addrs) : base_message("addrs")
+        message_addrs(std::vector<c2pool::messages::stream::addr_stream> _addrs) : base_message("addrs")
         {
             addrs = _addrs;
         }
