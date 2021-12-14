@@ -29,7 +29,7 @@ namespace c2pool
     }
 } // namespace c2pool
 
-#define HOST_IDENT std::string
+#define HOST_IDENT unsigned long long
 
 using namespace c2pool::libnet;
 
@@ -42,6 +42,7 @@ namespace c2pool::libnet::p2p
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
+        std::map<HOST_IDENT, shared_ptr<c2pool::libnet::p2p::Protocol>>& get_peers();
         unsigned long long get_nonce();
         bool is_connected() const;
 
@@ -66,11 +67,12 @@ namespace c2pool::libnet::p2p
         ip::tcp::acceptor _acceptor;
 
     private:
-        unsigned long long node_id; //nonce
+        HOST_IDENT node_id; //nonce
 
         map<HOST_IDENT, shared_ptr<P2PSocket>> client_attempts;
         set<shared_ptr<P2PSocket>> server_attempts;
         set<shared_ptr<c2pool::libnet::p2p::Protocol>> client_connections;
         map<HOST_IDENT, int> server_connections;
+        map<HOST_IDENT, shared_ptr<c2pool::libnet::p2p::Protocol>> peers;
     };
 } // namespace c2pool::p2p

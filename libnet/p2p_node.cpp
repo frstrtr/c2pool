@@ -140,6 +140,10 @@ namespace c2pool::libnet::p2p
         return result;
     }
 
+    std::map<HOST_IDENT, shared_ptr<c2pool::libnet::p2p::Protocol>>& P2PNode::get_peers(){
+        return peers;
+    }
+
     unsigned long long P2PNode::get_nonce()
     {
         return node_id;
