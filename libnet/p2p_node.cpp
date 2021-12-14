@@ -140,7 +140,21 @@ namespace c2pool::libnet::p2p
         return result;
     }
 
-    std::map<HOST_IDENT, shared_ptr<c2pool::libnet::p2p::Protocol>>& P2PNode::get_peers(){
+    void P2PNode::got_addr(c2pool::libnet::addr _addr, uint64_t services, int timestamp)
+    {
+        if (_addr_store->Check(_addr)) {
+            auto old = _addr_store->Get(_addr);
+            c2pool::dev::AddrValue new_addr(services, old.first_seen, std::max(old.last_seen, timestamp));
+            _addr_store->Add(_addr, new_addr);
+        } else {
+            if (_addr_store->len() < 10000) {
+                c2pool::dev::AddrValue new_addr(services, timestamp, timestamp);
+                _addr_store->Add(_addr, new_addr);
+            }
+        }
+    }
+
+    std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>>& P2PNode::get_peers(){
         return peers;
     }
 
@@ -171,5 +185,7 @@ namespace c2pool::libnet::p2p
         LOG_WARNING << "P2PNode::protocol_connected - protocol = nullptr";
         return false;
     }
+
+
 
 } // namespace c2pool::p2p

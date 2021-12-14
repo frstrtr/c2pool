@@ -10,6 +10,7 @@
 
 #include <libdevcore/addrStore.h>
 #include <libdevcore/config.h>
+#include <libdevcore/types.h>
 #include <networks/network.h>
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
@@ -29,7 +30,7 @@ namespace c2pool
     }
 } // namespace c2pool
 
-#define HOST_IDENT unsigned long long
+#define HOST_IDENT std::string
 
 using namespace c2pool::libnet;
 
@@ -42,8 +43,12 @@ namespace c2pool::libnet::p2p
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
-        std::map<HOST_IDENT, shared_ptr<c2pool::libnet::p2p::Protocol>>& get_peers();
+        void got_addr(c2pool::libnet::addr _addr, uint64_t services, int timestamp);
+
+
+        std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>>& get_peers();
         unsigned long long get_nonce();
+
         bool is_connected() const;
 
     private:
@@ -67,12 +72,12 @@ namespace c2pool::libnet::p2p
         ip::tcp::acceptor _acceptor;
 
     private:
-        HOST_IDENT node_id; //nonce
+        unsigned long long node_id; //nonce
 
         map<HOST_IDENT, shared_ptr<P2PSocket>> client_attempts;
         set<shared_ptr<P2PSocket>> server_attempts;
         set<shared_ptr<c2pool::libnet::p2p::Protocol>> client_connections;
         map<HOST_IDENT, int> server_connections;
-        map<HOST_IDENT, shared_ptr<c2pool::libnet::p2p::Protocol>> peers;
+        map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>> peers;
     };
 } // namespace c2pool::p2p

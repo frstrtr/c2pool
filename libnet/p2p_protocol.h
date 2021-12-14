@@ -1,7 +1,7 @@
 #pragma once
 
 #include <memory>
-
+#include <string>
 #include <univalue.h>
 #include <btclibs/uint256.h>
 
@@ -9,6 +9,7 @@
 #include "p2p_node.h"
 #include "p2p_socket.h"
 #include <networks/network.h>
+#include <libdevcore/random.h>
 #include <libdevcore/logger.h>
 #include <sharechains/share.h>
 #include <libdevcore/types.h>
@@ -88,9 +89,7 @@ namespace c2pool::libnet::p2p
                 handle(GenerateMsg<message_addrme>(RawMSG->value));
                 break;
             case commands::cmd_addrs:
-                LOG_TRACE << "addrs1";
                 handle(GenerateMsg<message_addrs>(RawMSG->value));
-                LOG_TRACE << "addrs2";
                 break;
             case commands::cmd_getaddrs:
                 handle(GenerateMsg<message_getaddrs>(RawMSG->value));
@@ -188,9 +187,30 @@ namespace c2pool::libnet::p2p
         {
             //TODO:
         }
+
+        //TODO: test:
         void handle(shared_ptr<message_addrme> msg)
         {
-            //TODO:
+            auto host = std::get<0>(_socket->get_addr());
+
+            if (host.compare("127.0.0.1") == 0)
+            {
+                if ((c2pool::random::RandomFloat(0,1) < 0.8) && (!_p2p_node->get_peers().empty()))
+                {
+                    auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
+                    _proto->write(make_message<message_addrme>(msg->port.get()));
+                }
+            } else
+            {
+                _p2p_node->got_addr(std::make_tuple(host, std::to_string(msg->port.get())), other_services, dev::timestamp());
+                if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
+                {
+                    auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
+//                    _proto->write(make_message<message_addrs>(
+//                            //TODO:
+//                            );
+                }
+            }
         }
         void handle(shared_ptr<message_ping> msg)
         {
