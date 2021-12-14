@@ -213,6 +213,8 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
             packed[i] = stream.data[i];
         }
         stream.data.erase(stream.data.begin(), stream.data.begin() + _len);
+        if (BIG_ENDIAN)
+            std::reverse(packed, packed+_len);
         auto *_value = reinterpret_cast<INT_T *>(packed);
         value = *_value;
 
