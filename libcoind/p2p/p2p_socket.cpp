@@ -18,6 +18,7 @@ using std::tuple;
 namespace ip = boost::asio::ip;
 
 #include <networks/network.h>
+#include <libcoind/data.h>
 using namespace coind::p2p;
 using namespace coind::p2p::messages;
 
@@ -136,7 +137,18 @@ namespace coind::p2p
             value << unpacked_len;
 
             //checksum [-]
-            //TODO: sha256(sha256(payload))
+            PackStream payload_checksum_stream;
+            payload_checksum_stream << *msg;
+
+            auto __checksum = coind::data::hash256(payload_checksum_stream);
+            IntType(256) checksum_full(__checksum);
+            PackStream _packed_checksum;
+            _packed_checksum << checksum_full;
+            //TODO: почему результат реверснутый?
+            vector<unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
+            std::reverse(packed_checksum.begin(), packed_checksum.end());
+            PackStream checksum(packed_checksum);
+            value << checksum;
 
             //payload [+]
             value << payload_stream;

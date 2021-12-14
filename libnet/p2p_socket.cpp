@@ -121,57 +121,20 @@ namespace c2pool::libnet::p2p
             IntType(32) unpacked_len(payload_stream.size());
             value << unpacked_len;
 
-            //checksum []
-            //sha256(sha256(payload))
-//            auto __checksum = coind::data::hash256(payload_stream);
-//            IntType(256) checksum_full(__checksum);
-//            PackStream _packed_checksum;
-//            _packed_checksum << checksum_full;
-//            vector <unsigned char> packed_checksum(_packed_checksum.data.begin(), _packed_checksum.data.begin()+4);
-//            PackStream checksum(packed_checksum);
-//            value << checksum;
-
+            //checksum [+]
             PackStream payload_checksum_stream;
             payload_checksum_stream << *msg;
 
-            std::cout << "payload: ";
-            for (auto v : payload_checksum_stream.data){
-                std::cout << (unsigned int)v << " ";
-            }
-            std::cout << "\n";
-
             auto __checksum = coind::data::hash256(payload_checksum_stream);
-            std::cout << "__checksum: " << __checksum.GetHex() << std::endl;
             IntType(256) checksum_full(__checksum);
-            std::cout << "checksum_full: " << checksum_full.value.GetHex() << std::endl;
             PackStream _packed_checksum;
             _packed_checksum << checksum_full;
             //TODO: почему результат реверснутый?
-
             vector<unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
             std::reverse(packed_checksum.begin(), packed_checksum.end());
-            std::cout << "_packed_checksum: ";
-            for (auto v : _packed_checksum.data){
-                std::cout << (unsigned int)v << " " ;
-            }
-            std::cout << "\n";
-
-            std::cout << "_packed_checksum: ";
-            for (auto v : _packed_checksum.data){
-                std::cout << v << " " ;
-            }
-            std::cout << "\n";
-
-            std::cout << "packed_checksum: ";
-            for (auto v : packed_checksum){
-                std::cout << v;
-            }
-            std::cout << "\n";
-
             PackStream checksum(packed_checksum);
             value << checksum;
-
-
+            
             //payload [+]
             value << payload_stream;
 
