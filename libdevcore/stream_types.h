@@ -39,7 +39,7 @@ struct ListType : MakerListType<T>
 
     PackStream &write(PackStream &stream) const
     {
-        LOG_TRACE << "ListType Worked!";
+//        LOG_TRACE << "ListType Worked!";
         auto len = l.size();
         stream << len;
         for (auto v : l)
@@ -84,7 +84,7 @@ struct StrType : public Maker<StrType, string>
 
     PackStream &write(PackStream &stream) const
     {
-        LOG_TRACE << "StrType Worked!";
+//        LOG_TRACE << "StrType Worked!";
 
         char s[str.length() + 1];
         strcpy(s, str.c_str());
@@ -132,7 +132,7 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
 
     PackStream &write(PackStream &stream) const
     {
-        LOG_TRACE << "FixedStrType Worked!";
+//        LOG_TRACE << "FixedStrType Worked!";
 
         for (auto c : str)
         {
@@ -187,7 +187,7 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
 
     PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "IntType Worked!";
+//        LOG_TRACE << "IntType Worked!";
 
         INT_T value2 = value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
@@ -252,7 +252,7 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
 
     virtual PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "ULongIntType Worked!";
+//        LOG_TRACE << "ULongIntType Worked!";
 
         INT_T value2 = value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
@@ -337,8 +337,6 @@ struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
 
     PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "EnumType Worked!";
-
         PACK_TYPE v((typename PACK_TYPE::value_type)value);
         stream << v;
 
