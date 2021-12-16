@@ -189,7 +189,17 @@ namespace c2pool::libnet::p2p
         }
         void handle(shared_ptr<message_addrs> msg)
         {
-            //TODO:
+            for (auto addr_record : msg->addrs.l){
+                auto addr = addr_record.get();
+                _p2p_node->got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)), addr.address.services, std::min((int64_t) dev::timestamp(), addr.timestamp));
+
+                if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
+                {
+                    auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
+                    std::vector<c2pool::messages::stream::addr_stream> _addrs{addr_record};
+                    _proto->write(make_message<message_addrs>(_addrs));
+                }
+            }
         }
 
         //TODO: test:
