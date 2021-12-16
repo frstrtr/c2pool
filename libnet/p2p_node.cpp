@@ -117,14 +117,14 @@ namespace c2pool::libnet::p2p
 
     std::vector<addr> P2PNode::get_good_peers(int max_count)
     {
-        float t = c2pool::dev::timestamp();
+        int t = c2pool::dev::timestamp();
 
         std::vector<std::pair<float, addr>> values;
         for (auto kv : _addr_store->GetAll())
         {
             values.push_back(
                 std::make_pair(
-                    -log(max(3600.0, kv.second.last_seen - kv.second.first_seen)) / log(max(3600.0, t - kv.second.last_seen)) * c2pool::random::Expovariate(1),
+                    -log(max(3600, kv.second.last_seen - kv.second.first_seen)) / log(max(3600, t - kv.second.last_seen)) * c2pool::random::Expovariate(1),
                     kv.first));
         }
 

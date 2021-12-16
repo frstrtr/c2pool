@@ -34,6 +34,8 @@ namespace c2pool::dev
         int first_seen;
         int last_seen;
 
+        AddrValue() {}
+
         AddrValue(int _service, int _first_seen, int _last_seen){
             service = _service;
             first_seen = _first_seen;

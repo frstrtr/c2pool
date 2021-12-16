@@ -40,8 +40,8 @@ namespace c2pool::dev
         {
             store[key] = {
                 0,
-                (double)c2pool::dev::timestamp(),
-                (double)c2pool::dev::timestamp()};
+                (int) c2pool::dev::timestamp(),
+                (int) c2pool::dev::timestamp()};
         }
 
         //SAVE IN FILE
@@ -141,8 +141,8 @@ namespace c2pool::dev
             c2pool::libnet::addr key = std::make_tuple(AddrsValue[i]["address"].get_str(),
                                        AddrsValue[i]["port"].get_str());
             store[key] = {AddrsValue[i]["services"].get_int(),
-                          AddrsValue[i]["first_seen"].get_real(),
-                          AddrsValue[i]["last_seen"].get_real()};
+                          AddrsValue[i]["first_seen"].get_int(),
+                          AddrsValue[i]["last_seen"].get_int()};
         }
     }
 } // namespace c2pool::p2p
