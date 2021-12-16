@@ -39,9 +39,11 @@ namespace c2pool::libnet::messages
         cmd_sharereply,
         cmd_best_block, //TODO
         cmd_have_tx,
-        cmd_losing_tx
+        cmd_losing_tx,
+        cmd_forget_tx
     };
 
+    //TODO: remake for auto generate:
     const std::map<commands, std::string> _string_commands = {
         {cmd_error, "error"},
         {cmd_version, "version"},
@@ -55,7 +57,8 @@ namespace c2pool::libnet::messages
         {cmd_sharereply, "sharereply"},
         {cmd_best_block, "best_block"},
         {cmd_have_tx, "have_tx"},
-        {cmd_losing_tx, "losing_tx"}};
+        {cmd_losing_tx, "losing_tx"},
+        {cmd_forget_tx, "forget_tx"}};
 
     const std::map<std::string, commands> _reverse_string_commands = {
         {"error", cmd_error},
@@ -70,7 +73,9 @@ namespace c2pool::libnet::messages
         {"sharereply", cmd_sharereply},
         {"best_block", cmd_best_block},
         {"have_tx", cmd_have_tx},
-        {"losing_tx", cmd_losing_tx}};
+        {"losing_tx", cmd_losing_tx},
+        {"forget_tx", cmd_forget_tx}
+    };
 
     std::string string_commands(commands cmd);
 
@@ -441,6 +446,32 @@ namespace c2pool::libnet::messages
         message_losing_tx() : base_message("losing_tx") {}
 
         message_losing_tx(std::vector<uint256> _tx_hashes) : base_message("losing_tx")
+        {
+            tx_hashes = tx_hashes.make_type(_tx_hashes);
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << tx_hashes;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> tx_hashes;
+            return stream;
+        }
+    };
+
+    class message_forget_tx : public base_message
+    {
+    public:
+        ListType<IntType(256)> tx_hashes;
+
+    public:
+        message_forget_tx() : base_message("forget_tx") {}
+
+        message_forget_tx(std::vector<uint256> _tx_hashes) : base_message("forget_tx")
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }

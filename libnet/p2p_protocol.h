@@ -114,7 +114,11 @@ namespace c2pool::libnet::p2p
             case commands::cmd_losing_tx:
                 handle(GenerateMsg<message_losing_tx>(RawMSG->value));
                 break;
+            case commands::cmd_forget_tx:
+                handle(GenerateMsg<message_forget_tx>(RawMSG->value));
+                break;
             case commands::cmd_error:
+                //TODO: fix
                 handle(GenerateMsg<message_error>(RawMSG->value));
                 break;
             }
@@ -318,6 +322,11 @@ namespace c2pool::libnet::p2p
             //TODO:
         }
         void handle(shared_ptr<message_losing_tx> msg)
+        {
+            //TODO:
+        }
+
+        void handle(shared_ptr<message_forget_tx> msg)
         {
             //TODO:
         }
