@@ -283,6 +283,11 @@ namespace c2pool::libnet::messages
     public:
         message_addrs() : base_message("addrs") {}
 
+        message_addrs(std::vector<c2pool::messages::addr> _addrs) : base_message("addrs")
+        {
+            addrs = stream::addr_stream::make_list_type(_addrs); //TODO: test
+        }
+
         message_addrs(std::vector<c2pool::messages::stream::addr_stream> _addrs) : base_message("addrs")
         {
             addrs = _addrs;
