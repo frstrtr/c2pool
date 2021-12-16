@@ -187,11 +187,14 @@ namespace c2pool::libnet::p2p
 
             //TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
         }
+
         void handle(shared_ptr<message_addrs> msg)
         {
-            for (auto addr_record : msg->addrs.l){
+            for (auto addr_record : msg->addrs.l)
+            {
                 auto addr = addr_record.get();
-                _p2p_node->got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)), addr.address.services, std::min((int64_t) dev::timestamp(), addr.timestamp));
+                _p2p_node->got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)),
+                                    addr.address.services, std::min((int64_t) dev::timestamp(), addr.timestamp));
 
                 if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
                 {
@@ -229,12 +232,29 @@ namespace c2pool::libnet::p2p
         }
         void handle(shared_ptr<message_ping> msg)
         {
-            //TODO:
+
         }
+
+        //TODO: TEST
         void handle(shared_ptr<message_getaddrs> msg)
         {
-            //TODO:
+            uint32_t count = msg->count.get();
+            if (count > 100)
+                count = 100;
+
+            std::vector<c2pool::messages::addr> _addrs;
+            for (auto v : _p2p_node->get_good_peers(count))
+            {
+                auto _addr = _p2p_node->get_addr_store()->Get(v);
+                _addrs.push_back(
+                        c2pool::messages::addr(_addr.last_seen,
+                                               _addr.service, std::get<0>(v), dev::str_to_int<int>(std::get<1>(v)))
+                        );
+            }
+
+            write(make_message<message_addrs>(_addrs));
         }
+
         void handle(shared_ptr<message_error> msg)
         {
             LOG_WARNING << "Handled message_error! command = " << msg->command.get() << " ; error_text = " << msg->error_text.get();

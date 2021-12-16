@@ -70,6 +70,8 @@ namespace c2pool::libnet::p2p
         ip::tcp::resolver _resolver;
         //server
         ip::tcp::acceptor _acceptor;
+    public:
+        shared_ptr<c2pool::dev::AddrStore> get_addr_store() { return _addr_store; }
 
     private:
         unsigned long long node_id; //nonce
