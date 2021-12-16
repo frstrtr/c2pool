@@ -43,7 +43,7 @@ namespace c2pool::libnet::p2p
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
-        void got_addr(c2pool::libnet::addr _addr, uint64_t services, int timestamp);
+        void got_addr(c2pool::libnet::addr _addr, uint64_t services, int64_t timestamp);
 
 
         std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>>& get_peers();
