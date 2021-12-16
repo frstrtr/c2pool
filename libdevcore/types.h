@@ -298,10 +298,17 @@ namespace c2pool::messages::stream
         }
     };
 
-    struct addr_stream
+    struct addr_stream : Maker<addr_stream, addr>
     {
         IntType(64) timestamp;
         address_type_stream address;
+
+        addr_stream() {}
+
+        addr_stream(const addr& value)
+        {
+            *this = value;
+        }
 
         PackStream &write(PackStream &stream)
         {

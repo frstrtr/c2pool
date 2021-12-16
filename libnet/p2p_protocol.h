@@ -206,9 +206,10 @@ namespace c2pool::libnet::p2p
                 if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
                 {
                     auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
-//                    _proto->write(make_message<message_addrs>(
-//                            //TODO:
-//                            );
+                    std::vector<c2pool::messages::addr> _addrs {
+                        c2pool::messages::addr(dev::timestamp(),other_services,host, msg->port.get())
+                    };
+                    _proto->write(make_message<message_addrs>(_addrs));
                 }
             }
         }
