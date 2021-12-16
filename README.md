@@ -45,7 +45,7 @@ Telegram:
 
 Discord:
 
-### https://discord.gg/bK6ZA6AT3w
+### https://discord.gg/yb6ujsPRsv
 
 # Install:
 ```
