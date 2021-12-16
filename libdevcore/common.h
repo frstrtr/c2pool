@@ -17,7 +17,7 @@ namespace c2pool::dev
         return result;
     }
 
-    //TODO: create timestamp class
+    //int64_t/IntType(64)
     time_t timestamp();
 
     template <typename Derived, typename Base, typename Del>

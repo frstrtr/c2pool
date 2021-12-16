@@ -93,18 +93,18 @@ namespace c2pool::messages
     class addr
     {
     public:
-        int timestamp;
+        int64_t timestamp;
         address_type address;
 
         addr();
 
-        addr(int t, address_type a);
+        addr(int64_t t, address_type a);
 
-        addr(int t, int _services, std::string _address, int _port);
+        addr(int64_t t, int _services, std::string _address, int _port);
 
         addr &operator=(UniValue value)
         {
-            timestamp = value["timestamp"].get_int();
+            timestamp = value["timestamp"].get_int64();
 
             address = value["address"].get_obj();
             return *this;

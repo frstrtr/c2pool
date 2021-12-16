@@ -124,7 +124,7 @@ namespace c2pool::libnet::p2p
         {
             values.push_back(
                 std::make_pair(
-                    -log(max(3600, kv.second.last_seen - kv.second.first_seen)) / log(max(3600, t - kv.second.last_seen)) * c2pool::random::Expovariate(1),
+                    -log(max(int64_t(3600), kv.second.last_seen - kv.second.first_seen)) / log(max(int64_t(3600), t - kv.second.last_seen)) * c2pool::random::Expovariate(1),
                     kv.first));
         }
 
@@ -140,7 +140,7 @@ namespace c2pool::libnet::p2p
         return result;
     }
 
-    void P2PNode::got_addr(c2pool::libnet::addr _addr, uint64_t services, int timestamp)
+    void P2PNode::got_addr(c2pool::libnet::addr _addr, uint64_t services, int64_t timestamp)
     {
         if (_addr_store->Check(_addr)) {
             auto old = _addr_store->Get(_addr);
