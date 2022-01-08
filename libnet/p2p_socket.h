@@ -10,6 +10,7 @@
 #include "messages.h"
 #include <networks/network.h>
 #include <libdevcore/stream.h>
+#include <libdevcore/random.h>
 
 using namespace c2pool::libnet::messages;
 namespace ip = boost::asio::ip;
@@ -71,7 +72,7 @@ namespace c2pool::libnet::p2p
     {
     public:
         //for receive
-        P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node);
+        P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node, std::shared_ptr<boost::asio::io_context> __context);
 
         //for connect
         void connector_init(protocol_handle handle, const boost::asio::ip::tcp::resolver::results_type endpoints);
@@ -108,6 +109,9 @@ namespace c2pool::libnet::p2p
         void write_prefix(std::shared_ptr<base_message> msg);
         void write_message_data(std::shared_ptr<base_message> msg);
 
+    public:
+        boost::asio::steady_timer ping_timer;
+        boost::asio::steady_timer auto_disconnect_timer;
     private:
         ip::tcp::socket _socket;
 

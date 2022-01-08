@@ -27,7 +27,7 @@ namespace c2pool::libnet::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node) : _socket(std::move(socket)), _net(__net), _p2p_node(__p2p_node)
+    P2PSocket::P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node, std::shared_ptr<boost::asio::io_context> __context) : _socket(std::move(socket)), _net(__net), _p2p_node(__p2p_node), ping_timer(*__context), auto_disconnect_timer(*__context)
     {
     }
 
