@@ -9,7 +9,7 @@
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::JSONRPC_Coind> __coind) : _context(__context), _parent_net(__parent_net), _coind(__coind), _resolver(*_context), work_poller_t(*_context)
+    CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker) : _context(__context), _parent_net(__parent_net), _coind(__coind), _resolver(*_context), work_poller_t(*_context), _tracker(__tracker)
     {
         LOG_INFO << "CoindNode constructor";
         new_block = std::make_shared<Event<uint256>>();
@@ -79,6 +79,11 @@ namespace c2pool::libnet
         // });
 
         LOG_INFO << "... CoindNode started!"; //TODO: log coind name
+    }
+
+    shared_ptr<ShareTracker> CoindNode::tracker()
+    {
+        return _tracker;
     }
 
     //Каждые 15 секунд или получение ивента new_block, вызываем getwork у coind'a.

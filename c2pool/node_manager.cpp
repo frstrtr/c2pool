@@ -27,7 +27,7 @@ namespace c2pool::libnet
         //0:    COIND
         LOG_INFO << "Init Coind...";
         const char *coind_login = "user:VeryVeryLongPass123"; //TODO: from args
-        const char *coind_address = "192.168.10.10"; //TODO: from args
+        const char *coind_address = "217.72.4.157"; //TODO: from args
         const char *coind_port = "14024"; //TODO: from args
         _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, coind_address, coind_port, coind_login);
         //1:    Determining payout address
@@ -35,17 +35,18 @@ namespace c2pool::libnet
         LOG_INFO << "ShareStore initialization...";
         _share_store = std::make_shared<c2pool::shares::ShareStore>("dgb"); //TODO: init
         //Init work:
-        //3:    CoindNode
-        LOG_INFO << "CoindNode initialization...";
-        _coind_node = std::make_shared<c2pool::libnet::CoindNode>(_context, _parent_net, _coind);
-        //3.1:  CoindNode.start?
-        LOG_INFO << "CoindNode starting...";
-        coind_node()->start();
-        //4:    ShareTracker
+        //3:    ShareTracker
         LOG_INFO << "ShareTracker initialization...";
         _tracker = std::make_shared<ShareTracker>(_net, _parent_net);
-        //4.1:  Save shares every 60 seconds
+        //3.1:  Save shares every 60 seconds
         //TODO: timer in _tracker constructor
+
+        //4:    CoindNode
+        LOG_INFO << "CoindNode initialization...";
+        _coind_node = std::make_shared<c2pool::libnet::CoindNode>(_context, _parent_net, _coind, _tracker);
+        //4.1:  CoindNode.start?
+        LOG_INFO << "CoindNode starting...";
+        coind_node()->start();
         //...success!
 
         //Joing c2pool/p2pool network:
@@ -54,7 +55,7 @@ namespace c2pool::libnet
         //5.1:  Bootstrap_addrs
         //5.2:  Parse CLI args for addrs
         //6:    P2PNode
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context, _net, _config, _addr_store);
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context, _net, _config, _addr_store, _coind_node);
         //6.1:  P2PNode.start?
         p2pNode()->start();
         //7:    Save addrs every 60 seconds

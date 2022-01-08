@@ -52,7 +52,7 @@ namespace c2pool::shares
 
     class ShareTracker : public enable_shared_from_this<ShareTracker>
     {
-    private:
+    public:
         PrefsumShare shares;
         PrefsumVerifiedShare verified;
     public:

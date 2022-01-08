@@ -5,6 +5,8 @@
 #include <univalue.h>
 #include <btclibs/uint256.h>
 
+#include <boost/bind.hpp>
+
 #include "messages.h"
 #include "p2p_node.h"
 #include "p2p_socket.h"
@@ -72,6 +74,32 @@ namespace c2pool::libnet::p2p
 //            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, _p2p_node->get_nonce(), "c2pool-test", 1, best_hash_test_answer);
             auto msg = make_message<message_version>(version, 0, addrs1, addrs2, 254, "c2pool-test", 1, best_hash_test_answer);
             write(msg);
+
+            _socket->auto_disconnect_timer.expires_from_now(boost::asio::chrono::seconds(10));
+            _socket->auto_disconnect_timer.async_wait([&](const boost::system::error_code& ec)
+            {
+                if (!ec)
+                {
+                    _socket->disconnect();
+                    LOG_INFO << "Auto disconnect, peer: " << std::get<0>(_socket->get_addr()) << ":"
+                             << std::get<1>(_socket->get_addr());
+                }
+            });
+        }
+
+        void refresh_autodisconnect_timer()
+        {
+            _socket->auto_disconnect_timer.expires_from_now(boost::asio::chrono::seconds(100));
+            _socket->auto_disconnect_timer.async_wait([&](const boost::system::error_code& ec)
+                                                      {
+                                                          if (!ec)
+                                                          {
+                                                              _socket->disconnect();
+                                                              LOG_INFO << "Auto disconnect, peer: "
+                                                                       << std::get<0>(_socket->get_addr()) << ":"
+                                                                       << std::get<1>(_socket->get_addr());
+                                                          }
+                                                      });
         }
 
         void handle(shared_ptr<raw_message> RawMSG) override
@@ -122,6 +150,7 @@ namespace c2pool::libnet::p2p
                 handle(GenerateMsg<message_error>(RawMSG->value));
                 break;
             }
+            refresh_autodisconnect_timer();
         }
 
         template <class message_type, class... Args>
@@ -139,6 +168,17 @@ namespace c2pool::libnet::p2p
             shared_ptr<MsgType> msg = make_shared<MsgType>();
             stream >> *msg;
             return msg;
+        }
+
+        void ping_timer_func(const boost::system::error_code& ec)
+        {
+            int _time = (int) c2pool::random::Expovariate(100);
+            //LOG_TRACE << "TIME FROM EXPOVARIATE: " << _time;
+            _socket->ping_timer.expires_from_now(boost::asio::chrono::seconds(_time));
+            _socket->ping_timer.async_wait(boost::bind(&P2P_Protocol::ping_timer_func, this, _1));
+
+            auto msg = make_message<message_ping>();
+            write(msg);
         }
 
         void handle(shared_ptr<message_version> msg)
@@ -178,7 +218,8 @@ namespace c2pool::libnet::p2p
             //TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
             //*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
 
-            //TODO: send_ping, раз в random.expovariate(1/100)
+            _socket->ping_timer.expires_from_now(boost::asio::chrono::seconds((int) c2pool::random::Expovariate(1.0/100)));
+            _socket->ping_timer.async_wait(boost::bind(&P2P_Protocol::ping_timer_func, this, _1));
 
             //TODO: if (p2p_node->advertise_ip):
             //TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
@@ -259,6 +300,7 @@ namespace c2pool::libnet::p2p
         {
             LOG_WARNING << "Handled message_error! command = " << msg->command.get() << " ; error_text = " << msg->error_text.get();
         }
+
         void handle(shared_ptr<message_shares> msg)
         {
             //t0
@@ -301,8 +343,27 @@ namespace c2pool::libnet::p2p
             /*t1
             if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares))) */
         }
+
         void handle(shared_ptr<message_sharereq> msg)
         {
+            std::vector<uint256> hashes;
+            for (auto hash : msg->hashes.l)
+            {
+                hashes.push_back(hash.get());
+            }
+
+            std::vector<uint256> stops;
+            for (auto hash : msg->stops.l)
+            {
+                stops.push_back(hash.get());
+            }
+
+            //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
+            auto shares = _p2p_node->handle_get_shares(hashes, msg->parents.value, stops, _socket->get_addr());
+
+            //TODO:
+            //SEND_RHAREREPLY
+
             //TODO:
             // auto _shares = p2pNode()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());//TODO: handle_get_shares
             // vector<UniValue> packed_shares;
