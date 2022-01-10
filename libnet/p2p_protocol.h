@@ -361,29 +361,25 @@ namespace c2pool::libnet::p2p
             //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
             auto shares = _p2p_node->handle_get_shares(hashes, msg->parents.value, stops, _socket->get_addr());
 
-            //TODO:
-            //SEND_RHAREREPLY
-
-            //TODO:
-            // auto _shares = p2pNode()->handle_get_shares(msg->hashes, msg->parents, msg->stops, _socket->get_addr());//TODO: handle_get_shares
-            // vector<UniValue> packed_shares;
-            // //msg data: //uint256 _id, ShareReplyResult _result, std::vector<c2pool::shares::RawShare> _shares
-            // try
-            // {
-            //     for (auto share : _shares)
-            //     {
-            //         packed_shares.push_back(share); //TODO: pack share to UniValue[type + contents]
-            //     }
-            //     shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 0, _shares);
-            //     _socket->write(answer_msg);
-            // }
-            // catch (const std::invalid_argument &e) //TODO: when throw Payload too long
-            // {
-            //     packed_shares.clear();
-            //     shared_ptr<message_sharereply> answer_msg = make_message<message_sharereply>(msg->id, 1, _shares);
-            //     _socket->write(answer_msg);
-            // }
+            std::vector<share_type> _shares;
+            try
+            {
+                for (auto share : shares)
+                {
+                    auto contents = share->to_contents();
+                    share_type _share(share->SHARE_VERSION, contents.write());
+                    _shares.push_back(_share);
+                }
+                auto reply_msg = make_message<message_sharereply>(msg->id.get(), good, _shares);
+                write(reply_msg);
+            }
+            catch (const std::invalid_argument &e)
+            {
+                auto reply_msg = make_message<message_sharereply>(msg->id.get(), too_long, _shares);
+                write(reply_msg);
+            }
         }
+
         void handle(shared_ptr<message_sharereply> msg)
         {
             std::vector<shared_ptr<c2pool::shares::BaseShare>> res;
@@ -391,9 +387,12 @@ namespace c2pool::libnet::p2p
             {
                 for (auto share : msg->shares.l)
                 {
-                    if (share["type"].get_int() >= 17) //TODO: 17 = minimum share version; move to macros
+                    if (share.type.value >= 17) //TODO: 17 = minimum share version; move to macros
                     {
-                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(share, _net, _socket->get_addr());
+                        UniValue contents(UniValue::VOBJ);
+                        contents.read(share.contents.get());
+
+                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(contents, _net, _socket->get_addr());
                         res.push_back(_share);
                     }
                 }
@@ -404,10 +403,12 @@ namespace c2pool::libnet::p2p
             }
             //TODO: self.get_shares.got_response(id, res)
         }
-        //TODO:
-        // void handle(shared_ptr<message_best_block> msg){
-        //TODO:
-        //}
+
+        void handle(shared_ptr<message_bestblock> msg)
+        {
+            _p2p_node->handle_bestblock((shares::BlockHeaderType)msg->header);
+        }
+
         void handle(shared_ptr<message_have_tx> msg)
         {
             //TODO:

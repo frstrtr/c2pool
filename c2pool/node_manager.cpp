@@ -55,7 +55,7 @@ namespace c2pool::libnet
         //5.1:  Bootstrap_addrs
         //5.2:  Parse CLI args for addrs
         //6:    P2PNode
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context, _net, _config, _addr_store, _coind_node);
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context, _net, _config, _addr_store, _coind_node, _tracker);
         //6.1:  P2PNode.start?
         p2pNode()->start();
         //7:    Save addrs every 60 seconds

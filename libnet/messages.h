@@ -386,16 +386,16 @@ namespace c2pool::libnet::messages
     public:
         IntType(256) id;
         EnumType<ShareReplyResult, VarIntType> result;
-        ListType<UniValue> shares; //type + contents data
+        ListType<stream::share_type_stream> shares; //type + contents data
 
     public:
         message_sharereply() : base_message("sharereply") {}
 
-        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<UniValue> _shares) : base_message("sharereply")
+        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<share_type> _shares) : base_message("sharereply")
         {
             id = _id;
             result = _result;
-            shares = _shares;
+            shares = shares.make_type(_shares);
         }
 
         PackStream &write(PackStream &stream) override
@@ -407,6 +407,32 @@ namespace c2pool::libnet::messages
         PackStream &read(PackStream &stream) override
         {
             stream >> id >> result >> shares;
+            return stream;
+        }
+    };
+
+    class message_bestblock : public base_message
+    {
+    public:
+        shares::BlockHeaderType_stream header;
+
+    public:
+        message_bestblock() : base_message("bestblock") {}
+
+        message_bestblock(shares::BlockHeaderType _header) : base_message("bestblock")
+        {
+            header = _header;
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << header;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> header;
             return stream;
         }
     };
