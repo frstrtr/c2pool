@@ -198,6 +198,17 @@ namespace c2pool::shares
             nonce = value.nonce;
         }
 
+        operator BlockHeaderType()
+        {
+            BlockHeaderType result;
+            result.version = version.value;
+            result.previous_block = previous_block.get();
+            result.merkle_root = merkle_root.value;
+            result.timestamp = timestamp.value;
+            result.bits = bits.get();
+            result.nonce = nonce.value;
+        }
+
         PackStream &write(PackStream &stream)
         {
             stream << version << previous_block << merkle_root << timestamp << bits << nonce;

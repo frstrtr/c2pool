@@ -334,6 +334,41 @@ namespace c2pool::messages::stream
             return addr(timestamp.get(), address.services.get(), address.address.get(),address.port.get());
         }
     };
+
+    struct share_type_stream : Maker <share_type_stream, share_type> {
+        VarIntType type;
+        StrType contents;
+
+        share_type_stream() {};
+        share_type_stream(share_type val) {
+            type = val.type;
+            contents = val.contents;
+        };
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << type << contents;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> type >> contents;
+            return stream;
+        }
+
+        share_type_stream& operator =(const share_type& val)
+        {
+            type = val.type;
+            contents = val.contents;
+            return *this;
+        }
+
+        share_type get()
+        {
+            return share_type(type.value, contents.get());
+        }
+    };
 }
 
 namespace c2pool::libnet{
