@@ -44,6 +44,18 @@ namespace c2pool::libnet::p2p
         LOG_INFO << "... P2PNode started!";
     }
 
+    void P2PNode::handle_bestblock(shares::BlockHeaderType_stream header)
+    {
+        PackStream packed_header;
+        packed_header << header;
+
+        if (_net->parent->POW_FUNC(packed_header) > header.bits.bits.target())
+        {
+            throw std::invalid_argument("received block header fails PoW test");
+        }
+        //TODO: _coind_node->handle_header(header);
+    }
+
     void P2PNode::listen()
     {
         _acceptor.async_accept([this](boost::system::error_code ec, ip::tcp::socket socket)

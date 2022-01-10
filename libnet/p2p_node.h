@@ -79,9 +79,7 @@ namespace c2pool::libnet::p2p
             return shares;
         }
 
-        void handle_bestblock(shares::BlockHeaderType header){
-            //TODO:
-        }
+        void handle_bestblock(shares::BlockHeaderType_stream header);
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
         bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);

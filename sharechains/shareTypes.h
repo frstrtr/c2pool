@@ -202,7 +202,7 @@ namespace c2pool::shares
         {
             BlockHeaderType result;
             result.version = version.value;
-            result.previous_block = previous_block.get();
+            result.previous_block = previous_block.get().value;
             result.merkle_root = merkle_root.value;
             result.timestamp = timestamp.value;
             result.bits = bits.get();
