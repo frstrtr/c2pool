@@ -13,7 +13,7 @@ set(devcore_sources ${devcore_sources} types.h events.h prefsum.h stream.h strea
 find_library(dl NAMES dl)
 
 add_library(libdevcore ${devcore_sources})
-target_link_libraries(libdevcore Boost::log Boost::log_setup univalue ${dl})
-target_link_libraries(libdevcore btclibs Threads::Threads Boost::coroutine leveldb)
+target_link_libraries(libdevcore Boost::coroutine Boost::log Boost::log_setup univalue ${dl})
+target_link_libraries(libdevcore btclibs Threads::Threads leveldb)
 
 target_compile_definitions(libdevcore PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
