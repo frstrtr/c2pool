@@ -69,9 +69,10 @@ namespace c2pool::libnet
     private:
         boost::asio::deadline_timer work_poller_t;
         void work_poller();
-
-        void handle_header(const BlockHeaderType &new_header);
         void poll_header();
+    public:
+        void handle_header(const BlockHeaderType &new_header);
+
 
     private:
         shared_ptr<coind::ParentNetwork> _parent_net;
