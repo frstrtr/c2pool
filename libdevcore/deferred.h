@@ -121,7 +121,8 @@ namespace c2pool::util::deferred
         std::optional<RetType> result;
 
     public:
-        Deferred(std::shared_ptr<io::io_context> _context, io::yield_context _yield_context) : context(_context), yield_context(std::move(_yield_context)) //, result_timer(*context, callback_idle)
+        Deferred(std::shared_ptr<io::io_context> _context, io::yield_context _yield_context) : context(_context), yield_context(std::move(_yield_context)),
+                                                                                               __timer(*_context) //, result_timer(*context, callback_idle)
         {
         }
 
@@ -143,10 +144,13 @@ namespace c2pool::util::deferred
             callbacks.push_back(__callback);
         }
 
+    private:
+        io::steady_timer __timer;
+    public:
         //Таймер, который не блокирует yield_context
         void external_timer(std::function<void(const boost::system::error_code &ec)> __handler, const std::chrono::_V2::steady_clock::duration &expiry_time)
         {
-            io::steady_timer __timer(*context, expiry_time);
+            __timer.expires_from_now(expiry_time);
             __timer.async_wait(__handler);
         }
 

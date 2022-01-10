@@ -41,8 +41,43 @@ namespace po = boost::program_options;
 //     return in;
 // }
 
+#include <libdevcore/deferred.h>
+using namespace c2pool::util::deferred;
+
+
 int main(int ac, char *av[])
 {
+    std::shared_ptr<io::io_context> context = std::make_shared<io::io_context>(2);
+
+    shared_defer<int> defer;
+    context->post([&]()
+                  {
+                      defer = Deferred<int>::yield(context, [&](std::shared_ptr<Deferred<int>> def)
+                      {
+                          def->add_callback([&](int i)
+                                            { std::cout << "RESULT: " << i << std::endl; });
+                          std::cout << "before sleep:" <<  time(NULL) << std::endl;
+                          def->sleep(3s);
+                          std::cout << "after sleep:" <<  time(NULL) << std::endl;
+
+                          def->external_timer([&, def](const boost::system::error_code &ec)
+                                              {
+                                                  std::cout << "external timer:" <<  time(NULL) << std::endl;
+                              def->returnValue(15); },
+                                              5s);
+                          // def->returnValue(15);
+                          def->sleep(2s);
+                          std::cout << "2:" <<  time(NULL) << std::endl;
+                      });
+                  });
+
+    std::cout << "1:" <<  time(NULL) << std::endl;
+    io::steady_timer timer(*context, 1s);
+    timer.async_wait([&](const boost::system::error_code &ec)
+                     { std::cout << "timer: " << time(NULL) << std::endl; });
+    std::cout << "ok" << std::endl;
+    context->run();
+
     c2pool_config::INIT();
     //========================================================================================================================
     //TODO:
