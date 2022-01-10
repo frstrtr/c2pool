@@ -15,6 +15,10 @@ namespace coind::jsonrpc
     class Coind;
 }
 
+namespace coind{
+    class ParentNetwork;
+}
+
 namespace c2pool
 {
 #define CREATE_ADDR(addr, port) std::make_tuple<std::string, std::string>(addr, port)
@@ -23,6 +27,8 @@ namespace c2pool
     {
     public:
         const std::string net_name;
+    public:
+        std::shared_ptr<coind::ParentNetwork> parent;
     public:
         //std::tuple<std::string, std::string> = addr
         std::vector<std::tuple<std::string, std::string>> BOOTSTRAP_ADDRS; //217.72.6.241
@@ -45,13 +51,13 @@ namespace c2pool
         uint256 MAX_TARGET;
 
     protected:
-        Network(std::string name);
+        Network(std::string name, std::shared_ptr<coind::ParentNetwork> _parent_net);
     };
 
     class DigibyteNetwork : public Network
     {
     public:
-        DigibyteNetwork();
+        DigibyteNetwork(std::shared_ptr<coind::ParentNetwork> _parent);
     };
 
     /*

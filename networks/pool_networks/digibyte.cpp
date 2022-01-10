@@ -9,7 +9,7 @@ using std::shared_ptr;
 
 namespace c2pool
 {
-    DigibyteNetwork::DigibyteNetwork() : Network("DGB")
+    DigibyteNetwork::DigibyteNetwork(std::shared_ptr<coind::ParentNetwork> _parent) : Network("DGB", _parent)
     {
         BOOTSTRAP_ADDRS = {
             //CREATE_ADDR("217.72.4.157", "5024")

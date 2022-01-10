@@ -406,7 +406,7 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_bestblock> msg)
         {
-            _p2p_node->handle_bestblock((shares::BlockHeaderType)msg->header);
+            _p2p_node->handle_bestblock(msg->header);
         }
 
         void handle(shared_ptr<message_have_tx> msg)

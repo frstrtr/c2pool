@@ -22,10 +22,10 @@ namespace c2pool::master {
     shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool) {
         LOG_INFO << "Starting DGB initialization...";
         //Networks/Configs
-        LOG_INFO << "DGB_net initialization...";
-        auto DGB_net = std::make_shared<c2pool::DigibyteNetwork>();
         LOG_INFO << "DGB_parent_net initialization...";
         auto DGB_parent_net = std::make_shared<coind::DigibyteParentNetwork>();
+        LOG_INFO << "DGB_net initialization...";
+        auto DGB_net = std::make_shared<c2pool::DigibyteNetwork>(DGB_parent_net);
         LOG_INFO << "DGB_cfg initialization...";
         auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
         //NodeManager
