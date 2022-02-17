@@ -68,7 +68,7 @@ namespace c2pool::libnet::p2p
         std::set<uint256> remote_tx_hashes;
         int32_t remote_remembered_txs_size = 0;
 
-        std::map<uint256, coind::data::TransactionType> remembered_txs;
+        std::map<uint256, coind::data::stream::TransactionType_stream> remembered_txs;
         int32_t remembered_txs_size;
         //TODO: known_txs_cache
 
@@ -447,10 +447,7 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_have_tx> msg)
         {
-            for (auto v: msg->tx_hashes.l)
-            {
-                remote_tx_hashes.insert(v.get());
-            }
+            remote_tx_hashes.insert(msg->tx_hashes.l.begin(), msg->tx_hashes.l.end());
             if (remote_tx_hashes.size() > 10000)
             {
                 remote_tx_hashes.erase(remote_tx_hashes.begin(),
@@ -462,10 +459,7 @@ namespace c2pool::libnet::p2p
         {
             //remove all msg->txs hashes from remote_tx_hashes
             std::set<uint256> losing_txs;
-            for (auto v: msg->tx_hashes.l)
-            {
-                losing_txs.insert(v.get());
-            }
+            losing_txs.insert(msg->tx_hashes.l.begin(), msg->tx_hashes.l.end());
 
             std::set<uint256> diff_txs;
             std::set_difference(remote_tx_hashes.begin(), remote_tx_hashes.end(),
@@ -477,14 +471,54 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_remember_tx> msg)
         {
-            //TODO:
+            for (auto tx_hash: msg->tx_hashes.l)
+            {
+                if (remembered_txs.find(tx_hash.get()) != remembered_txs.end())
+                {
+                    LOG_WARNING << "Peer referenced transaction twice, disconnecting";
+                    _socket->disconnect();
+                    return;
+                }
+
+                coind::data::stream::TransactionType_stream tx;
+                //TODO: _p2p_node.known_txs_var
+                if (_p2p_node->known_txs_var.find(tx_hash.get()) != _p2p_node->known_txs_var.end())
+                {
+                    tx = _p2p_node.known_txs_var[tx_hash.get()];
+                } else
+                {
+                    for (auto cache : known_txs_cache)
+                    {
+                        if (cache.find(tx_hash.get()) != cache.end())
+                        {
+                            tx = cache[tx_hash.get()];
+                            LOG_INFO << "Transaction " << tx_hash.get().ToString() << " rescued from peer latency cache!";
+                            break;
+                        } else
+                        {
+                            LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.get().ToString() << " disconnecting";
+                            _socket->disconnect();
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (remembered_txs_size >= max_remembered_txs_size)
+            {
+                throw std::runtime_error("too much transaction data stored!");
+            }
         }
 
         void handle(shared_ptr<message_forget_tx> msg)
         {
             for (auto tx_hash : msg->tx_hashes.l)
             {
-                //remembered_txs_size -= 100 + pack
+                PackStream stream;
+                stream << remembered_txs[tx_hash.get()];
+                remembered_txs_size -= 100 + stream.size();
+                assert(remembered_txs_size >= 0);
+                remembered_txs.erase(tx_hash.get());
             }
         }
     };
