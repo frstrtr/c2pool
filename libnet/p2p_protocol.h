@@ -45,13 +45,16 @@ namespace c2pool::libnet::p2p
 
     public:
 
-        virtual void write(std::shared_ptr<base_message> msg){
+        virtual void write(std::shared_ptr<base_message> msg)
+        {
             _socket->write(msg);
         }
 
-        virtual void handle(shared_ptr<raw_message> RawMSG) {}
+        virtual void handle(shared_ptr<raw_message> RawMSG)
+        {}
 
-        virtual shared_ptr<raw_message> make_raw_message(std::string cmd) { return make_shared<raw_message>(cmd); }
+        virtual shared_ptr<raw_message> make_raw_message(std::string cmd)
+        { return make_shared<raw_message>(cmd); }
     };
 
     class P2P_Protocol : public Protocol
@@ -60,7 +63,9 @@ namespace c2pool::libnet::p2p
         std::shared_ptr<c2pool::Network> _net;
         std::shared_ptr<libnet::p2p::P2PNode> _p2p_node;
     public:
-        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node) : Protocol(socket), _net(__net), _p2p_node(__p2p_node)
+        P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, std::shared_ptr<c2pool::Network> __net,
+                     std::shared_ptr<libnet::p2p::P2PNode> __p2p_node) : Protocol(socket), _net(__net),
+                                                                         _p2p_node(__p2p_node)
         {
             LOG_TRACE << "P2P_Protocol: "
                       << "start constructor";
@@ -72,25 +77,27 @@ namespace c2pool::libnet::p2p
             uint256 best_hash_test_answer;
             best_hash_test_answer.SetHex("06abb7263fc73665f1f5b129959d90419fea5b1fdbea6216e8847bcc286c14e9");
 //            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, _p2p_node->get_nonce(), "c2pool-test", 1, best_hash_test_answer);
-            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, 254, "c2pool-test", 1, best_hash_test_answer);
+            auto msg = make_message<message_version>(version, 0, addrs1, addrs2, 254, "c2pool-test", 1,
+                                                     best_hash_test_answer);
             write(msg);
 
             _socket->auto_disconnect_timer.expires_from_now(boost::asio::chrono::seconds(10));
-            _socket->auto_disconnect_timer.async_wait([&](const boost::system::error_code& ec)
-            {
-                if (!ec)
-                {
-                    _socket->disconnect();
-                    LOG_INFO << "Auto disconnect, peer: " << std::get<0>(_socket->get_addr()) << ":"
-                             << std::get<1>(_socket->get_addr());
-                }
-            });
+            _socket->auto_disconnect_timer.async_wait([&](const boost::system::error_code &ec)
+                                                      {
+                                                          if (!ec)
+                                                          {
+                                                              _socket->disconnect();
+                                                              LOG_INFO << "Auto disconnect, peer: "
+                                                                       << std::get<0>(_socket->get_addr()) << ":"
+                                                                       << std::get<1>(_socket->get_addr());
+                                                          }
+                                                      });
         }
 
         void refresh_autodisconnect_timer()
         {
             _socket->auto_disconnect_timer.expires_from_now(boost::asio::chrono::seconds(100));
-            _socket->auto_disconnect_timer.async_wait([&](const boost::system::error_code& ec)
+            _socket->auto_disconnect_timer.async_wait([&](const boost::system::error_code &ec)
                                                       {
                                                           if (!ec)
                                                           {
@@ -107,53 +114,56 @@ namespace c2pool::libnet::p2p
             LOG_DEBUG << "called HANDLE msg in p2p_protocol" << ", with name_type = " << RawMSG->command;
             switch (reverse_string_commands(RawMSG->command.c_str()))
             {
-            case commands::cmd_version:
-                handle(GenerateMsg<message_version>(RawMSG->value));
-                break;
-            case commands::cmd_ping:
-                handle(GenerateMsg<message_ping>(RawMSG->value));
-                break;
-            case commands::cmd_addrme:
-                handle(GenerateMsg<message_addrme>(RawMSG->value));
-                break;
-            case commands::cmd_addrs:
-                handle(GenerateMsg<message_addrs>(RawMSG->value));
-                break;
-            case commands::cmd_getaddrs:
-                handle(GenerateMsg<message_getaddrs>(RawMSG->value));
-                break;
-            //new:
-            case commands::cmd_shares:
-                handle(GenerateMsg<message_shares>(RawMSG->value));
-                break;
-            case commands::cmd_sharereq:
-                handle(GenerateMsg<message_sharereq>(RawMSG->value));
-                break;
-            case commands::cmd_sharereply:
-                handle(GenerateMsg<message_sharereply>(RawMSG->value));
-                break;
-            //TODO:
-            // case commands::cmd_best_block:
-            //     handle(GenerateMsg<message_best_block>(RawMSG->value));
-            //     break;
-            case commands::cmd_have_tx:
-                handle(GenerateMsg<message_have_tx>(RawMSG->value));
-                break;
-            case commands::cmd_losing_tx:
-                handle(GenerateMsg<message_losing_tx>(RawMSG->value));
-                break;
-            case commands::cmd_forget_tx:
-                handle(GenerateMsg<message_forget_tx>(RawMSG->value));
-                break;
-            case commands::cmd_error:
-                //TODO: fix
-                handle(GenerateMsg<message_error>(RawMSG->value));
-                break;
+                case commands::cmd_version:
+                    handle(GenerateMsg<message_version>(RawMSG->value));
+                    break;
+                case commands::cmd_ping:
+                    handle(GenerateMsg<message_ping>(RawMSG->value));
+                    break;
+                case commands::cmd_addrme:
+                    handle(GenerateMsg<message_addrme>(RawMSG->value));
+                    break;
+                case commands::cmd_addrs:
+                    handle(GenerateMsg<message_addrs>(RawMSG->value));
+                    break;
+                case commands::cmd_getaddrs:
+                    handle(GenerateMsg<message_getaddrs>(RawMSG->value));
+                    break;
+                    //new:
+                case commands::cmd_shares:
+                    handle(GenerateMsg<message_shares>(RawMSG->value));
+                    break;
+                case commands::cmd_sharereq:
+                    handle(GenerateMsg<message_sharereq>(RawMSG->value));
+                    break;
+                case commands::cmd_sharereply:
+                    handle(GenerateMsg<message_sharereply>(RawMSG->value));
+                    break;
+                    //TODO:
+                    // case commands::cmd_best_block:
+                    //     handle(GenerateMsg<message_best_block>(RawMSG->value));
+                    //     break;
+                case commands::cmd_have_tx:
+                    handle(GenerateMsg<message_have_tx>(RawMSG->value));
+                    break;
+                case commands::cmd_losing_tx:
+                    handle(GenerateMsg<message_losing_tx>(RawMSG->value));
+                    break;
+                case commands::cmd_forget_tx:
+                    handle(GenerateMsg<message_forget_tx>(RawMSG->value));
+                    break;
+                case commands::cmd_remember_tx:
+                    handle(GenerateMsg<message_remember_tx>(RawMSG->value));
+                    break;
+                case commands::cmd_error:
+                    //TODO: fix
+                    handle(GenerateMsg<message_error>(RawMSG->value));
+                    break;
             }
             refresh_autodisconnect_timer();
         }
 
-        template <class message_type, class... Args>
+        template<class message_type, class... Args>
         shared_ptr<message_type> make_message(Args &&...args)
         {
             auto msg = std::make_shared<message_type>(args...);
@@ -161,7 +171,7 @@ namespace c2pool::libnet::p2p
         }
 
     protected:
-        template <class MsgType>
+        template<class MsgType>
         //template <class MsgType<>, class ct = converter_type>
         shared_ptr<MsgType> GenerateMsg(PackStream &stream)
         {
@@ -170,7 +180,7 @@ namespace c2pool::libnet::p2p
             return msg;
         }
 
-        void ping_timer_func(const boost::system::error_code& ec)
+        void ping_timer_func(const boost::system::error_code &ec)
         {
             int _time = (int) c2pool::random::Expovariate(100);
             //LOG_TRACE << "TIME FROM EXPOVARIATE: " << _time;
@@ -184,32 +194,39 @@ namespace c2pool::libnet::p2p
         void handle(shared_ptr<message_version> msg)
         {
             LOG_DEBUG << "handle message_version";
-            LOG_INFO << "Peer " << msg->addr_from.address.get() << ":" << msg->addr_from.port.get() << " says protocol version is " << msg->version.get() << ", client version " << msg->sub_version.get();
+            LOG_INFO << "Peer " << msg->addr_from.address.get() << ":" << msg->addr_from.port.get()
+                     << " says protocol version is " << msg->version.get() << ", client version "
+                     << msg->sub_version.get();
 
             if (other_version != -1)
             {
-                LOG_DEBUG << "more than one version message"; 
+                LOG_DEBUG << "more than one version message";
             }
-            if (msg->version.get() < _net->MINIMUM_PROTOCOL_VERSION){
+            if (msg->version.get() < _net->MINIMUM_PROTOCOL_VERSION)
+            {
                 LOG_DEBUG << "peer too old";
             }
 
-            other_version = msg->version.get() ;
+            other_version = msg->version.get();
             other_sub_version = msg->sub_version.get();
-            other_services = msg->services.get() ;
+            other_services = msg->services.get();
 
-            if (msg->nonce.get() == _p2p_node->get_nonce()){
+            if (msg->nonce.get() == _p2p_node->get_nonce())
+            {
                 LOG_WARNING << "was connected to self";
                 //TODO: assert
             }
 
             //detect duplicate in node->peers
-            if (_p2p_node->get_peers().find(msg->nonce.get()) != _p2p_node->get_peers().end()){
+            if (_p2p_node->get_peers().find(msg->nonce.get()) != _p2p_node->get_peers().end())
+            {
 
             }
-            if (_p2p_node->get_peers().count(msg->nonce.get()) != 0){
+            if (_p2p_node->get_peers().count(msg->nonce.get()) != 0)
+            {
                 auto addr = _socket->get_addr();
-                LOG_WARNING << "Detected duplicate connection, disconnecting from " << std::get<0>(addr) << ":" << std::get<1>(addr);
+                LOG_WARNING << "Detected duplicate connection, disconnecting from " << std::get<0>(addr) << ":"
+                            << std::get<1>(addr);
                 _socket->disconnect();
                 return;
             }
@@ -218,7 +235,8 @@ namespace c2pool::libnet::p2p
             //TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
             //*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
 
-            _socket->ping_timer.expires_from_now(boost::asio::chrono::seconds((int) c2pool::random::Expovariate(1.0/100)));
+            _socket->ping_timer.expires_from_now(
+                    boost::asio::chrono::seconds((int) c2pool::random::Expovariate(1.0 / 100)));
             _socket->ping_timer.async_wait(boost::bind(&P2P_Protocol::ping_timer_func, this, _1));
 
             //TODO: if (p2p_node->advertise_ip):
@@ -231,7 +249,7 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_addrs> msg)
         {
-            for (auto addr_record : msg->addrs.l)
+            for (auto addr_record: msg->addrs.l)
             {
                 auto addr = addr_record.get();
                 _p2p_node->got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)),
@@ -253,24 +271,26 @@ namespace c2pool::libnet::p2p
 
             if (host.compare("127.0.0.1") == 0)
             {
-                if ((c2pool::random::RandomFloat(0,1) < 0.8) && (!_p2p_node->get_peers().empty()))
+                if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
                 {
                     auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
                     _proto->write(make_message<message_addrme>(msg->port.get()));
                 }
             } else
             {
-                _p2p_node->got_addr(std::make_tuple(host, std::to_string(msg->port.get())), other_services, dev::timestamp());
+                _p2p_node->got_addr(std::make_tuple(host, std::to_string(msg->port.get())), other_services,
+                                    dev::timestamp());
                 if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
                 {
                     auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
-                    std::vector<c2pool::messages::addr> _addrs {
-                        c2pool::messages::addr(dev::timestamp(),other_services,host, msg->port.get())
+                    std::vector<c2pool::messages::addr> _addrs{
+                            c2pool::messages::addr(dev::timestamp(), other_services, host, msg->port.get())
                     };
                     _proto->write(make_message<message_addrs>(_addrs));
                 }
             }
         }
+
         void handle(shared_ptr<message_ping> msg)
         {
 
@@ -281,16 +301,18 @@ namespace c2pool::libnet::p2p
         {
             uint32_t count = msg->count.get();
             if (count > 100)
+            {
                 count = 100;
+            }
 
             std::vector<c2pool::messages::addr> _addrs;
-            for (auto v : _p2p_node->get_good_peers(count))
+            for (auto v: _p2p_node->get_good_peers(count))
             {
                 auto _addr = _p2p_node->get_addr_store()->Get(v);
                 _addrs.push_back(
                         c2pool::messages::addr(_addr.last_seen,
                                                _addr.service, std::get<0>(v), dev::str_to_int<int>(std::get<1>(v)))
-                        );
+                );
             }
 
             write(make_message<message_addrs>(_addrs));
@@ -298,24 +320,28 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_error> msg)
         {
-            LOG_WARNING << "Handled message_error! command = " << msg->command.get() << " ; error_text = " << msg->error_text.get();
+            LOG_WARNING << "Handled message_error! command = " << msg->command.get() << " ; error_text = "
+                        << msg->error_text.get();
         }
 
         void handle(shared_ptr<message_shares> msg)
         {
             //t0
             vector<tuple<shared_ptr<c2pool::shares::BaseShare>, vector<UniValue>>> result; //share, txs
-            for (auto wrappedshare : msg->raw_shares)
+            for (auto wrappedshare: msg->raw_shares)
             {
                 int _type = wrappedshare["type"].get_int();
-                if (_type < 17) //TODO: 17 = minimum share version; move to macros
+                if (_type < 17)
+                { //TODO: 17 = minimum share version; move to macros
                     continue;
+                }
 
-                shared_ptr<c2pool::shares::BaseShare> share = c2pool::shares::load_share(wrappedshare, _net, _socket->get_addr());
+                shared_ptr<c2pool::shares::BaseShare> share = c2pool::shares::load_share(wrappedshare, _net,
+                                                                                         _socket->get_addr());
                 std::vector<UniValue> txs;
                 if (_type >= 13)
                 {
-                    for (auto tx_hash : share->new_transaction_hashes)
+                    for (auto tx_hash: share->new_transaction_hashes)
                     {
                         //TODO: txs
                         /*
@@ -347,13 +373,13 @@ namespace c2pool::libnet::p2p
         void handle(shared_ptr<message_sharereq> msg)
         {
             std::vector<uint256> hashes;
-            for (auto hash : msg->hashes.l)
+            for (auto hash: msg->hashes.l)
             {
                 hashes.push_back(hash.get());
             }
 
             std::vector<uint256> stops;
-            for (auto hash : msg->stops.l)
+            for (auto hash: msg->stops.l)
             {
                 stops.push_back(hash.get());
             }
@@ -364,7 +390,7 @@ namespace c2pool::libnet::p2p
             std::vector<share_type> _shares;
             try
             {
-                for (auto share : shares)
+                for (auto share: shares)
                 {
                     auto contents = share->to_contents();
                     share_type _share(share->SHARE_VERSION, contents.write());
@@ -385,19 +411,19 @@ namespace c2pool::libnet::p2p
             std::vector<shared_ptr<c2pool::shares::BaseShare>> res;
             if (msg->result.value == 0)
             {
-                for (auto share : msg->shares.l)
+                for (auto share: msg->shares.l)
                 {
                     if (share.type.value >= 17) //TODO: 17 = minimum share version; move to macros
                     {
                         UniValue contents(UniValue::VOBJ);
                         contents.read(share.contents.get());
 
-                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(contents, _net, _socket->get_addr());
+                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(contents, _net,
+                                                                                                  _socket->get_addr());
                         res.push_back(_share);
                     }
                 }
-            }
-            else
+            } else
             {
                 //TODO: res = failure.Failure(self.ShareReplyError(result))
             }
@@ -413,7 +439,13 @@ namespace c2pool::libnet::p2p
         {
             //TODO:
         }
+
         void handle(shared_ptr<message_losing_tx> msg)
+        {
+            //TODO:
+        }
+
+        void handle(shared_ptr<message_remember_tx> msg)
         {
             //TODO:
         }
