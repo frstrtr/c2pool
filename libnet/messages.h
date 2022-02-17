@@ -14,6 +14,7 @@
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
 #include <libdevcore/logger.h>
+#include <libcoind/transaction.h>
 
 using namespace c2pool::messages;
 
@@ -40,6 +41,7 @@ namespace c2pool::libnet::messages
         cmd_best_block, //TODO
         cmd_have_tx,
         cmd_losing_tx,
+        cmd_remember_tx,
         cmd_forget_tx
     };
 
@@ -472,6 +474,32 @@ namespace c2pool::libnet::messages
         message_losing_tx() : base_message("losing_tx") {}
 
         message_losing_tx(std::vector<uint256> _tx_hashes) : base_message("losing_tx")
+        {
+            tx_hashes = tx_hashes.make_type(_tx_hashes);
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << tx_hashes;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> tx_hashes;
+            return stream;
+        }
+    };
+
+    class message_remember_tx : public base_message
+    {
+    public:
+        ListType<IntType(256)> tx_hashes;
+        ListType<coind::data::stream::TransactionType_stream> txs;
+    public:
+        message_remember_tx() : base_message("remember_tx") {}
+
+        message_remember_tx(std::vector<uint256> _tx_hashes) : base_message("remember_tx")
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }
