@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <string>
+#include <iterator>
+#include <algorithm>
 #include <univalue.h>
 #include <btclibs/uint256.h>
 
@@ -62,6 +64,14 @@ namespace c2pool::libnet::p2p
     private:
         std::shared_ptr<c2pool::Network> _net;
         std::shared_ptr<libnet::p2p::P2PNode> _p2p_node;
+
+        std::set<uint256> remote_tx_hashes;
+        int32_t remote_remembered_txs_size = 0;
+
+        std::map<uint256, coind::data::TransactionType> remembered_txs;
+        int32_t remembered_txs_size;
+        //TODO: known_txs_cache
+
     public:
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, std::shared_ptr<c2pool::Network> __net,
                      std::shared_ptr<libnet::p2p::P2PNode> __p2p_node) : Protocol(socket), _net(__net),
@@ -437,12 +447,32 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_have_tx> msg)
         {
-            //TODO:
+            for (auto v: msg->tx_hashes.l)
+            {
+                remote_tx_hashes.insert(v.get());
+            }
+            if (remote_tx_hashes.size() > 10000)
+            {
+                remote_tx_hashes.erase(remote_tx_hashes.begin(),
+                                       std::next(remote_tx_hashes.begin(), remote_tx_hashes.size() - 10000));
+            }
         }
 
         void handle(shared_ptr<message_losing_tx> msg)
         {
-            //TODO:
+            //remove all msg->txs hashes from remote_tx_hashes
+            std::set<uint256> losing_txs;
+            for (auto v: msg->tx_hashes.l)
+            {
+                losing_txs.insert(v.get());
+            }
+
+            std::set<uint256> diff_txs;
+            std::set_difference(remote_tx_hashes.begin(), remote_tx_hashes.end(),
+                                losing_txs.begin(), losing_txs.end(),
+                                std::inserter(diff_txs, diff_txs.begin()));
+
+            remote_tx_hashes = diff_txs;
         }
 
         void handle(shared_ptr<message_remember_tx> msg)
@@ -452,7 +482,10 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_forget_tx> msg)
         {
-            //TODO:
+            for (auto tx_hash : msg->tx_hashes.l)
+            {
+                //remembered_txs_size -= 100 + pack
+            }
         }
     };
 } // namespace c2pool::p2p
