@@ -56,13 +56,13 @@ namespace c2pool::messages
         timestamp = 0;
     }
 
-    addr::addr(int t, address_type a)
+    addr::addr(int64_t t, address_type a)
     {
         address = a;
         timestamp = t;
     }
 
-    addr::addr(int t, int _services, std::string _address, int _port)
+    addr::addr(int64_t t, int _services, std::string _address, int _port)
     {
         address_type a = address_type(_services, _address, _port);
         address = a;
@@ -110,5 +110,5 @@ namespace c2pool::messages
     {
         return !(first == second);
     }
-    
+
 } // namespace c2pool::messages

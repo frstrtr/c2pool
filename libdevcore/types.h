@@ -7,9 +7,12 @@
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
+#include <boost/algorithm/string.hpp>
+#include <boost/lexical_cast.hpp>
 
 #include "common.h"
 #include "logger.h"
+#include "stream_types.h"
 
 //todo: move all methods to types.cpp
 namespace c2pool::messages
@@ -90,18 +93,18 @@ namespace c2pool::messages
     class addr
     {
     public:
-        int timestamp;
+        int64_t timestamp;
         address_type address;
 
         addr();
 
-        addr(int t, address_type a);
+        addr(int64_t t, address_type a);
 
-        addr(int t, int _services, std::string _address, int _port);
+        addr(int64_t t, int _services, std::string _address, int _port);
 
         addr &operator=(UniValue value)
         {
-            timestamp = value["timestamp"].get_int();
+            timestamp = value["timestamp"].get_int64();
 
             address = value["address"].get_obj();
             return *this;
@@ -170,6 +173,203 @@ namespace c2pool::messages
         }
     };
 } // namespace c2pool::messages
+
+namespace c2pool::messages::stream
+{
+    struct IPV6AddressType
+    {
+        std::string value;
+
+        IPV6AddressType()
+        {
+
+        }
+
+        IPV6AddressType(std::string _value) : value(_value)
+        {
+
+        }
+
+        IPV6AddressType &operator=(std::string _value)
+        {
+            value = _value;
+            return *this;
+        }
+
+        std::string get() const
+        {
+            return value;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            //TODO: IPV6
+//            if ':' in item:
+//                data = ''.join(item.replace(':', '')).decode('hex')
+//            else
+
+            std::vector<std::string> split_res;
+            boost::algorithm::split(split_res, value, boost::is_any_of("."));
+            if (split_res.size() != 4) {
+                throw (std::runtime_error("Invalid address in IPV6AddressType"));
+            }
+
+            vector<unsigned int> bits;
+            for (auto bit: split_res) {
+                int bit_int = 0;
+                try {
+                    bit_int = boost::lexical_cast<unsigned int>(bit);
+                } catch (boost::bad_lexical_cast const &) {
+                    LOG_ERROR << "Error lexical cast in IPV6AddressType";
+                }
+                bits.push_back(bit_int);
+            }
+
+            vector<unsigned char> data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+            for (auto x: bits) {
+                data.push_back((unsigned char) x);
+            }
+
+            PackStream _data(data);
+            stream << _data;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            vector<unsigned char> hex_data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+            if (stream.size() >= 16) {
+                vector<unsigned char> data{stream.data.begin(), stream.data.begin() + 16};
+                stream.data.erase(stream.data.begin(), stream.data.begin() + 16);
+                bool ipv4 = true;
+                for (int i = 0; i < 12; i++) {
+                    if (data[i] != hex_data[i]) {
+                        ipv4 = false;
+                        break;
+                    }
+                }
+
+                if (ipv4) {
+                    vector<std::string> nums;
+                    for (int i = 12; i < 16; i++) {
+                        auto num = std::to_string((unsigned int) data[i]);
+                        nums.push_back(num);
+                    }
+                    value = boost::algorithm::join(nums, ".");
+                } else {
+                    //TODO: IPV6
+                }
+            } else {
+                throw std::runtime_error("Invalid address!");
+            }
+            return stream;
+        }
+    };
+
+    struct address_type_stream
+    {
+        IntType(64) services;
+        IPV6AddressType address; //IPV6AddressType
+        IntType<uint16_t, true> port;
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << services << address << port;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> services >> address >> port;
+            return stream;
+        }
+
+        address_type_stream& operator =(const address_type& val)
+        {
+            services = val.services;
+            address = val.address;
+            port = val.port;
+            return *this;
+        }
+
+        address_type get()
+        {
+            return address_type(services.get(), address.get(), port.get());
+        }
+    };
+
+    struct addr_stream : Maker<addr_stream, addr>
+    {
+        IntType(64) timestamp;
+        address_type_stream address;
+
+        addr_stream() {}
+
+        addr_stream(const addr& value)
+        {
+            *this = value;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << timestamp << address;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> timestamp >> address;
+            return stream;
+        }
+
+        addr_stream& operator =(const addr& val)
+        {
+            timestamp = val.timestamp;
+            address = val.address;
+            return *this;
+        }
+
+        addr get()
+        {
+            return addr(timestamp.get(), address.services.get(), address.address.get(),address.port.get());
+        }
+    };
+
+    struct share_type_stream : Maker <share_type_stream, share_type> {
+        VarIntType type;
+        StrType contents;
+
+        share_type_stream() {};
+        share_type_stream(share_type val) {
+            type = val.type;
+            contents = val.contents;
+        };
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << type << contents;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> type >> contents;
+            return stream;
+        }
+
+        share_type_stream& operator =(const share_type& val)
+        {
+            type = val.type;
+            contents = val.contents;
+            return *this;
+        }
+
+        share_type get()
+        {
+            return share_type(type.value, contents.get());
+        }
+    };
+}
 
 namespace c2pool::libnet{
     typedef std::tuple<std::string, std::string> addr;

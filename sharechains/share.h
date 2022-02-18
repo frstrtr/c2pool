@@ -32,8 +32,8 @@ namespace c2pool::shares
 {
     class BaseShare : public DBObject
     {
-        const int SHARE_VERSION; //init in constructor
     public:
+        const int SHARE_VERSION; //init in constructor
         static const int32_t gentx_size = 50000;
 
     public:
@@ -90,6 +90,8 @@ namespace c2pool::shares
         }
 
         virtual void contents_load(UniValue contents);
+
+        virtual UniValue to_contents();
 
         virtual bool check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/);
 

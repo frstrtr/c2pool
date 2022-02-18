@@ -5,7 +5,7 @@
 #include <libnet/p2p_node.h>
 #include <libnet/coind_node.h>
 #include <libnet/worker.h>
-#include <libcoind/jsonrpc/coind.h>
+#include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/jsonrpc/stratum.h>
 #include <sharechains/tracker.h>
 #include <sharechains/shareStore.h>
@@ -26,27 +26,27 @@ namespace c2pool::libnet
 
         //0:    COIND
         LOG_INFO << "Init Coind...";
-        const char *coind_username = "user"; //TODO: from args
-        const char *coind_password = "VeryVeryLongPass123"; //TODO: from args
-        const char *coind_address = "http://192.168.10.10:14024";  //TODO: from args
-        //Coind(char *username, char *password, char *address, shared_ptr<coind::ParentNetwork> _net)
-        _coind = std::make_shared<coind::jsonrpc::Coind>(coind_username, coind_password, coind_address, _parent_net);
+        const char *coind_login = "user:VeryVeryLongPass123"; //TODO: from args
+        const char *coind_address = "217.72.4.157"; //TODO: from args
+        const char *coind_port = "14024"; //TODO: from args
+        _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, coind_address, coind_port, coind_login);
         //1:    Determining payout address
         //2:    ShareStore
         LOG_INFO << "ShareStore initialization...";
         _share_store = std::make_shared<c2pool::shares::ShareStore>("dgb"); //TODO: init
         //Init work:
-        //3:    CoindNode
+        //3:    ShareTracker
+        LOG_INFO << "ShareTracker initialization...";
+        _tracker = std::make_shared<ShareTracker>(_net, _parent_net);
+        //3.1:  Save shares every 60 seconds
+        //TODO: timer in _tracker constructor
+
+        //4:    CoindNode
         LOG_INFO << "CoindNode initialization...";
-        _coind_node = std::make_shared<c2pool::libnet::CoindNode>(_context, _parent_net, _coind);
-        //3.1:  CoindNode.start?
+        _coind_node = std::make_shared<c2pool::libnet::CoindNode>(_context, _parent_net, _coind, _tracker);
+        //4.1:  CoindNode.start?
         LOG_INFO << "CoindNode starting...";
         coind_node()->start();
-        //4:    ShareTracker
-        LOG_INFO << "ShareTracker initialization...";
-        _tracker = std::make_shared<ShareTracker>();
-        //4.1:  Save shares every 60 seconds
-        //TODO: timer in _tracker constructor
         //...success!
 
         //Joing c2pool/p2pool network:
@@ -55,7 +55,7 @@ namespace c2pool::libnet
         //5.1:  Bootstrap_addrs
         //5.2:  Parse CLI args for addrs
         //6:    P2PNode
-        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context);
+        _p2pnode = std::make_shared<c2pool::libnet::p2p::P2PNode>(_context, _net, _config, _addr_store, _coind_node, _tracker);
         //6.1:  P2PNode.start?
         p2pNode()->start();
         //7:    Save addrs every 60 seconds
@@ -70,6 +70,7 @@ namespace c2pool::libnet
         //10:   WebRoot
         //...success!
         _is_loaded = true;
+        _context->run();
     }
 
     bool NodeManager::is_loaded() const
@@ -107,7 +108,7 @@ namespace c2pool::libnet
         return _p2pnode;
     }
 
-    shared_ptr<coind::jsonrpc::Coind> NodeManager::coind() const
+    shared_ptr<coind::JSONRPC_Coind> NodeManager::coind() const
     {
         return _coind;
     }
@@ -152,7 +153,7 @@ namespace c2pool::libnet
     create_set_method(c2pool::dev::coind_config, _config);
     create_set_method(c2pool::dev::AddrStore, _addr_store);
     create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
-    create_set_method(coind::jsonrpc::Coind, _coind);
+    create_set_method(coind::JSONRPC_Coind, _coind);
     create_set_method(c2pool::libnet::CoindNode, _coind_node);
     create_set_method(c2pool::shares::ShareTracker, _tracker);
     create_set_method(c2pool::shares::ShareStore, _share_store);

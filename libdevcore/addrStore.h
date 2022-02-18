@@ -31,8 +31,16 @@ namespace c2pool::dev
     struct AddrValue
     {
         int service;
-        double first_seen;
-        double last_seen;
+        int64_t first_seen;
+        int64_t last_seen;
+
+        AddrValue() {}
+
+        AddrValue(int _service, int64_t _first_seen, int64_t _last_seen){
+            service = _service;
+            first_seen = _first_seen;
+            last_seen = _last_seen;
+        }
     };
 
     class AddrStore
@@ -50,7 +58,7 @@ namespace c2pool::dev
         string ToJSON();
         void FromJSON(string json);
         
-        int len() { return store.size(); }
+        size_t len() { return store.size(); }
     private:
         map<c2pool::libnet::addr, AddrValue> store;
         std::string filePath;

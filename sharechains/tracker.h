@@ -52,14 +52,14 @@ namespace c2pool::shares
 
     class ShareTracker : public enable_shared_from_this<ShareTracker>
     {
-    private:
+    public:
         PrefsumShare shares;
         PrefsumVerifiedShare verified;
     public:
         shared_ptr<c2pool::Network> net;
         shared_ptr<coind::ParentNetwork> parent_net;
     public:
-        ShareTracker();
+        ShareTracker(shared_ptr<c2pool::Network> _net, shared_ptr<coind::ParentNetwork> _parent_net);
 
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);

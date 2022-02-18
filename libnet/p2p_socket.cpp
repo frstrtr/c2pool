@@ -15,6 +15,7 @@
 #include <networks/network.h>
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
+#include <libcoind/data.h>
 
 using std::string;
 using std::tuple;
@@ -26,7 +27,7 @@ namespace c2pool::libnet::p2p
 {
     //P2PSocket
 
-    P2PSocket::P2PSocket(ip::tcp::socket socket) : _socket(std::move(socket))
+    P2PSocket::P2PSocket(ip::tcp::socket socket, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<libnet::p2p::P2PNode> __p2p_node, std::shared_ptr<boost::asio::io_context> __context) : _socket(std::move(socket)), _net(__net), _p2p_node(__p2p_node), ping_timer(*__context), auto_disconnect_timer(*__context)
     {
     }
 
@@ -52,7 +53,7 @@ namespace c2pool::libnet::p2p
         LOG_TRACE << "P2PSocket: "
                   << "Start constructor";
 
-        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this());
+        auto proto = std::make_shared<c2pool::libnet::p2p::P2P_Protocol>(shared_from_this(), _net, _p2p_node);
 
         if (handle.empty())
         {
@@ -63,23 +64,29 @@ namespace c2pool::libnet::p2p
             LOG_TRACE << "handle not empty";
         }
         LOG_TRACE << "Called handle";
-        handle(proto); // <---------------bug there!!!!!!!!!?????
+        if (handle(proto)){
+            LOG_INFO << "P2P_Protocol connected";
+        }
 
         _protocol = proto;
+
         //start reading in socket:
         start_read();
     }
 
     void P2PSocket::write(std::shared_ptr<base_message> msg)
     {
+        LOG_DEBUG << "P2PSocket::write, msg->cmd = "<< (int)msg->cmd;
         write_prefix(msg);
     }
 
     void P2PSocket::write_prefix(std::shared_ptr<base_message> msg)
     {
+        LOG_TRACE << "Write prefix method called";
         boost::asio::async_write(_socket, boost::asio::buffer(_net->PREFIX, _net->PREFIX_LENGTH),
                                  [this, msg](boost::system::error_code _ec, std::size_t length)
                                  {
+                                    LOG_DEBUG << "Write prefix called";
                                      if (_ec)
                                      {
                                          LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
@@ -99,9 +106,9 @@ namespace c2pool::libnet::p2p
             PackStream value;
 
             //command [+]
-            const char *temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
+            std::string temp_cmd = c2pool::libnet::messages::string_commands(msg->cmd);
             auto command = new char[12]{'\0'};
-            memcpy(command, temp_cmd, strlen(temp_cmd));
+            memcpy(command, temp_cmd.c_str(), temp_cmd.size());
             PackStream s_command(command, 12);
             value << s_command;
             delete command;
@@ -114,9 +121,20 @@ namespace c2pool::libnet::p2p
             IntType(32) unpacked_len(payload_stream.size());
             value << unpacked_len;
 
-            //checksum [-]
-            //TODO: sha256(sha256(payload))
+            //checksum [+]
+            PackStream payload_checksum_stream;
+            payload_checksum_stream << *msg;
 
+            auto __checksum = coind::data::hash256(payload_checksum_stream);
+            IntType(256) checksum_full(__checksum);
+            PackStream _packed_checksum;
+            _packed_checksum << checksum_full;
+            //TODO: почему результат реверснутый?
+            vector<unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
+            std::reverse(packed_checksum.begin(), packed_checksum.end());
+            PackStream checksum(packed_checksum);
+            value << checksum;
+            
             //payload [+]
             value << payload_stream;
 
@@ -137,11 +155,13 @@ namespace c2pool::libnet::p2p
 
     void P2PSocket::write_message_data(std::shared_ptr<base_message> _msg)
     {
+        LOG_DEBUG << "Write msg data method called";
         SendPackedMsg msg(_msg);
         boost::asio::async_write(_socket, boost::asio::buffer(msg.data, msg.len),
                                  //TODO?: this -> shared_this()
                                  [this](boost::system::error_code _ec, std::size_t length)
                                  {
+                                     LOG_DEBUG << "Write msg data called";
                                      if (_ec)
                                      {
                                          LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
@@ -194,7 +214,7 @@ namespace c2pool::libnet::p2p
                                 {
                                     if (!ec)
                                     {
-                                        LOG_TRACE << "try to read command";
+                                        LOG_TRACE << "try to read command: " << msg->command;
                                         //LOG_INFO << "read_command";
                                         read_length(msg);
                                     }
@@ -253,6 +273,8 @@ namespace c2pool::libnet::p2p
         IntType(32) payload_len;
         stream_len >> payload_len;
         msg->unpacked_len = payload_len.get();
+        msg->payload = new char[msg->unpacked_len+1];
+        LOG_DEBUG << "unpacked_len: " << msg->unpacked_len;
 
         boost::asio::async_read(_socket,
                                 boost::asio::buffer(msg->payload, msg->unpacked_len),
@@ -267,7 +289,7 @@ namespace c2pool::libnet::p2p
                                     }
                                     else
                                     {
-                                        LOG_ERROR << ec << " " << ec.message();
+                                        LOG_ERROR << "read_payload: " << ec << " " << ec.message();
                                         disconnect();
                                     }
                                 });
@@ -281,12 +303,14 @@ namespace c2pool::libnet::p2p
         //Make raw message
         PackStream stream_RawMsg;
 
-        PackStream stream_command(msg->command, msg->COMMAND_LEN);
+//        PackStream stream_command(msg->command, msg->COMMAND_LEN);
+        std::string cmd(msg->command);
         PackStream stream_payload(msg->payload, msg->unpacked_len);
 
-        stream_RawMsg << stream_command << stream_payload;
+        stream_RawMsg << stream_payload;
 
-        shared_ptr<raw_message> RawMessage = _protocol.lock()->make_raw_message();
+        shared_ptr<raw_message> RawMessage = _protocol.lock()->make_raw_message(cmd);
+        //RawMessage->name_type = reverse_string_commands(msg->command);
         stream_RawMsg >> *RawMessage;
 
         //Protocol handle message

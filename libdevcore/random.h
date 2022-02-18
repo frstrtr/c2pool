@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <map>
 
 namespace c2pool::random
 {
@@ -11,6 +12,17 @@ namespace c2pool::random
 
     template <typename T>
     T RandomChoice(std::vector<T> &list);
+
+
+    template <typename Key, typename Value>
+    Value RandomChoice(std::map<Key, Value> _map)
+    {
+        int pos = RandomInt(0, _map.size());
+        auto item = _map.begin();
+        std::advance(item, pos);
+        return item->second;
+    }
+
 
     //TODO: Remake?
     // template <typename K, typename V, typename Compare = std::less<K>,
