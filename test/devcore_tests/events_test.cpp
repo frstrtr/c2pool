@@ -89,10 +89,21 @@ TEST(DevcoreEvents, variabledict_lambda)
 {
 	VariableDict<int, std::shared_ptr<int>> var;
 	var.added.subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType new_items){
-		for (auto it = new_items.begin(); it != new_items.end(); it++){
-			std::cout << it->first << ":" << *it->second << std::endl;
+        for (auto it : new_items){
+			std::cout << "added: " << it.first << ":" << *it.second << std::endl;
 		}
 	});
+    var.removed.subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
+        for (auto it : gone_items){
+            std::cout << "removed: " <<it.first << ":" << *it.second << std::endl;
+        }
+    });
 
-	var.add(0, std::make_shared<int>(111));
+    var.add(0, std::make_shared<int>(0));
+
+
+    VariableDict<int, std::shared_ptr<int>>::MapType newVals = {{1, std::make_shared<int>(112)}, {2, std::make_shared<int>(222)}, {3, std::make_shared<int>(333)}};
+	var.add(newVals);
+
+    var.remove(1);
 }
