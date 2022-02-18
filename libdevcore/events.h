@@ -19,8 +19,7 @@ class Event
 	int times;
 
 public:
-	Event()
-	{}
+	Event(){}
 
 	//for std::function/lambda
 	template<typename Lambda>
@@ -35,10 +34,13 @@ public:
 		subscribe(_f);
 	}
 
-	void unsubscribe()
-	{
-		//TODO
-	}
+//	void unsubscribe()
+//	{
+//        //Дисконнект устроен по принципу:
+//        //signals2::connection bc = w.Signal.connect(bind(&Object::doSomething, o));
+//        //bc.disconnect();
+//        //return bc;
+//	}
 
 	void happened(Args... args)
 	{
