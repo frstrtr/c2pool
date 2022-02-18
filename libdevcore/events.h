@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <functional>
+#include <memory>
 
 
 //Example:
@@ -54,9 +55,9 @@ template<typename VarType>
 class Variable
 {
 public:
-    VarType value;
-    Event<VarType> changed;
-    Event<VarType, VarType> transitioned;
+    std::shared_ptr<VarType> value;
+    std::shared_ptr<Event<VarType>> changed;
+    std::shared_ptr<Event<VarType, VarType>> transitioned;
 
 public:
     Variable()
@@ -64,17 +65,17 @@ public:
 
     Variable(const VarType &_value)
     {
-        value = _value;
+        *value = _value;
     }
 
     Variable<VarType> &operator=(const VarType &_value)
     {
-        if (value != _value)
+        if (*value != _value)
         {
-            auto oldvalue = value;
-            value = _value;
-            changed.happened(value);
-            transitioned.happened(oldvalue, value);
+            auto oldvalue = *value;
+            *value = _value;
+            changed->happened(*value);
+            transitioned->happened(oldvalue, *value);
         }
         return *this;
     }
@@ -100,8 +101,8 @@ public:
     typedef std::map<KeyType, VarType> MapType;
 
 public:
-    Event<MapType> added;
-    Event<MapType> removed;
+    std::shared_ptr<Event<MapType>> added;
+    std::shared_ptr<Event<MapType>> removed;
 
     VariableDict()
     {}
@@ -115,26 +116,29 @@ public:
         MapType new_items;
         for (auto item: _values)
         {
-            if ((this->value.find(item.first) == this->value.end()) || (this->value[item.first] != item.second))
+            if ((this->value->find(item.first) == this->value->end()) || ((*this->value)[item.first] != item.second))
             {
                 new_items[item.first] = item.second;
             }
         }
-        this->value.insert(new_items.begin(), new_items.end());
-        added.happened(new_items);
+        this->value->insert(new_items.begin(), new_items.end());
+        added->happened(new_items);
     }
 
     void add(const KeyType &_key, const VarType &_value)
     {
         MapType new_items;
         auto item = std::make_pair(_key, _value);
-        if ((this->value.find(item.first) == this->value.end()) || (this->value[item.first] != item.second))
+        if ((this->value->find(item.first) == this->value->end()) || ((*this->value)[item.first] != item.second))
         {
             new_items[item.first] = item.second;
+
+        } else {
+            return;//TODO: throw?
         }
         std::map<int, int> a;
-        this->value.insert(this->value.begin(), item);
-        added.happened(new_items);
+        this->value->insert(item);
+        added->happened(new_items);
     }
 
     void remove(std::map<KeyType, VarType> _values)
@@ -142,23 +146,25 @@ public:
         std::map<KeyType, VarType> gone_items;
         for (auto item: _values)
         {
-            if (this->value.find(item.first) != this->value.end())
+            if (this->value->find(item.first) != this->value->end())
             {
                 gone_items[item.first] = item.second;
-                this->value.erase(item.first);
+                this->value->erase(item.first);
+            } else {
+                //TODO: throw?
             }
         }
-        removed.happened(gone_items);
+        removed->happened(gone_items);
     }
 
     void remove(KeyType _key)
     {
         std::map<KeyType, VarType> gone_items;
-        if (this->value.find(_key) != this->value.end())
+        if (this->value->find(_key) != this->value->end())
         {
-            gone_items[_key] = this->value[_key];
-            this->value.erase(_key);
+            gone_items[_key] = (*this->value)[_key];
+            this->value->erase(_key);
         }
-        removed.happened(gone_items);
+        removed->happened(gone_items);
     }
 };
