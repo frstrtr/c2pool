@@ -95,7 +95,7 @@ public:
 template<typename KeyType, typename VarType>
 class VariableDict : public Variable<std::map<KeyType, VarType>>
 {
-private:
+public:
 	typedef std::map<KeyType, VarType> MapType;
 
 public:
