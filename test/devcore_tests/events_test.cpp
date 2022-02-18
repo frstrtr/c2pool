@@ -63,37 +63,37 @@ TEST(DevcoreEvents, event_many_args)
 TEST(DevcoreEvents, variable_lambda)
 {
 	Variable<int> var(10);
-	var.changed.subscribe([](int val)
+	var.changed->subscribe([](int val)
 						  {
 							  std::cout << "changed to: " << val << std::endl;
 							  ASSERT_EQ(100, val);
 						  });
 
-	var.changed.subscribe([](int val)
+	var.changed->subscribe([](int val)
 						  {
 							  std::cout << "changed to_2(value+100): " << val + 100 << std::endl;
 							  ASSERT_EQ(100, val);
 						  });
 
-	var.transitioned.subscribe([](int valFrom, int valTo)
+	var.transitioned->subscribe([](int valFrom, int valTo)
 							   {
 								   std::cout << "From: " << valFrom << ", To: " << valTo << std::endl;
 								   ASSERT_EQ(valFrom, 10);
 								   ASSERT_EQ(valTo, 100);
 							   });
 	var = 100;
-	ASSERT_EQ(100, var.value);
+	ASSERT_EQ(100, *var.value);
 }
 
 TEST(DevcoreEvents, variabledict_lambda)
 {
 	VariableDict<int, std::shared_ptr<int>> var;
-	var.added.subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType new_items){
+	var.added->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType new_items){
         for (auto it : new_items){
 			std::cout << "added: " << it.first << ":" << *it.second << std::endl;
 		}
 	});
-    var.removed.subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
+    var.removed->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
         for (auto it : gone_items){
             std::cout << "removed: " <<it.first << ":" << *it.second << std::endl;
         }
