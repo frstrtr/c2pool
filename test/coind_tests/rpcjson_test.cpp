@@ -9,8 +9,8 @@
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-#include <libcoind/jsonrpc/coind.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
+#include <thread>
 
 #ifdef PASS_EXIST
 #include "pass.h"
@@ -76,16 +76,35 @@ TEST_F(Bitcoind_JSONRPC, getblock)
 
 TEST_F(Bitcoind_JSONRPC, getwork)
 {
-	coind::TXIDCache txidcache;
-	map<uint256, coind::data::tx_type> known_txs;
-	auto result = coind->getwork(txidcache, known_txs);
+    coind::TXIDCache txidcache;
+    map<uint256, coind::data::tx_type> known_txs;
+    auto result = coind->getwork(txidcache, known_txs);
 
-	std::cout << "version: " <<  result.version << std::endl;
-	std::cout << "previous_block: " <<  result.previous_block.GetHex() << std::endl;
-	std::cout << "transactions: ";
-	for (auto v : result.transactions){
-		std::cout << v->version << std::endl;
-	}
-	std::cout << std::endl;
-	
+    std::cout << "version: " << result.version << std::endl;
+    std::cout << "previous_block: " << result.previous_block.GetHex() << std::endl;
+    std::cout << "transactions: ";
+    for (auto v: result.transactions) {
+        std::cout << v->version << std::endl;
+    }
+    std::cout << std::endl;
+
+}
+
+TEST_F(Bitcoind_JSONRPC, multi_getwork)
+{
+    coind::TXIDCache txidcache;
+    map<uint256, coind::data::tx_type> known_txs;
+
+    for (int i = 0; i < 10; i++) {
+        auto result = coind->getwork(txidcache, known_txs);
+
+        std::cout << "version: " << result.version << std::endl;
+        std::cout << "previous_block: " << result.previous_block.GetHex() << std::endl;
+        std::cout << "transactions: ";
+        for (auto v: result.transactions) {
+            std::cout << v->version << std::endl;
+        }
+        std::cout << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
 }

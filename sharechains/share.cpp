@@ -57,7 +57,7 @@ namespace c2pool::shares
         auto share_info = contents["share_info"].get_obj();
         auto share_data = share_info["share_data"].get_obj();
 
-        previous_hash.SetHex(share_data.get_str());
+        previous_hash.SetHex(share_data["previous_share_hash"].get_str());
         coinbase = share_data["coinbase"].get_str();
         nonce = share_data["nonce"].get_int();
         pubkey_hash.SetHex(share_data["pubkey_hash"].get_str());
@@ -101,6 +101,60 @@ namespace c2pool::shares
         merkle_link = contents["merkle_link"].get_obj();
     }
 
+    UniValue BaseShare::to_contents()
+    {
+        UniValue result;
+        result.pushKV("min_header", (UniValue) min_header);
+
+        //START: share_info
+        UniValue share_info(UniValue::VOBJ);
+        //START: share_info::share_data
+        UniValue share_data(UniValue::VOBJ);
+
+        share_data.pushKV("previous_share_hash", previous_hash.GetHex());
+        share_data.pushKV("coinbase", coinbase);
+        share_data.pushKV("nonce", (int)nonce);
+        share_data.pushKV("pubkey_hash", pubkey_hash.GetHex());
+        share_data.pushKV("subsidy", subsidy);
+        share_data.pushKV("donation", donation);
+        share_data.pushKV("stale_info", (int) stale_info);
+        share_data.pushKV("desired_version", desired_version);
+
+        share_info.pushKV("share_data", share_data);
+        //END: share_info::share_data
+
+        UniValue _new_transaction_hashes(UniValue::VARR);
+        for (auto item : new_transaction_hashes)
+        {
+            _new_transaction_hashes.push_back(item.GetHex());
+        }
+        share_info.pushKV("new_transaction_hashes", _new_transaction_hashes);
+
+        UniValue _transaction_hash_refs(UniValue::VARR);
+        for (auto _tx_hash_ref : transaction_hash_refs)
+        {
+            UniValue _tx_ref(UniValue::VARR);
+            _tx_ref.push_back(std::get<0>(_tx_hash_ref));
+            _tx_ref.push_back(std::get<1>(_tx_hash_ref));
+            _transaction_hash_refs.push_back(_tx_ref);
+        }
+        share_info.pushKV("transaction_hash_refs", _transaction_hash_refs);
+        share_info.pushKV("far_share_hash", far_share_hash.GetHex());
+        share_info.pushKV("max_bits", max_target.GetHex());
+        share_info.pushKV("bits", target.GetHex());
+        share_info.pushKV("timestamp", timestamp);
+        share_info.pushKV("absheight", absheight);
+        share_info.pushKV("abswork", abswork.GetHex());
+        //END: share_info
+
+        result.pushKV("share_info", share_info);
+        result.pushKV("ref_merkle_link", (UniValue) ref_merkle_link);
+        result.pushKV("last_txout_nonce", last_txout_nonce);
+        result.pushKV("hash_link", (UniValue) hash_link);
+        result.pushKV("merkle_link", (UniValue) merkle_link);
+
+        return result;
+    }
 
 
     BaseShare::BaseShare(int VERSION, shared_ptr<Network> _net, tuple<string, string> _peer_addr, UniValue _contents) : SHARE_VERSION(VERSION), net(_net), peer_addr(_peer_addr), contents(_contents)

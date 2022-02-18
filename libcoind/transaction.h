@@ -19,6 +19,7 @@ namespace coind::data
     struct TxOutType;
     struct TxIDType;
 }
+
 namespace coind::data::stream
 {
     struct PreviousOutput_stream;
@@ -30,12 +31,7 @@ namespace coind::data::stream
     struct TxWriteType;
     struct TransactionType_stream;
 }
-//
-//
-//
-//
-//
-//
+
 namespace coind::data
 {
     struct PreviousOutput
@@ -169,10 +165,7 @@ namespace coind::data::stream
         }
         PackStream &read(PackStream &stream)
         {
-			std::cout << "prevout read" << std::endl;
-            stream >> hash;
-			stream >> index;
-			std::cout << "GG" << std::endl;
+            stream >> hash >> index;
             return stream;
         }
     };

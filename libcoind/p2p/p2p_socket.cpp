@@ -17,12 +17,14 @@ using std::tuple;
 #include <boost/function.hpp>
 namespace ip = boost::asio::ip;
 
+#include <networks/network.h>
+#include <libcoind/data.h>
 using namespace coind::p2p;
 using namespace coind::p2p::messages;
 
 namespace coind::p2p
 {
-    P2PSocket::P2PSocket(ip::tcp::socket socket) : _socket(std::move(socket))
+    P2PSocket::P2PSocket(ip::tcp::socket socket, std::shared_ptr<coind::ParentNetwork> __parent_net) : _socket(std::move(socket)), _parent_net(__parent_net)
     {
     }
 
@@ -30,11 +32,9 @@ namespace coind::p2p
     void P2PSocket::init(const boost::asio::ip::tcp::resolver::results_type endpoints, shared_ptr<coind::p2p::CoindProtocol> proto)
     {
         _protocol = proto;
-        //auto self = shared_from_this();
-        std::cout << "Try to connected in P2PSocket::init" << std::endl;
+        LOG_TRACE << "Try to connected in P2PSocket::init" << std::endl;
         boost::asio::async_connect(_socket, endpoints, [this](boost::system::error_code ec, boost::asio::ip::tcp::endpoint ep)
                                    {
-                                       std::cout << "Connected to " << ep.address() << ":" << ep.port();
                                        LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
                                        connectionMade(ep);
                                        if (!ec)
@@ -137,7 +137,18 @@ namespace coind::p2p
             value << unpacked_len;
 
             //checksum [-]
-            //TODO: sha256(sha256(payload))
+            PackStream payload_checksum_stream;
+            payload_checksum_stream << *msg;
+
+            auto __checksum = coind::data::hash256(payload_checksum_stream);
+            IntType(256) checksum_full(__checksum);
+            PackStream _packed_checksum;
+            _packed_checksum << checksum_full;
+            //TODO: почему результат реверснутый?
+            vector<unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
+            std::reverse(packed_checksum.begin(), packed_checksum.end());
+            PackStream checksum(packed_checksum);
+            value << checksum;
 
             //payload [+]
             value << payload_stream;

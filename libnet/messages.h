@@ -14,6 +14,7 @@
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
 #include <libdevcore/logger.h>
+#include <libcoind/transaction.h>
 
 using namespace c2pool::messages;
 
@@ -39,10 +40,13 @@ namespace c2pool::libnet::messages
         cmd_sharereply,
         cmd_best_block, //TODO
         cmd_have_tx,
-        cmd_losing_tx
+        cmd_losing_tx,
+        cmd_remember_tx,
+        cmd_forget_tx
     };
 
-    const std::map<commands, const char *> _string_commands = {
+    //TODO: remake for auto generate:
+    const std::map<commands, std::string> _string_commands = {
         {cmd_error, "error"},
         {cmd_version, "version"},
         {cmd_ping, "ping"},
@@ -55,9 +59,10 @@ namespace c2pool::libnet::messages
         {cmd_sharereply, "sharereply"},
         {cmd_best_block, "best_block"},
         {cmd_have_tx, "have_tx"},
-        {cmd_losing_tx, "losing_tx"}};
+        {cmd_losing_tx, "losing_tx"},
+        {cmd_forget_tx, "forget_tx"}};
 
-    const std::map<const char *, commands> _reverse_string_commands = {
+    const std::map<std::string, commands> _reverse_string_commands = {
         {"error", cmd_error},
         {"version", cmd_version},
         {"ping", cmd_ping},
@@ -70,11 +75,13 @@ namespace c2pool::libnet::messages
         {"sharereply", cmd_sharereply},
         {"best_block", cmd_best_block},
         {"have_tx", cmd_have_tx},
-        {"losing_tx", cmd_losing_tx}};
+        {"losing_tx", cmd_losing_tx},
+        {"forget_tx", cmd_forget_tx}
+    };
 
-    const char *string_commands(commands cmd);
+    std::string string_commands(commands cmd);
 
-    commands reverse_string_commands(const char *key);
+    commands reverse_string_commands(std::string key);
 
     //base_message type for handle
     class raw_message
@@ -82,23 +89,24 @@ namespace c2pool::libnet::messages
         friend c2pool::libnet::p2p::P2PSocket;
 
     public:
-        EnumType<c2pool::libnet::messages::commands> name_type;
+        std::string command;
+        // c2pool::libnet::messages::commands name_type;
+        // EnumType<c2pool::libnet::messages::commands> name_type;
         PackStream value;
 
     public:
-        raw_message()
+        raw_message(std::string  _command) : command(_command)
         {
         }
 
         PackStream &write(PackStream &stream)
         {
-            stream << name_type << value;
+            stream << value;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
-            stream >> name_type;
             value = PackStream(stream);
             return stream;
         }
@@ -168,8 +176,8 @@ namespace c2pool::libnet::messages
     public:
         IntType(32) version;
         IntType(64) services;
-        address_type addr_to;
-        address_type addr_from;
+        stream::address_type_stream addr_to;
+        stream::address_type_stream addr_from;
         IntType(64) nonce;
         StrType sub_version;
         IntType(32) mode; //# always 1 for legacy compatibility
@@ -277,12 +285,17 @@ namespace c2pool::libnet::messages
     class message_addrs : public base_message
     {
     public:
-        ListType<c2pool::messages::addr> addrs;
+        ListType<c2pool::messages::stream::addr_stream> addrs;
 
     public:
         message_addrs() : base_message("addrs") {}
 
         message_addrs(std::vector<c2pool::messages::addr> _addrs) : base_message("addrs")
+        {
+            addrs = stream::addr_stream::make_list_type(_addrs); //TODO: test
+        }
+
+        message_addrs(std::vector<c2pool::messages::stream::addr_stream> _addrs) : base_message("addrs")
         {
             addrs = _addrs;
         }
@@ -375,16 +388,16 @@ namespace c2pool::libnet::messages
     public:
         IntType(256) id;
         EnumType<ShareReplyResult, VarIntType> result;
-        ListType<UniValue> shares; //type + contents data
+        ListType<stream::share_type_stream> shares; //type + contents data
 
     public:
         message_sharereply() : base_message("sharereply") {}
 
-        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<UniValue> _shares) : base_message("sharereply")
+        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<share_type> _shares) : base_message("sharereply")
         {
             id = _id;
             result = _result;
-            shares = _shares;
+            shares = shares.make_type(_shares);
         }
 
         PackStream &write(PackStream &stream) override
@@ -396,6 +409,32 @@ namespace c2pool::libnet::messages
         PackStream &read(PackStream &stream) override
         {
             stream >> id >> result >> shares;
+            return stream;
+        }
+    };
+
+    class message_bestblock : public base_message
+    {
+    public:
+        shares::BlockHeaderType_stream header;
+
+    public:
+        message_bestblock() : base_message("bestblock") {}
+
+        message_bestblock(shares::BlockHeaderType _header) : base_message("bestblock")
+        {
+            header = _header;
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << header;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> header;
             return stream;
         }
     };
@@ -435,6 +474,58 @@ namespace c2pool::libnet::messages
         message_losing_tx() : base_message("losing_tx") {}
 
         message_losing_tx(std::vector<uint256> _tx_hashes) : base_message("losing_tx")
+        {
+            tx_hashes = tx_hashes.make_type(_tx_hashes);
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << tx_hashes;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> tx_hashes;
+            return stream;
+        }
+    };
+
+    class message_remember_tx : public base_message
+    {
+    public:
+        ListType<IntType(256)> tx_hashes;
+        ListType<coind::data::stream::TransactionType_stream> txs;
+    public:
+        message_remember_tx() : base_message("remember_tx") {}
+
+        message_remember_tx(std::vector<uint256> _tx_hashes) : base_message("remember_tx")
+        {
+            tx_hashes = tx_hashes.make_type(_tx_hashes);
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << tx_hashes;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> tx_hashes;
+            return stream;
+        }
+    };
+
+    class message_forget_tx : public base_message
+    {
+    public:
+        ListType<IntType(256)> tx_hashes;
+
+    public:
+        message_forget_tx() : base_message("forget_tx") {}
+
+        message_forget_tx(std::vector<uint256> _tx_hashes) : base_message("forget_tx")
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }

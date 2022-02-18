@@ -39,7 +39,7 @@ struct ListType : MakerListType<T>
 
     PackStream &write(PackStream &stream) const
     {
-        LOG_TRACE << "ListType Worked!";
+//        LOG_TRACE << "ListType Worked!";
         auto len = l.size();
         stream << len;
         for (auto v : l)
@@ -84,7 +84,7 @@ struct StrType : public Maker<StrType, string>
 
     PackStream &write(PackStream &stream) const
     {
-        LOG_TRACE << "StrType Worked!";
+//        LOG_TRACE << "StrType Worked!";
 
         char s[str.length() + 1];
         strcpy(s, str.c_str());
@@ -132,7 +132,7 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
 
     PackStream &write(PackStream &stream) const
     {
-        LOG_TRACE << "FixedStrType Worked!";
+//        LOG_TRACE << "FixedStrType Worked!";
 
         for (auto c : str)
         {
@@ -155,8 +155,8 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
     }
 };
 
-template <typename INT_T>
-struct IntType : public Maker<IntType<INT_T>, INT_T>
+template <typename INT_T, bool BIG_ENDIAN = false>
+struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
 {
     typedef INT_T value_type;
     INT_T value;
@@ -187,11 +187,14 @@ struct IntType : public Maker<IntType<INT_T>, INT_T>
 
     PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "IntType Worked!";
+//        LOG_TRACE << "IntType Worked!";
 
         INT_T value2 = value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
         int32_t len = sizeof(value2) / sizeof(*packed);
+
+        if (BIG_ENDIAN)
+            std::reverse(packed, packed+len);
 
         PackStream s(packed, len);
         stream << s;
@@ -201,14 +204,17 @@ struct IntType : public Maker<IntType<INT_T>, INT_T>
 
     virtual PackStream &read(PackStream &stream)
     {
-        unsigned char *packed = new unsigned char[CALC_SIZE(INT_T)];
+        size_t _len = CALC_SIZE(INT_T);
+        unsigned char *packed = new unsigned char[_len];
         //int32_t len = sizeof(value2) / sizeof(*packed);
 
-        for (int i = 0; i < CALC_SIZE(INT_T); i++)
+        for (int i = 0; i < _len; i++)
         {
             packed[i] = stream.data[i];
-            stream.data.erase(stream.data.begin(), stream.data.begin() + 1);
         }
+        stream.data.erase(stream.data.begin(), stream.data.begin() + _len);
+        if (BIG_ENDIAN)
+            std::reverse(packed, packed+_len);
         auto *_value = reinterpret_cast<INT_T *>(packed);
         value = *_value;
 
@@ -248,7 +254,7 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
 
     virtual PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "ULongIntType Worked!";
+//        LOG_TRACE << "ULongIntType Worked!";
 
         INT_T value2 = value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
@@ -333,8 +339,6 @@ struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
 
     PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "EnumType Worked!";
-
         PACK_TYPE v((typename PACK_TYPE::value_type)value);
         stream << v;
 

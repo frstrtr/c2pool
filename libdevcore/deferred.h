@@ -1,4 +1,5 @@
 #include <boost/asio.hpp>
+#include <iostream>
 #include <future>
 #include <functional>
 #include <map>
@@ -7,6 +8,9 @@
 #include <functional>
 #include <vector>
 #include <optional>
+
+#include "random.h"
+
 namespace io = boost::asio;
 using namespace std::chrono_literals;
 using boost::system::error_code;
@@ -143,11 +147,25 @@ namespace c2pool::util::deferred
             callbacks.push_back(__callback);
         }
 
+    private:
+        std::map<unsigned long long, std::shared_ptr<io::steady_timer>> external_timers;
+    public:
         //Таймер, который не блокирует yield_context
         void external_timer(std::function<void(const boost::system::error_code &ec)> __handler, const std::chrono::_V2::steady_clock::duration &expiry_time)
         {
-            io::steady_timer __timer(*context, expiry_time);
-            __timer.async_wait(__handler);
+            auto __timer = std::make_shared<io::steady_timer>(*context);
+            unsigned long long _id = c2pool::random::RandomNonce();
+            while (external_timers.count(_id) != 0){
+                _id = c2pool::random::RandomNonce();
+            }
+            external_timers[_id] = __timer;
+
+            __timer->expires_from_now(expiry_time);
+            __timer->async_wait([&, __handler, _id] (const boost::system::error_code& ec)
+                                {
+                                    __handler(ec);
+                                    external_timers.erase(_id);
+                                });
         }
 
         static std::shared_ptr<Deferred<RetType>> make_deferred(std::shared_ptr<io::io_context> _context, io::yield_context _yield_context)

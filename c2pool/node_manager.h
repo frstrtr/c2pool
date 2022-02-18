@@ -28,9 +28,9 @@ namespace c2pool
 }
 namespace coind
 {
+    class JSONRPC_Coind;
     namespace jsonrpc
     {
-        class Coind;
         class StratumNode;
     }
 }
@@ -62,7 +62,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::dev::coind_config> config() const;
         shared_ptr<c2pool::dev::AddrStore> addr_store() const;
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const;
-        shared_ptr<coind::jsonrpc::Coind> coind() const;
+        shared_ptr<coind::JSONRPC_Coind> coind() const;
         shared_ptr<c2pool::libnet::CoindNode> coind_node() const;
         shared_ptr<c2pool::shares::ShareTracker> tracker() const;
         shared_ptr<c2pool::shares::ShareStore> share_store() const;
@@ -76,7 +76,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::libnet::p2p::P2PNode> _p2pnode;
-        shared_ptr<coind::jsonrpc::Coind> _coind;
+        shared_ptr<coind::JSONRPC_Coind> _coind;
         shared_ptr<c2pool::libnet::CoindNode> _coind_node;
         shared_ptr<c2pool::shares::ShareTracker> _tracker;
         shared_ptr<c2pool::shares::ShareStore> _share_store;
@@ -105,7 +105,7 @@ namespace c2pool::libnet
         create_set_method(c2pool::dev::coind_config, _config);
         create_set_method(c2pool::dev::AddrStore, _addr_store);
         create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
-        create_set_method(coind::jsonrpc::Coind, _coind);
+        create_set_method(coind::JSONRPC_Coind, _coind);
         create_set_method(c2pool::libnet::CoindNode, _coind_node);
         create_set_method(c2pool::shares::ShareTracker, _tracker);
         create_set_method(c2pool::shares::ShareStore, _share_store);

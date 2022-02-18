@@ -9,15 +9,17 @@
 #include <networks/network.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
-#include <libcoind/jsonrpc/coind.h>
 #include <sharechains/tracker.h>
 #include <libdevcore/events.h>
 #include <libcoind/jsonrpc/results.h>
+#include <libcoind/jsonrpc/txidcache.h>
+#include <libcoind/jsonrpc/jsonrpc_coind.h>
+
 
 using namespace coind::jsonrpc;
 using namespace c2pool::shares;
 using namespace c2pool::util::events;
-using namespace coind::jsonrpc::data;
+using namespace coind;
 
 using std::make_shared;
 using std::shared_ptr, std::unique_ptr;
@@ -39,15 +41,16 @@ namespace c2pool::libnet
         ip::tcp::resolver _resolver;
 
     public:
-        CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::jsonrpc::Coind> __coind);
+        CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker);
 
         void start();
 
+        shared_ptr<ShareTracker> tracker();
         void set_best_share();
         void clean_tracker();
 
     public:
-        coind::jsonrpc::TXIDCache txidcache;
+        coind::TXIDCache txidcache;
         Event<> stop;
 
         VariableDict<uint256, coind::data::tx_type> known_txs;
@@ -66,13 +69,15 @@ namespace c2pool::libnet
     private:
         boost::asio::deadline_timer work_poller_t;
         void work_poller();
-
-        void handle_header(const BlockHeaderType &new_header);
         void poll_header();
+    public:
+        void handle_header(const BlockHeaderType &new_header);
+
 
     private:
         shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<coind::p2p::CoindProtocol> protocol;
-        shared_ptr<coind::jsonrpc::Coind> _coind;
+        shared_ptr<coind::JSONRPC_Coind> _coind;
+        shared_ptr<ShareTracker> _tracker;
     };
 }

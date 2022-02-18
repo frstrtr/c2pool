@@ -218,11 +218,12 @@ struct PackStream
     template <StreamObjType T>
     PackStream &operator>>(T &val)
     {
-		std::cout << "[";
-		for (int i = 0; i < 32; i++){
-			std::cout << (unsigned int) data[i] << ", ";
-		}
-		std::cout << "]" << std::endl;
+//      FOR TEST
+//		std::cout << "[";
+//		for (int i = 0; i < 32; i++){
+//			std::cout << (unsigned int) data[i] << ", ";
+//		}
+//		std::cout << "]" << std::endl;
         val.read(*this);
         return *this;
     }
@@ -281,7 +282,7 @@ struct PackStream
 
     bool isNull() const
     {
-        return data.size() > 0;
+        return data.size() <= 0;
     }
 };
 

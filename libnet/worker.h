@@ -6,7 +6,6 @@
 #include <sharechains/tracker.h>
 #include <sharechains/shareTypes.h>
 #include <networks/network.h>
-#include <libcoind/jsonrpc/coind.h>
 #include <libdevcore/events.h>
 #include <btclibs/uint256.h>
 
