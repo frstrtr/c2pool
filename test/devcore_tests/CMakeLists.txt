@@ -1,6 +1,6 @@
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
-set(DEVCORE_TEST_SOURCE addrStore_test.cpp stream_test.cpp)
+set(DEVCORE_TEST_SOURCE addrStore_test.cpp stream_test.cpp events_test.cpp)
 
 
 add_executable(devcore_test ${DEVCORE_TEST_SOURCE})
