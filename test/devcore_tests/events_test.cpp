@@ -82,7 +82,7 @@ TEST(DevcoreEvents, variable_lambda)
 								   ASSERT_EQ(valTo, 100);
 							   });
 	var = 100;
-	ASSERT_EQ(100, *var.value);
+	ASSERT_EQ(100, var.value());
 }
 
 TEST(DevcoreEvents, variabledict_lambda)
@@ -104,6 +104,15 @@ TEST(DevcoreEvents, variabledict_lambda)
 
     VariableDict<int, std::shared_ptr<int>>::MapType newVals = {{1, std::make_shared<int>(112)}, {2, std::make_shared<int>(222)}, {3, std::make_shared<int>(333)}};
 	var.add(newVals);
+
+    std::cout << "Check duplicate (wanna be empty):" << std::endl;
+    var.add(newVals);
+    std::cout << "Check finished." << std::endl;
+
+    std::cout << "Check change in duplicate (wanna be not empty):" << std::endl;
+    newVals[1] = std::make_shared<int>(111);
+    var.add(newVals);
+    std::cout << "Check finished." << std::endl;
 
     var.remove(1);
 }
