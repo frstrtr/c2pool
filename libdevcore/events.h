@@ -54,28 +54,41 @@ public:
 template<typename VarType>
 class Variable
 {
+protected:
+    std::shared_ptr<VarType> _value;
 public:
-    std::shared_ptr<VarType> value;
     std::shared_ptr<Event<VarType>> changed;
     std::shared_ptr<Event<VarType, VarType>> transitioned;
 
 public:
     Variable()
-    {}
-
-    Variable(const VarType &_value)
     {
-        *value = _value;
+        _value = std::make_shared<VarType>();
+        changed = std::make_shared<Event<VarType>>();
+        transitioned = std::make_shared<Event<VarType, VarType>>();
     }
 
-    Variable<VarType> &operator=(const VarType &_value)
+    Variable(const VarType &init_value)
     {
-        if (*value != _value)
+        _value = std::make_shared<VarType>();
+        changed = std::make_shared<Event<VarType>>();
+        transitioned = std::make_shared<Event<VarType, VarType>>();
+        *_value = init_value;
+    }
+
+    VarType value() const
+    {
+        return *_value;
+    }
+
+    Variable<VarType> &operator=(const VarType &__value)
+    {
+        if (*_value != __value)
         {
-            auto oldvalue = *value;
-            *value = _value;
-            changed->happened(*value);
-            transitioned->happened(oldvalue, *value);
+            auto oldvalue = *_value;
+            *_value = __value;
+            changed->happened(*_value);
+            transitioned->happened(oldvalue, *_value);
         }
         return *this;
     }
@@ -93,7 +106,6 @@ public:
     */
 };
 
-//TODO: test
 template<typename KeyType, typename VarType>
 class VariableDict : public Variable<std::map<KeyType, VarType>>
 {
@@ -105,10 +117,15 @@ public:
     std::shared_ptr<Event<MapType>> removed;
 
     VariableDict()
-    {}
+    {
+        added = std::make_shared<Event<MapType>>();
+        removed = std::make_shared<Event<MapType>>();
+    }
 
     VariableDict(const MapType &_value) : Variable<std::map<KeyType, VarType>>(_value)
     {
+        added = std::make_shared<Event<MapType>>();
+        removed = std::make_shared<Event<MapType>>();
     }
 
     void add(const MapType &_values)
@@ -116,29 +133,27 @@ public:
         MapType new_items;
         for (auto item: _values)
         {
-            if ((this->value->find(item.first) == this->value->end()) || ((*this->value)[item.first] != item.second))
+            if ((this->_value->find(item.first) == this->_value->end()) || ((*this->_value)[item.first] != item.second))
             {
                 new_items[item.first] = item.second;
+                (*this->_value)[item.first] = item.second;
             }
         }
-        this->value->insert(new_items.begin(), new_items.end());
-        added->happened(new_items);
+
+        if (!new_items.empty())
+            added->happened(new_items);
     }
 
     void add(const KeyType &_key, const VarType &_value)
     {
         MapType new_items;
         auto item = std::make_pair(_key, _value);
-        if ((this->value->find(item.first) == this->value->end()) || ((*this->value)[item.first] != item.second))
+        if ((this->_value->find(item.first) == this->_value->end()) || ((*this->_value)[item.first] != item.second))
         {
             new_items[item.first] = item.second;
-
-        } else {
-            return;//TODO: throw?
+            this->_value->insert(item);
+            added->happened(new_items);
         }
-        std::map<int, int> a;
-        this->value->insert(item);
-        added->happened(new_items);
     }
 
     void remove(std::map<KeyType, VarType> _values)
@@ -146,11 +161,12 @@ public:
         std::map<KeyType, VarType> gone_items;
         for (auto item: _values)
         {
-            if (this->value->find(item.first) != this->value->end())
+            if (this->_value->find(item.first) != this->_value->end())
             {
                 gone_items[item.first] = item.second;
-                this->value->erase(item.first);
-            } else {
+                this->_value->erase(item.first);
+            } else
+            {
                 //TODO: throw?
             }
         }
@@ -160,10 +176,10 @@ public:
     void remove(KeyType _key)
     {
         std::map<KeyType, VarType> gone_items;
-        if (this->value->find(_key) != this->value->end())
+        if (this->_value->find(_key) != this->_value->end())
         {
-            gone_items[_key] = (*this->value)[_key];
-            this->value->erase(_key);
+            gone_items[_key] = (*this->_value)[_key];
+            this->_value->erase(_key);
         }
         removed->happened(gone_items);
     }
