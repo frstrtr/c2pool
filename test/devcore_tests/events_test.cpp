@@ -16,6 +16,17 @@ TEST(DevcoreEvents, event_lambda)
 	ASSERT_EQ(500, res);
 }
 
+TEST(DevcoreEvents, event_void)
+{
+    Event event;
+    event.happened();
+
+    bool result = false;
+    event.subscribe([&result](){result = true;});
+    event.happened();
+    ASSERT_TRUE(result);
+}
+
 class TestEvent
 {
 public:
@@ -152,6 +163,4 @@ TEST(DevcoreEvents, variabledict_varinheritance)
     var.remove(empty_keys);
 
     var.add(5,6);
-
-
 }
