@@ -2,19 +2,6 @@
 #include <libdevcore/events.h>
 #include <iostream>
 
-template <typename Key, typename Value>
-bool eq_maps(const std::map<Key, Value> &m1, const std::map<Key, Value> &m2)
-{
-    for (auto val: m1)
-    {
-        if (m2.find(val.first) == m2.end())
-            return false;
-        if (val.second != m2.find(val.first)->second)
-            return false;
-    }
-    return true;
-}
-
 TEST(DevcoreEvents, event_lambda)
 {
 	int res = 0;
@@ -184,8 +171,8 @@ TEST(DevcoreEvents, variabledict_set)
 
     var.changed->subscribe([](std::map<int,int> val){
         std::cout << "changed" << std::endl;
-        std::map<int, int> new_var_value = {{0,2}, {2,3}};
-        ASSERT_TRUE(eq_maps(val, new_var_value));
+        std::map<int, int> new_var_value = {{0,1}, {2,3}};
+        ASSERT_EQ(val, new_var_value);
     });
 
     std::map<int, int> new_var_value = {{0,1}, {2,3}};
