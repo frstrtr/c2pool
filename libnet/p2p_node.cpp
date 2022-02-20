@@ -26,6 +26,11 @@ namespace c2pool::libnet::p2p
     P2PNode::P2PNode(std::shared_ptr<io::io_context> __context, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<c2pool::dev::coind_config> __config, shared_ptr<c2pool::dev::AddrStore> __addr_store, shared_ptr<c2pool::libnet::CoindNode> __coind_node, shared_ptr<c2pool::shares::ShareTracker> __tracker) : _context(__context), _net(__net), _config(__config), _addr_store(__addr_store), _coind_node(__coind_node), _tracker(__tracker), _resolver(*_context), _acceptor(*_context), _auto_connect_timer(*_context)
     {
         node_id = c2pool::random::RandomNonce();
+
+        best_share = __coind_node->best_share;
+        known_txs = __coind_node->known_txs;
+        mining_txs = __coind_node->mining_txs;
+
         ip::tcp::endpoint listen_ep(ip::tcp::v4(), _config->listenPort);
 
         _acceptor.open(listen_ep.protocol());

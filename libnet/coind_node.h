@@ -18,7 +18,6 @@
 
 using namespace coind::jsonrpc;
 using namespace c2pool::shares;
-using namespace c2pool::util::events;
 using namespace coind;
 
 using std::make_shared;
@@ -54,14 +53,14 @@ namespace c2pool::libnet
         Event<> stop;
 
         VariableDict<uint256, coind::data::tx_type> known_txs;
-        Variable<map<uint256, coind::data::tx_type>> mining_txs;
-        Variable<map<uint256, coind::data::tx_type>> mining2_txs;
+        VariableDict<uint256, coind::data::tx_type> mining_txs;
+        VariableDict<uint256, coind::data::tx_type> mining2_txs;
         Variable<uint256> best_share;
         Variable<c2pool::libnet::addr> desired;
 
-        shared_ptr<Event<uint256>> new_block;                           //block_hash
-        shared_ptr<Event<coind::data::tx_type>> new_tx;                 //bitcoin_data.tx_type
-        shared_ptr<Event<c2pool::shares::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
+        Event<uint256> new_block;                           //block_hash
+        Event<coind::data::tx_type> new_tx;                 //bitcoin_data.tx_type
+        Event<c2pool::shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
         Variable<coind::getwork_result> coind_work;
         Variable<std::optional<c2pool::shares::BlockHeaderType>> best_block_header;

@@ -482,9 +482,9 @@ namespace c2pool::libnet::p2p
 
                 coind::data::stream::TransactionType_stream tx;
                 //TODO: _p2p_node.known_txs_var
-                if (_p2p_node->known_txs_var.find(tx_hash.get()) != _p2p_node->known_txs_var.end())
+                if (_p2p_node->known_txs.value().find(tx_hash.get()) != _p2p_node->known_txs.value().end())
                 {
-                    tx = _p2p_node.known_txs_var[tx_hash.get()];
+                    tx = _p2p_node->known_txs.value()[tx_hash.get()];
                 } else
                 {
                     for (auto cache : known_txs_cache)
