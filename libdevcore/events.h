@@ -190,4 +190,16 @@ public:
         std::vector<KeyType> keys = {_key};
         remove(keys);
     }
+
+    VariableDict<KeyType, VarType> &operator=(const MapType &__value)
+    {
+        if (*this->_value != __value)
+        {
+            auto oldvalue = *this->_value;
+            *this->_value = __value;
+            this->changed->happened(*this->_value);
+            this->transitioned->happened(oldvalue, *this->_value);
+        }
+        return *this;
+    }
 };
