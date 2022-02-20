@@ -114,5 +114,44 @@ TEST(DevcoreEvents, variabledict_lambda)
     var.add(newVals);
     std::cout << "Check finished." << std::endl;
 
-    var.remove(1);
+    auto var_copy = var;
+
+    var_copy.remove(1);
+}
+
+TEST(DevcoreEvents, variabledict_varinheritance)
+{
+    VariableDict<int, int> var({{1,2},{2,3}, {5,6}});
+
+    var.changed->subscribe([](std::map<int,int> _new){
+        std::cout << "changed:" << std::endl;
+        for (auto item : _new)
+        {
+            std::cout << item.first << ":" << item.second << std::endl;
+        }
+
+        std::map<int,int> true_result = {{1,2}, {5,6}};
+        ASSERT_EQ(true_result, _new);
+    });
+
+    var.transitioned->subscribe([](std::map<int,int> _old, std::map<int,int> _new){
+        std::map<int,int> true_old = {{1,2},{2,3}, {5,6}};
+        std::map<int,int> true_result = {{1,2}, {5,6}};
+
+        ASSERT_EQ(true_old, _old);
+        ASSERT_EQ(true_result, _new);
+
+    });
+
+    var.remove(2);
+
+    std::map<int, int> empty_map;
+    var.add(empty_map);
+
+    std::vector<int> empty_keys;
+    var.remove(empty_keys);
+
+    var.add(5,6);
+
+
 }

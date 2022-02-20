@@ -130,6 +130,11 @@ public:
 
     void add(const MapType &_values)
     {
+        if (_values.empty())
+            return;
+
+        MapType old_value = *this->_value;
+
         MapType new_items;
         for (auto item: _values)
         {
@@ -141,46 +146,48 @@ public:
         }
 
         if (!new_items.empty())
+        {
             added->happened(new_items);
+            this->changed->happened(*this->_value);
+            this->transitioned->happened(old_value, *this->_value);
+        }
     }
 
     void add(const KeyType &_key, const VarType &_value)
     {
         MapType new_items;
-        auto item = std::make_pair(_key, _value);
-        if ((this->_value->find(item.first) == this->_value->end()) || ((*this->_value)[item.first] != item.second))
-        {
-            new_items[item.first] = item.second;
-            this->_value->insert(item);
-            added->happened(new_items);
-        }
+        new_items[_key] = _value;
+        add(new_items);
     }
 
-    void remove(std::map<KeyType, VarType> _values)
+    void remove(std::vector<KeyType> _keys)
     {
-        std::map<KeyType, VarType> gone_items;
-        for (auto item: _values)
+        if (_keys.empty())
+            return;
+
+        MapType old_value = *this->_value;
+
+        MapType gone_items;
+        for (auto key: _keys)
         {
-            if (this->_value->find(item.first) != this->_value->end())
+            if (this->_value->find(key) != this->_value->end())
             {
-                gone_items[item.first] = item.second;
-                this->_value->erase(item.first);
-            } else
-            {
-                //TODO: throw?
+                gone_items[key] = (*this->_value)[key];
+                this->_value->erase(key);
             }
         }
-        removed->happened(gone_items);
+
+        if (!gone_items.empty())
+        {
+            removed->happened(gone_items);
+            this->changed->happened(*this->_value);
+            this->transitioned->happened(old_value, *this->_value);
+        }
     }
 
     void remove(KeyType _key)
     {
-        std::map<KeyType, VarType> gone_items;
-        if (this->_value->find(_key) != this->_value->end())
-        {
-            gone_items[_key] = (*this->_value)[_key];
-            this->_value->erase(_key);
-        }
-        removed->happened(gone_items);
+        std::vector<KeyType> keys = {_key};
+        remove(keys);
     }
 };
