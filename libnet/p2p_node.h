@@ -11,8 +11,10 @@
 #include <libdevcore/addrStore.h>
 #include <libdevcore/config.h>
 #include <libdevcore/types.h>
+#include <libdevcore/events.h>
 #include <sharechains/tracker.h>
 #include <networks/network.h>
+#include <libcoind/transaction.h>
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 using std::set, std::tuple, std::map;
@@ -46,7 +48,6 @@ namespace c2pool::libnet::p2p
 
         std::vector<addr> get_good_peers(int max_count);
         void got_addr(c2pool::libnet::addr _addr, uint64_t services, int64_t timestamp);
-
 
         std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>>& get_peers();
         unsigned long long get_nonce();
@@ -86,6 +87,11 @@ namespace c2pool::libnet::p2p
 
         void listen();
         void auto_connect();
+
+    public:
+        VariableDict<uint256, coind::data::tx_type> known_txs;
+        VariableDict<uint256, coind::data::tx_type> mining_txs;
+        Variable<uint256> best_share;
 
     private:
         shared_ptr<c2pool::Network> _net;

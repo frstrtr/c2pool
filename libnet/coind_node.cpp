@@ -12,9 +12,6 @@ namespace c2pool::libnet
     CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker) : _context(__context), _parent_net(__parent_net), _coind(__coind), _resolver(*_context), work_poller_t(*_context), _tracker(__tracker)
     {
         LOG_INFO << "CoindNode constructor";
-        new_block = std::make_shared<Event<uint256>>();
-        new_tx = std::make_shared<Event<coind::data::tx_type>>();
-        new_headers = std::make_shared<Event<c2pool::shares::BlockHeaderType>>();
     }
 
     void CoindNode::start()
@@ -33,7 +30,7 @@ namespace c2pool::libnet
                                 });
         //COIND:
         coind_work = Variable<coind::getwork_result>(_coind->getwork(txidcache));
-        new_block->subscribe([&](uint256 _value)
+        new_block.subscribe([&](uint256 _value)
                              {
                                  //Если получаем новый блок, то обновляем таймер
                                  work_poller_t.expires_from_now(boost::posix_time::seconds(15));
@@ -41,11 +38,15 @@ namespace c2pool::libnet
         work_poller();
 
         //PEER:
-        coind_work.changed.subscribe(&CoindNode::poll_header, this);
+        coind_work.changed->subscribe([&](getwork_result result){
+            this->poll_header();
+        });
         poll_header();
 
         //BEST SHARE
-        coind_work.changed.subscribe(&CoindNode::set_best_share, this);
+        coind_work.changed->subscribe([&](getwork_result result){
+            set_best_share();
+        });
         set_best_share();
 
         // p2p logic and join p2pool network
@@ -78,7 +79,7 @@ namespace c2pool::libnet
     //Каждые 15 секунд или получение ивента new_block, вызываем getwork у coind'a.
     void CoindNode::work_poller()
     {
-        coind_work = _coind->getwork(txidcache, known_txs.value);
+        coind_work = _coind->getwork(txidcache, known_txs.value());
         work_poller_t.expires_from_now(boost::posix_time::seconds(15));
         work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
     }
@@ -91,17 +92,17 @@ namespace c2pool::libnet
 
         arith_uint256 hash_header = UintToArith256(_parent_net->POW_FUNC(packed_new_header));
         //check that header matches current target
-        if (!(hash_header <= UintToArith256(coind_work.value.bits.target())))
+        if (!(hash_header <= UintToArith256(coind_work.value().bits.target())))
             return;
 
-        auto coind_best_block = coind_work.value.previous_block;
+        auto coind_best_block = coind_work.value().previous_block;
 
         PackStream packed_best_block_header;
-        PackShareType(BlockHeaderType, best_block_header.value.value(), packed_best_block_header);
+        PackShareType(BlockHeaderType, best_block_header.value().value(), packed_best_block_header);
 
-        if (!best_block_header.value.has_value() ||
+        if (!best_block_header.value().has_value() ||
             ((new_header.previous_block == coind_best_block) && (coind::data::hash256(packed_best_block_header) == coind_best_block)) ||
-            ((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header.value->previous_block != coind_best_block)))
+            ((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header.value()->previous_block != coind_best_block)))
         {
             best_block_header = new_header;
         }
