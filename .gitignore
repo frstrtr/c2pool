@@ -57,4 +57,4 @@ vc140.pdb
 /test/coind_tests/pass.h
 
 #secp256k1 from cmake/ProjectSecp256k1.cmake
-/libs/secp256k1/*
+libs/secp256k1/*
