@@ -16,18 +16,21 @@
 template<typename... Args>
 class Event
 {
-    boost::signals2::signal<void(Args...)> sig;
-    int times;
+    std::shared_ptr<boost::signals2::signal<void(Args...)>> sig;
+    std::shared_ptr<int> times;
 
 public:
     Event()
-    {}
+    {
+        sig = std::make_shared<boost::signals2::signal<void(Args...)>>();
+        times = std::make_shared<int>(0);
+    }
 
     //for std::function/lambda
     template<typename Lambda>
     void subscribe(Lambda _f)
     {
-        sig.connect(_f);
+        sig->connect(_f);
     }
 
     void run_and_subscribe(std::function<void()> _f)
@@ -46,11 +49,13 @@ public:
 
     void happened(Args... args)
     {
-        sig(args...);
-        times += 1;
+        (*sig)(args...);
+        *times += 1;
     }
 };
 
+
+//TODO: remove shared_ptr for Events?
 template<typename VarType>
 class Variable
 {
