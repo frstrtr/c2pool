@@ -16,6 +16,33 @@ TEST(DevcoreEvents, event_lambda)
 	ASSERT_EQ(500, res);
 }
 
+TEST(DevcoreEvents, event_run_and_subscribe)
+{
+    int res = 0;
+
+    Event<int> event;
+    event.run_and_subscribe([&res](){
+        res = 99;
+    });
+
+    ASSERT_EQ(res, 99);
+
+    res = 0;
+    event.happened(199);
+    ASSERT_EQ(res, 99);
+
+    res = 0;
+    int res2 = 0;
+    event.subscribe([&](const int &value){
+        res2 = value;
+    });
+    event.happened(511);
+
+    ASSERT_EQ(res, 99);
+    ASSERT_EQ(res2, 511);
+
+}
+
 TEST(DevcoreEvents, event_copy)
 {
     int res = 0;

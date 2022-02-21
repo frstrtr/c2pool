@@ -17,12 +17,14 @@ template<typename... Args>
 class Event
 {
     std::shared_ptr<boost::signals2::signal<void(Args...)>> sig;
+    std::shared_ptr<boost::signals2::signal<void()>> sig_anon; //For subs without arguments;
     std::shared_ptr<int> times;
 
 public:
     Event()
     {
         sig = std::make_shared<boost::signals2::signal<void(Args...)>>();
+        sig_anon = std::make_shared<boost::signals2::signal<void()>>();
         times = std::make_shared<int>(0);
     }
 
@@ -31,6 +33,12 @@ public:
     void subscribe(Lambda _f)
     {
         sig->connect(_f);
+    }
+
+    void subscribe(std::function<void()> _f)
+    {
+        std::cout << "SUBSCRIBE" << std::endl;
+        sig_anon->connect(_f);
     }
 
     void run_and_subscribe(std::function<void()> _f)
@@ -50,6 +58,7 @@ public:
     void happened(Args... args)
     {
         (*sig)(args...);
+        (*sig_anon)();
         *times += 1;
     }
 };
