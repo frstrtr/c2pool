@@ -7,7 +7,6 @@
 #include <libcoind/transaction.h>
 #include <sharechains/data.h>
 using namespace coind::p2p::messages;
-using namespace c2pool::util::events;
 using namespace c2pool::libnet;
 
 #include <univalue.h>
@@ -37,11 +36,11 @@ namespace coind::p2p
         CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct);
 
     public:
-        std::shared_ptr<Event<uint256>> new_block;    //block_hash
-        std::shared_ptr<Event<coind::data::tx_type>> new_tx;      //bitcoin_data.tx_type
-        std::shared_ptr<Event<c2pool::shares::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
+        Event<uint256> new_block;    //block_hash
+        Event<coind::data::tx_type> new_tx;      //bitcoin_data.tx_type
+        Event<c2pool::shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
-        void init(std::shared_ptr<Event<uint256>> _new_block, std::shared_ptr<Event<coind::data::tx_type>> _new_tx, std::shared_ptr<Event<c2pool::shares::BlockHeaderType>> _new_headers)
+        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<c2pool::shares::BlockHeaderType> _new_headers)
         {
             new_block = _new_block;
             new_tx = _new_tx;
@@ -188,8 +187,7 @@ namespace coind::p2p
                 break;
                 case inventory_type::block:
                     LOG_TRACE << "HANDLED BLOCK, with hash: " << inv.hash.GetHex();
-                    LOG_TRACE << "new_block != nullptr" << (new_block != nullptr);
-                    new_block->happened(inv.hash); //self.factory.new_block.happened(inv['hash'])
+                    new_block.happened(inv.hash); //self.factory.new_block.happened(inv['hash'])
                     break;
                 default:
                     //when Unkown inv type
