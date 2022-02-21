@@ -1,5 +1,8 @@
 #include "coind_node.h"
 
+#include <boost/range/combine.hpp>
+#include <boost/foreach.hpp>
+
 #include <networks/network.h>
 #include <libcoind/p2p/p2p_socket.h>
 #include <libcoind/p2p/p2p_protocol.h>
@@ -52,21 +55,27 @@ namespace c2pool::libnet
         // p2p logic and join p2pool network
 
         // update mining_txs according to getwork results
-        // coind_work.changed.run_and_subscribe([&]()
-        // {
-        //     /* TODO:
-        //         new_mining_txs = {}
-        //         new_known_txs = dict(self.known_txs_var.value)
-        //         for tx_hash, tx in zip(self.bitcoind_work.value['transaction_hashes'], self.bitcoind_work.value['transactions']):
-        //             new_mining_txs[tx_hash] = tx
-        //             new_known_txs[tx_hash] = tx
-        //         self.mining_txs_var.set(new_mining_txs)
-        //         self.known_txs_var.set(new_known_txs)
-        //     */
-        //    auto new_mining_txs;
-        //    auto new_known_txs;
+        coind_work.changed->run_and_subscribe([&](){
+            std::map<uint256, coind::data::tx_type> new_mining_txs;
+            auto new_known_txs = known_txs.value();
 
-        // });
+            uint256 _tx_hash;
+            coind::data::tx_type _tx;
+            BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work.value().transaction_hashes,coind_work.value().transactions))
+                        {
+                            new_mining_txs[_tx_hash] = _tx;
+                            new_known_txs[_tx_hash] = _tx;
+                        }
+
+            mining_txs = new_mining_txs;
+            known_txs = new_known_txs;
+        });
+
+        new_tx.subscribe([&](coind::data::tx_type _tx){
+            auto new_known_txs = known_txs.value();
+
+        });
+
 
         LOG_INFO << "... CoindNode started!"; //TODO: log coind name
     }
@@ -112,7 +121,7 @@ namespace c2pool::libnet
     {
         if (!protocol)
             return;
-        //TODO: handle_header(protocol->get_block_header(coind_work.value.previous_block));
+        handle_header(protocol->get_block_header(coind_work.value().previous_block));
     }
 
     void CoindNode::set_best_share()
