@@ -79,3 +79,18 @@ TEST(Devcore_stream, type_IPV6AddressType){
 
     ASSERT_EQ(ip1, unpack_ip.value);
 }
+
+TEST(Devcore_stream, type_const_char)
+{
+    vector<unsigned char> chrs = {0x83, 0x76, 0xa9, 0xA9};
+    PackStream stream;
+
+    stream << chrs;
+
+    std::cout << stream.size() << std::endl;
+    std::cout << chrs.size() << std::endl;
+    for (int i = 0; i < chrs.size(); i++)
+    {
+        ASSERT_EQ(chrs[i], stream.data[i]);
+    }
+}

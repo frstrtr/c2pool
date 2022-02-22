@@ -131,6 +131,12 @@ struct PackStream
         return *this;
     }
 
+    PackStream &operator<<(std::vector<unsigned char> &val)
+    {
+        data.insert(data.end(), val.begin(), val.end());
+        return *this;
+    }
+
     template <typename T>
     PackStream &operator<<(T &val)
     {
