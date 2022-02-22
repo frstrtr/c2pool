@@ -82,15 +82,21 @@ TEST(Devcore_stream, type_IPV6AddressType){
 
 TEST(Devcore_stream, type_const_char)
 {
-    vector<unsigned char> chrs = {0x83, 0x76, 0xa9, 0xA9};
+    vector<unsigned char> chrs1 = {0x84, 0x76, 0xA9, 0xA9, 0xA9};
+    vector<unsigned char> chrs2 = {0x76, 0xa9, 0x14, 0xF1};
+
+    vector<unsigned char> check_res(chrs1);
+    check_res.insert(check_res.end(), chrs2.begin(), chrs2.end());
+
     PackStream stream;
 
-    stream << chrs;
+    stream << chrs1;
+    stream << vector<unsigned char>({0x76, 0xa9, 0x14, 0xF1});
 
-    std::cout << stream.size() << std::endl;
-    std::cout << chrs.size() << std::endl;
-    for (int i = 0; i < chrs.size(); i++)
+    std::cout << "check_res.size(): " << check_res.size() << std::endl;
+    for (int i = 0; i < check_res.size(); i++)
     {
-        ASSERT_EQ(chrs[i], stream.data[i]);
+        ASSERT_EQ(check_res[i], stream.data[i]);
     }
+
 }
