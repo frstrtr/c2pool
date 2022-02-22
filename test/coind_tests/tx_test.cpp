@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+
+#include <libcoind/data.h>
 #include <libcoind/transaction.h>
 #include <btclibs/util/strencodings.h>
 #include <libdevcore/stream.h>
@@ -14,4 +16,41 @@ TEST(TX_TEST, data_load)
 	packed >> _unpacked;
 	coind::data::tx_type unpacked;
 	unpacked = _unpacked.tx;
+}
+
+TEST(CoindTxs, tx_hash)
+{
+    vector<coind::data::TxInType> _tx_ins;
+    coind::data::TxInType tx_in1;
+
+    auto a = ParseHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
+    PackStream packed_in_script(a);
+    StrType unpacked_in_script;
+    packed_in_script >> unpacked_in_script;
+    tx_in1.script = unpacked_in_script.get();
+
+    _tx_ins.push_back(tx_in1);
+
+
+    vector<coind::data::TxOutType> _tx_outs;
+
+    PackStream packed_out_script(ParseHex("ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b"));
+    IntType(160) script_num;
+    packed_out_script >> script_num;
+    auto _script = coind::data::pubkey_hash_to_script2(script_num.get());
+    StrType unpacked_out_script;
+    _script >> unpacked_out_script;
+
+    coind::data::TxOutType tx_out1(5003880250, unpacked_out_script.get());
+    _tx_outs.push_back(tx_out1);
+
+    coind::data::tx_type tx = std::make_shared<coind::data::TransactionType>(1, _tx_ins, _tx_outs, 0);
+
+    //===
+
+    PackStream result;
+    coind::data::stream::TransactionType_stream packed_tx(tx);
+    result << packed_tx;
+
+    std::cout << result.bytes() << std::endl;
 }
