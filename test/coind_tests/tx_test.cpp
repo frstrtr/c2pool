@@ -23,10 +23,11 @@ TEST(CoindTxs, tx_hash)
     vector<coind::data::TxInType> _tx_ins;
     coind::data::TxInType tx_in1;
 
-    auto a = ParseHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
-    PackStream packed_in_script(a);
+//    auto a = ParseHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
+//    PackStream packed_in_script(a);
     StrType unpacked_in_script;
-    packed_in_script >> unpacked_in_script;
+    unpacked_in_script.fromHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
+//    packed_in_script >> unpacked_in_script;
     tx_in1.script = unpacked_in_script.get();
 
     _tx_ins.push_back(tx_in1);
@@ -39,7 +40,7 @@ TEST(CoindTxs, tx_hash)
     packed_out_script >> script_num;
     auto _script = coind::data::pubkey_hash_to_script2(script_num.get());
     StrType unpacked_out_script;
-    _script >> unpacked_out_script;
+    unpacked_out_script.fromHex(_script);
 
     coind::data::TxOutType tx_out1(5003880250, unpacked_out_script.get());
     _tx_outs.push_back(tx_out1);
@@ -52,5 +53,15 @@ TEST(CoindTxs, tx_hash)
     coind::data::stream::TransactionType_stream packed_tx(tx);
     result << packed_tx;
 
-    std::cout << result.bytes() << std::endl;
+    for (auto v : result.data)
+    {
+        std::cout << (unsigned int) v << " ";
+    }
+    std::cout << std::endl;
+
+    auto hash_tx = coind::data::hash256(result);
+
+    std::cout << "hash: " << hash_tx.GetHex() << std::endl;
+
+    ASSERT_EQ(hash_tx, "b53802b2333e828d6532059f46ecf6b313a42d79f97925e457fbbfda45367e5c");
 }

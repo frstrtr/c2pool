@@ -72,10 +72,58 @@ namespace c2pool::libnet
         });
 
         new_tx.subscribe([&](coind::data::tx_type _tx){
-            auto new_known_txs = known_txs.value();
+            //TODO:
+            PackStream packed_tx;
+            //_tx->
+            //known_txs.add(coind::data::hash256())
 
         });
 
+        /* TODO:
+         * # forward transactions seen to bitcoind
+        @self.known_txs_var.transitioned.watch
+        @defer.inlineCallbacks
+        def _(before, after):
+            yield deferral.sleep(random.expovariate(1/1))
+            if self.factory.conn.value is None:
+                return
+            for tx_hash in set(after) - set(before):
+                self.factory.conn.value.send_tx(tx=after[tx_hash])
+
+        @self.tracker.verified.added.watch
+        def _(share):
+            if not (share.pow_hash <= share.header['bits'].target):
+                return
+
+            block = share.as_block(self.tracker, self.known_txs_var.value)
+            if block is None:
+                print >>sys.stderr, 'GOT INCOMPLETE BLOCK FROM PEER! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
+                return
+            helper.submit_block(block, True, self.factory, self.bitcoind, self.bitcoind_work, self.net)
+            print
+            print 'GOT BLOCK FROM PEER! Passing to bitcoind! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
+            print
+
+        def forget_old_txs():
+            new_known_txs = {}
+            if self.p2p_node is not None:
+                for peer in self.p2p_node.peers.itervalues():
+                    new_known_txs.update(peer.remembered_txs)
+            new_known_txs.update(self.mining_txs_var.value)
+            for share in self.tracker.get_chain(self.best_share_var.value, min(120, self.tracker.get_height(self.best_share_var.value))):
+                for tx_hash in share.new_transaction_hashes:
+                    if tx_hash in self.known_txs_var.value:
+                        new_known_txs[tx_hash] = self.known_txs_var.value[tx_hash]
+            self.known_txs_var.set(new_known_txs)
+        t = deferral.RobustLoopingCall(forget_old_txs)
+        t.start(10)
+        stop_signal.watch(t.stop)
+
+        t = deferral.RobustLoopingCall(self.clean_tracker)
+        t.start(5)
+        stop_signal.watch(t.stop)
+
+         */
 
         LOG_INFO << "... CoindNode started!"; //TODO: log coind name
     }
@@ -121,7 +169,7 @@ namespace c2pool::libnet
     {
         if (!protocol)
             return;
-        handle_header(protocol->get_block_header(coind_work.value().previous_block));
+        //TODO: handle_header(protocol->get_block_header(coind_work.value().previous_block));
     }
 
     void CoindNode::set_best_share()
