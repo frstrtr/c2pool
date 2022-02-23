@@ -130,4 +130,6 @@ namespace coind::data
 
         return human_addr.pubkey_hash.value;
     }
+
+    PackStream pubkey_hash_to_script2(uint160 pubkey_hash);
 }

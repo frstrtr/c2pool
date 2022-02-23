@@ -6,6 +6,7 @@
 #include <list>
 #include <optional>
 
+#include <btclibs/util/strencodings.h>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 
@@ -54,6 +55,7 @@ struct ListType : MakerListType<T>
     {
         auto len = 0;
         stream >> len;
+        std::cout << "len:" << len << std::endl;
         for (int i = 0; i < len; i++)
         {
             T temp;
@@ -74,6 +76,24 @@ struct StrType : public Maker<StrType, string>
     StrType(const string _str)
     {
         str = _str;
+    }
+
+    StrType &fromHex(const std::string &hexData)
+    {
+        PackStream _stream;
+        auto lenData = hexData.length();
+        _stream << lenData << ParseHex(hexData);
+
+        return *this;
+    }
+
+    StrType &fromHex(PackStream &hexData)
+    {
+        PackStream _stream;
+        auto lenData = hexData.size();
+        _stream << lenData << hexData;
+
+        return *this;
     }
 
     auto &operator=(std::string _str)

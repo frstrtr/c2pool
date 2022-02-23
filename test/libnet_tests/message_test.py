@@ -330,6 +330,27 @@ message_version = ComposedType([
     ('best_share_hash', PossiblyNoneType(0, IntType(256))),
 ])
 
+tx_type = ComposedType([
+    ('version', IntType(32)),
+    ('tx_ins', ListType(ComposedType([
+        ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
+            ('hash', IntType(256)),
+            ('index', IntType(32)),
+        ]))),
+        ('script', VarStrType()),
+        ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
+    ]))),
+    ('tx_outs', ListType(ComposedType([
+        ('value', IntType(64)),
+        ('script', VarStrType()),
+    ]))),
+    ('lock_time', IntType(32)),
+])
+
+def pubkey_hash_to_script2(pubkey_hash):
+    return '\x76\xa9' + ('\x14' + IntType(160).pack(pubkey_hash)) + '\x88\xac'
+
+"""
 addrs1 = dict(services=3, address="192.168.10.10", port=8)
 addrs2 = dict(services=9, address="192.168.10.11", port=9999)
 best_share_hash = int("06abb7263fc73665f1f5b129959d90419fea5b1fdbea6216e8847bcc286c14e9", 16)
@@ -359,6 +380,8 @@ print(res_str)
 # print(checksum)
 print (checksum[:4])
 # print(msg)
+"""
+
 
 #c2pool
 #229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 8 0 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 14 0 21 205 91 7 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
@@ -390,3 +413,25 @@ print (checksum[:4])
 #202 129 170 188 195 123 105 117 227 142 244 158 47 69 25 8 112 64 14 54 56 211 106 63 207 27 165 41 65 70 138 248
 #p2pool [True]
 #21 102 66 235 221 222 11 88 186 181 186 213 103 112 141 227 218 158 162 171 230 24 239 175 202 203 234 35 156 35 113 14
+
+#====================
+
+tx = tx_type.pack(dict(
+    version=1,
+    tx_ins=[dict(
+        previous_output=None,
+        sequence=None,
+        script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
+    )],
+    tx_outs=[dict(
+        value=5003880250,
+        script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
+    )],
+    lock_time=0,
+))
+
+l_tx = []
+for i in tx:
+    l_tx += [ord(i)]
+
+print(str(l_tx).replace(',', ''))

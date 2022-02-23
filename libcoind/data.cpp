@@ -19,7 +19,8 @@ namespace coind::data
 
     bool is_segwit_tx(std::shared_ptr<TransactionType> tx)
     {
-        auto cast_tx = std::static_pointer_cast<WitnessTransactionType>(tx);
+        std::shared_ptr<WitnessTransactionType> cast_tx = std::dynamic_pointer_cast<WitnessTransactionType>(tx);
+//        if (std::is_t)
         if (cast_tx)
         {
             return cast_tx->marker == 0 && cast_tx->flag >= 1;
@@ -139,5 +140,15 @@ namespace coind::data
         }
 
         return cur;
+    }
+
+    PackStream pubkey_hash_to_script2(uint160 pubkey_hash)
+    {
+        auto packed_pubkey_hash = IntType(160)(pubkey_hash);
+
+        PackStream result;
+        result << vector<unsigned char>({0x76, 0xa9, 0x14}) << packed_pubkey_hash << vector<unsigned char>({0x88, 0xac});
+
+        return result;
     }
 }

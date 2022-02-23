@@ -41,6 +41,8 @@ namespace coind::data
 
         PreviousOutput()
         {
+            hash.SetHex("0");
+            index = 4294967295;
         }
 
         PreviousOutput(uint256 _hash, int32_t _index)
@@ -100,6 +102,8 @@ namespace coind::data
 
         TransactionType() = default;
 
+        virtual ~TransactionType() {}
+
         TransactionType(uint32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, uint32_t _locktime)
         {
             version = _version;
@@ -114,10 +118,10 @@ namespace coind::data
     struct WitnessTransactionType : TransactionType
     {
 
-        uint64_t marker{};
+        uint64_t marker;
         //TODO:?
         // int8_t marker{};
-        uint8_t flag{};
+        uint8_t flag;
         vector<vector<string>> witness;
 
         WitnessTransactionType() : TransactionType() {}
@@ -310,10 +314,11 @@ namespace coind::data::stream
         std::shared_ptr<coind::data::TransactionType> tx;
 
         TransactionType_stream() = default;
-        //TODO:
-        // TransactionType_stream(TransactionType val){
-        //     tx = std::make_shared
-        // }
+
+        TransactionType_stream(coind::data::tx_type val)
+        {
+            tx = val;
+        }
 
         PackStream &write(PackStream &stream);
         PackStream &read(PackStream &stream)
