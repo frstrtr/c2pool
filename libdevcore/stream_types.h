@@ -84,6 +84,8 @@ struct StrType : public Maker<StrType, string>
         auto lenData = hexData.length();
         _stream << lenData << ParseHex(hexData);
 
+        _stream >> *this;
+
         return *this;
     }
 

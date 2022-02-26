@@ -415,8 +415,133 @@ print (checksum[:4])
 #21 102 66 235 221 222 11 88 186 181 186 213 103 112 141 227 218 158 162 171 230 24 239 175 202 203 234 35 156 35 113 14
 
 #====================
+#
+# tx = tx_type.pack(dict(
+#     version=1,
+#     tx_ins=[dict(
+#         previous_output=None,
+#         sequence=None,
+#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
+#     )],
+#     tx_outs=[dict(
+#         value=5003880250,
+#         script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
+#     )],
+#     lock_time=0,
+# ))
+#
+# l_tx = []
+# for i in tx:
+#     l_tx += [ord(i)]
+#
+# print(str(l_tx).replace(',', ''))
+#
+# #===========================================================
+# tx_type2 = ComposedType([
+#     ('version', IntType(32)),
+#     ('tx_ins', ListType(ComposedType([
+#         ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
+#             ('hash', IntType(256)),
+#             ('index', IntType(32)),
+#         ]))),
+#         ('script', VarStrType()),
+#         ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
+#     ])))
+# ])
+#
+# tx2 = tx_type2.pack(dict(
+#     version=1,
+#     tx_ins=[dict(
+#         previous_output=None,
+#         sequence=None,
+#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
+#     )]
+# ))
+#
+# l_tx2 = []
+# for i in tx2:
+#     l_tx2 += [ord(i)]
+#
+# print(str(l_tx2).replace(',', ''))
 
-tx = tx_type.pack(dict(
+#==================================
+
+def is_segwit_tx(tx):
+    return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
+
+tx_in_type = ComposedType([
+    ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
+        ('hash', IntType(256)),
+        ('index', IntType(32)),
+    ]))),
+    ('script', VarStrType()),
+    ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
+])
+
+tx_out_type = ComposedType([
+    ('value', IntType(64)),
+    ('script', VarStrType()),
+])
+
+tx_id_type = ComposedType([
+    ('version', IntType(32)),
+    ('tx_ins', ListType(tx_in_type)),
+    ('tx_outs', ListType(tx_out_type)),
+    ('lock_time', IntType(32))
+])
+
+class TransactionType(Type):
+    _int_type = IntType(32)
+    _varint_type = VarIntType()
+    _witness_type = ListType(VarStrType())
+    _wtx_type = ComposedType([
+        ('flag', IntType(8)),
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type))
+    ])
+    _ntx_type = ComposedType([
+        ('tx_outs', ListType(tx_out_type)),
+        ('lock_time', _int_type)
+    ])
+    _write_type = ComposedType([
+        ('version', _int_type),
+        ('marker', IntType(8)),
+        ('flag', IntType(8)),
+        ('tx_ins', ListType(tx_in_type)),
+        ('tx_outs', ListType(tx_out_type))
+    ])
+
+    def read(self, file):
+        version = self._int_type.read(file)
+        marker = self._varint_type.read(file)
+        if marker == 0:
+            next = self._wtx_type.read(file)
+            witness = [None]*len(next['tx_ins'])
+            for i in xrange(len(next['tx_ins'])):
+                witness[i] = self._witness_type.read(file)
+            locktime = self._int_type.read(file)
+            return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
+        else:
+            tx_ins = [None]*marker
+            for i in xrange(marker):
+                tx_ins[i] = tx_in_type.read(file)
+            next = self._ntx_type.read(file)
+            return dict(version=version, tx_ins=tx_ins, tx_outs=next['tx_outs'], lock_time=next['lock_time'])
+
+    def write(self, file, item):
+        if is_segwit_tx(item):
+            assert len(item['tx_ins']) == len(item['witness'])
+            self._write_type.write(file, item)
+            for w in item['witness']:
+                self._witness_type.write(file, w)
+            self._int_type.write(file, item['lock_time'])
+            return
+        return tx_id_type.write(file, item)
+
+tx_type = TransactionType()
+
+#=====================
+tx1 = dict(
     version=1,
     tx_ins=[dict(
         previous_output=None,
@@ -428,10 +553,12 @@ tx = tx_type.pack(dict(
         script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
     )],
     lock_time=0,
-))
+)
 
-l_tx = []
-for i in tx:
-    l_tx += [ord(i)]
+a = tx_type.pack(tx1)
 
-print(str(l_tx).replace(',', ''))
+l_tx2 = []
+for i in a:
+    l_tx2 += [ord(i)]
+
+print(str(l_tx2).replace(',', ''))
