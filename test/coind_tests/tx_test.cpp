@@ -28,7 +28,10 @@ TEST(CoindTxs, tx_hash)
     StrType unpacked_in_script;
     unpacked_in_script.fromHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
 //    packed_in_script >> unpacked_in_script;
+
+    std::cout << unpacked_in_script.str.size() << std::endl;
     tx_in1.script = unpacked_in_script.get();
+    std::cout << "tx_in1.Script: " << tx_in1.script << std::endl;
 
     _tx_ins.push_back(tx_in1);
 
@@ -63,5 +66,5 @@ TEST(CoindTxs, tx_hash)
 
     std::cout << "hash: " << hash_tx.GetHex() << std::endl;
 
-    ASSERT_EQ(hash_tx, "b53802b2333e828d6532059f46ecf6b313a42d79f97925e457fbbfda45367e5c");
+    ASSERT_EQ(hash_tx.GetHex(), "b53802b2333e828d6532059f46ecf6b313a42d79f97925e457fbbfda45367e5c");
 }
