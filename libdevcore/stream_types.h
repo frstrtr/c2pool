@@ -40,7 +40,6 @@ struct ListType : MakerListType<T>
 
     PackStream &write(PackStream &stream) const
     {
-//        LOG_TRACE << "ListType Worked!";
         auto len = l.size();
         stream << len;
         for (auto v : l)
@@ -55,7 +54,6 @@ struct ListType : MakerListType<T>
     {
         auto len = 0;
         stream >> len;
-        std::cout << "len:" << len << std::endl;
         for (int i = 0; i < len; i++)
         {
             T temp;
@@ -69,40 +67,31 @@ struct ListType : MakerListType<T>
 //In p2pool - VarStrType
 struct StrType : public Maker<StrType, string>
 {
-    string str;
+    vector<unsigned char> value;
 
-    vector<unsigned char> c_str;
+	//TODO: c_str()?
 
     StrType() = default;
 
     StrType(string _str)
     {
-        str = _str;
+        value.insert(value.begin(), _str.begin(), _str.end());
     }
 
     StrType(vector<unsigned char> _c_str)
     {
-        c_str = _c_str;
+        value = _c_str;
     }
 
-    //TODO: remove or update
     StrType &fromHex(const std::string &hexData)
     {
         PackStream _stream;
-
-        PackStream _stream_test;
-        StrType str("abcdef");
-        ListType<unsigned char> res;
-
-//        _stream_test << str;
-//        _stream_test >> res;
 
         auto parsedHexData = ParseHex(hexData);
         auto lenData = parsedHexData.size();
 
         _stream << lenData << parsedHexData;
 
-//        _stream >> res;
         std::cout << "parsedHexData: ";
         for (auto v : _stream.data)
         {
@@ -115,7 +104,6 @@ struct StrType : public Maker<StrType, string>
         return *this;
     }
 
-    //TODO: remove or update
     StrType &fromHex(PackStream &hexData)
     {
         PackStream _stream;
@@ -127,36 +115,29 @@ struct StrType : public Maker<StrType, string>
 
     auto &operator=(std::string _str)
     {
-        str = _str;
+		value.clear();
+        value.insert(value.begin(), _str.begin(), _str.end());
         return *this;
     }
 
     PackStream &write(PackStream &stream) const
     {
-//        LOG_TRACE << "StrType Worked!";
-
-        char s[str.length() + 1];
-        strcpy(s, str.c_str());
-
-        ListType<char> list_s(s, str.length());
-
+        ListType<unsigned char> list_s(value);
         stream << list_s;
-
         return stream;
     }
 
     PackStream &read(PackStream &stream)
     {
-        ListType<char> list_s;
+        ListType<unsigned char> list_s;
         stream >> list_s;
-
-        str = string(list_s.l.begin(), list_s.l.end());
+        value = std::move(list_s.l);
         return stream;
     }
 
     string get()
     {
-        return str;
+		return string(value.begin(), value.end());
     }
 };
 

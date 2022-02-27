@@ -57,12 +57,12 @@ namespace coind::data
     struct TxInType
     {
         PreviousOutput previous_output;
-        string script;
+		std::vector<unsigned char> script;
         int32_t sequence;
 
         TxInType();
 
-        TxInType(PreviousOutput _previous_output, char *_script, unsigned long _sequence);
+        TxInType(PreviousOutput _previous_output, unsigned char *_script, unsigned long _sequence);
 
         TxInType(std::shared_ptr<stream::TxInType_stream> obj);
     };
@@ -70,11 +70,11 @@ namespace coind::data
     struct TxOutType
     {
         int64_t value;
-        string script;
+        std::vector<unsigned char> script;
 
         TxOutType() = default;
 
-        TxOutType(int64_t _value, string _script);
+        TxOutType(int64_t _value, unsigned char *_script);
 
         TxOutType(std::shared_ptr<stream::TxOutType_stream> obj);
     };
