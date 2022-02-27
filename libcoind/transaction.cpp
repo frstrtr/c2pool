@@ -181,16 +181,16 @@ coind::data::TxIDType::TxIDType(coind::data::stream::TxIDType_stream obj)
     lock_time = obj.lock_time.get();
 }
 
-coind::data::TxOutType::TxOutType(int64_t _value, string _script)
+coind::data::TxOutType::TxOutType(int64_t _value, unsigned char *_script)
 {
     value = _value;
-    script = _script;
+    script = std::vector<unsigned char>(_script, _script + (strlen((char*)_script))-1);
 }
 
 coind::data::TxOutType::TxOutType(std::shared_ptr<stream::TxOutType_stream> obj)
 {
     value = obj->value.value;
-    script = obj->script.get();
+    script = obj->script.value;
 }
 
 coind::data::TxInType::TxInType()
@@ -200,17 +200,17 @@ coind::data::TxInType::TxInType()
     sequence = 4294967295;
 }
 
-coind::data::TxInType::TxInType(coind::data::PreviousOutput _previous_output, char *_script, unsigned long _sequence)
+coind::data::TxInType::TxInType(coind::data::PreviousOutput _previous_output, unsigned char *_script, unsigned long _sequence)
 {
     previous_output = _previous_output;
-    script = _script;
+    script = std::vector<unsigned char>(_script, _script + (strlen((char*)_script))-1);
     sequence = _sequence;
 }
 
 coind::data::TxInType::TxInType(std::shared_ptr<coind::data::stream::TxInType_stream> obj)
 {
     previous_output = PreviousOutput(obj->previous_output.get());
-    script = obj->script.get();
+    script = obj->script.value;
     sequence = obj->sequence.get().value;
 }
 

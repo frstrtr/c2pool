@@ -98,5 +98,17 @@ TEST(Devcore_stream, type_const_char)
     {
         ASSERT_EQ(check_res[i], stream.data[i]);
     }
+}
 
+TEST(Devcore_stream, type_str)
+{
+	StrType str1("asd123");
+	ASSERT_EQ(str1.get(), "asd123");
+
+	PackStream stream;
+	stream << str1;
+
+	StrType str2;
+	stream >> str2;
+	ASSERT_EQ(str2.get(), "asd123");
 }

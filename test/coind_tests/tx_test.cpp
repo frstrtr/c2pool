@@ -23,15 +23,16 @@ TEST(CoindTxs, tx_hash)
     vector<coind::data::TxInType> _tx_ins;
     coind::data::TxInType tx_in1;
 
-//    auto a = ParseHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
-//    PackStream packed_in_script(a);
     StrType unpacked_in_script;
     unpacked_in_script.fromHex("70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88");
-//    packed_in_script >> unpacked_in_script;
 
-    std::cout << unpacked_in_script.str.size() << std::endl;
-    tx_in1.script = unpacked_in_script.get();
-    std::cout << "tx_in1.Script: " << tx_in1.script << std::endl;
+    std::cout << unpacked_in_script.get().size() << std::endl;
+    tx_in1.script = unpacked_in_script.value;
+    std::cout << "tx_in1.Script: ";
+	for (auto v : tx_in1.script){
+		std::cout << v << " ";
+	}
+	std::cout << std::endl;
 
     _tx_ins.push_back(tx_in1);
 
@@ -45,7 +46,7 @@ TEST(CoindTxs, tx_hash)
     StrType unpacked_out_script;
     unpacked_out_script.fromHex(_script);
 
-    coind::data::TxOutType tx_out1(5003880250, unpacked_out_script.get());
+    coind::data::TxOutType tx_out1(5003880250, unpacked_out_script.value);
     _tx_outs.push_back(tx_out1);
 
     coind::data::tx_type tx = std::make_shared<coind::data::TransactionType>(1, _tx_ins, _tx_outs, 0);
