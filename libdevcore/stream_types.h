@@ -78,17 +78,37 @@ struct StrType : public Maker<StrType, string>
         str = _str;
     }
 
+    //TODO: remove or update
     StrType &fromHex(const std::string &hexData)
     {
         PackStream _stream;
-        auto lenData = hexData.length();
-        _stream << lenData << ParseHex(hexData);
+
+        PackStream _stream_test;
+        StrType str("abcdef");
+        StrType res;
+
+//        _stream_test << str;
+//        _stream_test >> res;
+
+        auto parsedHexData = ParseHex(hexData);
+        auto lenData = parsedHexData.size();
+
+        _stream << lenData << parsedHexData;
+
+//        _stream >> res;
+        std::cout << "parsedHexData: ";
+        for (auto v : _stream.data)
+        {
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << std::endl;
 
         _stream >> *this;
 
         return *this;
     }
 
+    //TODO: remove or update
     StrType &fromHex(PackStream &hexData)
     {
         PackStream _stream;
