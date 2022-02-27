@@ -71,11 +71,18 @@ struct StrType : public Maker<StrType, string>
 {
     string str;
 
+    vector<unsigned char> c_str;
+
     StrType() = default;
 
-    StrType(const string _str)
+    StrType(string _str)
     {
         str = _str;
+    }
+
+    StrType(vector<unsigned char> _c_str)
+    {
+        c_str = _c_str;
     }
 
     //TODO: remove or update
@@ -85,7 +92,7 @@ struct StrType : public Maker<StrType, string>
 
         PackStream _stream_test;
         StrType str("abcdef");
-        StrType res;
+        ListType<unsigned char> res;
 
 //        _stream_test << str;
 //        _stream_test >> res;
