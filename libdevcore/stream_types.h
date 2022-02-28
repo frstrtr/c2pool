@@ -90,16 +90,17 @@ struct StrType : public Maker<StrType, string>
         auto parsedHexData = ParseHex(hexData);
         auto lenData = parsedHexData.size();
 
-        _stream << lenData << parsedHexData;
+        value.insert(value.end(), parsedHexData.begin(), parsedHexData.end());
+//        _stream << parsedHexData;
 
         std::cout << "parsedHexData: ";
-        for (auto v : _stream.data)
+        for (auto v : value)
         {
             std::cout << (unsigned int) v << " ";
         }
         std::cout << std::endl;
 
-        _stream >> *this;
+//        _stream >> *this;
 
         return *this;
     }
@@ -123,7 +124,14 @@ struct StrType : public Maker<StrType, string>
     PackStream &write(PackStream &stream) const
     {
         ListType<unsigned char> list_s(value);
-        stream << list_s;
+
+        std::cout << "list_s.l: ";
+        for (auto v : list_s.l){
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << std::endl;
+        auto _len = value.size();
+        stream << _len << PackStream(value);
         return stream;
     }
 

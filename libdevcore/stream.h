@@ -131,6 +131,12 @@ struct PackStream
         return *this;
     }
 
+    PackStream &operator<<(const PackStream &val)
+    {
+        data.insert(data.end(), val.data.begin(), val.data.end());
+        return *this;
+    }
+
     PackStream &operator<<(const std::vector<unsigned char> &val)
     {
         data.insert(data.end(), val.begin(), val.end());
