@@ -69,7 +69,8 @@ TEST(CoindTxs, tx_hash)
 
     auto hash_tx = coind::data::hash256(result);
 
+    std::cout << coind::data::hash256("asdb3") << std::endl;
     std::cout << "hash: " << hash_tx.GetHex() << std::endl;
-
+    
     ASSERT_EQ(hash_tx.GetHex(), "b53802b2333e828d6532059f46ecf6b313a42d79f97925e457fbbfda45367e5c");
 }
