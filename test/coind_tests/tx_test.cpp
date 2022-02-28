@@ -28,11 +28,11 @@ TEST(CoindTxs, tx_hash)
 
     std::cout << unpacked_in_script.get().size() << std::endl;
     tx_in1.script = unpacked_in_script.value;
-    std::cout << "tx_in1.Script: ";
-	for (auto v : tx_in1.script){
-		std::cout << (unsigned int) v << " ";
-	}
-	std::cout << std::endl;
+//    std::cout << "tx_in1.Script: ";
+//	for (auto v : tx_in1.script){
+//		std::cout << (unsigned int) v << " ";
+//	}
+//	std::cout << std::endl;
 
     _tx_ins.push_back(tx_in1);
 
@@ -50,27 +50,30 @@ TEST(CoindTxs, tx_hash)
     _tx_outs.push_back(tx_out1);
 
     coind::data::tx_type tx = std::make_shared<coind::data::TransactionType>(1, _tx_ins, _tx_outs, 0);
-    std::cout << "tx.tx_ins.script:";
-    for (auto v : tx->tx_ins[0].script){
-        std::cout << (unsigned int) v << " ";
-    }
-    std::cout << std::endl;
-    //===
+//    std::cout << "tx.tx_ins.script:";
+//    for (auto v : tx->tx_ins[0].script){
+//        std::cout << (unsigned int) v << " ";
+//    }
+//    std::cout << std::endl;
+//    //===
 
     PackStream result;
     coind::data::stream::TransactionType_stream packed_tx(tx);
     result << packed_tx;
 
-    for (auto v : result.data)
-    {
-        std::cout << (unsigned int) v << " ";
-    }
-    std::cout << std::endl;
+//    for (auto v : result.data)
+//    {
+//        std::cout << (unsigned int) v << " ";
+//    }
+//    std::cout << std::endl;
 
     auto hash_tx = coind::data::hash256(result);
+    std::cout << "HexStr: " << HexStr(hash_tx.begin(), hash_tx.end()) << std::endl;
 
-    std::cout << coind::data::hash256("asdb3") << std::endl;
-    std::cout << "hash: " << hash_tx.GetHex() << std::endl;
-    
-    ASSERT_EQ(hash_tx.GetHex(), "b53802b2333e828d6532059f46ecf6b313a42d79f97925e457fbbfda45367e5c");
+    ASSERT_EQ(HexStr(hash_tx.begin(), hash_tx.end()), "b53802b2333e828d6532059f46ecf6b313a42d79f97925e457fbbfda45367e5c");
+
+    auto arith_hash_tx2 = UintToArith256(hash_tx);
+    arith_hash_tx2 += 1;
+    auto hash_tx2 = ArithToUint256(arith_hash_tx2);
+    std::cout << HexStr(hash_tx2.begin(), hash_tx2.end()) << std::endl;
 }

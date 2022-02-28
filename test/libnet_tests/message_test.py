@@ -565,4 +565,8 @@ for i in a:
     l_tx2 += [ord(i)]
 
 print(str(l_tx2).replace(',', ''))
-print('hash: {0}, hex: {1}'.format(hash256(a), hex(hash256(a))))
+
+b = 'asdb3'
+b2 = (hash256(b)+1)
+print('hash: {0}, hex: {1}'.format(hash256(b), hex(hash256(b))))
+print('hash: {0}, hex: {1}'.format(b2, hex(b2)))
