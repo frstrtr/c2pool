@@ -62,7 +62,7 @@ namespace coind::data
 
         TxInType();
 
-        TxInType(PreviousOutput _previous_output, unsigned char *_script, unsigned long _sequence);
+        TxInType(PreviousOutput _previous_output, std::vector<unsigned char> _script, unsigned long _sequence);
 
         TxInType(std::shared_ptr<stream::TxInType_stream> obj);
     };
@@ -74,7 +74,7 @@ namespace coind::data
 
         TxOutType() = default;
 
-        TxOutType(int64_t _value, unsigned char *_script);
+        TxOutType(int64_t _value, std::vector<unsigned char> _script);
 
         TxOutType(std::shared_ptr<stream::TxOutType_stream> obj);
     };

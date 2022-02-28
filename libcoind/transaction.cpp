@@ -8,6 +8,7 @@ namespace coind::data::stream
     {
         if (is_segwit_tx(tx))
         {
+            std::cout << "Segwit tx" << std::endl;
             auto _tx = std::static_pointer_cast<WitnessTransactionType>(tx);
 
             assert(_tx->tx_ins.size() == _tx->witness.size());
@@ -38,6 +39,12 @@ namespace coind::data::stream
         version = _version;
 
         tx_ins = ListType<TxInType_stream>(ListType<TxInType_stream>::make_type(_tx_ins));
+        std::cout << "TXIDType_stream.script: ";
+        for (auto v : tx_ins.l[0].script.value){
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << std::endl;
+
         tx_outs = ListType<TxOutType_stream>(ListType<TxOutType_stream>::make_type(_tx_outs));
 
         lock_time = _locktime;
@@ -46,6 +53,43 @@ namespace coind::data::stream
     PackStream &TxIDType_stream::write(PackStream &stream)
     {
         stream << version << tx_ins << tx_outs << lock_time;
+
+        //======================================================
+//        stream << version;
+//        std::cout << "TXIDType_stream.write.stream[version]: ";
+//        for (auto v : stream.data){
+//            std::cout << (unsigned int) v << " ";
+//        }
+//        std::cout << std::endl;
+
+//        stream << tx_ins.l[0].script;
+//        std::cout << "TXIDType_stream.write.stream[tx_ins.script]:  ";
+//        for (auto v : stream.data){
+//            std::cout << (unsigned int) v << " ";
+//        }
+//        std::cout << std::endl;
+//
+//        std::cout << "TXIDType_stream.write.stream[tx_ins.script.value]:  ";
+//        for (auto v : tx_ins.l[0].script.value){
+//            std::cout << (unsigned int) v << " ";
+//        }
+//        std::cout << std::endl;
+//
+//
+//        stream << tx_outs;
+//        std::cout << "TXIDType_stream.write.stream[tx_outs]: ";
+//        for (auto v : stream.data){
+//            std::cout << (unsigned int) v << " ";
+//        }
+//        std::cout << std::endl;
+//
+//        stream << lock_time;
+//        std::cout << "TXIDType_stream.write.stream[lock_time]: ";
+//        for (auto v : stream.data){
+//            std::cout << (unsigned int) v << " ";
+//        }
+//        std::cout << std::endl;
+
         return stream;
     }
 
@@ -181,10 +225,11 @@ coind::data::TxIDType::TxIDType(coind::data::stream::TxIDType_stream obj)
     lock_time = obj.lock_time.get();
 }
 
-coind::data::TxOutType::TxOutType(int64_t _value, unsigned char *_script)
+coind::data::TxOutType::TxOutType(int64_t _value, std::vector<unsigned char> _script)
 {
     value = _value;
-    script = std::vector<unsigned char>(_script, _script + (strlen((char*)_script))-1);
+//    script = std::vector<unsigned char>(_script, _script + (strlen((char*)_script))-1);
+    script = _script;
 }
 
 coind::data::TxOutType::TxOutType(std::shared_ptr<stream::TxOutType_stream> obj)
@@ -200,10 +245,11 @@ coind::data::TxInType::TxInType()
     sequence = 4294967295;
 }
 
-coind::data::TxInType::TxInType(coind::data::PreviousOutput _previous_output, unsigned char *_script, unsigned long _sequence)
+coind::data::TxInType::TxInType(coind::data::PreviousOutput _previous_output, std::vector<unsigned char> _script, unsigned long _sequence)
 {
     previous_output = _previous_output;
-    script = std::vector<unsigned char>(_script, _script + (strlen((char*)_script))-1);
+    //script = std::vector<unsigned char>(_script, _script + (strlen((char*)_script))-1);
+    script = _script;
     sequence = _sequence;
 }
 

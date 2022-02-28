@@ -30,7 +30,7 @@ TEST(CoindTxs, tx_hash)
     tx_in1.script = unpacked_in_script.value;
     std::cout << "tx_in1.Script: ";
 	for (auto v : tx_in1.script){
-		std::cout << v << " ";
+		std::cout << (unsigned int) v << " ";
 	}
 	std::cout << std::endl;
 
@@ -50,7 +50,11 @@ TEST(CoindTxs, tx_hash)
     _tx_outs.push_back(tx_out1);
 
     coind::data::tx_type tx = std::make_shared<coind::data::TransactionType>(1, _tx_ins, _tx_outs, 0);
-
+    std::cout << "tx.tx_ins.script:";
+    for (auto v : tx->tx_ins[0].script){
+        std::cout << (unsigned int) v << " ";
+    }
+    std::cout << std::endl;
     //===
 
     PackStream result;
