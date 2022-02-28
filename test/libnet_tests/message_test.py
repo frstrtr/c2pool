@@ -347,6 +347,9 @@ tx_type = ComposedType([
     ('lock_time', IntType(32)),
 ])
 
+def hash256(data):
+    return IntType(256).unpack(hashlib.sha256(hashlib.sha256(data).digest()).digest())
+
 def pubkey_hash_to_script2(pubkey_hash):
     return '\x76\xa9' + ('\x14' + IntType(160).pack(pubkey_hash)) + '\x88\xac'
 
@@ -562,3 +565,4 @@ for i in a:
     l_tx2 += [ord(i)]
 
 print(str(l_tx2).replace(',', ''))
+print('hash: {0}, hex: {1}'.format(hash256(a), hex(hash256(a))))

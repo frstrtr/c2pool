@@ -107,9 +107,8 @@ struct StrType : public Maker<StrType, string>
 
     StrType &fromHex(PackStream &hexData)
     {
-        PackStream _stream;
-        auto lenData = hexData.size();
-        _stream << lenData << hexData;
+        value.clear();
+        value.insert(value.end(), hexData.data.begin(), hexData.data.end());
 
         return *this;
     }

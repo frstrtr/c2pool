@@ -60,7 +60,11 @@ namespace coind::data
 
         CSHA256().Write((unsigned char *)&data[0], data.length()).Finalize(&out1[0]);
         CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
-        result.SetHex(HexStr(out2));
+
+        auto _hash = HexStr(out2);
+//        std::reverse(_hash.begin(), _hash.end());
+        result.SetHex(_hash);
+        std::reverse(result.begin(), result.end());
 
         return result;
     }
