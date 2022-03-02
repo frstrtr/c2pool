@@ -195,7 +195,7 @@ namespace c2pool::libnet::messages
             addr_to = to;
             addr_from = from;
             nonce = _nonce;
-            sub_version.str = sub_ver;
+            sub_version = sub_ver;
             mode = _mode;
             best_share_hash = PossibleNoneType<IntType(256)>::make_type(best_hash);
             //pool_version = pool_ver;

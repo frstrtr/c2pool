@@ -5,10 +5,12 @@
 #include <iomanip>
 #include <string>
 
-#include "shareTracker.h"
-#include "config.h"
-#include "uint256.h"
-#include "arith_uint256.h"
+//#include "shareTracker.h"
+//#include "config.h"
+//#include "uint256.h"
+//#include "arith_uint256.h"
+
+#include <sharechains/tracker.h>
 
 using namespace std;
 
