@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "univalue.h"
+//#include "univalue.h"
 //#include <univalue.h>
 #include "shareTypes.h"
 #include "prefsum_share.h"
@@ -60,7 +61,7 @@ namespace c2pool::shares
         shared_ptr<c2pool::Network> net;
         shared_ptr<coind::ParentNetwork> parent_net;
     public:
-        ShareTracker(shared_ptr<c2pool::Network> _net, shared_ptr<coind::ParentNetwork> _parent_net);
+        ShareTracker(shared_ptr<c2pool::Network> _net);
 
         shared_ptr<BaseShare> get(uint256 hash);
         void add(shared_ptr<BaseShare> share);
