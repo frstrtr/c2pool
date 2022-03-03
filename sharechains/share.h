@@ -111,6 +111,33 @@ namespace c2pool::shares
 
             return res;
         }
+
+        PackStream &write(PackStream &stream)
+        {
+            ShareInfoVer_stream<17, 1> unpacked_data;
+            stream << unpacked_data;
+
+            stream << share_data;
+            if (VERSION >= SEGWIT_VERSION)
+            {
+                stream << segwit_data;
+            }
+            stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp << absheight << abswork;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            ShareInfoVer_stream<17, 1> unpacked_data;
+
+            stream >> unpacked_data;
+            if (VERSION >= SEGWIT_VERSION)
+            {
+                stream >> segwit_data;
+            }
+            stream >> new_transaction_hashes >> transaction_hash_refs >> far_share_hash >> max_bits >> bits >> timestamp >> absheight >> abswork;
+            return stream;
+        }
     };
 
     //17

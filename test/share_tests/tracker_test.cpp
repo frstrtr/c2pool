@@ -103,6 +103,30 @@ TEST_F(ShareTrackerTest, GetEmptyTrackerTest)
     ASSERT_FALSE(share1);
 }
 
+TEST_F(ShareTrackerTest, InvalidLoadShareTest)
+{
+    UniValue share_type(UniValue::VOBJ);
+
+    share_type.pushKV("type", 16);
+    share_type.pushKV("contents", "123");
+
+    c2pool::libnet::addr _addr("255.255.255.255", "1234");
+    ASSERT_THROW(c2pool::shares::load_share(share_type, net, _addr), std::runtime_error);
+}
+
+TEST_F(ShareTrackerTest, ValidLoadShareTest)
+{
+    UniValue share_type(UniValue::VOBJ);
+
+    share_type.pushKV("type", 17);
+    share_type.pushKV("contents", "21fd4301fe020000209de9671e01aa0f06737b5aba0d547efb3064f8e8c5895e83d862169f5a46dd91bde1a36171b8001bc30a5e6eeba44141049c3f9d8453e73a0801db121e198af36ccb8c56d25c26af7e688a823d0471f4d6002cfabe6d6d5b57ca3c49353a085f40e3d5375e569349a5d6e3478f167df08a2c648e2f208b01000000000000000a5f5f6332706f6f6c5f5f8d1f6b9f9ad7bdd0e20eb7f64fa6dd42734dd4f43275cc26609753310b00000000000021000000000000000000000000000000000000000000000000000000000000000000000096f9718dd7d3ed68299d04c111d3bfb03f251d84b5b77737280a7625a4cddeb245d6011dffac0f1cbde1a361c8e614004170dc4fc36d88020000000000000000000000000005000000f60044fe657dce736492e948bdfc2894befdd62cf1641cea82fe75c1fd0197d8fd7a0100");
+
+    c2pool::libnet::addr _addr("255.255.255.255", "1234");
+    auto share = c2pool::shares::load_share(share_type, net, _addr);
+    ASSERT_TRUE(share);
+
+}
+
 TEST_F(ShareTrackerTest, CreateAddShareToTracker){
     UniValue share;
     share.pushKV("min_header", (UniValue) min_header);
