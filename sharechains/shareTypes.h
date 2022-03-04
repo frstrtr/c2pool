@@ -622,7 +622,6 @@ struct RefType
     PackStream &write(PackStream &stream)
     {
         stream << identifier << share_info;
-
         return stream;
     }
 
@@ -631,4 +630,25 @@ struct RefType
         stream >> identifier >> share_info;
         return stream;
     }
+};
+
+struct ShareType_stream {
+	SmallBlockHeaderType_stream min_header;
+	ShareInfo_stream share_info;
+	MerkleLink_stream ref_merkle_link;
+	IntType(64) last_txout_nonce;
+	HashLinkType_stream hash_link;
+	MerkleLink_stream merkle_link;
+
+	PackStream &write(PackStream &stream)
+	{
+		stream << min_header << share_info << ref_merkle_link << last_txout_nonce << hash_link << merkle_link;
+		return stream;
+	}
+
+	PackStream &read(PackStream &stream)
+	{
+		stream >> min_header >> share_info >> ref_merkle_link >> last_txout_nonce >> hash_link >> merkle_link;
+		return stream;
+	}
 };
