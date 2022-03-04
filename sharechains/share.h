@@ -23,72 +23,77 @@ using std::vector, std::tuple, std::map;
 #include "data.h"
 class ShareTracker;
 
-
-class BaseShare : public DBObject
+class BaseShare //: public DBObject
 {
 public:
     const int SHARE_VERSION; //init in constructor
     static const int32_t gentx_size = 50000;
+protected:
+	StrType contents;
+	ShareType_stream share_type_data;
 
 public:
-    SmallBlockHeaderType min_header;
-    ShareInfo share_info;
-    MerkleLink ref_merkle_link; //FOR?
-    unsigned long long last_txout_nonce;
-    HashLinkType hash_link;
-    MerkleLink merkle_link;
+
+
+//public:
+//    SmallBlockHeaderType min_header;
+//    ShareInfo share_info;
+//    MerkleLink ref_merkle_link; //FOR?
+//    unsigned long long last_txout_nonce;
+//    HashLinkType hash_link;
+//    MerkleLink merkle_link;
+//
+//public:
+//    //============share_data=============
+//    uint256 previous_hash;
+//    string coinbase;
+//    unsigned int nonce;
+//    uint160 pubkey_hash;
+//    unsigned long long subsidy;
+//    unsigned short donation;
+//    StaleInfo stale_info;
+//    unsigned long long desired_version;
+//    //===================================
+//
+//    vector<uint256> new_transaction_hashes;
+//    vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
+//    uint256 far_share_hash;
+//    uint256 max_target; //from max_bits;
+//    uint256 target;     //from bits;
+//    int32_t timestamp;
+//    int32_t absheight;
+//    uint128 abswork;
+//    char *new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
+//    //TODO: gentx_hash
+//    BlockHeaderType header;
+//    uint256 pow_hash;
+//    uint256 hash; //=header_hash
+//    int32_t time_seen;
+//
+//    shared_ptr<c2pool::Network> net;
+//    c2pool::libnet::addr peer_addr;
+//    UniValue contents;
+//    //TODO: segwit ???
 
 public:
-    //============share_data=============
-    uint256 previous_hash;
-    string coinbase;
-    unsigned int nonce;
-    uint160 pubkey_hash;
-    unsigned long long subsidy;
-    unsigned short donation;
-    StaleInfo stale_info;
-    unsigned long long desired_version;
-    //===================================
+    BaseShare(int VERSION, shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents);
 
-    vector<uint256> new_transaction_hashes;
-    vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
-    uint256 far_share_hash;
-    uint256 max_target; //from max_bits;
-    uint256 target;     //from bits;
-    int32_t timestamp;
-    int32_t absheight;
-    uint128 abswork;
-    char *new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
-    //TODO: gentx_hash
-    BlockHeaderType header;
-    uint256 pow_hash;
-    uint256 hash; //=header_hash
-    int32_t time_seen;
-
-    shared_ptr<c2pool::Network> net;
-    c2pool::libnet::addr peer_addr;
-    UniValue contents;
-    //TODO: segwit ???
-
-public:
-    BaseShare(int VERSION, shared_ptr<Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents);
-
-    virtual string SerializeJSON() override;
-
-    virtual void DeserializeJSON(std::string json) override;
+//    virtual string SerializeJSON() override;
+//
+//    virtual void DeserializeJSON(std::string json) override;
 
     bool is_segwit_activated() const
     {
         return c2pool::shares::is_segwit_activated(SHARE_VERSION, net);
     }
 
-    virtual void contents_load(UniValue contents);
+//    virtual void contents_load(UniValue contents);
+//
+//    virtual UniValue to_contents();
 
-    virtual UniValue to_contents();
+    virtual bool check(shared_ptr<ShareTracker> tracker /*, TODO: other_txs = None???*/);
 
-    virtual bool check(shared_ptr<c2pool::shares::ShareTracker> tracker /*, TODO: other_txs = None???*/);
-
-    static PackStream get_ref_hash(shared_ptr<Network> _net, ShareInfo _share_info, MerkleLink _ref_merkle_link)
+    static PackStream get_ref_hash(shared_ptr<c2pool::Network> _net, ShareInfo _share_info, MerkleLink _ref_merkle_link)
     {
         PackStream res;
 
@@ -108,30 +113,14 @@ public:
 
     PackStream &write(PackStream &stream)
     {
-        ShareInfoVer_stream<17, 1> unpacked_data;
-        stream << unpacked_data;
-
-        stream << share_data;
-        if (VERSION >= SEGWIT_VERSION)
-        {
-            stream << segwit_data;
-        }
-        stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp
-               << absheight << abswork;
+		//TODO:
+		stream << share_type_data;
         return stream;
     }
 
     PackStream &read(PackStream &stream)
     {
-        ShareInfoVer_stream<17, 1> unpacked_data;
-
-        stream >> unpacked_data;
-        if (VERSION >= SEGWIT_VERSION)
-        {
-            stream >> segwit_data;
-        }
-        stream >> new_transaction_hashes >> transaction_hash_refs >> far_share_hash >> max_bits >> bits >> timestamp
-               >> absheight >> abswork;
+		stream >> share_type_data;
         return stream;
     }
 };
@@ -140,12 +129,25 @@ public:
 class Share : public BaseShare
 {
 public:
-    Share(shared_ptr<Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents) : BaseShare(17, _net,
+    Share(shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents) : BaseShare(17, _net,
                                                                                                      _peer_addr,
                                                                                                      _contents)
     {}
 
-    virtual void contents_load(UniValue contents) override;
+//    virtual void contents_load(UniValue contents) override;
+
+PackStream &write(PackStream &stream)
+	{
+		//TODO:
+		stream << share_type_data;
+		return stream;
+	}
+
+	PackStream &read(PackStream &stream)
+	{
+		stream >> share_type_data;
+		return stream;
+	}
 };
 
 //32
@@ -155,7 +157,7 @@ public:
     SegwitData segwit_data;
 
 public:
-    PreSegwitShare(shared_ptr<Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents) : BaseShare(32, _net,
+    PreSegwitShare(shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _peer_addr, UniValue _contents) : BaseShare(32, _net,
                                                                                                               _peer_addr,
                                                                                                               _contents)
     {
@@ -166,7 +168,19 @@ public:
         }
     }
 
-    virtual void contents_load(UniValue contents) override;
+//    virtual void contents_load(UniValue contents) override;
+	PackStream &write(PackStream &stream)
+	{
+		//TODO:
+		stream << share_type_data;
+		return stream;
+	}
+
+	PackStream &read(PackStream &stream)
+	{
+		stream >> share_type_data;
+		return stream;
+	}
 };
 
-shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<Network> net, c2pool::libnet::addr peer_addr);
+shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr);
