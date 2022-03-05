@@ -234,33 +234,60 @@ void PreSegwitShare::contents_load(UniValue contents)
     share_result = make_shared<CLASS>(net, peer_addr, share["contents"].get_obj()); \
     break;
 
-shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr)
-{
-	shared_ptr<BaseShare> share_result;
-	int type_version;
-	if (share.exists("type"))
-	{
-		type_version = share["type"].get_int();
-	} else
-	{
-		throw std::runtime_error("share data in load_share() without type!");
-	}
 
-	switch (type_version)
+std::shared_ptr<Share> load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr)
+{
+	PackedShareData packed_share;
+	stream >> packed_share;
+
+	PackStream _stream(packed_share.contents.value);
+
+	ShareDirector director(net);
+	switch (packed_share.type.value)
 	{
 		case 17:
-		MAKE_SHARE(Share) //TODO: TEST
+			return director.make_Share(packed_share.type.value, _stream);
 		case 32:
-		MAKE_SHARE(PreSegwitShare) //TODO: TEST
+			return director.make_PreSegwitShare(packed_share.type.value, _stream);
 		default:
-			if (type_version < 17)
+			if (packed_share.type.value < 17)
 				throw std::runtime_error("sent an obsolete share");
 			else
-				throw std::runtime_error((boost::format("unkown share type: %1") % type_version).str());
+				throw std::runtime_error((boost::format("unkown share type: %1") % packed_share.type.value).str());
 			break;
 	}
-
-	return share_result;
 }
+
+
+//shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr)
+//{
+//	shared_ptr<BaseShare> share_result;
+//	int type_version;
+//	if (share.exists("type"))
+//	{
+//		type_version = share["type"].get_int();
+//	} else
+//	{
+//		throw std::runtime_error("share data in load_share() without type!");
+//	}
+//
+//	switch (type_version)
+//	{
+//		case 17:
+//		MAKE_SHARE(Share) //TODO: TEST
+//		case 32:
+//		MAKE_SHARE(PreSegwitShare) //TODO: TEST
+//		default:
+//			if (type_version < 17)
+//				throw std::runtime_error("sent an obsolete share");
+//			else
+//				throw std::runtime_error((boost::format("unkown share type: %1") % type_version).str());
+//			break;
+//	}
+//
+//	return share_result;
+//}
+
+
 
 #undef MAKE_SHARE

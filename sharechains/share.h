@@ -191,7 +191,7 @@ public:
 class Share
 {
 public:
-	const int SHARE_VERSION; //init in constructor
+	const uint64_t SHARE_VERSION; //init in constructor
 	static const int32_t gentx_size = 50000;
 public:
 	std::shared_ptr<SmallBlockHeaderType> min_header;
@@ -232,7 +232,7 @@ public:
 	c2pool::libnet::addr peer_addr;
 
 public:
-	Share(int version) : SHARE_VERSION(version)
+	Share(uint64_t version) : SHARE_VERSION(version)
 	{
 
 	}
@@ -250,7 +250,8 @@ public:
 		Reset();
 	}
 
-	void Start(int32_t version){
+	void create(int64_t version)
+	{
 		share = std::make_shared<Share>(version);
 	}
 
@@ -315,14 +316,14 @@ class ShareDirector
 private:
 	std::shared_ptr<ShareBuilder> builder;
 public:
-	ShareDirector(c2pool::Network _net)
+	ShareDirector(std::shared_ptr<c2pool::Network> _net)
 	{
 		builder = std::make_shared<ShareBuilder>(_net);
 	}
 
-	std::shared_ptr<Share> make_Share(PackStream& stream)
+	std::shared_ptr<Share> make_Share(uint64_t version, PackStream& stream)
 	{
-		builder->Start(stream);
+		builder->create(version);
 		builder->min_header(stream)
 			->share_info(stream)
 			->ref_merkle_link(stream)
@@ -331,15 +332,16 @@ public:
 			->merkle_link(stream);
 	}
 
-	std::shared_ptr<Share> make_PreSegwitShare(PackStream& stream)
+	std::shared_ptr<Share> make_PreSegwitShare(uint64_t version, PackStream& stream)
 	{
-		builder->min_header(stream);
-		builder->share_info(stream);
-		builder->ref_merkle_link(stream);
-		builder->segwit_data(stream);
-		builder->last_txout_nonce(stream);
-		builder->hash_link(stream);
-		builder->merkle_link(stream);
+		builder->create(version);
+		builder->min_header(stream)
+			->share_info(stream)
+			->ref_merkle_link(stream)
+			->segwit_data(stream)
+			->last_txout_nonce(stream)
+			->hash_link(stream)
+			->merkle_link(stream);
 	}
 };
 
