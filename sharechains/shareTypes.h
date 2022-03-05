@@ -23,6 +23,24 @@ enum StaleInfo
         out_data << __pack_data;            \
     }
 
+struct PackedShareData
+{
+	VarIntType type;
+	StrType contents;
+
+	PackStream &write(PackStream &stream)
+	{
+		stream << type << contents;
+		return stream;
+	}
+
+	PackStream &read(PackStream &stream)
+	{
+		stream >> type >> contents;
+		return stream;
+	}
+};
+
 struct SmallBlockHeaderType_stream
 {
     VarIntType version;
