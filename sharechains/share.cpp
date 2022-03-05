@@ -13,28 +13,6 @@ using namespace std;
 
 #include <boost/format.hpp>
 
-//std::string BaseShare::SerializeJSON()
-//{
-//	UniValue json(UniValue::VOBJ);
-//
-//	//TODO:
-//	// json.pushKV("TYPE", (int)TYPE);
-//	// json.pushKV("contents", contents);
-//
-//	return json.write();
-//}
-//
-//void BaseShare::DeserializeJSON(std::string json)
-//{
-//	//TODO:
-//	UniValue ShareValue(UniValue::VOBJ);
-//	ShareValue.read(json);
-//
-//	// TYPE = (ShareVersion)ShareValue["TYPE"].get_int();
-//	// LOG_DEBUG << TYPE;
-//	// contents = ShareValue["contents"].get_obj();
-//}
-
 bool BaseShare::check(shared_ptr<ShareTracker> tracker /*, TODO: other_txs = None???*/)
 {
 	if (timestamp > (c2pool::dev::timestamp() + 600))
