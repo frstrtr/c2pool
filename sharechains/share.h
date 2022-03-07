@@ -195,46 +195,48 @@ public:
 	static const int32_t gentx_size = 50000;
 public:
 	std::shared_ptr<SmallBlockHeaderType> min_header;
-	std::shared_ptr<ShareInfo> share_info;
+    std::shared_ptr<ShareData> share_data;
+    std::shared_ptr<SegwitData> segwit_data;
+    std::shared_ptr<ShareInfo> share_info;
 	std::shared_ptr<MerkleLink> ref_merkle_link;
 	unsigned long long last_txout_nonce;
 	std::shared_ptr<HashLinkType> hash_link;
 	std::shared_ptr<MerkleLink> merkle_link;
-	std::shared_ptr<SegwitData> segwit_data;
 public:
-	//============share_data=============
-	uint256 previous_hash;
-	string coinbase;
-	unsigned int nonce;
-	uint160 pubkey_hash;
-	unsigned long long subsidy;
-	unsigned short donation;
-	StaleInfo stale_info;
-	unsigned long long desired_version;
-	//===================================
-
-	vector<uint256> new_transaction_hashes;
-	vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
-	uint256 far_share_hash;
-	uint256 max_target; //from max_bits;
-	uint256 target;     //from bits;
-	int32_t timestamp;
-	int32_t absheight;
-	uint128 abswork;
-	std::vector<unsigned char> new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
-	//TODO: gentx_hash
-	BlockHeaderType header;
-	uint256 pow_hash;
-	uint256 hash; //=header_hash
-	int32_t time_seen;
+//	//============share_data=============
+//	uint256 previous_hash;
+//	string coinbase;
+//	unsigned int nonce;
+//	uint160 pubkey_hash;
+//	unsigned long long subsidy;
+//	unsigned short donation;
+//	StaleInfo stale_info;
+//	unsigned long long desired_version;
+//	//===================================
+//
+//	vector<uint256> new_transaction_hashes;
+//	vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
+//	uint256 far_share_hash;
+//	uint256 max_target; //from max_bits;
+//	uint256 target;     //from bits;
+//	int32_t timestamp;
+//	int32_t absheight;
+//	uint128 abswork;
+//	std::vector<unsigned char> new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
+//	//TODO: gentx_hash
+//	BlockHeaderType header;
+//	uint256 pow_hash;
+//	uint256 hash; //=header_hash
+//	int32_t time_seen;
 
 	shared_ptr<c2pool::Network> net;
 	c2pool::libnet::addr peer_addr;
 
 public:
-	Share(uint64_t version) : SHARE_VERSION(version)
+	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _addr) : SHARE_VERSION(version)
 	{
-
+        net = _net;
+        peer_addr = _addr;
 	}
 };
 
@@ -250,9 +252,9 @@ public:
 		Reset();
 	}
 
-	void create(int64_t version)
+	void create(int64_t version, c2pool::libnet::addr addr)
 	{
-		share = std::make_shared<Share>(version);
+		share = std::make_shared<Share>(version, net, addr);
 	}
 
 	void Reset()
@@ -274,6 +276,18 @@ public:
 		stream >> _min_header;
 		return shared_from_this();
 	}
+
+    auto share_data(PackStream &stream){
+        ShareData_stream share_data;
+        stream >> share_data;
+        return shared_from_this();
+    }
+
+    auto segwit_data(PackStream &stream){
+        PossibleNoneType<SegwitData_stream> segwit_data;
+        stream >> segwit_data;
+        return shared_from_this();
+    }
 
 	auto share_info(PackStream &stream)
 	{
@@ -321,10 +335,11 @@ public:
 		builder = std::make_shared<ShareBuilder>(_net);
 	}
 
-	std::shared_ptr<Share> make_Share(uint64_t version, PackStream& stream)
+	std::shared_ptr<Share> make_Share(uint64_t version, c2pool::libnet::addr addr, PackStream& stream)
 	{
-		builder->create(version);
+		builder->create(version, addr);
 		builder->min_header(stream)
+            ->share_data(stream)
 			->share_info(stream)
 			->ref_merkle_link(stream)
 			->last_txout_nonce(stream)
@@ -332,17 +347,18 @@ public:
 			->merkle_link(stream);
 	}
 
-	std::shared_ptr<Share> make_PreSegwitShare(uint64_t version, PackStream& stream)
+	std::shared_ptr<Share> make_PreSegwitShare(uint64_t version, c2pool::libnet::addr addr, PackStream& stream)
 	{
-		builder->create(version);
+		builder->create(version, addr);
 		builder->min_header(stream)
+            ->share_data(stream)
+            ->segwit_data(stream)
 			->share_info(stream)
 			->ref_merkle_link(stream)
-			->segwit_data(stream)
 			->last_txout_nonce(stream)
 			->hash_link(stream)
 			->merkle_link(stream);
 	}
 };
 
-shared_ptr<BaseShare> load_share(UniValue share, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr);
+std::shared_ptr<Share> load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr);
