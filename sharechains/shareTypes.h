@@ -476,8 +476,6 @@ struct transaction_hash_refs_stream
 
 struct ShareInfo_stream
 {
-    ShareData_stream share_data;
-    PossibleNoneType<SegwitData_stream> segwit_data;
     ListType<IntType(256) > new_transaction_hashes;
     ListType<transaction_hash_refs_stream> transaction_hash_refs;
     PossibleNoneType<IntType(256) > far_share_hash;
@@ -487,34 +485,13 @@ struct ShareInfo_stream
     IntType(32) absheight;
     IntType(128) abswork;
 
-    virtual PackStream &write(PackStream &stream) = 0;
-
-    virtual PackStream &read(PackStream &stream) = 0;
-};
-
-template<int VERSION, int SEGWIT_VERSION>
-struct ShareInfoVer_stream : ShareInfo_stream
-{
-
-    PackStream &write(PackStream &stream) override
-    {
-        stream << share_data;
-        if (VERSION >= SEGWIT_VERSION)
-        {
-            stream << segwit_data;
-        }
+    virtual PackStream &write(PackStream &stream) {
         stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp
                << absheight << abswork;
         return stream;
     }
 
-    PackStream &read(PackStream &stream) override
-    {
-        stream >> share_data;
-        if (VERSION >= SEGWIT_VERSION)
-        {
-            stream >> segwit_data;
-        }
+    virtual PackStream &read(PackStream &stream){
         stream >> new_transaction_hashes >> transaction_hash_refs >> far_share_hash >> max_bits >> bits >> timestamp
                >> absheight >> abswork;
         return stream;
