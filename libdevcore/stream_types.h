@@ -397,17 +397,21 @@ template <StreamObjType ObjType>
 class PossibleNoneType : public Maker<PossibleNoneType<ObjType>, ObjType>
 {
 private:
-    ObjType none_value; //TODO: init
+    ObjType none_value;
 
 public:
     typedef ObjType TYPE;
 
     optional<ObjType> value;
 
-    PossibleNoneType() = default;
-
-    PossibleNoneType(ObjType _value)
+    PossibleNoneType(const ObjType &_none_value)
     {
+        none_value = _none_value;
+    }
+
+    PossibleNoneType(const ObjType &_none_value, const ObjType &_value)
+    {
+        none_value = _none_value;
         value = _value;
     }
 
@@ -454,8 +458,6 @@ public:
         return stream;
     }
 };
-
-//TODO: test
 
 struct FloatingInteger
 {
