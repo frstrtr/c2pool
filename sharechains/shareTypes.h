@@ -501,7 +501,6 @@ struct ShareInfo_stream
 struct ShareInfo
 {
 public:
-    ShareData share_data;
     uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
     unsigned int max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
     unsigned int bits;                                       //bitcoin_data.FloatingIntegerType() bits;
@@ -511,20 +510,17 @@ public:
     unsigned long absheigth;                                 //pack.IntType(32)
     uint128 abswork;                                         //pack.IntType(128)
 
-    boost::optional<SegwitData> segwit_data;
-
 public:
     ShareInfo()
     {};
 
-    ShareInfo(ShareData share_data, std::vector<uint256> new_transaction_hashes,
+    ShareInfo(std::vector<uint256> new_transaction_hashes,
               std::vector<std::tuple<int, int>> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits,
-              unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork,
-              SegwitData segwit_data);
+              unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork);
 
     bool operator==(const ShareInfo &value)
     {
-        return share_data == value.share_data && far_share_hash == value.far_share_hash && max_bits == value.max_bits &&
+        return far_share_hash == value.far_share_hash && max_bits == value.max_bits &&
                bits == value.bits && timestamp == value.timestamp &&
                new_transaction_hashes == value.new_transaction_hashes &&
                transaction_hash_refs == value.transaction_hash_refs && absheigth == value.absheigth &&
