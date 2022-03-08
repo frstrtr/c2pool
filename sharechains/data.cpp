@@ -1,5 +1,5 @@
 #include "data.h"
-#include "shareTypes.h"
+#include "share_types.h"
 #include <networks/network.h>
 
 namespace c2pool::shares

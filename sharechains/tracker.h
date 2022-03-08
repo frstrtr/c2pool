@@ -8,7 +8,7 @@
 #include <tuple>
 
 #include "univalue.h"
-#include "shareTypes.h"
+#include "share_types.h"
 #include "prefsum_share.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
