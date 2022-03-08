@@ -18,9 +18,7 @@ namespace shares::stream
         {
         }
 
-        SmallBlockHeaderType_stream(SmallBlockHeaderType) : SmallBlockHeaderType_stream(){
-
-        }
+        //TODO: init
 
         PackStream &write(PackStream &stream)
         {
@@ -40,6 +38,8 @@ namespace shares::stream
         ListType<IntType(256) > branch;
         //В p2pool используется костыль при пустой упаковке, но в этой реализации он не нужен.
         //index
+
+        //TODO: init
 
         PackStream &write(PackStream &stream)
         {
@@ -67,26 +67,27 @@ namespace shares::stream
         {
         }
 
-        BlockHeaderType_stream(const BlockHeaderType &value) : BlockHeaderType_stream()
-        {
-            version = value.version;
-            previous_block = value.previous_block;
-            merkle_root = value.merkle_root;
-            timestamp = value.timestamp;
-            bits = value.bits;
-            nonce = value.nonce;
-        }
+        //TODO: init
+//        BlockHeaderType_stream(const BlockHeaderType &value) : BlockHeaderType_stream()
+//        {
+//            version = value.version;
+//            previous_block = value.previous_block;
+//            merkle_root = value.merkle_root;
+//            timestamp = value.timestamp;
+//            bits = value.bits;
+//            nonce = value.nonce;
+//        }
 
-        operator BlockHeaderType()
-        {
-            BlockHeaderType result;
-            result.version = version.value;
-            result.previous_block = previous_block.get().value;
-            result.merkle_root = merkle_root.value;
-            result.timestamp = timestamp.value;
-            result.bits = bits.get();
-            result.nonce = nonce.value;
-        }
+//        operator BlockHeaderType()
+//        {
+//            BlockHeaderType result;
+//            result.version = version.value;
+//            result.previous_block = previous_block.get().value;
+//            result.merkle_root = merkle_root.value;
+//            result.timestamp = timestamp.value;
+//            result.bits = bits.get();
+//            result.nonce = nonce.value;
+//        }
 
         PackStream &write(PackStream &stream)
         {
@@ -108,6 +109,8 @@ namespace shares::stream
         //FixedStrType<0> extra_data
         VarIntType length;
 
+        //TODO: init
+
         PackStream &write(PackStream &stream)
         {
             stream << state << length;
@@ -126,6 +129,8 @@ namespace shares::stream
         MerkleLink_stream txid_merkle_link;
         IntType(256) wtxid_merkle_root;
 
+        //TODO: init
+
         PackStream &write(PackStream &stream)
         {
             stream << txid_merkle_link << wtxid_merkle_root;
@@ -141,14 +146,16 @@ namespace shares::stream
 
     struct ShareData_stream
     {
-        PossibleNoneType<IntType(256) > previous_share_hash;
+        PossibleNoneType<IntType(256)> previous_share_hash;
         StrType coinbase;
         IntType(32) nonce;
         IntType(160) pubkey_hash;
         IntType(64) subsidy;
         IntType(16) donation;
-        EnumType<StaleInfo, IntType(8) > stale_info;
+        EnumType<StaleInfo, IntType(8)> stale_info;
         VarIntType desired_version;
+
+        //TODO: init
 
         PackStream &write(PackStream &stream)
         {
@@ -169,6 +176,8 @@ namespace shares::stream
     {
         VarIntType share_count;
         VarIntType tx_count;
+
+        //TODO: init
 
         PackStream &write(PackStream &stream)
         {
@@ -194,6 +203,8 @@ namespace shares::stream
         IntType(32) absheight;
         IntType(128) abswork;
 
+        //TODO: init
+
         virtual PackStream &write(PackStream &stream) {
             stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp
                    << absheight << abswork;
@@ -215,6 +226,8 @@ namespace shares::stream
         HashLinkType_stream hash_link;
         MerkleLink_stream merkle_link;
 
+        //TODO: init
+
         PackStream &write(PackStream &stream)
         {
             stream << min_header << share_info << ref_merkle_link << last_txout_nonce << hash_link << merkle_link;
@@ -233,13 +246,14 @@ namespace shares::stream
         FixedStrType<8> identifier;
         shared_ptr<ShareInfo_stream> share_info;
 
-        RefType(const unsigned char *_ident, ShareInfo _share_info)
-        {
-            string str_ident((const char *) _ident, 8);
-            identifier = FixedStrType<8>(str_ident);
-
-            //TODO: *share_info = _share_info;
-        }
+        //TODO: init
+//        RefType(const unsigned char *_ident, ShareInfo _share_info)
+//        {
+//            string str_ident((const char *) _ident, 8);
+//            identifier = FixedStrType<8>(str_ident);
+//
+//            //TODO: *share_info = _share_info;
+//        }
 
         PackStream &write(PackStream &stream)
         {

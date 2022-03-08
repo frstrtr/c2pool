@@ -39,22 +39,22 @@
 //     return !(first == second);
 // }
 
-ShareInfo::ShareInfo(ShareData _share_data, std::vector<uint256> _new_transaction_hashes,
-                     std::vector<std::tuple<int, int>> _transaction_hash_refs, uint256 _far_share_hash,
-                     unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth,
-                     uint128 _abswork, SegwitData _segwit_data)
-{
-    share_data = _share_data;
-    segwit_data = _segwit_data;
-    new_transaction_hashes = _new_transaction_hashes;
-    transaction_hash_refs = _transaction_hash_refs;
-    far_share_hash = _far_share_hash;
-    max_bits = _max_bits;
-    bits = _bits;
-    timestamp = _timestamp;
-    absheigth = _absheigth;
-    abswork = _abswork;
-};
+//ShareInfo::ShareInfo(ShareData _share_data, std::vector<uint256> _new_transaction_hashes,
+//                     std::vector<std::tuple<int, int>> _transaction_hash_refs, uint256 _far_share_hash,
+//                     unsigned int _max_bits, unsigned int _bits, unsigned int _timestamp, unsigned long _absheigth,
+//                     uint128 _abswork, SegwitData _segwit_data)
+//{
+//    share_data = _share_data;
+//    segwit_data = _segwit_data;
+//    new_transaction_hashes = _new_transaction_hashes;
+//    transaction_hash_refs = _transaction_hash_refs;
+//    far_share_hash = _far_share_hash;
+//    max_bits = _max_bits;
+//    bits = _bits;
+//    timestamp = _timestamp;
+//    absheigth = _absheigth;
+//    abswork = _abswork;
+//};
 
 // bool operator==(const ShareInfo &first, const ShareInfo &second)
 // {
@@ -121,13 +121,13 @@ ShareInfo::ShareInfo(ShareData _share_data, std::vector<uint256> _new_transactio
 //     return !(first == second);
 // }
 
-SmallBlockHeaderType &SmallBlockHeaderType::operator=(UniValue value)
-{
-    version = value["version"].get_int64();
-    previous_block.SetHex(value["previous_block"].get_str());
-    timestamp = value["timestamp"].get_int64();
-    bits = value["bits"].get_int64();
-    nonce = value["nonce"].get_int64();
-
-    return *this;
-}
+//SmallBlockHeaderType &SmallBlockHeaderType::operator=(UniValue value)
+//{
+//    version = value["version"].get_int64();
+//    previous_block.SetHex(value["previous_block"].get_str());
+//    timestamp = value["timestamp"].get_int64();
+//    bits = value["bits"].get_int64();
+//    nonce = value["nonce"].get_int64();
+//
+//    return *this;
+//}

@@ -3,6 +3,8 @@
 #include <btclibs/uint256.h>
 #include <univalue.h>
 #include <boost/optional.hpp>
+#include <libdevcore/stream_types.h>
+#include <libdevcore/stream.h>
 
 #include <set>
 #include <tuple>
@@ -68,20 +70,20 @@ namespace shares
             return !(*this == value);
         }
 
-        SmallBlockHeaderType &operator=(UniValue value);
+//        SmallBlockHeaderType &operator=(UniValue value);
 
-        operator UniValue()
-        {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("version", (uint64_t) version);
-            result.pushKV("previous_block", previous_block.GetHex());
-            result.pushKV("timestamp", (uint64_t) timestamp);
-            result.pushKV("bits", (uint64_t) bits);
-            result.pushKV("nonce", (uint64_t) nonce);
-
-            return result;
-        }
+//        operator UniValue()
+//        {
+//            UniValue result(UniValue::VOBJ);
+//
+//            result.pushKV("version", (uint64_t) version);
+//            result.pushKV("previous_block", previous_block.GetHex());
+//            result.pushKV("timestamp", (uint64_t) timestamp);
+//            result.pushKV("bits", (uint64_t) bits);
+//            result.pushKV("nonce", (uint64_t) nonce);
+//
+//            return result;
+//        }
     };
 
     class MerkleLink
@@ -107,34 +109,34 @@ namespace shares
             return !(*this == value);
         }
 
-        MerkleLink &operator=(UniValue value)
-        {
-            for (auto hex_str: value["branch"].get_array().getValues())
-            {
-                uint256 temp_uint256;
-                temp_uint256.SetHex(hex_str.get_str());
-                branch.push_back(temp_uint256);
-            }
-            index = value["index"].get_int();
+//        MerkleLink &operator=(UniValue value)
+//        {
+//            for (auto hex_str: value["branch"].get_array().getValues())
+//            {
+//                uint256 temp_uint256;
+//                temp_uint256.SetHex(hex_str.get_str());
+//                branch.push_back(temp_uint256);
+//            }
+//            index = value["index"].get_int();
+//
+//            return *this;
+//        }
 
-            return *this;
-        }
-
-        operator UniValue()
-        {
-            UniValue result(UniValue::VOBJ);
-
-            UniValue branch_list(UniValue::VARR);
-            for (auto num: branch)
-            {
-                branch_list.push_back(num.GetHex());
-            }
-
-            result.pushKV("branch", branch_list);
-            result.pushKV("index", index);
-
-            return result;
-        }
+//        operator UniValue()
+//        {
+//            UniValue result(UniValue::VOBJ);
+//
+//            UniValue branch_list(UniValue::VARR);
+//            for (auto num: branch)
+//            {
+//                branch_list.push_back(num.GetHex());
+//            }
+//
+//            result.pushKV("branch", branch_list);
+//            result.pushKV("index", index);
+//
+//            return result;
+//        }
     };
 
     class BlockHeaderType : public SmallBlockHeaderType
@@ -164,10 +166,6 @@ namespace shares
         }
     };
 
-
-
-
-
     class HashLinkType
     {
     public:
@@ -190,27 +188,25 @@ namespace shares
             return !(*this == value);
         }
 
-        HashLinkType &operator=(UniValue value)
-        {
-            state = value["state"].get_str();
-            extra_data = value["extra_data"].get_str();
-            length = value["length"].get_int64();
-            return *this;
-        }
+//        HashLinkType &operator=(UniValue value)
+//        {
+//            state = value["state"].get_str();
+//            extra_data = value["extra_data"].get_str();
+//            length = value["length"].get_int64();
+//            return *this;
+//        }
 
-        operator UniValue()
-        {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("state", state);
-            result.pushKV("extra_data", extra_data);
-            result.pushKV("length", (uint64_t) length);
-
-            return result;
-        }
+//        operator UniValue()
+//        {
+//            UniValue result(UniValue::VOBJ);
+//
+//            result.pushKV("state", state);
+//            result.pushKV("extra_data", extra_data);
+//            result.pushKV("length", (uint64_t) length);
+//
+//            return result;
+//        }
     };
-
-
 
     class SegwitData
     {
@@ -238,24 +234,24 @@ namespace shares
             return !(*this == value);
         }
 
-        SegwitData &operator=(UniValue value)
-        {
-            txid_merkle_link = value["txid_merkle_link"].get_obj();
-
-            wtxid_merkle_root.SetHex(value["wtxid_merkle_root"].get_str());
-
-            return *this;
-        }
-
-        operator UniValue()
-        {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("txid_merkle_link", txid_merkle_link);
-            result.pushKV("wtxid_merkle_root", wtxid_merkle_root.GetHex());
-
-            return result;
-        }
+//        SegwitData &operator=(UniValue value)
+//        {
+//            txid_merkle_link = value["txid_merkle_link"].get_obj();
+//
+//            wtxid_merkle_root.SetHex(value["wtxid_merkle_root"].get_str());
+//
+//            return *this;
+//        }
+//
+//        operator UniValue()
+//        {
+//            UniValue result(UniValue::VOBJ);
+//
+//            result.pushKV("txid_merkle_link", txid_merkle_link);
+//            result.pushKV("wtxid_merkle_root", wtxid_merkle_root.GetHex());
+//
+//            return result;
+//        }
     };
 
 
@@ -284,40 +280,36 @@ namespace shares
             return !(*this == value);
         }
 
-        ShareData &operator=(UniValue value)
-        {
-            previous_share_hash.SetHex(value["previous_share_hash"].get_str());
-            coinbase = value["coinbase"].get_str();
-            nonce = value["nonce"].get_int64();
-            pubkey_hash.SetHex(value["pubkey_hash"].get_str());
-            subsidy = value["subsidy"].get_int64();
-            donation = value["donation"].get_int();
-            stale_info = (StaleInfo) value["stale_info"].get_int();
-            desired_version = value["desired_version"].get_int64();
-
-            return *this;
-        }
-
-        operator UniValue()
-        {
-            UniValue result(UniValue::VOBJ);
-
-            result.pushKV("previous_share_hash", previous_share_hash.GetHex());
-            result.pushKV("coinbase", coinbase);
-            result.pushKV("nonce", (uint64_t) nonce);
-            result.pushKV("pubkey_hash", pubkey_hash.GetHex());
-            result.pushKV("subsidy", (uint64_t) subsidy);
-            result.pushKV("donation", donation);
-            result.pushKV("stale_info", (int) stale_info);
-            result.pushKV("desired_version", (uint64_t) desired_version);
-
-            return result;
-        }
+//        ShareData &operator=(UniValue value)
+//        {
+//            previous_share_hash.SetHex(value["previous_share_hash"].get_str());
+//            coinbase = value["coinbase"].get_str();
+//            nonce = value["nonce"].get_int64();
+//            pubkey_hash.SetHex(value["pubkey_hash"].get_str());
+//            subsidy = value["subsidy"].get_int64();
+//            donation = value["donation"].get_int();
+//            stale_info = (StaleInfo) value["stale_info"].get_int();
+//            desired_version = value["desired_version"].get_int64();
+//
+//            return *this;
+//        }
+//
+//        operator UniValue()
+//        {
+//            UniValue result(UniValue::VOBJ);
+//
+//            result.pushKV("previous_share_hash", previous_share_hash.GetHex());
+//            result.pushKV("coinbase", coinbase);
+//            result.pushKV("nonce", (uint64_t) nonce);
+//            result.pushKV("pubkey_hash", pubkey_hash.GetHex());
+//            result.pushKV("subsidy", (uint64_t) subsidy);
+//            result.pushKV("donation", donation);
+//            result.pushKV("stale_info", (int) stale_info);
+//            result.pushKV("desired_version", (uint64_t) desired_version);
+//
+//            return result;
+//        }
     };
-
-
-
-
 
     struct ShareInfo
     {
@@ -353,18 +345,4 @@ namespace shares
             return !(*this == value);
         }
     };
-
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
