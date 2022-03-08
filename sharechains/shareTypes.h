@@ -49,6 +49,14 @@ struct SmallBlockHeaderType_stream
     FloatingIntegerType bits;
     IntType(32) nonce;
 
+    SmallBlockHeaderType_stream() : previous_block(IntType(256)(uint256()))
+    {
+    }
+
+    SmallBlockHeaderType_stream(SmallBlockHeaderType) : SmallBlockHeaderType_stream(){
+
+    }
+
     PackStream &write(PackStream &stream)
     {
         stream << version << previous_block << timestamp << bits << nonce;
@@ -212,10 +220,11 @@ struct BlockHeaderType_stream
     FloatingIntegerType bits;
     IntType(32) nonce;
 
-    BlockHeaderType_stream()
-    {}
+    BlockHeaderType_stream() : previous_block(IntType(256)(uint256()))
+    {
+    }
 
-    BlockHeaderType_stream(const BlockHeaderType &value)
+    BlockHeaderType_stream(const BlockHeaderType &value) : BlockHeaderType_stream()
     {
         version = value.version;
         previous_block = value.previous_block;
