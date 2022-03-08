@@ -20,7 +20,7 @@ using dbshell::DBObject;
 using std::shared_ptr, std::string, std::make_shared;
 using std::vector, std::tuple, std::map;
 
-#include "shareTypes.h"
+#include "share_types.h"
 #include "data.h"
 
 namespace c2pool::shares

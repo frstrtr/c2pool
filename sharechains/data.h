@@ -1,7 +1,7 @@
 #pragma once
 #include <btclibs/uint256.h>
 #include <networks/network.h>
-#include "shareTypes.h"
+#include "share_types.h"
 
 #include "string"
 using std::string;

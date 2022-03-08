@@ -11,7 +11,7 @@
 #include <libdevcore/types.h>
 #include <libdevcore/stream_types.h>
 #include <btclibs/uint256.h>
-#include <sharechains/shareTypes.h>
+#include <sharechains/share_types.h>
 #include <networks/network.h>
 #include <libdevcore/logger.h>
 #include <libcoind/transaction.h>

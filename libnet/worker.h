@@ -4,7 +4,7 @@
 #include <string>
 
 #include <sharechains/tracker.h>
-#include <sharechains/shareTypes.h>
+#include <sharechains/share_types.h>
 #include <networks/network.h>
 #include <libdevcore/events.h>
 #include <btclibs/uint256.h>
