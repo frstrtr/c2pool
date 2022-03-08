@@ -180,9 +180,10 @@ namespace coind::data::stream
         StrType script;
         PossibleNoneType<IntType(32)> sequence;
 
-        TxInType_stream() = default;
-        TxInType_stream(TxInType val)
-        {
+        TxInType_stream() : previous_output(PreviousOutput_stream(PreviousOutput())), sequence(IntType(32)(4294967295)) {
+
+        }
+        TxInType_stream(TxInType val) : TxInType_stream() {
             previous_output = PossibleNoneType<PreviousOutput_stream>(PreviousOutput_stream::make_type(val.previous_output));
             script = StrType::make_type(val.script);
             sequence = sequence.make_type(val.sequence);
