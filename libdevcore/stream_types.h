@@ -393,7 +393,8 @@ struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
     }
 };
 
-template <StreamObjType ObjType>
+//template <StreamObjType ObjType>
+template <typename ObjType>
 class PossibleNoneType : public Maker<PossibleNoneType<ObjType>, ObjType>
 {
 private:
@@ -435,8 +436,6 @@ public:
 
     PackStream &write(PackStream &stream)
     {
-        cout << "NonValueType Worked!" << endl;
-
         if (value.has_value())
         {
             value.value().write(stream);
