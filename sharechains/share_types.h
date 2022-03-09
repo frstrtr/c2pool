@@ -47,17 +47,24 @@ namespace shares
     class SmallBlockHeaderType
     {
     public:
-        unsigned long long version;
+        uint64_t version;
         uint256 previous_block;
-        unsigned int timestamp;
-        unsigned int bits;
-        unsigned int nonce;
+        uint32_t timestamp;
+        int32_t bits;
+        uint32_t nonce;
 
         SmallBlockHeaderType()
         {};
 
-        SmallBlockHeaderType(unsigned long long version, uint256 previous_block, unsigned int timeStamp, unsigned int bits,
-                             unsigned int nonce);
+        SmallBlockHeaderType(uint64_t _version, uint256 _previous_block, uint32_t _timestamp, int32_t _bits,
+                             uint32_t _nonce)
+        {
+            version = _version;
+            previous_block = _previous_block;
+            timestamp = _timestamp;
+            bits = _bits;
+            nonce = _nonce;
+        }
 
         bool operator==(const SmallBlockHeaderType &value)
         {
