@@ -112,3 +112,66 @@ TEST(Devcore_stream, type_str)
 	stream >> str2;
 	ASSERT_EQ(str2.get(), "asd123");
 }
+
+struct TestType
+{
+    int64_t i1;
+    int32_t i2;
+
+    TestType() = default;
+
+    TestType(int64_t _i1, int32_t _i2)
+    {
+        i1 = _i1;
+        i2 = _i2;
+    }
+};
+
+struct TestType_stream
+{
+    IntType(64) i1;
+    IntType(32) i2;
+
+    TestType_stream() = default;
+
+    TestType_stream(IntType(64) _i1, IntType(32) _i2)
+    {
+        i1 = _i1;
+        i2 = _i2;
+    }
+
+    TestType_stream(int64_t _i1, int32_t _i2)
+    {
+        i1 = _i1;
+        i2 = _i2;
+    }
+
+};
+
+struct TestTypeAdapter : public
+        StreamTypeAdapter<TestType, TestType_stream>
+{
+    void _to_stream() override
+    {
+
+    }
+
+    void _to_value() override
+    {
+        make_value(_stream->i1.get(), _stream->i2.get());
+    }
+};
+
+TEST(Devcore_stream, adapter)
+{
+    TestTypeAdapter adapter1;
+    adapter1.make_value(123,232);
+
+    ASSERT_EQ(adapter1->i1, 123);
+    ASSERT_EQ(adapter1->i2, 232);
+
+    TestTypeAdapter adapter2;
+    adapter2.make_stream(123,232);
+    ASSERT_EQ(adapter2->i1, 123);
+    ASSERT_EQ(adapter2->i2, 232);
+}

@@ -4,6 +4,7 @@
 #include <sstream>
 #include <vector>
 #include <numeric>
+#include <memory>
 using namespace std;
 
 class PackStream;
@@ -305,3 +306,103 @@ struct PackStream
 };
 
 #undef GET_INT
+
+template<typename ValueType, typename StreamType>
+class StreamTypeAdapter
+{
+public:
+    typedef ValueType value_type;
+    typedef StreamType stream_type;
+protected:
+    std::shared_ptr<ValueType> _value;
+    std::shared_ptr<StreamType> _stream;
+
+public:
+    StreamTypeAdapter() = default;
+
+    std::shared_ptr<ValueType> operator->()
+    {
+        if (!_value)
+        {
+            if (_stream)
+            {
+                to_value();
+            } else
+            {
+                throw std::runtime_error("StreamTypeAdapter operator -> error: _value and _stream - nullptr!");
+            }
+        }
+        return _value;
+    }
+
+    PackStream &write(PackStream &stream)
+    {
+        stream << *_stream;
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        stream >> *_stream;
+        return stream;
+    }
+
+    std::shared_ptr<ValueType> get()
+    {
+        return _value;
+    }
+
+    std::shared_ptr<StreamType> stream()
+    {
+        return _stream;
+    }
+
+//    template <class T, >
+//    shared_ptr<T> make_shared (Args&&... args);
+
+    template<class... Args>
+    void make_value(Args &&... args)
+    {
+        _value = std::make_shared<value_type>(args...);
+    }
+
+    template<class... Args>
+    void make_stream(Args &&... args)
+    {
+        _stream = std::make_shared<stream_type>(args...);
+    }
+
+    bool is_none()
+    {
+        return _value || _stream;
+
+    }
+
+protected:
+    virtual void _to_stream() = 0;
+
+    virtual void _to_value() = 0;
+
+private:
+    virtual void to_stream()
+    {
+        if (_value)
+        {
+            _to_stream();
+        } else
+        {
+            throw std::runtime_error("StreamTypeAdapter.to_stream error: _value - nullptr!");
+        }
+    }
+
+    virtual void to_value()
+    {
+        if (_stream)
+        {
+            _to_value();
+        } else
+        {
+            throw std::runtime_error("StreamTypeAdapter.to_value error: _stream - nullptr!");
+        }
+    }
+};
