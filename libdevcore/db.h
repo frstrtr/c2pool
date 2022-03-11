@@ -1,44 +1,48 @@
 #pragma once
 
-#include <leveldb/db.h>
 #include <string>
 
-namespace dbshell{
-    class DBObject;
-    class DBBatch;
-}
+#include <leveldb/db.h>
+#include <boost/filesystem.hpp>
 
-namespace dbshell
+class DBObject;
+class DBBatch;
+
+class Database
 {
-    //TODO: Objects to bytes serialize;
-    //TODO: stream << key/value;
-    class Database
-    {
-    protected:
-        leveldb::DB *db;
+protected:
+	leveldb::DB* db;
 
-        leveldb::Options options;
-        leveldb::WriteOptions writeOptions;
-        leveldb::WriteOptions syncOptions;
-        leveldb::ReadOptions iterOptions;
-        leveldb::ReadOptions readOptions;
+	leveldb::Options options;
+	leveldb::WriteOptions writeOptions;
+	leveldb::WriteOptions syncOptions;
+	leveldb::ReadOptions iterOptions;
+	leveldb::ReadOptions readOptions;
 
-    public:
-        Database(const std::string /*TODO: boost::filesystem*/ filepath, bool reset = false); //TODO
-        ~Database();
+	std::string name;
 
-        //Write value to DB
-        bool Write(const std::string& key, DBObject& value, bool sync = false);
-        bool Write(DBBatch& batch, bool sync = false);
-        //Read value from DB
-        bool Read(const std::string& key, DBObject& value);
-        //Delete element from DB
-        bool Remove(const std::string& key, bool fSync = false); //TODO
+public:
+	Database(const boost::filesystem::path &filepath, std::string _name, bool wipe = false);
 
-        bool Exist(const std::string& key); //TODO
-        bool IsEmpty(); //TODO
+	~Database();
 
-        Database(const Database &) = delete;
-        Database &operator=(const Database &) = delete;
-    };
-} // namespace dbshell
+	Database(const Database &) = delete;
+
+	Database &operator=(const Database &) = delete;
+
+
+
+	//Write value to DB
+	bool Write(const std::string &key, DBObject &value, bool sync = false);
+
+	bool Write(DBBatch &batch, bool sync = false);
+
+	//Read value from DB
+	bool Read(const std::string &key, DBObject &value);
+
+	//Delete element from DB
+	bool Remove(const std::string &key, bool fSync = false); //TODO
+
+	bool Exist(const std::string &key); //TODO
+	bool IsEmpty(); //TODO
+};

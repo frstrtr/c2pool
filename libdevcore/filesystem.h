@@ -1,4 +1,5 @@
 #pragma once
+
 #include <string>
 #include <iostream>
 #include <boost/dll.hpp>
@@ -7,24 +8,24 @@
 using namespace boost::dll;
 using namespace boost::filesystem;
 
-namespace c2pool::filesystem
-{
+//full path to main project folder
+std::string getProjectDir();
 
-    //full path to main project folder
-    std::string getProjectDir();
-    const char *getProjectDir_c();
+const char *getProjectDir_c();
 
-    path getProjectPath();
-    auto createDirectory(std::string directoryName);
-    path findFile(std::string fileName);
-    std::fstream getFile(std::string fileName, std::ios_base::openmode openMode = std::ios_base::out);
-    std::fstream closeFile(std::fstream file);
+path getProjectPath();
 
-    //full subdirection path.
-    std::string getSubDir(std::string path);
+auto createDirectory(std::string directoryName);
 
-    const char *getSubDir_c(std::string path);
+path findFile(std::string fileName);
 
-    bool copy_file(const char* from, const char* to, copy_option options = copy_option::overwrite_if_exists);
+std::fstream getFile(std::string fileName, std::ios_base::openmode openMode = std::ios_base::out);
 
-} // namespace c2pool::filesystem
+std::fstream closeFile(std::fstream file);
+
+//full subdirection path.
+std::string getSubDir(std::string path);
+
+const char *getSubDir_c(std::string path);
+
+bool copy_file(const char *from, const char *to, copy_option options = copy_option::overwrite_if_exists);
