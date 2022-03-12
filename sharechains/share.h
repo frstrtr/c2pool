@@ -3,14 +3,11 @@
 #include <boost/format.hpp>
 #include <libcoind/data.h>
 #include <btclibs/uint256.h>
-#include <libdevcore/dbObject.h>
 #include <networks/network.h>
 #include <libdevcore/addrStore.h>
 #include <libdevcore/types.h>
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
-
-using dbshell::DBObject;
 
 #include <string>
 #include <memory>
@@ -78,10 +75,12 @@ public:
 	}
 };
 
+typedef std::shared_ptr<Share> ShareType;
+
 class ShareBuilder : enable_shared_from_this<ShareBuilder>
 {
 private:
-	std::shared_ptr<Share> share;
+	ShareType share;
 
 	std::shared_ptr<c2pool::Network> net;
 public:
@@ -100,7 +99,7 @@ public:
 		share = nullptr;
 	}
 
-	std::shared_ptr<Share> GetShare()
+	ShareType GetShare()
 	{
 		auto result = share;
 		Reset();
@@ -173,7 +172,7 @@ public:
 		builder = std::make_shared<ShareBuilder>(_net);
 	}
 
-	std::shared_ptr<Share> make_Share(uint64_t version, const c2pool::libnet::addr &addr, PackStream& stream)
+	ShareType make_Share(uint64_t version, const c2pool::libnet::addr &addr, PackStream& stream)
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
@@ -185,7 +184,7 @@ public:
 			->merkle_link(stream);
 	}
 
-	std::shared_ptr<Share> make_PreSegwitShare(uint64_t version, const c2pool::libnet::addr &addr, PackStream& stream)
+	ShareType make_PreSegwitShare(uint64_t version, const c2pool::libnet::addr &addr, PackStream& stream)
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
@@ -199,4 +198,4 @@ public:
 	}
 };
 
-std::shared_ptr<Share> load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr);
+ShareType load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr);

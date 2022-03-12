@@ -3,6 +3,7 @@
 #include <string>
 
 #include <leveldb/db.h>
+#include <leveldb/slice.h>
 #include <boost/filesystem.hpp>
 
 class DBObject;
