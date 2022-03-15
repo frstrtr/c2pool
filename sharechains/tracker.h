@@ -6,37 +6,26 @@
 #include <memory>
 #include <set>
 #include <tuple>
+using namespace std;
 
 #include "univalue.h"
-#include "share_types.h"
+#include "share.h"
+#include "share_adapters.h"
 #include "prefsum_share.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libcoind/data.h>
+#include <libcoind/transaction.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <networks/network.h>
-
-using namespace std;
-
-#include <boost/function.hpp>
-
-class BaseShare;
-
 using namespace c2pool::shares;
+
+class Share;
+class GeneratedShare;
 
 #define LOOKBEHIND 200
 //TODO: multi_index for more speed https://www.boost.org/doc/libs/1_76_0/libs/multi_index/doc/index.html
-
-typedef boost::function<shared_ptr<BaseShare>(/*TODO: args*/)> get_share_method;
-
-struct GeneratedShare
-{
-	ShareInfo share_info; //TODO: sharechain[v1]::ShareTypes.h::ShareInfoType
-	UniValue gentx;       //TODO: just tx
-	vector<uint256> other_transaction_hashes;
-	get_share_method get_share;
-};
 
 struct TrackerThinkResult
 {
@@ -57,11 +46,11 @@ public:
 public:
 	ShareTracker(shared_ptr<c2pool::Network> _net);
 
-	shared_ptr<BaseShare> get(uint256 hash);
+	ShareType get(uint256 hash);
 
-	void add(shared_ptr<BaseShare> share);
+	void add(ShareType share);
 
-	bool attempt_verify(shared_ptr<BaseShare> share);
+	bool attempt_verify(ShareType share);
 
 	TrackerThinkResult think();
 
@@ -74,17 +63,10 @@ public:
 	uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
 	///in p2pool - generate_transaction | segwit_data in other_data
-	template<typename ShareType>
-	GeneratedShare
-	generate_share_transactions(ShareData share_data, uint256 block_target, int32_t desired_timestamp,
-								uint256 desired_target, MerkleLink ref_merkle_link,
-								vector<tuple<uint256, boost::optional<int32_t>>> desired_other_transaction_hashes_and_fees,
-								map<uint256, UniValue> known_txs = map<uint256, UniValue>(),
-								unsigned long long last_txout_nonce = 0, long long base_subsidy = 0,
-								UniValue other_data = UniValue())
+	std::shared_ptr<GeneratedShare> generate_share_transactions()
 	{
 		//t0
-		shared_ptr<BaseShare> previous_share;
+		ShareType previous_share;
 		if (share_data.previous_share_hash)
 		{
 			previous_share = nullptr;
@@ -163,10 +145,10 @@ public:
 				this_weight = this_real_size + 3 * this_stripped_size;
 			}
 
-			if (all_transaction_stripped_size + this_stripped_size + 80 + BaseShare::gentx_size + 500 >
+			if (all_transaction_stripped_size + this_stripped_size + 80 + Share::gentx_size + 500 >
 				net->BLOCK_MAX_SIZE)
 				break;
-			if (all_transaction_weight + this_weight + 4 * 80 + BaseShare::gentx_size + 2000 >
+			if (all_transaction_weight + this_weight + 4 * 80 + Share::gentx_size + 2000 >
 				net->BLOCK_MAX_WEIGHT)
 				break;
 
