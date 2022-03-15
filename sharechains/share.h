@@ -53,8 +53,8 @@ public:
 //	vector<uint256> new_transaction_hashes;
 //	vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
 //	uint256 far_share_hash;
-//	uint256 max_target; //from max_bits;
-//	uint256 target;     //from bits;
+	uint256 max_target; //from max_bits;
+	uint256 target;     //from bits;
 //	int32_t timestamp;
 //	int32_t absheight;
 //	uint128 abswork;
@@ -131,6 +131,8 @@ public:
 	{
 		ShareInfo_stream _share_info;
 		stream >> _share_info;
+
+		share->target = share->share_info->bits;
 		return shared_from_this();
 	}
 
