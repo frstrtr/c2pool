@@ -29,7 +29,7 @@ ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : verified(shares),
 
 }
 
-shared_ptr<BaseShare> ShareTracker::get(uint256 hash)
+ShareType ShareTracker::get(uint256 hash)
 {
 	try
 	{
@@ -42,7 +42,7 @@ shared_ptr<BaseShare> ShareTracker::get(uint256 hash)
 	}
 }
 
-void ShareTracker::add(shared_ptr<BaseShare> share)
+void ShareTracker::add(ShareType share)
 {
 	if (!share)
 	{
@@ -59,7 +59,7 @@ void ShareTracker::add(shared_ptr<BaseShare> share)
 	}
 }
 
-bool ShareTracker::attempt_verify(shared_ptr<BaseShare> share)
+bool ShareTracker::attempt_verify(ShareType share)
 {
 	if (verified.exists(share->hash))
 	{

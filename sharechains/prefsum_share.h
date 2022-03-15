@@ -19,7 +19,7 @@ namespace c2pool::shares
     public:
         map<uint256, element_type>::iterator prev;
         list<map<uint256, element_type>::iterator> nexts;
-        shared_ptr<BaseShare> element;
+        ShareType element;
 
         int32_t height;
         arith_uint256 work;
@@ -27,7 +27,7 @@ namespace c2pool::shares
 
     public:
         element_type() {}
-        element_type(shared_ptr<BaseShare> _share)
+        element_type(ShareType _share)
         {
             element = _share;
             work = coind::data::target_to_average_attempts(_share->target);
@@ -142,11 +142,11 @@ namespace c2pool::shares
     class PrefsumShare
     {
     public:
-        map<uint256, shared_ptr<BaseShare>> items;
+        map<uint256, ShareType> items;
         map<uint256, element_type> sum;
 
     protected:
-        element_type make_element(shared_ptr<BaseShare> _share)
+        element_type make_element(ShareType _share)
         {
             element_type element(_share);
             element.prev = sum.find(_share->previous_hash);
@@ -154,7 +154,7 @@ namespace c2pool::shares
         }
 
     public:
-        void add(shared_ptr<BaseShare> _share)
+        void add(ShareType _share)
         {
             //TODO: throw if share exists in items;
             items[_share->hash] = _share;

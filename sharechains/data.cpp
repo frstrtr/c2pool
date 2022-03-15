@@ -2,9 +2,9 @@
 #include "share_types.h"
 #include <networks/network.h>
 
-namespace c2pool::shares
+namespace shares
 {
-    bool is_segwit_activated(int version, shared_ptr<Network> net)
+    bool is_segwit_activated(int version, shared_ptr<c2pool::Network> net)
     {
         return version >= net->SEGWIT_ACTIVATION_VERSION;
     }

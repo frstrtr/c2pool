@@ -17,13 +17,6 @@ enum StaleInfo
     doa = 254
 };
 
-//TODO: legacy?
-#define PackShareType(type, data, out_data) \
-    {                                       \
-        type##_stream __pack_data(data);    \
-        out_data << __pack_data;            \
-    }
-
 struct PackedShareData
 {
     VarIntType type;

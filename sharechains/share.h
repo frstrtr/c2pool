@@ -18,8 +18,9 @@
 using std::shared_ptr, std::string, std::make_shared;
 using std::vector, std::tuple, std::map;
 
-#include "share_types.h"
-#include "data.h"
+#include "share_adapters.h"
+//#include "data.h"
+using namespace shares::stream;
 
 class ShareTracker;
 
