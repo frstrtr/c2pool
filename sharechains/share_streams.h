@@ -129,6 +129,8 @@ namespace shares::stream
         MerkleLink_stream txid_merkle_link;
         IntType(256) wtxid_merkle_root;
 
+        SegwitData_stream() = default;
+
         //TODO: init
 
         PackStream &write(PackStream &stream)
@@ -154,6 +156,11 @@ namespace shares::stream
         IntType(16) donation;
         EnumType<StaleInfo, IntType(8)> stale_info;
         VarIntType desired_version;
+
+        ShareData_stream() : previous_share_hash(uint256())
+        {
+
+        }
 
         //TODO: init
 
@@ -196,12 +203,17 @@ namespace shares::stream
     {
         ListType<IntType(256) > new_transaction_hashes;
         ListType<transaction_hash_refs_stream> transaction_hash_refs;
-        PossibleNoneType<IntType(256) > far_share_hash;
+        PossibleNoneType<IntType(256)> far_share_hash;
         FloatingIntegerType max_bits;
         FloatingIntegerType bits;
         IntType(32) timestamp;
         IntType(32) absheight;
         IntType(128) abswork;
+
+        ShareInfo_stream() : far_share_hash(uint256{})
+        {
+
+        }
 
         //TODO: init
 
