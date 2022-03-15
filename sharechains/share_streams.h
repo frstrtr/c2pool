@@ -18,7 +18,14 @@ namespace shares::stream
         {
         }
 
-        //TODO: init
+		SmallBlockHeaderType_stream(uint64_t _version, uint256 _prev_block, uint32_t _timestamp, int32_t _bits, uint32_t _nonce) : SmallBlockHeaderType_stream()
+		{
+			version = _version;
+			previous_block = previous_block.make_type(_prev_block);
+			timestamp = _timestamp;
+			bits = _bits;
+			nonce = _nonce;
+		}
 
         PackStream &write(PackStream &stream)
         {
@@ -35,11 +42,16 @@ namespace shares::stream
 
     struct MerkleLink_stream
     {
-        ListType<IntType(256) > branch;
+        ListType<IntType(256)> branch;
         //В p2pool используется костыль при пустой упаковке, но в этой реализации он не нужен.
         //index
 
-        //TODO: init
+        MerkleLink_stream() = default;
+
+		MerkleLink_stream(vector<uint256> _branch)
+		{
+			branch = branch.make_type(_branch);
+		}
 
         PackStream &write(PackStream &stream)
         {
@@ -56,6 +68,9 @@ namespace shares::stream
 
     struct BlockHeaderType_stream
     {
+		//SmalBlockHeader only:
+		// 'version' 'previous_block' 'timestamp' 'bits' 'nonce'
+
         VarIntType version;
         PossibleNoneType<IntType(256) > previous_block;
         IntType(256) merkle_root;
@@ -67,7 +82,12 @@ namespace shares::stream
         {
         }
 
-        //TODO: init
+		BlockHeaderType_stream(uint64_t _version, uint256 _previous_block, uint32_t _timestamp, int32_t _bits,
+							   uint32_t _nonce) : BlockHeaderType_stream()
+		{
+			//TODO:
+		}
+
 //        BlockHeaderType_stream(const BlockHeaderType &value) : BlockHeaderType_stream()
 //        {
 //            version = value.version;
@@ -109,7 +129,13 @@ namespace shares::stream
         //FixedStrType<0> extra_data
         VarIntType length;
 
-        //TODO: init
+        HashLinkType_stream() = default;
+
+		HashLinkType_stream(std::string _state, unsigned long long _length)
+		{
+			state = _state;
+			length = _length;
+		}
 
         PackStream &write(PackStream &stream)
         {
@@ -131,7 +157,11 @@ namespace shares::stream
 
         SegwitData_stream() = default;
 
-        //TODO: init
+		SegwitData_stream(MerkleLink _txid_merkle_link, uint256 _wtxid_merkle_root)
+		{
+			txid_merkle_link = MerkleLink_stream(_txid_merkle_link.branch);
+			wtxid_merkle_root = _wtxid_merkle_root;
+		}
 
         PackStream &write(PackStream &stream)
         {
@@ -161,6 +191,13 @@ namespace shares::stream
         {
 
         }
+
+		ShareData_stream() : ShareData_stream()
+		{
+
+		}
+
+
 
         //TODO: init
 
