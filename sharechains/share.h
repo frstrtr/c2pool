@@ -122,8 +122,8 @@ public:
     }
 
     auto segwit_data(PackStream &stream){
-        PossibleNoneType<SegwitData_stream> segwit_data;
-        stream >> segwit_data;
+        PossibleNoneType <SegwitData_stream> _segwit_data(SegwitData_stream{});
+        stream >> _segwit_data;
         return shared_from_this();
     }
 

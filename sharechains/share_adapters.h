@@ -27,12 +27,19 @@ struct MerkleLink :
 {
     void _to_stream() override
     {
-        //TODO:
+        make_stream(_value->branch);//, _value->index);
     }
 
     void _to_value() override
     {
-        //TODO:
+        auto _branch = _stream->branch.l;
+        std::vector<uint256> branch;
+        for (auto v : _branch)
+        {
+            branch.push_back(v.get());
+        }
+
+        make_value(branch);
     }
 };
 

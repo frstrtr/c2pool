@@ -90,18 +90,22 @@ namespace shares
     {
     public:
         std::vector<uint256> branch;
-        int32_t index;
+//        int32_t index;
 
         MerkleLink()
         {
-            index = 0;
+//            index = 0;
         };
 
-        MerkleLink(std::vector<uint256> branch, int index);
+        MerkleLink(std::vector<uint256> _branch)//, int index)
+        {
+            branch = _branch;
+        }
 
         bool operator==(const MerkleLink &value)
         {
-            return branch == value.branch && index == value.index;
+            return branch == value.branch;
+            //return branch == value.branch && index == value.index;
         }
 
         bool operator!=(const MerkleLink &value)

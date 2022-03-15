@@ -405,7 +405,7 @@ public:
 
     optional<ObjType> value;
 
-    PossibleNoneType(const ObjType &_none_value)
+    PossibleNoneType(ObjType _none_value)
     {
         none_value = _none_value;
     }
