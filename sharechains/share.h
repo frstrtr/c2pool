@@ -40,29 +40,30 @@ public:
 	std::shared_ptr<MerkleLink> merkle_link;
 public:
 //	//============share_data=============
-//	uint256 previous_hash;
-//	string coinbase;
-//	unsigned int nonce;
-//	uint160 pubkey_hash;
-//	unsigned long long subsidy;
-//	unsigned short donation;
-//	StaleInfo stale_info;
-//	unsigned long long desired_version;
+//TODO: Init:
+	uint256 previous_hash;
+	string coinbase;
+	unsigned int nonce;
+	uint160 pubkey_hash;
+	unsigned long long subsidy;
+	unsigned short donation;
+	StaleInfo stale_info;
+	unsigned long long desired_version;
 //	//===================================
 //
 //	vector<uint256> new_transaction_hashes;
 //	vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
 //	uint256 far_share_hash;
-	uint256 max_target; //from max_bits;
-	uint256 target;     //from bits;
+	uint256 max_target; //from max_bits; //TODO: init
+	uint256 target;     //from bits; //TODO: init
 //	int32_t timestamp;
 //	int32_t absheight;
 //	uint128 abswork;
 //	std::vector<unsigned char> new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
 //	//TODO: gentx_hash
-//	BlockHeaderType header;
+	BlockHeaderType header;
 //	uint256 pow_hash;
-//	uint256 hash; //=header_hash
+	uint256 hash; //=header_hash //TODO: init
 //	int32_t time_seen;
 
 	shared_ptr<c2pool::Network> net;
@@ -132,7 +133,7 @@ public:
 		ShareInfo_stream _share_info;
 		stream >> _share_info;
 
-		share->target = share->share_info->bits;
+		//TODO: share->target = (*share->share_info)->bits;
 		return shared_from_this();
 	}
 
