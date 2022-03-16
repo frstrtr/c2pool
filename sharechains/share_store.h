@@ -22,10 +22,10 @@ public:
 		PackStream packed_share;
 		packed_share << *share;
 
-		leveldb::Slice key(share->hash, sizeof(share->hash));
+		leveldb::Slice key(share->hash.begin(), sizeof(share->hash));
 		leveldb::Slice value((char*) packed_share.data.data(), packed_share.size());
 
-		shares->write(key, value);
+		shares->Write(key, value);
 	}
 
 	void add_verified(ShareType share)
