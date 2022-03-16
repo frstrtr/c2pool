@@ -157,6 +157,17 @@ namespace shares
             merkle_root = _merkle_root;
         }
 
+		BlockHeaderType(uint64_t _version, uint256 _previous_block, uint32_t _timestamp, int32_t _bits,
+				uint32_t _nonce, uint256 _merkle_root)
+		{
+			version = _version;
+			previous_block = _previous_block;
+			timestamp = _timestamp;
+			bits = _bits;
+			nonce = _nonce;
+			merkle_root = _merkle_root;
+		}
+
         bool operator==(const BlockHeaderType &value) const
         {
             return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
@@ -180,11 +191,16 @@ namespace shares
         HashLinkType()
         {}
 
-        HashLinkType(std::string state, std::string extra_data, unsigned long long length);
+        HashLinkType(std::string _state, std::string _extra_data, unsigned long long _length)
+		{
+			state = _state;
+			extra_data = _extra_data;
+			length = _length;
+		}
 
         bool operator==(const HashLinkType &value)
         {
-            return state == value.state && extra_data == value.extra_data && length == value.length;
+            return state == value.state && length == value.length;
         }
 
         bool operator!=(const HashLinkType &value)
@@ -271,6 +287,8 @@ namespace shares
         unsigned short donation;    //pack.IntType(16)
         StaleInfo stale_info;
         unsigned long long desired_version; //pack.VarIntType()
+
+		//TODO: init
 
         bool operator==(const ShareData &value)
         {
