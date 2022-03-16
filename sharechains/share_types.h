@@ -349,4 +349,28 @@ namespace shares
             return !(*this == value);
         }
     };
+
+	struct ShareTypeData
+	{
+		SmallBlockHeaderType min_header;
+		ShareInfo share_info;
+		MerkleLink ref_merkle_link;
+		uint64_t last_txout_nonce;
+		HashLinkType hash_link;
+		MerkleLink merkle_link;
+
+		ShareTypeData() = default;
+
+		ShareTypeData(SmallBlockHeaderType _min_header, ShareInfo _share_info,
+					  MerkleLink _ref_merkle_link, uint64_t _last_txout_nonce,
+					  HashLinkType _hash_link, MerkleLink _merkle_link)
+		{
+			min_header = _min_header;
+			share_info = _share_info;
+			ref_merkle_link = _ref_merkle_link;
+			last_txout_nonce = _last_txout_nonce;
+			hash_link = _hash_link;
+			merkle_link = _merkle_link;
+		}
+	};
 }
