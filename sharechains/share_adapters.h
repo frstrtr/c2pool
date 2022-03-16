@@ -13,7 +13,7 @@ struct SmallBlockHeaderType :
 {
     void _to_stream() override
     {
-        make_stream(_value->version, _value->previous_block, _value->timestamp, _value->bits, _value->nonce);
+        make_stream(*_value);
     }
 
     void _to_value() override
@@ -27,7 +27,7 @@ struct MerkleLink :
 {
     void _to_stream() override
     {
-        make_stream(_value->branch);//, _value->index);
+        make_stream(*_value);//, _value->index);
     }
 
     void _to_value() override
@@ -48,12 +48,12 @@ struct BlockHeaderType :
 {
     void _to_stream() override
     {
-        //TODO:
+        make_stream(*_value);
     }
 
     void _to_value() override
     {
-        //TODO:
+        make_value(_stream->version.value, _stream->previous_block.get().get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get(), _stream->merkle_root.get());
     }
 };
 
@@ -62,12 +62,12 @@ struct HashLinkType :
 {
     void _to_stream() override
     {
-        //TODO:
+		make_stream(*_value);
     }
 
     void _to_value() override
     {
-        //TODO:
+		make_value(_stream->state.str, _stream->extra_data.str, _stream->length.value);
     }
 };
 
@@ -76,12 +76,14 @@ struct SegwitData :
 {
     void _to_stream() override
     {
-        //TODO:
+		make_stream(*_value);
     }
 
     void _to_value() override
     {
-        //TODO:
+		MerkleLink merkleLink;
+		merkleLink.set_stream(_stream->txid_merkle_link);
+		make_value(*merkleLink.get(), _stream->wtxid_merkle_root.get());
     }
 };
 
@@ -90,7 +92,7 @@ struct ShareData :
 {
     void _to_stream() override
     {
-        //TODO:
+		make_stream(*_value);
     }
 
     void _to_value() override
@@ -104,7 +106,7 @@ struct ShareInfo :
 {
     void _to_stream() override
     {
-        //TODO:
+		make_stream(*_value);
     }
 
     void _to_value() override
