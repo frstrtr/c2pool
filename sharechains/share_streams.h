@@ -3,43 +3,10 @@
 #include <libdevcore/stream_types.h>
 #include <libdevcore/stream.h>
 
+#include "share_types.h"
 
 namespace shares::stream
 {
-    struct SmallBlockHeaderType_stream
-    {
-        VarIntType version;
-        PossibleNoneType<IntType(256)> previous_block;
-        IntType(32) timestamp;
-        FloatingIntegerType bits;
-        IntType(32) nonce;
-
-        SmallBlockHeaderType_stream() : previous_block(IntType(256)(uint256()))
-        {
-        }
-
-		SmallBlockHeaderType_stream(uint64_t _version, uint256 _prev_block, uint32_t _timestamp, int32_t _bits, uint32_t _nonce) : SmallBlockHeaderType_stream()
-		{
-			version = _version;
-			previous_block = previous_block.make_type(_prev_block);
-			timestamp = _timestamp;
-			bits = _bits;
-			nonce = _nonce;
-		}
-
-        PackStream &write(PackStream &stream)
-        {
-            stream << version << previous_block << timestamp << bits << nonce;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream)
-        {
-            stream >> version >> previous_block >> timestamp >> bits >> nonce;
-            return stream;
-        }
-    };
-
     struct MerkleLink_stream
     {
         ListType<IntType(256)> branch;
@@ -48,9 +15,9 @@ namespace shares::stream
 
         MerkleLink_stream() = default;
 
-		MerkleLink_stream(vector<uint256> _branch)
+		MerkleLink_stream(const shares::MerkleLink &value)
 		{
-			branch = branch.make_type(_branch);
+			branch = branch.make_type(value.branch);
 		}
 
         PackStream &write(PackStream &stream)
@@ -66,11 +33,42 @@ namespace shares::stream
         }
     };
 
+	struct SmallBlockHeaderType_stream
+	{
+		VarIntType version;
+		PossibleNoneType<IntType(256)> previous_block;
+		IntType(32) timestamp;
+		FloatingIntegerType bits;
+		IntType(32) nonce;
+
+		SmallBlockHeaderType_stream() : previous_block(IntType(256)(uint256()))
+		{
+		}
+
+		SmallBlockHeaderType_stream(const shares::SmallBlockHeaderType &val) : SmallBlockHeaderType_stream()
+		{
+			version = val.version;
+			previous_block = previous_block.make_type(val.previous_block);
+			timestamp = val.timestamp;
+			bits = val.bits;
+			nonce = val.nonce;
+		}
+
+		PackStream &write(PackStream &stream)
+		{
+			stream << version << previous_block << timestamp << bits << nonce;
+			return stream;
+		}
+
+		PackStream &read(PackStream &stream)
+		{
+			stream >> version >> previous_block >> timestamp >> bits >> nonce;
+			return stream;
+		}
+	};
+
     struct BlockHeaderType_stream
     {
-		//SmalBlockHeader only:
-		// 'version' 'previous_block' 'timestamp' 'bits' 'nonce'
-
         VarIntType version;
         PossibleNoneType<IntType(256) > previous_block;
         IntType(256) merkle_root;
@@ -82,10 +80,14 @@ namespace shares::stream
         {
         }
 
-		BlockHeaderType_stream(uint64_t _version, uint256 _previous_block, uint32_t _timestamp, int32_t _bits,
-							   uint32_t _nonce) : BlockHeaderType_stream()
+		BlockHeaderType_stream(const BlockHeaderType &val) : BlockHeaderType_stream()
 		{
-			//TODO:
+			version = val.version;
+			previous_block = previous_block.make_type(val.previous_block);
+			merkle_root = val.merkle_root;
+			timestamp = val.timestamp;
+			bits = val.bits;
+			nonce = val.nonce;
 		}
 
 //        BlockHeaderType_stream(const BlockHeaderType &value) : BlockHeaderType_stream()
@@ -131,10 +133,10 @@ namespace shares::stream
 
         HashLinkType_stream() = default;
 
-		HashLinkType_stream(std::string _state, unsigned long long _length)
+		HashLinkType_stream(const HashLinkType &val)
 		{
-			state = _state;
-			length = _length;
+			state = val.state;
+			length = val.length;
 		}
 
         PackStream &write(PackStream &stream)
@@ -157,10 +159,10 @@ namespace shares::stream
 
         SegwitData_stream() = default;
 
-		SegwitData_stream(MerkleLink _txid_merkle_link, uint256 _wtxid_merkle_root)
+		SegwitData_stream(const SegwitData &val)
 		{
-			txid_merkle_link = MerkleLink_stream(_txid_merkle_link.branch);
-			wtxid_merkle_root = _wtxid_merkle_root;
+			txid_merkle_link = MerkleLink_stream(val.txid_merkle_link);
+			wtxid_merkle_root = val.wtxid_merkle_root;
 		}
 
         PackStream &write(PackStream &stream)
@@ -192,14 +194,17 @@ namespace shares::stream
 
         }
 
-		ShareData_stream() : ShareData_stream()
+		ShareData_stream(const ShareData &val) : ShareData_stream()
 		{
-
+			previous_share_hash = val.previous_share_hash;
+			coinbase = val.coinbase;
+			nonce = val.nonce;
+			pubkey_hash = val.pubkey_hash;
+			subsidy = val.subsidy;
+			donation = val.donation;
+			stale_info = val.stale_info;
+			desired_version = val.desired_version;
 		}
-
-
-
-        //TODO: init
 
         PackStream &write(PackStream &stream)
         {
@@ -221,7 +226,13 @@ namespace shares::stream
         VarIntType share_count;
         VarIntType tx_count;
 
-        //TODO: init
+        transaction_hash_refs_stream() = default;
+
+		transaction_hash_refs_stream(const std::tuple<uint64_t, uint64_t> &val)
+		{
+			share_count = std::get<0>(val);
+			tx_count = std::get<1>(val);
+		}
 
         PackStream &write(PackStream &stream)
         {
@@ -252,7 +263,20 @@ namespace shares::stream
 
         }
 
-        //TODO: init
+        ShareInfo_stream(const ShareInfo &val) : ShareInfo_stream()
+		{
+			new_transaction_hashes = new_transaction_hashes.make_type(val.new_transaction_hashes);
+			for (auto tx_hash_ref : val.transaction_hash_refs)
+			{
+				transaction_hash_refs.l.push_back(transaction_hash_refs_stream(tx_hash_ref));
+			}
+			far_share_hash = val.far_share_hash;
+			max_bits = val.max_bits;
+			bits = val.bits;
+			timestamp = val.timestamp;
+			absheight = val.absheigth;
+			abswork = val.abswork;
+		}
 
         virtual PackStream &write(PackStream &stream) {
             stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp
@@ -275,7 +299,17 @@ namespace shares::stream
         HashLinkType_stream hash_link;
         MerkleLink_stream merkle_link;
 
-        //TODO: init
+        ShareType_stream() = default;
+
+		ShareType_stream(const ShareTypeData &val)
+		{
+			min_header = val.min_header;
+			share_info = val.share_info;
+			ref_merkle_link = val.ref_merkle_link;
+			last_txout_nonce = val.last_txout_nonce;
+			hash_link = val.hash_link;
+			merkle_link = val.merkle_link;
+		}
 
         PackStream &write(PackStream &stream)
         {
@@ -295,14 +329,13 @@ namespace shares::stream
         FixedStrType<8> identifier;
         shared_ptr<ShareInfo_stream> share_info;
 
-        //TODO: init
-//        RefType(const unsigned char *_ident, ShareInfo _share_info)
-//        {
-//            string str_ident((const char *) _ident, 8);
-//            identifier = FixedStrType<8>(str_ident);
-//
-//            //TODO: *share_info = _share_info;
-//        }
+		RefType() = default;
+
+		RefType(std::string _ident, shared_ptr<ShareInfo_stream> _share_info)
+		{
+			identifier.str = _ident;
+			share_info = _share_info;
+		}
 
         PackStream &write(PackStream &stream)
         {
