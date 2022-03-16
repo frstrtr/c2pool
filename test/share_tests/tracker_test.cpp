@@ -61,14 +61,16 @@ protected:
     shared_ptr<TestParentNetwork> parent_net;
     shared_ptr<TestNetwork> net;
     vector<TestShare> _items;
+	c2pool::libnet::addr _addr;
 
-    std::shared_ptr<ShareTracker> tracker;
+	std::shared_ptr<ShareTracker> tracker;
 protected:
     void SetUp()
     {
         parent_net = std::make_shared<TestParentNetwork>();
         net = std::make_shared<TestNetwork>(parent_net);
         tracker = std::make_shared<ShareTracker>(net);
+		_addr = std::make_tuple("255.255.255.255", "25565");
 //        stringstream ss;
 //
 //        arith_uint256 _hash;
@@ -102,6 +104,15 @@ TEST_F(ShareTrackerTest, GetEmptyTrackerTest)
     auto share1 = tracker->get(hash);
     ASSERT_FALSE(share1);
 }
+
+TEST_F(ShareTrackerTest, AddLightShareInTracker)
+{
+	ASSERT_NO_THROW({
+		ShareType _share = std::make_shared<Share>(17, net, _addr);
+		tracker->add(_share);
+	});
+}
+
 //
 //TEST_F(ShareTrackerTest, InvalidLoadShareTest)
 //{
