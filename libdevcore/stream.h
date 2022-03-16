@@ -378,6 +378,16 @@ public:
 
     }
 
+	void set_value(const ValueType& __value)
+	{
+		_value = std::make_shared<ValueType>(__value);
+	}
+
+	void set_stream(const StreamType& __stream)
+	{
+		_stream = std::make_shared<StreamType>(__stream);
+	}
+
 protected:
     virtual void _to_stream() = 0;
 
