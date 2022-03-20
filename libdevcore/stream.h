@@ -10,16 +10,20 @@ using namespace std;
 class PackStream;
 
 template <typename T>
-concept StreamObjType = requires(T a, PackStream &stream)
+concept StreamObjType = requires(T a)
 {
-    {
-        a.write(stream)
-        } -> PackStream &;
-
-    {
-        a.read(stream)
-        } -> PackStream &;
+	a.write;
+	a.read;
 };
+//{
+//    {
+//        a.write(stream)
+//        } -> PackStream &;
+//
+//    {
+//        a.read(stream)
+//        } -> PackStream &;
+//};
 
 template <typename T>
 concept C_STRING = std::is_same_v<T, const char *> || std::is_same_v<T, char *> || std::is_same_v<T, unsigned char *> || std::is_same_v<T, const unsigned char *> || std::is_same_v<T, char>;
@@ -29,6 +33,8 @@ concept StreamIntType = !C_STRING<T> && std::numeric_limits<T>::is_integer;
 
 template <typename T>
 concept StreamEnumType = std::is_enum_v<T>;
+
+/// MAKER
 
 struct BaseMaker //TIP, HACK, КОСТЫЛЬ
 {
@@ -103,6 +109,68 @@ struct MakerListType<LIST_TYPE> : BaseMaker
         return LIST_TYPE::make_list_type(values);
     }
 };
+
+/// GETTER
+
+struct BaseGetter{};
+
+template <typename T>
+concept bool GetterType = std::is_base_of_v<BaseGetter, T>;
+
+template <typename GET_TYPE>
+struct Getter : BaseGetter
+{
+	typedef GET_TYPE get_type;
+	get_type value;
+
+	virtual get_type get()
+	{
+		return value;
+	}
+};
+
+template <GetterType GET_TYPE>
+struct Getter <GET_TYPE> : BaseGetter
+{
+	typedef typename GET_TYPE::get_type get_type;
+	GET_TYPE value;
+
+	virtual get_type get()
+	{
+		return value.get();
+	}
+};
+
+template <typename GET_TYPE>
+struct GetterList : BaseGetter
+{
+	typedef std::vector<GET_TYPE> get_type;
+	get_type value;
+
+	virtual get_type get()
+	{
+		return value;
+	}
+};
+
+template <GetterType GET_TYPE>
+struct GetterList<GET_TYPE> : BaseGetter
+{
+	typedef std::vector<typename GET_TYPE::get_type> get_type;
+	std::vector<GET_TYPE> value;
+
+	virtual get_type get()
+	{
+		get_type result;
+		for (auto v: value)
+		{
+			result.push_back(v.get());
+		}
+		return result;
+	}
+};
+
+/// PackStream
 
 struct PackStream
 {
