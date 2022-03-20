@@ -97,7 +97,9 @@ struct ShareData :
 
     void _to_value() override
     {
-        //TODO:
+		make_value(_stream->previous_share_hash.get().get(), _stream->coinbase.get(),
+				   _stream->nonce.get(), _stream->pubkey_hash.get(), _stream->subsidy.get(),
+				   _stream->donation.get(), _stream->stale_info, _stream->desired_version.value);
     }
 };
 
@@ -111,6 +113,14 @@ struct ShareInfo :
 
     void _to_value() override
     {
-        //TODO:
+//		std::vector<uint256> new_transaction_hashes;
+//		for (auto v : _stream->new_transaction_hashes.l)
+//		{
+//			new_transaction_hashes.push_back(v.get());
+//		}
+
+		make_value(_stream->far_share_hash.get().get(), _stream->max_bits.get(), _stream->bits.get(),
+				   _stream->timestamp.get(), _stream->new_transaction_hashes.get(), _stream->transaction_hash_refs,
+				   _stream->absheight.get(), _stream->abswork.get());
     }
 };

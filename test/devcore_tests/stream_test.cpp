@@ -175,3 +175,68 @@ TEST(Devcore_stream, adapter)
     ASSERT_EQ(adapter2->i1, 123);
     ASSERT_EQ(adapter2->i2, 232);
 }
+
+TEST(Devcore_stream, getter_test_class)
+{
+	class TestInt : public Getter<int>
+	{
+
+	};
+
+	TestInt t_int;
+	t_int.value = 100;
+	ASSERT_EQ(t_int.get(), 100);
+
+	class TestSubInt : public Getter<TestInt>{
+
+	};
+
+	TestSubInt t_sub_int;
+	t_sub_int.value = t_int;
+	t_sub_int.value.value = 1337;
+	ASSERT_EQ(t_sub_int.get(), 1337);
+}
+
+template <typename T>
+class TestTemplateObj : public Getter<T>
+{
+public:
+	TestTemplateObj() = default;
+
+	TestTemplateObj(T _value)
+	{
+		Getter<T>::value = _value;
+	}
+};
+
+TEST(Devcore_stream, getter_template_test_class)
+{
+	TestTemplateObj<int> t_int;
+	t_int.value = 1234;
+	ASSERT_EQ(t_int.get(), 1234);
+
+	TestTemplateObj<TestTemplateObj<int>> t_sub_int;
+	t_sub_int.value.value = 4321;
+	ASSERT_EQ(t_sub_int.get(), 4321);
+}
+
+template <typename T>
+class TestListType : public GetterList<T>
+{
+
+};
+
+TEST(Devcore_stream, getter_vector_test_class)
+{
+	TestListType<int> l1;
+	l1.value.push_back(1);
+	l1.value.push_back(2);
+	l1.value.push_back(3);
+	ASSERT_EQ(l1.get(), (vector<int>{1, 2, 3}));
+
+	TestListType<TestTemplateObj<int>> l2;
+	l2.value.push_back(TestTemplateObj<int>(10));
+	l2.value.push_back(TestTemplateObj<int>(25));
+	l2.value.push_back(TestTemplateObj<int>(17));
+	ASSERT_EQ(l2.get(), (vector<int>{10, 25, 17}));
+}

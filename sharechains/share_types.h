@@ -242,7 +242,11 @@ namespace shares
             wtxid_merkle_root.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         };
 
-        SegwitData(MerkleLink txid_merkle_link, uint256 wtxid_merkle_root);
+        SegwitData(MerkleLink _txid_merkle_link, uint256 _wtxid_merkle_root)
+		{
+			txid_merkle_link = _txid_merkle_link;
+			wtxid_merkle_root = _wtxid_merkle_root;
+		}
 
         bool operator==(const SegwitData &value)
         {
@@ -288,7 +292,23 @@ namespace shares
         StaleInfo stale_info;
         unsigned long long desired_version; //pack.VarIntType()
 
-		//TODO: init
+		ShareData()
+		{
+			previous_share_hash.SetHex("0");
+		}
+
+		ShareData(uint256 _prev_share_hash, std::string _coinbase, uint32_t _nonce, uint160 _pubkey_hash,
+					unsigned long long _subsidy, unsigned short _donation, StaleInfo _stale_info, unsigned long long _desired_version)
+		{
+			previous_share_hash = _prev_share_hash;
+			coinbase = _coinbase;
+			nonce = _nonce;
+			pubkey_hash = _pubkey_hash;
+			subsidy = _subsidy;
+			donation = _donation;
+			stale_info = _stale_info;
+			desired_version = _desired_version;
+		}
 
         bool operator==(const ShareData &value)
         {
@@ -347,11 +367,24 @@ namespace shares
 
     public:
         ShareInfo()
-        {};
+        {
+			far_share_hash.SetHex("0");
+		}
 
-        ShareInfo(std::vector<uint256> new_transaction_hashes,
-                  std::vector<std::tuple<int, int>> transaction_hash_refs, uint256 far_share_hash, unsigned int max_bits,
-                  unsigned int bits, unsigned int timestamp, unsigned long absheigth, uint128 abswork);
+        ShareInfo(uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
+				  unsigned int _timestamp, std::vector<uint256> _new_transaction_hashes,
+                  std::vector<std::tuple<int, int>> _transaction_hash_refs, unsigned long _absheigth,
+				  uint128 _abswork)
+		{
+			far_share_hash = _far_share_hash;
+			max_bits = _max_bits;
+			bits = _bits;
+			timestamp = _timestamp;
+			new_transaction_hashes = _new_transaction_hashes;
+			transaction_hash_refs = _transaction_hash_refs;
+			absheigth = _absheigth;
+			abswork = _abswork;
+		}
 
         bool operator==(const ShareInfo &value)
         {
@@ -368,6 +401,7 @@ namespace shares
         }
     };
 
+	//t['share_type']
 	struct ShareTypeData
 	{
 		SmallBlockHeaderType min_header;

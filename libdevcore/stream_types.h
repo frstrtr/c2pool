@@ -64,6 +64,62 @@ struct ListType : MakerListType<T>
     }
 };
 
+// remake?
+template <StreamObjType T>
+struct ListType<T> : MakerListType<T>
+{
+	vector<T> l;
+
+	ListType() {}
+
+	ListType(T arr[], size_t len)
+	{
+		l.insert(l.end(), arr, arr + len);
+	}
+
+	ListType(vector<T> arr)
+	{
+		l = vector<T>(arr);
+	}
+
+	auto &operator=(vector<T> _value)
+	{
+		l = _value;
+		return *this;
+	}
+
+	auto get() const
+	{
+		return l[0].get();
+	}
+
+	PackStream &write(PackStream &stream) const
+	{
+		auto len = l.size();
+		stream << len;
+		for (auto v : l)
+		{
+			stream << v;
+		}
+
+		return stream;
+	}
+
+	PackStream &read(PackStream &stream)
+	{
+		auto len = 0;
+		stream >> len;
+		for (int i = 0; i < len; i++)
+		{
+			T temp;
+			stream >> temp;
+			l.push_back(temp);
+		}
+		return stream;
+	}
+};
+//=======================
+
 //In p2pool - VarStrType
 struct StrType : public Maker<StrType, string>
 {
@@ -166,6 +222,11 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
         }
         str = _str;
     }
+
+	auto get() const
+	{
+		return str;
+	}
 
     PackStream &write(PackStream &stream) const
     {
@@ -342,6 +403,11 @@ struct VarIntType : public Maker<VarIntType, uint64_t>
         value = _v;
     }
 
+	auto get() const
+	{
+		return value;
+	}
+
     PackStream &write(PackStream &stream)
     {
         stream << value;
@@ -357,9 +423,11 @@ struct VarIntType : public Maker<VarIntType, uint64_t>
     }
 };
 
-template <StreamEnumType ENUM_T, StreamObjType PACK_TYPE = IntType(32)>
+//PACK_TYPE = StreamObjType
+template <StreamEnumType ENUM_T, typename PACK_TYPE = IntType(32)>
 struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
 {
+	typedef typename PACK_TYPE::value_type value_type;
     ENUM_T value;
 
     EnumType() {}
@@ -373,6 +441,11 @@ struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
     {
         value = _value;
     }
+
+	ENUM_T get()
+	{
+		return value;
+	}
 
     PackStream &write(PackStream &stream)
     {
