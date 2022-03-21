@@ -32,13 +32,7 @@ struct MerkleLink :
 
     void _to_value() override
     {
-        auto _branch = _stream->branch.l;
-        std::vector<uint256> branch;
-        for (auto v : _branch)
-        {
-            branch.push_back(v.get());
-        }
-
+        std::vector<uint256> branch = _stream->branch.get();
         make_value(branch);
     }
 };
@@ -67,7 +61,7 @@ struct HashLinkType :
 
     void _to_value() override
     {
-		make_value(_stream->state.str, _stream->extra_data.str, _stream->length.value);
+		make_value(_stream->state.get(), _stream->extra_data.get(), _stream->length.value);
     }
 };
 
@@ -99,7 +93,7 @@ struct ShareData :
     {
 		make_value(_stream->previous_share_hash.get().get(), _stream->coinbase.get(),
 				   _stream->nonce.get(), _stream->pubkey_hash.get(), _stream->subsidy.get(),
-				   _stream->donation.get(), _stream->stale_info, _stream->desired_version.value);
+				   _stream->donation.get(), _stream->stale_info.get(), _stream->desired_version.get());
     }
 };
 
@@ -113,14 +107,8 @@ struct ShareInfo :
 
     void _to_value() override
     {
-//		std::vector<uint256> new_transaction_hashes;
-//		for (auto v : _stream->new_transaction_hashes.l)
-//		{
-//			new_transaction_hashes.push_back(v.get());
-//		}
-
-		make_value(_stream->far_share_hash.get().get(), _stream->max_bits.get(), _stream->bits.get(),
-				   _stream->timestamp.get(), _stream->new_transaction_hashes.get(), _stream->transaction_hash_refs,
+		make_value(_stream->far_share_hash.get(), _stream->max_bits.get(), _stream->bits.get(),
+				   _stream->timestamp.get(), _stream->new_transaction_hashes.get(), _stream->transaction_hash_refs.get(),
 				   _stream->absheight.get(), _stream->abswork.get());
     }
 };

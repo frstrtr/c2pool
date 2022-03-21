@@ -258,3 +258,12 @@ TEST(Devcore_stream, getter_list_type)
 
 	ASSERT_EQ(l.get(), (std::vector<uint32_t>{1,2,3,4}));
 }
+
+TEST(Devcore_stream, getter_possible_nonetype)
+{
+	PossibleNoneType<IntType(32)> v(-1);
+	ASSERT_EQ(v.get(), -1);
+
+	v = 123;
+	ASSERT_EQ(v.get(), 123);
+}
