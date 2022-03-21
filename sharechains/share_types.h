@@ -361,7 +361,7 @@ namespace shares
         unsigned int bits;                                       //bitcoin_data.FloatingIntegerType() bits;
         unsigned int timestamp;                                  //pack.IntType(32)
         std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
-        std::vector<std::tuple<int, int>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
+        std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
         unsigned long absheigth;                                 //pack.IntType(32)
         uint128 abswork;                                         //pack.IntType(128)
 
@@ -373,7 +373,7 @@ namespace shares
 
         ShareInfo(uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
 				  unsigned int _timestamp, std::vector<uint256> _new_transaction_hashes,
-                  std::vector<std::tuple<int, int>> _transaction_hash_refs, unsigned long _absheigth,
+				  vector<tuple<uint64_t, uint64_t>> _transaction_hash_refs, unsigned long _absheigth,
 				  uint128 _abswork)
 		{
 			far_share_hash = _far_share_hash;

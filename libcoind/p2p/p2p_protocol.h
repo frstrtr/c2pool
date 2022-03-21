@@ -1,11 +1,12 @@
 #pragma once
 
 #include "messages.h"
+#include "p2p_socket.h"
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
-#include "p2p_socket.h"
 #include <libcoind/transaction.h>
 #include <sharechains/data.h>
+#include <sharechains/share_types.h>
 using namespace coind::p2p::messages;
 using namespace c2pool::libnet;
 
@@ -38,9 +39,9 @@ namespace coind::p2p
     public:
         Event<uint256> new_block;    //block_hash
         Event<coind::data::tx_type> new_tx;      //bitcoin_data.tx_type
-        Event<c2pool::shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
-        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<c2pool::shares::BlockHeaderType> _new_headers)
+        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<shares::BlockHeaderType> _new_headers)
         {
             new_block = _new_block;
             new_tx = _new_tx;
@@ -143,7 +144,7 @@ namespace coind::p2p
             self.get_block_header = deferral.ReplyMatcher(lambda hash: self.send_getheaders(version=1, have=[], last=hash))
             */
 
-            pinger(30); //TODO: 30 sec!!
+            pinger(30);
         }
 
         void handle(shared_ptr<message_ping> msg)
@@ -173,7 +174,7 @@ namespace coind::p2p
         void handle(shared_ptr<message_inv> msg)
         {
             LOG_TRACE << "HANDLED INV";
-            for (auto inv : msg->invs.l)
+            for (auto inv : msg->invs.value)
             {
                 switch (inv.type)
                 {
