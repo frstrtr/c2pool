@@ -62,62 +62,6 @@ struct ListType : public MakerListType<T>, public GetterList<T>
     }
 };
 
-//// remake?
-//template <StreamObjType T>
-//struct ListType<T> : MakerListType<T>
-//{
-//	vector<T> l;
-//
-//	ListType() {}
-//
-//	ListType(T arr[], size_t len)
-//	{
-//		l.insert(l.end(), arr, arr + len);
-//	}
-//
-//	ListType(vector<T> arr)
-//	{
-//		l = vector<T>(arr);
-//	}
-//
-//	auto &operator=(vector<T> _value)
-//	{
-//		l = _value;
-//		return *this;
-//	}
-//
-//	auto get() const
-//	{
-//		return l[0].get();
-//	}
-//
-//	PackStream &write(PackStream &stream) const
-//	{
-//		auto len = l.size();
-//		stream << len;
-//		for (auto v : l)
-//		{
-//			stream << v;
-//		}
-//
-//		return stream;
-//	}
-//
-//	PackStream &read(PackStream &stream)
-//	{
-//		auto len = 0;
-//		stream >> len;
-//		for (int i = 0; i < len; i++)
-//		{
-//			T temp;
-//			stream >> temp;
-//			l.push_back(temp);
-//		}
-//		return stream;
-//	}
-//};
-////=======================
-
 //In p2pool - VarStrType
 struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 {
@@ -511,6 +455,70 @@ public:
 		delete _value;
         return stream;
     }
+};
+
+template <GetterType ObjType>
+class PossibleNoneType<ObjType> : public Maker<PossibleNoneType<ObjType>, ObjType>, public CustomGetter<typename ObjType::get_type>
+{
+private:
+	ObjType none_value;
+
+public:
+	typedef ObjType TYPE;
+
+	optional<ObjType> value;
+
+	PossibleNoneType(ObjType _none_value)
+	{
+		none_value = _none_value;
+	}
+
+	PossibleNoneType(const ObjType &_none_value, const ObjType &_value)
+	{
+		none_value = _none_value;
+		value = _value;
+	}
+
+	typename ObjType::get_type get() const override
+	{
+		if (value.has_value())
+		{
+			return value.value().get();
+		}
+		else
+		{
+			return none_value.get();
+		}
+	}
+
+	auto &operator=(ObjType obj)
+	{
+		value = obj;
+		return *this;
+	}
+
+	PackStream &write(PackStream &stream)
+	{
+		if (value.has_value())
+		{
+			value.value().write(stream);
+		}
+		else
+		{
+			none_value.write(stream);
+		}
+		return stream;
+	}
+
+	PackStream &read(PackStream &stream)
+	{
+		ObjType *_value = new ObjType();
+		stream >> *_value;
+
+		value = make_optional(*_value);
+		delete _value;
+		return stream;
+	}
 };
 
 struct FloatingInteger : public Getter<IntType(32)>
