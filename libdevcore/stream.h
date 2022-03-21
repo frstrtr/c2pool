@@ -123,7 +123,7 @@ struct Getter : BaseGetter
 	typedef GET_TYPE get_type;
 	get_type value;
 
-	virtual get_type get()
+	virtual get_type get() const
 	{
 		return value;
 	}
@@ -135,7 +135,7 @@ struct Getter <GET_TYPE> : BaseGetter
 	typedef typename GET_TYPE::get_type get_type;
 	GET_TYPE value;
 
-	virtual get_type get()
+	virtual get_type get() const
 	{
 		return value.get();
 	}
@@ -147,7 +147,7 @@ struct GetterList : BaseGetter
 	typedef std::vector<GET_TYPE> get_type;
 	get_type value;
 
-	virtual get_type get()
+	virtual get_type get() const
 	{
 		return value;
 	}
@@ -159,7 +159,7 @@ struct GetterList<GET_TYPE> : BaseGetter
 	typedef std::vector<typename GET_TYPE::get_type> get_type;
 	std::vector<GET_TYPE> value;
 
-	virtual get_type get()
+	virtual get_type get() const
 	{
 		get_type result;
 		for (auto v: value)
@@ -168,6 +168,14 @@ struct GetterList<GET_TYPE> : BaseGetter
 		}
 		return result;
 	}
+};
+
+template <typename T>
+struct CustomGetter : BaseGetter
+{
+	typedef T get_type;
+
+	virtual T get() const = 0;
 };
 
 /// PackStream

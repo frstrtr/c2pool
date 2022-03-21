@@ -240,3 +240,21 @@ TEST(Devcore_stream, getter_vector_test_class)
 	l2.value.push_back(TestTemplateObj<int>(17));
 	ASSERT_EQ(l2.get(), (vector<int>{10, 25, 17}));
 }
+
+TEST(Devcore_stream, getter_basic_types)
+{
+	IntType(32) _int32_type;
+	_int32_type = 123;
+
+	ASSERT_EQ(_int32_type.get(), 123);
+}
+
+TEST(Devcore_stream, getter_list_type)
+{
+	ListType<IntType(32)> l;
+	std::vector<uint32_t> test_data{1,2,3,4};
+	l = l.make_type(test_data);
+	ASSERT_EQ(l.value.size(), 4);
+
+	ASSERT_EQ(l.get(), (std::vector<uint32_t>{1,2,3,4}));
+}

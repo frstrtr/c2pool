@@ -16,33 +16,31 @@
 using namespace std;
 
 template <typename T>
-struct ListType : MakerListType<T>
+struct ListType : public MakerListType<T>, public GetterList<T>
 {
-    vector<T> l;
-
     ListType() {}
 
     ListType(T arr[], size_t len)
     {
-        l.insert(l.end(), arr, arr + len);
+		GetterList<T>::value.insert(GetterList<T>::value.end(), arr, arr + len);
     }
 
     ListType(vector<T> arr)
     {
-        l = vector<T>(arr);
+		GetterList<T>::value = vector<T>(arr);
     }
 
     auto &operator=(vector<T> _value)
     {
-        l = _value;
+		GetterList<T>::value = _value;
         return *this;
     }
 
     PackStream &write(PackStream &stream) const
     {
-        auto len = l.size();
+        auto len = GetterList<T>::value.size();
         stream << len;
-        for (auto v : l)
+        for (auto v : GetterList<T>::value)
         {
             stream << v;
         }
@@ -58,70 +56,70 @@ struct ListType : MakerListType<T>
         {
             T temp;
             stream >> temp;
-            l.push_back(temp);
+			GetterList<T>::value.push_back(temp);
         }
         return stream;
     }
 };
 
-// remake?
-template <StreamObjType T>
-struct ListType<T> : MakerListType<T>
-{
-	vector<T> l;
-
-	ListType() {}
-
-	ListType(T arr[], size_t len)
-	{
-		l.insert(l.end(), arr, arr + len);
-	}
-
-	ListType(vector<T> arr)
-	{
-		l = vector<T>(arr);
-	}
-
-	auto &operator=(vector<T> _value)
-	{
-		l = _value;
-		return *this;
-	}
-
-	auto get() const
-	{
-		return l[0].get();
-	}
-
-	PackStream &write(PackStream &stream) const
-	{
-		auto len = l.size();
-		stream << len;
-		for (auto v : l)
-		{
-			stream << v;
-		}
-
-		return stream;
-	}
-
-	PackStream &read(PackStream &stream)
-	{
-		auto len = 0;
-		stream >> len;
-		for (int i = 0; i < len; i++)
-		{
-			T temp;
-			stream >> temp;
-			l.push_back(temp);
-		}
-		return stream;
-	}
-};
-//=======================
+//// remake?
+//template <StreamObjType T>
+//struct ListType<T> : MakerListType<T>
+//{
+//	vector<T> l;
+//
+//	ListType() {}
+//
+//	ListType(T arr[], size_t len)
+//	{
+//		l.insert(l.end(), arr, arr + len);
+//	}
+//
+//	ListType(vector<T> arr)
+//	{
+//		l = vector<T>(arr);
+//	}
+//
+//	auto &operator=(vector<T> _value)
+//	{
+//		l = _value;
+//		return *this;
+//	}
+//
+//	auto get() const
+//	{
+//		return l[0].get();
+//	}
+//
+//	PackStream &write(PackStream &stream) const
+//	{
+//		auto len = l.size();
+//		stream << len;
+//		for (auto v : l)
+//		{
+//			stream << v;
+//		}
+//
+//		return stream;
+//	}
+//
+//	PackStream &read(PackStream &stream)
+//	{
+//		auto len = 0;
+//		stream >> len;
+//		for (int i = 0; i < len; i++)
+//		{
+//			T temp;
+//			stream >> temp;
+//			l.push_back(temp);
+//		}
+//		return stream;
+//	}
+//};
+////=======================
 
 //In p2pool - VarStrType
-struct StrType : public Maker<StrType, string>
+struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 {
     vector<unsigned char> value;
 
@@ -181,7 +179,7 @@ struct StrType : public Maker<StrType, string>
         ListType<unsigned char> list_s(value);
 
         std::cout << "list_s.l: ";
-        for (auto v : list_s.l){
+        for (auto v : list_s.value){
             std::cout << (unsigned int) v << " ";
         }
         std::cout << std::endl;
@@ -194,11 +192,11 @@ struct StrType : public Maker<StrType, string>
     {
         ListType<unsigned char> list_s;
         stream >> list_s;
-        value = std::move(list_s.l);
+        value = std::move(list_s.value);
         return stream;
     }
 
-    string get()
+    std::string get() const override
     {
 		return string(value.begin(), value.end());
     }
@@ -206,10 +204,8 @@ struct StrType : public Maker<StrType, string>
 
 //TODO: TEST
 template <int SIZE>
-struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
+struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public Getter<std::string>
 {
-    string str;
-
     FixedStrType()
     {
     }
@@ -220,19 +216,19 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
         {
             throw std::invalid_argument("Incorrect length str in FixedStrType");
         }
-        str = _str;
+        value = _str;
     }
 
 	auto get() const
 	{
-		return str;
+		return value;
 	}
 
     PackStream &write(PackStream &stream) const
     {
 //        LOG_TRACE << "FixedStrType Worked!";
 
-        for (auto c : str)
+        for (auto c : value)
         {
             stream << c;
         }
@@ -248,38 +244,32 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>
             stream >> c_str[i];
         }
 
-        str = string(c_str, c_str + SIZE);
+        value = string(c_str, c_str + SIZE);
         return stream;
     }
 };
 
 template <typename INT_T, bool BIG_ENDIAN = false>
-struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
+struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>, public Getter<INT_T>
 {
     typedef INT_T value_type;
-    INT_T value;
 
     IntType() {}
 
     IntType(INT_T _value)
     {
-        value = _value;
+        Getter<INT_T>::value = _value;
     }
 
     IntType<INT_T> &set(const INT_T &_value)
     {
-        value = _value;
+		Getter<INT_T>::value = _value;
         return *this;
-    }
-
-    INT_T get() const
-    {
-        return value;
     }
 
     auto &operator=(INT_T _value)
     {
-        value = _value;
+		Getter<INT_T>::value = _value;
         return *this;
     }
 
@@ -287,7 +277,7 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
     {
 //        LOG_TRACE << "IntType Worked!";
 
-        INT_T value2 = value;
+        INT_T value2 = Getter<INT_T>::value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
         int32_t len = sizeof(value2) / sizeof(*packed);
 
@@ -314,39 +304,38 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>
         if (BIG_ENDIAN)
             std::reverse(packed, packed+_len);
         auto *_value = reinterpret_cast<INT_T *>(packed);
-        value = *_value;
+		Getter<INT_T>::value = *_value;
 
         return stream;
     }
 };
 
 template <typename INT_T>
-struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
+struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<INT_T>
 {
     typedef INT_T value_type;
-    INT_T value;
 
     ULongIntType() {}
 
     ULongIntType(INT_T _value)
     {
-        value = _value;
+		Getter<INT_T>::value = _value;
     }
 
     ULongIntType<INT_T> &set(const INT_T &_value)
     {
-        value = _value;
+		Getter<INT_T>::value = _value;
         return *this;
     }
 
     INT_T get() const
     {
-        return value;
+        return Getter<INT_T>::value;
     }
 
     auto &operator=(INT_T _value)
     {
-        value = _value;
+		Getter<INT_T>::value = _value;
         return *this;
     }
 
@@ -354,7 +343,7 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
     {
 //        LOG_TRACE << "ULongIntType Worked!";
 
-        INT_T value2 = value;
+        INT_T value2 = Getter<INT_T>::value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
         int32_t len = std::distance(value2.begin(), value2.end());
 
@@ -375,7 +364,7 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
 		}
 		stream.data.erase(stream.data.begin(), stream.data.begin() + value_type::WIDTH);
 		auto *_value = reinterpret_cast<INT_T *>(packed);
-		value = *_value;
+		Getter<INT_T>::value = *_value;
 
 		return stream;
 	}
@@ -391,10 +380,9 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>
 
 #define IntType(bytes) INT##bytes
 
-struct VarIntType : public Maker<VarIntType, uint64_t>
+struct VarIntType : public Maker<VarIntType, uint64_t>, public Getter<uint64_t>
 {
     typedef uint64_t value_type;
-    uint64_t value;
 
     VarIntType() {}
 
@@ -402,11 +390,6 @@ struct VarIntType : public Maker<VarIntType, uint64_t>
     {
         value = _v;
     }
-
-	auto get() const
-	{
-		return value;
-	}
 
     PackStream &write(PackStream &stream)
     {
@@ -425,31 +408,30 @@ struct VarIntType : public Maker<VarIntType, uint64_t>
 
 //PACK_TYPE = StreamObjType
 template <StreamEnumType ENUM_T, typename PACK_TYPE = IntType(32)>
-struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
+struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>, public Getter<ENUM_T>
 {
 	typedef typename PACK_TYPE::value_type value_type;
-    ENUM_T value;
 
     EnumType() {}
 
     EnumType(ENUM_T _value)
     {
-        value = _value;
+		Getter<ENUM_T>::value = _value;
     }
 
     void set(ENUM_T _value)
     {
-        value = _value;
+		Getter<ENUM_T>::value = _value;
     }
 
 	ENUM_T get()
 	{
-		return value;
+		return Getter<ENUM_T>::value;
 	}
 
     PackStream &write(PackStream &stream)
     {
-        PACK_TYPE v((typename PACK_TYPE::value_type)value);
+        PACK_TYPE v((typename PACK_TYPE::value_type)Getter<ENUM_T>::value);
         stream << v;
 
         return stream;
@@ -460,7 +442,7 @@ struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
         PACK_TYPE v;
         stream >> v;
 
-        value = (ENUM_T)v.value;
+		Getter<ENUM_T>::value = (ENUM_T)v.value;
 
         return stream;
     }
@@ -468,7 +450,7 @@ struct EnumType : public Maker<EnumType<ENUM_T, PACK_TYPE>, ENUM_T>
 
 //template <StreamObjType ObjType>
 template <typename ObjType>
-class PossibleNoneType : public Maker<PossibleNoneType<ObjType>, ObjType>
+class PossibleNoneType : public Maker<PossibleNoneType<ObjType>, ObjType>, public CustomGetter<ObjType>
 {
 private:
     ObjType none_value;
@@ -489,7 +471,7 @@ public:
         value = _value;
     }
 
-    ObjType get() const
+    ObjType get() const override
     {
         if (value.has_value())
         {
@@ -531,9 +513,10 @@ public:
     }
 };
 
-struct FloatingInteger
+struct FloatingInteger : public Getter<IntType(32)>
 {
-    IntType(32) bits;
+	///now: Getter<IntType(32)>::value = bits
+	///legacy: IntType(32) bits;
 
     FloatingInteger()
     {
@@ -541,19 +524,19 @@ struct FloatingInteger
 
     FloatingInteger(IntType(32) _bits)
     {
-        bits = _bits;
+        value = _bits;
     }
 
     FloatingInteger(int32_t _bits)
     {
-        bits = _bits;
+        value = _bits;
     }
 
     uint256 target()
     {
-        arith_uint256 res(bits.value && 0x00ffffff);
+        arith_uint256 res(value.value && 0x00ffffff);
 
-        res << (8 * ((bits.value >> 24) - 3));
+        res << (8 * ((value.value >> 24) - 3));
 
         return ArithToUint256(res);
     }
@@ -594,13 +577,13 @@ struct FloatingInteger
 };
 
 //TODO: test
-struct FloatingIntegerType
+struct FloatingIntegerType : public CustomGetter<typename FloatingInteger::get_type>
 {
     FloatingInteger bits;
 
     PackStream &write(PackStream &stream)
     {
-        stream << bits.bits;
+        stream << bits.value;
 
         return stream;
     }
@@ -616,12 +599,12 @@ struct FloatingIntegerType
 
     auto &operator=(int32_t v)
     {
-        bits.bits = v;
+        bits.value = v;
         return *this;
     }
 
-    int32_t get() const
+    uint32_t get() const override
     {
-        return bits.bits.get();
+        return bits.get();
     }
 };
