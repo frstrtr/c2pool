@@ -163,11 +163,6 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public Getter<st
         value = _str;
     }
 
-	auto get() const
-	{
-		return value;
-	}
-
     PackStream &write(PackStream &stream) const
     {
 //        LOG_TRACE << "FixedStrType Worked!";

@@ -221,7 +221,7 @@ namespace shares::stream
         }
     };
 
-    struct transaction_hash_refs_stream
+    struct transaction_hash_refs_stream : public CustomGetter<std::tuple<uint64_t, uint64_t>>
     {
         VarIntType share_count;
         VarIntType tx_count;
@@ -245,11 +245,16 @@ namespace shares::stream
             stream >> share_count >> tx_count;
             return stream;
         }
+
+		std::tuple<uint64_t, uint64_t> get() const override
+		{
+			return std::make_tuple(share_count.get(), tx_count.get());
+		}
     };
 
     struct ShareInfo_stream
     {
-        ListType<IntType(256) > new_transaction_hashes;
+        ListType<IntType(256)> new_transaction_hashes;
         ListType<transaction_hash_refs_stream> transaction_hash_refs;
         PossibleNoneType<IntType(256)> far_share_hash;
         FloatingIntegerType max_bits;
@@ -268,7 +273,7 @@ namespace shares::stream
 			new_transaction_hashes = new_transaction_hashes.make_type(val.new_transaction_hashes);
 			for (auto tx_hash_ref : val.transaction_hash_refs)
 			{
-				transaction_hash_refs.l.push_back(transaction_hash_refs_stream(tx_hash_ref));
+				transaction_hash_refs.value.push_back(transaction_hash_refs_stream(tx_hash_ref));
 			}
 			far_share_hash = val.far_share_hash;
 			max_bits = val.max_bits;
@@ -333,7 +338,7 @@ namespace shares::stream
 
 		RefType(std::string _ident, shared_ptr<ShareInfo_stream> _share_info)
 		{
-			identifier.str = _ident;
+			identifier.value = _ident;
 			share_info = _share_info;
 		}
 

@@ -40,7 +40,7 @@ namespace coind::data::stream
 
         tx_ins = ListType<TxInType_stream>(ListType<TxInType_stream>::make_type(_tx_ins));
         std::cout << "TXIDType_stream.script: ";
-        for (auto v : tx_ins.l[0].script.value){
+        for (auto v : tx_ins.value[0].script.value){
             std::cout << (unsigned int) v << " ";
         }
         std::cout << std::endl;
@@ -208,14 +208,14 @@ coind::data::TxIDType::TxIDType(coind::data::stream::TxIDType_stream obj)
 {
     version = obj.version.value;
 
-    for (auto v : obj.tx_ins.l)
+    for (auto v : obj.tx_ins.value)
     {
         auto ptr_tx_in = make_shared<coind::data::stream::TxInType_stream>(v);
         TxInType tx_in(ptr_tx_in);
         tx_ins.push_back(tx_in);
     }
 
-    for (auto v : obj.tx_outs.l)
+    for (auto v : obj.tx_outs.value)
     {
         auto ptr_tx_out = make_shared<coind::data::stream::TxOutType_stream>(v);
         TxOutType tx_out(ptr_tx_out);
@@ -257,7 +257,7 @@ coind::data::TxInType::TxInType(std::shared_ptr<coind::data::stream::TxInType_st
 {
     previous_output = PreviousOutput(obj->previous_output.get());
     script = obj->script.value;
-    sequence = obj->sequence.get().value;
+    sequence = obj->sequence.get();
 }
 
 coind::data::PreviousOutput::PreviousOutput(coind::data::stream::PreviousOutput_stream obj)

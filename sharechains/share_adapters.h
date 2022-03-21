@@ -18,7 +18,7 @@ struct SmallBlockHeaderType :
 
     void _to_value() override
     {
-        make_value(_stream->version.value, _stream->previous_block.get().get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get());
+        make_value(_stream->version.value, _stream->previous_block.get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get());
     }
 };
 
@@ -47,7 +47,7 @@ struct BlockHeaderType :
 
     void _to_value() override
     {
-        make_value(_stream->version.value, _stream->previous_block.get().get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get(), _stream->merkle_root.get());
+        make_value(_stream->version.value, _stream->previous_block.get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get(), _stream->merkle_root.get());
     }
 };
 
@@ -91,7 +91,7 @@ struct ShareData :
 
     void _to_value() override
     {
-		make_value(_stream->previous_share_hash.get().get(), _stream->coinbase.get(),
+		make_value(_stream->previous_share_hash.get(), _stream->coinbase.get(),
 				   _stream->nonce.get(), _stream->pubkey_hash.get(), _stream->subsidy.get(),
 				   _stream->donation.get(), _stream->stale_info.get(), _stream->desired_version.get());
     }
