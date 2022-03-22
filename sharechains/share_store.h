@@ -22,8 +22,8 @@ public:
 		PackStream packed_share;
 		packed_share << *share;
 
-		leveldb::Slice key(share->hash.begin(), sizeof(share->hash));
-		leveldb::Slice value((char*) packed_share.data.data(), packed_share.size());
+		leveldb::Slice key(reinterpret_cast<const char*>(share->hash.begin()), share->hash.size());
+		leveldb::Slice value(reinterpret_cast<const char*>(packed_share.data.data()), packed_share.size());
 
 		shares->Write(key, value);
 	}
@@ -33,11 +33,13 @@ public:
 		PackStream packed_share;
 		packed_share << *share;
 
-		leveldb::Slice key(share->hash, sizeof(share->hash));
-		leveldb::Slice value((char*) packed_share.data.data(), packed_share.size());
+        leveldb::Slice key(reinterpret_cast<const char*>(share->hash.begin()), share->hash.size());
+        leveldb::Slice value(reinterpret_cast<const char*>(packed_share.data.data()), packed_share.size());
 
-		verified_shares->write(key, value);
+        shares->Write(key, value);
 	}
 
+    //TODO: GET for what?
+    //TODO: Test for GET
 };
 

@@ -54,7 +54,6 @@ public:
 
 	TrackerThinkResult think();
 
-
 	int32_t get_height_rel_highest(uint256 prev_block_hash)
 	{
 		//TODO:
@@ -434,4 +433,14 @@ public:
 								   ((-block_height.value() + 1) * parent_net->BLOCK_PERIOD));
 		return std::make_tuple(net->CHAIN_LENGTH, score_res);
 	}
+
+    auto get_height(){
+        //TODO:
+    }
+
+    std::map<uint64_t, uint64_t> get_desired_version_counts(uint256 best_share_hash, uint64_t dist)
+    {
+        std::map<uint64_t, uint64_t> result;
+
+    }
 };
