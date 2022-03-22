@@ -29,45 +29,52 @@ class Share
 public:
 	const uint64_t SHARE_VERSION; //init in constructor
 	static const int32_t gentx_size = 50000;
+
+    shared_ptr<c2pool::Network> net;
+    c2pool::libnet::addr peer_addr;
 public:
+    ///objs
 	std::shared_ptr<SmallBlockHeaderType> min_header;
     std::shared_ptr<ShareData> share_data;
     std::shared_ptr<SegwitData> segwit_data;
     std::shared_ptr<ShareInfo> share_info;
-	std::shared_ptr<MerkleLink> ref_merkle_link;
+    std::shared_ptr<MerkleLink> ref_merkle_link;
 	unsigned long long last_txout_nonce;
-	std::shared_ptr<HashLinkType> hash_link;
-	std::shared_ptr<MerkleLink> merkle_link;
+    std::shared_ptr<HashLinkType> hash_link;
+    std::shared_ptr<MerkleLink> merkle_link;
 public:
+    ///Reference to objs
 //	//============share_data=============
 //TODO: Init:
-	uint256 previous_hash;
-	string coinbase;
-	unsigned int nonce;
-	uint160 pubkey_hash;
-	unsigned long long subsidy;
-	unsigned short donation;
-	StaleInfo stale_info;
-	unsigned long long desired_version;
-//	//===================================
-//
-//	vector<uint256> new_transaction_hashes;
-//	vector<tuple<int, int>> transaction_hash_refs; //TODO: check+test; # pairs of share_count, tx_count
-//	uint256 far_share_hash;
-	uint256 max_target; //from max_bits; //TODO: init
-	uint256 target;     //from bits; //TODO: init
-//	int32_t timestamp;
-//	int32_t absheight;
-//	uint128 abswork;
-//	std::vector<unsigned char> new_script; //TODO: self.new_script = bitcoin_data.pubkey_hash_to_script2(self.share_data['pubkey_hash']) //FROM pubkey_hash;
-//	//TODO: gentx_hash
-	BlockHeaderType header;
-//	uint256 pow_hash;
-	uint256 hash; //=header_hash //TODO: init
-//	int32_t time_seen;
+	std::unique_ptr<uint256> previous_hash;
+    std::unique_ptr<string> coinbase;
+    std::unique_ptr<unsigned int> nonce;
+    std::unique_ptr<uint160> pubkey_hash;
+    std::unique_ptr<unsigned long long> subsidy;
+    std::unique_ptr<unsigned short> donation;
+    std::unique_ptr<StaleInfo> stale_info;
+    std::unique_ptr<unsigned long long> desired_version;
+	//===================================
 
-	shared_ptr<c2pool::Network> net;
-	c2pool::libnet::addr peer_addr;
+    ///Other reference
+    std::unique_ptr<vector<uint256>> new_transaction_hashes;
+    std::unique_ptr<uint256> max_target; //from max_bits; //TODO: init
+    std::unique_ptr<uint256> target;     //from bits; //TODO: init
+    std::unique_ptr<int32_t> timestamp;
+    std::unique_ptr<int32_t> absheight;
+    std::unique_ptr<uint128> abswork;
+
+public:
+    ///other
+    //TODO: init
+    PackStream new_script; //FROM pubkey_hash;
+
+//TODO: gentx_hash
+
+	BlockHeaderType header; //TODO: init
+	uint256 pow_hash; //TODO: init
+	uint256 hash; //=header_hash //TODO: init
+	int32_t time_seen;
 
 public:
 	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _addr) : SHARE_VERSION(version)
@@ -75,6 +82,30 @@ public:
         net = _net;
         peer_addr = _addr;
 	}
+
+    ///check for verify share
+    void check(std::shared_ptr<ShareTracker> _tracker);
+
+    ~Share()
+    {
+        //share_data reference
+        previous_hash.release();
+        coinbase.release();
+        nonce.release();
+        pubkey_hash.release();
+        subsidy.release();
+        donation.release();
+        stale_info.release();
+        desired_version.release();
+
+        //other reference
+        new_transaction_hashes.release();
+        max_target.release();
+        target.release();
+        timestamp.release();
+        absheight.release();
+        abswork.release();
+    }
 };
 
 typedef std::shared_ptr<Share> ShareType;
