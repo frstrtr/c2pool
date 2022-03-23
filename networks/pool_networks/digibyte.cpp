@@ -35,5 +35,8 @@ namespace c2pool
         SPREAD = 30;
         ADDRESS_VERSION = 30;
         PERSIST = true;
+
+        MIN_TARGET.SetHex("0");
+        MAX_TARGET.SetHex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"); // 2**256/2**20 - 1
     }
 } // namespace c2pool

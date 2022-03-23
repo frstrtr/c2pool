@@ -1,16 +1,17 @@
 #pragma once
 
+#include <boost/function.hpp>
+
 #include <map>
 #include <queue>
 #include <list>
 #include <memory>
 #include <tuple>
+
+#include "share.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libcoind/data.h>
-#include <boost/function.hpp>
-#include "share.h"
-using namespace std;
 
 namespace c2pool::shares
 {
@@ -30,8 +31,8 @@ namespace c2pool::shares
         element_type(ShareType _share)
         {
             element = _share;
-            work = coind::data::target_to_average_attempts(_share->target);
-            min_work = coind::data::target_to_average_attempts(_share->max_target);
+            work = coind::data::target_to_average_attempts(*_share->target);
+            min_work = coind::data::target_to_average_attempts(*_share->max_target);
             height = 1;
         }
 
@@ -48,7 +49,7 @@ namespace c2pool::shares
                 res.SetNull();
                 return res;
             }
-            return element->previous_hash;
+            return *element->previous_hash;
         }
 
         element_type operator+(const element_type &element)
@@ -149,7 +150,7 @@ namespace c2pool::shares
         element_type make_element(ShareType _share)
         {
             element_type element(_share);
-            element.prev = sum.find(_share->previous_hash);
+            element.prev = sum.find(*_share->previous_hash);
             return element;
         }
 
@@ -312,8 +313,7 @@ namespace c2pool::shares
             return get_delta_to_last(hash).height;
         }
 
-        //todo: get_best
-        uint256 get_test_best()
+        uint256 get_best()
         {
             if (items.empty())
             {
@@ -354,7 +354,7 @@ namespace c2pool::shares
                     if ((cur_it != _items.end()) && (cur_pos != 0))
                     {
                         ref_hash = cur_it->second->hash;
-                        cur_it = _items.find(cur_it->second->previous_hash);
+                        cur_it = _items.find(*cur_it->second->previous_hash);
                         cur_pos -= 1;
                         return true;
                     }

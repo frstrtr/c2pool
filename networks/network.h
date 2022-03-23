@@ -48,6 +48,7 @@ namespace c2pool
         int ADDRESS_VERSION;
         bool PERSIST;
 
+        uint256 MIN_TARGET;
         uint256 MAX_TARGET;
 
     protected:

@@ -24,7 +24,7 @@ using std::shared_ptr;
 
 #include <boost/format.hpp>
 
-ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : verified(shares), net(_net), parent_net(_net->parent)
+ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : PrefsumShare(), verified(*this), net(_net), parent_net(_net->parent)
 {
 
 }
@@ -33,11 +33,12 @@ ShareType ShareTracker::get(uint256 hash)
 {
 	try
 	{
-		auto share = shares.items.at(hash);
+		auto share = PrefsumShare::items.at(hash);
 		return share;
 	}
 	catch (const std::out_of_range &e)
 	{
+        LOG_WARNING << "ShareTracker.get(" << hash.GetHex() << "): out of range!";
 		return nullptr;
 	}
 }
@@ -50,12 +51,12 @@ void ShareTracker::add(ShareType share)
 		return;
 	}
 
-	if (!shares.exists(share->hash))
+	if (!PrefsumShare::exists(share->hash))
 	{
-		shares.add(share);
+        PrefsumShare::add(share);
 	} else
 	{
-		LOG_WARNING << share->hash.ToString() << " item already present"; //TODO: for what???
+		LOG_WARNING << share->hash.ToString() << " item already present";
 	}
 }
 
@@ -82,17 +83,17 @@ bool ShareTracker::attempt_verify(ShareType share)
 
 TrackerThinkResult ShareTracker::think()
 {
+    //TODO:
 }
 
-uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
+arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
 {
 	assert(dist >= 2);
-	auto near = shares.items[previous_share_hash]; //TODO: rework for shares.get_item()
-	auto far = shares.items[shares.get_nth_parent_hash(previous_share_hash,
-													   dist - 1)]; //TODO: rework for shares.get_item()
-	auto attempts_delta = shares.get_delta(previous_share_hash, far->hash);
+    auto near = get(previous_share_hash);
+    auto far = get(PrefsumShare::get_nth_parent_hash(previous_share_hash,dist - 1));
+	auto attempts_delta = PrefsumShare::get_delta(previous_share_hash, far->hash);
 
-	auto time = near->timestamp - far->timestamp;
+	auto time = *near->timestamp - *far->timestamp;
 	if (time <= 0)
 	{
 		time = 1;
@@ -108,5 +109,5 @@ uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, 
 	}
 	res /= time;
 
-	return ArithToUint256(res);
+	return res;
 }
