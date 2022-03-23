@@ -15,6 +15,8 @@
 
 using std::string;
 
+class ShareTracker;
+
 namespace shares
 {
 	typedef boost::function<ShareType(int)> get_share_method;//TODO: args
@@ -43,6 +45,12 @@ namespace shares
 
 	class GenerateShareTransaction
 	{
+    public:
+        std::shared_ptr<ShareTracker> tracker;
+        std::shared_ptr<c2pool::Network> net;
+
+        GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker);
+
 	public:
 		SetProperty(ShareData, share_data);
 		SetProperty(uint256, block_target);
@@ -53,12 +61,13 @@ namespace shares
 		SetProperty(type_known_txs, known_txs);
 		SetProperty(unsigned long long, last_txout_nonce);
 		SetProperty(long long, base_subsidy);
-		SetProperty(shares::SegwitData, segwit_data);
+
+        std::optional<shares::SegwitData> _segwit_data;
+        void set_segwit_data(const shares::SegwitData &_value){
+            _segwit_data = _value;
+        }
 	public:
-		GeneratedShare operator()()
-		{
-			//TODO:
-		}
+		GeneratedShare operator()(uint64_t version);
 	};
 
 #undef SetProperty

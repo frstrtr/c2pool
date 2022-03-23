@@ -20,17 +20,16 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker)
         throw std::invalid_argument((boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} % (*timestamp - c2pool::dev::timestamp())).str());
     }
 
-    std::map<uint64_t, uint64_t> counts;
+    std::map<uint64_t, uint256> counts;
 
     if (!previous_hash->IsNull())
     {
         auto previous_share = _tracker->get(*previous_hash);
-        //TODO: remove comments, when updated tracker
-//        if (_tracker->get_height(*previous_hash) >= net->CHAIN_LENGTH)
-//        {
-//            //tracker.get_nth_parent_hash(previous_share.hash, self.net.CHAIN_LENGTH*9//10), self.net.CHAIN_LENGTH//10
-//            counts = _tracker->get_desired_version_counts(_tracker->get_nth_parent_hash(*previous_share->hash, net->CHAIN_LENGTH*9/10), net->CHAIN_LENGTH/10);
-//        }
+        if (_tracker->get_height(*previous_hash) >= net->CHAIN_LENGTH)
+        {
+            //tracker.get_nth_parent_hash(previous_share.hash, self.net.CHAIN_LENGTH*9//10), self.net.CHAIN_LENGTH//10
+            counts = _tracker->get_desired_version_counts(_tracker->get_nth_parent_hash(previous_share->hash, net->CHAIN_LENGTH*9/10), net->CHAIN_LENGTH/10);
+        }
     }
 }
 
