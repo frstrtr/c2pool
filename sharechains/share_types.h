@@ -285,12 +285,12 @@ namespace shares
     public:
         uint256 previous_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
         std::string coinbase;
-        unsigned int nonce;         //pack.IntType(32)
+        uint32_t nonce;         //pack.IntType(32)
         uint160 pubkey_hash;        //pack.IntType(160)
-        unsigned long long subsidy; //pack.IntType(64)
-        unsigned short donation;    //pack.IntType(16)
+        uint64_t subsidy; //pack.IntType(64)
+        uint16_t donation;    //pack.IntType(16)
         StaleInfo stale_info;
-        unsigned long long desired_version; //pack.VarIntType()
+        uint64_t desired_version; //pack.VarIntType()
 
 		ShareData()
 		{
@@ -357,12 +357,12 @@ namespace shares
     {
     public:
         uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
-        unsigned int max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
-        unsigned int bits;                                       //bitcoin_data.FloatingIntegerType() bits;
-        unsigned int timestamp;                                  //pack.IntType(32)
+        uint32_t max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
+        uint32_t bits;                                       //bitcoin_data.FloatingIntegerType() bits;
+        uint32_t timestamp;                                  //pack.IntType(32)
         std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
         std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        unsigned long absheigth;                                 //pack.IntType(32)
+        uint32_t absheigth;                                 //pack.IntType(32)
         uint128 abswork;                                         //pack.IntType(128)
 
     public:

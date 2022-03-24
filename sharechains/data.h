@@ -23,7 +23,7 @@ namespace shares
 
 	bool is_segwit_activated(int version, shared_ptr<c2pool::Network> net);
 
-	uint256 check_hash_link(HashLinkType hash_link, unsigned char *data, string const_ending = "");
+	uint256 check_hash_link(shared_ptr<HashLinkType> hash_link, PackStream &data, string const_ending = "");
 
 	struct GeneratedShare
 	{
