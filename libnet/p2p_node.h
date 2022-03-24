@@ -43,7 +43,7 @@ namespace c2pool::libnet::p2p
     class P2PNode : public std::enable_shared_from_this<P2PNode>
     {
     public:
-        P2PNode(std::shared_ptr<io::io_context> __context, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<c2pool::dev::coind_config> __config, shared_ptr<c2pool::dev::AddrStore> __addr_store, shared_ptr<c2pool::libnet::CoindNode> __coind_node, shared_ptr<c2pool::shares::ShareTracker> __tracker);
+        P2PNode(std::shared_ptr<io::io_context> __context, std::shared_ptr<c2pool::Network> __net, std::shared_ptr<c2pool::dev::coind_config> __config, shared_ptr<c2pool::dev::AddrStore> __addr_store, shared_ptr<c2pool::libnet::CoindNode> __coind_node, shared_ptr<ShareTracker> __tracker);
         void start();
 
         std::vector<addr> get_good_peers(int max_count);
@@ -55,14 +55,14 @@ namespace c2pool::libnet::p2p
         bool is_connected() const;
 
     public:
-        std::vector<shared_ptr<BaseShare>> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr)
+        std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr)
         {
             parents = std::min(parents, 1000/hashes.size());
-            std::vector<shared_ptr<BaseShare>> shares;
+            std::vector<ShareType> shares;
             for (auto share_hash : hashes)
             {
-                uint64_t n = std::min(parents+1, (uint64_t)_tracker->shares.get_height(share_hash));
-                auto get_chain_func = _tracker->shares.get_chain(share_hash, n);
+                uint64_t n = std::min(parents+1, (uint64_t)_tracker->get_height(share_hash));
+                auto get_chain_func = _tracker->get_chain(share_hash, n);
 
                 uint256 _hash;
                 while(get_chain_func(_hash))
@@ -80,7 +80,7 @@ namespace c2pool::libnet::p2p
             return shares;
         }
 
-        void handle_bestblock(shares::BlockHeaderType_stream header);
+        void handle_bestblock(::shares::stream::BlockHeaderType_stream header);
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
         bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
@@ -99,7 +99,7 @@ namespace c2pool::libnet::p2p
         shared_ptr<io::io_context> _context; //From NodeManager;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
         shared_ptr<c2pool::libnet::CoindNode> _coind_node;
-        shared_ptr<c2pool::shares::ShareTracker> _tracker;
+        shared_ptr<ShareTracker> _tracker;
 
         io::steady_timer _auto_connect_timer;
         const std::chrono::seconds auto_connect_interval{std::chrono::seconds(1)};

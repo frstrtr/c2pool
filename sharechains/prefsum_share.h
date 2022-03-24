@@ -31,8 +31,8 @@ namespace c2pool::shares
         element_type(ShareType _share)
         {
             element = _share;
-            work = coind::data::target_to_average_attempts(*_share->target);
-            min_work = coind::data::target_to_average_attempts(*_share->max_target);
+            work = coind::data::target_to_average_attempts(_share->target);
+            min_work = coind::data::target_to_average_attempts(_share->max_target);
             height = 1;
         }
 

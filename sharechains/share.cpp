@@ -1,14 +1,17 @@
 #include "share.h"
 
+#include <stdexcept>
+#include <tuple>
+#include <set>
+
 #include <univalue.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <libdevcore/addrStore.h>
 #include "tracker.h"
 #include "data.h"
-#include <stdexcept>
-#include <tuple>
-#include <set>
+#include "share_builder.h"
+
 
 using namespace std;
 
@@ -115,9 +118,9 @@ std::shared_ptr<Share> load_share(PackStream &stream, shared_ptr<c2pool::Network
 	switch (packed_share.type.value)
 	{
 		case 17:
-			return director.make_Share(packed_share.type.value, peer_addr, _stream);
+			return director.make_share(packed_share.type.value, peer_addr, _stream);
 		case 32:
-			return director.make_PreSegwitShare(packed_share.type.value, peer_addr, _stream);
+			return director.make_preSegwitShare(packed_share.type.value, peer_addr, _stream);
 		default:
 			if (packed_share.type.value < 17)
 				throw std::runtime_error("sent an obsolete share");

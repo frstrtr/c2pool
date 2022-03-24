@@ -11,7 +11,7 @@
 #include <libdevcore/types.h>
 #include <libdevcore/stream_types.h>
 #include <btclibs/uint256.h>
-#include <sharechains/share_types.h>
+#include <sharechains/share_streams.h>
 #include <networks/network.h>
 #include <libdevcore/logger.h>
 #include <libcoind/transaction.h>
@@ -186,9 +186,9 @@ namespace c2pool::libnet::messages
         //PoolVersion pool_version;
 
     public:
-        message_version() : base_message("version") {}
+        message_version() : base_message("version"), best_share_hash(uint256()) {}
 
-        message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, std::string sub_ver, int _mode, uint256 best_hash, PoolVersion pool_ver = PoolVersion::None) : base_message("version")
+        message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, std::string sub_ver, int _mode, uint256 best_hash, PoolVersion pool_ver = PoolVersion::None) : message_version()
         {
             version = ver;
             services = serv;
@@ -238,7 +238,7 @@ namespace c2pool::libnet::messages
     public:
         message_addrme() : base_message("addrme") {}
 
-        message_addrme(int _port) : base_message("addrme")
+        message_addrme(int _port) : message_addrme()
         {
             port = _port;
         }
@@ -264,7 +264,7 @@ namespace c2pool::libnet::messages
     public:
         message_getaddrs() : base_message("getaddrs") {}
 
-        message_getaddrs(int cnt) : base_message("getaddrs")
+        message_getaddrs(int cnt) : message_getaddrs()
         {
             count = cnt;
         }
@@ -290,12 +290,12 @@ namespace c2pool::libnet::messages
     public:
         message_addrs() : base_message("addrs") {}
 
-        message_addrs(std::vector<c2pool::messages::addr> _addrs) : base_message("addrs")
+        message_addrs(std::vector<c2pool::messages::addr> _addrs) : message_addrs()
         {
             addrs = stream::addr_stream::make_list_type(_addrs); //TODO: test
         }
 
-        message_addrs(std::vector<c2pool::messages::stream::addr_stream> _addrs) : base_message("addrs")
+        message_addrs(std::vector<c2pool::messages::stream::addr_stream> _addrs) : message_addrs()
         {
             addrs = _addrs;
         }
@@ -322,7 +322,7 @@ namespace c2pool::libnet::messages
     public:
         message_shares() : base_message("shares") {}
 
-        message_shares(std::vector<UniValue> _shares) : base_message("shares")
+        message_shares(std::vector<UniValue> _shares) : message_shares()
         {
             raw_shares = _shares;
         }
@@ -351,7 +351,7 @@ namespace c2pool::libnet::messages
     public:
         message_sharereq() : base_message("sharereq") {}
 
-        message_sharereq(uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops) : base_message("sharereq")
+        message_sharereq(uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops) : message_sharereq()
         {
             id = _id;
             hashes = hashes.make_type(_hashes);
@@ -393,7 +393,7 @@ namespace c2pool::libnet::messages
     public:
         message_sharereply() : base_message("sharereply") {}
 
-        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<share_type> _shares) : base_message("sharereply")
+        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<share_type> _shares) : message_sharereply()
         {
             id = _id;
             result = _result;
@@ -416,12 +416,12 @@ namespace c2pool::libnet::messages
     class message_bestblock : public base_message
     {
     public:
-        shares::BlockHeaderType_stream header;
+        ::shares::stream::BlockHeaderType_stream header;
 
     public:
         message_bestblock() : base_message("bestblock") {}
 
-        message_bestblock(shares::BlockHeaderType _header) : base_message("bestblock")
+        message_bestblock(::shares::BlockHeaderType _header) : message_bestblock()
         {
             header = _header;
         }
@@ -447,7 +447,7 @@ namespace c2pool::libnet::messages
     public:
         message_have_tx() : base_message("have_tx") {}
 
-        message_have_tx(std::vector<uint256> _tx_hashes) : base_message("have_tx")
+        message_have_tx(std::vector<uint256> _tx_hashes) : message_have_tx()
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }
@@ -473,7 +473,7 @@ namespace c2pool::libnet::messages
     public:
         message_losing_tx() : base_message("losing_tx") {}
 
-        message_losing_tx(std::vector<uint256> _tx_hashes) : base_message("losing_tx")
+        message_losing_tx(std::vector<uint256> _tx_hashes) : message_losing_tx()
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }
@@ -499,7 +499,7 @@ namespace c2pool::libnet::messages
     public:
         message_remember_tx() : base_message("remember_tx") {}
 
-        message_remember_tx(std::vector<uint256> _tx_hashes) : base_message("remember_tx")
+        message_remember_tx(std::vector<uint256> _tx_hashes) : message_remember_tx()
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }
@@ -525,7 +525,7 @@ namespace c2pool::libnet::messages
     public:
         message_forget_tx() : base_message("forget_tx") {}
 
-        message_forget_tx(std::vector<uint256> _tx_hashes) : base_message("forget_tx")
+        message_forget_tx(std::vector<uint256> _tx_hashes) : message_forget_tx()
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
         }

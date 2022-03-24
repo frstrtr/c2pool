@@ -8,7 +8,7 @@
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/jsonrpc/stratum.h>
 #include <sharechains/tracker.h>
-#include <sharechains/shareStore.h>
+#include <sharechains/share_store.h>
 
 using boost::asio::ip::tcp;
 using namespace c2pool::shares;
@@ -33,11 +33,12 @@ namespace c2pool::libnet
         //1:    Determining payout address
         //2:    ShareStore
         LOG_INFO << "ShareStore initialization...";
-        _share_store = std::make_shared<c2pool::shares::ShareStore>("dgb"); //TODO: init
+        //TODO: init
+        //_share_store = std::make_shared<ShareStore>("dgb"); //TODO: init
         //Init work:
         //3:    ShareTracker
         LOG_INFO << "ShareTracker initialization...";
-        _tracker = std::make_shared<ShareTracker>(_net, _parent_net);
+        _tracker = std::make_shared<ShareTracker>(_net);
         //3.1:  Save shares every 60 seconds
         //TODO: timer in _tracker constructor
 
@@ -118,12 +119,12 @@ namespace c2pool::libnet
         return _coind_node;
     }
 
-    shared_ptr<c2pool::shares::ShareTracker> NodeManager::tracker() const
+    shared_ptr<ShareTracker> NodeManager::tracker() const
     {
         return _tracker;
     }
 
-    shared_ptr<c2pool::shares::ShareStore> NodeManager::share_store() const
+    shared_ptr<ShareStore> NodeManager::share_store() const
     {
         return _share_store;
     }
@@ -155,8 +156,8 @@ namespace c2pool::libnet
     create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
     create_set_method(coind::JSONRPC_Coind, _coind);
     create_set_method(c2pool::libnet::CoindNode, _coind_node);
-    create_set_method(c2pool::shares::ShareTracker, _tracker);
-    create_set_method(c2pool::shares::ShareStore, _share_store);
+    create_set_method(ShareTracker, _tracker);
+    create_set_method(ShareStore, _share_store);
     create_set_method(c2pool::libnet::WorkerBridge, _worker);
     create_set_method(coind::jsonrpc::StratumNode, _stratum);
 

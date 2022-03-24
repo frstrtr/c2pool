@@ -74,7 +74,7 @@ public:
 	int32_t time_seen;
 
 public:
-	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _addr) : SHARE_VERSION(version)
+	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _addr) : VERSION(version)
 	{
         net = _net;
         peer_addr = _addr;
