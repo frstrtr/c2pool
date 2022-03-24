@@ -1,7 +1,7 @@
 #include "data.h"
 
 #include "tracker.h"
-#include "share_types.h"
+#include "share_adapters.h"
 #include <networks/network.h>
 #include <libdevcore/stream_types.h>
 
@@ -12,16 +12,25 @@ namespace shares
         return version >= net->SEGWIT_ACTIVATION_VERSION;
     }
 
-    uint256 check_hash_link(HashLinkType hash_link, unsigned char *data, string const_ending)
+    //TODO: test
+    uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, PackStream &data, string const_ending)
     {
-        auto extra_length = hash_link.length % (512 / 8);
-        //TODO: assert len(hash_link['extra_data']) == max(0, extra_length - len(const_ending))
-        auto extra = hash_link.extra_data + const_ending;
-        int32_t temp_len = hash_link.extra_data.length() + const_ending.length() - extra_length;
-        string extra_sub(extra, temp_len, extra.length() - temp_len); //TODO: test
+        uint64_t extra_length = (*hash_link)->length % (512 / 8);
+        assert((*hash_link)->extra_data.size() == max(extra_length - const_ending.size(), (uint64_t)0));
+
+        auto extra = (*hash_link)->extra_data + const_ending;
+        {
+            int32_t len = (*hash_link)->extra_data.size() + const_ending.length() - extra_length;
+            extra = string(extra, len, extra.length() - len); //TODO: test
+        }
+        assert(extra.size() == extra_length);
+
+        IntType(256) result;
 
         //TODO: SHA256 test in p2pool
         //TODO: return pack.IntType(256).unpack(hashlib.sha256(sha256.sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
+
+        return result.get();
     }
 
     GenerateShareTransaction::GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker) : tracker(_tracker), net(_tracker->net)

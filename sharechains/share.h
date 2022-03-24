@@ -27,7 +27,7 @@ class ShareTracker;
 class Share
 {
 public:
-	const uint64_t SHARE_VERSION; //init in constructor
+	const uint64_t VERSION; // Share version, init in constructor
 	static const int32_t gentx_size = 50000;
 
     shared_ptr<c2pool::Network> net;
@@ -45,32 +45,29 @@ public:
 public:
     ///Reference to objs
 	//============share_data=============
-//TODO: Init:
 	std::unique_ptr<uint256> previous_hash;
     std::unique_ptr<string> coinbase;
-    std::unique_ptr<unsigned int> nonce;
+    std::unique_ptr<uint32_t> nonce;
     std::unique_ptr<uint160> pubkey_hash;
-    std::unique_ptr<unsigned long long> subsidy;
-    std::unique_ptr<unsigned short> donation;
+    std::unique_ptr<uint64_t> subsidy;
+    std::unique_ptr<uint16_t> donation;
     std::unique_ptr<StaleInfo> stale_info;
-    std::unique_ptr<unsigned long long> desired_version;
+    std::unique_ptr<uint64_t> desired_version;
 	//===================================
 
     ///Other reference
     std::unique_ptr<vector<uint256>> new_transaction_hashes;
-    std::unique_ptr<uint256> max_target; //from max_bits; //TODO: init
-    std::unique_ptr<uint256> target;     //from bits; //TODO: init
-    std::unique_ptr<int32_t> timestamp;
-    std::unique_ptr<int32_t> absheight;
+    uint256 max_target; //from max_bits;
+    uint256 target;     //from bits;
+    std::unique_ptr<uint32_t> timestamp;
+    std::unique_ptr<uint32_t> absheight;
     std::unique_ptr<uint128> abswork;
 
 public:
     ///other
-    //TODO: init
     PackStream new_script; //FROM pubkey_hash;
 
-//TODO: gentx_hash
-
+    uint256 gentx_hash; //TODO: init
 	BlockHeaderType header; //TODO: init
 	uint256 pow_hash; //TODO: init
 	uint256 hash; //=header_hash //TODO: init
@@ -83,7 +80,10 @@ public:
         peer_addr = _addr;
 	}
 
-    ///check for verify share
+    /// called, when Builder finished building obj.
+    void init();
+
+    /// check for verify share.
     void check(std::shared_ptr<ShareTracker> _tracker);
 
     ~Share()
@@ -100,8 +100,6 @@ public:
 
         //other reference
         new_transaction_hashes.release();
-        max_target.release();
-        target.release();
         timestamp.release();
         absheight.release();
         abswork.release();
