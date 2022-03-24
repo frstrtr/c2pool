@@ -25,6 +25,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+    
+    - name: Install leveldb
+      run: sudo apt-get install libleveldb-dev
 
     - name: Install libcurl
       run: sudo apt-get update && sudo apt-get install libcurl4-openssl-dev
