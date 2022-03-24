@@ -8,6 +8,9 @@
 
 using std::shared_ptr;
 
+class ShareTracker;
+class ShareStore;
+
 namespace c2pool
 {
     namespace libnet
@@ -20,11 +23,7 @@ namespace c2pool
         class CoindNode;
     }
 
-    namespace shares
-    {
-        class ShareTracker;
-        class ShareStore;
-    }
+
 }
 namespace coind
 {
@@ -64,8 +63,8 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const;
         shared_ptr<coind::JSONRPC_Coind> coind() const;
         shared_ptr<c2pool::libnet::CoindNode> coind_node() const;
-        shared_ptr<c2pool::shares::ShareTracker> tracker() const;
-        shared_ptr<c2pool::shares::ShareStore> share_store() const;
+        shared_ptr<ShareTracker> tracker() const;
+        shared_ptr<ShareStore> share_store() const;
         shared_ptr<c2pool::libnet::WorkerBridge> worker() const;
         shared_ptr<coind::jsonrpc::StratumNode> stratum() const;
 
@@ -78,8 +77,8 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::p2p::P2PNode> _p2pnode;
         shared_ptr<coind::JSONRPC_Coind> _coind;
         shared_ptr<c2pool::libnet::CoindNode> _coind_node;
-        shared_ptr<c2pool::shares::ShareTracker> _tracker;
-        shared_ptr<c2pool::shares::ShareStore> _share_store;
+        shared_ptr<ShareTracker> _tracker;
+        shared_ptr<ShareStore> _share_store;
         shared_ptr<c2pool::libnet::WorkerBridge> _worker;
         shared_ptr<coind::jsonrpc::StratumNode> _stratum;
 
@@ -107,8 +106,8 @@ namespace c2pool::libnet
         create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
         create_set_method(coind::JSONRPC_Coind, _coind);
         create_set_method(c2pool::libnet::CoindNode, _coind_node);
-        create_set_method(c2pool::shares::ShareTracker, _tracker);
-        create_set_method(c2pool::shares::ShareStore, _share_store);
+        create_set_method(ShareTracker, _tracker);
+        create_set_method(ShareStore, _share_store);
         create_set_method(c2pool::libnet::WorkerBridge, _worker);
         create_set_method(coind::jsonrpc::StratumNode, _stratum);
     };

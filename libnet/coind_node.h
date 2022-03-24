@@ -45,7 +45,7 @@ namespace c2pool::libnet
 
         void start();
 
-        shared_ptr<ShareTracker> tracker;
+        shared_ptr<ShareTracker> tracker();
         void set_best_share();
         void clean_tracker();
 
@@ -61,17 +61,17 @@ namespace c2pool::libnet
 
         Event<uint256> new_block;                           //block_hash
         Event<coind::data::tx_type> new_tx;                 //bitcoin_data.tx_type
-        Event<shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<::shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
         Variable<coind::getwork_result> coind_work;
-        Variable<std::optional<shares::BlockHeaderType>> best_block_header;
+        Variable<std::optional<::shares::BlockHeaderType>> best_block_header;
 
     private:
         boost::asio::deadline_timer work_poller_t;
         void work_poller();
         void poll_header();
     public:
-        void handle_header(const BlockHeaderType &new_header);
+        void handle_header(const ::shares::BlockHeaderType &new_header);
     private:
         shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<coind::p2p::CoindProtocol> protocol;

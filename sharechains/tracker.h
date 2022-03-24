@@ -75,17 +75,18 @@ public:
 		{
 			auto share = verified.items[hash];
 
-			auto block_height_temp = PrefsumShare::get_height_rel_highest(share->header->previous_block);
-			if (!block_height.has_value())
-			{
-				block_height = block_height_temp;
-			} else
-			{
-				if (block_height.value() > block_height_temp)
-				{
-					block_height = block_height_temp;
-				}
-			}
+            //TODO: create get_height_rel_highest
+//			auto block_height_temp = PrefsumShare::get_height_rel_highest(share->header->previous_block);
+//			if (!block_height.has_value())
+//			{
+//				block_height = block_height_temp;
+//			} else
+//			{
+//				if (block_height.value() > block_height_temp)
+//				{
+//					block_height = block_height_temp;
+//				}
+//			}
 		}
 
 		score_res = ArithToUint256(verified.get_delta(share_hash, end_point).work /
@@ -107,7 +108,7 @@ public:
             if (_result.find(*share->desired_version) == _result.end())
                 _result[*share->desired_version] = 0;
 
-            _result[*share->desired_version] += UintToArith256(coind::data::target_to_average_attempts(*share->target)) + 1;
+            _result[*share->desired_version] += UintToArith256(coind::data::target_to_average_attempts(share->target)) + 1;
         }
 
         std::map<uint64_t, uint256> result;
