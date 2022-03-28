@@ -2,7 +2,9 @@ set(coind_tool_sources
         data.h
         data.cpp
         transaction.h
-        transaction.cpp)
+        transaction.cpp
+        height_tracker.h
+        )
 
 set(jsonrpc_sources 
 #        jsonrpc/coind.h

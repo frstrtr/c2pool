@@ -81,7 +81,7 @@ bool ShareTracker::attempt_verify(ShareType share)
 	return true;
 }
 
-TrackerThinkResult ShareTracker::think()
+TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_rel_height_func)
 {
     //TODO:
 }
