@@ -51,11 +51,11 @@ public:
 
 	bool attempt_verify(ShareType share);
 
-	TrackerThinkResult think();
+	TrackerThinkResult think(boost::function<int32_t(uint256)> block_rel_height_func);
 
 	arith_uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
-	std::tuple<int32_t, uint256> score(uint256 share_hash)
+	std::tuple<int32_t, uint256> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
 	{
 		uint256 score_res;
 		score_res.SetNull();
@@ -75,18 +75,17 @@ public:
 		{
 			auto share = verified.items[hash];
 
-            //TODO: create get_height_rel_highest
-//			auto block_height_temp = PrefsumShare::get_height_rel_highest(share->header->previous_block);
-//			if (!block_height.has_value())
-//			{
-//				block_height = block_height_temp;
-//			} else
-//			{
-//				if (block_height.value() > block_height_temp)
-//				{
-//					block_height = block_height_temp;
-//				}
-//			}
+			auto block_height_temp = block_rel_height_func(share->header->previous_block);
+			if (!block_height.has_value())
+			{
+				block_height = block_height_temp;
+			} else
+			{
+				if (block_height.value() > block_height_temp)
+				{
+					block_height = block_height_temp;
+				}
+			}
 		}
 
 		score_res = ArithToUint256(verified.get_delta(share_hash, end_point).work /

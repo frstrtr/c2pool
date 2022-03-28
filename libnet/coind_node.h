@@ -15,6 +15,7 @@
 #include <libcoind/jsonrpc/results.h>
 #include <libcoind/jsonrpc/txidcache.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
+#include <libcoind/height_tracker.h>
 
 
 using namespace coind::jsonrpc;
@@ -65,6 +66,7 @@ namespace c2pool::libnet
 
         Variable<coind::getwork_result> coind_work;
         Variable<std::optional<::shares::BlockHeaderType>> best_block_header;
+        HeightTracker get_height_rel_highest;
 
     private:
         boost::asio::deadline_timer work_poller_t;
