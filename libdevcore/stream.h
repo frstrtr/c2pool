@@ -464,6 +464,7 @@ public:
 		_stream = std::make_shared<StreamType>(__stream);
 	}
 
+
 protected:
     virtual void _to_stream() = 0;
 
@@ -479,6 +480,13 @@ private:
         {
             throw std::runtime_error("StreamTypeAdapter.to_stream error: _value - nullptr!");
         }
+    }
+
+    size_t size() const
+    {
+        PackStream _buffer;
+        _buffer << *stream();
+        return _buffer.size();
     }
 
     virtual void to_value()

@@ -181,6 +181,7 @@ namespace shares
         }
     };
 
+    //TODO: for what?
     class HashLinkType
     {
     public:

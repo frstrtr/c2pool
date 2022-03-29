@@ -21,7 +21,7 @@ namespace shares
         auto extra = (*hash_link)->extra_data + const_ending;
         {
             int32_t len = (*hash_link)->extra_data.size() + const_ending.length() - extra_length;
-            extra = string(extra, len, extra.length() - len); //TODO: test
+            extra = string(extra, len, extra.length() - len);
         }
         assert(extra.size() == extra_length);
 
@@ -120,111 +120,123 @@ namespace shares
 		}
 
 		//t2
-        //TODO:
-//
-//		for (auto item: _desired_other_transaction_hashes_and_fees)
-//		{
-//			auto tx_hash = std::get<0>(item);
-//			auto fee = std::get<1>(item);
-//
-//			int32_t this_stripped_size = 0;
-//			int32_t this_real_size = 0;
-//			int32_t this_weight = 0;
-//			if (!_known_txs.empty())
-//			{
-//                //TODO: pack size for coind::data::stream::TxIDType_stream
-//				// this_stripped_size = c2pool::python::PyPackTypes::packed_size("tx_id_type", known_txs[tx_hash]); //TODO:
-//				// this_real_size = c2pool::python::PyPackTypes::packed_size("tx_type", known_txs[tx_hash]); //TODO:
-//				this_weight = this_real_size + 3 * this_stripped_size;
-//			}
-//
-//			if (all_transaction_stripped_size + this_stripped_size + 80 + Share::gentx_size + 500 >
-//				net->BLOCK_MAX_SIZE)
-//				break;
-//			if (all_transaction_weight + this_weight + 4 * 80 + Share::gentx_size + 2000 >
-//				net->BLOCK_MAX_WEIGHT)
-//				break;
-//
-//			tuple<int, int> _this;
-//			all_transaction_stripped_size += this_stripped_size;
-//			//all_transaction_real_size += this_real_size;
-//			all_transaction_weight += this_weight;
-//			if (tx_hash_to_this.find(tx_hash) != tx_hash_to_this.end())
-//			{
-//				_this = tx_hash_to_this[tx_hash];
-//			} else
-//			{
-//				//new_transaction_size += this_real_size;
-//				new_transaction_weight += this_weight;
-//
-//				new_transaction_hashes.push_back(tx_hash);
-//				_this = std::make_tuple(0, new_transaction_hashes.size() - 1);
-//			}
-//			transaction_hash_refs.push_back(_this);
-//			other_transaction_hashes.push_back(tx_hash);
-//		}
-//
-//		//t3
-//
-//		// Тут в питон-коде проводятся махинации с упаковкой в типы C, для оптимизации памяти. Нам, по идее, это не нужно.
-//		// if transaction_hash_refs and max(transaction_hash_refs) < 2**16:
-//		//     transaction_hash_refs = array.array('H', transaction_hash_refs)
-//		// elif transaction_hash_refs and max(transaction_hash_refs) < 2**32: # in case we see blocks with more than 65536 tx
-//		//     transaction_hash_refs = array.array('L', transaction_hash_refs)
-//
-//		//t4
-//
-//		// if all_transaction_stripped_size:
-//		//     print "Generating a share with %i bytes, %i WU (new: %i B, %i WU) in %i tx (%i new), plus est gentx of %i bytes/%i WU" % (
-//		//         all_transaction_real_size,
-//		//         all_transaction_weight,
-//		//         new_transaction_size,
-//		//         new_transaction_weight,
-//		//         len(other_transaction_hashes),
-//		//         len(new_transaction_hashes),
-//		//         cls.gentx_size,
-//		//         cls.gentx_weight)
-//		//     print "Total block stripped size=%i B, full size=%i B,  weight: %i WU" % (
-//		//         80+all_transaction_stripped_size+cls.gentx_size,
-//		//         80+all_transaction_real_size+cls.gentx_size,
-//		//         3*80+all_transaction_weight+cls.gentx_weight)
-//
-//		set<uint256> included_transactions = set<uint256>(other_transaction_hashes.begin(),
-//														  other_transaction_hashes.end());
-//
-//		vector<boost::optional<int32_t>> removed_fee;
-//		int32_t removed_fee_sum;
-//		int32_t definite_fees;
-//		bool fees_none_contains = false;
-//		for (auto item: _desired_other_transaction_hashes_and_fees)
-//		{
-//			auto tx_hash = std::get<0>(item);
-//			auto fee = std::get<1>(item);
-//			if (!fee.has_value())
-//				fees_none_contains = true;
-//
-//			if (included_transactions.find(tx_hash) == included_transactions.end())
-//			{
-//				removed_fee.push_back(fee);
-//				if (fee.has_value())
-//					removed_fee_sum += fee.get();
-//			} else
-//			{
-//				if (fee.has_value())
-//					definite_fees += fee.get();
-//				else
-//					definite_fees += 0;
-//			}
-//		}
-//
-//		if (!fees_none_contains)
-//		{
-//			_share_data.subsidy += removed_fee_sum;
-//		} else
-//		{
-//			_share_data.subsidy = _base_subsidy + definite_fees;
-//		}
-//
+        //TODO: test
+		for (auto item: _desired_other_transaction_hashes_and_fees)
+		{
+			auto tx_hash = std::get<0>(item);
+			auto fee = std::get<1>(item);
+
+			int32_t this_stripped_size = 0;
+			int32_t this_real_size = 0;
+			int32_t this_weight = 0;
+			if (!_known_txs.empty())
+			{
+                auto _tx = _known_txs[tx_hash];
+                // this_stripped_size
+                {
+
+                    PackStream temp_txid;
+                    auto stream_txid = coind::data::stream::TxIDType_stream(_tx->version,_tx->tx_ins, _tx->tx_outs, _tx->lock_time);
+                    temp_txid << stream_txid;
+                    this_stripped_size = temp_txid.size();
+                }
+                // this_real_size
+                {
+                    PackStream temp_tx;
+                    auto stream_tx = coind::data::stream::TransactionType_stream(_tx);
+                    temp_tx << stream_tx;
+                    this_real_size = temp_tx.size();
+                }
+				this_weight = this_real_size + 3 * this_stripped_size;
+			}
+
+			if (all_transaction_stripped_size + this_stripped_size + 80 + Share::gentx_size + 500 >
+				net->BLOCK_MAX_SIZE)
+				break;
+			if (all_transaction_weight + this_weight + 4 * 80 + Share::gentx_size + 2000 >
+				net->BLOCK_MAX_WEIGHT)
+				break;
+
+			tuple<int, int> _this;
+			all_transaction_stripped_size += this_stripped_size;
+			//all_transaction_real_size += this_real_size;
+			all_transaction_weight += this_weight;
+			if (tx_hash_to_this.find(tx_hash) != tx_hash_to_this.end())
+			{
+				_this = tx_hash_to_this[tx_hash];
+			} else
+			{
+				//new_transaction_size += this_real_size;
+				new_transaction_weight += this_weight;
+
+				new_transaction_hashes.push_back(tx_hash);
+				_this = std::make_tuple(0, new_transaction_hashes.size() - 1);
+			}
+			transaction_hash_refs.push_back(_this);
+			other_transaction_hashes.push_back(tx_hash);
+		}
+
+		//t3
+
+		// Тут в питон-коде проводятся махинации с упаковкой в типы C, для оптимизации памяти. Нам, по идее, это не нужно.
+		// if transaction_hash_refs and max(transaction_hash_refs) < 2**16:
+		//     transaction_hash_refs = array.array('H', transaction_hash_refs)
+		// elif transaction_hash_refs and max(transaction_hash_refs) < 2**32: # in case we see blocks with more than 65536 tx
+		//     transaction_hash_refs = array.array('L', transaction_hash_refs)
+
+		//t4
+
+		// if all_transaction_stripped_size:
+		//     print "Generating a share with %i bytes, %i WU (new: %i B, %i WU) in %i tx (%i new), plus est gentx of %i bytes/%i WU" % (
+		//         all_transaction_real_size,
+		//         all_transaction_weight,
+		//         new_transaction_size,
+		//         new_transaction_weight,
+		//         len(other_transaction_hashes),
+		//         len(new_transaction_hashes),
+		//         cls.gentx_size,
+		//         cls.gentx_weight)
+		//     print "Total block stripped size=%i B, full size=%i B,  weight: %i WU" % (
+		//         80+all_transaction_stripped_size+cls.gentx_size,
+		//         80+all_transaction_real_size+cls.gentx_size,
+		//         3*80+all_transaction_weight+cls.gentx_weight)
+
+		set<uint256> included_transactions = set<uint256>(other_transaction_hashes.begin(),
+														  other_transaction_hashes.end());
+
+		vector<boost::optional<int32_t>> removed_fee;
+		int32_t removed_fee_sum;
+		int32_t definite_fees;
+		bool fees_none_contains = false;
+		for (auto item: _desired_other_transaction_hashes_and_fees)
+		{
+			auto tx_hash = std::get<0>(item);
+			auto fee = std::get<1>(item);
+			if (!fee.has_value())
+				fees_none_contains = true;
+
+			if (included_transactions.find(tx_hash) == included_transactions.end())
+			{
+				removed_fee.push_back(fee);
+				if (fee.has_value())
+					removed_fee_sum += fee.get();
+			} else
+			{
+				if (fee.has_value())
+					definite_fees += fee.get();
+				else
+					definite_fees += 0;
+			}
+		}
+
+		if (!fees_none_contains)
+		{
+			_share_data.subsidy += removed_fee_sum;
+		} else
+		{
+			_share_data.subsidy = _base_subsidy + definite_fees;
+		}
+
 //		/*TODO:
 //		weights, total_weight, donation_weight = tracker.get_cumulative_weights(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
 //		max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),

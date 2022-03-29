@@ -68,14 +68,14 @@ namespace c2pool::shares
             return res;
         }
 
-        element_type operator+=(const element_type &element)
+        element_type &operator+=(const element_type &element)
         {
             this->work += element.work;
             this->height += element.height;
             return *this;
         }
 
-        element_type operator-=(const element_type &element)
+        element_type &operator-=(const element_type &element)
         {
             this->work -= element.work;
             this->height -= element.height;
