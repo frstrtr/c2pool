@@ -18,6 +18,7 @@ using namespace std;
 #include <libcoind/transaction.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
+#include <libdevcore/events.h>
 #include <networks/network.h>
 using namespace c2pool::shares;
 
@@ -39,6 +40,7 @@ class ShareTracker : public PrefsumShare, public enable_shared_from_this<ShareTr
 {
 public:
 	PrefsumVerifiedShare verified;
+    Event<ShareType> removed;
 public:
 	shared_ptr<c2pool::Network> net;
 	shared_ptr<coind::ParentNetwork> parent_net;
@@ -48,6 +50,7 @@ public:
 	ShareType get(uint256 hash);
 
 	void add(ShareType share);
+    void remove(uint256 hash);
 
 	bool attempt_verify(ShareType share);
 
