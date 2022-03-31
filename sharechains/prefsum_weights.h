@@ -13,6 +13,37 @@ class ShareTracker;
 
 namespace shares::weight
 {
+	class weight_element;
+
+	class weight_element_ptr
+	{
+		std::shared_ptr<weight_element> value;
+	public:
+		weight_element_ptr() = default;
+		weight_element_ptr(std::vector<unsigned char> _key, arith_uint256 _value);
+
+		std::shared_ptr<weight_element> operator->();
+		bool is_null() const;
+
+		weight_element_ptr operator+(weight_element_ptr element);
+
+		weight_element_ptr operator+=(const& weight_element_ptr element);
+	};
+
+	class weight_element : public enable_shared_from_this<weight_element>
+	{
+	public:
+		weight_element_ptr prev;
+		std::pair<std::vector<unsigned char>, arith_uint256> weights;
+
+		weight_element(std::pair<std::vector<unsigned char>, arith_uint256> _weights) : weights(_weights) {}
+
+		weight_element_ptr operator+(weight_element_ptr element);
+
+		weight_element_ptr operator+=(const weight_element_ptr &element);
+
+	};
+
 	class element_type
 	{
 	public:
@@ -21,7 +52,7 @@ namespace shares::weight
 		ShareType element;
 
 		int32_t share_count;
-		std::map<std::vector<unsigned char>, arith_uint256> weights;
+		std::shared_ptr<weight_element> weights;
 		arith_uint256 total_weight;
 		arith_uint256 total_donation_weight;
 
@@ -34,7 +65,7 @@ namespace shares::weight
 			auto att = UintToArith256(coind::data::target_to_average_attempts(element->target));
 
 			share_count = 1;
-			weights[element->new_script.data] = att * (65535 - *element->donation);
+			weights = std::make_ weights[element->new_script.data] = att * (65535 - *element->donation);
 			total_weight = att * 65535;
 			total_donation_weight = att * (*element->donation);
 		}
