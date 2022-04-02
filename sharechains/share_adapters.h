@@ -9,7 +9,7 @@
 #include "share_streams.h"
 
 struct SmallBlockHeaderType :
-        StreamTypeAdapter<shares::SmallBlockHeaderType, shares::stream::SmallBlockHeaderType_stream>
+        StreamTypeAdapter<shares::types::SmallBlockHeaderType, shares::stream::SmallBlockHeaderType_stream>
 {
     void _to_stream() override
     {
@@ -23,7 +23,7 @@ struct SmallBlockHeaderType :
 };
 
 struct MerkleLink :
-        StreamTypeAdapter<shares::MerkleLink, shares::stream::MerkleLink_stream>
+        StreamTypeAdapter<shares::types::MerkleLink, shares::stream::MerkleLink_stream>
 {
     void _to_stream() override
     {
@@ -38,7 +38,7 @@ struct MerkleLink :
 };
 
 struct BlockHeaderType :
-        StreamTypeAdapter<shares::BlockHeaderType, shares::stream::BlockHeaderType_stream>
+        StreamTypeAdapter<shares::types::BlockHeaderType, shares::stream::BlockHeaderType_stream>
 {
     void _to_stream() override
     {
@@ -52,7 +52,7 @@ struct BlockHeaderType :
 };
 
 struct HashLinkType :
-        StreamTypeAdapter<shares::HashLinkType, shares::stream::HashLinkType_stream>
+        StreamTypeAdapter<shares::types::HashLinkType, shares::stream::HashLinkType_stream>
 {
     void _to_stream() override
     {
@@ -66,7 +66,7 @@ struct HashLinkType :
 };
 
 struct SegwitData :
-        StreamTypeAdapter<shares::SegwitData, shares::stream::SegwitData_stream>
+        StreamTypeAdapter<shares::types::SegwitData, shares::stream::SegwitData_stream>
 {
     void _to_stream() override
     {
@@ -82,7 +82,7 @@ struct SegwitData :
 };
 
 struct ShareData :
-        StreamTypeAdapter<shares::ShareData, shares::stream::ShareData_stream>
+        StreamTypeAdapter<shares::types::ShareData, shares::stream::ShareData_stream>
 {
     void _to_stream() override
     {
@@ -98,7 +98,7 @@ struct ShareData :
 };
 
 struct ShareInfo :
-        StreamTypeAdapter<shares::ShareInfo, shares::stream::ShareInfo_stream>
+        StreamTypeAdapter<shares::types::ShareInfo, shares::stream::ShareInfo_stream>
 {
     void _to_stream() override
     {

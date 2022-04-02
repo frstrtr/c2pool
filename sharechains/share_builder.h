@@ -98,7 +98,7 @@ class ShareObjectBuilder : public BaseShareBuilder, enable_shared_from_this<Shar
 public:
 	ShareObjectBuilder(std::shared_ptr<c2pool::Network> _net) : BaseShareBuilder(_net) { }
 public:
-    auto min_header(const shares::SmallBlockHeaderType &data)
+    auto min_header(const shares::types::SmallBlockHeaderType &data)
     {
         auto value = std::make_shared<SmallBlockHeaderType>();
         value->set_value(data);
@@ -106,21 +106,21 @@ public:
         return shared_from_this();
     }
 
-    auto share_data(const shares::ShareData &data){
+    auto share_data(const shares::types::ShareData &data){
         auto value = std::make_shared<ShareData>();
         value->set_value(data);
         _share_data(value);
         return shared_from_this();
     }
 
-    auto segwit_data(const shares::SegwitData &data){
+    auto segwit_data(const shares::types::SegwitData &data){
         auto value = std::make_shared<SegwitData>();
         value->set_value(data);
         _segwit_data(value);
         return shared_from_this();
     }
 
-    auto share_info(const shares::ShareInfo &data)
+    auto share_info(const shares::types::ShareInfo &data)
     {
         auto value = std::make_shared<ShareInfo>();
         value->set_value(data);
@@ -128,7 +128,7 @@ public:
         return shared_from_this();
     }
 
-    auto ref_merkle_link(const shares::MerkleLink &data)
+    auto ref_merkle_link(const shares::types::MerkleLink &data)
     {
         auto value = std::make_shared<MerkleLink>();
         value->set_value(data);
@@ -142,7 +142,7 @@ public:
         return shared_from_this();
     }
 
-    auto hash_link(const shares::HashLinkType &data)
+    auto hash_link(const shares::types::HashLinkType &data)
     {
         auto value = std::make_shared<HashLinkType>();
         value->set_value(data);
@@ -150,7 +150,7 @@ public:
         return shared_from_this();
     }
 
-    auto merkle_link(const shares::MerkleLink &data)
+    auto merkle_link(const shares::types::MerkleLink &data)
     {
         auto value = std::make_shared<MerkleLink>();
         value->set_value(data);

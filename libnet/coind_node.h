@@ -19,7 +19,7 @@
 
 
 using namespace coind::jsonrpc;
-using namespace c2pool::shares;
+using namespace shares;
 using namespace coind;
 
 using std::make_shared;
@@ -62,10 +62,10 @@ namespace c2pool::libnet
 
         Event<uint256> new_block;                           //block_hash
         Event<coind::data::tx_type> new_tx;                 //bitcoin_data.tx_type
-        Event<::shares::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<::shares::types::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
         Variable<coind::getwork_result> coind_work;
-        Variable<std::optional<::shares::BlockHeaderType>> best_block_header;
+        Variable<std::optional<::shares::types::BlockHeaderType>> best_block_header;
         HeightTracker get_height_rel_highest;
 
     private:
@@ -73,7 +73,7 @@ namespace c2pool::libnet
         void work_poller();
         void poll_header();
     public:
-        void handle_header(const ::shares::BlockHeaderType &new_header);
+        void handle_header(const ::shares::types::BlockHeaderType &new_header);
     private:
         shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<coind::p2p::CoindProtocol> protocol;

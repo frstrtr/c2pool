@@ -17,6 +17,7 @@
 #include <libcoind/transaction.h>
 
 using namespace c2pool::messages;
+using namespace c2pool::messages::stream;
 
 namespace c2pool::libnet::p2p
 {
@@ -176,8 +177,8 @@ namespace c2pool::libnet::messages
     public:
         IntType(32) version;
         IntType(64) services;
-        stream::address_type_stream addr_to;
-        stream::address_type_stream addr_from;
+        c2pool::messages::stream::address_type_stream addr_to;
+        c2pool::messages::stream::address_type_stream addr_from;
         IntType(64) nonce;
         StrType sub_version;
         IntType(32) mode; //# always 1 for legacy compatibility
@@ -292,7 +293,7 @@ namespace c2pool::libnet::messages
 
         message_addrs(std::vector<c2pool::messages::addr> _addrs) : message_addrs()
         {
-            addrs = stream::addr_stream::make_list_type(_addrs); //TODO: test
+            addrs = c2pool::messages::stream::addr_stream::make_list_type(_addrs); //TODO: test
         }
 
         message_addrs(std::vector<c2pool::messages::stream::addr_stream> _addrs) : message_addrs()
@@ -388,7 +389,7 @@ namespace c2pool::libnet::messages
     public:
         IntType(256) id;
         EnumType<ShareReplyResult, VarIntType> result;
-        ListType<stream::share_type_stream> shares; //type + contents data
+        ListType<c2pool::messages::stream::share_type_stream> shares; //type + contents data
 
     public:
         message_sharereply() : base_message("sharereply") {}
@@ -421,7 +422,7 @@ namespace c2pool::libnet::messages
     public:
         message_bestblock() : base_message("bestblock") {}
 
-        message_bestblock(::shares::BlockHeaderType _header) : message_bestblock()
+        message_bestblock(::shares::types::BlockHeaderType _header) : message_bestblock()
         {
             header = _header;
         }

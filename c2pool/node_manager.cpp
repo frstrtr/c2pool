@@ -11,7 +11,7 @@
 #include <sharechains/share_store.h>
 
 using boost::asio::ip::tcp;
-using namespace c2pool::shares;
+using namespace shares::types;
 
 namespace c2pool::libnet
 {
