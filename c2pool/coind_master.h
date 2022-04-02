@@ -14,7 +14,7 @@ using namespace std;
 #include <boost/asio/post.hpp>
 using namespace c2pool::dev;
 using namespace c2pool::libnet;
-using namespace c2pool::shares;
+using namespace shares;
 
 #include "node_manager.h"
 

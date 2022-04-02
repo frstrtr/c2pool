@@ -15,7 +15,7 @@ namespace shares::stream
 
         MerkleLink_stream() = default;
 
-		MerkleLink_stream(const shares::MerkleLink &value)
+		MerkleLink_stream(const shares::types::MerkleLink &value)
 		{
 			branch = branch.make_type(value.branch);
 		}
@@ -45,7 +45,7 @@ namespace shares::stream
 		{
 		}
 
-		SmallBlockHeaderType_stream(const shares::SmallBlockHeaderType &val) : SmallBlockHeaderType_stream()
+		SmallBlockHeaderType_stream(const shares::types::SmallBlockHeaderType &val) : SmallBlockHeaderType_stream()
 		{
 			version = val.version;
 			previous_block = previous_block.make_type(val.previous_block);
@@ -80,7 +80,7 @@ namespace shares::stream
         {
         }
 
-		BlockHeaderType_stream(const BlockHeaderType &val) : BlockHeaderType_stream()
+		BlockHeaderType_stream(const types::BlockHeaderType &val) : BlockHeaderType_stream()
 		{
 			version = val.version;
 			previous_block = previous_block.make_type(val.previous_block);
@@ -133,7 +133,7 @@ namespace shares::stream
 
         HashLinkType_stream() = default;
 
-		HashLinkType_stream(const HashLinkType &val)
+		HashLinkType_stream(const types::HashLinkType &val)
 		{
 			state = val.state;
 			length = val.length;
@@ -159,7 +159,7 @@ namespace shares::stream
 
         SegwitData_stream() = default;
 
-		SegwitData_stream(const SegwitData &val)
+		SegwitData_stream(const types::SegwitData &val)
 		{
 			txid_merkle_link = MerkleLink_stream(val.txid_merkle_link);
 			wtxid_merkle_root = val.wtxid_merkle_root;
@@ -194,7 +194,7 @@ namespace shares::stream
 
         }
 
-		ShareData_stream(const ShareData &val) : ShareData_stream()
+		ShareData_stream(const types::ShareData &val) : ShareData_stream()
 		{
 			previous_share_hash = val.previous_share_hash;
 			coinbase = val.coinbase;
@@ -268,7 +268,7 @@ namespace shares::stream
 
         }
 
-        ShareInfo_stream(const ShareInfo &val) : ShareInfo_stream()
+        ShareInfo_stream(const types::ShareInfo &val) : ShareInfo_stream()
 		{
 			new_transaction_hashes = new_transaction_hashes.make_type(val.new_transaction_hashes);
 			for (auto tx_hash_ref : val.transaction_hash_refs)
@@ -306,7 +306,7 @@ namespace shares::stream
 
         ShareType_stream() = default;
 
-		ShareType_stream(const ShareTypeData &val)
+		ShareType_stream(const types::ShareTypeData &val)
 		{
 			min_header = val.min_header;
 			share_info = val.share_info;

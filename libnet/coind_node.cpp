@@ -143,7 +143,7 @@ namespace c2pool::libnet
     }
 
     //TODO:
-    void CoindNode::handle_header(const ::shares::BlockHeaderType &new_header)
+    void CoindNode::handle_header(const ::shares::types::BlockHeaderType &new_header)
     {
         //TODO: check this:
 //        PackStream packed_new_header;

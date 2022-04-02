@@ -35,7 +35,7 @@ struct PackedShareData
     }
 };
 
-namespace shares
+namespace shares::types
 {
     class SmallBlockHeaderType
     {
