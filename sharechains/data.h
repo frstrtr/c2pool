@@ -52,18 +52,18 @@ namespace shares
         GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker);
 
 	public:
-		SetProperty(ShareData, share_data);
+		SetProperty(types::ShareData, share_data);
 		SetProperty(uint256, block_target);
 		SetProperty(int32_t, desired_timestamp);
 		SetProperty(uint256, desired_target);
-		SetProperty(shares::MerkleLink, ref_merkle_link);
+		SetProperty(shares::types::MerkleLink, ref_merkle_link);
 		SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
 		SetProperty(type_known_txs, known_txs);
 		SetProperty(unsigned long long, last_txout_nonce);
 		SetProperty(long long, base_subsidy);
 
-        std::optional<shares::SegwitData> _segwit_data;
-        void set_segwit_data(const shares::SegwitData &_value){
+        std::optional<shares::types::SegwitData> _segwit_data;
+        void set_segwit_data(const shares::types::SegwitData &_value){
             _segwit_data = _value;
         }
 	public:
