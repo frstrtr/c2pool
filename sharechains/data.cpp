@@ -237,18 +237,29 @@ namespace shares
 			_share_data.subsidy = _base_subsidy + definite_fees;
 		}
 
-//		/*TODO:
-//		weights, total_weight, donation_weight = tracker.get_cumulative_weights(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
-//		max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
-//		65535*net.SPREAD*bitcoin_data.target_to_average_attempts(block_target),
-//	)
-//	*/
-//		//TODO: types
-//		tuple<int32_t, int32_t, int32_t> cumulative_weights; //TODO: Реализовать get_cumulative_weights
-//		int32_t weights = std::get<0>(cumulative_weights);
-//		int32_t total_weight = std::get<1>(cumulative_weights);
-//		int32_t donation_weight = std::get<2>(cumulative_weights);
-//		//TODO: [assert] assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
+
+		std::map<std::vector<unsigned char>, arith_uint256> weights;
+		arith_uint256 total_weight;
+		arith_uint256 donation_weight;
+		{
+			uint256 start_hash;
+			if (previous_share)
+				start_hash = *previous_share->previous_hash;
+			else
+				start_hash.SetNull();
+
+			int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
+
+			arith_uint256 desired_weight =
+					UintToArith256(coind::data::target_to_average_attempts(_block_target)) * 65535 * net->SPREAD;
+
+			auto weights_result = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
+			weights = std::get<0>(weights_result);
+			total_weight = std::get<1>(weights_result);
+			donation_weight = std::get<2>(weights_result);
+		}
+
+		//TODO: [assert] assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
 //
 //		/*TODO:
 //		amounts = dict((script, share_data['subsidy']*(199*weight)//(200*total_weight)) for script, weight in weights.iteritems()) # 99.5% goes according to weights prior to this share

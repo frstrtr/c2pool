@@ -20,7 +20,7 @@ using namespace std;
 #include <libdevcore/common.h>
 #include <libdevcore/events.h>
 #include <networks/network.h>
-using namespace c2pool::shares;
+using namespace shares;
 
 class Share;
 class GeneratedShare;
@@ -120,4 +120,10 @@ public:
         }
         return result;
     }
+
+	std::tuple<std::map<std::vector<unsigned char>, arith_uint256>, arith_uint256, arith_uint256>
+	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint256 desired_weight)
+	{
+
+	}
 };

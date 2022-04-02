@@ -1,7 +1,7 @@
 #include "tracker.h"
 #include "share.h"
 
-using namespace c2pool::shares;
+using namespace shares;
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
