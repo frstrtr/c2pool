@@ -9,11 +9,12 @@
 #include <tuple>
 
 #include "share.h"
+#include "prefsum_weights.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libcoind/data.h>
 
-namespace c2pool::shares
+namespace shares
 {
     class element_type
     {
@@ -25,15 +26,17 @@ namespace c2pool::shares
         int32_t height;
         arith_uint256 work;
         arith_uint256 min_work;
-
+		weight::weight_element_type weight;
     public:
         element_type() {}
         element_type(ShareType _share)
         {
             element = _share;
+
             work = coind::data::target_to_average_attempts(_share->target);
             min_work = coind::data::target_to_average_attempts(_share->max_target);
             height = 1;
+			weight = weight::weight_element_type(_share);
         }
 
         uint256 hash()
@@ -57,6 +60,7 @@ namespace c2pool::shares
             element_type res = *this;
             res.work += element.work;
             res.height += element.height;
+			res.weight += res.weight;
             return res;
         }
 
@@ -65,6 +69,7 @@ namespace c2pool::shares
             element_type res = *this;
             res.work -= element.work;
             res.height -= element.height;
+			res.weight -= element.weight;
             return res;
         }
 
@@ -72,6 +77,7 @@ namespace c2pool::shares
         {
             this->work += element.work;
             this->height += element.height;
+			this->weight += element.weight;
             return *this;
         }
 
@@ -79,10 +85,11 @@ namespace c2pool::shares
         {
             this->work -= element.work;
             this->height -= element.height;
+			this->weight += element.weight;
             return *this;
         }
 
-        // static element_type get_null(){}
+        // static weight_element_type get_null(){}
     };
 
     class element_delta_type
@@ -93,9 +100,11 @@ namespace c2pool::shares
     public:
         uint256 head;
         uint256 tail;
+
         int32_t height;
         arith_uint256 work;
         arith_uint256 min_work;
+		weight::weight_element_type weight;
 
         element_delta_type(bool none = true)
         {
@@ -106,9 +115,11 @@ namespace c2pool::shares
         {
             head = el.hash();
             tail = el.prev_hash();
+
             height = el.height;
             work = el.work;
             min_work = el.min_work;
+			weight = el.weight;
         }
 
         element_delta_type operator-(const element_delta_type &el) const
@@ -118,6 +129,7 @@ namespace c2pool::shares
             res.height -= el.height;
             res.work -= el.work;
             res.min_work -= el.min_work;
+			res.weight -= el.weight;
             return res;
         }
 
@@ -127,6 +139,7 @@ namespace c2pool::shares
             height -= el.height;
             work -= el.work;
             min_work -= el.min_work;
+			weight -= el.weight;
         }
 
         bool is_none()
