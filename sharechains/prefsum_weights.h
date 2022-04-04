@@ -20,11 +20,32 @@ namespace shares::weight
 	{
 	public:
 		weight_element_ptr prev;
-		std::pair<std::vector<unsigned char>, arith_uint256> weights;
+		std::pair<std::vector<unsigned char>, arith_uint256> amount;
 
 		weight_element(std::vector<unsigned char> _key, arith_uint256 _value)
 		{
-			weights = std::make_pair(_key, _value);
+			amount = std::make_pair(_key, _value);
+		}
+
+		std::map<std::vector<unsigned char>, arith_uint256> get_map()
+		{
+			std::map<std::vector<unsigned char>, arith_uint256> result;
+			auto it = shared_from_this();
+
+			while (it)
+			{
+				if (result.find(it->amount.first) != result.end())
+				{
+					result[it->amount.first] += it->amount.second;
+				} else
+				{
+					result[it->amount.first] = it->amount.second;
+				}
+
+				it = it->prev;
+			}
+
+			return result;
 		}
 
 		//best+last
@@ -53,6 +74,13 @@ namespace shares::weight
 			weights = std::make_shared<weight_element>(share->new_script.data, att * (65535 - *share->donation));
 			total_weight = att * 65535;
 			total_donation_weight = att * (*share->donation);
+		}
+
+		weight_element_type(weight_element_ptr _weights, arith_uint256 _total_weight, arith_uint256 _total_donation_weight)
+		{
+			weights = _weights;
+			total_weight = _total_weight;
+			total_donation_weight = _total_donation_weight;
 		}
 
 		weight_element_type operator+(const weight_element_type &element)
