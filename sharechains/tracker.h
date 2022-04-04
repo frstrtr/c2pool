@@ -121,9 +121,72 @@ public:
         return result;
     }
 
+	//TODO: test!
 	std::tuple<std::map<std::vector<unsigned char>, arith_uint256>, arith_uint256, arith_uint256>
 	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint256 desired_weight)
 	{
+		// [last; best]
+		auto best = get_delta_to_last(start);
+		auto p = best.weight.total_weight - desired_weight;
 
+
+		auto it = sum.find(start);
+
+		while (it != sum.end())
+		{
+			if (it->second.weight.total_weight <= p)
+				break;
+
+			if ((best.height - it->second.height) == max_shares)
+				break;
+
+			it = it->second.prev;
+		}
+
+		element_delta_type i;
+		if (it != sum.end())
+		{
+			if (it->second.weight.total_weight < p)
+			{
+				element_delta_type x;
+				if (it->second.prev != sum.end())
+				{
+					x = get_delta(it->first, it->second.prev->first);
+				} else
+				{
+					x = get_delta_to_last(it->first);
+				}
+
+				auto cur = get_delta(start, it->first);
+				auto script = x.weight.weights->amount.first;
+				// - new_weights = {script: (desired_weight - total_weight1)//65535*weights2[script]//(total_weight2//65535)}
+				auto new_weight = (desired_weight - cur.weight.total_weight)/65535*x.weight.weights->amount.second/(cur.weight.weights->amount.second/65535);
+				auto _weights = std::make_shared<shares::weight::weight_element>(script, new_weight);
+
+				// - total_donation_weight1 + (desired_weight - total_weight1)//65535*total_donation_weight2//(total_weight2//65535)
+				auto total_donation = cur.weight.total_donation_weight + (desired_weight - cur.weight.total_weight)/65535*x.weight.total_donation_weight/(x.weight.total_weight/65535);
+				shares::weight::weight_element_type new_weights(_weights, desired_weight, total_donation);
+
+				x.weight = new_weights;
+				i = x;
+			} else
+			{
+				// (it; best]
+				i = get_delta(best.head, it->first);
+			}
+		}
+		else
+		{
+			i = best;
+		}
+
+		assert((i.height <= max_shares) && (i.weight.total_weight <= desired_weight));
+		assert((i.height == max_shares) || (i.weight.total_weight == desired_weight));
+
+		auto weights = i.weight.weights->get_map();
+		auto total_weight = i.weight.total_weight;
+		auto donation_weight = i.weight.total_donation_weight;
+
+		return std::make_tuple(weights, total_weight, donation_weight);
 	}
 };

@@ -259,25 +259,62 @@ namespace shares
 			donation_weight = std::get<2>(weights_result);
 		}
 
-		//TODO: [assert] assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
-//
-//		/*TODO:
-//		amounts = dict((script, share_data['subsidy']*(199*weight)//(200*total_weight)) for script, weight in weights.iteritems()) # 99.5% goes according to weights prior to this share
-//		this_script = bitcoin_data.pubkey_hash_to_script2(share_data['pubkey_hash'])
-//		amounts[this_script] = amounts.get(this_script, 0) + share_data['subsidy']//200 # 0.5% goes to block finder
-//		amounts[DONATION_SCRIPT] = amounts.get(DONATION_SCRIPT, 0) + share_data['subsidy'] - sum(amounts.itervalues()) # all that's left over is the donation weight and some extra satoshis due to rounding
-//
+		//assert
+		{
+			arith_uint256 sum_weights;
+			sum_weights.SetHex("0");
+			for (auto v : weights)
+			{
+				sum_weights += v.second;
+			}
+
+			assert(total_weight == (sum_weights + donation_weight));
+		}
+
+		// 99.5% goes according to weights prior to this share
+		std::map<std::vector<unsigned char>, arith_uint256> amounts;
+		for (auto v : weights)
+		{
+			amounts[v.first] = v.second*199*_share_data.subsidy/(200*total_weight);
+		}
+
+		//this script reward; 0.5% goes to block finder
+		{
+			std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash).data;
+			auto _this_amount = amounts.find(this_script);
+			if (_this_amount == amounts.end())
+				amounts[this_script] = 0;
+			amounts[this_script] += _share_data.subsidy/200;
+		}
+
+		//all that's left over is the donation weight and some extra satoshis due to rounding
+		{
+			std::vector<unsigned char> DONATION_SCRIPT; //TODO:
+			auto _donation_amount = amounts.find(DONATION_SCRIPT);
+			if (_donation_amount == amounts.end())
+				amounts[DONATION_SCRIPT] = 0;
+
+			arith_uint256 sum_amounts;
+			sum_amounts.SetHex("0");
+			for (auto v: amounts)
+			{
+				sum_amounts += v.second;
+			}
+
+			amounts[DONATION_SCRIPT] += _share_data.subsidy - sum_amounts;
+		}
+		//TODO:
 //		if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
 //			raise ValueError()
 //
 //		dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
-//	*/
-//
-//		bool segwit_activated = is_segwit_activated(version, net);
-//        if (!_segwit_data.has_value() && _known_txs.empty())
-//        {
-//            segwit_activated = false;
-//        }
+
+
+	bool segwit_activated = is_segwit_activated(version, net);
+    if (!_segwit_data.has_value() && _known_txs.empty())
+	{
+		segwit_activated = false;
+	}
 //
 //		bool segwit_tx = false;
 //		for (auto _tx_hash: other_transaction_hashes)
