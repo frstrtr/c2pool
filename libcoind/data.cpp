@@ -8,7 +8,7 @@
 
 namespace coind::data
 {
-    bool is_segwit_tx(UniValue tx)
+    [[maybe_unused]]bool is_segwit_tx(UniValue tx)
     {
         if (tx.exists("marker") && tx.exists("flag"))
         {
@@ -47,6 +47,42 @@ namespace coind::data
     {
         //TODO: return coind::data::python::PyBitcoindData::difficulty_to_target(difficulty);
     }
+
+	uint256 get_txid(shared_ptr<coind::data::TransactionType> tx)
+	{
+		coind::data::stream::TxIDType_stream txid_stream(tx->version, tx->tx_ins, tx->tx_outs, tx->lock_time);
+		PackStream stream;
+		stream << txid_stream;
+		return hash256(stream);
+	}
+
+	uint256 get_wtxid(shared_ptr<coind::data::TransactionType> tx, uint256 txid, uint256 txhash)
+	{
+		bool has_witness = false;
+		if (is_segwit_tx(tx))
+		{
+			//TODO:
+//			tx->tx_ins.size() == tx->
+		}
+
+		PackStream packed_tx;
+		if (has_witness)
+		{
+			if (txhash.IsNull())
+				return txhash;
+
+			coind::data::stream::TransactionType_stream _tx(tx);
+			packed_tx << _tx;
+		} else
+		{
+			if (txid.IsNull())
+				return txid;
+
+			coind::data::stream::TxIDType_stream _tx(tx->version,tx->tx_ins, tx->tx_outs, tx->lock_time);
+			packed_tx << _tx;
+		}
+		return hash256(packed_tx);
+	}
 
     uint256 hash256(std::string data)
     {
@@ -154,4 +190,47 @@ namespace coind::data
 
         return result;
     }
+}
+
+//MerkleTree
+namespace coind::data
+{
+
+	merkle_link calculate_merkle_link(std::vector<uint256> hashes, int32_t index)
+	{
+		struct __data{
+			bool side;
+			uint256 hash;
+
+			__data() = default;
+			__data(bool _side, uint256 _hash)
+			{
+				hash = _hash;
+			}
+		};
+
+		struct __hash_list_data{
+			uint256 value;
+			bool f;
+			std::vector<__data> l;
+
+			__hash_list_data() = default;
+			__hash_list_data(uint256 _value, bool _f, std::vector<__data> _l) {
+				value = _value;
+				f = _f;
+				l = _l;
+			}
+		};
+
+		std::vector<__hash_list_data> hash_list;
+		for (int i = 0; i < hashes.size(); i++)
+		{
+			hash_list.emplace_back(hashes[i], i == index, std::vector<__data>{});
+		}
+
+		while (hash_list.size() > 1)
+		{
+
+		}
+	}
 }

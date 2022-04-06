@@ -1,5 +1,7 @@
 #include "data.h"
 
+#include <algorithm>
+
 #include "tracker.h"
 #include "share_adapters.h"
 #include <networks/network.h>
@@ -287,9 +289,9 @@ namespace shares
 			amounts[this_script] += _share_data.subsidy/200;
 		}
 
+		std::vector<unsigned char> DONATION_SCRIPT; //TODO:
 		//all that's left over is the donation weight and some extra satoshis due to rounding
 		{
-			std::vector<unsigned char> DONATION_SCRIPT; //TODO:
 			auto _donation_amount = amounts.find(DONATION_SCRIPT);
 			if (_donation_amount == amounts.end())
 				amounts[DONATION_SCRIPT] = 0;
@@ -303,29 +305,63 @@ namespace shares
 
 			amounts[DONATION_SCRIPT] += _share_data.subsidy - sum_amounts;
 		}
-		//TODO:
+//TODO: check
 //		if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
 //			raise ValueError()
-//
+
 //		dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
+		std::vector<std::pair<std::vector<unsigned char>, arith_uint256>> dests(amounts.begin(),amounts.end());
+		std::sort(dests.begin(), dests.end(), [&](std::pair<std::vector<unsigned char>, arith_uint256> a, std::pair<std::vector<unsigned char>, arith_uint256> b){
+			if (a.first == DONATION_SCRIPT)
+				return false;
 
+			return a.second != b.second ? a.second < b.second : a.first < b.first;
+		});
 
-	bool segwit_activated = is_segwit_activated(version, net);
-    if (!_segwit_data.has_value() && _known_txs.empty())
-	{
-		segwit_activated = false;
-	}
-//
-//		bool segwit_tx = false;
-//		for (auto _tx_hash: other_transaction_hashes)
-//		{
-//			if (coind::data::is_segwit_tx(_known_txs[_tx_hash]))
-//				segwit_tx = true;
-//		}
-//		if (!(segwit_activated || _known_txs.empty()) && segwit_tx)
-//		{
-//			throw "segwit transaction included before activation";
-//		}
+		bool segwit_activated = is_segwit_activated(version, net);
+    	if (!_segwit_data.has_value() && _known_txs.empty())
+		{
+			segwit_activated = false;
+		}
+
+		bool segwit_tx = false;
+		for (auto _tx_hash: other_transaction_hashes)
+		{
+			if (coind::data::is_segwit_tx(_known_txs[_tx_hash]))
+				segwit_tx = true;
+		}
+		if (!(segwit_activated || _known_txs.empty()) && segwit_tx)
+		{
+			throw "segwit transaction included before activation";
+		}
+
+		//	share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
+		//  segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
+		if (segwit_activated && !_known_txs.empty())
+		{
+			struct __share_tx{
+				std::shared_ptr<coind::data::TransactionType> tx;
+				uint256 txid;
+				uint256 h; //hash
+
+				__share_tx() = default;
+				__share_tx(std::shared_ptr<coind::data::TransactionType> _tx, uint256 _txid, uint256 _h)
+				{
+					tx = _tx;
+					txid = _txid;
+					h = _h;
+				}
+			};
+			std::vector<__share_tx> share_txs;
+			std::vector<uint256> txids;
+			for (auto h : other_transaction_hashes)
+			{
+				auto txid = coind::data::get_txid(_known_txs[h]);
+				share_txs.emplace_back(_known_txs[h], txid, h);
+				txids.push_back(txid);
+			}
+		}
+
 //		/*TODO:
 //		if segwit_activated and known_txs is not None:
 //			share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
