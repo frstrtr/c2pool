@@ -24,7 +24,11 @@ namespace shares
 	bool is_segwit_activated(int version, shared_ptr<c2pool::Network> net);
 
 	uint256 check_hash_link(shared_ptr<HashLinkType> hash_link, PackStream &data, string const_ending = "");
+}
 
+//GenerateShareTransaction
+namespace shares
+{
 	struct GeneratedShare
 	{
 		ShareInfo share_info;
@@ -45,11 +49,11 @@ namespace shares
 
 	class GenerateShareTransaction
 	{
-    public:
-        std::shared_ptr<ShareTracker> tracker;
-        std::shared_ptr<c2pool::Network> net;
+	public:
+		std::shared_ptr<ShareTracker> tracker;
+		std::shared_ptr<c2pool::Network> net;
 
-        GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker);
+		GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker);
 
 	public:
 		SetProperty(types::ShareData, share_data);
@@ -62,10 +66,13 @@ namespace shares
 		SetProperty(unsigned long long, last_txout_nonce);
 		SetProperty(long long, base_subsidy);
 
-        std::optional<shares::types::SegwitData> _segwit_data;
-        void set_segwit_data(const shares::types::SegwitData &_value){
-            _segwit_data = _value;
-        }
+		std::optional<shares::types::SegwitData> _segwit_data;
+
+		void set_segwit_data(const shares::types::SegwitData &_value)
+		{
+			_segwit_data = _value;
+		}
+
 	public:
 		GeneratedShare operator()(uint64_t version);
 	};

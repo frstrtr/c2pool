@@ -40,7 +40,21 @@ namespace coind::data
 
     uint256 difficulty_to_target(uint256 difficulty);
 
+	uint256 get_txid(shared_ptr<coind::data::TransactionType> tx);
+
+	uint256 get_wtxid(shared_ptr<coind::data::TransactionType> tx, uint256 txid = uint256(), uint256 txhash = uint256());
+
 } // namespace coind::data
+
+// MerkleTree
+namespace coind::data{
+	struct merkle_link{
+		vector<uint256> branch;
+		int32_t index;
+	};
+
+	merkle_link calculate_merkle_link(std::vector<uint256> hashes, int32_t index);
+};
 
 namespace coind::data
 {
