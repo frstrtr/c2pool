@@ -93,50 +93,50 @@ namespace coind::data
         TxIDType(stream::TxIDType_stream obj);
     };
 
+    struct WitnessTransactionData
+    {
+        uint64_t marker;
+        uint8_t flag;
+        vector<vector<string>> witness;
+
+        WitnessTransactionData() {}
+
+        WitnessTransactionData(uint64_t _marker, uint8_t _flag, vector<ListType<StrType>> _witness)
+        {
+            marker = _marker;
+            flag = _flag;
+
+            for (auto v_list : _witness)
+            {
+                vector<string> _wit_tx;
+                for (auto _v : v_list.value)
+                {
+                    _wit_tx.push_back(_v.get());
+                }
+                witness.push_back(_wit_tx);
+            }
+        }
+    };
+
     struct TransactionType
     {
         uint32_t version;
         vector<TxInType> tx_ins;
         vector<TxOutType> tx_outs;
         uint32_t lock_time;
+        std::optional<WitnessTransactionData> wdata;
 
         TransactionType() = default;
 
         virtual ~TransactionType() {}
 
-        TransactionType(uint32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, uint32_t _locktime)
+        TransactionType(uint32_t _version, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, uint32_t _locktime, std::optional<WitnessTransactionData> _wdata = std::nullopt)
         {
             version = _version;
-
             tx_ins = _tx_ins;
             tx_outs = _tx_outs;
-
             lock_time = _locktime;
-        }
-    };
-
-    struct WitnessTransactionType : TransactionType
-    {
-        uint64_t marker;
-        uint8_t flag;
-        vector<vector<string>> witness;
-
-        WitnessTransactionType() : TransactionType() {}
-
-        WitnessTransactionType(uint32_t _version, uint64_t _marker, uint8_t _flag, vector<TxInType> _tx_ins, vector<TxOutType> _tx_outs, vector<ListType<StrType>> _witness, uint32_t _locktime) : TransactionType(_version, _tx_ins, _tx_outs, _locktime)
-        {
-            marker = _marker;
-            flag = _flag;
-
-			for (auto v_list : _witness)
-			{
-				vector<string> _wit_tx;
-				for (auto _v : v_list.value)
-				{
-					_wit_tx.push_back(_v.get());
-				}
-				witness.push_back(_wit_tx);
-			}
+            wdata = _wdata;
         }
     };
 
@@ -298,7 +298,7 @@ namespace coind::data::stream
         ListType<TxOutType_stream> tx_outs;
 
         TxWriteType() {}
-        TxWriteType(shared_ptr<WitnessTransactionType> tx);
+        TxWriteType(shared_ptr<TransactionType> tx);
 
         PackStream &write(PackStream &stream);
 
@@ -359,7 +359,7 @@ namespace coind::data::stream
                     tx_outs.push_back(tx_out);
                 }
 
-                tx = std::make_shared<coind::data::WitnessTransactionType>(version.get(), marker.value, next.flag.value, tx_ins, tx_outs, _witness, locktime.value);
+                tx = std::make_shared<coind::data::TransactionType>(version.get(), tx_ins, tx_outs, locktime.value, std::make_optional<WitnessTransactionData>(marker.value, next.flag.value, _witness));
             }
             else
             {
