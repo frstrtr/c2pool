@@ -1,6 +1,6 @@
 from functools import reduce
 
-hashes = [None] + [i for i in range(1, 5)]
+hashes = [None] + [i for i in range(1, 11)]
 index = 0
 
 hash_list = [(lambda _h=h: _h, i == index, []) for i, h in enumerate(hashes)]
@@ -35,5 +35,5 @@ print(hash_list)
 res = [x['hash']() for x in hash_list[0][2]]
 print(res)
 
-check = check_merkle_link(2,dict(branch=res, index=index))
+check = check_merkle_link(0,dict(branch=res, index=index))
 print(check)
