@@ -95,4 +95,14 @@ namespace c2pool::math
         return result;
     }
 
+    template <typename IteratorValue>
+    std::vector<typename IteratorValue::value_type> every_nth_element(IteratorValue begin, IteratorValue end, int32_t n)
+    {
+        std::vector<typename IteratorValue::value_type> result;
+        for (auto it = begin; it < end; it+=n)
+        {
+            result.push_back(*it);
+        }
+        return result;
+    }
 }
