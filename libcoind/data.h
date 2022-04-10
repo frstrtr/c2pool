@@ -48,12 +48,55 @@ namespace coind::data
 
 // MerkleTree
 namespace coind::data{
-	struct merkle_link{
-		vector<uint256> branch;
-		int32_t index;
-	};
+	struct merkle_link
+    {
+        vector<uint256> branch;
+        int32_t index;
+
+        merkle_link() = default;
+
+        merkle_link(vector<uint256> _branch, int32_t _index)
+        {
+            branch = _branch;
+            index = _index;
+        }
+    };
+
+    struct merkle_record_type
+    {
+        IntType(256) left;
+        IntType(256) right;
+
+        merkle_record_type() = default;
+
+        merkle_record_type(uint256 _left, uint256 _right)
+        {
+            left = _left;
+            right = _right;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << left << right;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> left >> right;
+            return stream;
+        }
+    };
 
 	merkle_link calculate_merkle_link(std::vector<uint256> hashes, int32_t index);
+
+    //link = MerkleLink from shareTypes.h
+    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link);
+
+    uint256 merkle_hash(std::vector<uint256> hashes);
+
+    // Для этого действия -- не нужна отдельная функция.
+    uint256 get_witness_commitment_hash(uint256 witness_root_hash, uint256 witness_reserved_value);
 };
 
 namespace coind::data
@@ -70,27 +113,6 @@ namespace coind::data
     uint160 hash160(PackStream stream);
 
     uint160 hash160(uint160 data);
-
-    struct MerkleRecordType
-    {
-        uint256 left;
-        uint256 right;
-
-        PackStream &write(PackStream &stream)
-        {
-            stream << left << right;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream)
-        {
-            stream >> left >> right;
-            return stream;
-        }
-    };
-
-    //link = MerkleLink from shareTypes.h
-    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link);
 
     struct HumanAddressType
     {

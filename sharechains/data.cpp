@@ -360,17 +360,27 @@ namespace shares
 				share_txs.emplace_back(_known_txs[h], txid, h);
 				txids.push_back(txid);
 			}
+            //TODO: segwit_data upd
 		}
 
-//		/*TODO:
-//		if segwit_activated and known_txs is not None:
-//			share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
-//			segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
-//		if segwit_activated and segwit_data is not None:
-//			witness_reserved_value_str = '[P2Pool]'*4
-//			witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
-//			witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
-//	*/
+//      witness_reserved_value_str = '[P2Pool]'*4
+//		witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
+//		witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
+
+        char* witness_reserved_value_str = "[C2Pool][CPool][C2Pool][C2Pool]";
+        uint256 witness_commitment_hash;
+        if (segwit_activated && _segwit_data.has_value())
+        {
+            //TODO: TEST
+            PackStream stream(witness_reserved_value_str, strlen(witness_reserved_value_str));
+            IntType(256) witness_reserved_stream;
+            stream >> witness_reserved_stream;
+
+            uint256 witness_reserved_value = witness_reserved_stream.get();
+
+            witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
+        }
+
 //
 //        unique_ptr<ShareInfo> share_info;
 //        {
@@ -420,26 +430,29 @@ namespace shares
 //                    );
 //        }
 //
-//		if (previous_share)
-//		{
-//			if (_desired_timestamp > (*previous_share->timestamp + 180))
-//			{
-//				LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n \
-//                            Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n \
-//                            If your clock is more than 300 seconds behind, it can result in orphaned shares.\n \
-//                            (It's also possible that this share is just taking a long time to mine.)") %
-//								(_desired_timestamp - *previous_share->timestamp))
-//							.str();
-//			}
-//
-//			if (*previous_share->timestamp > (c2pool::dev::timestamp() + 3))
-//			{
-//				LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n"
-//                                              "Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
-//								(*previous_share->timestamp - c2pool::dev::timestamp()))
-//							.str();
-//			}
-//		}
+		if (previous_share)
+		{
+			if (_desired_timestamp > (*previous_share->timestamp + 180))
+			{
+				LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n" \
+                            "Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n" \
+                            "If your clock is more than 300 seconds behind, it can result in orphaned shares.\n" \
+                            "(It's also possible that this share is just taking a long time to mine.)") %
+								(_desired_timestamp - *previous_share->timestamp))
+							.str();
+			}
+
+			if (*previous_share->timestamp > (c2pool::dev::timestamp() + 3))
+			{
+				LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n" \
+                                              "Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
+								(*previous_share->timestamp - c2pool::dev::timestamp()))
+							.str();
+			}
+		}
+//        //TODO:
+//        //if segwit_activated:
+//        //            share_info['segwit_data'] = segwit_data
 //
 //        // gentx
 //		coind::data::tx_type gentx;
@@ -475,10 +488,7 @@ namespace shares
 //			(t5-t4)*1000.)
 //	    */
 //
-//        //TODO:
-//        //if segwit_activated:
-//        //            share_info['segwit_data'] = segwit_data
-//
+
 //		return {share_info, gentx, other_transaction_hashes, get_share};
     }
 }
