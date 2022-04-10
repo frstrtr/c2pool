@@ -117,10 +117,7 @@ namespace coind::data
 
     struct WitnessTransactionType : TransactionType
     {
-
         uint64_t marker;
-        //TODO:?
-        // int8_t marker{};
         uint8_t flag;
         vector<vector<string>> witness;
 

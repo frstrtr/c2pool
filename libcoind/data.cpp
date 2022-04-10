@@ -1,10 +1,14 @@
 #include "data.h"
 
+#include <btclibs/uint256.h>
+#include <univalue.h>
+#include <boost/range/combine.hpp>
+#include <boost/foreach.hpp>
+
 #include <sstream>
 
 #include "transaction.h"
-#include <btclibs/uint256.h>
-#include <univalue.h>
+
 
 namespace coind::data
 {
@@ -147,40 +151,6 @@ namespace coind::data
         return hash160(in);
     }
 
-    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link)
-    {
-        auto branch = std::get<0>(link);
-        auto index = std::get<1>(link);
-
-        if (index >= pow(2, branch.size()))
-        {
-            throw std::invalid_argument("index too large");
-        }
-
-        auto cur = tip_hash;
-
-        int i = 0;
-        for (auto h : branch)
-        {
-            if ((index >> i) & 1)
-            {
-                auto merkle_rec = MerkleRecordType{h, cur};
-                PackStream ps;
-                ps << merkle_rec;
-                cur = hash256(ps);
-            }
-            else
-            {
-                auto merkle_rec = MerkleRecordType{cur, h};
-                PackStream ps;
-                ps << merkle_rec;
-                cur = hash256(ps);
-            }
-        }
-
-        return cur;
-    }
-
     PackStream pubkey_hash_to_script2(uint160 pubkey_hash)
     {
         auto packed_pubkey_hash = IntType(160)(pubkey_hash);
@@ -198,39 +168,137 @@ namespace coind::data
 
 	merkle_link calculate_merkle_link(std::vector<uint256> hashes, int32_t index)
 	{
-		struct __data{
+		struct _side_data{
 			bool side;
 			uint256 hash;
 
-			__data() = default;
-			__data(bool _side, uint256 _hash)
+			_side_data() = default;
+			_side_data(bool _side, uint256 _hash)
 			{
 				hash = _hash;
 			}
 		};
 
-		struct __hash_list_data{
+		struct _hash_list_data{
 			uint256 value;
 			bool f;
-			std::vector<__data> l;
+			std::vector<_side_data> l;
 
-			__hash_list_data() = default;
-			__hash_list_data(uint256 _value, bool _f, std::vector<__data> _l) {
+			_hash_list_data() = default;
+			_hash_list_data(uint256 _value, bool _f, std::vector<_side_data> _l) {
 				value = _value;
 				f = _f;
 				l = _l;
 			}
 		};
 
-		std::vector<__hash_list_data> hash_list;
+		std::vector<_hash_list_data> hash_list;
 		for (int i = 0; i < hashes.size(); i++)
 		{
-			hash_list.emplace_back(hashes[i], i == index, std::vector<__data>{});
+			hash_list.emplace_back(hashes[i], i == index, std::vector<_side_data>{});
 		}
 
 		while (hash_list.size() > 1)
 		{
+            //TODO: Optimize
+            std::vector<_hash_list_data> new_hash_list;
 
+            std::vector<_hash_list_data> evens = c2pool::math::every_nth_element(hash_list.begin(), hash_list.end(), 2);
+
+            std::vector<_hash_list_data> odds = c2pool::math::every_nth_element(hash_list.begin()+1, hash_list.end(), 2);
+            odds.push_back(evens.back());
+
+            _hash_list_data left, right;
+            BOOST_FOREACH(boost::tie(left, right), boost::combine(evens, odds))
+                        {
+                            merkle_record_type record(left.value, right.value);
+                            PackStream _stream;
+                            _stream << record;
+                            uint256 _hash = hash256(_stream);
+
+                            std::vector<_side_data> _l = left.f ? left.l : right.l;
+                            _l.push_back(left.f ? _side_data(1, right.value) : _side_data(0, left.value));
+
+                            new_hash_list.emplace_back(_hash, left.f || right.f, _l);
+                        }
+            hash_list = new_hash_list;
 		}
+
+        std::vector<uint256> res_branch;
+        for (auto v: hash_list[0].l){
+            res_branch.push_back(v.hash);
+        }
+
+        return merkle_link(res_branch, index);
 	}
+
+    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link)
+    {
+        auto branch = std::get<0>(link);
+        auto index = std::get<1>(link);
+
+        if (index >= pow(2, branch.size()))
+        {
+            throw std::invalid_argument("index too large");
+        }
+
+        auto cur = tip_hash;
+
+        int i = 0;
+        for (auto h : branch)
+        {
+            if ((index >> i) & 1)
+            {
+                auto merkle_rec = merkle_record_type{h, cur};
+                PackStream ps;
+                ps << merkle_rec;
+                cur = hash256(ps);
+            }
+            else
+            {
+                auto merkle_rec = merkle_record_type{cur, h};
+                PackStream ps;
+                ps << merkle_rec;
+                cur = hash256(ps);
+            }
+        }
+
+        return cur;
+    }
+
+    uint256 merkle_hash(std::vector<uint256> hashes)
+    {
+        if (hashes.empty())
+            return uint256();
+
+        while(hashes.size() > 1)
+        {
+            std::vector<uint256> new_hashes;
+
+            std::vector<uint256> evens = c2pool::math::every_nth_element(hashes.begin(), hashes.end(), 2);
+
+            std::vector<uint256> odds = c2pool::math::every_nth_element(hashes.begin() + 1, hashes.end(), 2);
+            odds.push_back(evens.back());
+
+            uint256 left, right;
+            BOOST_FOREACH(boost::tie(left, right), boost::combine(evens, odds))
+                        {
+                            merkle_record_type record(left, right);
+                            PackStream _stream;
+                            _stream << record;
+                            uint256 _hash = hash256(_stream);
+
+                            new_hashes.push_back(_hash);
+                        }
+        }
+        return hashes.front();
+    }
+
+    uint256 get_witness_commitment_hash(uint256 witness_root_hash, uint256 witness_reserved_value)
+    {
+        merkle_record_type record(witness_root_hash, witness_reserved_value);
+        PackStream _stream;
+        _stream << record;
+        return hash256(_stream);
+    }
 }
