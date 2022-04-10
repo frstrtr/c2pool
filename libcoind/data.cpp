@@ -23,11 +23,9 @@ namespace coind::data
 
     bool is_segwit_tx(std::shared_ptr<TransactionType> tx)
     {
-        std::shared_ptr<WitnessTransactionType> cast_tx = std::dynamic_pointer_cast<WitnessTransactionType>(tx);
-//        if (std::is_t)
-        if (cast_tx)
+        if (tx)
         {
-            return cast_tx->marker == 0 && cast_tx->flag >= 1;
+            return tx->wdata->marker == 0 && tx->wdata->flag >= 1;
         }
         return false;
     }
@@ -65,8 +63,15 @@ namespace coind::data
 		bool has_witness = false;
 		if (is_segwit_tx(tx))
 		{
-			//TODO:
-//			tx->tx_ins.size() == tx->
+            assert(tx->tx_ins.size() == tx->wdata->witness.size());
+            for (auto w : tx->wdata->witness)
+            {
+                if (w.size() > 0)
+                {
+                    has_witness = true;
+                    break;
+                }
+            }
 		}
 
 		PackStream packed_tx;

@@ -8,21 +8,18 @@ namespace coind::data::stream
     {
         if (is_segwit_tx(tx))
         {
-            std::cout << "Segwit tx" << std::endl;
-            auto _tx = std::static_pointer_cast<WitnessTransactionType>(tx);
-
-            assert(_tx->tx_ins.size() == _tx->witness.size());
-            TxWriteType write_tx(_tx);
+            assert(tx->tx_ins.size() == tx->wdata->witness.size());
+            TxWriteType write_tx(tx);
             stream << write_tx;
 
-            for (auto v : _tx->witness)
+            for (auto v : tx->wdata->witness)
             {
                 WitnessType _witness;
                 _witness = WitnessType::make_type(v);
                 stream << _witness;
             }
 
-            IntType(32) _locktime(_tx->lock_time);
+            IntType(32) _locktime(tx->lock_time);
             stream << _locktime;
             return stream;
         }
@@ -99,11 +96,11 @@ namespace coind::data::stream
         return stream;
     }
 
-    TxWriteType::TxWriteType(std::shared_ptr<WitnessTransactionType> tx)
+    TxWriteType::TxWriteType(std::shared_ptr<TransactionType> tx)
     {
         version.set(tx->version);
-        marker.set(tx->marker);
-        flag.set(tx->flag);
+        marker.set(tx->wdata->marker);
+        flag.set(tx->wdata->flag);
         tx_ins = ListType<TxInType_stream>::make_type(tx->tx_ins);
         tx_outs = ListType<TxOutType_stream>::make_type(tx->tx_outs);
     }
