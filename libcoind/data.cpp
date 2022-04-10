@@ -170,8 +170,7 @@ namespace coind::data
 //MerkleTree
 namespace coind::data
 {
-
-	merkle_link calculate_merkle_link(std::vector<uint256> hashes, int32_t index)
+    MerkleLink calculate_merkle_link(std::vector<uint256> hashes, int32_t index)
 	{
 		struct _side_data{
 			bool side;
@@ -234,7 +233,7 @@ namespace coind::data
             res_branch.push_back(v.hash);
         }
 
-        return merkle_link(res_branch, index);
+        return MerkleLink(res_branch, index);
 	}
 
     uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link)

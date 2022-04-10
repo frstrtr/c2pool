@@ -60,7 +60,7 @@ namespace shares
 		SetProperty(uint256, block_target);
 		SetProperty(int32_t, desired_timestamp);
 		SetProperty(uint256, desired_target);
-		SetProperty(shares::types::MerkleLink, ref_merkle_link);
+		SetProperty(coind::data::MerkleLink, ref_merkle_link);
 		SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
 		SetProperty(type_known_txs, known_txs);
 		SetProperty(unsigned long long, last_txout_nonce);
