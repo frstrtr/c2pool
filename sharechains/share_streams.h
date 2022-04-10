@@ -15,7 +15,7 @@ namespace shares::stream
 
         MerkleLink_stream() = default;
 
-		MerkleLink_stream(const shares::types::MerkleLink &value)
+		MerkleLink_stream(const coind::data::MerkleLink &value)
 		{
 			branch = branch.make_type(value.branch);
 		}
@@ -254,6 +254,7 @@ namespace shares::stream
 
     struct ShareInfo_stream
     {
+        ShareData_stream share_data;
         ListType<IntType(256)> new_transaction_hashes;
         ListType<transaction_hash_refs_stream> transaction_hash_refs;
         PossibleNoneType<IntType(256)> far_share_hash;
@@ -270,6 +271,7 @@ namespace shares::stream
 
         ShareInfo_stream(const types::ShareInfo &val) : ShareInfo_stream()
 		{
+            share_data = ShareData_stream(val.share_data);
 			new_transaction_hashes = new_transaction_hashes.make_type(val.new_transaction_hashes);
 			for (auto tx_hash_ref : val.transaction_hash_refs)
 			{

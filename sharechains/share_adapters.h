@@ -23,7 +23,7 @@ struct SmallBlockHeaderType :
 };
 
 struct MerkleLink :
-        StreamTypeAdapter<shares::types::MerkleLink, shares::stream::MerkleLink_stream>
+        StreamTypeAdapter<coind::data::MerkleLink, shares::stream::MerkleLink_stream>
 {
     void _to_stream() override
     {
@@ -107,7 +107,9 @@ struct ShareInfo :
 
     void _to_value() override
     {
-		make_value(_stream->far_share_hash.get(), _stream->max_bits.get(), _stream->bits.get(),
+        ShareData _share_data;
+        _share_data.set_stream(_stream->share_data);
+		make_value(*_share_data.get(), _stream->far_share_hash.get(), _stream->max_bits.get(), _stream->bits.get(),
 				   _stream->timestamp.get(), _stream->new_transaction_hashes.get(), _stream->transaction_hash_refs.get(),
 				   _stream->absheight.get(), _stream->abswork.get());
     }

@@ -128,7 +128,7 @@ public:
         return shared_from_this();
     }
 
-    auto ref_merkle_link(const shares::types::MerkleLink &data)
+    auto ref_merkle_link(const coind::data::MerkleLink &data)
     {
         auto value = std::make_shared<MerkleLink>();
         value->set_value(data);
@@ -150,7 +150,7 @@ public:
         return shared_from_this();
     }
 
-    auto merkle_link(const shares::types::MerkleLink &data)
+    auto merkle_link(const coind::data::MerkleLink &data)
     {
         auto value = std::make_shared<MerkleLink>();
         value->set_value(data);

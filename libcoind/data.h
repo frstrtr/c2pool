@@ -48,18 +48,63 @@ namespace coind::data
 
 // MerkleTree
 namespace coind::data{
-	struct merkle_link
+
+    class MerkleLink
     {
-        vector<uint256> branch;
+    public:
+        std::vector<uint256> branch;
         int32_t index;
 
-        merkle_link() = default;
+        MerkleLink()
+        {
+            index = 0;
+        };
 
-        merkle_link(vector<uint256> _branch, int32_t _index)
+        MerkleLink(std::vector<uint256> _branch, int32_t _index = 0)//, int index)
         {
             branch = _branch;
             index = _index;
         }
+
+        bool operator==(const MerkleLink &value)
+        {
+            return branch == value.branch;
+            //return branch == value.branch && index == value.index;
+        }
+
+        bool operator!=(const MerkleLink &value)
+        {
+            return !(*this == value);
+        }
+
+//        MerkleLink &operator=(UniValue value)
+//        {
+//            for (auto hex_str: value["branch"].get_array().getValues())
+//            {
+//                uint256 temp_uint256;
+//                temp_uint256.SetHex(hex_str.get_str());
+//                branch.push_back(temp_uint256);
+//            }
+//            index = value["index"].get_int();
+//
+//            return *this;
+//        }
+
+//        operator UniValue()
+//        {
+//            UniValue result(UniValue::VOBJ);
+//
+//            UniValue branch_list(UniValue::VARR);
+//            for (auto num: branch)
+//            {
+//                branch_list.push_back(num.GetHex());
+//            }
+//
+//            result.pushKV("branch", branch_list);
+//            result.pushKV("index", index);
+//
+//            return result;
+//        }
     };
 
     struct merkle_record_type
@@ -88,7 +133,7 @@ namespace coind::data{
         }
     };
 
-	merkle_link calculate_merkle_link(std::vector<uint256> hashes, int32_t index);
+    MerkleLink calculate_merkle_link(std::vector<uint256> hashes, int32_t index);
 
     //link = MerkleLink from shareTypes.h
     uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link);

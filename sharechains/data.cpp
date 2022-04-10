@@ -360,13 +360,24 @@ namespace shares
 				share_txs.emplace_back(_known_txs[h], txid, h);
 				txids.push_back(txid);
 			}
-            //TODO: segwit_data upd
+
+            {
+                std::vector<uint256> txids{uint256()};
+                std::vector<uint256> wtxids{uint256()};
+                for (auto v : share_txs)
+                {
+                    txids.push_back(v.txid);
+                    wtxids.push_back(coind::data::get_wtxid(v.tx, v.txid, v.h));
+                }
+
+                _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(txids, 0),
+                                                                     coind::data::merkle_hash(wtxids));
+            }
 		}
 
 //      witness_reserved_value_str = '[P2Pool]'*4
 //		witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
 //		witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
-
         char* witness_reserved_value_str = "[C2Pool][CPool][C2Pool][C2Pool]";
         uint256 witness_commitment_hash;
         if (segwit_activated && _segwit_data.has_value())
@@ -381,14 +392,21 @@ namespace shares
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
 
+        unique_ptr<shares::types::ShareInfo> share_info;
+        {
+            uint256 far_share_hash;
+            if (last.IsNull() && height < 99)
+                far_share_hash.SetNull();
+            else
+                far_share_hash = tracker->get_nth_parent_hash(_share_data.previous_share_hash, 99);
+
+// TODO:           share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(), bits.get(), );
+        }
+
 //
 //        unique_ptr<ShareInfo> share_info;
 //        {
-//            uint256 far_share_hash;
-//            if (last.IsNull() && height < 99)
-//                far_share_hash.SetNull();
-//            else
-//                far_share_hash = tracker->get_nth_parent_hash(_share_data.previous_share_hash, 99);
+
 //
 //            int32_t result_timestamp;
 //

@@ -5,6 +5,7 @@
 #include <boost/optional.hpp>
 #include <libdevcore/stream_types.h>
 #include <libdevcore/stream.h>
+#include <libcoind/data.h>
 
 #include <set>
 #include <tuple>
@@ -81,63 +82,6 @@ namespace shares::types
 //            result.pushKV("timestamp", (uint64_t) timestamp);
 //            result.pushKV("bits", (uint64_t) bits);
 //            result.pushKV("nonce", (uint64_t) nonce);
-//
-//            return result;
-//        }
-    };
-
-    class MerkleLink
-    {
-    public:
-        std::vector<uint256> branch;
-//        int32_t index;
-
-        MerkleLink()
-        {
-//            index = 0;
-        };
-
-        MerkleLink(std::vector<uint256> _branch)//, int index)
-        {
-            branch = _branch;
-        }
-
-        bool operator==(const MerkleLink &value)
-        {
-            return branch == value.branch;
-            //return branch == value.branch && index == value.index;
-        }
-
-        bool operator!=(const MerkleLink &value)
-        {
-            return !(*this == value);
-        }
-
-//        MerkleLink &operator=(UniValue value)
-//        {
-//            for (auto hex_str: value["branch"].get_array().getValues())
-//            {
-//                uint256 temp_uint256;
-//                temp_uint256.SetHex(hex_str.get_str());
-//                branch.push_back(temp_uint256);
-//            }
-//            index = value["index"].get_int();
-//
-//            return *this;
-//        }
-
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            UniValue branch_list(UniValue::VARR);
-//            for (auto num: branch)
-//            {
-//                branch_list.push_back(num.GetHex());
-//            }
-//
-//            result.pushKV("branch", branch_list);
-//            result.pushKV("index", index);
 //
 //            return result;
 //        }
@@ -233,17 +177,17 @@ namespace shares::types
     {
         //SEGWIT DATA, 94 data.py
     public:
-        MerkleLink txid_merkle_link; //---------------
+        coind::data::MerkleLink txid_merkle_link; //---------------
         uint256 wtxid_merkle_root;   //pack.IntType(256)
 
         //Init PossiblyNoneType
         SegwitData()
         {
-            txid_merkle_link = MerkleLink();
+            txid_merkle_link = coind::data::MerkleLink();
             wtxid_merkle_root.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         };
 
-        SegwitData(MerkleLink _txid_merkle_link, uint256 _wtxid_merkle_root)
+        SegwitData(coind::data::MerkleLink _txid_merkle_link, uint256 _wtxid_merkle_root)
 		{
 			txid_merkle_link = _txid_merkle_link;
 			wtxid_merkle_root = _wtxid_merkle_root;
@@ -357,6 +301,7 @@ namespace shares::types
     struct ShareInfo
     {
     public:
+        ShareData share_data;
         uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
         uint32_t max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
         uint32_t bits;                                       //bitcoin_data.FloatingIntegerType() bits;
@@ -372,11 +317,12 @@ namespace shares::types
 			far_share_hash.SetHex("0");
 		}
 
-        ShareInfo(uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
+        ShareInfo(ShareData _share_data, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
 				  unsigned int _timestamp, std::vector<uint256> _new_transaction_hashes,
 				  vector<tuple<uint64_t, uint64_t>> _transaction_hash_refs, unsigned long _absheigth,
 				  uint128 _abswork)
 		{
+            share_data = _share_data;
 			far_share_hash = _far_share_hash;
 			max_bits = _max_bits;
 			bits = _bits;
@@ -407,16 +353,16 @@ namespace shares::types
 	{
 		SmallBlockHeaderType min_header;
 		ShareInfo share_info;
-		MerkleLink ref_merkle_link;
+		coind::data::MerkleLink ref_merkle_link;
 		uint64_t last_txout_nonce;
 		HashLinkType hash_link;
-		MerkleLink merkle_link;
+		coind::data::MerkleLink merkle_link;
 
 		ShareTypeData() = default;
 
 		ShareTypeData(SmallBlockHeaderType _min_header, ShareInfo _share_info,
-					  MerkleLink _ref_merkle_link, uint64_t _last_txout_nonce,
-					  HashLinkType _hash_link, MerkleLink _merkle_link)
+					  coind::data::MerkleLink _ref_merkle_link, uint64_t _last_txout_nonce,
+					  HashLinkType _hash_link, coind::data::MerkleLink _merkle_link)
 		{
 			min_header = _min_header;
 			share_info = _share_info;
