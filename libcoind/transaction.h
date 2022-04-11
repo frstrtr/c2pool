@@ -97,9 +97,16 @@ namespace coind::data
     {
         uint64_t marker;
         uint8_t flag;
-        vector<vector<string>> witness;
+        vector<vector<std::string>> witness;
 
         WitnessTransactionData() {}
+
+        WitnessTransactionData(uint64_t _marker, uint8_t _flag, vector<vector<string>> _witness)
+        {
+            marker = _marker;
+            flag = _flag;
+            witness = _witness;
+        }
 
         WitnessTransactionData(uint64_t _marker, uint8_t _flag, vector<ListType<StrType>> _witness)
         {

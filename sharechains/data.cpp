@@ -1,6 +1,8 @@
 #include "data.h"
 
 #include <algorithm>
+#include <string>
+#include <vector>
 
 #include "tracker.h"
 #include "share_adapters.h"
@@ -310,12 +312,15 @@ namespace shares
 //			raise ValueError()
 
 //		dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
-		std::vector<std::pair<std::vector<unsigned char>, arith_uint256>> dests(amounts.begin(),amounts.end());
-		std::sort(dests.begin(), dests.end(), [&](std::pair<std::vector<unsigned char>, arith_uint256> a, std::pair<std::vector<unsigned char>, arith_uint256> b){
-			if (a.first == DONATION_SCRIPT)
+		std::vector<std::vector<unsigned char>> dests;
+        for (auto v : amounts)
+            dests.push_back(v.first);
+
+		std::sort(dests.begin(), dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b){
+			if (a == DONATION_SCRIPT)
 				return false;
 
-			return a.second != b.second ? a.second < b.second : a.first < b.first;
+			return amounts[a] != amounts[b] ? amounts[a] < amounts[b] : a < b;
 		});
 
 		bool segwit_activated = is_segwit_activated(version, net);
@@ -400,68 +405,47 @@ namespace shares
             else
                 far_share_hash = tracker->get_nth_parent_hash(_share_data.previous_share_hash, 99);
 
-            int32_t result_timestamp;
+            uint32_t timestamp;
 
             if (previous_share != nullptr)
             {
                 if (version < 32)
-                    result_timestamp = std::clamp(_desired_timestamp, *previous_share->timestamp + 1,
+                    timestamp = std::clamp(_desired_timestamp, *previous_share->timestamp + 1,
                                                   *previous_share->timestamp + net->SHARE_PERIOD * 2 - 1);
                 else
-                    result_timestamp = std::max(_desired_timestamp, *previous_share->timestamp + 1);
+                    timestamp = std::max(_desired_timestamp, *previous_share->timestamp + 1);
             } else
             {
-                result_timestamp = _desired_timestamp;
+                timestamp = _desired_timestamp;
             }
 
-            share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(), bits.get(),  );
+            auto _absheight = ((previous_share ? *previous_share->absheight : 0) + 1) % 0x100000000; // % 2^32
+
+
+            uint128 _abswork;
+            {
+                arith_uint256 _temp;
+                if (previous_share)
+                {
+                    auto _share_abswork = *previous_share->abswork;
+                    _temp.SetHex(_share_abswork.GetHex());
+                }
+
+                _temp = _temp + coind::data::target_to_average_attempts(bits.target());
+                arith_uint256 pow2_128; // 2^128
+                pow2_128.SetHex("100000000000000000000000000000000");
+
+                _temp = _temp >= pow2_128 ? _temp-pow2_128 : _temp; // _temp % pow2_128;
+                _abswork.SetHex(_temp.GetHex());
+            }
+            //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
+
+            share_info = std::make_unique<shares::types::ShareInfo>(_share_data, far_share_hash, max_bits.get(),
+                                                                    bits.get(), timestamp, new_transaction_hashes, transaction_hash_refs,
+                                                                    _absheight, _abswork
+                                                                    );
         }
 
-//
-//        unique_ptr<ShareInfo> share_info;
-//        {
-
-//
-//            int32_t result_timestamp;
-//
-//            if (previous_share != nullptr)
-//            {
-//                if (version < 32)
-//                    result_timestamp = std::clamp(_desired_timestamp, *previous_share->timestamp + 1,
-//                                                  *previous_share->timestamp + net->SHARE_PERIOD * 2 - 1);
-//                else
-//                    result_timestamp = std::max(_desired_timestamp, *previous_share->timestamp + 1);
-//            } else
-//            {
-//                result_timestamp = _desired_timestamp;
-//            }
-//
-//            unsigned long absheight = 1;
-//            if (previous_share)
-//            {
-//                absheight += *previous_share->absheight;
-//            }
-//            absheight %= 4294967296; //% 2**32
-//
-//            uint128 abswork;
-//            if (previous_share)
-//            {
-//                abswork = *previous_share->abswork;
-//            }
-//            //TODO: abswork=((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128,
-//
-//            share_info = std::make_unique<ShareInfo>(
-//                    far_share_hash,
-//                    max_bits.get(),
-//                    bits.get(),
-//                    result_timestamp,
-//                    new_transaction_hashes,
-//                    transaction_hash_refs,
-//                    absheight,
-//                    abswork
-//                    );
-//        }
-//
 		if (previous_share)
 		{
 			if (_desired_timestamp > (*previous_share->timestamp + 180))
@@ -482,24 +466,51 @@ namespace shares
 							.str();
 			}
 		}
-//        //TODO:
-//        //if segwit_activated:
-//        //            share_info['segwit_data'] = segwit_data
-//
-//        // gentx
-//		coind::data::tx_type gentx;
-//        {
-//            vector<coind::data::TxInType> tx_ins; //TODO: init
-//            vector<coind::data::TxOutType> tx_outs; //TODO: init
-//
-//            if (segwit_activated)
-//            {
-//                vector<ListType<StrType>> witness; //TODO: init
-//                gentx = std::make_shared<coind::data::WitnessTransactionType>(1, 0, 1, tx_ins, tx_outs, witness, 0);
-//            }
-//            else
-//                gentx = std::make_shared<coind::data::TransactionType>(1, tx_ins, tx_outs, 0);
-//        }
+
+        if (segwit_activated)
+            share_info->segwit_data = _segwit_data;
+
+        coind::data::tx_type gentx;
+        {
+            //TX_IN
+            vector<coind::data::TxInType> tx_ins;
+            tx_ins.emplace_back(coind::data::PreviousOutput(uint256(), 0), std::vector<unsigned char>{}, 0); // TODO: check + debug
+
+            //TX_OUT
+            vector<coind::data::TxOutType> tx_outs;
+            if (segwit_activated)
+            {
+                auto script = std::vector<unsigned char> {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+
+                IntType(256) w_com_hash(witness_commitment_hash);
+                PackStream _pfs; //part_first_script
+                _pfs << w_com_hash;
+
+                script.insert(script.end(), _pfs.data.begin(), _pfs.data.end());
+                tx_outs.emplace_back(0, script);
+            }
+
+            for (auto script : dests)
+            {
+                tx_outs.emplace_back(ArithToUint256(amounts[script]).GetUint64(0), script); // TODO: TEST FOR RESULT!!!
+            }
+            {
+                auto script = std::vector<unsigned char> {0x6a, 0x28};
+                //TODO: script + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce))],
+
+                tx_outs.emplace_back(0, script);
+            }
+
+            // MAKE GENTX
+            gentx = std::make_shared<coind::data::TransactionType>(1, tx_ins, tx_outs, 0);
+
+            if(segwit_activated)
+            {
+                std::vector<std::vector<std::string>> _witness;
+                _witness.push_back(std::vector<string>{std::string(witness_reserved_value_str)});
+                gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
+            }
+        }
 //
 //
 //		get_share_method get_share([=](SmallBlockHeaderType header, unsigned long long last_txout_nonce)

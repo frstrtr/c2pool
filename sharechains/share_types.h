@@ -310,7 +310,7 @@ namespace shares::types
         std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
         uint32_t absheigth;                                 //pack.IntType(32)
         uint128 abswork;                                         //pack.IntType(128)
-
+        std::optional<SegwitData> segwit_data;
     public:
         ShareInfo()
         {

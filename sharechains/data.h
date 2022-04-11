@@ -58,7 +58,7 @@ namespace shares
 	public:
 		SetProperty(types::ShareData, share_data);
 		SetProperty(uint256, block_target);
-		SetProperty(int32_t, desired_timestamp);
+		SetProperty(uint32_t, desired_timestamp);
 		SetProperty(uint256, desired_target);
 		SetProperty(coind::data::MerkleLink, ref_merkle_link);
 		SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
