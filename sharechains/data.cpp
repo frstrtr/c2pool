@@ -400,7 +400,21 @@ namespace shares
             else
                 far_share_hash = tracker->get_nth_parent_hash(_share_data.previous_share_hash, 99);
 
-// TODO:           share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(), bits.get(), );
+            int32_t result_timestamp;
+
+            if (previous_share != nullptr)
+            {
+                if (version < 32)
+                    result_timestamp = std::clamp(_desired_timestamp, *previous_share->timestamp + 1,
+                                                  *previous_share->timestamp + net->SHARE_PERIOD * 2 - 1);
+                else
+                    result_timestamp = std::max(_desired_timestamp, *previous_share->timestamp + 1);
+            } else
+            {
+                result_timestamp = _desired_timestamp;
+            }
+
+            share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(), bits.get(),  );
         }
 
 //
