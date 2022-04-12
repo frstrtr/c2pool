@@ -22,7 +22,8 @@ namespace c2pool
         };
         PREFIX_LENGTH = 8;
         PREFIX = new unsigned char[PREFIX_LENGTH]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
-        IDENTIFIER = new unsigned char[8]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
+        IDENTIFIER_LENGHT = 8;
+        IDENTIFIER = new unsigned char[IDENTIFIER_LENGHT]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
         MINIMUM_PROTOCOL_VERSION = 1600;
         SEGWIT_ACTIVATION_VERSION = 17;
 
