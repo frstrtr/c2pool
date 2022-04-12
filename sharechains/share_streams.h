@@ -334,14 +334,14 @@ namespace shares::stream
     struct RefType
     {
         FixedStrType<8> identifier;
-        shared_ptr<ShareInfo_stream> share_info;
+        ShareInfo_stream share_info;
 
 		RefType() = default;
 
-		RefType(std::string _ident, shared_ptr<ShareInfo_stream> _share_info)
+		RefType(std::vector<unsigned char> _ident, shares::types::ShareInfo &_share_info)
 		{
-			identifier.value = _ident;
-			share_info = _share_info;
+			identifier = FixedStrType<8>(_ident);
+			share_info = ShareInfo_stream(_share_info);
 		}
 
         PackStream &write(PackStream &stream)

@@ -6,6 +6,7 @@
 
 #include "tracker.h"
 #include "share_adapters.h"
+#include "share_builder.h"
 #include <networks/network.h>
 #include <libdevcore/stream_types.h>
 
@@ -17,10 +18,10 @@ namespace shares
     }
 
     //TODO: test
-    uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, PackStream &data, string const_ending)
+    uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, string const_ending)
     {
         uint64_t extra_length = (*hash_link)->length % (512 / 8);
-        assert((*hash_link)->extra_data.size() == max(extra_length - const_ending.size(), (uint64_t)0));
+        assert((*hash_link)->extra_data.size() == max(extra_length - const_ending.size(), (uint64_t) 0));
 
         auto extra = (*hash_link)->extra_data + const_ending;
         {
@@ -37,13 +38,50 @@ namespace shares
         return result.get();
     }
 
+    shared_ptr<shares::types::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
+    {
+        //TODO: assert prefix.endswith(const_ending), (prefix, const_ending)
+        shared_ptr<shares::types::HashLinkType> result;
+
+        //TODO:
+//        x = sha256.sha256(prefix)
+//        return dict(state=x.state, extra_data=x.buf[:max(0, len(x.buf)-len(const_ending))], length=x.length//8)
+
+        return result;
+    }
+
+    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link)
+    {
+        RefType ref_type(std::vector<unsigned char>(net->IDENTIFIER, net->IDENTIFIER+net->IDENTIFIER_LENGHT), share_info);
+
+        PackStream ref_type_packed;
+        ref_type_packed << ref_type;
+
+        auto hash_ref_type = coind::data::hash256(ref_type_packed);
+        IntType(256) _check_merkle_link(coind::data::check_merkle_link(hash_ref_type, ref_merkle_link));
+
+        PackStream result;
+        result << _check_merkle_link;
+
+        return result;
+    }
+}
+
+namespace shares
+{
+
+    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
+    {
+        share_info = std::move(_share_info);
+    }
+
     GenerateShareTransaction::GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker) : tracker(_tracker), net(_tracker->net)
     {
 
     }
 
     //TODO: Test
-    GeneratedShare GenerateShareTransaction::operator()(uint64_t version)
+    GeneratedShareTransactionResult GenerateShareTransaction::operator()(uint64_t version)
     {
         //t0
 		ShareType previous_share = tracker->get(_share_data.previous_share_hash);
@@ -291,12 +329,11 @@ namespace shares
 			amounts[this_script] += _share_data.subsidy/200;
 		}
 
-		std::vector<unsigned char> DONATION_SCRIPT; //TODO:
 		//all that's left over is the donation weight and some extra satoshis due to rounding
 		{
-			auto _donation_amount = amounts.find(DONATION_SCRIPT);
+			auto _donation_amount = amounts.find(net->DONATION_SCRIPT);
 			if (_donation_amount == amounts.end())
-				amounts[DONATION_SCRIPT] = 0;
+				amounts[net->DONATION_SCRIPT] = 0;
 
 			arith_uint256 sum_amounts;
 			sum_amounts.SetHex("0");
@@ -305,7 +342,7 @@ namespace shares
 				sum_amounts += v.second;
 			}
 
-			amounts[DONATION_SCRIPT] += _share_data.subsidy - sum_amounts;
+			amounts[net->DONATION_SCRIPT] += _share_data.subsidy - sum_amounts;
 		}
 //TODO: check
 //		if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
@@ -317,7 +354,7 @@ namespace shares
             dests.push_back(v.first);
 
 		std::sort(dests.begin(), dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b){
-			if (a == DONATION_SCRIPT)
+			if (a == net->DONATION_SCRIPT)
 				return false;
 
 			return amounts[a] != amounts[b] ? amounts[a] < amounts[b] : a < b;
@@ -495,8 +532,16 @@ namespace shares
                 tx_outs.emplace_back(ArithToUint256(amounts[script]).GetUint64(0), script); // TODO: TEST FOR RESULT!!!
             }
             {
+                // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)
                 auto script = std::vector<unsigned char> {0x6a, 0x28};
-                //TODO: script + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce))],
+
+                auto _get_ref_hash = get_ref_hash(net, *share_info, _ref_merkle_link);
+                script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
+
+                IntType(64) _last_txout_nonce(_last_txout_nonce);
+                PackStream packed_last_txout_nonce;
+                packed_last_txout_nonce << _last_txout_nonce;
+                script.insert(script.end(), packed_last_txout_nonce.data.begin(), packed_last_txout_nonce.data.end());
 
                 tx_outs.emplace_back(0, script);
             }
@@ -511,16 +556,45 @@ namespace shares
                 gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
             }
         }
-//
-//
-//		get_share_method get_share([=](SmallBlockHeaderType header, unsigned long long last_txout_nonce)
-//								   {
-//									   auto min_header = header;
-//									   ShareType share = std::make_shared<ShareType>(); //TODO: GENERATE SHARE IN CONSTUCTOR
-//								   });
-//
-//		/*
-//		 TODO: TIMER?
+
+        get_share_method get_share_F([=, &share_info](shares::types::BlockHeaderType header, uint64_t last_txout_nonce)
+        {
+            shares::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
+
+            ShareType share;
+            std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
+
+            shared_ptr<shares::types::HashLinkType> pref_to_hash_link;
+            {
+                coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
+
+                PackStream txid_packed;
+                txid_packed << txid;
+
+                std::vector<unsigned char> prefix;
+                prefix.insert(prefix.begin(), prefix.end()-32-8-4, prefix.end());
+
+                pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
+            }
+
+            auto tx_hashes = other_transaction_hashes;
+            tx_hashes.insert(tx_hashes.begin(),uint256());
+
+            builder
+                ->min_header(min_header)
+                ->share_info(*share_info)
+                ->ref_merkle_link(coind::data::MerkleLink())
+                ->last_txout_nonce(last_txout_nonce)
+                ->hash_link(*pref_to_hash_link)
+                ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
+
+            builder->create(version, {});
+
+            share = builder->GetShare();
+            //TODO: assert(share->header == header);
+            return share;
+        });
+
 //		t5 = time.time()
 //		if p2pool.BENCH: print "%8.3f ms for data.py:generate_transaction(). Parts: %8.3f %8.3f %8.3f %8.3f %8.3f " % (
 //			(t5-t0)*1000.,
@@ -532,6 +606,6 @@ namespace shares
 //	    */
 //
 
-//		return {share_info, gentx, other_transaction_hashes, get_share};
+        return GeneratedShareTransactionResult(std::move(share_info),gentx, other_transaction_hashes,get_share_F);
     }
 }
