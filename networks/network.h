@@ -35,7 +35,10 @@ namespace c2pool
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
         const unsigned char *PREFIX;
+
+        int IDENTIFIER_LENGHT;
         const unsigned char *IDENTIFIER;
+
         int MINIMUM_PROTOCOL_VERSION;
         int SEGWIT_ACTIVATION_VERSION;
         int TARGET_LOOKBEHIND;
@@ -50,6 +53,9 @@ namespace c2pool
 
         uint256 MIN_TARGET;
         uint256 MAX_TARGET;
+    public:
+        std::vector<unsigned char> DONATION_SCRIPT; //TODO: INIT (from share)
+        std::vector<unsigned char> gentx_before_refhash; //TODO: INIT (from share)
 
     protected:
         Network(std::string name, std::shared_ptr<coind::ParentNetwork> _parent_net);
