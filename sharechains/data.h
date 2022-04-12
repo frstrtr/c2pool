@@ -19,22 +19,28 @@ class ShareTracker;
 
 namespace shares
 {
-	typedef boost::function<ShareType(int)> get_share_method;//TODO: args
-
 	bool is_segwit_activated(int version, shared_ptr<c2pool::Network> net);
 
-	uint256 check_hash_link(shared_ptr<HashLinkType> hash_link, PackStream &data, string const_ending = "");
+	uint256 check_hash_link(shared_ptr<HashLinkType> hash_link, std::vector<unsigned char> data, string const_ending = "");
+
+    shared_ptr<shares::types::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending = {});
+
+    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link);
 }
 
 //GenerateShareTransaction
 namespace shares
 {
-	struct GeneratedShare
+    typedef boost::function<ShareType(shares::types::BlockHeaderType, uint64_t)> get_share_method;
+
+	struct GeneratedShareTransactionResult
 	{
-		ShareInfo share_info;
-		coind::data::TransactionType gentx;
-		vector<uint256> other_transaction_hashes;
+		std::unique_ptr<shares::types::ShareInfo> share_info;
+        coind::data::tx_type gentx;
+		std::vector<uint256> other_transaction_hashes;
 		get_share_method get_share;
+
+        GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
 	};
 
 #define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256,boost::optional<int32_t>>>
@@ -74,7 +80,7 @@ namespace shares
 		}
 
 	public:
-		GeneratedShare operator()(uint64_t version);
+		GeneratedShareTransactionResult operator()(uint64_t version);
 	};
 
 #undef SetProperty
