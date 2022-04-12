@@ -91,6 +91,7 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
         value.insert(value.end(), parsedHexData.begin(), parsedHexData.end());
 //        _stream << parsedHexData;
 
+//TODO: Remove
         std::cout << "parsedHexData: ";
         for (auto v : value)
         {
@@ -122,6 +123,7 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
     {
         ListType<unsigned char> list_s(value);
 
+        //TODO: remove trace lines
         std::cout << "list_s.l: ";
         for (auto v : list_s.value){
             std::cout << (unsigned int) v << " ";
@@ -148,11 +150,11 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 
 //TODO: TEST
 template <int SIZE>
-struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public Getter<std::string>
+struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGetter<std::string>
 {
-    FixedStrType()
-    {
-    }
+    vector<unsigned char> value;
+
+    FixedStrType() = default;
 
     FixedStrType(string _str)
     {
@@ -160,31 +162,37 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public Getter<st
         {
             throw std::invalid_argument("Incorrect length str in FixedStrType");
         }
-        value = _str;
+        value.insert(value.begin(), _str.begin(), _str.end());
+    }
+
+    FixedStrType(vector<unsigned char> _c_str)
+    {
+        value = _c_str;
     }
 
     PackStream &write(PackStream &stream) const
     {
 //        LOG_TRACE << "FixedStrType Worked!";
+        ListType<unsigned char> list_s(value);
 
-        for (auto c : value)
-        {
-            stream << c;
-        }
-
+        auto _len = value.size();
+        stream << _len << PackStream(value);
         return stream;
     }
 
     PackStream &read(PackStream &stream)
     {
-        char *c_str = new char[SIZE];
-        for (int i = 0; i < SIZE; i++)
-        {
-            stream >> c_str[i];
-        }
-
-        value = string(c_str, c_str + SIZE);
+        ListType<unsigned char> list_s;
+        stream >> list_s;
+        if (SIZE < list_s.value.size())
+            list_s.value.resize(SIZE);
+        value = std::move(list_s.value);
         return stream;
+    }
+
+    std::string get() const override
+    {
+        return string(value.begin(), value.end());
     }
 };
 
