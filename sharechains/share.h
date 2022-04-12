@@ -2,6 +2,7 @@
 
 #include <boost/format.hpp>
 #include <libcoind/data.h>
+#include <libcoind/transaction.h>
 #include <btclibs/uint256.h>
 #include <networks/network.h>
 #include <libdevcore/addrStore.h>
@@ -67,10 +68,10 @@ public:
     ///other
     PackStream new_script; //FROM pubkey_hash;
 
-    uint256 gentx_hash; //TODO: init
-	BlockHeaderType header; //TODO: init
-	uint256 pow_hash; //TODO: init
-	uint256 hash; //=header_hash //TODO: init
+    uint256 gentx_hash;
+	BlockHeaderType header;
+	uint256 pow_hash;
+	uint256 hash; //=header_hash
 	int32_t time_seen;
 
 public:
@@ -84,7 +85,7 @@ public:
     void init();
 
     /// check for verify share.
-    void check(std::shared_ptr<ShareTracker> _tracker);
+    void check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coind::data::tx_type> other_txs = {});
 
     ~Share()
     {
