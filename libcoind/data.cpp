@@ -236,12 +236,10 @@ namespace coind::data
         return MerkleLink(res_branch, index);
 	}
 
-    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link)
+    //TODO: test
+    uint256 check_merkle_link(uint256 tip_hash, coind::data::MerkleLink link)
     {
-        auto branch = std::get<0>(link);
-        auto index = std::get<1>(link);
-
-        if (index >= pow(2, branch.size()))
+        if (link.index >= pow(2, link.branch.size()))
         {
             throw std::invalid_argument("index too large");
         }
@@ -249,9 +247,9 @@ namespace coind::data
         auto cur = tip_hash;
 
         int i = 0;
-        for (auto h : branch)
+        for (auto h : link.branch)
         {
-            if ((index >> i) & 1)
+            if ((link.index >> i) & 1)
             {
                 auto merkle_rec = merkle_record_type{h, cur};
                 PackStream ps;

@@ -136,7 +136,7 @@ namespace coind::data{
     MerkleLink calculate_merkle_link(std::vector<uint256> hashes, int32_t index);
 
     //link = MerkleLink from shareTypes.h
-    uint256 check_merkle_link(uint256 tip_hash, tuple<vector<uint256>, int32_t> link);
+    uint256 check_merkle_link(uint256 tip_hash, coind::data::MerkleLink link);
 
     uint256 merkle_hash(std::vector<uint256> hashes);
 
