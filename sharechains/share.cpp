@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <set>
+#include <string>
 
 #include <univalue.h>
 #include <libdevcore/logger.h>
@@ -63,16 +64,35 @@ void Share::init()
 //          n.add(tx_count)
 //    assert n == set(range(len(self.share_info['new_transaction_hashes'])))
 
+    std::vector<unsigned char> hash_link_data;
+    {
+        auto ref_hash = shares::get_ref_hash(net, *share_info->get(), *ref_merkle_link->get());
+        hash_link_data = ref_hash.data;
 
-    //TODO: GENTX
-//    gentx_hash =  shares::check_hash_link(
-//            hash_link,
-//
-//            );
+        IntType(64) _last_txout_nonce(last_txout_nonce);
+        PackStream packed_last_txout_nonce;
+        packed_last_txout_nonce << _last_txout_nonce;
+        hash_link_data.insert(hash_link_data.begin(), packed_last_txout_nonce.data.begin(), packed_last_txout_nonce.data.end());
 
-     //TODO: header
-     //TODO: pow_hash
-     //TODO: hash
+        IntType(32) _z(0);
+        PackStream packed_z;
+        packed_z << _z;
+        hash_link_data.insert(hash_link_data.begin(), packed_z.data.begin(), packed_z.data.end());
+    }
+
+    gentx_hash = shares::check_hash_link(hash_link, hash_link_data, std::string(net->gentx_before_refhash.begin(),net->gentx_before_refhash.end()));
+    auto merkle_root = coind::data::check_merkle_link(gentx_hash, segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
+    header.set_value(shares::types::BlockHeaderType(*min_header->get(), merkle_root));
+
+    shares::stream::BlockHeaderType_stream header_stream(*header.get());
+    PackStream packed_block_header;
+    packed_block_header << header_stream;
+
+    pow_hash = net->parent->POW_FUNC(packed_block_header);
+
+    PackStream packed_block_header2;
+    packed_block_header2 << header_stream;
+    hash = coind::data::hash256(packed_block_header2);
 
     if (target > net->MAX_TARGET)
     {
@@ -86,11 +106,13 @@ void Share::init()
 }
 #undef CheckShareRequirement
 
-void Share::check(std::shared_ptr<ShareTracker> _tracker)
+void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coind::data::tx_type> other_txs)
 {
     if (*timestamp > (c2pool::dev::timestamp() + 600))
     {
-        throw std::invalid_argument((boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} % (*timestamp - c2pool::dev::timestamp())).str());
+        throw std::invalid_argument(
+                (boost::format{"Share timestamp is %1% seconds in the future! Check your system clock."} %
+                 (*timestamp - c2pool::dev::timestamp())).str());
     }
 
     std::map<uint64_t, uint256> counts;
@@ -101,10 +123,85 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker)
         if (_tracker->get_height(*previous_hash) >= net->CHAIN_LENGTH)
         {
             //tracker.get_nth_parent_hash(previous_share.hash, self.net.CHAIN_LENGTH*9//10), self.net.CHAIN_LENGTH//10
-            counts = _tracker->get_desired_version_counts(_tracker->get_nth_parent_hash(previous_share->hash, net->CHAIN_LENGTH*9/10), net->CHAIN_LENGTH/10);
+            counts = _tracker->get_desired_version_counts(
+                    _tracker->get_nth_parent_hash(previous_share->hash, net->CHAIN_LENGTH * 9 / 10),
+                    net->CHAIN_LENGTH / 10);
+
+            //TODO: python check for version
+//            if type(self) is type(previous_share):
+//                pass
+//              elif type(self) is type(previous_share).SUCCESSOR:
+//                  # switch only valid if 60% of hashes in [self.net.CHAIN_LENGTH*9//10, self.net.CHAIN_LENGTH] for new version
+//                  if counts.get(self.VERSION, 0) < sum(counts.itervalues())*60//100:
+//                      raise p2p.PeerMisbehavingError('switch without enough hash power upgraded')
+//              else:
+//                  raise p2p.PeerMisbehavingError('''%s can't follow %s''' % (type(self).__name__, type(previous_share).__name__))
         }
+        //elif type(self) is type(previous_share).SUCCESSOR:
+        //      raise p2p.PeerMisbehavingError('switch without enough history')
     }
+
+    std::vector<uint256> other_tx_hashes;
+    for (auto v: (*share_info)->transaction_hash_refs)
+    {
+        auto share_count = std::get<0>(v);
+        auto tx_count = std::get<1>(v);
+
+        other_tx_hashes.push_back(_tracker->get(_tracker->get_nth_parent_hash(hash,
+                                                                              share_count))->share_info->get()->new_transaction_hashes[tx_count]);
+    }
+
+    // TODO: Check type in python???
+    //if other_txs is not None and not isinstance(other_txs, dict): other_txs = dict((bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx)), tx) for tx in other_txs)
+
+    auto gentx_F = GenerateShareTransaction(_tracker);
+    gentx_F.set_share_data(*share_data->get());
+    gentx_F.set_block_target(FloatingInteger(header->bits).target()); //TODO: check
+    gentx_F.set_desired_timestamp(*timestamp);
+    gentx_F.set_desired_target(FloatingInteger((*share_info)->bits).target()); //TODO: check
+    gentx_F.set_ref_merkle_link(*ref_merkle_link->get());
+    {
+        std::vector<std::tuple<uint256, boost::optional<int32_t>>> _desired_other_transaction_hashes_and_fees;
+        for (auto v: other_tx_hashes)
+        {
+            boost::optional<int32_t> temp_value{};
+            _desired_other_transaction_hashes_and_fees.emplace_back(v, temp_value);
+        }
+        gentx_F.set_desired_other_transaction_hashes_and_fees(_desired_other_transaction_hashes_and_fees);
+    }
+    gentx_F.set_known_txs(other_txs);
+    gentx_F.set_last_txout_nonce(last_txout_nonce);
+    if (segwit_data)
+    {
+        gentx_F.set_segwit_data(*segwit_data->get());
+    }
+
+    auto gentx = gentx_F(VERSION);
+
+    //TODO: just check
+//    assert other_tx_hashes2 == other_tx_hashes
+//    if share_info != self.share_info:
+//        raise ValueError('share_info invalid')
+//    if bitcoin_data.get_txid(gentx) != self.gentx_hash:
+//        raise ValueError('''gentx doesn't match hash_link''')
+//    if bitcoin_data.calculate_merkle_link([None] + other_tx_hashes, 0) != self.merkle_link: # the other hash commitments are checked in the share_info assertion
+//        raise ValueError('merkle_link and other_tx_hashes do not match')
+
+    //TODO: wanna for upd protocol version???
+    // update_min_protocol_version(counts, self)
+
+    //TODO: Нужно ли это делать в c2pool???
+//    self.gentx_size = len(bitcoin_data.tx_id_type.pack(gentx))
+//    self.gentx_weight = len(bitcoin_data.tx_type.pack(gentx)) + 3*self.gentx_size
+//
+//    type(self).gentx_size   = self.gentx_size # saving this share's gentx size as a class variable is an ugly hack, and you're welcome to hate me for doing it. But it works.
+//            type(self).gentx_weight = self.gentx_weight
+
+//TODO: При получении блока, нужно ли это?
+// return gentx # only used by as_block
 }
+
+
 
 
 std::shared_ptr<Share> load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr)
