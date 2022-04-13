@@ -131,12 +131,11 @@ namespace shares::types
     public:
         std::string state;         //pack.FixedStrType(32)
         std::string extra_data;    //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
-        unsigned long long length; //pack.VarIntType()
+        uint64_t length; //pack.VarIntType()
 
-        HashLinkType()
-        {}
+        HashLinkType() = default;
 
-        HashLinkType(std::string _state, std::string _extra_data, unsigned long long _length)
+        HashLinkType(std::string _state, std::string _extra_data, uint64_t _length)
 		{
 			state = _state;
 			extra_data = _extra_data;

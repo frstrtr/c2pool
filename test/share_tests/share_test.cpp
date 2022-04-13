@@ -1,130 +1,161 @@
 #include <gtest/gtest.h>
-#include <tuple>
+#include <memory>
+#include <vector>
 #include <string>
 
+#include <sharechains/tracker.h>
+#include <networks/network.h>
 
-#include "share.h"
-#include "shareTypes.h"
-#include <config.h>
-#include "uint256.h"
-#include "arith_uint256.h"
-#include "univalue.h"
-
+#include <sharechains/share.h>
+#include <sharechains/share_builder.h>
 
 using namespace std;
 
-class TestNetwork : public c2pool::config::Network
+namespace share_test
 {
-public:
-    TestNetwork() : Network()
+    class TestParentNetwork : public coind::ParentNetwork
     {
-        BOOTSTRAP_ADDRS = {
-            CREATE_ADDR("192.168.0.1", "5024")
+    public:
+        TestParentNetwork() : ParentNetwork("parent_testnet")
+        {
+
+        }
+
+        bool jsonrpc_check() override
+        {
+            return true;
+        }
+
+        bool version_check(int version) override
+        {
+            return true;
         };
-        PREFIX_LENGTH = 8;
-        PREFIX = new unsigned char[PREFIX_LENGTH]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
-        IDENTIFIER = new unsigned char[8]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
-        MINIMUM_PROTOCOL_VERSION = 1600;
-        SEGWIT_ACTIVATION_VERSION = 17;
 
-        TARGET_LOOKBEHIND = 200;
-        SHARE_PERIOD = 25;
-        BLOCK_MAX_SIZE = 1000000;
-        BLOCK_MAX_WEIGHT = 4000000;
-        REAL_CHAIN_LENGTH = 24*60*60/10;
-        CHAIN_LENGTH = 24*60*60/10;
-        SPREAD = 30;
-    }
-};
+        uint256 POW_FUNC(PackStream &packed_block_header) override
+        {
+            uint256 res;
+            res.SetNull();
+            return res;
+        };
+    };
 
-class BaseShareTest : public ::testing::Test
+    class TestNetwork : public c2pool::Network
+    {
+    public:
+        TestNetwork(std::shared_ptr<TestParentNetwork> _parentNet) : Network("testnet", _parentNet)
+        {
+            BOOTSTRAP_ADDRS = {
+                    CREATE_ADDR("217.72.4.157", "5024")
+                    //"217.42.4.157:5025"
+            };
+            PREFIX_LENGTH = 8;
+            PREFIX = new unsigned char[PREFIX_LENGTH]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
+            IDENTIFIER_LENGHT = 8;
+            IDENTIFIER = new unsigned char[IDENTIFIER_LENGHT]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
+            MINIMUM_PROTOCOL_VERSION = 1600;
+            SEGWIT_ACTIVATION_VERSION = 17;
+
+            TARGET_LOOKBEHIND = 200;
+            SHARE_PERIOD = 25;
+            BLOCK_MAX_SIZE = 1000000;
+            BLOCK_MAX_WEIGHT = 4000000;
+            REAL_CHAIN_LENGTH = 24 * 60 * 60 / 10;
+            CHAIN_LENGTH = 24 * 60 * 60 / 10;
+            SPREAD = 30;
+            ADDRESS_VERSION = 30;
+            PERSIST = true;
+
+            MIN_TARGET.SetHex("0");
+            MAX_TARGET.SetHex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"); // 2**256/2**20 - 1
+        }
+    };
+}
+class ShareBaseBuilderTest : public ::testing::Test
 {
 protected:
-    shared_ptr<TestNetwork> net;
-    BaseShare* share;
+    shared_ptr<share_test::TestParentNetwork> parent_net;
+    shared_ptr<share_test::TestNetwork> net;
+    c2pool::libnet::addr _addr;
 
 protected:
-    template <typename UINT_TYPE>
-    UINT_TYPE CreateUINT(string hex){
-        UINT_TYPE _number;
-        _number.SetHex(hex);
-        return _number;
-    }
-
     virtual void SetUp()
     {
-        net = make_shared<TestNetwork>();
-        tuple<string, string> peer_addr = make_tuple<std::string, std::string>("192.168.0.1", "1337");
+        parent_net = std::make_shared<share_test::TestParentNetwork>();
+        net = std::make_shared<share_test::TestNetwork>(parent_net);
+        _addr = std::make_tuple("255.255.255.255", "25565");
 
-        ShareType share_type( 
-            make_shared<SmallBlockHeaderType>(
-                1,
-                CreateUINT<uint256>("2"),
-                3,
-                4,
-                5
-            ),
-            make_shared<ShareInfoType>(
-                make_shared<ShareData>(
-                    CreateUINT<uint256>("2"),
-                    "empty",
-                    5,
-                    CreateUINT<uint160>("33"),
-                    11,
-                    1,
-                    StaleInfo::None,
-                    1337
-                ),
-                vector<uint256>(),
-                vector<TransactionHashRef>(),
-                CreateUINT<uint256>("2"),
-                10000,
-                9999,
-                100123123,
-                12,
-                CreateUINT<uint128>("321"),
-                make_shared<SegwitData>(
-                    make_shared<MerkleLink>(),
-                    CreateUINT<uint256>("0")
-                )
-            ),
-            make_shared<MerkleLink>(),
-            5,
-            make_shared<HashLinkType>("state", "", 5),
-            make_shared<MerkleLink>()
-        );
-
-
-        share = new BaseShare(net, peer_addr, share_type, ShareVersion::NewShare);
-        //share = new BaseShare();
     }
 
     virtual void TearDown()
     {
-        delete share;
+
     }
 };
 
-TEST_F(BaseShareTest, InitBaseShare)
+class ShareObjectBuilderTest : public ShareBaseBuilderTest
 {
-    cout << share->timestamp << endl;
+protected:
+    std::shared_ptr<ShareObjectBuilder> builder;
+
+protected:
+    void SetUp()
+    {
+        ShareBaseBuilderTest::SetUp();
+        builder = std::make_shared<ShareObjectBuilder>(net);
+    }
+
+    void TearDown()
+    {
+        ShareBaseBuilderTest::TearDown();
+
+    }
+};
+
+TEST_F(ShareObjectBuilderTest, ShareEmptyThrowTest)
+{
+    builder->create(17, _addr);
+    ShareType share;
+    ASSERT_ANY_THROW({share = builder->GetShare();});
 }
 
-TEST_F(BaseShareTest, GenerateTransaction){
-    //TODO:
-}
+TEST_F(ShareObjectBuilderTest, ShareLightTest)
+{
+    builder->create(16, _addr);
+    std::cout << "Create share" << std::endl;
 
-TEST_F(BaseShareTest, TestSerialize){
-    string share_json = share->SerializeJSON();
-    string json = "{\"TYPE\":33,\"contents\":{\"min_header\":{\"version\":1,\"previous_block\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"timestamp\":3,\"bits\":4,\"nonce\":5},\"share_info\":{\"share_data\":{\"previous_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"coinbase\":\"empty\",\"nonce\":5,\"pubkey_hash\":\"0000000000000000000000000000000000000033\",\"subsidy\":11,\"donation\":1,\"stale_info\":0,\"desired_version\":1337},\"segwit_data\":{\"txid_merkle_link\":{\"branch\":[],\"index\":0},\"wtxid_merkle_root\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"new_transaction_hashes\":[],\"transaction_hash_refs\":[],\"far_share_hash\":\"0000000000000000000000000000000000000000000000000000000000000002\",\"max_bits\":10000,\"bits\":9999,\"timestamp\":100123123,\"absheigth\":12,\"abswork\":\"00000000000000000000000000000321\"},\"ref_merkle_link\":{\"branch\":[],\"index\":0},\"last_txout_nonce\":5,\"hash_link\":{\"state\":\"state\",\"extra_data\":\"\",\"length\":5},\"merkle_link\":{\"branch\":[],\"index\":0}}}";
-    ASSERT_EQ(share_json, json);
-}
+    // - min_header
+    shares::types::SmallBlockHeaderType min_header(16, uint256(), 0, 0, 0);
+    builder->min_header(min_header);
+    std::cout << "min_header" << std::endl;
 
-TEST_F(BaseShareTest, TestDeserialize){
-    string json = share->SerializeJSON();
+    // - share_data
+    shares::types::ShareData share_data(uint256(), "00000000", 0, uint160(),
+                                        0, 0, StaleInfo::unk, 16);
+    builder->share_data(share_data);
+    std::cout << "share_data" << std::endl;
 
-    BaseShare share_from_json;
-    share_from_json.DeserializeJSON(json);
+    // - share_info
+    builder->share_info(shares::types::ShareInfo{});
+    std::cout << "share_info" << std::endl;
 
-    ASSERT_EQ(share->contents.min_header->nonce, share_from_json.contents.min_header->nonce);
+    // - ref_merkle_link
+    builder->ref_merkle_link(coind::data::MerkleLink{});
+    std::cout << "ref_merkle_link" << std::endl;
+
+    // - last_txout_nonce
+    builder->last_txout_nonce(0);
+    std::cout << "last_txout_nonce" << std::endl;
+
+    // - hash_link
+    shares::types::HashLinkType hash_link{};
+    builder->hash_link(hash_link);
+
+    // - merkle_link
+    builder->merkle_link(coind::data::MerkleLink{});
+    std::cout << "merkle_link" << std::endl;
+
+    // Get result
+    ShareType share;
+
+    share = builder->GetShare();
 }

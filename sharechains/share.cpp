@@ -19,7 +19,7 @@ using namespace std;
 #include <boost/format.hpp>
 
 #define CheckShareRequirement(field_name)               \
-    if (field_name)                                     \
+    if (!field_name)                                     \
         throw std::runtime_error(#field_name " == NULL");
 
 void Share::init()
@@ -32,6 +32,9 @@ void Share::init()
     CheckShareRequirement(merkle_link);
 
     bool segwit_activated = shares::is_segwit_activated(VERSION, net);
+    if (segwit_activated && !segwit_data)
+        throw std::runtime_error("Segwit activated, but segwit_data == nullptr!");
+
 
     if (!(coinbase->size() >= 2 && coinbase->size() <= 100))
     {

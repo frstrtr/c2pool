@@ -580,6 +580,8 @@ namespace shares
             auto tx_hashes = other_transaction_hashes;
             tx_hashes.insert(tx_hashes.begin(),uint256());
 
+            builder->create(version, {});
+
             builder
                 ->min_header(min_header)
                 ->share_info(*share_info)
@@ -588,7 +590,7 @@ namespace shares
                 ->hash_link(*pref_to_hash_link)
                 ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
 
-            builder->create(version, {});
+
 
             share = builder->GetShare();
             //TODO: assert(share->header == header);
