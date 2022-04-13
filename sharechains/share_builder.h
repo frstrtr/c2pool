@@ -93,7 +93,7 @@ protected:
     }
 };
 
-class ShareObjectBuilder : public BaseShareBuilder, enable_shared_from_this<ShareObjectBuilder>
+class ShareObjectBuilder : public BaseShareBuilder, public enable_shared_from_this<ShareObjectBuilder>
 {
 public:
 	ShareObjectBuilder(std::shared_ptr<c2pool::Network> _net) : BaseShareBuilder(_net) { }
@@ -159,7 +159,7 @@ public:
     }
 };
 
-class ShareStreamBuilder : public BaseShareBuilder, enable_shared_from_this<ShareStreamBuilder>
+class ShareStreamBuilder : public BaseShareBuilder, public enable_shared_from_this<ShareStreamBuilder>
 {
 public:
 	ShareStreamBuilder(std::shared_ptr<c2pool::Network> _net) : BaseShareBuilder(_net) { }
