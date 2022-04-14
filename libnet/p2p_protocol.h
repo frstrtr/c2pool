@@ -436,7 +436,7 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_have_tx> msg)
         {
-            remote_tx_hashes.insert(msg->tx_hashes.value.begin(), msg->tx_hashes.value.end());
+            remote_tx_hashes.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
             if (remote_tx_hashes.size() > 10000)
             {
                 remote_tx_hashes.erase(remote_tx_hashes.begin(),
@@ -448,7 +448,7 @@ namespace c2pool::libnet::p2p
         {
             //remove all msg->txs hashes from remote_tx_hashes
             std::set<uint256> losing_txs;
-            losing_txs.insert(msg->tx_hashes.value.begin(), msg->tx_hashes.value.end());
+            losing_txs.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
 
             std::set<uint256> diff_txs;
             std::set_difference(remote_tx_hashes.begin(), remote_tx_hashes.end(),
