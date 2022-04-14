@@ -59,7 +59,7 @@ namespace c2pool::libnet::p2p
         { return make_shared<raw_message>(cmd); }
     };
 
-    class P2P_Protocol : public Protocol
+    class P2P_Protocol : public Protocol, public enable_shared_from_this<P2P_Protocol>
     {
     private:
         std::shared_ptr<c2pool::Network> _net;
@@ -70,7 +70,7 @@ namespace c2pool::libnet::p2p
 
         std::map<uint256, coind::data::stream::TransactionType_stream> remembered_txs;
         int32_t remembered_txs_size;
-        //TODO: known_txs_cache
+        std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
 
     public:
         P2P_Protocol(shared_ptr<c2pool::libnet::p2p::P2PSocket> socket, std::shared_ptr<c2pool::Network> __net,
@@ -337,109 +337,96 @@ namespace c2pool::libnet::p2p
         void handle(shared_ptr<message_shares> msg)
         {
             //t0
-//            vector<tuple<ShareType, vector<UniValue>>> result; //share, txs
-//            for (auto wrappedshare: msg->raw_shares)
-//            {
-//                int _type = wrappedshare["type"].get_int();
-//                if (_type < 17)
-//                { //TODO: 17 = minimum share version; move to macros
-//                    continue;
-//                }
-//
-//                shared_ptr<c2pool::shares::BaseShare> share = c2pool::shares::load_share(wrappedshare, _net,
-//                                                                                         _socket->get_addr());
-//                std::vector<UniValue> txs;
-//                if (_type >= 13)
-//                {
-//                    for (auto tx_hash: share->new_transaction_hashes)
-//                    {
-//                        //TODO: txs
-//                        /*
-//                        for tx_hash in share.share_info['new_transaction_hashes']:
-//                    if tx_hash in self.node.known_txs_var.value:
-//                        tx = self.node.known_txs_var.value[tx_hash]
-//                    else:
-//                        for cache in self.known_txs_cache.itervalues():
-//                            if tx_hash in cache:
-//                                tx = cache[tx_hash]
-//                                print 'Transaction %064x rescued from peer latency cache!' % (tx_hash,)
-//                                break
-//                        else:
-//                            print >>sys.stderr, 'Peer referenced unknown transaction %064x, disconnecting' % (tx_hash,)
-//                            self.disconnect()
-//                            return
-//                    txs.append(tx)
-//                        */
-//                    }
-//                }
-//                result.push_back(std::make_tuple(share, txs));
-//            }
-//            //TODO: p2pNode()->handle_shares(result, shared_from_this()); //TODO: create handle_shares in p2p_node
-//
-//            /*t1
-//            if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares))) */
+            vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
+            for (auto wrappedshare: msg->raw_shares.get())
+            {
+                // TODO: move all supported share version in network setting
+                if (wrappedshare.type.get() < 17)
+                    continue;
+
+                //TODO: optimize
+                PackStream stream_wrappedshare;
+                stream_wrappedshare << wrappedshare;
+                auto share = load_share(stream_wrappedshare, _net, _socket->get_addr());
+
+                std::vector<coind::data::tx_type> txs;
+                if (wrappedshare.type.get() >= 13)
+                {
+                    for (auto tx_hash: *share->new_transaction_hashes)
+                    {
+                        coind::data::tx_type tx;
+                        if (_p2p_node->known_txs.value().find(tx_hash) != _p2p_node->known_txs.value().end())
+                        {
+                            tx = _p2p_node->known_txs.value()[tx_hash];
+                        } else
+                        {
+                             for (auto cache : known_txs_cache)
+                             {
+                                 if (cache.find(tx_hash) != cache.end())
+                                 {
+                                     tx = cache[tx_hash];
+                                     LOG_INFO << boost::format("Transaction %0% rescued from peer latency cache!") % tx_hash.GetHex();
+                                     break;
+                                 }
+                             }
+                        }
+                        txs.push_back(tx);
+                    }
+                }
+                result.emplace_back(share, txs);
+            }
+
+            _p2p_node->handle_shares(result, shared_from_this());
+            //t1
+            //TODO: if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares)))
         }
 
         void handle(shared_ptr<message_sharereq> msg)
         {
-            //TODO: check for new Share System
-//            std::vector<uint256> hashes;
-//            for (auto hash: msg->hashes.get())
-//            {
-//                hashes.push_back(hash);
-//            }
-//
-//            std::vector<uint256> stops;
-//            for (auto hash: msg->stops.get())
-//            {
-//                stops.push_back(hash);
-//            }
-//
-//            //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
-//            auto shares = _p2p_node->handle_get_shares(hashes, msg->parents.value, stops, _socket->get_addr());
-//
-//            std::vector<share_type> _shares;
-//            try
-//            {
-//                for (auto share: shares)
-//                {
+            //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
+            auto shares = _p2p_node->handle_get_shares(msg->hashes.get(), msg->parents.get(), msg->stops.get(), _socket->get_addr());
+
+            std::vector<PackedShareData> _shares;
+            try
+            {
+                for (auto share: shares)
+                {
+                    //TODO: share->PackedShareData
 //                    auto contents = share->to_contents();
 //                    share_type _share(share->SHARE_VERSION, contents.write());
 //                    _shares.push_back(_share);
-//                }
-//                auto reply_msg = make_message<message_sharereply>(msg->id.get(), good, _shares);
-//                write(reply_msg);
-//            }
-//            catch (const std::invalid_argument &e)
-//            {
-//                auto reply_msg = make_message<message_sharereply>(msg->id.get(), too_long, _shares);
-//                write(reply_msg);
-//            }
+                }
+                auto reply_msg = make_message<message_sharereply>(msg->id.get(), good, _shares);
+                write(reply_msg);
+            }
+            catch (const std::invalid_argument &e)
+            {
+                auto reply_msg = make_message<message_sharereply>(msg->id.get(), too_long, _shares);
+                write(reply_msg);
+            }
         }
 
         void handle(shared_ptr<message_sharereply> msg)
         {
-            //TODO: check for new Share System
-//            std::vector<shared_ptr<c2pool::shares::BaseShare>> res;
-//            if (msg->result.value == 0)
-//            {
-//                for (auto share: msg->shares.l)
-//                {
-//                    if (share.type.value >= 17) //TODO: 17 = minimum share version; move to macros
-//                    {
-//                        UniValue contents(UniValue::VOBJ);
-//                        contents.read(share.contents.get());
-//
-//                        shared_ptr<c2pool::shares::BaseShare> _share = c2pool::shares::load_share(contents, _net,
-//                                                                                                  _socket->get_addr());
-//                        res.push_back(_share);
-//                    }
-//                }
-//            } else
-//            {
-//                //TODO: res = failure.Failure(self.ShareReplyError(result))
-//            }
-//            //TODO: self.get_shares.got_response(id, res)
+            std::vector<ShareType> res;
+            if (msg->result.get() == ShareReplyResult::good)
+            {
+                for (auto content: msg->shares.get())
+                {
+                    if (content.type.get() >= 17) //TODO: 17 = minimum share version; move to macros
+                    {
+                        //TODO: optimize
+                        PackStream stream_content;
+                        stream_content << content;
+                        ShareType _share = load_share(stream_content, _net, _socket->get_addr());
+                        res.push_back(_share);
+                    }
+                }
+            } else
+            {
+                //TODO: res = failure.Failure(self.ShareReplyError(result))
+            }
+            //TODO: self.get_shares.got_response(id, res)
         }
 
         void handle(shared_ptr<message_bestblock> msg)
@@ -449,28 +436,26 @@ namespace c2pool::libnet::p2p
 
         void handle(shared_ptr<message_have_tx> msg)
         {
-            //TODO: upd for new TXs
-//            remote_tx_hashes.insert(msg->tx_hashes.value.begin(), msg->tx_hashes.value.end());
-//            if (remote_tx_hashes.size() > 10000)
-//            {
-//                remote_tx_hashes.erase(remote_tx_hashes.begin(),
-//                                       std::next(remote_tx_hashes.begin(), remote_tx_hashes.size() - 10000));
-//            }
+            remote_tx_hashes.insert(msg->tx_hashes.value.begin(), msg->tx_hashes.value.end());
+            if (remote_tx_hashes.size() > 10000)
+            {
+                remote_tx_hashes.erase(remote_tx_hashes.begin(),
+                                       std::next(remote_tx_hashes.begin(), remote_tx_hashes.size() - 10000));
+            }
         }
 
         void handle(shared_ptr<message_losing_tx> msg)
         {
-            //TODO: upd for new TXs
-//            //remove all msg->txs hashes from remote_tx_hashes
-//            std::set<uint256> losing_txs;
-//            losing_txs.insert(msg->tx_hashes.value.begin(), msg->tx_hashes.value.end());
-//
-//            std::set<uint256> diff_txs;
-//            std::set_difference(remote_tx_hashes.begin(), remote_tx_hashes.end(),
-//                                losing_txs.begin(), losing_txs.end(),
-//                                std::inserter(diff_txs, diff_txs.begin()));
-//
-//            remote_tx_hashes = diff_txs;
+            //remove all msg->txs hashes from remote_tx_hashes
+            std::set<uint256> losing_txs;
+            losing_txs.insert(msg->tx_hashes.value.begin(), msg->tx_hashes.value.end());
+
+            std::set<uint256> diff_txs;
+            std::set_difference(remote_tx_hashes.begin(), remote_tx_hashes.end(),
+                                losing_txs.begin(), losing_txs.end(),
+                                std::inserter(diff_txs, diff_txs.begin()));
+
+            remote_tx_hashes = diff_txs;
         }
 
         void handle(shared_ptr<message_remember_tx> msg)
@@ -490,24 +475,23 @@ namespace c2pool::libnet::p2p
                     tx = _p2p_node->known_txs.value()[tx_hash];
                 } else
                 {
-                    //TODO: Update for new TXs:
-//                    for (auto cache : known_txs_cache)
-//                    {
-//                        if (cache.find(tx_hash.get()) != cache.end())
-//                        {
-//                            tx = cache[tx_hash.get()];
-//                            LOG_INFO << "Transaction " << tx_hash.get().ToString() << " rescued from peer latency cache!";
-//                            break;
-//                        } else
-//                        {
-//                            LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.get().ToString() << " disconnecting";
-//                            _socket->disconnect();
-//                            return;
-//                        }
-//                    }
+                    for (auto cache : known_txs_cache)
+                    {
+                        if (cache.find(tx_hash) != cache.end())
+                        {
+                            tx = cache[tx_hash];
+                            LOG_INFO << "Transaction " << tx_hash.ToString() << " rescued from peer latency cache!";
+                            break;
+                        } else
+                        {
+                            LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString() << " disconnecting";
+                            _socket->disconnect();
+                            return;
+                        }
+                    }
                 }
             }
-//
+
 //            if (remembered_txs_size >= max_remembered_txs_size)
 //            {
 //                throw std::runtime_error("too much transaction data stored!");

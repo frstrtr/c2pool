@@ -318,12 +318,12 @@ namespace c2pool::libnet::messages
     class message_shares : public base_message
     {
     public:
-        std::vector<UniValue> raw_shares;
+        ListType<PackedShareData> raw_shares;
 
     public:
         message_shares() : base_message("shares") {}
 
-        message_shares(std::vector<UniValue> _shares) : message_shares()
+        message_shares(std::vector<PackedShareData> _shares) : message_shares()
         {
             raw_shares = _shares;
         }
@@ -389,16 +389,16 @@ namespace c2pool::libnet::messages
     public:
         IntType(256) id;
         EnumType<ShareReplyResult, VarIntType> result;
-        ListType<c2pool::messages::stream::share_type_stream> shares; //type + contents data
+        ListType<PackedShareData> shares; //type + contents data
 
     public:
         message_sharereply() : base_message("sharereply") {}
 
-        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<share_type> _shares) : message_sharereply()
+        message_sharereply(uint256 _id, ShareReplyResult _result, std::vector<PackedShareData> _shares) : message_sharereply()
         {
             id = _id;
             result = _result;
-            shares = shares.make_type(_shares);
+            //TODO: shares = shares.make_type(_shares);
         }
 
         PackStream &write(PackStream &stream) override
