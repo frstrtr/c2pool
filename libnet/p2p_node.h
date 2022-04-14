@@ -80,6 +80,10 @@ namespace c2pool::libnet::p2p
             return shares;
         }
 
+        void handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares, shared_ptr<c2pool::libnet::p2p::Protocol> peer)
+        {
+            //TODO: finish
+        }
         void handle_bestblock(::shares::stream::BlockHeaderType_stream header);
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
