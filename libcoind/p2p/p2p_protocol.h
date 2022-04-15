@@ -39,9 +39,9 @@ namespace coind::p2p
     public:
         Event<uint256> new_block;    //block_hash
         Event<coind::data::tx_type> new_tx;      //bitcoin_data.tx_type
-        Event<shares::types::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
-        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<shares::types::BlockHeaderType> _new_headers)
+        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<BlockHeaderType> _new_headers)
         {
             new_block = _new_block;
             new_tx = _new_tx;

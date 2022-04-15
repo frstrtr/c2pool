@@ -58,9 +58,11 @@ namespace c2pool::libnet::p2p
         {
             throw std::invalid_argument("received block header fails PoW test");
         }
-        //TODO:
-//        auto _header = (::shares::BlockHeaderType) header;
-//        _coind_node->handle_header(_header);
+
+        auto _header = BlockHeaderType();
+        _header.set_stream(header);
+
+        _coind_node->handle_header(_header);
     }
 
     void P2PNode::listen()
