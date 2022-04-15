@@ -77,7 +77,6 @@ public:
 public:
     Variable()
     {
-        _value = std::make_shared<VarType>();
         changed = std::make_shared<Event<VarType>>();
         transitioned = std::make_shared<Event<VarType, VarType>>();
     }
@@ -95,8 +94,16 @@ public:
         return *_value;
     }
 
+    bool isNull() const
+    {
+        return _value == nullptr;
+    }
+
     Variable<VarType> &operator=(const VarType &__value)
     {
+        if (_value)
+            _value = std::make_shared<VarType>();
+
         if (*_value != __value)
         {
             auto oldvalue = *_value;
