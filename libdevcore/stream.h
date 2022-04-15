@@ -464,7 +464,15 @@ public:
 		_stream = std::make_shared<StreamType>(__stream);
 	}
 
+    PackStream get_pack()
+    {
+        PackStream __stream;
+        __stream << *_stream;
+        return std::move(__stream);
+    }
 
+    friend inline bool operator==(const StreamTypeAdapter &a, const StreamTypeAdapter &b) { return *a._value == *b._value; }
+    friend inline bool operator!=(const StreamTypeAdapter &a, const StreamTypeAdapter &b) { return !(a == b); }
 protected:
     virtual void _to_stream() = 0;
 
