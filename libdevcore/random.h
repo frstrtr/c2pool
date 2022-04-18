@@ -10,6 +10,8 @@ namespace c2pool::random
     ///[min, max]
     float RandomFloat(float min, float max);
 
+    std::vector<unsigned char> random_bytes(int32_t length);
+
     template <typename T>
     T RandomChoice(std::vector<T> &list);
 

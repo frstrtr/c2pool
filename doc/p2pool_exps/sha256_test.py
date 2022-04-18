@@ -95,11 +95,34 @@ def check_hash_link(hash_link, data, const_ending=''):
     assert len(extra) == extra_length
     return hashlib.sha256(sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest()
 
-d = random_bytes(random.randrange(2048))
-print(d)
-x = prefix_to_hash_link(d)
-print(x)
-res = check_hash_link(x, '')
-print(res)
-revert_res = prefix_to_hash_link(res)
-print(revert_res)
+# d = random_bytes(random.randrange(2048))
+# print(d)
+# x = prefix_to_hash_link(d)
+# print(x)
+# res = check_hash_link(x, '')
+# print(res)
+# revert_res = prefix_to_hash_link(res)
+# print(revert_res)
+
+_initial_state = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12)
+
+data = "123456789"
+
+#(initial_state, '', 0)
+_t1 = sha256(data, (initial_state, '', 0))
+t1 = _t1.digest()
+print(t1)
+t2 = hashlib.sha256(data).digest()
+print(t2)
+print(t1 == t2)
+#####################################################
+print("#"*16)
+print("t1:")
+print(_t1.state)
+print(_t1.buf)
+print(_t1.length)
+_t3 = sha256(data, (initial_state, '1337', 1))
+print("t3:")
+print(_t3.state)
+print(_t3.buf)
+print(_t3.length)

@@ -38,10 +38,10 @@ namespace shares
         return result.get();
     }
 
-    shared_ptr<shares::types::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
+    shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
     {
         //TODO: assert prefix.endswith(const_ending), (prefix, const_ending)
-        shared_ptr<shares::types::HashLinkType> result;
+        shared_ptr<::HashLinkType> result;
 
         //TODO:
 //        x = sha256.sha256(prefix)
@@ -564,7 +564,7 @@ namespace shares
             ShareType share;
             std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
 
-            shared_ptr<shares::types::HashLinkType> pref_to_hash_link;
+            shared_ptr<::HashLinkType> pref_to_hash_link;
             {
                 coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
 
@@ -587,7 +587,7 @@ namespace shares
                 ->share_info(*share_info)
                 ->ref_merkle_link(coind::data::MerkleLink())
                 ->last_txout_nonce(last_txout_nonce)
-                ->hash_link(*pref_to_hash_link)
+                ->hash_link(*pref_to_hash_link->get())
                 ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
 
 
