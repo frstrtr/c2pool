@@ -28,6 +28,17 @@ namespace c2pool::random
         return res;
     }
 
+    std::vector<unsigned char> random_bytes(int32_t length)
+    {
+        std::vector<unsigned char> bytes;
+
+        for (int i = 0; i < length; i++)
+        {
+            bytes.emplace_back(c2pool::random::RandomInt(0, 256));
+        }
+
+    }
+
     template <typename T>
     T RandomChoice(std::vector<T> &list)
     {
