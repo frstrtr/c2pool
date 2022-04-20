@@ -544,29 +544,51 @@ class TransactionType(Type):
 tx_type = TransactionType()
 
 #=====================
-tx1 = dict(
-    version=1,
+# tx1 = dict(
+#     version=1,
+#     tx_ins=[dict(
+#         previous_output=None,
+#         sequence=None,
+#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
+#     )],
+#     tx_outs=[dict(
+#         value=5003880250,
+#         script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
+#     )],
+#     lock_time=0,
+# )
+#
+# a = tx_type.pack(tx1)
+#
+# l_tx2 = []
+# for i in a:
+#     l_tx2 += [ord(i)]
+#
+# print(str(l_tx2).replace(',', ''))
+#
+# b = 'asdb3'
+# b2 = (hash256(b)+1)
+# print('hash: {0}, hex: {1}'.format(hash256(b), hex(hash256(b))))
+# print('hash: {0}, hex: {1}'.format(b2, hex(b2)))
+
+gentx = dict(
+    version=4294967295,
     tx_ins=[dict(
         previous_output=None,
         sequence=None,
-        script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
+        script='015d5d52ad85411c47a5a8c71b8de0a39835891c26539eb2170eee693f08681a0302042800000003205b41960f08035d9b1ced05be46f7f8621053f1d362341dee2b9ada51abb3cf47',
     )],
-    tx_outs=[dict(
-        value=5003880250,
-        script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
-    )],
+    tx_outs=([dict(value=0, script='\x6a\x24\xaa\x21\xa9\xed' + IntType(256).pack(1234567))]),
     lock_time=0,
 )
 
-a = tx_type.pack(tx1)
+gentx['marker'] = 3
+gentx['flag'] = 2
+gentx['witness'] = [["c2pool"*4]]
 
-l_tx2 = []
-for i in a:
-    l_tx2 += [ord(i)]
+def postprocess(data):
+    return [ord(x) for x in data]
 
-print(str(l_tx2).replace(',', ''))
-
-b = 'asdb3'
-b2 = (hash256(b)+1)
-print('hash: {0}, hex: {1}'.format(hash256(b), hex(hash256(b))))
-print('hash: {0}, hex: {1}'.format(b2, hex(b2)))
+packed_gentx = tx_id_type.pack(gentx)
+print(postprocess(packed_gentx))
+print(postprocess(packed_gentx[:-32]))

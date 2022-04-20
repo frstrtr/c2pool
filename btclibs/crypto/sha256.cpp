@@ -62,8 +62,16 @@ void inline Round(uint32_t a, uint32_t b, uint32_t c, uint32_t& d, uint32_t e, u
 }
 
 /** Initialize SHA-256 state. */
-void inline Initialize(uint32_t* s)
+void inline Initialize(uint32_t* s, uint32_t* custom_init_state = nullptr)
 {
+    if (custom_init_state)
+    {
+        for (int i = 0; i < 8; i++, custom_init_state++)
+        {
+            s[i] = *custom_init_state;
+        }
+        return;
+    }
     s[0] = 0x6a09e667ul;
     s[1] = 0xbb67ae85ul;
     s[2] = 0x3c6ef372ul;
