@@ -69,7 +69,7 @@ class sha256(object):
     def digest(self):
         state = self.state
         buf = self.buf + '\x80' + '\x00'*((self.block_size - 9 - len(self.buf)) % self.block_size) + struct.pack('>Q', self.length)
-
+        print([ord(x) for x in buf])
         for chunk in [buf[i:i + self.block_size] for i in xrange(0, len(buf), self.block_size)]:
             state = process(state, chunk)
 
@@ -109,7 +109,7 @@ _initial_state = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff5
 data = "123456789"
 
 #(initial_state, '', 0)
-_t1 = sha256(data, (initial_state, '', 0))
+_t1 = sha256(data, (_initial_state, '', 0))
 t1 = _t1.digest()
 print(t1)
 t2 = hashlib.sha256(data).digest()
@@ -118,11 +118,19 @@ print(t1 == t2)
 #####################################################
 print("#"*16)
 print("t1:")
-print(_t1.state)
-print(_t1.buf)
-print(_t1.length)
-_t3 = sha256(data, (initial_state, '1337', 1))
+print("digest: {0}".format(_t1.digest()))
+print("state: {0}".format((_t1.state)))
+print("buf: {0}".format((_t1.buf)))
+print("length: {0}".format((_t1.length)))
+_t3 = sha256(data, (initial_state, '1337', 0))
 print("t3:")
-print(_t3.state)
-print(_t3.buf)
-print(_t3.length)
+print("digest: {0}".format(_t3.digest()))
+print("state: {0}".format(_t3.state))
+print("buf: {0}".format(_t3.buf))
+print("length: {0}".format(_t3.length))
+_t4 = sha256(data, (_initial_state, '1337', 100))
+print("t4:")
+print("digest: {0}".format(_t4.digest()))
+print("state: {0}".format(_t4.state))
+print("buf: {0}".format(_t4.buf))
+print("length: {0}".format(_t4.length))
