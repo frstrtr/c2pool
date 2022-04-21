@@ -4,6 +4,7 @@
 
 #include "sha256.h"
 #include "common.h"
+#include <iostream>
 
 #include <assert.h>
 #include <string.h>
@@ -66,10 +67,15 @@ void inline Initialize(uint32_t* s, uint32_t* custom_init_state = nullptr)
 {
     if (custom_init_state)
     {
-        for (int i = 0; i < 8; i++, custom_init_state++)
-        {
-            s[i] = *custom_init_state;
+        auto it = custom_init_state;
+        for (int i = 0; i < 8; i++){
+            std::cout << *it << " ";
+            s[i] = *it;
+            it++;
+
         }
+        std::cout << std::endl;
+//        memcpy(s, custom_init_state, 8);
         return;
     }
     s[0] = 0x6a09e667ul;
@@ -642,10 +648,21 @@ CSHA256::CSHA256() : bytes(0)
     sha256::Initialize(s);
 }
 
+CSHA256::CSHA256(uint32_t* custom_init, unsigned char* _buf, uint64_t _length) : bytes(_length)
+{
+    sha256::Initialize(s, custom_init);
+    if (_buf)
+        memcpy(buf, _buf, strlen((char*)_buf));
+}
+
 CSHA256& CSHA256::Write(const unsigned char* data, size_t len)
 {
     const unsigned char* end = data + len;
     size_t bufsize = bytes % 64;
+    for (auto v : s){
+        std::cout << v << " ";
+    }
+    std::cout << std::endl;
     if (bufsize && bufsize + len >= 64) {
         // Fill the buffer, and process it.
         memcpy(buf + bufsize, data, 64 - bufsize);
