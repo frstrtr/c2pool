@@ -36,7 +36,6 @@ endif()
 include_directories(${Boost_INCLUDE_DIRS})
 
 set (CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(ProjectSecp256k1)
 
 add_subdirectory(libs)
 #---------------
