@@ -9,6 +9,7 @@
 #include "share_builder.h"
 #include <networks/network.h>
 #include <libdevcore/stream_types.h>
+#include <libdevcore/str.h>
 
 namespace shares
 {
@@ -32,20 +33,30 @@ namespace shares
 
         IntType(256) result;
 
-        //TODO: SHA256 test in p2pool
-        //TODO: return pack.IntType(256).unpack(hashlib.sha256(sha256.sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
-
+        //pack.IntType(256).unpack(hashlib.sha256(sha256.sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
+        //TODO: test
+        //TODO: result = coind::data::hash256_from_hash_link((unsigned char*)((*hash_link)->state.data()), data.data(), (unsigned char*)extra.data(), hash_link->get()->length);
         return result.get();
     }
 
+    //TODO: TEST
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
     {
         //TODO: assert prefix.endswith(const_ending), (prefix, const_ending)
         shared_ptr<::HashLinkType> result;
 
-        //TODO:
-//        x = sha256.sha256(prefix)
-//        return dict(state=x.state, extra_data=x.buf[:max(0, len(x.buf)-len(const_ending))], length=x.length//8)
+        auto sha = CSHA256().Write(prefix.data(), prefix.size());
+
+        uint32_t* state;
+        memcpy(state, sha.s, 8); //TODO: test
+
+        char* extra_data;
+        c2pool::dev::substr(extra_data, (char*) sha.buf, 0,  strlen((char*)sha.buf)-const_ending.size());
+
+
+        (*result)->length = sha.bytes*8;
+        (*result)->extra_data = {extra_data};
+        //TODO: init state
 
         return result;
     }
