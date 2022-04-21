@@ -134,3 +134,30 @@ print("digest: {0}".format(_t4.digest()))
 print("state: {0}".format(_t4.state))
 print("buf: {0}".format(_t4.buf))
 print("length: {0}".format(_t4.length))
+
+print("#"*16)
+print("#"*16)
+print("#"*16)
+
+a = sha256("123456789")
+print(a.hexdigest())
+print('15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225')
+
+b = sha256("1234567890", (_initial_state, '', 0))
+print(b.hexdigest())
+print('23de2ce70e77d80ba1c110071462e90e96710fd0b0ee3faa81b1d04b7fb58535')
+
+print(b.buf)
+print(b.length)
+
+c = sha256("123456789", (_initial_state, '1234567890', 80))
+print(c.hexdigest())
+print('7c3c79a815ce2b9b7d0e6e7a0f3ec415903ca435ef0a9f55cdd7bad317f8f225')
+
+initial_state2 = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12)
+d = sha256("12345678901234ac", (initial_state2, '12345678901234ac', 128))
+print(d.buf)
+print(d.length)
+
+print(hashlib.sha256(d.digest()).hexdigest())
+print('209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e')
