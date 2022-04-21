@@ -156,6 +156,17 @@ namespace coind::data
         return hash160(in);
     }
 
+    uint256 hash256_from_hash_link(uint32_t* init, unsigned char* data, unsigned char* buf, uint64_t length)
+    {
+        uint256 result;
+
+        unsigned char _buf[CSHA256::OUTPUT_SIZE];
+        CSHA256(init, buf, length).Write(data, strlen((char*)data)).Finalize(_buf);
+        CSHA256().Write(_buf, CSHA256::OUTPUT_SIZE).Finalize(result.begin());
+        reverse(result.begin(), result.end());
+        return result;
+    }
+
     PackStream pubkey_hash_to_script2(uint160 pubkey_hash)
     {
         auto packed_pubkey_hash = IntType(160)(pubkey_hash);
