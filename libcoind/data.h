@@ -159,6 +159,10 @@ namespace coind::data
 
     uint160 hash160(uint160 data);
 
+    //TODO: Check for data & buf valid '\0x0'
+    //double hash
+    uint256 hash256_from_hash_link(uint32_t* init, unsigned char* data, unsigned char* buf = nullptr, uint64_t length = 0);
+
     struct HumanAddressType
     {
         IntType(8) version;
