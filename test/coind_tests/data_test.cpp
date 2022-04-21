@@ -61,3 +61,11 @@ TEST(BitcoindDataTest, average_attempts_to_target_test){
     cout << fourth_res.GetHex() << endl;
     ASSERT_EQ(fourth_res.GetHex(), "00000000000000000000000000000000ffffffffffffffffffffffffffffffff");
 }
+
+TEST(CoindDataTest, hash256_from_hash_link_test)
+{
+    uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12};
+    auto result = coind::data::hash256_from_hash_link(_init, (unsigned char*)"12345678901234ac", (unsigned char*) "12345678901234ac", 128/8);
+    std::cout << result.GetHex() << std::endl;
+    ASSERT_EQ(result.GetHex(), "209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e");
+}
