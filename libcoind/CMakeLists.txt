@@ -11,8 +11,7 @@ set(jsonrpc_sources
         jsonrpc/requests.h 
         jsonrpc/results.h 
 #        jsonrpc/coind.cpp
-        jsonrpc/stratum.h
-        jsonrpc/stratum.cpp)
+        )
 
 set(coind_p2p_sources
         p2p/messages.h
@@ -28,5 +27,5 @@ set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources} 
 #find_package(CURL REQUIRED)
 
 add_library(libcoind STATIC ${coind_sources})
-target_link_libraries(libcoind btclibs libdevcore networks univalue) # ${CURL_LIBRARIES})
+target_link_libraries(libcoind btclibs libdevcore networks univalue jsonrpccxx) # ${CURL_LIBRARIES})
 #target_include_directories(libcoind PRIVATE ${CURL_INCLUDE_DIR})
