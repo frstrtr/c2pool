@@ -49,8 +49,9 @@ namespace shares
 #define SetProperty(type, name)          \
     type _##name;                        \
                                          \
-    void set_##name(const type &_value){ \
+    GenerateShareTransaction &set_##name(const type &_value){ \
         _##name = _value;                \
+		return *this; \
     }
 
 	class GenerateShareTransaction
