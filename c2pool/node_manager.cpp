@@ -65,7 +65,7 @@ namespace c2pool::libnet
 
         //Start listening for workers with a JSON-RPC server:
         //8:    Worker
-        _worker = std::make_shared<c2pool::libnet::WorkerBridge>();
+        _worker = std::make_shared<c2pool::libnet::Worker>(_net, _p2pnode, _tracker);
         //9:    Stratum
 
         //10:   WebRoot
@@ -129,7 +129,7 @@ namespace c2pool::libnet
         return _share_store;
     }
 
-    shared_ptr<c2pool::libnet::WorkerBridge> NodeManager::worker() const
+    shared_ptr<c2pool::libnet::Worker> NodeManager::worker() const
     {
         return _worker;
     }
@@ -158,7 +158,7 @@ namespace c2pool::libnet
     create_set_method(c2pool::libnet::CoindNode, _coind_node);
     create_set_method(ShareTracker, _tracker);
     create_set_method(ShareStore, _share_store);
-    create_set_method(c2pool::libnet::WorkerBridge, _worker);
+    create_set_method(c2pool::libnet::Worker, _worker);
     create_set_method(coind::jsonrpc::StratumNode, _stratum);
 
 #undef create_set_method

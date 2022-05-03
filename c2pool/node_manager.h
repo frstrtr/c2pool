@@ -19,7 +19,7 @@ namespace c2pool
         {
             class P2PNode;
         }
-        class WorkerBridge;
+        class Worker;
         class CoindNode;
     }
 
@@ -65,7 +65,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::CoindNode> coind_node() const;
         shared_ptr<ShareTracker> tracker() const;
         shared_ptr<ShareStore> share_store() const;
-        shared_ptr<c2pool::libnet::WorkerBridge> worker() const;
+        shared_ptr<c2pool::libnet::Worker> worker() const;
         shared_ptr<coind::jsonrpc::StratumNode> stratum() const;
 
     protected:
@@ -79,7 +79,7 @@ namespace c2pool::libnet
         shared_ptr<c2pool::libnet::CoindNode> _coind_node;
         shared_ptr<ShareTracker> _tracker;
         shared_ptr<ShareStore> _share_store;
-        shared_ptr<c2pool::libnet::WorkerBridge> _worker;
+        shared_ptr<c2pool::libnet::Worker> _worker;
         shared_ptr<coind::jsonrpc::StratumNode> _stratum;
 
     private:
@@ -108,7 +108,7 @@ namespace c2pool::libnet
         create_set_method(c2pool::libnet::CoindNode, _coind_node);
         create_set_method(ShareTracker, _tracker);
         create_set_method(ShareStore, _share_store);
-        create_set_method(c2pool::libnet::WorkerBridge, _worker);
+        create_set_method(c2pool::libnet::Worker, _worker);
         create_set_method(coind::jsonrpc::StratumNode, _stratum);
     };
 #undef create_set_method
