@@ -164,10 +164,10 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
     gentx_F.set_desired_target(FloatingInteger((*share_info)->bits).target()); //TODO: check
     gentx_F.set_ref_merkle_link(*ref_merkle_link->get());
     {
-        std::vector<std::tuple<uint256, boost::optional<int32_t>>> _desired_other_transaction_hashes_and_fees;
+        std::vector<std::tuple<uint256, std::optional<int32_t>>> _desired_other_transaction_hashes_and_fees;
         for (auto v: other_tx_hashes)
         {
-            boost::optional<int32_t> temp_value{};
+            std::optional<int32_t> temp_value{};
             _desired_other_transaction_hashes_and_fees.emplace_back(v, temp_value);
         }
         gentx_F.set_desired_other_transaction_hashes_and_fees(_desired_other_transaction_hashes_and_fees);

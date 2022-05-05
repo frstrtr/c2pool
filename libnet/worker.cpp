@@ -110,7 +110,7 @@ namespace c2pool::libnet
 			//TODO: local_hash_rate
 
 			auto lookbehind = 3600 / _net->SHARE_PERIOD;
-			auto block_subsidy = _p2p_node->
+//			auto block_subsidy = _p2p_node->
 
 		}
 
