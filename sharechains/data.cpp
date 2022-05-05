@@ -257,7 +257,7 @@ namespace shares
 		set<uint256> included_transactions = set<uint256>(other_transaction_hashes.begin(),
 														  other_transaction_hashes.end());
 
-		vector<boost::optional<int32_t>> removed_fee;
+		vector<std::optional<int32_t>> removed_fee;
 		int32_t removed_fee_sum;
 		int32_t definite_fees;
 		bool fees_none_contains = false;
@@ -272,11 +272,11 @@ namespace shares
 			{
 				removed_fee.push_back(fee);
 				if (fee.has_value())
-					removed_fee_sum += fee.get();
+					removed_fee_sum += *fee;
 			} else
 			{
 				if (fee.has_value())
-					definite_fees += fee.get();
+					definite_fees += *fee;
 				else
 					definite_fees += 0;
 			}

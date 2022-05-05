@@ -70,7 +70,7 @@ public:
 
 		auto end_point = verified.get_nth_parent_hash(share_hash, net->CHAIN_LENGTH * 15 / 16);
 
-		boost::optional<int32_t> block_height;
+		std::optional<int32_t> block_height;
 		auto gen_verif_chain = verified.get_chain(end_point, net->CHAIN_LENGTH / 16);
 
 		uint256 hash;
