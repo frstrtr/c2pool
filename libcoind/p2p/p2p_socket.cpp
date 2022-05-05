@@ -60,7 +60,7 @@ namespace coind::p2p
             c2pool::dev::timestamp(),
             addr_to,
             addr_from,
-            c2pool::random::RandomNonce(),
+			c2pool::random::randomNonce(),
             "C2Pool:v0.1", //TODO: Network.version
             0);
         write(version_msg);

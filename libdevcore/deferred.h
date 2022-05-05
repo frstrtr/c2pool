@@ -154,9 +154,9 @@ namespace c2pool::util::deferred
         void external_timer(std::function<void(const boost::system::error_code &ec)> __handler, const std::chrono::_V2::steady_clock::duration &expiry_time)
         {
             auto __timer = std::make_shared<io::steady_timer>(*context);
-            unsigned long long _id = c2pool::random::RandomNonce();
+            unsigned long long _id = c2pool::random::randomNonce();
             while (external_timers.count(_id) != 0){
-                _id = c2pool::random::RandomNonce();
+                _id = c2pool::random::randomNonce();
             }
             external_timers[_id] = __timer;
 

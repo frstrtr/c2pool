@@ -60,7 +60,7 @@ namespace c2pool::random
         return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1 / l);
     }
 
-    unsigned long long RandomNonce()
+    unsigned long long randomNonce()
     {
         boost::random::uniform_int_distribution<unsigned long long> rnd(0, 0xFFFFFFFFFFFFFFFF);
         return rnd(generator);

@@ -8,7 +8,7 @@
 #include <btclibs/uint256.h>
 // #include <libcoind/jsonrpc/coind.h>
 // #include <libcoind/data.h>
-#include "dgb/scrypt.h"
+#include "dgb/digibyte_subsidy.cpp"
 
 using std::shared_ptr;
 
@@ -22,6 +22,7 @@ namespace coind
         ADDRESS_VERSION = 30;
         RPC_PORT = 14024;
         BLOCK_PERIOD = 150;
+		DUMB_SCRYPT_DIFF = 1;
     }
 
     //TODO:
@@ -58,4 +59,9 @@ namespace coind
     {
         //TODO: return coind::data::hash256(packed_block_header);
     }
+
+	unsigned long long DigibyteParentNetwork::SUBSIDY_FUNC(int32_t height)
+	{
+		return GetBlockBaseValue(height);
+	}
 } // namespace c2pool

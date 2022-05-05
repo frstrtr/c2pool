@@ -25,6 +25,9 @@ using namespace shares::stream;
 
 class ShareTracker;
 
+#define SHARE_VERSION 17
+#define PreSegwitShare_VERSION 32
+
 class Share
 {
 public:

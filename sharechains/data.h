@@ -43,7 +43,7 @@ namespace shares
         GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
 	};
 
-#define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256,boost::optional<int32_t>>>
+#define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256, std::optional<int32_t>>>
 #define type_known_txs std::map<uint256, coind::data::tx_type>
 
 #define SetProperty(type, name)          \
@@ -71,7 +71,7 @@ namespace shares
 		SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
 		SetProperty(type_known_txs, known_txs);
 		SetProperty(unsigned long long, last_txout_nonce);
-		SetProperty(long long, base_subsidy);
+		SetProperty(unsigned long long, base_subsidy);
 
 		std::optional<shares::types::SegwitData> _segwit_data;
 

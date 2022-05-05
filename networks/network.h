@@ -109,6 +109,7 @@ namespace coind
         int ADDRESS_VERSION;
         int RPC_PORT;
 
+		int DUMB_SCRYPT_DIFF;
     public:
         ParentNetwork(std::string name);
 
@@ -119,7 +120,8 @@ namespace coind
         virtual bool version_check(int version) = 0;
 
         virtual uint256 POW_FUNC(PackStream& packed_block_header) = 0;
-        //TODO: virtual /*todo: type*/ POW_FUNC(/*todo: block_header_type.pack(uint256)*/);
+
+		virtual unsigned long long SUBSIDY_FUNC(int32_t height) = 0;
     };
 
     class DigibyteParentNetwork : public ParentNetwork
@@ -134,5 +136,7 @@ namespace coind
         bool version_check(int version) override;
 
         virtual uint256 POW_FUNC(PackStream& packed_block_header) override;
+
+		virtual unsigned long long SUBSIDY_FUNC(int32_t height) override;
     };
 }
