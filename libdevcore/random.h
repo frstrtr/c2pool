@@ -39,5 +39,5 @@ namespace c2pool::random
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l);
 
-    unsigned long long RandomNonce();
+    unsigned long long randomNonce();
 } // namespace c2pool::random

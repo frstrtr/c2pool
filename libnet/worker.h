@@ -51,6 +51,7 @@ namespace c2pool::libnet
 		std::shared_ptr<ShareTracker> _tracker;
 	public:
 		Variable<Work> current_work;
+		double donation_percentage; // TODO: init
 	};
 }
 

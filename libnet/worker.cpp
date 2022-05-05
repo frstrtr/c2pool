@@ -1,11 +1,13 @@
 #include "worker.h"
 
 #include <vector>
+#include <tuple>
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
 
 #include "p2p_node.h"
 #include <btclibs/uint256.h>
+#include <libdevcore/random.h>
 #include <sharechains/data.h>
 
 using std::vector;
@@ -49,19 +51,33 @@ namespace c2pool::libnet
 			 tx_hashes.push_back(coind::data::hash256(packed_tx));
 		}
 
-		uint256 _tx_hash;
-		coind::data::tx_type _tx;
-
 		std::map<uint256, coind::data::tx_type> tx_map;
-		BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(tx_hashes, current_work.value().transactions))
 		{
-			tx_map[_tx_hash] = _tx;
+			uint256 _tx_hash;
+			coind::data::tx_type _tx;
+
+			BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(tx_hashes, current_work.value().transactions))
+						{
+							tx_map[_tx_hash] = _tx;
+						}
 		}
 
 		//TODO???: self.node.mining2_txs_var.set(tx_map) # let node.py know not to evict these transactions
 
 		//4
-		//TODO: check for share_version
+		uint64_t share_version;
+
+		ShareType prev_share;
+		if (!_p2p_node->best_share.isNull())
+			prev_share = _tracker->get(_p2p_node->best_share.value());
+
+		if (!prev_share)
+		{
+			share_version = SHARE_VERSION;
+		} else
+		{
+			//TODO: Succsessor
+		}
 
 		//5
 
@@ -87,22 +103,59 @@ namespace c2pool::libnet
 		if (desired_share_target.IsNull())
 		{
 			//TODO: DUMB_SCRYPT_DIFF to parent network
-//			desired_share_target = coind::data::difficulty_to_target(1/_net->parent->DUMB)
+			arith_uint256 diff;
+			diff.SetHex("1");
+			desired_share_target = coind::data::difficulty_to_target(ArithToUint256(diff/_net->parent->DUMB_SCRYPT_DIFF));
+
+			//TODO: local_hash_rate
+
+			auto lookbehind = 3600 / _net->SHARE_PERIOD;
+			auto block_subsidy = _p2p_node->
+
 		}
 
 		//6
 		shares::GenerateShareTransaction generate_transaction(_tracker);
 		generate_transaction.
-				//TODO: set_share_data()
 				set_block_target(FloatingInteger(current_work.value().bits).target()).
 				set_desired_timestamp(dev::timestamp()+0.5f).
 				set_desired_target(desired_share_target).
-				//TODO: set_ref_merkle_link
-				//TODO: set_desired_other_transaction_hashes_and_fees
-				//TODO: set_base_subsidy
+				set_ref_merkle_link(coind::data::MerkleLink({},0)).
+				set_base_subsidy(_net->parent->SUBSIDY_FUNC(current_work.value().height)).
 				set_known_txs(tx_map);
 
-//		auto generate_tx_result = generate_transaction()
+		{
+			std::vector<std::tuple<uint256,std::optional<int32_t>>> desired_other_transaction_hashes_and_fees;
+			uint256 _tx_hash;
+			int32_t _fee;
+
+			BOOST_FOREACH(boost::tie(_tx_hash, _fee), boost::combine(tx_hashes, current_work.value().transaction_fees))
+						{
+							desired_other_transaction_hashes_and_fees.push_back(std::make_tuple(_tx_hash, std::make_optional(_fee)));
+						}
+			generate_transaction.set_desired_other_transaction_hashes_and_fees(desired_other_transaction_hashes_and_fees);
+		}
+		// ShareData
+		{
+			std::string coinbase; //TODO: init
+			uint16_t donation = 65535*donation_percentage/100; //TODO: check
+			StaleInfo stale_info; //TODO: init
+
+			types::ShareData _share_data(
+					_p2p_node->best_share.value(),
+					coinbase,
+					c2pool::random::randomNonce(),
+					pubkey_hash,
+					current_work.value().subsidy,
+					donation,
+					stale_info,
+					share_version
+					);
+
+			generate_transaction.set_share_data(_share_data);
+		}
+
+		auto gen_sharetx_res = generate_transaction(share_version);
 
 		//7
 //		coind::data::stream::TransactionType_stream packed_gentx(generate_transaction);
