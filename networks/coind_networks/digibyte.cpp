@@ -23,6 +23,10 @@ namespace coind
         RPC_PORT = 14024;
         BLOCK_PERIOD = 150;
 		DUMB_SCRYPT_DIFF = 1;
+        DUST_THRESHOLD = 0.001e8;
+
+        SANE_TARGET_RANGE_MIN.SetHex("10c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26f9");
+        SANE_TARGET_RANGE_MAX.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     }
 
     //TODO:

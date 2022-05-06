@@ -110,6 +110,9 @@ namespace coind
         int RPC_PORT;
 
 		int DUMB_SCRYPT_DIFF;
+        int DUST_THRESHOLD;
+        uint256 SANE_TARGET_RANGE_MIN;
+        uint256 SANE_TARGET_RANGE_MAX;
     public:
         ParentNetwork(std::string name);
 
