@@ -65,7 +65,7 @@ namespace c2pool::libnet
 
         //Start listening for workers with a JSON-RPC server:
         //8:    Worker
-        _worker = std::make_shared<c2pool::libnet::Worker>(_net, _p2pnode, _tracker);
+        _worker = std::make_shared<c2pool::libnet::Worker>(_net, _p2pnode, _coind_node, _tracker);
         //9:    Stratum
 
         //10:   WebRoot
