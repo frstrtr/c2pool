@@ -61,6 +61,14 @@ public:
         (*sig_anon)();
         *times += 1;
     }
+
+    int get_times() const
+    {
+        if (times)
+            return *times;
+        else
+            return 0;
+    }
 };
 
 
