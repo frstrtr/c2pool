@@ -17,12 +17,9 @@ namespace c2pool::libnet
 {
     Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<c2pool::libnet::p2p::P2PNode> p2p_node,
                    shared_ptr<c2pool::libnet::CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net),
-                                                                                                              _p2p_node(
-                                                                                                                      p2p_node),
-                                                                                                              _coind_node(
-                                                                                                                      coind_node),
-                                                                                                              _tracker(
-                                                                                                                      tracker)
+                                                                                                              _p2p_node(p2p_node),
+                                                                                                              _coind_node(coind_node),
+                                                                                                              _tracker(tracker)
     {
 
     }
