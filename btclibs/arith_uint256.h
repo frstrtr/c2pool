@@ -274,11 +274,21 @@ public:
 
     friend uint256 ArithToUint256(const arith_uint256 &);
     friend arith_uint256 UintToArith256(const uint256 &);
+
+    arith_uint256 operator=(const uint256& v);
 };
 
 uint256 ArithToUint256(const arith_uint256 &);
 arith_uint256 UintToArith256(const uint256 &);
 
 extern template class base_uint<256>;
+
+uint256 operator+(const uint256 &a, const uint256 &b);
+
+uint256 operator-(const uint256 &a, const uint256 &b);
+
+arith_uint256 operator+(const arith_uint256 &a, const uint256 &b);
+
+arith_uint256 operator-(const arith_uint256 &a, const uint256 &b);
 
 #endif // BITCOIN_ARITH_UINT256_H

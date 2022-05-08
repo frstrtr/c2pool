@@ -252,3 +252,42 @@ arith_uint256 UintToArith256(const uint256 &a)
         b.pn[x] = ReadLE32(a.begin() + x*4);
     return b;
 }
+
+arith_uint256 arith_uint256::operator=(const uint256 &v){
+    *this = UintToArith256(v);
+    return *this;
+}
+
+uint256 operator+(const uint256 &a, const uint256 &b)
+{
+    auto _a = UintToArith256(a);
+    auto _b = UintToArith256(b);
+    arith_uint256 arith_res = _a + _b;
+
+    return ArithToUint256(arith_res);
+}
+
+uint256 operator-(const uint256 &a, const uint256 &b)
+{
+    auto _a = UintToArith256(a);
+    auto _b = UintToArith256(b);
+    arith_uint256 arith_res = _a - _b;
+
+    return ArithToUint256(arith_res);
+}
+
+arith_uint256 operator+(const arith_uint256 &a, const uint256 &b)
+{
+    auto _b = UintToArith256(b);
+    arith_uint256 arith_res = a + _b;
+
+    return arith_res;
+}
+
+arith_uint256 operator-(const arith_uint256 &a, const uint256 &b)
+{
+    auto _b = UintToArith256(b);
+    arith_uint256 arith_res = a - _b;
+
+    return arith_res;
+}
