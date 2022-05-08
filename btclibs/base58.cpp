@@ -17,22 +17,22 @@
 /** All alphanumeric characters except for "0", "I", "O", and "l" */
 static const char* pszBase58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const int8_t mapBase58[256] = {
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1, 0, 1, 2, 3, 4, 5, 6,  7, 8,-1,-1,-1,-1,-1,-1,
-    -1, 9,10,11,12,13,14,15, 16,-1,17,18,19,20,21,-1,
-    22,23,24,25,26,27,28,29, 30,31,32,-1,-1,-1,-1,-1,
-    -1,33,34,35,36,37,38,39, 40,41,42,43,-1,44,45,46,
-    47,48,49,50,51,52,53,54, 55,56,57,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6,  7, 8,-1,-1,-1,-1,-1,-1,
+        -1, 9,10,11,12,13,14,15, 16,-1,17,18,19,20,21,-1,
+        22,23,24,25,26,27,28,29, 30,31,32,-1,-1,-1,-1,-1,
+        -1,33,34,35,36,37,38,39, 40,41,42,43,-1,44,45,46,
+        47,48,49,50,51,52,53,54, 55,56,57,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
 };
 
 [[nodiscard]] static bool DecodeBase58(const char* psz, std::vector<unsigned char>& vch, int max_ret_len)
@@ -52,7 +52,7 @@ static const int8_t mapBase58[256] = {
     int size = strlen(psz) * 733 /1000 + 1; // log(58) / log(256), rounded up.
     std::vector<unsigned char> b256(size);
     // Process the characters.
-    static_assert(sizeof(mapBase58)/sizeof(mapBase58[0]) == 256, "mapBase58.size() should be 256"); // guarantee not out of range
+    static_assert(std::size(mapBase58) == 256, "mapBase58.size() should be 256"); // guarantee not out of range
     while (*psz && !IsSpace(*psz)) {
         // Decode base58 character
         int carry = mapBase58[(uint8_t)*psz];
@@ -126,7 +126,7 @@ std::string EncodeBase58(Span<const unsigned char> input)
 
 bool DecodeBase58(const std::string& str, std::vector<unsigned char>& vchRet, int max_ret_len)
 {
-    if (!ValidAsCString(str)) {
+    if (!ContainsNoNUL(str)) {
         return false;
     }
     return DecodeBase58(str.c_str(), vchRet, max_ret_len);
@@ -149,7 +149,7 @@ std::string EncodeBase58Check(Span<const unsigned char> input)
         return false;
     }
     // re-calculate the checksum, ensure it matches the included 4-byte checksum
-    uint256 hash = Hash(MakeSpan(vchRet).first(vchRet.size() - 4));
+    uint256 hash = Hash(Span{vchRet}.first(vchRet.size() - 4));
     if (memcmp(&hash, &vchRet[vchRet.size() - 4], 4) != 0) {
         vchRet.clear();
         return false;
@@ -160,7 +160,7 @@ std::string EncodeBase58Check(Span<const unsigned char> input)
 
 bool DecodeBase58Check(const std::string& str, std::vector<unsigned char>& vchRet, int max_ret)
 {
-    if (!ValidAsCString(str)) {
+    if (!ContainsNoNUL(str)) {
         return false;
     }
     return DecodeBase58Check(str.c_str(), vchRet, max_ret);
