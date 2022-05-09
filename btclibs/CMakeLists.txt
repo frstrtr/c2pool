@@ -25,6 +25,8 @@ set(sources
         base58.cpp
         serialize.h
         prevector.h
+        core_read.cpp
+        core_io.h
         ${crypto_sources}
         )
 
