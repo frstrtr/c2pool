@@ -3,6 +3,8 @@
 #include <btclibs/core_io.h>
 #include <btclibs/util/strencodings.h>
 
+#include <iostream>
+
 TEST(script, runtime_errors)
 {
     const std::vector<std::pair<std::string,std::string>> IN_OUT{
@@ -47,4 +49,20 @@ TEST(script, runtime_errors)
     ASSERT_THROW(ParseScript("11111111111111111111"), std::runtime_error);
     ASSERT_THROW(ParseScript("11111111111"), std::runtime_error);
     ASSERT_THROW(ParseScript("OP_CHECKSIGADD"), std::runtime_error);
+}
+
+TEST(script, parse)
+{
+    CScript sc;
+//    sc << ;
+//    std::cout << ParseHex("76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac") << std::endl;
+    sc << ParseHex("76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac");
+
+    std::cout << HexStr(sc) << std::endl;
+    std::cout << sc.IsPayToScriptHash() << std::endl;
+
+//    auto s = ParseScript(HexStr("76 a9 14 89 ab cd ef ab ba ab ba ab ba ab ba ab ba ab ba ab ba ab ba 88 ac"));
+//    std::cout << "s: " << s << std::endl;
+//ToByteVector()
+//    ParseScript(s);
 }
