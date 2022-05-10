@@ -19,7 +19,9 @@ namespace c2pool::libnet
                    shared_ptr<c2pool::libnet::CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net),
                                                                                                               _p2p_node(p2p_node),
                                                                                                               _coind_node(coind_node),
-                                                                                                              _tracker(tracker)
+                                                                                                              _tracker(tracker),
+                                                                                                              local_rate_monitor(10*60),
+                                                                                                              local_addr_rate_monitor(10*60)
     {
 
     }
@@ -108,7 +110,6 @@ namespace c2pool::libnet
         int64_t block_subsidy = 0;
         if (desired_share_target.IsNull())
         {
-            //TODO: DUMB_SCRYPT_DIFF to parent network
             arith_uint256 diff;
             diff.SetHex("1");
             desired_share_target = coind::data::difficulty_to_target(
