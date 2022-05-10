@@ -58,6 +58,20 @@ namespace c2pool::libnet
         NotifyData ba;
         std::function<int()> get_response; //TODO: change arguments
     };
+
+    struct local_rate_datum
+    {
+        uint256 work;
+        bool dead;
+        std::string user; // address
+        uint256 share_target;
+    };
+
+    struct local_addr_rate_datum
+    {
+        uint256 work;
+        uint160 pubkey_hash;
+    };
 }
 
 namespace c2pool::libnet
@@ -74,6 +88,9 @@ namespace c2pool::libnet
 		std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
         std::shared_ptr<c2pool::libnet::CoindNode> _coind_node;
 		std::shared_ptr<ShareTracker> _tracker;
+
+        math::RateMonitor<local_rate_datum> local_rate_monitor;
+        math::RateMonitor<local_addr_rate_datum> local_addr_rate_monitor;
 	public:
 		Variable<Work> current_work;
         Event<> new_work;

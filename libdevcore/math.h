@@ -7,6 +7,8 @@
 #include <initializer_list>
 #include <btclibs/uint256.h>
 
+#include "common.h"
+
 using namespace std;
 
 //TODO:
@@ -25,7 +27,6 @@ using namespace std;
 //      - binomial_conf_interval
 //      - format_binomial_conf
 //      - weighted_choice
-//      - RateMonitor
 
 namespace c2pool::math
 {
@@ -105,4 +106,62 @@ namespace c2pool::math
         }
         return result;
     }
+
+    template <typename T>
+    class RateMonitor
+    {
+    private:
+        int32_t max_lookback_time;
+        std::vector<std::pair<int32_t, T>> datums;
+
+        int32_t first_timestamp;
+
+        void prune()
+        {
+            auto start_time = c2pool::dev::timestamp() - max_lookback_time;
+
+            int i = 0;
+            for (auto [ts, datum]: datums)
+            {
+                if (ts > start_time)
+                {
+                    datums.erase(i); //TODO: check
+                }
+            }
+        }
+
+    public:
+        RateMonitor(int32_t _max_lookback_time) : max_lookback_time(_max_lookback_time), first_timestamp(0)
+        {}
+
+        void add_datum(T datum)
+        {
+            prune();
+
+            int32_t t = c2pool::dev::timestamp();
+            if (first_timestamp == 0)
+                first_timestamp = t;
+            else
+                datums.push_back(std::make_pair(t, datum));
+        }
+
+        std::tuple<std::vector<T>, int32_t> get_datums_in_last(int32_t dt = 0)
+        {
+            if (dt == 0)
+                dt = max_lookback_time;
+
+            assert(dt <= max_lookback_time);
+
+            prune();
+            int32_t now = c2pool::dev::timestamp();
+            std::vector<T> res;
+            for (auto [ts, datum]: datums)
+            {
+                if (ts > now - dt)
+                    res.push_back(datum);
+            }
+
+            return std::make_tuple(res, first_timestamp != 0 ? min(dt, now - first_timestamp) : 0);
+        }
+    };
 }
