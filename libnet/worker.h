@@ -115,7 +115,7 @@ namespace c2pool::libnet
         std::set<uint256> my_doa_share_hashes;
 
         Variable<std::tuple<int32_t, int32_t, int32_t>> removed_unstales; //TODO: WATCH
-        Variable<int32_t> removed_doa_unstalel; //TODO: WATCH
+        Variable<int32_t> removed_doa_unstales; //TODO: WATCH
 
 		double donation_percentage; // TODO: init
 	};
