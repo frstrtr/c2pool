@@ -10,6 +10,7 @@
 #include <btclibs/uint256.h>
 #include <libdevcore/random.h>
 #include <sharechains/data.h>
+#include <sharechains/prefsum_doa.h>
 
 using std::vector;
 
@@ -23,7 +24,32 @@ namespace c2pool::libnet
                                                                                                               local_rate_monitor(10*60),
                                                                                                               local_addr_rate_monitor(10*60)
     {
+        shares::doa_element_type::set_rules([&](ShareType share)
+        {
+            if (!share)
+            {
+                LOG_WARNING << "NULLPTR SHARE IN doa_element_type::rule!";
+                return std::tuple<int32_t, int32_t, int32_t, int32_t>(0,0,0,0);
+            }
 
+            int32_t my_count = 0;
+            if (my_share_hashes.count(share->hash))
+                my_count = 1;
+
+            int32_t my_doa_count = 0;
+            if (my_doa_share_hashes.count(share->hash))
+                my_doa_count = 1;
+
+            int32_t my_orphan_announce_count = 0;
+            if (my_share_hashes.count(share->hash) && (*share->share_data)->stale_info == orphan)
+                my_orphan_announce_count = 1;
+
+            int32_t my_dead_announce_count = 0;
+            if (my_share_hashes.count(share->hash) && (*share->share_data)->stale_info == doa)
+                my_dead_announce_count = 1;
+
+            return std::tuple(my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count);
+        });
     }
 
     worker_get_work_result Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target)

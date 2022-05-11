@@ -10,6 +10,7 @@
 
 #include "share.h"
 #include "prefsum_weights.h"
+#include "prefsum_doa.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libcoind/data.h>
@@ -27,6 +28,7 @@ namespace shares
         arith_uint256 work;
         arith_uint256 min_work;
 		weight::weight_element_type weight;
+        doa_element_type doa;
     public:
         element_type() {}
         element_type(ShareType _share)
@@ -37,6 +39,7 @@ namespace shares
             min_work = coind::data::target_to_average_attempts(_share->max_target);
             height = 1;
 			weight = weight::weight_element_type(_share);
+            doa = doa_element_type(_share);
         }
 
         uint256 hash()
@@ -55,37 +58,41 @@ namespace shares
             return *element->previous_hash;
         }
 
-        element_type operator+(const element_type &element)
+        element_type operator+(const element_type &_element)
         {
             element_type res = *this;
-            res.work += element.work;
-            res.height += element.height;
-			res.weight += res.weight;
+            res.work += _element.work;
+            res.height += _element.height;
+			res.weight += _element.weight;
+            res.doa += _element.doa;
             return res;
         }
 
-        element_type operator-(const element_type &element)
+        element_type operator-(const element_type &_element)
         {
             element_type res = *this;
-            res.work -= element.work;
-            res.height -= element.height;
-			res.weight -= element.weight;
+            res.work -= _element.work;
+            res.height -= _element.height;
+			res.weight -= _element.weight;
+            res.doa -= _element.doa;
             return res;
         }
 
-        element_type &operator+=(const element_type &element)
+        element_type &operator+=(const element_type &_element)
         {
-            this->work += element.work;
-            this->height += element.height;
-			this->weight += element.weight;
+            this->work += _element.work;
+            this->height += _element.height;
+			this->weight += _element.weight;
+            this->doa += _element.doa;
             return *this;
         }
 
-        element_type &operator-=(const element_type &element)
+        element_type &operator-=(const element_type &_element)
         {
-            this->work -= element.work;
-            this->height -= element.height;
-			this->weight += element.weight;
+            this->work -= _element.work;
+            this->height -= _element.height;
+			this->weight -= _element.weight;
+            this->doa -= _element.doa;
             return *this;
         }
 
@@ -105,6 +112,7 @@ namespace shares
         arith_uint256 work;
         arith_uint256 min_work;
 		weight::weight_element_type weight;
+        doa_element_type doa;
 
         element_delta_type(bool none = true)
         {
@@ -120,6 +128,7 @@ namespace shares
             work = el.work;
             min_work = el.min_work;
 			weight = el.weight;
+            doa = el.doa;
         }
 
         element_delta_type operator-(const element_delta_type &el) const
@@ -130,6 +139,7 @@ namespace shares
             res.work -= el.work;
             res.min_work -= el.min_work;
 			res.weight -= el.weight;
+            res.doa -= el.doa;
             return res;
         }
 
@@ -140,6 +150,7 @@ namespace shares
             work -= el.work;
             min_work -= el.min_work;
 			weight -= el.weight;
+            doa -= el.doa;
         }
 
         bool is_none()

@@ -103,6 +103,9 @@ namespace c2pool::libnet
 		Variable<Work> current_work;
         Event<> new_work;
 
+        std::set<uint256> my_share_hashes;
+        std::set<uint256> my_doa_share_hashes;
+
 		double donation_percentage; // TODO: init
 	};
 }
