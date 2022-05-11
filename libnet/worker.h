@@ -72,6 +72,12 @@ namespace c2pool::libnet
         uint256 work;
         uint160 pubkey_hash;
     };
+
+    struct local_rates
+    {
+        std::map<std::string, uint256> miner_hash_rates;
+        std::map<std::string, uint256> miner_dead_hash_rates;
+    };
 }
 
 namespace c2pool::libnet
@@ -83,6 +89,8 @@ namespace c2pool::libnet
 
         worker_get_work_result get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
 
+        local_rates get_local_rates();
+        std::map<uint160, uint256> get_local_addr_rates();
 	private:
 		std::shared_ptr<c2pool::Network> _net;
 		std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
