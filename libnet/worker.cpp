@@ -294,4 +294,52 @@ namespace c2pool::libnet
 
         return res;
     }
+
+    local_rates Worker::get_local_rates()
+    {
+        std::map<std::string, uint256> miner_hash_rates;
+        std::map<std::string, uint256> miner_dead_hash_rates;
+
+        auto [datums, dt] = local_rate_monitor.get_datums_in_last();
+        for (auto datum : datums)
+        {
+            {
+                arith_uint256 temp;
+                temp = ((miner_hash_rates.find(datum.user) != miner_hash_rates.end()) ? miner_hash_rates[datum.user]
+                                                                                      : uint256::ZERO);
+                temp += UintToArith256(datum.work) / dt;
+
+                miner_hash_rates[datum.user] = ArithToUint256(temp);
+            }
+
+            if (datum.dead)
+            {
+                arith_uint256 temp;
+                temp = ((miner_dead_hash_rates.find(datum.user) != miner_dead_hash_rates.end()) ? miner_dead_hash_rates[datum.user]
+                                                                                      : uint256::ZERO);
+                temp += UintToArith256(datum.work) / dt;
+                miner_dead_hash_rates[datum.user] = ArithToUint256(temp);
+            }
+        }
+
+        return {miner_hash_rates, miner_dead_hash_rates};
+    }
+
+    std::map<uint160, uint256> Worker::get_local_addr_rates()
+    {
+        std::map<uint160, uint256> addr_hash_rates;
+        auto [datums, dt] = local_addr_rate_monitor.get_datums_in_last();
+
+        for (auto datum : datums)
+        {
+            arith_uint256 temp;
+            temp = ((addr_hash_rates.find(datum.pubkey_hash) != addr_hash_rates.end()) ? addr_hash_rates[datum.pubkey_hash]
+                                                                                  : uint256::ZERO);
+            temp += UintToArith256(datum.work) / dt;
+
+            addr_hash_rates[datum.pubkey_hash] = ArithToUint256(temp);
+        }
+
+        return addr_hash_rates;
+    };
 }

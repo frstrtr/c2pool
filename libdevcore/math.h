@@ -125,7 +125,7 @@ namespace c2pool::math
             {
                 if (ts > start_time)
                 {
-                    datums.erase(i); //TODO: check
+                    datums.erase(datums.begin(), datums.begin() + i);
                 }
             }
         }
