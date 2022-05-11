@@ -24,6 +24,7 @@ namespace c2pool::libnet
                                                                                                               local_rate_monitor(10*60),
                                                                                                               local_addr_rate_monitor(10*60)
     {
+        // Rules for doa_element_type in PrefsumShare
         shares::doa_element_type::set_rules([&](ShareType share)
         {
             if (!share)
@@ -49,6 +50,24 @@ namespace c2pool::libnet
                 my_dead_announce_count = 1;
 
             return std::tuple(my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count);
+        });
+
+        // sub for removed_unstales Variable's
+        _tracker->removed.subscribe([&](ShareType share){
+            auto [count, orphan, doa] = removed_unstales.value();
+            if (my_share_hashes.count(share->hash) && tracker->is_child_of(share->hash, _coind_node->best_share.value()))
+            {
+                removed_unstales = std::make_tuple(
+                        count + 1,
+                        orphan + ((*share->share_data)->stale_info == orphan ? 1 : 0),
+                        doa + ((*share->share_data)->stale_info == doa ? 1 : 0)
+                );
+            }
+
+            if (my_doa_share_hashes.count(share->hash) && _tracker->is_child_of(share->hash, _coind_node->best_share.value()))
+            {
+                removed_doa_unstales = removed_doa_unstales.value() + 1;
+            }
         });
     }
 
@@ -378,7 +397,7 @@ namespace c2pool::libnet
 
         auto delta = _tracker->get_delta_to_last(_coind_node->best_share.value()).doa;
         auto my_shares_in_chain = delta.my_count + _removed_unstales;
-        auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstalel.value();
+        auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales.value();
         auto orphans_recorded_in_chain = delta.my_orphan_announce_count + _removed_unstales_orphans;
         auto doas_recorded_in_chain = delta.my_dead_announce_count + _removed_unstales_doa;
 
