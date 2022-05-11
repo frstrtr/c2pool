@@ -368,4 +368,23 @@ namespace c2pool::libnet
 
         return addr_hash_rates;
     };
+
+    stale_counts Worker::get_stale_counts()
+    {
+        auto my_shares = my_share_hashes.size();
+        auto my_doa_shares = my_doa_share_hashes.size();
+
+        auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales.value();
+
+        auto delta = _tracker->get_delta_to_last(_coind_node->best_share.value()).doa;
+        auto my_shares_in_chain = delta.my_count + _removed_unstales;
+        auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstalel.value();
+        auto orphans_recorded_in_chain = delta.my_orphan_announce_count + _removed_unstales_orphans;
+        auto doas_recorded_in_chain = delta.my_dead_announce_count + _removed_unstales_doa;
+
+        auto my_shares_not_in_chain = my_shares - my_shares_in_chain;
+        auto my_doa_shares_not_in_chain = my_doa_shares - my_doa_shares_in_chain;
+
+        return { {my_shares_not_in_chain - my_doa_shares_not_in_chain, my_doa_shares_not_in_chain}, (int32_t)my_shares, {orphans_recorded_in_chain, doas_recorded_in_chain} };
+    }
 }

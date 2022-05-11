@@ -78,6 +78,13 @@ namespace c2pool::libnet
         std::map<std::string, uint256> miner_hash_rates;
         std::map<std::string, uint256> miner_dead_hash_rates;
     };
+
+    struct stale_counts
+    {
+        std::tuple<int32_t, int32_t> orph_doa; //(orphans; doas)
+        int32_t total;
+        std::tuple<int32_t, int32_t> recorded_in_chain; // (orphans_recorded_in_chain, doas_recorded_in_chain)
+    };
 }
 
 namespace c2pool::libnet
@@ -91,6 +98,7 @@ namespace c2pool::libnet
 
         local_rates get_local_rates();
         std::map<uint160, uint256> get_local_addr_rates();
+        stale_counts get_stale_counts();
 	private:
 		std::shared_ptr<c2pool::Network> _net;
 		std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
@@ -105,6 +113,9 @@ namespace c2pool::libnet
 
         std::set<uint256> my_share_hashes;
         std::set<uint256> my_doa_share_hashes;
+
+        Variable<std::tuple<int32_t, int32_t, int32_t>> removed_unstales; //TODO: WATCH
+        Variable<int32_t> removed_doa_unstalel; //TODO: WATCH
 
 		double donation_percentage; // TODO: init
 	};
