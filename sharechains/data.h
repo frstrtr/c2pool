@@ -81,7 +81,7 @@ namespace shares
 		}
 
 	public:
-		GeneratedShareTransactionResult operator()(uint64_t version);
+		std::shared_ptr<GeneratedShareTransactionResult> operator()(uint64_t version);
 	};
 
 #undef SetProperty
