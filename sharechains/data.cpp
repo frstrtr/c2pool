@@ -92,7 +92,7 @@ namespace shares
     }
 
     //TODO: Test
-    GeneratedShareTransactionResult GenerateShareTransaction::operator()(uint64_t version)
+    std::shared_ptr<GeneratedShareTransactionResult> GenerateShareTransaction::operator()(uint64_t version)
     {
         //t0
 		ShareType previous_share = tracker->get(_share_data.previous_share_hash);
@@ -618,7 +618,6 @@ namespace shares
 //			(t5-t4)*1000.)
 //	    */
 //
-
-        return GeneratedShareTransactionResult(std::move(share_info),gentx, other_transaction_hashes,get_share_F);
+        return std::make_shared<GeneratedShareTransactionResult>(std::move(share_info),gentx, other_transaction_hashes,get_share_F);
     }
 }
