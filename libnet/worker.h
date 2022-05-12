@@ -56,7 +56,7 @@ namespace c2pool::libnet
     struct worker_get_work_result
     {
         NotifyData ba;
-        std::function<int()> get_response; //TODO: change arguments
+        std::function<bool(types::BlockHeaderType, std::string, IntType(64))> get_response;
     };
 
     struct local_rate_datum
@@ -85,6 +85,14 @@ namespace c2pool::libnet
         int32_t total;
         std::tuple<int32_t, int32_t> recorded_in_chain; // (orphans_recorded_in_chain, doas_recorded_in_chain)
     };
+
+    struct user_details
+    {
+        std::string user;
+        uint160 pubkey_hash;
+        uint256 desired_share_target;
+        uint256 desired_pseudoshare_target;
+    };
 }
 
 namespace c2pool::libnet
@@ -99,6 +107,7 @@ namespace c2pool::libnet
         local_rates get_local_rates();
         std::map<uint160, uint256> get_local_addr_rates();
         stale_counts get_stale_counts();
+        user_details get_user_details(std::string username);
 	private:
 		std::shared_ptr<c2pool::Network> _net;
 		std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
@@ -111,13 +120,18 @@ namespace c2pool::libnet
 		Variable<Work> current_work;
         Event<> new_work;
 
+        //TODO: for web static
+        //Event<> share_received;
+
         std::set<uint256> my_share_hashes;
         std::set<uint256> my_doa_share_hashes;
+        std::vector<std::tuple<int32_t, uint256>> recent_shares_ts_work;
 
-        Variable<std::tuple<int32_t, int32_t, int32_t>> removed_unstales; //TODO: WATCH
-        Variable<int32_t> removed_doa_unstales; //TODO: WATCH
+        Variable<std::tuple<int32_t, int32_t, int32_t>> removed_unstales;
+        Variable<int32_t> removed_doa_unstales;
 
 		double donation_percentage; // TODO: init
+        double worker_fee; //TODO: init
 	};
 }
 

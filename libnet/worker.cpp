@@ -4,6 +4,7 @@
 #include <tuple>
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
+#include <boost/tokenizer.hpp>
 
 #include "p2p_node.h"
 #include "coind_node.h"
@@ -11,6 +12,7 @@
 #include <libdevcore/random.h>
 #include <sharechains/data.h>
 #include <sharechains/prefsum_doa.h>
+#include <sharechains/share_adapters.h>
 
 using std::vector;
 
@@ -222,10 +224,10 @@ namespace c2pool::libnet
         auto gen_sharetx_res = generate_transaction(share_version);
 
         //7
-        PackStream packed_tx;
+        PackStream packed_gentx;
         {
             coind::data::stream::TransactionType_stream _gentx(gen_sharetx_res.gentx);
-            packed_tx << _gentx;
+            packed_gentx << _gentx;
         }
 
         std::vector<coind::data::tx_type> other_transactions;
@@ -286,7 +288,7 @@ namespace c2pool::libnet
         target = c2pool::math::clip(target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX); //TODO: check
 
         //9
-        auto getwork = dev::timestamp();
+        auto getwork_time = dev::timestamp();
         auto lp_count = new_work.get_times();
 
         coind::data::MerkleLink merkle_link;
@@ -320,20 +322,205 @@ namespace c2pool::libnet
         //TODO: for stats: self.last_work_shares.value[bitcoin_data.pubkey_hash_to_address(pubkey_hash, self.node.net.PARENT)]=share_info['bits']
 
         //10
+        NotifyData ba = {
+                std::max(current_work.value().version, 0x20000000),
+                current_work.value().previous_block,
+                merkle_link,
+                std::string(),//TODO: init: packed_gentx[:-self.COINBASE_NONCE_LENGTH-4],
+                std::string(),//TODO: init: packed_gentx[-4:]
+                current_work.value().timestamp,
+                current_work.value().bits,
+                target
+        };
+
+        // TODO: received_header_hashes = set()
+
         worker_get_work_result res = {
-                {
-                        std::max(current_work.value().version, 0x20000000),
-                        current_work.value().previous_block,
-                        merkle_link,
-                        std::string(),//TODO: init: packed_gentx[:-self.COINBASE_NONCE_LENGTH-4],
-                        std::string(),//TODO: init: packed_gentx[-4:]
-                        current_work.value().timestamp,
-                        current_work.value().bits,
-                        target
-                },
-                [=](){
+                ba,
+                [=, _gen_sharetx_res = std::move(gen_sharetx_res)](types::BlockHeaderType header, std::string user, IntType(64) coinbase_nonce){
+                    auto t0 = c2pool::dev::timestamp();
+
+                    PackStream new_packed_gentx;
+                    {
+                        new_packed_gentx << std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end()-12);
+
+                        PackStream temp;
+                        temp << coinbase_nonce;
+                        if (all_of(temp.data.begin(), temp.data.end(), [](unsigned char v) { return v == '\0';}))
+                            temp << std::vector<unsigned char>(packed_gentx.data.end()-4, packed_gentx.data.end());
+                        else
+                            temp << packed_gentx;
+
+                        new_packed_gentx << temp;
+                    }
+
+                    coind::data::tx_type new_gentx;
+                    {
+                        PackStream nonce_packed;
+                        nonce_packed << coinbase_nonce;
+
+                        if (all_of(nonce_packed.data.begin(), nonce_packed.data.end(), [](unsigned char v) { return v == '\0';}))
+                        {
+                            coind::data::stream::TransactionType_stream temp;
+                            new_packed_gentx >> temp;
+                            new_gentx = temp.tx;
+                        } else
+                        {
+                            new_gentx = gen_sharetx_res.gentx;
+                        }
+
+                        // reintroduce witness data to the gentx produced by stratum miners
+                        if (coind::data::is_segwit_tx(gen_sharetx_res.gentx))
+                        {
+                            new_gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, gen_sharetx_res.gentx->wdata->flag, gen_sharetx_res.gentx->wdata->witness);
+                        }
+                    }
+
+                    PackStream block_header_packed;
+                    {
+                        shares::stream::BlockHeaderType_stream _block_header_value(header);
+                        block_header_packed << _block_header_value;
+                    }
+
+                    auto header_hash = coind::data::hash256(block_header_packed);
+                    auto pow_hash = _net->parent->POW_FUNC(block_header_packed);
+
+                    try {
+                        if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target())) //XXX: or p2pool.DEBUG
+                        {
+                            //TODO: helper.submit_block
+                            LOG_INFO << "GOT BLOCK FROM MINER! Passing to bitcoind!";
+                        }
+                    } catch (const std::error_code &ec)
+                    {
+                        LOG_ERROR << "Error while processing potential block: " << ec.message();
+                    }
+
+                    auto user_detail = get_user_details(user);
+
+                    assert(header.previous_block == ba.previous_block);
+                    assert(header.merkle_root == coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), merkle_link));
+                    assert(header.bits == ba.bits);
+
+                    bool on_time = new_work.get_times() == lp_count;
+
+                    //TODO: merged mining
+//                    for aux_work, index, hashes in mm_later:
+//                        try:
+//                            if pow_hash <= aux_work['target'] or p2pool.DEBUG:
+//                                df = deferral.retry('Error submitting merged block: (will retry)', 10, 10)(aux_work['merged_proxy'].rpc_getauxblock)(
+//                                    pack.IntType(256, 'big').pack(aux_work['hash']).encode('hex'),
+//                                    bitcoin_data.aux_pow_type.pack(dict(
+//                                        merkle_tx=dict(
+//                                            tx=new_gentx,
+//                                            block_hash=header_hash,
+//                                            merkle_link=merkle_link,
+//                                        ),
+//                                        merkle_link=bitcoin_data.calculate_merkle_link(hashes, index),
+//                                        parent_block_header=header,
+//                                    )).encode('hex'),
+//                                )
+//                                @df.addCallback
+//                                def _(result, aux_work=aux_work):
+//                                    if result != (pow_hash <= aux_work['target']):
+//                                        print >>sys.stderr, 'Merged block submittal result: %s Expected: %s' % (result, pow_hash <= aux_work['target'])
+//                                    else:
+//                                        print 'Merged block submittal result: %s' % (result,)
+//                                @df.addErrback
+//                                def _(err):
+//                                    log.err(err, 'Error submitting merged block:')
+//                        except:
+//                            log.err(None, 'Error while processing merged mining POW:')
+
+
+                    // TODO: and header_hash not in received_header_hashes:
+                    if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(gen_sharetx_res.share_info->bits).target()))
+                    {
+                        auto last_txout_nonce =  coinbase_nonce.get();
+                        auto share = gen_sharetx_res.get_share(header, last_txout_nonce);
+
+                        LOG_INFO << "GOT SHARE! " << user << " " << share->hash
+                                 << " prev " << c2pool::dev::timestamp() - getwork_time
+                                 << " age " << (!on_time ? "DEAD OR ARRIVAL" : "");
+
+                        // XXX: ???
+                        //# node.py will sometimes forget transactions if bitcoind's work has changed since this stratum
+                        //# job was assigned. Fortunately, the tx_map is still in in our scope from this job, so we can use that
+                        //# to refill it if needed.
+
+                        auto known_txs = _coind_node->known_txs.value();
+
+                        std::map<uint256, coind::data::tx_type> missing;
+                        for (auto [_hash, _value] : tx_map)
+                            if (known_txs.count(_hash) == 0)
+                                missing[_hash] = _value;
+
+                        if (!missing.empty())
+                        {
+                            LOG_WARNING << missing.size() << " transactions were erroneously evicted from known_txs_var. Refilling now.";
+                            _coind_node->known_txs.add(missing);
+                        }
+
+                        my_share_hashes.insert(share->hash);
+                        if (!on_time)
+                            my_doa_share_hashes.insert(share->hash);
+
+                        _tracker->add(share);
+                        _coind_node->set_best_share();
+
+                        try
+                        {
+                            if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()) && _p2p_node)
+                            {
+                                //TODO:
+//                                self.node.p2p_node.broadcast_share(share.hash)
+                            }
+                        } catch (const error_code &ec)
+                        {
+                            LOG_ERROR << "Error forwarding block solution: " << ec.message();
+                        }
+
+                        //TODO: for web_static
+                        //self.share_received.happened(bitcoin_data.target_to_average_attempts(share.target), not on_time, share.hash)
+                    }
+
+                    if (pow_hash > target)
+                    {
+                        LOG_INFO << "Worker " << user << " submitted share with hash > target";
+                        LOG_INFO << "Hash: " << pow_hash.GetHex();
+                        LOG_INFO << "Target: " << target.GetHex();
+                    }
                     //TODO:
-                    return 1;
+                    //elif header_hash in received_header_hashes:
+                    //    print >>sys.stderr, 'Worker %s submitted share more than once!' % (user,)
+                    else
+                    {
+                        // TODO: received_header_hashes.add(header_hash)
+                        // TODO: for web static: self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(target), not on_time, user)
+                        recent_shares_ts_work.push_back({c2pool::dev::timestamp(), coind::data::target_to_average_attempts(target)});
+                        if (recent_shares_ts_work.size() > 50)
+                        {
+                            recent_shares_ts_work.erase(recent_shares_ts_work.begin(), recent_shares_ts_work.end()-50); //TODO: check
+                        }
+                        local_rate_monitor.add_datum(
+                                {
+                                    coind::data::target_to_average_attempts(target),
+                                    !on_time,
+                                    user,
+                                    FloatingInteger(gen_sharetx_res.share_info->bits).target()
+                                }
+                                );
+
+                        local_addr_rate_monitor.add_datum(
+                                {
+                                        coind::data::target_to_average_attempts(target),
+                                        pubkey_hash
+                                }
+                                );
+                    }
+                    auto t1 = c2pool::dev::timestamp();
+
+                    return on_time;
                 }
         };
 
@@ -405,5 +592,56 @@ namespace c2pool::libnet
         auto my_doa_shares_not_in_chain = my_doa_shares - my_doa_shares_in_chain;
 
         return { {my_shares_not_in_chain - my_doa_shares_not_in_chain, my_doa_shares_not_in_chain}, (int32_t)my_shares, {orphans_recorded_in_chain, doas_recorded_in_chain} };
+    }
+
+    // TODO: check
+    user_details Worker::get_user_details(std::string username)
+    {
+        user_details result;
+        result.desired_pseudoshare_target = uint256::ZERO;
+        result.desired_share_target = uint256::ZERO;
+
+        std::vector<std::string> contents;
+        boost::char_separator<char> sep("+", "/");
+        boost::tokenizer<boost::char_separator<char>> tokens(username, sep);
+        for (std::string t : tokens) { contents.push_back(t); }
+//        boost::split(contents, username, boost::is_any_of("+/"));
+        assert(contents.size() % 2 == 1);
+
+        result.user = boost::trim_copy(contents[0]);
+        contents.erase(contents.begin(), contents.begin() + 1);
+
+        for (int i = 0; i < (contents.size() - contents.size() % 2); i+=2)
+        {
+            std::string symbol = contents[i];
+            std::string parameter = contents[i+1];
+
+            if (symbol == "+")
+            {
+                result.desired_pseudoshare_target = coind::data::difficulty_to_target(uint256S(parameter));
+            } else if (symbol == "/")
+            {
+                result.desired_share_target = coind::data::difficulty_to_target(uint256S(parameter));
+            }
+        }
+
+        //TODO: parse args
+//        if self.args.address == 'dynamic':
+//            i = self.pubkeys.weighted()
+//            pubkey_hash = self.pubkeys.keys[i]
+//
+//            c = time.time()
+//            if (c - self.pubkeys.stamp) > self.args.timeaddresses:
+//                self.freshen_addresses(c)
+
+        if (c2pool::random::RandomFloat(0, 100) < worker_fee)
+        {
+            result.pubkey_hash = coind::data::address_to_pubkey_hash(result.user, _net);
+            //TODO: try-except from p2pool???
+//            if self.args.address != 'dynamic':
+//                pubkey_hash = self.my_pubkey_hash
+        }
+
+        return result;
     }
 }
