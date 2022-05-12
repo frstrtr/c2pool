@@ -18,6 +18,29 @@ using std::vector;
 
 namespace c2pool::libnet
 {
+    Work &Work::from_jsonrpc_data(coind::getwork_result data)
+    {
+        static Work result{};
+
+        result.version = data.version;
+        result.previous_block = data.previous_block;
+        result.bits = data.bits.get();
+        result.coinfbaseflags = std::string((char*)data.coinbaseflags.bytes());
+        result.height = data.height;
+        result.timestamp = data.time;
+        result.transactions = data.transactions;
+        for (auto v : data.transaction_fees)
+        {
+            if (v.has_value())
+                result.transaction_fees.push_back(v.value());
+            else
+                result.transaction_fees.push_back(0);
+        }
+        result.subsidy = data.subsidy;
+
+        return result;
+    }
+
     Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<c2pool::libnet::p2p::P2PNode> p2p_node,
                    shared_ptr<c2pool::libnet::CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net),
                                                                                                               _p2p_node(p2p_node),
@@ -71,6 +94,35 @@ namespace c2pool::libnet
                 removed_doa_unstales = removed_doa_unstales.value() + 1;
             }
         });
+
+        /* TODO
+         * # MERGED WORK
+
+        self.merged_work = variable.Variable({})
+
+        @defer.inlineCallbacks
+        def set_merged_work(merged_url, merged_userpass):
+            merged_proxy = jsonrpc.HTTPProxy(merged_url, dict(Authorization='Basic ' + base64.b64encode(merged_userpass)))
+            while self.running:
+                auxblock = yield deferral.retry('Error while calling merged getauxblock on %s:' % (merged_url,), 30)(merged_proxy.rpc_getauxblock)()
+                target = auxblock['target'] if 'target' in auxblock else auxblock['_target']
+                self.merged_work.set(math.merge_dicts(self.merged_work.value, {auxblock['chainid']: dict(
+                    hash=int(auxblock['hash'], 16),
+                    target='p2pool' if target == 'p2pool' else pack.IntType(256).unpack(target.decode('hex')),
+                    merged_proxy=merged_proxy,
+                )}))
+                yield deferral.sleep(1)
+        for merged_url, merged_userpass in merged_urls:
+            set_merged_work(merged_url, merged_userpass)
+
+        @self.merged_work.changed.watch
+        def _(new_merged_work):
+            print 'Got new merged mining work!'
+         */
+
+        // COMBINE WORK
+
+
     }
 
     worker_get_work_result Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target)
@@ -323,7 +375,7 @@ namespace c2pool::libnet
 
         //10
         NotifyData ba = {
-                std::max(current_work.value().version, 0x20000000),
+                std::max(current_work.value().version, (uint64_t)0x20000000),
                 current_work.value().previous_block,
                 merkle_link,
                 std::string(),//TODO: init: packed_gentx[:-self.COINBASE_NONCE_LENGTH-4],
@@ -643,5 +695,37 @@ namespace c2pool::libnet
         }
 
         return result;
+    }
+
+    void Worker::compute_work()
+    {
+        c2pool::libnet::Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
+        if (_coind_node->best_block_header.isNull())
+        {
+            auto bb = _coind_node->best_block_header.value();
+            PackStream packed_block_header = bb.get_pack();
+
+            if (bb->previous_block == t.previous_block &&
+                    UintToArith256(_net->parent->POW_FUNC(packed_block_header)) <= UintToArith256(t.bits.target()))
+            {
+                LOG_INFO << "Skipping from block " << bb->previous_block.GetHex() << " to block" << coind::data::hash256(packed_block_header) << "!";
+
+                t = {
+                        bb->version,
+                        coind::data::hash256(packed_block_header),
+                        bb->bits,
+                        "",
+                        t.height + 1,
+                        (int32_t)std::max((uint32_t)c2pool::dev::timestamp(), bb->timestamp + 1),
+                        {},
+                        {},
+                        coind::data::calculate_merkle_link({}, 0),
+                        _net->parent->SUBSIDY_FUNC(_coind_node->coind_work.value().height),
+//                        (int32_t)_coind_node->coind_work.value().last_update
+                };
+//                t = coind::getwork_result()
+            }
+            current_work = t;
+        }
     }
 }

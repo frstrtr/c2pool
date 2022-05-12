@@ -29,27 +29,31 @@ namespace c2pool::libnet
 	{
 	public:
 		// https://developer.bitcoin.org/reference/block_chain.html#block-headers
-		int32_t version;
+		uint64_t version;
 		uint256 previous_block;
-		uint32_t bits;
+		int32_t bits;
 		std::string coinfbaseflags;
 		int32_t height;
 		int32_t timestamp;
 		vector<coind::data::tx_type> transactions;
 		vector<int32_t> transaction_fees; //TODO
-		MerkleLink merkle_link;
-		int64_t subsidy;
+        coind::data::MerkleLink merkle_link; //TODO
+		uint64_t subsidy;
+        // TODO: last_update???
+
+        //TODO:
+        static Work &from_jsonrpc_data(coind::getwork_result data);
 	};
 
     struct NotifyData
     {
-        int32_t version;
+        uint64_t version;
         uint256 previous_block;
         coind::data::MerkleLink merkle_link;
         std::string coinb1;
         std::string coinb2;
         int32_t timestamp;
-        uint32_t bits;
+        int32_t bits;
         uint256 share_target;
     };
 
@@ -108,6 +112,8 @@ namespace c2pool::libnet
         std::map<uint160, uint256> get_local_addr_rates();
         stale_counts get_stale_counts();
         user_details get_user_details(std::string username);
+    private:
+        void compute_work();
 	private:
 		std::shared_ptr<c2pool::Network> _net;
 		std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
@@ -130,8 +136,8 @@ namespace c2pool::libnet
         Variable<std::tuple<int32_t, int32_t, int32_t>> removed_unstales;
         Variable<int32_t> removed_doa_unstales;
 
-		double donation_percentage; // TODO: init
-        double worker_fee; //TODO: init
+		double donation_percentage; // TODO: init from args
+        double worker_fee; //TODO: init from args
 	};
 }
 
