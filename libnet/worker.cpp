@@ -134,7 +134,7 @@ namespace c2pool::libnet
         }
 
         //5
-
+//TODO:
 //		local_addr_rates = self.get_local_addr_rates()
 //
 //		if desired_share_target is None:
@@ -226,13 +226,13 @@ namespace c2pool::libnet
         //7
         PackStream packed_gentx;
         {
-            coind::data::stream::TransactionType_stream _gentx(gen_sharetx_res.gentx);
+            coind::data::stream::TransactionType_stream _gentx(gen_sharetx_res->gentx);
             packed_gentx << _gentx;
         }
 
         std::vector<coind::data::tx_type> other_transactions;
         {
-            for (auto tx_hash: gen_sharetx_res.other_transaction_hashes)
+            for (auto tx_hash: gen_sharetx_res->other_transaction_hashes)
             {
                 other_transactions.push_back(tx_map[tx_hash]);
             }
@@ -277,7 +277,7 @@ namespace c2pool::libnet
             target = desired_pseudoshare_target;
         }
 
-        auto bits_target = FloatingInteger(gen_sharetx_res.share_info->bits).target();
+        auto bits_target = FloatingInteger(gen_sharetx_res->share_info->bits).target();
         if (target < bits_target)
         {
             target = bits_target;
@@ -292,15 +292,15 @@ namespace c2pool::libnet
         auto lp_count = new_work.get_times();
 
         coind::data::MerkleLink merkle_link;
-        if (gen_sharetx_res.share_info->segwit_data.has_value())
+        if (gen_sharetx_res->share_info->segwit_data.has_value())
         {
             std::vector<uint256> _copy_for_link{uint256()};
-            _copy_for_link.insert(_copy_for_link.begin(), gen_sharetx_res.other_transaction_hashes.begin(), gen_sharetx_res.other_transaction_hashes.end());
+            _copy_for_link.insert(_copy_for_link.begin(), gen_sharetx_res->other_transaction_hashes.begin(), gen_sharetx_res->other_transaction_hashes.end());
 
             merkle_link = coind::data::calculate_merkle_link(_copy_for_link, 0);
         } else
         {
-            merkle_link = gen_sharetx_res.share_info->segwit_data->txid_merkle_link;
+            merkle_link = gen_sharetx_res->share_info->segwit_data->txid_merkle_link;
         }
 
         //TODO: for debug INFO
@@ -337,7 +337,7 @@ namespace c2pool::libnet
 
         worker_get_work_result res = {
                 ba,
-                [=, _gen_sharetx_res = std::move(gen_sharetx_res)](types::BlockHeaderType header, std::string user, IntType(64) coinbase_nonce){
+                [=](types::BlockHeaderType header, std::string user, IntType(64) coinbase_nonce){
                     auto t0 = c2pool::dev::timestamp();
 
                     PackStream new_packed_gentx;
@@ -366,13 +366,13 @@ namespace c2pool::libnet
                             new_gentx = temp.tx;
                         } else
                         {
-                            new_gentx = gen_sharetx_res.gentx;
+                            new_gentx = gen_sharetx_res->gentx;
                         }
 
                         // reintroduce witness data to the gentx produced by stratum miners
-                        if (coind::data::is_segwit_tx(gen_sharetx_res.gentx))
+                        if (coind::data::is_segwit_tx(gen_sharetx_res->gentx))
                         {
-                            new_gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, gen_sharetx_res.gentx->wdata->flag, gen_sharetx_res.gentx->wdata->witness);
+                            new_gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, gen_sharetx_res->gentx->wdata->flag, gen_sharetx_res->gentx->wdata->witness);
                         }
                     }
 
@@ -434,10 +434,10 @@ namespace c2pool::libnet
 
 
                     // TODO: and header_hash not in received_header_hashes:
-                    if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(gen_sharetx_res.share_info->bits).target()))
+                    if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(gen_sharetx_res->share_info->bits).target()))
                     {
                         auto last_txout_nonce =  coinbase_nonce.get();
-                        auto share = gen_sharetx_res.get_share(header, last_txout_nonce);
+                        auto share = gen_sharetx_res->get_share(header, last_txout_nonce);
 
                         LOG_INFO << "GOT SHARE! " << user << " " << share->hash
                                  << " prev " << c2pool::dev::timestamp() - getwork_time
@@ -507,7 +507,7 @@ namespace c2pool::libnet
                                     coind::data::target_to_average_attempts(target),
                                     !on_time,
                                     user,
-                                    FloatingInteger(gen_sharetx_res.share_info->bits).target()
+                                    FloatingInteger(gen_sharetx_res->share_info->bits).target()
                                 }
                                 );
 
