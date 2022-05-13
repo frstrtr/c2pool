@@ -13,12 +13,13 @@
 #include <sharechains/data.h>
 #include <sharechains/prefsum_doa.h>
 #include <sharechains/share_adapters.h>
+#include <libcoind/jsonrpc/results.h>
 
 using std::vector;
 
 namespace c2pool::libnet
 {
-    Work &Work::from_jsonrpc_data(coind::getwork_result data)
+    Work Work::from_jsonrpc_data(coind::getwork_result data)
     {
         static Work result{};
 
@@ -37,8 +38,39 @@ namespace c2pool::libnet
                 result.transaction_fees.push_back(0);
         }
         result.subsidy = data.subsidy;
+        result.last_update = data.last_update;
 
         return result;
+    }
+
+    bool Work::operator==(const Work &value)
+    {
+        if (version != value.version)
+            return false;
+        if (previous_block != value.previous_block)
+            return false;
+        if (bits != value.bits)
+            return false;
+        if (coinfbaseflags != value.coinfbaseflags)
+            return false;
+        if (height != value.height)
+            return false;
+        if (timestamp != value.timestamp)
+            return false;
+        if (transactions != value.transactions)
+            return false;
+        if (transaction_fees != value.transaction_fees)
+            return false;
+        if (merkle_link != value.merkle_link)
+            return false;
+        if (subsidy != value.subsidy)
+            return false;
+        return true;
+    }
+
+    bool Work::operator!=(const Work &value)
+    {
+        return !(*this == value);
     }
 
     Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<c2pool::libnet::p2p::P2PNode> p2p_node,
@@ -697,6 +729,20 @@ namespace c2pool::libnet
         return result;
     }
 
+    user_details Worker::preprocess_request(std::string username)
+    {
+        if (!_p2p_node || _p2p_node->get_peers().size() == 0)
+        {
+            //TODO: raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
+        }
+        if (c2pool::dev::timestamp() > current_work.value().last_update + 60)
+        {
+            //TODO: raise jsonrpc.Error_for_code(-12345)(u'lost contact with bitcoind')
+        }
+
+        return get_user_details(username);
+    }
+
     void Worker::compute_work()
     {
         c2pool::libnet::Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
@@ -706,7 +752,7 @@ namespace c2pool::libnet
             PackStream packed_block_header = bb.get_pack();
 
             if (bb->previous_block == t.previous_block &&
-                    UintToArith256(_net->parent->POW_FUNC(packed_block_header)) <= UintToArith256(t.bits.target()))
+                    UintToArith256(_net->parent->POW_FUNC(packed_block_header)) <= UintToArith256(FloatingInteger(t.bits).target()))
             {
                 LOG_INFO << "Skipping from block " << bb->previous_block.GetHex() << " to block" << coind::data::hash256(packed_block_header) << "!";
 
@@ -721,7 +767,7 @@ namespace c2pool::libnet
                         {},
                         coind::data::calculate_merkle_link({}, 0),
                         _net->parent->SUBSIDY_FUNC(_coind_node->coind_work.value().height),
-//                        (int32_t)_coind_node->coind_work.value().last_update
+                        (int32_t)_coind_node->coind_work.value().last_update
                 };
 //                t = coind::getwork_result()
             }

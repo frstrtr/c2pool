@@ -1,75 +1,38 @@
 #pragma once
 
 #include <iostream>
+#include <memory>
+
 #include "stratum_protocol.h"
 
+#include <libnet/worker.h>
+#include <libdevcore/logger.h>
+#include <libdevcore/expiring_dict.h>
 
 class Stratum : public StratumProtocol
 {
+    typedef double difficulty_type;
 public:
-    Stratum(boost::asio::io_context& context);
+    Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<c2pool::libnet::Worker> _worker);
 
     boost::asio::deadline_timer _t_send_work;
+    std::shared_ptr<c2pool::libnet::Worker> worker;
+
+private:
+    std::string username;
+    expiring_dict<std::string, c2pool::libnet::worker_get_work_result> handler_map;
+
+public:
+    void _send_work();
 
 public:
     // Server:
-    json mining_subscribe(const json & _params)
-    {
-        std::vector<std::string> params = _params.get<std::vector<std::string>>();
-        auto miner_info = params[0];
-        std::cout << "mining.subscribe called: " << miner_info << std::endl;
-
-        json res;
-        //res = {{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"}, "", 8};
-
-        _t_send_work.expires_from_now(boost::posix_time::seconds(1));
-        _t_send_work.async_wait([&](const boost::system::error_code &ec){
-            mining_set_difficulty();
-            mining_notify();
-        });
-
-        res = {{{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"},{}}, "", 8};
-        return res;
-    }
-
-    json mining_authorize(const std::string &username, const std::string &password)
-    {
-        std::cout << "Auth with [username: " << username << ", password: " << password << "]." << std::endl;
-        return json({true});
-    }
+    json mining_subscribe(const json & _params);
+    json mining_authorize(const std::string &_username, const std::string &_password);
 
 public:
     // Client:
-    json mining_set_difficulty()
-    {
-        client.CallNotification("mining.set_difficulty", {0x1b0404cb});
-        std::cout << "called mining_set_difficulty" << std::endl;
-    }
-
-    json mining_notify()
-    {
-        json notify_data = {
-                // jobid
-                "ae6812eb4cd7735a302a8a9dd95cf71f",
-                // prevhash
-                "4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6c0440b921e00000000",
-                // coinb1
-                "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008",
-                // coinb2
-                "072f736c7573682f000000000100f2052a010000001976a914d23fcdf86f7e756a64a7a9688ef9903327048ed988ac00000000",
-                // merkle_branch
-                json::array(),
-                // version
-                "00000002",
-                // nbits
-                "1c2ac4af",
-                // ntime
-                "504e86b9",
-                // clean_jobs
-                true
-        };
-        client.CallNotification("mining.notify", notify_data);
-        std::cout << "called mining.notify" << std::endl;
-    }
+    json mining_set_difficulty(difficulty_type difficulty);
+    json mining_notify();
     
 };
