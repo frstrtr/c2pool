@@ -4,6 +4,14 @@ set(coind_tool_sources
         transaction.h
         transaction.cpp
         height_tracker.h
+        jsonrpc/jsonrpc_coind.h
+        jsonrpc/jsonrpc_coind.cpp
+        jsonrpc/txidcache.h
+
+        jsonrpc/stratum.h
+        jsonrpc/stratum.cpp
+        jsonrpc/stratum_protocol.h
+        jsonrpc/stratum_protocol.cpp
         )
 
 set(jsonrpc_sources 
@@ -21,7 +29,7 @@ set(coind_p2p_sources
         p2p/p2p_socket.h
         p2p/p2p_socket.cpp)
 
-set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources} jsonrpc/jsonrpc_coind.h jsonrpc/jsonrpc_coind.cpp jsonrpc/txidcache.h)
+set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources} )
 
 #set(CURL_LIBRARY "-lcurl")
 #find_package(CURL REQUIRED)
