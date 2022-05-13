@@ -23,6 +23,11 @@ namespace c2pool
     }
 }
 
+namespace coind
+{
+    class getwork_result;
+}
+
 namespace c2pool::libnet
 {
 	class Work
@@ -39,10 +44,12 @@ namespace c2pool::libnet
 		vector<int32_t> transaction_fees; //TODO
         coind::data::MerkleLink merkle_link; //TODO
 		uint64_t subsidy;
-        // TODO: last_update???
+        int32_t last_update;
 
-        //TODO:
-        static Work &from_jsonrpc_data(coind::getwork_result data);
+        static Work from_jsonrpc_data(coind::getwork_result data);
+
+        bool operator==(const Work &value);
+        bool operator!=(const Work &value);
 	};
 
     struct NotifyData
@@ -112,9 +119,10 @@ namespace c2pool::libnet
         std::map<uint160, uint256> get_local_addr_rates();
         stale_counts get_stale_counts();
         user_details get_user_details(std::string username);
+        user_details preprocess_request(std::string username);
     private:
         void compute_work();
-	private:
+	public:
 		std::shared_ptr<c2pool::Network> _net;
 		std::shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
         std::shared_ptr<c2pool::libnet::CoindNode> _coind_node;

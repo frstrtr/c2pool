@@ -3,24 +3,8 @@
 #include <iostream>
 #include <string>
 
-std::string StratumProtocol::Send(const std::string &request)
-{
-    auto _req = request + "\n";
-    std::cout << "SEND DATA: " << _req << std::endl;
-    boost::asio::async_write(*socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
-        if (!ec)
-        {
-            //buffer.consume(buffer.size());
-//                    read();
-            std::cout << "Writed answer" << std::endl;
-        } else {
-            std::cout << "Response error: " << ec.message() << std::endl;
-        }
-    });
-    return std::__cxx11::string();
-}
 
-StratumProtocol::StratumProtocol(boost::asio::io_context& context) : client(*this, version::v2), acceptor(context), resolver(context)
+StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context) : _context(context), client(*this, version::v2), acceptor(*context), resolver(*context)
 {
     ip::tcp::endpoint listen_ep(ip::tcp::v4(), 1131);
 
@@ -69,4 +53,27 @@ void StratumProtocol::read()
             std::cout << "StratumProtocol::read() error: " << ec.message() << std::endl;
         }
     });
+}
+
+std::string StratumProtocol::Send(const std::string &request)
+{
+    auto _req = request + "\n";
+    std::cout << "SEND DATA: " << _req << std::endl;
+    boost::asio::async_write(*socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
+        if (!ec)
+        {
+            //buffer.consume(buffer.size());
+//                    read();
+            std::cout << "Writed answer" << std::endl;
+        } else {
+            std::cout << "Response error: " << ec.message() << std::endl;
+        }
+    });
+    return std::__cxx11::string();
+}
+
+void StratumProtocol::disconnect()
+{
+    socket->close();
+    socket = nullptr;
 }
