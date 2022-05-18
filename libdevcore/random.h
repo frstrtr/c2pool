@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <map>
+#include <list>
 
 namespace c2pool::random
 {
@@ -25,16 +26,14 @@ namespace c2pool::random
         return item->second;
     }
 
-
-    //TODO: Remake?
-    // template <typename K, typename V, typename Compare = std::less<K>,
-    //           typename Alloc = std::allocator<std::pair<const K, V>>>
-    // V RandomChoice(std::map<K, V, Compare, Alloc> m)
-    // { //TODO: THIS WANNA TEST
-    //     int pos = RandomInt(0, m.size());
-    //     std::iterator item = m.cbegin();
-    //     return std::advance(item, pos);
-    // }
+    template <typename Value>
+    Value RandomChoice(std::list<Value> _list)
+    {
+        int pos = RandomInt(0, _list.size());
+        auto item = _list.begin();
+        std::advance(item, pos);
+        return *item;
+    }
 
     ///l = 1.0/<среднее желаемое число>
     float Expovariate(float l);
