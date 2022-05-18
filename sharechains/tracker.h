@@ -28,9 +28,22 @@ class GeneratedShare;
 #define LOOKBEHIND 200
 //TODO: multi_index for more speed https://www.boost.org/doc/libs/1_76_0/libs/multi_index/doc/index.html
 
+struct desired_type
+{
+    std::tuple<std::string, std::string> peer_addr;
+    uint256 hash;
+    uint32_t timestamp;
+    uint256 target;
+
+    friend bool operator<(const desired_type& l, const desired_type& r)
+    {
+        return std::tie(l.peer_addr, l.hash, l.target, l.timestamp) < std::tie(r.peer_addr, r.hash, r.target, r.timestamp);
+    }
+};
+
 struct TrackerThinkResult
 {
-	uint256 best_hash;
+	uint256 best;
 	std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
 	std::vector<uint256> decorated_heads; //TODO: TYPE???
 	std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
@@ -54,7 +67,7 @@ public:
 
 	bool attempt_verify(ShareType share);
 
-	TrackerThinkResult think(boost::function<int32_t(uint256)> block_rel_height_func);
+	TrackerThinkResult think(boost::function<int32_t(uint256)> block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs);
 
 	arith_uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
@@ -189,4 +202,11 @@ public:
 
 		return std::make_tuple(weights, total_weight, donation_weight);
 	}
+
+    // from p2pool::share
+    std::vector<uint256> get_other_tx_hashes(ShareType share);
+
+    std::vector<coind::data::tx_type> _get_other_txs(ShareType share, const std::map<uint256, coind::data::tx_type> &known_txs);
+
+    std::tuple<bool, std::string> should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits, const std::map<uint256, coind::data::tx_type> &known_txs);
 };

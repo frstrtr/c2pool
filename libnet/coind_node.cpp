@@ -36,6 +36,7 @@ namespace c2pool::libnet
         coind_work = Variable<coind::getwork_result>(_coind->getwork(txidcache));
         new_block.subscribe([&](uint256 _value)
                              {
+
                                  //Если получаем новый блок, то обновляем таймер
                                  work_poller_t.expires_from_now(boost::posix_time::seconds(15));
                              });
