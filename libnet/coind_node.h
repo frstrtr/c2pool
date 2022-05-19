@@ -58,7 +58,7 @@ namespace c2pool::libnet
         VariableDict<uint256, coind::data::tx_type> mining_txs;
         VariableDict<uint256, coind::data::tx_type> mining2_txs;
         Variable<uint256> best_share;
-        Variable<c2pool::libnet::addr> desired;
+        Variable<std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>>> desired;
 
         Event<uint256> new_block;                           //block_hash
         Event<coind::data::tx_type> new_tx;                 //bitcoin_data.tx_type

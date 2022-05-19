@@ -56,6 +56,11 @@ namespace coind::p2p
         void get_block_header(uint256 hash);
 
     public:
+        void write(std::shared_ptr<base_message> msg)
+        {
+            _socket->write(msg);
+        }
+
         shared_ptr<raw_message> make_raw_message() { return make_shared<raw_message>(); }
 
         void handle(shared_ptr<raw_message> RawMSG)
