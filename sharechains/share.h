@@ -77,6 +77,7 @@ public:
 	uint256 hash; //=header_hash
 	int32_t time_seen;
 
+    int32_t gentx_weight;
 public:
 	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _addr) : VERSION(version)
 	{

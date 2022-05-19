@@ -197,7 +197,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     }
 
     // decide best tree
-    std::vector<std::tuple<int32_t, uint256>> decorated_tails;
+    std::vector<std::tuple<std::tuple<int32_t, uint256>, uint256>> decorated_tails;
     for (auto tail_hash : verified.sum)
     {
         auto max_el = std::max_element(tail_hash.second.nexts.begin(), tail_hash.second.nexts.end(),
@@ -206,23 +206,64 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
                             return verified.get_work(a->first) < verified.get_work(b->first);
                          });
 
-        auto _score = score((*max_el)->first, block_rel_height_func);
+        auto _score = std::make_tuple(score((*max_el)->first, block_rel_height_func), tail_hash.first);
         decorated_tails.push_back(_score);
     }
     std::sort(decorated_tails.begin(), decorated_tails.end()); //TODO: test for compare with p2pool
 
-    auto [best_tail_score, best_tail] = decorated_tails.empty() ? std::make_tuple(0, uint256::ZERO) : decorated_tails.back();
+    auto [best_tail_score, best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, uint256::ZERO), uint256::ZERO) : decorated_tails.back();
 
     // decide best verified head
-    std::vector<std::tuple<int>> decorated_heads;
+    std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
     for (auto h : verified.sum[best_tail].nexts)
     {
-        //TODO:
-//        std::make_tuple(
-//                verified.get_work(verified.get_nth_parent_hash(h->first, std::min(5, verified.get_height(h->first)))),
-//                -h->second.element.
-//                )
+        auto el = std::make_tuple(
+                verified.get_work(verified.get_nth_parent_hash(h->first, std::min(5, verified.get_height(h->first)))),
+                - std::get<0>(should_punish_reason(h->second.element,previous_block, bits, known_txs)),
+                - h->second.element->time_seen
+                );
+        decorated_heads.push_back({el, h->first});
     }
+    std::sort(decorated_heads.begin(), decorated_heads.end()); //TODO: test for compare with p2pool
+    //TODO: debug print heads. Top 10.
+
+    auto [best_head_score, best] = decorated_heads.empty() ? std::make_tuple(std::make_tuple(uint256::ZERO, 0, 0), uint256::ZERO) : decorated_heads.back();
+
+    uint32_t timestamp_cutoff;
+    arith_uint256 target_cutoff;
+
+    if (!best.IsNull())
+    {
+        auto best_share = items[best];
+        auto [punish,  punish_reason] = should_punish_reason(best_share, previous_block, bits, known_txs);
+        if (punish)
+        {
+            LOG_INFO << "Punishing share for " << punish_reason << "! Jumping from " << best.ToString() << " to " << best_share->previous_hash->ToString() << "!";
+            best = *best_share->previous_hash;
+        }
+
+        timestamp_cutoff = std::min((uint32_t)c2pool::dev::timestamp(), *best_share->timestamp) - 3600;
+
+        target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        target_cutoff /= std::get<1>(best_tail_score).IsNull() ? UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) : (UintToArith256(std::get<1>(best_tail_score)) * net->SHARE_PERIOD + 1) * 2;
+    } else
+    {
+        timestamp_cutoff = c2pool::dev::timestamp() - 24*60*60;
+        target_cutoff = UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
+    }
+
+    //TODO: debug print data
+
+    auto _target_cutoff = ArithToUint256(target_cutoff);
+
+    std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired_result;
+    for (auto [peer_addr, hash, ts, targ] : desired)
+    {
+        if (ts >= timestamp_cutoff)
+            desired_result.push_back({peer_addr, hash});
+    }
+
+    return {best, desired_result, decorated_heads, bad_peer_addresses};
 }
 
 arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
@@ -306,6 +347,34 @@ std::vector<coind::data::tx_type> ShareTracker::_get_other_txs(ShareType share, 
 std::tuple<bool, std::string> ShareTracker::should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits,
                                                                  const std::map<uint256, coind::data::tx_type> &known_txs)
 {
-    //TODO:
-    return std::tuple<bool, std::string>();
+    if (UintToArith256(share->pow_hash) <= UintToArith256(share->header.stream()->bits.bits.target()))
+        return {-1, "block_solution"};
+
+    auto other_txs = _get_other_txs(share, known_txs);
+    if (!other_txs.empty())
+    {
+        // Оптимизация?: два all_txs_size; stripped_txs_size -- за один цикл, а не два.
+        auto all_txs_size = std::accumulate(other_txs.begin(), other_txs.end(), 0, [&](const int32_t &a, coind::data::tx_type tx)-> int32_t{
+            coind::data::stream::TransactionType_stream packed_tx = tx;
+
+            PackStream stream;
+            stream << packed_tx;
+            return a + stream.size();
+        });
+
+        auto stripped_txs_size = std::accumulate(other_txs.begin(), other_txs.end(), 0, [&](const int32_t &a, coind::data::tx_type tx)-> int32_t{
+            auto stream_txid = coind::data::stream::TxIDType_stream(tx->version,tx->tx_ins, tx->tx_outs, tx->lock_time);
+            PackStream stream;
+            stream << stream_txid;
+
+            return a + stream.size();
+        });
+
+        //TODO: c2pool::DEBUG -> print stripped_txs_size
+        if ((all_txs_size + 3 * stripped_txs_size + 4*80 + share->gentx_weight) > net->BLOCK_MAX_WEIGHT)
+            return {true, "txs over block weight limit"};
+        if ((stripped_txs_size + 80 + share->gentx_size) > net->BLOCK_MAX_SIZE)
+            return {true, "txs over block size limit"};
+    }
+    return {false, ""};
 }

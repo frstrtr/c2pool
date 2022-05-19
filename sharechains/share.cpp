@@ -195,7 +195,17 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
 
     //TODO: Нужно ли это делать в c2pool???
 //    self.gentx_size = len(bitcoin_data.tx_id_type.pack(gentx))
-//    self.gentx_weight = len(bitcoin_data.tx_type.pack(gentx)) + 3*self.gentx_size
+
+    //    self.gentx_weight = len(bitcoin_data.tx_type.pack(gentx)) + 3*self.gentx_size
+    {
+        PackStream weight_stream;
+        coind::data::stream::TransactionType_stream tx_type_data = gentx->gentx;
+        weight_stream << tx_type_data;
+
+        gentx_weight = weight_stream.size();
+    }
+
+
 //
 //    type(self).gentx_size   = self.gentx_size # saving this share's gentx size as a class variable is an ugly hack, and you're welcome to hate me for doing it. But it works.
 //            type(self).gentx_weight = self.gentx_weight
