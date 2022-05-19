@@ -36,7 +36,7 @@ namespace c2pool::libnet
         coind_work = Variable<coind::getwork_result>(_coind->getwork(txidcache));
         new_block.subscribe([&](uint256 _value)
                              {
-
+                                //TODO: check!
                                  //Если получаем новый блок, то обновляем таймер
                                  work_poller_t.expires_from_now(boost::posix_time::seconds(15));
                              });
@@ -73,12 +73,31 @@ namespace c2pool::libnet
             known_txs = new_known_txs;
         });
 
+        // add p2p transactions from bitcoind to known_txs
         new_tx.subscribe([&](coind::data::tx_type _tx){
-            //TODO:
-            PackStream packed_tx;
-            //_tx->
-            //known_txs.add(coind::data::hash256())
+            coind::data::stream::TransactionType_stream packed_tx = _tx;
+            PackStream stream_tx;
+            stream_tx << packed_tx;
+            known_txs.add(coind::data::hash256(stream_tx), _tx);
+        });
 
+        // forward transactions seen to bitcoind
+        known_txs.transitioned->subscribe([&](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+            //TODO: for what???
+            // yield deferral.sleep(random.expovariate(1/1))
+
+            if (!protocol)
+                return;
+
+            std::map<uint256, coind::data::tx_type> trans_difference;
+            std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(trans_difference, trans_difference.begin()));
+
+            for (auto [tx_hash, tx] : trans_difference)
+            {
+                //TODO: update coind::message
+//                auto msg = protocol->make_message<message_tx>(tx);
+//                protocol->write(msg);
+            }
         });
 
         /* TODO:
@@ -165,18 +184,18 @@ namespace c2pool::libnet
     {
         if (!protocol)
             return;
-        //TODO: handle_header(protocol->get_block_header(coind_work.value().previous_block));
+        //TODO update protocol: handle_header(protocol->get_block_header(coind_work.value().previous_block));
     }
 
     void CoindNode::set_best_share()
     {
-        //TODO:
-        // auto tracker_think_result = coind()->think(/*TODO: self.get_height_rel_highest, self.coind_work.value['previous_block'], self.coind_work.value['bits'], self.known_txs_var.value*/);
 
-        // best_share_var = tracker_think_result.best;
-        //TODO: self.desired_var.set(desired)
+        auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker()->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
-        //TODO:
+        best_share = _best;
+        desired = _desired;
+
+        //TODO: Проверка подключения на p2p_node.
         // if (_node_manager->p2pNode() != nullptr)
         // {
         //     for (auto bad_peer_address : bad_peer_addresses)
@@ -196,12 +215,7 @@ namespace c2pool::libnet
     void CoindNode::clean_tracker()
     {
         //TODO:
-        // c2pool::shares::TrackerThinkResult think_result = tracker->think();
-
-        // auto best = think_result.best_hash;
-        // auto desired = think_result.desired;
-        // auto decorated_heads = think_result.decorated_heads;
-        // auto bad_peer_addresses = think_result.bad_peer_addresses;
+        auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker()->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
         // if (decorated_heads.size() > 0)
         // {
@@ -290,8 +304,9 @@ namespace c2pool::libnet
         //         }
         //         tracker.remove(aftertail);
         //     }
-        //     set_best_share();
         // }
+
+        set_best_share();
     }
 
 }
