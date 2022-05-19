@@ -45,7 +45,7 @@ struct TrackerThinkResult
 {
 	uint256 best;
 	std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
-	std::vector<uint256> decorated_heads; //TODO: TYPE???
+    std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
 	std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
 };
 
