@@ -36,7 +36,7 @@ public:
 	}
 
 protected:
-    void _min_header(std::shared_ptr<SmallBlockHeaderType> value)
+    void _min_header(std::shared_ptr<coind::data::SmallBlockHeaderType> value)
     {
         share->min_header = value;
     }
@@ -98,9 +98,9 @@ class ShareObjectBuilder : public BaseShareBuilder, public enable_shared_from_th
 public:
 	ShareObjectBuilder(std::shared_ptr<c2pool::Network> _net) : BaseShareBuilder(_net) { }
 public:
-    auto min_header(const shares::types::SmallBlockHeaderType &data)
+    auto min_header(const coind::data::types::SmallBlockHeaderType &data)
     {
-        auto value = std::make_shared<SmallBlockHeaderType>();
+        auto value = std::make_shared<coind::data::SmallBlockHeaderType>();
         value->set_value(data);
         _min_header(value);
         return shared_from_this();
@@ -166,7 +166,7 @@ public:
 public:
 	auto min_header(PackStream &stream)
 	{
-		auto value = std::make_shared<SmallBlockHeaderType>();
+		auto value = std::make_shared<coind::data::SmallBlockHeaderType>();
 		stream >> *value;
         _min_header(value);
 		return shared_from_this();

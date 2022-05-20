@@ -421,7 +421,7 @@ namespace c2pool::libnet
 
         worker_get_work_result res = {
                 ba,
-                [=](types::BlockHeaderType header, std::string user, IntType(64) coinbase_nonce){
+                [=](coind::data::types::BlockHeaderType header, std::string user, IntType(64) coinbase_nonce){
                     auto t0 = c2pool::dev::timestamp();
 
                     PackStream new_packed_gentx;
@@ -462,7 +462,7 @@ namespace c2pool::libnet
 
                     PackStream block_header_packed;
                     {
-                        shares::stream::BlockHeaderType_stream _block_header_value(header);
+                        coind::data::stream::BlockHeaderType_stream _block_header_value(header);
                         block_header_packed << _block_header_value;
                     }
 

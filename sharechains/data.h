@@ -31,7 +31,7 @@ namespace shares
 //GenerateShareTransaction
 namespace shares
 {
-    typedef boost::function<ShareType(shares::types::BlockHeaderType, uint64_t)> get_share_method;
+    typedef boost::function<ShareType(coind::data::types::BlockHeaderType, uint64_t)> get_share_method;
 
 	struct GeneratedShareTransactionResult
 	{

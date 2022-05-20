@@ -84,7 +84,7 @@ namespace c2pool::libnet::p2p
         {
             //TODO: finish
         }
-        void handle_bestblock(::shares::stream::BlockHeaderType_stream header);
+        void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
         bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
