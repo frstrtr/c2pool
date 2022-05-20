@@ -8,6 +8,7 @@ using namespace c2pool::messages;
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
 #include <libcoind/transaction.h>
+#include <libcoind/types.h>
 
 #include <sstream>
 #include <string>
@@ -26,7 +27,6 @@ namespace coind::p2p
 
 namespace coind::p2p::messages
 {
-
     enum commands
     {
         cmd_error = 9999,
@@ -253,14 +253,14 @@ namespace coind::p2p::messages
     };
 
     class message_ping : public base_message
-    { //-
+    {
     public:
         IntType(64) nonce;
 
     public:
         message_ping() : base_message("ping") {}
 
-        message_ping(uint64_t _nonce) : base_message("ping")
+        message_ping(uint64_t _nonce) : message_ping()
         {
             nonce = _nonce;
         }
@@ -279,14 +279,14 @@ namespace coind::p2p::messages
     };
 
     class message_pong : public base_message
-    { //-
+    {
     public:
-        uint64_t nonce;
+        IntType(64) nonce;
 
     public:
         message_pong() : base_message("pong") {}
 
-        message_pong(uint64_t _nonce) : base_message("pong")
+        message_pong(uint64_t _nonce) : message_pong()
         {
             nonce = _nonce;
         }
@@ -305,13 +305,19 @@ namespace coind::p2p::messages
     };
 
     class message_alert : public base_message
-    {//-
+    {
     public:
         StrType message;
         StrType signature;
 
     public:
         message_alert() : base_message("alert") {}
+
+        message_alert(std::string _message, std::string _signature) : message_alert()
+        {
+            message = _message;
+            signature = _signature;
+        }
 
         PackStream &write(PackStream &stream) override
         {
@@ -327,8 +333,9 @@ namespace coind::p2p::messages
     };
 
     class message_getaddr : public base_message
-    {//--
+    {
     public:
+
     public:
         message_getaddr() : base_message("getaddr") {}
 
@@ -344,16 +351,16 @@ namespace coind::p2p::messages
     };
 
     class message_addr : public base_message
-    {//-
+    {
     public:
-        ListType<c2pool::messages::addr> addrs;
+        ListType<c2pool::messages::stream::addr_stream> addrs;
 
     public:
         message_addr() : base_message("addr") {}
 
         message_addr(std::vector<c2pool::messages::addr> _addrs) : base_message("addr")
         {
-            addrs = _addrs;
+            addrs = c2pool::messages::stream::addr_stream::make_list_type(_addrs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -540,56 +547,57 @@ namespace coind::p2p::messages
     };
 
     class message_block : public base_message
-    {//-
+    {
     public:
-
-        //TODO:
-        /*
-        message_block = pack.ComposedType([
-        ('block', bitcoin_data.block_type),
-        ])
-        */
-        //TODO:UniValue block;
+        coind::data::stream::BlockType_stream block;
 
     public:
         message_block() : base_message("block") {}
 
+        message_block(coind::data::types::BlockType _block) : message_block()
+        {
+            block = coind::data::stream::BlockType_stream(_block);
+        }
+
         PackStream &write(PackStream &stream) override
         {
-            //TODO: stream << block;
+            stream << block;
             return stream;
         }
 
         PackStream &read(PackStream &stream) override
         {
-            //TODO: stream >> block;
+            stream >> block;
             return stream;
         }
     };
 
     class message_headers : public base_message
-    {//-
+    {
     public:
-        //TODO:
-        /*
-        message_headers = pack.ComposedType([
-        ('headers', pack.ListType(bitcoin_data.block_type)),
-        ])
-        */
-        //TODO: UniValue headers;
+        ListType<coind::data::stream::BlockType_stream> headers;
 
     public:
         message_headers() : base_message("headers") {}
 
+        message_headers(std::vector<coind::data::types::BlockType> _headers) : message_headers()
+        {
+            std::vector<coind::data::stream::BlockType_stream> temp_headers;
+            std::transform(_headers.begin(), _headers.end(), temp_headers.begin(), [&](coind::data::types::BlockType header){
+                return coind::data::stream::BlockType_stream(header);
+            });
+            headers = temp_headers;
+        }
+
         PackStream &write(PackStream &stream) override
         {
-            //TODO: stream << headers;
+            stream << headers;
             return stream;
         }
 
         PackStream &read(PackStream &stream) override
         {
-            //TODO: stream >> headers;
+            stream >> headers;
             return stream;
         }
     };
