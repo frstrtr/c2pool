@@ -125,7 +125,6 @@ namespace shares::types
         }
     };
 
-    //TODO: for what?
     class HashLinkType
     {
     public:
@@ -371,4 +370,32 @@ namespace shares::types
 			merkle_link = _merkle_link;
 		}
 	};
+
+    struct BlockType
+    {
+        BlockHeaderType header;
+        std::vector<coind::data::tx_type> txs;
+
+        BlockType() = default;
+
+        BlockType(BlockHeaderType _header, std::vector<coind::data::tx_type> _txs)
+        {
+            header = _header;
+            txs = _txs;
+        }
+    };
+
+    struct StrippedBlockType
+    {
+        BlockHeaderType header;
+        std::vector<coind::data::TxIDType> txs;
+
+        StrippedBlockType() = default;
+
+        StrippedBlockType(BlockHeaderType _header, std::vector<coind::data::TxIDType> _txs)
+        {
+            header = _header;
+            txs = _txs;
+        }
+    };
 }

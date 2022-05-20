@@ -356,4 +356,68 @@ namespace shares::stream
             return stream;
         }
     };
+
+    struct BlockType_stream
+    {
+        BlockHeaderType_stream header;
+        ListType<coind::data::stream::TransactionType_stream> txs;
+
+        BlockType_stream() = default;
+
+        BlockType_stream(shares::types::BlockHeaderType _header, std::vector<coind::data::tx_type> _txs)
+        {
+            header = _header;
+
+            std::vector<coind::data::stream::TransactionType_stream> _temp_txs;
+            std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
+            {
+                return coind::data::stream::TransactionType_stream(_tx);
+            });
+            txs = _temp_txs;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << header << txs;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> header >> txs;
+            return stream;
+        }
+    };
+
+    struct StrippedBlockType_stream
+    {
+        BlockHeaderType_stream header;
+        ListType<coind::data::stream::TxIDType_stream> txs;
+
+        StrippedBlockType_stream() = default;
+
+        StrippedBlockType_stream(shares::types::BlockHeaderType _header, std::vector<coind::data::TxIDType> _txs)
+        {
+            header = _header;
+
+            std::vector<coind::data::stream::TxIDType_stream> _temp_txs;
+            std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](const coind::data::TxIDType &_tx)
+            {
+                return coind::data::stream::TxIDType_stream(_tx);
+            });
+            txs = _temp_txs;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << header << txs;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> header >> txs;
+            return stream;
+        }
+    };
 }

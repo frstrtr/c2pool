@@ -7,6 +7,7 @@ using namespace c2pool::messages;
 #include <networks/network.h>
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
+#include <libcoind/transaction.h>
 
 #include <sstream>
 #include <string>
@@ -201,8 +202,8 @@ namespace coind::p2p::messages
         IntType(32) version;
         IntType(64) services;
         IntType(64) timestamp;
-        address_type addr_to;
-        address_type addr_from;
+        c2pool::messages::stream::address_type_stream addr_to;
+        c2pool::messages::stream::address_type_stream addr_from;
         IntType(64) nonce;
         StrType sub_version;
         IntType(32) start_height;
@@ -210,7 +211,7 @@ namespace coind::p2p::messages
     public:
         message_version() : base_message("version") {}
 
-        message_version(int ver, int serv, int64_t _timestamp, address_type to, address_type from, unsigned long long _nonce, std::string sub_ver, int32_t _start_height) : base_message("version")
+        message_version(int32_t ver, int64_t serv, int64_t _timestamp, address_type to, address_type from, uint64_t _nonce, std::string sub_ver, int32_t _start_height) : base_message("version")
         {
             version = ver;
             services = serv;
@@ -252,7 +253,7 @@ namespace coind::p2p::messages
     };
 
     class message_ping : public base_message
-    {
+    { //-
     public:
         IntType(64) nonce;
 
@@ -278,7 +279,7 @@ namespace coind::p2p::messages
     };
 
     class message_pong : public base_message
-    {
+    { //-
     public:
         uint64_t nonce;
 
@@ -304,7 +305,7 @@ namespace coind::p2p::messages
     };
 
     class message_alert : public base_message
-    {
+    {//-
     public:
         StrType message;
         StrType signature;
@@ -326,7 +327,7 @@ namespace coind::p2p::messages
     };
 
     class message_getaddr : public base_message
-    {
+    {//--
     public:
     public:
         message_getaddr() : base_message("getaddr") {}
@@ -343,7 +344,7 @@ namespace coind::p2p::messages
     };
 
     class message_addr : public base_message
-    {
+    {//-
     public:
         ListType<c2pool::messages::addr> addrs;
 
@@ -371,14 +372,14 @@ namespace coind::p2p::messages
     class message_inv : public base_message
     {
     public:
-        ListType<inventory> invs;
+        ListType<stream::inventory_stream> invs;
 
     public:
         message_inv() : base_message("inv") {}
 
-        message_inv(std::vector<inventory> _invs) : base_message("inv")
+        message_inv(std::vector<inventory> _invs) : message_inv()
         {
-            invs = _invs;
+            invs = stream::inventory_stream::make_list_type(_invs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -397,14 +398,14 @@ namespace coind::p2p::messages
     class message_getdata : public base_message
     {
     public:
-        ListType<inventory> requests;
+        ListType<stream::inventory_stream> requests;
 
     public:
         message_getdata() : base_message("getdata") {}
 
-        message_getdata(std::vector<inventory> _reqs) : base_message("getdata")
+        message_getdata(std::vector<inventory> _reqs) : message_getdata()
         {
-            requests = _reqs;
+            requests = stream::inventory_stream::make_list_type(_reqs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -431,6 +432,14 @@ namespace coind::p2p::messages
     public:
         message_reject() : base_message("reject") {}
 
+        message_reject(std::string _message, uint8_t _ccode, std::string _reason, uint256 _data) : message_reject()
+        {
+            message = _message;
+            ccode = _ccode;
+            reason = _reason;
+            data = _data;
+        }
+
         PackStream &write(PackStream &stream) override
         {
             stream << message << ccode << reason << data;
@@ -449,10 +458,17 @@ namespace coind::p2p::messages
     public:
         IntType(32) version;
         ListType<IntType(256)> have;
-        IntType(256) last;
+        PossibleNoneType<IntType(256)> last;
 
     public:
-        message_getblocks() : base_message("getblocks") {}
+        message_getblocks() : base_message("getblocks"), last(uint256::ZERO) {}
+
+        message_getblocks(int32_t _version, std::vector<uint256> _have, uint256 _last) : message_getblocks()
+        {
+            version = _version;
+            have = IntType(256)::make_list_type(_have);
+            last = _last;
+        }
 
         PackStream &write(PackStream &stream) override
         {
@@ -472,17 +488,15 @@ namespace coind::p2p::messages
     public:
         IntType(32) version;
         ListType<IntType(256)> have;
-        IntType(256) last;
+        PossibleNoneType<IntType(256)> last;
 
     public:
-        message_getheaders() : base_message("getheaders") {}
+        message_getheaders() : base_message("getheaders"), last(uint256::ZERO) {}
 
-        message_getheaders(uint32_t _version, std::vector<uint256> _have, uint256 _last) : base_message("getheaders")
+        message_getheaders(int32_t _version, std::vector<uint256> _have, uint256 _last) : message_getheaders()
         {
             version = _version;
-
-            auto have_list = have.make_type(_have);
-            have = have_list;
+            have = IntType(256)::make_list_type(_have);
             last = _last;
         }
 
@@ -502,33 +516,33 @@ namespace coind::p2p::messages
     class message_tx : public base_message
     {
     public:
-        //TODO:
-        /*
-        message_tx = pack.ComposedType([
-        ('tx', bitcoin_data.tx_type),
-        ])
-        */
-        //TODO:UniValue tx;
+        coind::data::stream::TransactionType_stream tx;
 
     public:
         message_tx() : base_message("tx") {}
 
+        message_tx(coind::data::tx_type _tx) : message_tx()
+        {
+            tx = _tx;
+        }
+
         PackStream &write(PackStream &stream) override
         {
-            //TODO: stream << tx;
+            stream << tx;
             return stream;
         }
 
         PackStream &read(PackStream &stream) override
         {
-            //TODO: stream >> tx;
+            stream >> tx;
             return stream;
         }
     };
 
     class message_block : public base_message
-    {
+    {//-
     public:
+        shares::types::
         //TODO:
         /*
         message_block = pack.ComposedType([
@@ -554,7 +568,7 @@ namespace coind::p2p::messages
     };
 
     class message_headers : public base_message
-    {
+    {//-
     public:
         //TODO:
         /*
