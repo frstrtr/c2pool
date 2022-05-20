@@ -239,6 +239,17 @@ namespace coind::data::stream
             txs = _temp_txs;
         }
 
+        BlockType_stream (types::BlockType _block)
+        {
+            header = _block.header;
+            std::vector<coind::data::stream::TransactionType_stream> _temp_txs;
+            std::transform(_block.txs.begin(), _block.txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
+            {
+                return coind::data::stream::TransactionType_stream(_tx);
+            });
+            txs = _temp_txs;
+        }
+
         PackStream &write(PackStream &stream)
         {
             stream << header << txs;
@@ -265,6 +276,17 @@ namespace coind::data::stream
 
             std::vector<coind::data::stream::TxIDType_stream> _temp_txs;
             std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](const coind::data::TxIDType &_tx)
+            {
+                return coind::data::stream::TxIDType_stream(_tx);
+            });
+            txs = _temp_txs;
+        }
+
+        StrippedBlockType_stream (types::StrippedBlockType _block)
+        {
+            header = _block.header;
+            std::vector<coind::data::stream::TxIDType_stream> _temp_txs;
+            std::transform(_block.txs.begin(), _block.txs.end(), _temp_txs.begin(), [&](const coind::data::TxIDType &_tx)
             {
                 return coind::data::stream::TxIDType_stream(_tx);
             });
