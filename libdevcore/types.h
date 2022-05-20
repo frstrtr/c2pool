@@ -369,6 +369,38 @@ namespace c2pool::messages::stream
             return share_type(type.value, contents.get());
         }
     };
+
+    struct inventory_stream : Maker<inventory_stream, inventory>
+    {
+        EnumType<inventory_type, IntType(32)> type;
+        IntType(256) hash;
+
+        inventory_stream() = default;
+
+        inventory_stream(inventory inv)
+        {
+            type = inv.type;
+            hash = inv.hash;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << type << hash;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> type >> hash;
+            return stream;
+        }
+
+        inventory get()
+        {
+            return inventory(type.get(), hash.get());
+        }
+
+    };
 }
 
 namespace c2pool::libnet{
