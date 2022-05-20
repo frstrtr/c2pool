@@ -372,14 +372,14 @@ namespace coind::p2p::messages
     class message_inv : public base_message
     {
     public:
-        ListType<stream::inventory_stream> invs;
+        ListType<c2pool::messages::stream::inventory_stream> invs;
 
     public:
         message_inv() : base_message("inv") {}
 
         message_inv(std::vector<inventory> _invs) : message_inv()
         {
-            invs = stream::inventory_stream::make_list_type(_invs);
+            invs = c2pool::messages::stream::inventory_stream::make_list_type(_invs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -398,14 +398,14 @@ namespace coind::p2p::messages
     class message_getdata : public base_message
     {
     public:
-        ListType<stream::inventory_stream> requests;
+        ListType<c2pool::messages::stream::inventory_stream> requests;
 
     public:
         message_getdata() : base_message("getdata") {}
 
         message_getdata(std::vector<inventory> _reqs) : message_getdata()
         {
-            requests = stream::inventory_stream::make_list_type(_reqs);
+            requests = c2pool::messages::stream::inventory_stream::make_list_type(_reqs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -542,7 +542,7 @@ namespace coind::p2p::messages
     class message_block : public base_message
     {//-
     public:
-        shares::types::
+
         //TODO:
         /*
         message_block = pack.ComposedType([

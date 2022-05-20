@@ -3,6 +3,7 @@
 #include <boost/format.hpp>
 #include <libcoind/data.h>
 #include <libcoind/transaction.h>
+#include <libcoind/types.h>
 #include <btclibs/uint256.h>
 #include <networks/network.h>
 #include <libdevcore/addrStore.h>
@@ -38,7 +39,7 @@ public:
     c2pool::libnet::addr peer_addr;
 public:
     ///objs
-	std::shared_ptr<SmallBlockHeaderType> min_header;
+	std::shared_ptr<coind::data::SmallBlockHeaderType> min_header;
     std::shared_ptr<ShareData> share_data;
     std::shared_ptr<SegwitData> segwit_data;
     std::shared_ptr<ShareInfo> share_info;
@@ -72,7 +73,7 @@ public:
     PackStream new_script; //FROM pubkey_hash;
 
     uint256 gentx_hash;
-	BlockHeaderType header;
+    coind::data::BlockHeaderType header;
 	uint256 pow_hash;
 	uint256 hash; //=header_hash
 	int32_t time_seen;

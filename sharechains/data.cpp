@@ -568,9 +568,9 @@ namespace shares
             }
         }
 
-        get_share_method get_share_F([=, &share_info](shares::types::BlockHeaderType header, uint64_t last_txout_nonce)
+        get_share_method get_share_F([=, &share_info](coind::data::types::BlockHeaderType header, uint64_t last_txout_nonce)
         {
-            shares::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
+            coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
 
             ShareType share;
             std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);

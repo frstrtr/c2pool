@@ -8,20 +8,6 @@
 #include "share_types.h"
 #include "share_streams.h"
 
-struct SmallBlockHeaderType :
-        StreamTypeAdapter<shares::types::SmallBlockHeaderType, shares::stream::SmallBlockHeaderType_stream>
-{
-    void _to_stream() override
-    {
-        make_stream(*_value);
-    }
-
-    void _to_value() override
-    {
-        make_value(_stream->version.value, _stream->previous_block.get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get());
-    }
-};
-
 struct MerkleLink :
         StreamTypeAdapter<coind::data::MerkleLink, shares::stream::MerkleLink_stream>
 {
@@ -34,20 +20,6 @@ struct MerkleLink :
     {
         std::vector<uint256> branch = _stream->branch.get();
         make_value(branch);
-    }
-};
-
-struct BlockHeaderType :
-        StreamTypeAdapter<shares::types::BlockHeaderType, shares::stream::BlockHeaderType_stream>
-{
-    void _to_stream() override
-    {
-        make_stream(*_value);
-    }
-
-    void _to_value() override
-    {
-        make_value(_stream->version.value, _stream->previous_block.get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get(), _stream->merkle_root.get());
     }
 };
 

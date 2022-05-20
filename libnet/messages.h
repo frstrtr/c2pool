@@ -417,12 +417,12 @@ namespace c2pool::libnet::messages
     class message_bestblock : public base_message
     {
     public:
-        ::shares::stream::BlockHeaderType_stream header;
+        coind::data::stream::BlockHeaderType_stream header;
 
     public:
         message_bestblock() : base_message("bestblock") {}
 
-        message_bestblock(::shares::types::BlockHeaderType _header) : message_bestblock()
+        message_bestblock(coind::data::types::BlockHeaderType _header) : message_bestblock()
         {
             header = _header;
         }

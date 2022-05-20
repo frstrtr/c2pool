@@ -39,9 +39,9 @@ namespace coind::p2p
     public:
         Event<uint256> new_block;    //block_hash
         Event<coind::data::tx_type> new_tx;      //bitcoin_data.tx_type
-        Event<BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<coind::data::types::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
 
-        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<BlockHeaderType> _new_headers)
+        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<coind::data::types::BlockHeaderType> _new_headers)
         {
             new_block = _new_block;
             new_tx = _new_tx;
@@ -179,8 +179,9 @@ namespace coind::p2p
         void handle(shared_ptr<message_inv> msg)
         {
             LOG_TRACE << "HANDLED INV";
-            for (auto inv : msg->invs.value)
+            for (auto _inv : msg->invs.get())
             {
+                auto inv = _inv.get();
                 switch (inv.type)
                 {
                 case inventory_type::tx:

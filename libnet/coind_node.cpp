@@ -162,7 +162,7 @@ namespace c2pool::libnet
         work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
     }
 
-    void CoindNode::handle_header(BlockHeaderType new_header)
+    void CoindNode::handle_header(coind::data::BlockHeaderType new_header)
     {
         auto packed_new_header = new_header.get_pack();
         arith_uint256 hash_header = UintToArith256(_parent_net->POW_FUNC(packed_new_header));

@@ -49,7 +49,7 @@ namespace c2pool::libnet::p2p
         LOG_INFO << "... P2PNode started!";
     }
 
-    void P2PNode::handle_bestblock(::shares::stream::BlockHeaderType_stream header)
+    void P2PNode::handle_bestblock(coind::data::stream::BlockHeaderType_stream header)
     {
         PackStream packed_header;
         packed_header << header;
@@ -59,7 +59,7 @@ namespace c2pool::libnet::p2p
             throw std::invalid_argument("received block header fails PoW test");
         }
 
-        auto _header = BlockHeaderType();
+        auto _header = coind::data::BlockHeaderType();
         _header.set_stream(header);
 
         _coind_node->handle_header(_header);

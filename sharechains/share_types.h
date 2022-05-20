@@ -6,6 +6,7 @@
 #include <libdevcore/stream_types.h>
 #include <libdevcore/stream.h>
 #include <libcoind/data.h>
+#include <libcoind/types.h>
 
 #include <set>
 #include <tuple>
@@ -38,92 +39,6 @@ struct PackedShareData
 
 namespace shares::types
 {
-    class SmallBlockHeaderType
-    {
-    public:
-        uint64_t version;
-        uint256 previous_block;
-        uint32_t timestamp;
-        int32_t bits;
-        uint32_t nonce;
-
-        SmallBlockHeaderType()
-        {};
-
-        SmallBlockHeaderType(uint64_t _version, uint256 _previous_block, uint32_t _timestamp, int32_t _bits,
-                             uint32_t _nonce)
-        {
-            version = _version;
-            previous_block = _previous_block;
-            timestamp = _timestamp;
-            bits = _bits;
-            nonce = _nonce;
-        }
-
-        bool operator==(const SmallBlockHeaderType &value)
-        {
-            return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
-                   timestamp == value.timestamp && bits == value.bits && nonce == value.nonce;
-        }
-
-        bool operator!=(const SmallBlockHeaderType &value)
-        {
-            return !(*this == value);
-        }
-
-//        SmallBlockHeaderType &operator=(UniValue value);
-
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            result.pushKV("version", (uint64_t) version);
-//            result.pushKV("previous_block", previous_block.GetHex());
-//            result.pushKV("timestamp", (uint64_t) timestamp);
-//            result.pushKV("bits", (uint64_t) bits);
-//            result.pushKV("nonce", (uint64_t) nonce);
-//
-//            return result;
-//        }
-    };
-
-    class BlockHeaderType : public SmallBlockHeaderType
-    {
-    public:
-        uint256 merkle_root;
-
-    public:
-        BlockHeaderType() : SmallBlockHeaderType()
-        {};
-
-        BlockHeaderType(SmallBlockHeaderType _min_header, uint256 _merkle_root) : SmallBlockHeaderType(_min_header)
-        {
-            merkle_root = _merkle_root;
-        }
-
-		BlockHeaderType(uint64_t _version, uint256 _previous_block, uint32_t _timestamp, int32_t _bits,
-				uint32_t _nonce, uint256 _merkle_root)
-		{
-			version = _version;
-			previous_block = _previous_block;
-			timestamp = _timestamp;
-			bits = _bits;
-			nonce = _nonce;
-			merkle_root = _merkle_root;
-		}
-
-        bool operator==(const BlockHeaderType &value) const
-        {
-            return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
-                   timestamp == value.timestamp && bits == value.bits && nonce == value.nonce &&
-                   merkle_root.Compare(value.merkle_root) == 0;
-        }
-
-        bool operator!=(const BlockHeaderType &value) const
-        {
-            return !(*this == value);
-        }
-    };
 
     class HashLinkType
     {
@@ -349,7 +264,7 @@ namespace shares::types
 	//t['share_type']
 	struct ShareTypeData
 	{
-		SmallBlockHeaderType min_header;
+		coind::data::types::SmallBlockHeaderType min_header;
 		ShareInfo share_info;
 		coind::data::MerkleLink ref_merkle_link;
 		uint64_t last_txout_nonce;
@@ -358,7 +273,7 @@ namespace shares::types
 
 		ShareTypeData() = default;
 
-		ShareTypeData(SmallBlockHeaderType _min_header, ShareInfo _share_info,
+		ShareTypeData(coind::data::types::SmallBlockHeaderType _min_header, ShareInfo _share_info,
 					  coind::data::MerkleLink _ref_merkle_link, uint64_t _last_txout_nonce,
 					  HashLinkType _hash_link, coind::data::MerkleLink _merkle_link)
 		{
@@ -370,32 +285,4 @@ namespace shares::types
 			merkle_link = _merkle_link;
 		}
 	};
-
-    struct BlockType
-    {
-        BlockHeaderType header;
-        std::vector<coind::data::tx_type> txs;
-
-        BlockType() = default;
-
-        BlockType(BlockHeaderType _header, std::vector<coind::data::tx_type> _txs)
-        {
-            header = _header;
-            txs = _txs;
-        }
-    };
-
-    struct StrippedBlockType
-    {
-        BlockHeaderType header;
-        std::vector<coind::data::TxIDType> txs;
-
-        StrippedBlockType() = default;
-
-        StrippedBlockType(BlockHeaderType _header, std::vector<coind::data::TxIDType> _txs)
-        {
-            header = _header;
-            txs = _txs;
-        }
-    };
 }

@@ -2,6 +2,7 @@
 
 #include <libdevcore/stream_types.h>
 #include <libdevcore/stream.h>
+#include <libcoind/types.h>
 
 #include "share_types.h"
 
@@ -29,97 +30,6 @@ namespace shares::stream
         PackStream &read(PackStream &stream)
         {
             stream >> branch;
-            return stream;
-        }
-    };
-
-	struct SmallBlockHeaderType_stream
-	{
-		VarIntType version;
-		PossibleNoneType<IntType(256)> previous_block;
-		IntType(32) timestamp;
-		FloatingIntegerType bits;
-		IntType(32) nonce;
-
-		SmallBlockHeaderType_stream() : previous_block(IntType(256)(uint256()))
-		{
-		}
-
-		SmallBlockHeaderType_stream(const shares::types::SmallBlockHeaderType &val) : SmallBlockHeaderType_stream()
-		{
-			version = val.version;
-			previous_block = previous_block.make_type(val.previous_block);
-			timestamp = val.timestamp;
-			bits = val.bits;
-			nonce = val.nonce;
-		}
-
-		PackStream &write(PackStream &stream)
-		{
-			stream << version << previous_block << timestamp << bits << nonce;
-			return stream;
-		}
-
-		PackStream &read(PackStream &stream)
-		{
-			stream >> version >> previous_block >> timestamp >> bits >> nonce;
-			return stream;
-		}
-	};
-
-    struct BlockHeaderType_stream
-    {
-        VarIntType version;
-        PossibleNoneType<IntType(256) > previous_block;
-        IntType(256) merkle_root;
-        IntType(32) timestamp;
-        FloatingIntegerType bits;
-        IntType(32) nonce;
-
-        BlockHeaderType_stream() : previous_block(IntType(256)(uint256()))
-        {
-        }
-
-		BlockHeaderType_stream(const types::BlockHeaderType &val) : BlockHeaderType_stream()
-		{
-			version = val.version;
-			previous_block = previous_block.make_type(val.previous_block);
-			merkle_root = val.merkle_root;
-			timestamp = val.timestamp;
-			bits = val.bits;
-			nonce = val.nonce;
-		}
-
-//        BlockHeaderType_stream(const BlockHeaderType &value) : BlockHeaderType_stream()
-//        {
-//            version = value.version;
-//            previous_block = value.previous_block;
-//            merkle_root = value.merkle_root;
-//            timestamp = value.timestamp;
-//            bits = value.bits;
-//            nonce = value.nonce;
-//        }
-
-//        operator BlockHeaderType()
-//        {
-//            BlockHeaderType result;
-//            result.version = version.value;
-//            result.previous_block = previous_block.get().value;
-//            result.merkle_root = merkle_root.value;
-//            result.timestamp = timestamp.value;
-//            result.bits = bits.get();
-//            result.nonce = nonce.value;
-//        }
-
-        PackStream &write(PackStream &stream)
-        {
-            stream << version << previous_block << merkle_root << timestamp << bits << nonce;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream)
-        {
-            stream >> version >> previous_block >> merkle_root >> timestamp >> bits >> nonce;
             return stream;
         }
     };
@@ -299,7 +209,7 @@ namespace shares::stream
     };
 
     struct ShareType_stream {
-        SmallBlockHeaderType_stream min_header;
+        coind::data::stream::SmallBlockHeaderType_stream min_header;
         ShareInfo_stream share_info;
         MerkleLink_stream ref_merkle_link;
         IntType(64) last_txout_nonce;
@@ -357,67 +267,4 @@ namespace shares::stream
         }
     };
 
-    struct BlockType_stream
-    {
-        BlockHeaderType_stream header;
-        ListType<coind::data::stream::TransactionType_stream> txs;
-
-        BlockType_stream() = default;
-
-        BlockType_stream(shares::types::BlockHeaderType _header, std::vector<coind::data::tx_type> _txs)
-        {
-            header = _header;
-
-            std::vector<coind::data::stream::TransactionType_stream> _temp_txs;
-            std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
-            {
-                return coind::data::stream::TransactionType_stream(_tx);
-            });
-            txs = _temp_txs;
-        }
-
-        PackStream &write(PackStream &stream)
-        {
-            stream << header << txs;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream)
-        {
-            stream >> header >> txs;
-            return stream;
-        }
-    };
-
-    struct StrippedBlockType_stream
-    {
-        BlockHeaderType_stream header;
-        ListType<coind::data::stream::TxIDType_stream> txs;
-
-        StrippedBlockType_stream() = default;
-
-        StrippedBlockType_stream(shares::types::BlockHeaderType _header, std::vector<coind::data::TxIDType> _txs)
-        {
-            header = _header;
-
-            std::vector<coind::data::stream::TxIDType_stream> _temp_txs;
-            std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](const coind::data::TxIDType &_tx)
-            {
-                return coind::data::stream::TxIDType_stream(_tx);
-            });
-            txs = _temp_txs;
-        }
-
-        PackStream &write(PackStream &stream)
-        {
-            stream << header << txs;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream)
-        {
-            stream >> header >> txs;
-            return stream;
-        }
-    };
 }

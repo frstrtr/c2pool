@@ -1,6 +1,7 @@
 set(coind_tool_sources 
         data.h
         data.cpp
+        types.h
         transaction.h
         transaction.cpp
         height_tracker.h

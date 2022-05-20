@@ -67,7 +67,7 @@ namespace c2pool::libnet
     struct worker_get_work_result
     {
         NotifyData ba;
-        std::function<bool(types::BlockHeaderType, std::string, IntType(64))> get_response;
+        std::function<bool(coind::data::types::BlockHeaderType, std::string, IntType(64))> get_response;
     };
 
     struct local_rate_datum
