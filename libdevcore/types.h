@@ -145,11 +145,11 @@ namespace c2pool::messages
 
         inventory(inventory_type _type, uint256 _hash);
 
-        inventory_type parse_inv_type(std::string type)
+        inventory_type parse_inv_type(std::string _type)
         {
-            if (type == "tx")
+            if (_type == "tx")
                 return inventory_type::tx;
-            if (type == "block")
+            if (_type == "block")
                 return inventory_type::block;
             LOG_ERROR << "inv type don't parsed!";
             return inventory_type::tx; //if error

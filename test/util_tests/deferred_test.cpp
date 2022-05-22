@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <libdevcore/deferred.h>
-using namespace c2pool::util::deferred;
+using namespace c2pool::deferred;
 
 TEST(Deferred, Deferred_system)
 {
@@ -27,6 +27,28 @@ TEST(Deferred, Deferred_system)
     io::steady_timer timer(*context, 1s);
     timer.async_wait([&](const boost::system::error_code &ec)
                      { std::cout << "timer" << std::endl; });
+
+    context->run();
+}
+
+TEST(Deferred, ReplyMathcher)
+{
+    std::shared_ptr<boost::asio::io_context> context = std::make_shared<boost::asio::io_context>();
+    ReplyMatcher<int, int, int> reply(context, [&](const int &i){
+        return i;
+    });
+
+    boost::asio::steady_timer timer(*context);
+    timer.expires_from_now(4s);
+    timer.async_wait([&](const boost::system::error_code &ec)
+                     {
+                         if (!ec)
+                                 reply.got_response(1337, 7331);
+                     });
+
+    reply.yield(1337, [&](int reply_mathcer_result){
+        std::cout << reply_mathcer_result << std::endl;
+    }, 1337);
 
     context->run();
 }

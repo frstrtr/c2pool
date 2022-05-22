@@ -14,7 +14,7 @@ using std::shared_ptr, std::weak_ptr, std::make_shared;
 
 namespace coind::p2p
 {
-    CoindProtocol::CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct)
+    CoindProtocol::CoindProtocol(std::shared_ptr<boost::asio::io_context> cxt, shared_ptr<coind::p2p::P2PSocket> _sct) : _context(cxt)
     {
         LOG_TRACE << "CoindProtocol: "
                   << "start constuctor";
@@ -35,10 +35,10 @@ namespace coind::p2p
         });
     }
 
-    void CoindProtocol::get_block_header(uint256 hash)
-    {
-        std::vector<uint256> _have;
-        auto _msg = make_message<coind::p2p::messages::message_getheaders>(1, _have, hash);
-        _socket->write(_msg);
-    }
+//    void CoindProtocol::get_block_header(uint256 hash)
+//    {
+//        std::vector<uint256> _have;
+//        auto _msg = make_message<coind::p2p::messages::message_getheaders>(1, _have, hash);
+//        _socket->write(_msg);
+//    }
 }

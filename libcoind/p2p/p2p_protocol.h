@@ -4,11 +4,13 @@
 #include "p2p_socket.h"
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
+#include <libdevcore/deferred.h>
 #include <libcoind/transaction.h>
 #include <sharechains/data.h>
 #include <sharechains/share_types.h>
 using namespace coind::p2p::messages;
 using namespace c2pool::libnet;
+using namespace c2pool::deferred;
 
 #include <univalue.h>
 #include <btclibs/uint256.h>
@@ -31,15 +33,19 @@ namespace coind::p2p
     class CoindProtocol
     {
     protected:
+        shared_ptr<boost::asio::io_context> _context;
         shared_ptr<coind::p2p::P2PSocket> _socket;
 
     public:
-        CoindProtocol(shared_ptr<coind::p2p::P2PSocket> _sct);
+        CoindProtocol(std::shared_ptr<boost::asio::io_context> cxt, shared_ptr<coind::p2p::P2PSocket> _sct);
 
     public:
         Event<uint256> new_block;    //block_hash
         Event<coind::data::tx_type> new_tx;      //bitcoin_data.tx_type
         Event<coind::data::types::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+
+        std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
+        std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockHeaderType, uint256>> get_block_header;
 
         void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<coind::data::types::BlockHeaderType> _new_headers)
         {
@@ -53,7 +59,7 @@ namespace coind::p2p
         void pinger(int delay);
 
     public:
-        void get_block_header(uint256 hash);
+//        void get_block_header(uint256 hash);
 
     public:
         void write(std::shared_ptr<base_message> msg)
@@ -139,15 +145,20 @@ namespace coind::p2p
         void handle(shared_ptr<message_version> msg)
         {
             auto verack = make_message<message_verack>();
-            _socket->write(verack);
+            write(verack);
         }
 
         void handle(shared_ptr<message_verack> msg)
         {
-            /*TODO?: just for tests?
-            self.get_block = deferral.ReplyMatcher(lambda hash: self.send_getdata(requests=[dict(type='block', hash=hash)]))
-            self.get_block_header = deferral.ReplyMatcher(lambda hash: self.send_getheaders(version=1, have=[], last=hash))
-            */
+            get_block = std::make_shared<ReplyMatcher<uint256, coind::data::types::BlockType, uint256>>(_context, [&](uint256 hash) -> void {
+                auto _msg = make_message<message_getdata>(std::vector<inventory>{{block, hash}});
+                write(_msg);
+            });
+
+            get_block_header = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockHeaderType, uint256>> (_context, [&](uint256 hash){
+                auto  _msg = make_message<message_getheaders>(1, std::vector<uint256>{}, hash);
+                write(_msg);
+            });
 
             pinger(30);
         }
@@ -170,15 +181,14 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_getaddr> msg)
         {
-            //or not todo
+            // empty
         }
         void handle(shared_ptr<message_addr> msg)
         {
-            //or not todo
+            // empty
         }
         void handle(shared_ptr<message_inv> msg)
         {
-            LOG_TRACE << "HANDLED INV";
             for (auto _inv : msg->invs.get())
             {
                 auto inv = _inv.get();
@@ -198,6 +208,7 @@ namespace coind::p2p
                     break;
                 default:
                     //when Unkown inv type
+                    LOG_WARNING << "Unknown inv type";
                     break;
                 }
             }
@@ -205,7 +216,7 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_getdata> msg)
         {
-            //or not todo
+            // empty
         }
         void handle(shared_ptr<message_reject> msg)
         {
@@ -215,21 +226,26 @@ namespace coind::p2p
 
         void handle(shared_ptr<message_getblocks> msg)
         {
-            //or not todo
+            // empty
         }
 
         void handle(shared_ptr<message_getheaders> msg)
         {
-            //or not todo
+            // empty
         }
 
         void handle(shared_ptr<message_tx> msg)
         {
-            //TODO: new_tx->happened(msg->tx); //self.factory.new_tx.happened(tx)
+            new_tx.happened(msg->tx.tx);
         }
 
         void handle(shared_ptr<message_block> msg)
         {
+            PackStream packed_header;
+            packed_header << msg->block;
+
+            auto block_hash = coind::data::hash256(packed_header);
+            get_block->got_response(block_hash, block);
             //TODO!?:
             /*
             block_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header']))
