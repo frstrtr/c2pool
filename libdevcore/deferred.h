@@ -16,7 +16,7 @@ using namespace std::chrono_literals;
 using boost::system::error_code;
 
 //TODO: documentation
-namespace c2pool::util::deferred
+namespace c2pool::deferred
 {
     template <typename Fut>
     bool is_ready(Fut const &fut)
@@ -101,6 +101,7 @@ namespace c2pool::util::deferred
                                             });
         }
 
+        //TODO:
         void got_response(Key key, ReturnType val)
         {
             result[key]->_reply.set_value(val);
