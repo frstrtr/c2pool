@@ -336,4 +336,21 @@ namespace coind::data
             make_value(_stream->version.value, _stream->previous_block.get(), _stream->timestamp.get(), _stream->bits.get(), _stream->nonce.get(), _stream->merkle_root.get());
         }
     };
+
+    struct BlockTypeA :
+            StreamTypeAdapter<types::BlockType, stream::BlockType_stream>
+    {
+        void _to_stream() override
+        {
+            make_stream(*_value);
+        }
+
+        void _to_value() override
+        {
+            BlockHeaderType _block_header;
+            _block_header.set_stream(stream()->header);
+
+            make_value(*_block_header.get(), stream()->txs.get());
+        }
+    };
 }
