@@ -42,12 +42,12 @@ namespace coind::p2p
     public:
         Event<uint256> new_block;    //block_hash
         Event<coind::data::tx_type> new_tx;      //bitcoin_data.tx_type
-        Event<coind::data::types::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<std::vector<coind::data::types::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
         std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
         std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockHeaderType, uint256>> get_block_header;
 
-        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<coind::data::types::BlockHeaderType> _new_headers)
+        void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<std::vector<coind::data::types::BlockHeaderType>> _new_headers)
         {
             new_block = _new_block;
             new_tx = _new_tx;
@@ -175,8 +175,7 @@ namespace coind::p2p
         }
         void handle(shared_ptr<message_alert> msg)
         {
-            //pass # print 'ALERT:', (message, signature)
-            //or not todo
+            LOG_WARNING << "Handled message_alert signature: " << msg->signature.get();
         }
 
         void handle(shared_ptr<message_getaddr> msg)
@@ -243,24 +242,34 @@ namespace coind::p2p
         {
             PackStream packed_header;
             packed_header << msg->block;
-
             auto block_hash = coind::data::hash256(packed_header);
-            get_block->got_response(block_hash, block);
-            //TODO!?:
-            /*
-            block_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header']))
-            self.get_block.got_response(block_hash, block)
-            self.get_block_header.got_response(block_hash, block['header'])
-            */
+
+            coind::data::BlockTypeA block;
+            block.set_stream(msg->block);
+
+            get_block->got_response(block_hash, *block.get());
+            get_block_header->got_response(block_hash, block.get()->header);
         }
 
         void handle(shared_ptr<message_headers> msg)
         {
-            //TODO!?:
-            // for header in headers:
-            //     header = header['header']
-            //     self.get_block_header.got_response(bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header)), header)
-            // self.factory.new_headers.happened([header['header'] for header in headers])
+            std::vector<coind::data::types::BlockHeaderType> _new_headers;
+
+            for (auto _block : msg->headers.get())
+            {
+                coind::data::BlockTypeA block;
+                block.set_stream(_block);
+
+                PackStream packed_header;
+                packed_header << _block;
+                auto block_hash = coind::data::hash256(packed_header);
+
+                get_block_header->got_response(block_hash, block->header);
+
+                _new_headers.push_back(block->header);
+            }
+
+            new_headers.happened(_new_headers);
         }
 
         void handle(shared_ptr<message_error> msg)

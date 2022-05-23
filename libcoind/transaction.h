@@ -314,7 +314,7 @@ namespace coind::data::stream
 
 #define WitnessType ListType<StrType>
 
-    struct TransactionType_stream // : public Maker<TransactionType_stream, TransactionType>
+    struct TransactionType_stream : CustomGetter<std::shared_ptr<TransactionType>>// : public Maker<TransactionType_stream, TransactionType>
     {
         std::shared_ptr<coind::data::TransactionType> tx;
 
@@ -323,6 +323,11 @@ namespace coind::data::stream
         TransactionType_stream(coind::data::tx_type val)
         {
             tx = val;
+        }
+
+        std::shared_ptr<TransactionType> get() const override
+        {
+            return tx;
         }
 
         PackStream &write(PackStream &stream);

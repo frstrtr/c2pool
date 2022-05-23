@@ -62,7 +62,7 @@ namespace c2pool::libnet
 
         Event<uint256> new_block;                           //block_hash
         Event<coind::data::tx_type> new_tx;                 //bitcoin_data.tx_type
-        Event<coind::data::types::BlockHeaderType> new_headers; //bitcoin_data.block_header_type
+        Event<std::vector<coind::data::types::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
         Variable<coind::getwork_result> coind_work;
         Variable<coind::data::BlockHeaderType> best_block_header;
