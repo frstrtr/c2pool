@@ -25,49 +25,6 @@ namespace c2pool::deferred
     }
 
     template <typename ReturnType>
-    struct result_obj_type
-    {
-        std::promise<ReturnType> _reply;
-        std::shared_future<ReturnType> _future;
-        std::vector<std::function<void(ReturnType)>> callbacks;
-
-        ReturnType result;
-        boost::asio::steady_timer await_timer;
-        boost::asio::steady_timer timeout;
-
-        result_obj_type(std::shared_ptr<io::io_context> _context, time_t t) : timeout((*_context), std::chrono::seconds(t)), await_timer((*_context), 1ms)
-        {
-            _future = _reply.get_future().share();
-        }
-
-        void wait(const boost::system::error_code &ec)
-        {
-            if (!ec.failed())
-            {
-                if (is_ready(_future))
-                {
-                    for (auto v : callbacks)
-                    {
-                        v(result);
-                    }
-                    return;
-                }
-                else
-                {
-                    // std::cout << " (reply not ready)" << std::endl;
-                }
-
-                await_timer.expires_from_now(100ms);
-                await_timer.async_wait(std::bind(&result_obj_type<ReturnType>::wait, this, std::placeholders::_1));
-            }
-            else
-            {
-                throw ec;
-            }
-        }
-    };
-
-    template <typename ReturnType>
     class result_reply
     {
     private:
@@ -142,14 +99,14 @@ namespace c2pool::deferred
     };
 
     template <typename Key, typename ReturnType, typename... Args>
-    struct ReplyMatcher2
+    struct ReplyMatcher
     {
         std::map<Key, std::shared_ptr<result_reply<ReturnType>>> result;
         std::function<void(Args...)> func;
         std::shared_ptr<io::io_context> context;
         time_t timeout_t;
 
-        ReplyMatcher2(std::shared_ptr<io::io_context> _context, std::function<void(Args...)> _func, time_t _timeout_t = 5) : context(_context), func(_func), timeout_t(_timeout_t) {}
+        ReplyMatcher(std::shared_ptr<io::io_context> _context, std::function<void(Args...)> _func, time_t _timeout_t = 5) : context(_context), func(_func), timeout_t(_timeout_t) {}
 
         void operator()(Key key, Args... ARGS)
         {
@@ -171,54 +128,6 @@ namespace c2pool::deferred
         {
             this->operator()(key, ARGS...);
             result[key]->add_callback(__f);
-        }
-    };
-
-    template <typename Key, typename ReturnType, typename... Args>
-    struct ReplyMatcher
-    {
-        std::map<Key, std::shared_ptr<result_obj_type<ReturnType>>> result;
-        std::function<void(Args...)> func;
-        std::shared_ptr<io::io_context> _context;
-        time_t timeout_t;
-
-        ReplyMatcher(std::shared_ptr<io::io_context> context, std::function<void(Args...)> _func, time_t _timeout_t = 5) : func(_func), timeout_t(_timeout_t)
-        {
-            _context = context;
-        }
-
-        void operator()(Key key, Args... ARGS)
-        {
-            result[key] = std::make_shared<result_obj_type<ReturnType>>(_context, timeout_t);
-            result[key]->result = func(ARGS...);
-            result[key]->await_timer.async_wait(std::bind(&result_obj_type<ReturnType>::wait, result[key], std::placeholders::_1));
-            result[key]->timeout.async_wait([&](const boost::system::error_code &ec)
-                                            {
-                                                if (!ec)
-                                                {
-                                                    try
-                                                    {
-                                                        throw std::runtime_error("ReplyMatcher timeout!");
-                                                    }
-                                                    catch (const std::exception &e)
-                                                    {
-                                                        result[key]->_reply.set_exception(std::current_exception());
-                                                    }
-                                                }
-                                            });
-        }
-
-        //TODO:
-        void got_response(Key key, ReturnType val)
-        {
-            result[key]->_reply.set_value(val);
-            result[key]->timeout.cancel();
-        }
-
-        void yield(Key key, std::function<void(ReturnType)> __f, Args... ARGS)
-        {
-            this->operator()(key, ARGS...);
-            result[key]->callbacks.push_back(__f);
         }
     };
 
