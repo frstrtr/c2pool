@@ -31,11 +31,11 @@ TEST(Deferred, Deferred_system)
     context->run();
 }
 
-TEST(Deferred, ReplyMathcher)
+TEST(Deferred, ReplyMatcher)
 {
     std::shared_ptr<boost::asio::io_context> context = std::make_shared<boost::asio::io_context>();
-    ReplyMatcher<int, int, int> reply(context, [&](const int &i){
-        return i;
+    ReplyMatcher2<int, int, int> reply(context, [&](const int &i){
+        std::cout << "CALLED WITH PARAM: " << i << std::endl;
     });
 
     boost::asio::steady_timer timer(*context);
