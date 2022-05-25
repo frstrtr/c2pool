@@ -28,7 +28,7 @@ namespace c2pool::libnet
                                     ip::tcp::socket socket(*_context);
                                     auto _socket = make_shared<coind::p2p::P2PSocket>(std::move(socket), _parent_net);
 
-                                    protocol = make_shared<coind::p2p::CoindProtocol>(_socket);
+                                    protocol = make_shared<coind::p2p::CoindProtocol>(_context, _socket);
                                     protocol->init(new_block, new_tx, new_headers);
                                     _socket->init(endpoints, protocol);
                                 });
