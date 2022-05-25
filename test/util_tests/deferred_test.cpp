@@ -34,7 +34,7 @@ TEST(Deferred, Deferred_system)
 TEST(Deferred, ReplyMatcher)
 {
     std::shared_ptr<boost::asio::io_context> context = std::make_shared<boost::asio::io_context>();
-    ReplyMatcher2<int, int, int> reply(context, [&](const int &i){
+    ReplyMatcher<int, int, int> reply(context, [&](const int &i){
         std::cout << "CALLED WITH PARAM: " << i << std::endl;
     });
 
