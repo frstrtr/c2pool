@@ -33,6 +33,11 @@ namespace coind::p2p
     class CoindProtocol;
 }
 
+namespace c2pool::libnet::p2p
+{
+    class P2PNode;
+}
+
 namespace c2pool::libnet
 {
     class CoindNode
@@ -42,7 +47,7 @@ namespace c2pool::libnet
         ip::tcp::resolver _resolver;
 
     public:
-        CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker);
+        CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<c2pool::libnet::p2p::P2PNode> p2p_node, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker);
 
         void start();
 
@@ -78,6 +83,7 @@ namespace c2pool::libnet
         shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<coind::p2p::CoindProtocol> protocol;
         shared_ptr<coind::JSONRPC_Coind> _coind;
+        shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
         shared_ptr<ShareTracker> _tracker;
     };
 }

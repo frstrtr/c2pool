@@ -121,7 +121,7 @@ namespace c2pool::deferred
 
         void got_response(Key key, ReturnType val)
         {
-            result[key]-> template set_value(val);
+            result[key]->set_value(val);
         }
 
         void yield(Key key, std::function<void(ReturnType)> __f, Args... ARGS)
