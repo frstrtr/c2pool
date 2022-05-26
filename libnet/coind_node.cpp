@@ -3,6 +3,7 @@
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
 
+#include "p2p_node.h"
 #include <networks/network.h>
 #include <libcoind/p2p/p2p_socket.h>
 #include <libcoind/p2p/p2p_protocol.h>
@@ -12,7 +13,7 @@
 namespace c2pool::libnet
 {
 
-    CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker) : _context(__context), _parent_net(__parent_net), _coind(__coind), _resolver(*_context), work_poller_t(*_context), _tracker(__tracker),
+    CoindNode::CoindNode(std::shared_ptr<io::io_context> __context, shared_ptr<coind::ParentNetwork> __parent_net, shared_ptr<c2pool::libnet::p2p::P2PNode> p2p_node, shared_ptr<coind::JSONRPC_Coind> __coind, shared_ptr<ShareTracker> __tracker) : _context(__context), _parent_net(__parent_net), _p2p_node(p2p_node), _coind(__coind), _resolver(*_context), work_poller_t(*_context), _tracker(__tracker),
                                                                                                                                                                                                    get_height_rel_highest(_coind, [&](){return coind_work.value().previous_block; })
     {
         LOG_INFO << "CoindNode constructor";
@@ -189,12 +190,22 @@ namespace c2pool::libnet
 
     void CoindNode::set_best_share()
     {
-
         auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker()->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
         best_share = _best;
         desired = _desired;
 
+        if (_p2p_node)
+        {
+            for (auto bad_addr : _bad_peer_addresses)
+            {
+                //TODO: O(n) -- wanna for optimize
+                for (auto peer : _p2p_node->get_peers())
+                {
+                    if (peer.second->)
+                }
+            }
+        }
         //TODO: Проверка подключения на p2p_node.
         // if (_node_manager->p2pNode() != nullptr)
         // {
