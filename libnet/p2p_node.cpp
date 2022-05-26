@@ -176,7 +176,8 @@ namespace c2pool::libnet::p2p
         }
     }
 
-    std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>>& P2PNode::get_peers(){
+    std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>> P2PNode::get_peers()
+    {
         return peers;
     }
 
@@ -208,6 +209,11 @@ namespace c2pool::libnet::p2p
         return false;
     }
 
+    void P2PNode::handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares,
+                                shared_ptr<c2pool::libnet::p2p::Protocol> peer)
+    {
+        //TODO: finish
+    }
 
 
 } // namespace c2pool::p2p

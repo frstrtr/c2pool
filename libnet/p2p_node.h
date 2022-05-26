@@ -49,7 +49,7 @@ namespace c2pool::libnet::p2p
         std::vector<addr> get_good_peers(int max_count);
         void got_addr(c2pool::libnet::addr _addr, uint64_t services, int64_t timestamp);
 
-        std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>>& get_peers();
+        std::map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>> get_peers();
         unsigned long long get_nonce();
 
         bool is_connected() const;
@@ -80,10 +80,7 @@ namespace c2pool::libnet::p2p
             return shares;
         }
 
-        void handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares, shared_ptr<c2pool::libnet::p2p::Protocol> peer)
-        {
-            //TODO: finish
-        }
+        void handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares, shared_ptr<c2pool::libnet::p2p::Protocol> peer);
         void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
     private:
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);

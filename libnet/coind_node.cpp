@@ -202,10 +202,14 @@ namespace c2pool::libnet
                 //TODO: O(n) -- wanna for optimize
                 for (auto peer : _p2p_node->get_peers())
                 {
-                    if (peer.second->)
+                    if (peer.second->get_addr())
+                    {
+
+                    }
                 }
             }
         }
+
         //TODO: Проверка подключения на p2p_node.
         // if (_node_manager->p2pNode() != nullptr)
         // {

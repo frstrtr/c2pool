@@ -10,13 +10,12 @@
 #include <boost/bind.hpp>
 
 #include "messages.h"
-#include "p2p_node.h"
 #include "p2p_socket.h"
 #include <networks/network.h>
 #include <libdevcore/random.h>
 #include <libdevcore/logger.h>
-#include <sharechains/share.h>
 #include <libdevcore/types.h>
+#include <sharechains/share.h>
 
 using namespace c2pool::libnet::messages;
 using std::shared_ptr, std::weak_ptr, std::make_shared;
@@ -58,6 +57,11 @@ namespace c2pool::libnet::p2p
 
         virtual shared_ptr<raw_message> make_raw_message(std::string cmd)
         { return make_shared<raw_message>(cmd); }
+
+        auto get_addr() const
+        {
+            return _socket->get_addr();
+        }
     };
 
     class P2P_Protocol : public Protocol, public enable_shared_from_this<P2P_Protocol>
