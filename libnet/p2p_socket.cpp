@@ -111,7 +111,7 @@ namespace c2pool::libnet::p2p
             memcpy(command, temp_cmd.c_str(), temp_cmd.size());
             PackStream s_command(command, 12);
             value << s_command;
-            delete command;
+            delete command; // bug, wanna delete[]
 
             //-----
             PackStream payload_stream;
