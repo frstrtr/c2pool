@@ -16,13 +16,6 @@ protected:
 
     HandlerManager handler_manager;
 public:
-    Protocol(std::shared_ptr<Socket> _socket, const HandlerManager _handler_manager) : socket(_socket),
-                                                                                       handler_manager(_handler_manager)
-    {
-
-    }
-
-public:
     virtual void write(std::shared_ptr<Message> msg)
     {
         socket->write(msg);
@@ -38,5 +31,12 @@ public:
         {
             //TODO: empty handler
         }
+    }
+
+public:
+    Protocol(std::shared_ptr<Socket> _socket, const HandlerManager _handler_manager) : socket(_socket),
+                                                                                       handler_manager(_handler_manager)
+    {
+        _socket->set_message_handler(std::bind(&Protocol::handle, this, std::placeholders::_1));
     }
 };

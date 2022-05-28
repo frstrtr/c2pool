@@ -4,22 +4,30 @@
 #include <string>
 #include <tuple>
 #include <functional>
+#include <utility>
 
 #include "message.h"
 
 class Socket
 {
 protected:
-    std::function<void()> handler;
+    typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> handler_type;
+
+    handler_type handler;
 
 public:
-    Socket(std::function<void()> message_handler) : handler(message_handler) {}
+    Socket(handler_type message_handler) : handler(std::move(message_handler)) {}
+
+    void set_message_handler(handler_type message_handler)
+    {
+        handler = std::move(message_handler);
+    }
 
     virtual void write(std::shared_ptr<Message>) = 0;
 
     virtual void read() = 0;
 
-    virtual void isConnected() = 0;
+    virtual bool isConnected() = 0;
 
     virtual void disconnect() = 0;
 
@@ -37,7 +45,7 @@ private:
     socket_type fundamental_socket;
 public:
     FundamentalSocketObject(socket_type _fundamental_socket, std::shared_ptr<Socket> _socket) :
-            fundamental_socket(_fundamental_socket), socket(_socket)
+            fundamental_socket(_fundamental_socket), socket(std::move(_socket))
     {
 
     }
