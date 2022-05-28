@@ -34,7 +34,7 @@ namespace c2pool
     }
 } // namespace c2pool
 
-#define HOST_IDENT std::string
+
 
 using namespace c2pool::libnet;
 
@@ -86,8 +86,8 @@ namespace c2pool::libnet::p2p
         bool protocol_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
         bool protocol_listen_connected(shared_ptr<c2pool::libnet::p2p::Protocol> protocol);
 
-        void listen();
-        void auto_connect();
+        void listen(); //+
+        void auto_connect(); //+
 
     public:
         VariableDict<uint256, coind::data::tx_type> known_txs;
@@ -106,19 +106,19 @@ namespace c2pool::libnet::p2p
         const std::chrono::seconds auto_connect_interval{std::chrono::seconds(1)};
 
         //client
-        ip::tcp::resolver _resolver;
+        ip::tcp::resolver _resolver; //+
         //server
-        ip::tcp::acceptor _acceptor;
+        ip::tcp::acceptor _acceptor; //+
     public:
         shared_ptr<c2pool::dev::AddrStore> get_addr_store() { return _addr_store; }
 
     private:
         unsigned long long node_id; //nonce
 
-        map<HOST_IDENT, shared_ptr<P2PSocket>> client_attempts;
-        set<shared_ptr<P2PSocket>> server_attempts;
-        set<shared_ptr<c2pool::libnet::p2p::Protocol>> client_connections;
-        map<HOST_IDENT, int> server_connections;
+        map<HOST_IDENT, shared_ptr<P2PSocket>> client_attempts; //+
+        set<shared_ptr<P2PSocket>> server_attempts; //+
+        set<shared_ptr<c2pool::libnet::p2p::Protocol>> client_connections; //+
+        map<HOST_IDENT, int> server_connections; //+
         map<unsigned long long, shared_ptr<c2pool::libnet::p2p::Protocol>> peers;
     };
 } // namespace c2pool::p2p

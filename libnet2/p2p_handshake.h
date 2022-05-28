@@ -25,7 +25,7 @@ public:
         // TODO: write message_version
 
         client_connected = handler;
-        boost::asio::async_connect(*socket->get_fundamental_socket(), endpoint, [&](const boost::system::error_code &ec, boost::asio::ip::tcp::endpoint ep){
+        boost::asio::async_connect(socket->get_fundamental_socket(), endpoint, [&](const boost::system::error_code &ec, boost::asio::ip::tcp::endpoint ep){
             LOG_INFO << "Connect to " << ep.address() << ":" << ep.port();
             if (!ec)
             {
