@@ -12,7 +12,7 @@
 #include <boost/asio.hpp>
 
 
-class P2PSocket : public Socket, public FundamentalSocketObject<std::shared_ptr<boost::asio::ip::tcp::socket>>, public std::enable_shared_from_this<Socket>
+class P2PSocket : public Socket, public FundamentalSocketObject<boost::asio::ip::tcp::socket>, public std::enable_shared_from_this<Socket>
 {
 private:
     std::shared_ptr<c2pool::Network> net;
@@ -50,18 +50,18 @@ public:
 
     bool isConnected() override
     {
-        return get_fundamental_socket()->is_open();
+        return get_fundamental_socket().is_open();
     }
 
     void disconnect() override
     {
-        get_fundamental_socket()->close();
+        get_fundamental_socket().close();
     }
 
     std::tuple<std::string, std::string> get_addr() override
     {
         boost::system::error_code ec;
-        auto ep = get_fundamental_socket()->remote_endpoint(ec);
+        auto ep = get_fundamental_socket().remote_endpoint(ec);
         return {ep.address().to_string(), std::to_string(ep.port())};
     }
 };

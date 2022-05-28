@@ -17,7 +17,6 @@
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/height_tracker.h>
 
-
 using namespace coind::jsonrpc;
 using namespace shares;
 using namespace coind;

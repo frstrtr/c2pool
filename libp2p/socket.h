@@ -45,7 +45,7 @@ private:
     socket_type fundamental_socket;
 public:
     FundamentalSocketObject(socket_type _fundamental_socket, std::shared_ptr<Socket> _socket) :
-            fundamental_socket(_fundamental_socket), socket(std::move(_socket))
+            fundamental_socket(std::move(_fundamental_socket)), socket(std::move(_socket))
     {
 
     }
@@ -55,7 +55,7 @@ public:
         return socket;
     }
 
-    socket_type get_fundamental_socket()
+    socket_type &get_fundamental_socket()
     {
         return fundamental_socket;
     }
