@@ -16,6 +16,8 @@ protected:
     handler_type handler;
 
 public:
+    Socket() {}
+
     Socket(handler_type message_handler) : handler(std::move(message_handler)) {}
 
     void set_message_handler(handler_type message_handler)

@@ -16,7 +16,6 @@ private:
 public:
     P2PHandshake(std::shared_ptr<P2PSocket> _socket, HandlerManager _handler_manager) : Handshake(_socket, _handler_manager)
     {
-
     }
 
     /// [Client] Try to connect
@@ -42,11 +41,16 @@ public:
     /// [Server] Try to resolve connection
     virtual void listen_connection(std::function<void(std::shared_ptr<Protocol>)> handler) override
     {
-        // TODO: write message_version
+        // TODO: read message_version
         server_connected = handler;
 
         std::shared_ptr<Protocol> proto = std::make_shared<P2PProtocol>(socket, handler_manager);
         server_connected(proto);
 
+    }
+
+    void handle_message(std::shared_ptr<RawMessage> raw_msg)
+    {
+        //TODO:
     }
 };

@@ -41,7 +41,7 @@ private:
 
     ip::tcp::resolver resolver;
 protected:
-    std::map<HOST_IDENT, std::shared_ptr<P2PSocket>> client_attempts;
+    std::map<HOST_IDENT, std::shared_ptr<P2PHandshake>> client_attempts;
     std::set<std::shared_ptr<P2PProtocol>> client_connections;
 public:
     P2PNodeClient(std::shared_ptr<P2PNodeData> _data) : data(_data), resolver(*data->context)  {}
@@ -64,7 +64,7 @@ private:
 
     ip::tcp::acceptor acceptor;
 protected:
-    std::set<std::shared_ptr<P2PSocket>> server_attempts;
+    std::set<std::shared_ptr<P2PHandshake>> server_attempts;
     std::map<HOST_IDENT, int> server_connections;
 public:
     P2PNodeServer(std::shared_ptr<P2PNodeData> _data) : data(_data), acceptor(*data->context) {}
@@ -81,13 +81,10 @@ public:
                                    if (!ec)
                                    {
                                        auto _socket = std::make_shared<P2PSocket>(std::move(socket),
-                                                                                  [&](std::shared_ptr<RawMessage> raw_msg)
-                                                                                  {
-
-                                                                                  },
                                                                                   data->net);
-                                       server_attempts.insert(_socket);
-                                       _socket->init(std::bind(&P2PNodeServer::server_connected, this, std::placeholders::_1));
+                                       auto handshake = std::make_shared<P2PHandshake>(_socket, data->handler_manager);
+                                       handshake->listen_connection(std::bind(&P2PNodeServer::server_connected, this, std::placeholders::_1));
+                                       server_attempts.insert(handshake);
                                    }
                                    else
                                    {
