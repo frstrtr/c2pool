@@ -14,21 +14,12 @@ class Protocol
 protected:
     std::shared_ptr<Socket> socket;
 
-    std::map<std::string, HandlerPtr> handlers;
+    HandlerManager handler_manager;
 public:
-    Protocol(std::shared_ptr<Socket> _socket) : socket(_socket)
-    {}
-
-    template<typename MessageType>
-    void new_handler(std::string command, std::function<void(std::shared_ptr<MessageType>)> handlerF)
+    Protocol(std::shared_ptr<Socket> _socket, const HandlerManager _handler_manager) : socket(_socket),
+                                                                                       handler_manager(_handler_manager)
     {
-        if (!handlers.count(command))
-        {
-            handlers[command] = make_handler<MessageType>(handlerF);
-        } else
-        {
-            // TODO: handler for this command already exist in <handlers> map
-        }
+
     }
 
 public:
@@ -39,13 +30,13 @@ public:
 
     virtual void handle(std::shared_ptr<RawMessage> raw_msg)
     {
-        if (!handlers.count(raw_msg->command))
+        auto handler = handler_manager[raw_msg->command];
+        if (handler)
         {
-            // call handler for raw_msg.command
-            handlers[raw_msg->command]->invoke(raw_msg->value);
+            handler->invoke(raw_msg->value);
         } else
         {
-            //TODO: dont exist handler for this command
+            //TODO: empty handler
         }
     }
 };

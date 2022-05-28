@@ -2,7 +2,7 @@ set(libp2p_source
         socket.h
         socket.cpp
         socket_data.h
-        message.h protocol.h handler.h)
+        message.h protocol.h handler.h handshake.h)
 
 # TODO: library to interface
 add_library(libp2p ${libp2p_source})
