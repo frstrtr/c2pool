@@ -17,6 +17,14 @@ class P2PSocket : public Socket, public FundamentalSocketObject<boost::asio::ip:
 private:
     std::shared_ptr<c2pool::Network> net;
 public:
+    P2PSocket(socket_type _fundamental_socket, std::shared_ptr<c2pool::Network> _net) :
+            Socket(),
+            FundamentalSocketObject(std::move(_fundamental_socket), shared_from_this()),
+            net(_net)
+    {
+
+    }
+
     P2PSocket(socket_type _fundamental_socket, handler_type message_handler, std::shared_ptr<c2pool::Network> _net) :
             Socket(std::move(message_handler)),
             FundamentalSocketObject(std::move(_fundamental_socket), shared_from_this()),
