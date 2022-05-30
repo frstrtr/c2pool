@@ -2,113 +2,122 @@
 #include <iostream>
 #include <string>
 
-namespace c2pool::messages
+address_type::address_type()
 {
+    services = 0;
+    address = "";
+    port = 0;
+}
 
-    address_type::address_type()
+address_type::address_type(unsigned long long _services, std::string _address, int _port)
+{
+    services = _services;
+    address = _address;
+    port = _port;
+}
+
+bool operator==(const address_type &first, const address_type &second)
+{
+    if (first.address != second.address)
     {
-        services = 0;
-        address = "";
-        port = 0;
+        return false;
     }
-
-    address_type::address_type(unsigned long long _services, std::string _address, int _port)
+    if (first.port != second.port)
     {
-        services = _services;
-        address = _address;
-        port = _port;
+        return false;
     }
-
-    bool operator==(const address_type &first, const address_type &second)
+    if (first.services != second.services)
     {
-        if (first.address != second.address)
-            return false;
-        if (first.port != second.port)
-            return false;
-        if (first.services != second.services)
-            return false;
-        return true;
+        return false;
     }
+    return true;
+}
 
-    bool operator!=(const address_type &first, const address_type &second)
+bool operator!=(const address_type &first, const address_type &second)
+{
+    return !(first == second);
+}
+//share_type:
+
+share_type::share_type()
+{
+    type = 0;
+    contents = "";
+}
+
+share_type::share_type(int _type, std::string _contents)
+{
+    type = type;
+    contents = _contents;
+}
+
+//addr
+
+addr::addr()
+{
+    address = address_type();
+    timestamp = 0;
+}
+
+addr::addr(int64_t t, address_type a)
+{
+    address = a;
+    timestamp = t;
+}
+
+addr::addr(int64_t t, int _services, std::string _address, int _port)
+{
+    address_type a = address_type(_services, _address, _port);
+    address = a;
+    timestamp = t;
+}
+
+bool operator==(const addr &first, const addr &second)
+{
+    if (first.address != second.address)
     {
-        return !(first == second);
+        return false;
     }
-    //share_type:
-
-    share_type::share_type()
+    if (first.timestamp != second.timestamp)
     {
-        type = 0;
-        contents = "";
+        return false;
     }
+    return true;
+}
 
-    share_type::share_type(int _type, std::string _contents)
+bool operator!=(const addr &first, const addr &second)
+{
+    return !(first == second);
+}
+
+//inventory
+
+inventory::inventory()
+{
+    type = inventory_type::tx;
+    hash.SetNull();
+}
+
+inventory::inventory(inventory_type _type, uint256 _hash)
+{
+    type = _type;
+    hash = _hash;
+}
+
+bool operator==(const inventory &first, const inventory &second)
+{
+    if (first.type != second.type)
     {
-        type = type;
-        contents = _contents;
+        return false;
     }
-
-    //addr
-
-    addr::addr()
+    if (first.hash != second.hash)
     {
-        address = address_type();
-        timestamp = 0;
+        return false;
     }
+    return true;
+}
 
-    addr::addr(int64_t t, address_type a)
-    {
-        address = a;
-        timestamp = t;
-    }
-
-    addr::addr(int64_t t, int _services, std::string _address, int _port)
-    {
-        address_type a = address_type(_services, _address, _port);
-        address = a;
-        timestamp = t;
-    }
-
-    bool operator==(const addr &first, const addr &second)
-    {
-        if (first.address != second.address)
-            return false;
-        if (first.timestamp != second.timestamp)
-            return false;
-        return true;
-    }
-
-    bool operator!=(const addr &first, const addr &second)
-    {
-        return !(first == second);
-    }
-
-    //inventory
-
-    inventory::inventory()
-    {
-        type = inventory_type::tx;
-        hash.SetNull();
-    }
-
-    inventory::inventory(inventory_type _type, uint256 _hash)
-    {
-        type = _type;
-        hash = _hash;
-    }
-
-    bool operator==(const inventory &first, const inventory &second)
-    {
-        if (first.type != second.type)
-            return false;
-        if (first.hash != second.hash)
-            return false;
-        return true;
-    }
-
-    bool operator!=(const inventory &first, const inventory &second)
-    {
-        return !(first == second);
-    }
-
-} // namespace c2pool::messages
+bool operator!=(const inventory &first, const inventory &second)
+{
+    return !(first == second);
+}
