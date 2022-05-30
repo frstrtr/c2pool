@@ -48,19 +48,19 @@ namespace c2pool::dev
     public:
         AddrStore(string path, shared_ptr<c2pool::Network> net);
         void SaveToFile();
-        bool Check(c2pool::libnet::addr addr);
+        bool Check(addr_type addr);
 
-        bool Add(c2pool::libnet::addr key, AddrValue value);
-        bool Remove(c2pool::libnet::addr key);
-        AddrValue Get(c2pool::libnet::addr key);
-        std::vector<std::pair<c2pool::libnet::addr, AddrValue>> GetAll();
+        bool Add(addr_type key, AddrValue value);
+        bool Remove(addr_type key);
+        AddrValue Get(addr_type key);
+        std::vector<std::pair<addr_type, AddrValue>> GetAll();
 
         string ToJSON();
         void FromJSON(string json);
         
         size_t len() { return store.size(); }
     private:
-        map<c2pool::libnet::addr, AddrValue> store;
+        std::map<addr_type, AddrValue> store;
         std::string filePath;
     };
 
