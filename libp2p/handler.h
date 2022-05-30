@@ -7,19 +7,24 @@
 #include <string>
 
 #include "message.h"
+#include "protocol.h"
 #include <libdevcore/stream.h>
+
+template <typename MessageType, typename ProtocolType>
+using handler_type = std::function<void(std::shared_ptr<MessageType>, std::shared_ptr<ProtocolType>)>;
+
 
 class Handler
 {
 public:
-    virtual void invoke(PackStream &stream) = 0;
+    virtual void invoke(PackStream &stream, std::shared_ptr<Protocol> _protocol) = 0;
 };
 
-template <typename MessageType>
+template <typename MessageType, typename ProtocolType>
 class MessageHandler : public Handler
 {
 protected:
-    std::function<void(std::shared_ptr<MessageType>)> handlerF;
+    handler_type<MessageType, ProtocolType> handlerF;
 
     std::shared_ptr<MessageType> generate_message(PackStream &stream)
     {
@@ -29,43 +34,41 @@ protected:
     }
 
 public:
-    MessageHandler(std::function<void(std::shared_ptr<MessageType>)> _handlerF) : handlerF(_handlerF) {}
+    MessageHandler(handler_type<MessageType, ProtocolType> _handlerF) : handlerF(_handlerF) {}
 
-    void invoke(PackStream &stream) override
+    void invoke(PackStream &stream, std::shared_ptr<Protocol> _protocol) override
     {
         auto msg = generate_message(stream);
-        handlerF(msg);
+        auto protocol = std::static_pointer_cast<ProtocolType>(_protocol);
+        handlerF(msg, protocol);
     }
 };
 
 typedef std::shared_ptr<Handler> HandlerPtr;
 
-template <typename MessageType>
-HandlerPtr make_handler(std::function<void(std::shared_ptr<MessageType>)> handlerF)
+template <typename MessageType, typename ProtocolType>
+HandlerPtr make_handler(handler_type<MessageType, ProtocolType> handlerF)
 {
-    HandlerPtr handler = std::make_shared<MessageHandler<MessageType>>(std::move(handlerF));
+    HandlerPtr handler = std::make_shared<MessageHandler<MessageType, ProtocolType>>(std::move(handlerF));
     return handler;
 }
 
 class HandlerManager
 {
 private:
-    std::shared_ptr<std::map<std::string, HandlerPtr>> handlers;
+    std::map<std::string, HandlerPtr> handlers;
 
 public:
-    HandlerManager()
-    {
-        handlers = std::make_shared<std::map<std::string, HandlerPtr>>();
-    }
+    HandlerManager() {}
 
-    HandlerManager(const HandlerManager& manager) : handlers(manager.handlers) { }
+    HandlerManager(const HandlerManager& manager) = delete;
 
-    template<typename MessageType>
-    void new_handler(std::string command, std::function<void(std::shared_ptr<MessageType>)> handlerF)
+    template<typename MessageType, typename ProtocolType>
+    void new_handler(std::string command, handler_type<MessageType, ProtocolType> handlerF)
     {
-        if (!handlers->count(command))
+        if (!handlers.count(command))
         {
-            (*handlers)[command] = make_handler<MessageType>(handlerF);
+            handlers[command] = make_handler<MessageType, ProtocolType>(handlerF);
         } else
         {
             // TODO: handler for this command already exist in <handlers> map
@@ -74,13 +77,21 @@ public:
 
     HandlerPtr operator[](std::string command)
     {
-        if (handlers->count(command))
+        if (handlers.count(command))
         {
-            return (*handlers)[command];
+            return handlers[command];
         } else
         {
             //TODO: dont exist handler for this command
             return nullptr;
         }
     }
+
+    // operator[] for pointers
+    HandlerPtr get_handler(std::string command)
+    {
+        return (*this)[command];
+    }
 };
+
+typedef std::shared_ptr<HandlerManager> HandlerManagerPtr;

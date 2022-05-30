@@ -34,5 +34,4 @@ public:
     virtual void listen_connection(std::function<void(std::shared_ptr<Protocol>)> handler) = 0;
 
     virtual void handle_message(std::shared_ptr<RawMessage> raw_msg) = 0;
-
 };
