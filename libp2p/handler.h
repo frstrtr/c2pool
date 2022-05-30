@@ -16,10 +16,10 @@ public:
 };
 
 template <typename MessageType>
-class MessageHandler : Handler
+class MessageHandler : public Handler
 {
 protected:
-    std::function<void(MessageType)> handlerF;
+    std::function<void(std::shared_ptr<MessageType>)> handlerF;
 
     std::shared_ptr<MessageType> generate_message(PackStream &stream)
     {
@@ -41,9 +41,9 @@ public:
 typedef std::shared_ptr<Handler> HandlerPtr;
 
 template <typename MessageType>
-HandlerPtr make_handler(std::function<void(MessageType)> handlerF)
+HandlerPtr make_handler(std::function<void(std::shared_ptr<MessageType>)> handlerF)
 {
-    auto handler = std::make_shared<MessageType>(std::move(handlerF));
+    HandlerPtr handler = std::make_shared<MessageHandler<MessageType>>(std::move(handlerF));
     return handler;
 }
 
@@ -83,5 +83,4 @@ public:
             return nullptr;
         }
     }
-
 };
