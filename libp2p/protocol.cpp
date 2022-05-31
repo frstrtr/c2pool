@@ -9,6 +9,8 @@ void Protocol::write(std::shared_ptr<Message> msg)
 
 void Protocol::handle(std::shared_ptr<RawMessage> raw_msg)
 {
+    event_handle_message.happened(); // ProtocolEvents::event_handle_message
+
     auto handler = handler_manager->get_handler(raw_msg->command);
     if (handler)
     {
