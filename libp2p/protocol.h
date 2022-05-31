@@ -7,11 +7,11 @@
 
 #include "socket.h"
 #include "message.h"
-
+#include "protocol_events.h"
 
 class HandlerManager;
 
-class Protocol : public enable_shared_from_this<Protocol>
+class Protocol : public virtual ProtocolEvents, public enable_shared_from_this<Protocol>
 {
 protected:
     std::shared_ptr<Socket> socket;
