@@ -34,7 +34,7 @@ struct test_message
     }
 };
 
-class Libp2pHandlerTest : public ::testing::Test
+class p2plib_handler : public ::testing::Test
 {
 public:
     PackStream packed_test_message;
@@ -55,7 +55,7 @@ protected:
     }
 };
 
-TEST_F(Libp2pHandlerTest, raw_handler)
+TEST_F(p2plib_handler, raw_handler)
 {
     auto _handler = make_handler<test_message, TestProtocol>([&](auto _msg, auto _protocol){
         _protocol->version = _msg->num.get();
@@ -65,7 +65,7 @@ TEST_F(Libp2pHandlerTest, raw_handler)
     ASSERT_EQ(protocol->version, 123321);
 }
 
-TEST_F(Libp2pHandlerTest, handler_manager)
+TEST_F(p2plib_handler, handler_manager)
 {
     const std::string msg_command = "test_message_123";
     auto mngr = std::make_shared<HandlerManager>();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 
 #include <libdevcore/stream.h>
 
@@ -11,11 +12,17 @@ public:
     std::string command;
 
 public:
-    Message(const char *_command) : command(_command) {}
-    Message(std::string _command) : command(_command) {}
+    Message(const char *_command) : command(_command)
+    {}
 
-    virtual PackStream &write(PackStream &stream) = 0;
-    virtual PackStream &read(PackStream &stream) = 0;
+    Message(std::string _command) : command(std::move(_command))
+    {}
+
+    virtual PackStream &write(PackStream &stream)
+    { return stream; }
+
+    virtual PackStream &read(PackStream &stream)
+    { return stream; }
 };
 
 class RawMessage : public Message
