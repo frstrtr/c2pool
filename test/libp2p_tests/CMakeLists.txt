@@ -1,6 +1,6 @@
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
-set(LIBP2P_TEST_SRC handler_test.cpp socket_test.cpp)
+set(LIBP2P_TEST_SRC handler_test.cpp socket_test.cpp protocol_events_test.cpp)
 add_executable(libp2p_test ${LIBP2P_TEST_SRC})
 set_target_properties(libp2p_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
