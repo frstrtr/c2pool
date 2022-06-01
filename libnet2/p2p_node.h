@@ -5,10 +5,15 @@
 #include <memory>
 #include <numeric>
 #include <functional>
+#include <utility>
+#include <vector>
+#include <tuple>
 
 #include "p2p_handshake.h"
 #include "p2p_protocol.h"
 #include "p2p_socket.h"
+#include <libdevcore/addr_store.h>
+#include <libdevcore/config.h>
 #include <libdevcore/random.h>
 #include <libp2p/handler.h>
 #include <networks/network.h>
@@ -24,13 +29,15 @@ namespace ip = io::ip;
 class P2PNodeData
 {
 public:
+    std::shared_ptr<c2pool::dev::coind_config> config;
     std::shared_ptr<io::io_context> context;
     std::shared_ptr<c2pool::Network> net;
-    HandlerManager handler_manager;
+    std::shared_ptr<c2pool::dev::AddrStore> addr_store;
+    HandlerManagerPtr handler_manager;
 public:
-    P2PNodeData(std::shared_ptr<io::io_context> _context, auto _net) : context(_context), net(_net)
+    P2PNodeData(std::shared_ptr<io::io_context> _context, auto _net, auto _config, auto _addr_store) : context(std::move(_context)), net(_net), config(_config), addr_store(_addr_store)
     {
-
+        handler_manager = std::make_shared<HandlerManager>();
     }
 };
 
@@ -40,21 +47,20 @@ private:
     std::shared_ptr<P2PNodeData> data;
 
     ip::tcp::resolver resolver;
+    io::steady_timer auto_connect_timer;
+
+    const std::chrono::seconds auto_connect_interval{1s};
 protected:
     std::map<HOST_IDENT, std::shared_ptr<P2PHandshake>> client_attempts;
-    std::set<std::shared_ptr<P2PProtocol>> client_connections;
+    std::set<std::shared_ptr<Protocol>> client_connections;
 public:
-    P2PNodeClient(std::shared_ptr<P2PNodeData> _data) : data(_data), resolver(*data->context)  {}
+    P2PNodeClient(std::shared_ptr<P2PNodeData> _data) : data(std::move(_data)), resolver(*data->context), auto_connect_timer(*data->context)  {}
 
-    bool client_connected(std::shared_ptr<Protocol> protocol)
-    {
+    bool client_connected(std::shared_ptr<Protocol> protocol);
 
-    }
+    void auto_connect();
 
-    void auto_connect()
-    {
-
-    }
+    std::vector<addr_type> get_good_peers(int max_count);
 };
 
 class P2PNodeServer
@@ -67,7 +73,7 @@ protected:
     std::set<std::shared_ptr<P2PHandshake>> server_attempts;
     std::map<HOST_IDENT, int> server_connections;
 public:
-    P2PNodeServer(std::shared_ptr<P2PNodeData> _data) : data(_data), acceptor(*data->context) {}
+    P2PNodeServer(std::shared_ptr<P2PNodeData> _data) : data(std::move(_data)), acceptor(*data->context) {}
 
     bool server_connected(std::shared_ptr<Protocol> protocol)
     {

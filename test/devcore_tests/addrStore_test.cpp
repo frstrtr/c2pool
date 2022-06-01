@@ -6,7 +6,7 @@
 #include <fstream>
 
 #include <libdevcore/filesystem.h>
-#include <libdevcore/addrStore.h>
+#include <libdevcore/addr_store.h>
 
 using namespace std;
 

@@ -27,6 +27,21 @@ public:
 
 public:
     void set_socket(std::shared_ptr<Socket> _socket);
+    std::shared_ptr<Socket> get_socket() { return socket; }
 
     void set_handler_manager(std::shared_ptr<HandlerManager> _mngr);
+
+    bool operator<(const Protocol &rhs)
+    {
+        if (!socket)
+        {
+            // TODO: throw
+        }
+        if (!rhs.socket)
+        {
+            // TODO: throw
+        }
+
+        return socket->get_addr() < rhs.socket->get_addr();
+    }
 };
