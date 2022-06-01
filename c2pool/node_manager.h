@@ -3,7 +3,7 @@
 #include <memory>
 #include <networks/network.h>
 #include <libdevcore/config.h>
-#include <libdevcore/addrStore.h>
+#include <libdevcore/addr_store.h>
 #include <boost/asio/io_context.hpp>
 
 using std::shared_ptr;

@@ -8,7 +8,7 @@
 
 #include <boost/asio.hpp>
 
-#include <libdevcore/addrStore.h>
+#include <libdevcore/addr_store.h>
 #include <libdevcore/config.h>
 #include <libdevcore/types.h>
 #include <libdevcore/events.h>

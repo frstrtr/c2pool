@@ -6,7 +6,7 @@
 #include <libcoind/types.h>
 #include <btclibs/uint256.h>
 #include <networks/network.h>
-#include <libdevcore/addrStore.h>
+#include <libdevcore/addr_store.h>
 #include <libdevcore/types.h>
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>

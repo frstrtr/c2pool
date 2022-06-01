@@ -11,7 +11,7 @@
 #include "p2p_protocol.h"
 #include "coind_node.h"
 #include <libdevcore/logger.h>
-#include <libdevcore/addrStore.h>
+#include <libdevcore/addr_store.h>
 #include <libdevcore/common.h>
 #include <libdevcore/random.h>
 #include <libdevcore/config.h>

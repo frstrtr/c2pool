@@ -9,12 +9,12 @@
 
 #include <boost/asio.hpp>
 
-class P2PHandshake : public Handshake<std::shared_ptr<P2PSocket>, boost::asio::ip::tcp::resolver::results_type>
+class P2PHandshake : public Handshake<P2PSocket, boost::asio::ip::tcp::resolver::results_type>
 {
 private:
 
 public:
-    P2PHandshake(std::shared_ptr<P2PSocket> _socket, HandlerManager _handler_manager) : Handshake(_socket, _handler_manager)
+    P2PHandshake(std::shared_ptr<P2PSocket> _socket, HandlerManagerPtr _handler_manager) : Handshake(_socket, _handler_manager)
     {
     }
 

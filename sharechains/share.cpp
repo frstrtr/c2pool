@@ -8,7 +8,7 @@
 #include <univalue.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
-#include <libdevcore/addrStore.h>
+#include <libdevcore/addr_store.h>
 #include "tracker.h"
 #include "data.h"
 #include "share_builder.h"

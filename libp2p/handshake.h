@@ -12,17 +12,17 @@ class Handshake
 {
 protected:
     typedef ENDPOINT_TYPE endpoint_type;
-    typedef SOCKET_TYPE socket_type;
+    typedef std::shared_ptr<SOCKET_TYPE> socket_type;
 
     socket_type socket;
 
-    HandlerManager handler_manager;
+    HandlerManagerPtr handler_manager;
 
     std::function<void(std::shared_ptr<Protocol>)> client_connected;
     std::function<void(std::shared_ptr<Protocol>)> server_connected;
 
 public:
-    Handshake(socket_type _socket, HandlerManager _handler_manager) : socket(_socket), handler_manager(_handler_manager)
+    Handshake(socket_type _socket, HandlerManagerPtr _handler_manager) : socket(_socket), handler_manager(_handler_manager)
     {
         socket->set_message_handler(std::bind(&Handshake::handle_message, this, std::placeholders::_1));
     }

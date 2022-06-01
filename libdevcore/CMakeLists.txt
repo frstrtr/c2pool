@@ -1,7 +1,7 @@
 # file(GLOB devcore_sources "*.h" "*.cpp")
 
 #from devcore
-set(devcore_sources addrStore.h addrStore.cpp common.h common.cpp config.h config.cpp converter.cpp
+set(devcore_sources addr_store.h addr_store.cpp common.h common.cpp config.h config.cpp converter.cpp
     filesystem.h filesystem.cpp logger.h logger.cpp random.h random.cpp str.h str.cpp    
 )
 

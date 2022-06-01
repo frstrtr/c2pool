@@ -6,13 +6,20 @@
 
 #include <boost/asio.hpp>
 
+//TODO: удалением объекта протокола (дисконнект) -- отключать все ивенты.
 
 class ProtocolEvents
 {
+    bool stopped = false;
 protected:
     Event<> event_handle_message;
+
+    bool is_stopped() const { return stopped;}
+
+    void stop() { stopped = true; }
 };
 
+// TODO: автоматическая отправка сообщения message_ping, раз в заданное время.
 class ProtocolPinger : virtual ProtocolEvents
 {
 private:
@@ -54,4 +61,9 @@ public:
         start_ping();
         event_handle_message.subscribe(std::bind(&ProtocolPinger::restart_ping, this));
     }
+
+    ~ProtocolPinger() = default;
+//    {
+//        timer.cancel();
+//    }
 };
