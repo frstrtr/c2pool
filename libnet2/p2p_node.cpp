@@ -97,3 +97,42 @@ std::vector<addr_type> P2PNodeClient::get_good_peers(int max_count)
     }
     return result;
 }
+
+// P2PNodeServer
+
+bool P2PNodeServer::server_connected(std::shared_ptr<Protocol> protocol)
+{
+    auto socket_pos = server_attempts.find(protocol->get_socket());
+    if (socket_pos != server_attempts.end())
+    {
+        server_attempts.erase(socket_pos);
+
+        auto [ip, port] = protocol->get_socket()->get_addr();
+        server_connections[ip] = protocol;
+    } else
+    {
+        // Socket не найдет в server_attempts
+    }
+}
+
+void P2PNodeServer::listen()
+{
+    acceptor.async_accept([this](boost::system::error_code ec, ip::tcp::socket _socket)
+                          {
+                              if (!ec)
+                              {
+                                  auto socket = std::make_shared<P2PSocket>(std::move(socket),
+                                                                             data->net);
+                                  auto handshake = std::make_shared<P2PHandshake>(socket, data->handler_manager);
+                                  handshake->listen_connection(std::bind(&P2PNodeServer::server_connected, this, std::placeholders::_1));
+                                  server_attempts[socket] = handshake;
+                              }
+                              else
+                              {
+                                  LOG_ERROR << "P2PNode::listen: " << ec.message();
+                              }
+                              listen();
+                          });
+}
+
+

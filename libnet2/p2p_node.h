@@ -70,35 +70,14 @@ private:
 
     ip::tcp::acceptor acceptor;
 protected:
-    std::set<std::shared_ptr<P2PHandshake>> server_attempts;
-    std::map<HOST_IDENT, int> server_connections;
+    std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshake>> server_attempts;
+    std::map<HOST_IDENT, std::shared_ptr<Protocol>> server_connections;
 public:
     P2PNodeServer(std::shared_ptr<P2PNodeData> _data) : data(std::move(_data)), acceptor(*data->context) {}
 
-    bool server_connected(std::shared_ptr<Protocol> protocol)
-    {
+    bool server_connected(std::shared_ptr<Protocol> protocol);
 
-    }
-
-    void listen()
-    {
-        acceptor.async_accept([this](boost::system::error_code ec, ip::tcp::socket socket)
-                               {
-                                   if (!ec)
-                                   {
-                                       auto _socket = std::make_shared<P2PSocket>(std::move(socket),
-                                                                                  data->net);
-                                       auto handshake = std::make_shared<P2PHandshake>(_socket, data->handler_manager);
-                                       handshake->listen_connection(std::bind(&P2PNodeServer::server_connected, this, std::placeholders::_1));
-                                       server_attempts.insert(handshake);
-                                   }
-                                   else
-                                   {
-                                       LOG_ERROR << "P2PNode::listen: " << ec.message();
-                                   }
-                                   listen();
-                               });
-    }
+    void listen();
 };
 
 class P2PNode : public std::enable_shared_from_this<P2PNode>, public P2PNodeData, public P2PNodeClient, public P2PNodeServer
@@ -106,9 +85,14 @@ class P2PNode : public std::enable_shared_from_this<P2PNode>, public P2PNodeData
 private:
     std::map<uint64_t, std::shared_ptr<P2PProtocol>> peers;
 public:
-    P2PNode(std::shared_ptr<io::io_context> _context, std::shared_ptr<c2pool::Network> _net) : P2PNodeData(_context, _net), P2PNodeClient(shared_from_this()), P2PNodeServer(shared_from_this())
+    P2PNode(std::shared_ptr<io::io_context> _context, std::shared_ptr<c2pool::Network> _net,
+            std::shared_ptr<c2pool::dev::coind_config> _config, std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
+            :   P2PNodeData(_context, _net, _config, _addr_store),
+                P2PNodeClient(shared_from_this()),
+                P2PNodeServer(shared_from_this())
     {
-
+        listen();
+        auto_connect();
     }
 };
 
