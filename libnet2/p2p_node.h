@@ -1,24 +1,20 @@
 #pragma once
 
-#include <map>
-#include <set>
 #include <memory>
-#include <numeric>
-#include <functional>
-#include <utility>
+#include <set>
+#include <map>
 #include <vector>
 #include <tuple>
 
-#include "p2p_handshake.h"
-#include "p2p_protocol.h"
 #include "p2p_socket.h"
-#include <libdevcore/addr_store.h>
-#include <libdevcore/config.h>
-#include <libdevcore/random.h>
+#include "p2p_protocol.h"
+#include "p2p_handshake.h"
+#include "p2p_node_interface.h"
 #include <libp2p/handler.h>
+#include <libp2p/node.h>
 #include <networks/network.h>
-//#include <libp2p/socket.h>
-//#include <libp2p/protocol.h>
+#include <libdevcore/config.h>
+#include <libdevcore/addr_store.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
@@ -35,7 +31,7 @@ public:
 	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
 	HandlerManagerPtr handler_manager;
 public:
-	P2PNodeData(std::shared_ptr<io::io_context> _context) : context(_context)
+	P2PNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
 	{
 		handler_manager = std::make_shared<HandlerManager>();
 	}
@@ -65,61 +61,89 @@ public:
 	}
 };
 
-class P2PNodeClient : virtual P2PNodeData
-{
-private:
-    ip::tcp::resolver resolver;
-    io::steady_timer auto_connect_timer;
-
-    const std::chrono::seconds auto_connect_interval{1s};
-protected:
-    std::map<HOST_IDENT, std::shared_ptr<P2PHandshake>> client_attempts;
-    std::set<std::shared_ptr<Protocol>> client_connections;
-public:
-    P2PNodeClient(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), resolver(*context), auto_connect_timer(*context)  {}
-
-    bool client_connected(std::shared_ptr<Protocol> protocol);
-
-    void auto_connect();
-
-    std::vector<addr_type> get_good_peers(int max_count);
-};
-
 class P2PNodeServer : virtual P2PNodeData
 {
-private:
-    ip::tcp::acceptor acceptor;
 protected:
-    std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshake>> server_attempts;
-    std::map<HOST_IDENT, std::shared_ptr<Protocol>> server_connections;
+	std::shared_ptr<Listener> listener;
 public:
-    P2PNodeServer(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), acceptor(*_context) {}
+	P2PNodeServer(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)) {}
 
-    bool server_connected(std::shared_ptr<Protocol> protocol);
+	void socket_handle(std::shared_ptr<Socket>)
+	{
+		// TODO:
+	}
 
-	template <typename SocketType>
-    void listen();
+	void listen()
+	{
+		(*listener)(std::bind(&P2PNodeServer::socket_handle, this, std::placeholders::_1), std::bind(&P2PNodeServer::listen, this));
+	}
 };
 
-class P2PNode : public std::enable_shared_from_this<P2PNode>, public virtual P2PNodeData, public P2PNodeClient, public P2PNodeServer
+class P2PNodeClient : virtual P2PNodeData
 {
+protected:
+	std::shared_ptr<Connector> connector;
+
+	std::map<HOST_IDENT, std::shared_ptr<P2PHandshakeClient>> client_attempts;
+	std::set<std::shared_ptr<P2PProtocol>> client_connections;
 private:
-	std::map<uint64_t, std::shared_ptr<P2PProtocol>> peers;
+	io::steady_timer auto_connect_timer;
+	const std::chrono::seconds auto_connect_interval{1s};
 public:
+	P2PNodeClient(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), auto_connect_timer(*context) {}
+
+	void auto_connect()
+	{
+		auto_connect_timer.expires_from_now(auto_connect_interval);
+		auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
+									  {
+										  if (_ec)
+										  {
+											  LOG_ERROR << "P2PNode::auto_connect: " << _ec.message();
+											  return;
+										  }
+
+										  if (!((client_connections.size() < config->desired_conns) &&
+												(addr_store->len() > 0) &&
+												(client_attempts.size() <= config->max_attempts)))
+											  return;
+
+										  for (auto addr: get_good_peers(1))
+										  {
+											  if (client_attempts.find(std::get<0>(addr)) != client_attempts.end())
+											  {
+												  //TODO: [UNCOMMENT] LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+												  continue;
+											  }
+
+											  auto [ip, port] = addr;
+											  LOG_TRACE << "try to connect: " << ip << ":" << port;
+
+											  (*connector)();
+										  }
+										  auto_connect();
+									  });
+	}
+
+	std::vector<addr_type> get_good_peers(int max_count);
+};
+
+class P2PNode : public virtual P2PNodeData, P2PNodeServer, P2PNodeClient
+{
 	P2PNode(std::shared_ptr<io::io_context> _context)
 			: P2PNodeData(std::move(_context)),
-			  P2PNodeClient(context),
-			  P2PNodeServer(context)
+			  P2PNodeServer(context),
+			  P2PNodeClient(context)
 	{
 
 	}
 
-	template<typename SocketType>
+	template <typename ListenerType, typename ConnectorType>
 	void run()
 	{
-		listen <SocketType> ();
-		auto_connect();
+		listener = std::make_shared<ListenerType>();
+		(*listener)();
+		connector = std::make_shared<ConnectorType>();
+		(*connector)();
 	}
 };
-
-#undef HOST_IDENT
