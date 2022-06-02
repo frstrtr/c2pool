@@ -12,9 +12,7 @@ class Socket
 {
 protected:
     typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> handler_type;
-
     handler_type handler;
-
 public:
     Socket() {}
 
@@ -25,13 +23,11 @@ public:
         handler = std::move(message_handler);
     }
 
-    virtual void write(std::shared_ptr<Message>) = 0;
-
+    virtual void write(std::shared_ptr<Message> msg) = 0;
     virtual void read() = 0;
 
     virtual bool isConnected() = 0;
 
-	virtual void connect() = 0;
     virtual void disconnect() = 0;
 
     virtual std::tuple<std::string, std::string> get_addr() = 0;
