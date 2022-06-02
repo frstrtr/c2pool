@@ -29,23 +29,45 @@ namespace ip = io::ip;
 class P2PNodeData
 {
 public:
-    std::shared_ptr<c2pool::dev::coind_config> config;
-    std::shared_ptr<io::io_context> context;
-    std::shared_ptr<c2pool::Network> net;
-    std::shared_ptr<c2pool::dev::AddrStore> addr_store;
-    HandlerManagerPtr handler_manager;
+	std::shared_ptr<c2pool::dev::coind_config> config;
+	std::shared_ptr<io::io_context> context;
+	std::shared_ptr<c2pool::Network> net;
+	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
+	HandlerManagerPtr handler_manager;
 public:
-    P2PNodeData(std::shared_ptr<io::io_context> _context, auto _net, auto _config, auto _addr_store) : context(std::move(_context)), net(_net), config(_config), addr_store(_addr_store)
-    {
-        handler_manager = std::make_shared<HandlerManager>();
-    }
+	P2PNodeData(std::shared_ptr<io::io_context> _context) : context(_context)
+	{
+		handler_manager = std::make_shared<HandlerManager>();
+	}
+
+	auto &set_context(std::shared_ptr<io::io_context> _context)
+	{
+		context = std::move(_context);
+		return *this;
+	}
+
+	auto &set_net(std::shared_ptr<c2pool::Network> _net)
+	{
+		net = std::move(_net);
+		return *this;
+	}
+
+	auto &set_config(std::shared_ptr<c2pool::dev::coind_config> _config)
+	{
+		config = std::move(_config);
+		return *this;
+	}
+
+	auto &set_net(std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
+	{
+		addr_store = std::move(_addr_store);
+		return *this;
+	}
 };
 
-class P2PNodeClient
+class P2PNodeClient : virtual P2PNodeData
 {
 private:
-    std::shared_ptr<P2PNodeData> data;
-
     ip::tcp::resolver resolver;
     io::steady_timer auto_connect_timer;
 
@@ -54,7 +76,7 @@ protected:
     std::map<HOST_IDENT, std::shared_ptr<P2PHandshake>> client_attempts;
     std::set<std::shared_ptr<Protocol>> client_connections;
 public:
-    P2PNodeClient(std::shared_ptr<P2PNodeData> _data) : data(std::move(_data)), resolver(*data->context), auto_connect_timer(*data->context)  {}
+    P2PNodeClient(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), resolver(*context), auto_connect_timer(*context)  {}
 
     bool client_connected(std::shared_ptr<Protocol> protocol);
 
@@ -63,37 +85,41 @@ public:
     std::vector<addr_type> get_good_peers(int max_count);
 };
 
-class P2PNodeServer
+class P2PNodeServer : virtual P2PNodeData
 {
 private:
-    std::shared_ptr<P2PNodeData> data;
-
     ip::tcp::acceptor acceptor;
 protected:
     std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshake>> server_attempts;
     std::map<HOST_IDENT, std::shared_ptr<Protocol>> server_connections;
 public:
-    P2PNodeServer(std::shared_ptr<P2PNodeData> _data) : data(std::move(_data)), acceptor(*data->context) {}
+    P2PNodeServer(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), acceptor(*_context) {}
 
     bool server_connected(std::shared_ptr<Protocol> protocol);
 
+	template <typename SocketType>
     void listen();
 };
 
-class P2PNode : public std::enable_shared_from_this<P2PNode>, public P2PNodeData, public P2PNodeClient, public P2PNodeServer
+class P2PNode : public std::enable_shared_from_this<P2PNode>, public virtual P2PNodeData, public P2PNodeClient, public P2PNodeServer
 {
 private:
-    std::map<uint64_t, std::shared_ptr<P2PProtocol>> peers;
+	std::map<uint64_t, std::shared_ptr<P2PProtocol>> peers;
 public:
-    P2PNode(std::shared_ptr<io::io_context> _context, std::shared_ptr<c2pool::Network> _net,
-            std::shared_ptr<c2pool::dev::coind_config> _config, std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
-            :   P2PNodeData(_context, _net, _config, _addr_store),
-                P2PNodeClient(shared_from_this()),
-                P2PNodeServer(shared_from_this())
-    {
-        listen();
-        auto_connect();
-    }
+	P2PNode(std::shared_ptr<io::io_context> _context)
+			: P2PNodeData(std::move(_context)),
+			  P2PNodeClient(context),
+			  P2PNodeServer(context)
+	{
+
+	}
+
+	template<typename SocketType>
+	void run()
+	{
+		listen <SocketType> ();
+		auto_connect();
+	}
 };
 
 #undef HOST_IDENT
