@@ -111,7 +111,7 @@ bool P2PNodeServer::server_connected(std::shared_ptr<Protocol> protocol)
         server_connections[ip] = protocol;
     } else
     {
-        // Socket не найдет в server_attempts
+        // Socket не найден в server_attempts
     }
 }
 
