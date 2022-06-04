@@ -34,6 +34,7 @@ class P2PHandshakeClient : public Handshake
 
 	}
 };
+
 //
 //class P2PHandshake : public Handshake<P2PSocket, boost::asio::ip::tcp::resolver::results_type>
 //{
