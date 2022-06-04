@@ -5,6 +5,7 @@
 #include <map>
 #include <vector>
 #include <tuple>
+#include <functional>
 
 #include "p2p_socket.h"
 #include "p2p_protocol.h"
@@ -64,7 +65,7 @@ public:
 class P2PNodeServer : virtual P2PNodeData
 {
 protected:
-	std::shared_ptr<Listener> listener;
+	std::shared_ptr<Listener> listener; // from P2PNode::init()
 public:
 	P2PNodeServer(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)) {}
 
@@ -82,7 +83,7 @@ public:
 class P2PNodeClient : virtual P2PNodeData
 {
 protected:
-	std::shared_ptr<Connector> connector;
+	std::shared_ptr<Connector> connector; // from P2PNode::init()
 
 	std::map<HOST_IDENT, std::shared_ptr<P2PHandshakeClient>> client_attempts;
 	std::set<std::shared_ptr<P2PProtocol>> client_connections;
@@ -91,6 +92,11 @@ private:
 	const std::chrono::seconds auto_connect_interval{1s};
 public:
 	P2PNodeClient(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), auto_connect_timer(*context) {}
+
+    void socket_handle(std::shared_ptr<Socket> socket)
+    {
+        client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<P2PHandshakeClient>(std::move(socket), );
+    }
 
 	void auto_connect()
 	{
@@ -119,7 +125,7 @@ public:
 											  auto [ip, port] = addr;
 											  LOG_TRACE << "try to connect: " << ip << ":" << port;
 
-											  (*connector)();
+											  (*connector)(std::bind(&P2PNodeClient::socket_handle, this, std::placeholders::_1), addr);
 										  }
 										  auto_connect();
 									  });
@@ -142,8 +148,8 @@ class P2PNode : public virtual P2PNodeData, P2PNodeServer, P2PNodeClient
 	void run()
 	{
 		listener = std::make_shared<ListenerType>();
-		(*listener)();
+        listen();
 		connector = std::make_shared<ConnectorType>();
-		(*connector)();
+        auto_connect();
 	}
 };

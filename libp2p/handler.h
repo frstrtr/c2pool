@@ -7,21 +7,20 @@
 #include <string>
 
 #include "message.h"
-#include "protocol.h"
 #include <libdevcore/stream.h>
 
 template <typename MessageType, typename ProtocolType>
 using handler_type = std::function<void(std::shared_ptr<MessageType>, std::shared_ptr<ProtocolType>)>;
 
-
+template <typename ProtocolType>
 class Handler
 {
 public:
-    virtual void invoke(PackStream &stream, std::shared_ptr<Protocol> _protocol) = 0;
+    virtual void invoke(PackStream &stream, std::shared_ptr<ProtocolType> _protocol) = 0;
 };
 
 template <typename MessageType, typename ProtocolType>
-class MessageHandler : public Handler
+class MessageHandler : public Handler<ProtocolType>
 {
 protected:
     handler_type<MessageType, ProtocolType> handlerF;
@@ -36,7 +35,7 @@ protected:
 public:
     MessageHandler(handler_type<MessageType, ProtocolType> _handlerF) : handlerF(_handlerF) {}
 
-    void invoke(PackStream &stream, std::shared_ptr<Protocol> _protocol) override
+    void invoke(PackStream &stream, std::shared_ptr<ProtocolType> _protocol) override
     {
         auto msg = generate_message(stream);
         auto protocol = std::static_pointer_cast<ProtocolType>(_protocol);
@@ -44,26 +43,28 @@ public:
     }
 };
 
-typedef std::shared_ptr<Handler> HandlerPtr;
+template <typename ProtocolType>
+using HandlerPtr = Handler<ProtocolType>;
 
 template <typename MessageType, typename ProtocolType>
-HandlerPtr make_handler(handler_type<MessageType, ProtocolType> handlerF)
+HandlerPtr<ProtocolType> make_handler(handler_type<MessageType, ProtocolType> handlerF)
 {
-    HandlerPtr handler = std::make_shared<MessageHandler<MessageType, ProtocolType>>(std::move(handlerF));
+    HandlerPtr<ProtocolType> handler = std::make_shared<MessageHandler<MessageType, ProtocolType>>(std::move(handlerF));
     return handler;
 }
 
+template <typename ProtocolType>
 class HandlerManager
 {
 private:
-    std::map<std::string, HandlerPtr> handlers;
+    std::map<std::string, HandlerPtr<ProtocolType>> handlers;
 
 public:
     HandlerManager() {}
 
     HandlerManager(const HandlerManager& manager) = delete;
 
-    template<typename MessageType, typename ProtocolType>
+    template<typename MessageType>
     void new_handler(std::string command, handler_type<MessageType, ProtocolType> handlerF)
     {
         if (!handlers.count(command))
@@ -75,7 +76,7 @@ public:
         }
     }
 
-    HandlerPtr operator[](std::string command)
+    HandlerPtr<ProtocolType> operator[](std::string command)
     {
         if (handlers.count(command))
         {
@@ -88,10 +89,11 @@ public:
     }
 
     // operator[] for pointers
-    HandlerPtr get_handler(std::string command)
+    HandlerPtr<ProtocolType> get_handler(std::string command)
     {
         return (*this)[command];
     }
 };
 
-typedef std::shared_ptr<HandlerManager> HandlerManagerPtr;
+template <typename ProtocolType>
+using HandlerManagerPtr = std::shared_ptr<HandlerManager<ProtocolType>>;

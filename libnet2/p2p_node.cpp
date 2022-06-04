@@ -5,7 +5,7 @@ std::vector<addr_type> P2PNodeClient::get_good_peers(int max_count)
 	int t = c2pool::dev::timestamp();
 
 	std::vector<std::pair<float, addr_type>> values;
-	for (auto kv : data->addr_store->GetAll())
+	for (auto kv : addr_store->GetAll())
 	{
 		values.push_back(
 				std::make_pair(

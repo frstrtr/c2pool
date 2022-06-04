@@ -8,30 +8,27 @@
 #include "socket.h"
 #include "message.h"
 #include "protocol_events.h"
+#include "handler.h"
 
-class HandlerManager;
-
-class Protocol : public virtual ProtocolEvents, public enable_shared_from_this<Protocol>
+class BaseProtocol : public virtual ProtocolEvents, public enable_shared_from_this<BaseProtocol>
 {
 protected:
     std::shared_ptr<Socket> socket;
-    std::shared_ptr<HandlerManager> handler_manager;
+
 public:
     virtual void write(std::shared_ptr<Message> msg);
-    virtual void handle(std::shared_ptr<RawMessage> raw_msg);
+    virtual void handle(std::shared_ptr<RawMessage> raw_msg) = 0;
 public:
-    // Not safe, socket->message_handler = nullptr; handler_manager = nullptr; wanna for manual setup
-    Protocol() {}
+    // Not safe, socket->message_handler = nullptr; wanna for manual setup
+    BaseProtocol() = default;
 
-    Protocol(std::shared_ptr<Socket> _socket, std::shared_ptr<HandlerManager> _handler_manager);
+    BaseProtocol (std::shared_ptr<Socket> _socket) : socket(_socket) {}
 
 public:
     void set_socket(std::shared_ptr<Socket> _socket);
     std::shared_ptr<Socket> get_socket() { return socket; }
 
-    void set_handler_manager(std::shared_ptr<HandlerManager> _mngr);
-
-    bool operator<(const Protocol &rhs)
+    bool operator<(const BaseProtocol &rhs)
     {
         if (!socket)
         {
@@ -44,4 +41,42 @@ public:
 
         return socket->get_addr() < rhs.socket->get_addr();
     }
+};
+
+template <typename T>
+class Protocol : public BaseProtocol
+{
+protected:
+    HandlerManagerPtr<T> handler_manager;
+
+public:
+    // Not safe, socket->message_handler = nullptr; handler_manager = nullptr; wanna for manual setup
+    Protocol() : BaseProtocol() {}
+
+    Protocol (std::shared_ptr<Socket> _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket),
+                                                                                       handler_manager(_handler_manager)
+    {
+        _socket->set_message_handler(std::bind(&Protocol::handle, this, std::placeholders::_1));
+    }
+
+    virtual void handle(std::shared_ptr<RawMessage> raw_msg) override
+    {
+        event_handle_message.happened(); // ProtocolEvents::event_handle_message
+
+        auto handler = handler_manager->get_handler(raw_msg->command);
+        if (handler)
+        {
+            handler->invoke(raw_msg->value, shared_from_this());
+        } else
+        {
+            //TODO: empty handler
+        }
+    }
+
+public:
+    void set_handler_manager(HandlerManagerPtr<T> _mngr)
+    {
+        handler_manager = _mngr;
+    }
+
 };
