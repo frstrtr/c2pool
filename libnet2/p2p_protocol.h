@@ -13,7 +13,7 @@
 #include <boost/asio/io_context.hpp>
 
 
-class P2PProtocol : public enable_shared_from_this<P2PProtocol>, public Protocol, ProtocolPinger
+class P2PProtocol : public Protocol<P2PProtocol>, ProtocolPinger
 {
 public:
 	const int version;
@@ -33,7 +33,7 @@ public:
 
 public:
 	P2PProtocol(std::shared_ptr<boost::asio::io_context> _context, std::shared_ptr<Socket> _socket,
-				HandlerManagerPtr _handler_manager, int _version) : Protocol(_socket, _handler_manager),
+				HandlerManagerPtr<P2PProtocol> _handler_manager, int _version) : Protocol<P2PProtocol>(_socket, _handler_manager),
 													  ProtocolPinger(_context, 100, std::bind(&P2PProtocol::out_time_ping, this)),
 													  version(_version)
 	{}

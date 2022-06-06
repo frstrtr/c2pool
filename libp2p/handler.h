@@ -23,7 +23,7 @@ template <typename MessageType, typename ProtocolType>
 class MessageHandler : public Handler<ProtocolType>
 {
 protected:
-    handler_type<MessageType, ProtocolType> handlerF;
+    handler_type<MessageType, std::shared_ptr<ProtocolType>> handlerF;
 
     std::shared_ptr<MessageType> generate_message(PackStream &stream)
     {
@@ -33,18 +33,18 @@ protected:
     }
 
 public:
-    MessageHandler(handler_type<MessageType, ProtocolType> _handlerF) : handlerF(_handlerF) {}
+    MessageHandler(handler_type<MessageType, std::shared_ptr<ProtocolType>> _handlerF) : handlerF(_handlerF) {}
 
     void invoke(PackStream &stream, std::shared_ptr<ProtocolType> _protocol) override
     {
         auto msg = generate_message(stream);
-        auto protocol = std::static_pointer_cast<ProtocolType>(_protocol);
-        handlerF(msg, protocol);
+//        auto protocol = std::static_pointer_cast<ProtocolType>(_protocol);
+        handlerF(msg, _protocol);
     }
 };
 
 template <typename ProtocolType>
-using HandlerPtr = Handler<ProtocolType>;
+using HandlerPtr = std::shared_ptr<Handler<ProtocolType>>;
 
 template <typename MessageType, typename ProtocolType>
 HandlerPtr<ProtocolType> make_handler(handler_type<MessageType, ProtocolType> handlerF)
@@ -60,7 +60,7 @@ private:
     std::map<std::string, HandlerPtr<ProtocolType>> handlers;
 
 public:
-    HandlerManager() {}
+    HandlerManager() = default;
 
     HandlerManager(const HandlerManager& manager) = delete;
 
