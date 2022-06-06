@@ -10,7 +10,7 @@
 #include "protocol_events.h"
 #include "handler.h"
 
-class BaseProtocol : public virtual ProtocolEvents, public enable_shared_from_this<BaseProtocol>
+class BaseProtocol : public virtual ProtocolEvents
 {
 protected:
     std::shared_ptr<Socket> socket;
@@ -44,7 +44,7 @@ public:
 };
 
 template <typename T>
-class Protocol : public BaseProtocol
+class Protocol : public enable_shared_from_this<T>, public BaseProtocol
 {
 protected:
     HandlerManagerPtr<T> handler_manager;
@@ -52,6 +52,8 @@ protected:
 public:
     // Not safe, socket->message_handler = nullptr; handler_manager = nullptr; wanna for manual setup
     Protocol() : BaseProtocol() {}
+
+    Protocol (std::shared_ptr<Socket> _socket) : BaseProtocol(_socket) {}
 
     Protocol (std::shared_ptr<Socket> _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket),
                                                                                        handler_manager(_handler_manager)
@@ -66,7 +68,7 @@ public:
         auto handler = handler_manager->get_handler(raw_msg->command);
         if (handler)
         {
-            handler->invoke(raw_msg->value, shared_from_this());
+            handler->invoke(raw_msg->value, this->shared_from_this());
         } else
         {
             //TODO: empty handler

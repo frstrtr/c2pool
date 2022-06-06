@@ -30,11 +30,11 @@ public:
 	std::shared_ptr<io::io_context> context;
 	std::shared_ptr<c2pool::Network> net;
 	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
-	HandlerManagerPtr handler_manager;
+	HandlerManagerPtr<P2PProtocol> handler_manager;
 public:
 	P2PNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
 	{
-		handler_manager = std::make_shared<HandlerManager>();
+		handler_manager = std::make_shared<HandlerManager<P2PProtocol>>();
 	}
 
 	auto &set_context(std::shared_ptr<io::io_context> _context)
@@ -66,13 +66,23 @@ class P2PNodeServer : virtual P2PNodeData
 {
 protected:
 	std::shared_ptr<Listener> listener; // from P2PNode::init()
+
+    std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshakeServer>> server_attempts;
+    std::map<HOST_IDENT, std::shared_ptr<P2PProtocol>> server_connections;
 public:
 	P2PNodeServer(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)) {}
 
-	void socket_handle(std::shared_ptr<Socket>)
+	void socket_handle(std::shared_ptr<Socket> socket)
 	{
-		// TODO:
+		server_attempts[socket] = std::make_shared<P2PHandshakeServer>(std::move(socket),
+                                                                       std::bind(&P2PNodeServer::protocol_handle, this, std::placeholders::_1));
 	}
+
+    void protocol_handle(std::shared_ptr<P2PProtocol> _protocol)
+    {
+        _protocol->set_handler_manager(handler_manager);
+        server_connections[std::get<0>(_protocol->get_socket()->get_addr())] = std::move(_protocol);
+    }
 
 	void listen()
 	{
@@ -86,7 +96,7 @@ protected:
 	std::shared_ptr<Connector> connector; // from P2PNode::init()
 
 	std::map<HOST_IDENT, std::shared_ptr<P2PHandshakeClient>> client_attempts;
-	std::set<std::shared_ptr<P2PProtocol>> client_connections;
+    std::map<HOST_IDENT, std::shared_ptr<P2PProtocol>> client_connections;
 private:
 	io::steady_timer auto_connect_timer;
 	const std::chrono::seconds auto_connect_interval{1s};
@@ -95,7 +105,14 @@ public:
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
-        client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<P2PHandshakeClient>(std::move(socket), );
+        client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<P2PHandshakeClient>(std::move(socket),
+                                                                                                std::bind(&P2PNodeClient::protocol_handle, this, std::placeholders::_1));
+    }
+
+    void protocol_handle(std::shared_ptr<P2PProtocol> _protocol)
+    {
+        _protocol->set_handler_manager(handler_manager);
+        client_connections[std::get<0>(_protocol->get_socket()->get_addr())] = std::move(_protocol);
     }
 
 	void auto_connect()
