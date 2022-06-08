@@ -14,10 +14,8 @@ protected:
     typedef ProtocolType protocol_type;
 
 	std::shared_ptr<Socket> socket;
-
-	std::function<void(std::shared_ptr<protocol_type>)> success_connection;
 public:
-	Handshake(auto _socket, std::function<void(std::shared_ptr<protocol_type>)> _handle) : socket(_socket),  success_connection(std::move(_handle))
+	Handshake(auto _socket) : socket(_socket)
 	{
 		socket->set_message_handler(std::bind(&Handshake::handle_message, this, std::placeholders::_1));
 	}

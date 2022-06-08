@@ -4,7 +4,9 @@ set(libnet2_sources
         p2p_socket_data.h
         p2p_protocol.cpp p2p_protocol.h
         p2p_handshake.cpp p2p_handshake.h
-        p2p_node_interface.h)
+        p2p_node_interface.h p2p_protocol_data.h
+        p2p_messages.h p2p_messages.cpp
+        )
 
 add_library(libnet2 ${libnet2_sources})
 
