@@ -31,6 +31,8 @@ public:
 	std::shared_ptr<c2pool::Network> net;
 	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
 	HandlerManagerPtr<P2PProtocol> handler_manager;
+
+    std::map<uint64_t, std::shared_ptr<P2PProtocol>> peers;
 public:
 	P2PNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
 	{
@@ -69,19 +71,26 @@ protected:
 
     std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshakeServer>> server_attempts;
     std::map<HOST_IDENT, std::shared_ptr<P2PProtocol>> server_connections;
+private:
+    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> message_version_handle;
 public:
-	P2PNodeServer(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)) {}
+	P2PNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> version_handle) : P2PNodeData(std::move(_context)), message_version_handle(version_handle) {}
 
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
 		server_attempts[socket] = std::make_shared<P2PHandshakeServer>(std::move(socket),
-                                                                       std::bind(&P2PNodeServer::protocol_handle, this, std::placeholders::_1));
+                                                                       message_version_handle,
+                                                                       std::bind(&P2PNodeServer::handshake_handle, this, std::placeholders::_1));
 	}
 
-    void protocol_handle(std::shared_ptr<P2PProtocol> _protocol)
+    void handshake_handle(std::shared_ptr<P2PHandshake> _handshake)
     {
+        auto _protocol = std::make_shared<P2PProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
         _protocol->set_handler_manager(handler_manager);
-        server_connections[std::get<0>(_protocol->get_socket()->get_addr())] = std::move(_protocol);
+
+        auto ip = std::get<0>(_protocol->get_socket()->get_addr());
+        peers[_protocol->nonce] = _protocol;
+        server_connections[ip] = std::move(_protocol);
     }
 
 	void listen()
@@ -100,19 +109,29 @@ protected:
 private:
 	io::steady_timer auto_connect_timer;
 	const std::chrono::seconds auto_connect_interval{1s};
+
+    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> message_version_handle;
 public:
-	P2PNodeClient(std::shared_ptr<io::io_context> _context) : P2PNodeData(std::move(_context)), auto_connect_timer(*context) {}
+	P2PNodeClient(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> version_handle) : P2PNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
         client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<P2PHandshakeClient>(std::move(socket),
-                                                                                                std::bind(&P2PNodeClient::protocol_handle, this, std::placeholders::_1));
+                                                                                                message_version_handle,
+                                                                                                std::bind(
+                                                                                                        &P2PNodeClient::handshake_handle,
+                                                                                                        this,
+                                                                                                        std::placeholders::_1));
     }
 
-    void protocol_handle(std::shared_ptr<P2PProtocol> _protocol)
+    void handshake_handle(std::shared_ptr<P2PHandshake> _handshake)
     {
+        auto _protocol = std::make_shared<P2PProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
         _protocol->set_handler_manager(handler_manager);
-        client_connections[std::get<0>(_protocol->get_socket()->get_addr())] = std::move(_protocol);
+
+        auto ip = std::get<0>(_protocol->get_socket()->get_addr());
+        peers[_protocol->nonce] = _protocol;
+        client_connections[ip] = std::move(_protocol);
     }
 
 	void auto_connect()
@@ -153,10 +172,13 @@ public:
 
 class P2PNode : public virtual P2PNodeData, P2PNodeServer, P2PNodeClient
 {
+private:
+    uint64_t nonce; // node_id
+public:
 	P2PNode(std::shared_ptr<io::io_context> _context)
 			: P2PNodeData(std::move(_context)),
-			  P2PNodeServer(context),
-			  P2PNodeClient(context)
+			  P2PNodeServer(context, std::bind(&P2PNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2)),
+			  P2PNodeClient(context, std::bind(&P2PNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2))
 	{
 
 	}
@@ -169,4 +191,83 @@ class P2PNode : public virtual P2PNodeData, P2PNodeServer, P2PNodeClient
 		connector = std::make_shared<ConnectorType>();
         auto_connect();
 	}
+
+    void handle_message_version(std::shared_ptr<P2PHandshake> handshake, std::shared_ptr<net::messages::message_version> msg)
+    {
+        LOG_DEBUG
+            << "handle message_version";
+        LOG_INFO << "Peer "
+                 << msg->addr_from.address.get()
+                 << ":"
+                 << msg->addr_from.port.get()
+                 << " says protocol version is "
+                 << msg->version.get()
+                 << ", client version "
+                 << msg->sub_version.get();
+
+        if (handshake->other_version.has_value())
+        {
+            LOG_DEBUG
+                << "more than one version message";
+        }
+        if (msg->version.get() <
+            net->MINIMUM_PROTOCOL_VERSION)
+        {
+            LOG_DEBUG
+                << "peer too old";
+        }
+
+        handshake->other_version = msg->version.get();
+        handshake->other_sub_version = msg->sub_version.get();
+        handshake->other_services = msg->services.get();
+
+        if (msg->nonce.get() ==
+            nonce)
+        {
+            LOG_WARNING
+                << "was connected to self";
+            //TODO: assert
+        }
+
+        //detect duplicate in node->peers
+        if (peers.find(msg->nonce.get()) !=
+            peers.end())
+        {
+
+        }
+        if (peers.count(
+                msg->nonce.get()) != 0)
+        {
+            auto addr = handshake->get_socket()->get_addr();
+            LOG_WARNING
+                << "Detected duplicate connection, disconnecting from "
+                << std::get<0>(addr)
+                << ":"
+                << std::get<1>(addr);
+            handshake->get_socket()->disconnect();
+            return;
+        }
+
+        handshake->nonce = msg->nonce.get();
+        //TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
+        //*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
+
+//                                                                                                    socket->ping_timer.expires_from_now(
+//                                                                                                            boost::asio::chrono::seconds(
+//                                                                                                                    (int) c2pool::random::Expovariate(
+//                                                                                                                            1.0 /
+//                                                                                                                            100)));
+//                                                                                                    _socket->ping_timer.async_wait(
+//                                                                                                            boost::bind(
+//                                                                                                                    &P2P_Protocol::ping_timer_func,
+//                                                                                                                    this,
+//                                                                                                                    _1));
+
+        //TODO: if (p2p_node->advertise_ip):
+        //TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
+
+        //TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
+
+        //TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
+    }
 };
