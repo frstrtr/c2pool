@@ -192,82 +192,31 @@ public:
         auto_connect();
 	}
 
-    void handle_message_version(std::shared_ptr<P2PHandshake> handshake, std::shared_ptr<net::messages::message_version> msg)
-    {
-        LOG_DEBUG
-            << "handle message_version";
-        LOG_INFO << "Peer "
-                 << msg->addr_from.address.get()
-                 << ":"
-                 << msg->addr_from.port.get()
-                 << " says protocol version is "
-                 << msg->version.get()
-                 << ", client version "
-                 << msg->sub_version.get();
+    void handle_message_version(std::shared_ptr<P2PHandshake> handshake, std::shared_ptr<net::messages::message_version> msg);
 
-        if (handshake->other_version.has_value())
-        {
-            LOG_DEBUG
-                << "more than one version message";
-        }
-        if (msg->version.get() <
-            net->MINIMUM_PROTOCOL_VERSION)
-        {
-            LOG_DEBUG
-                << "peer too old";
-        }
+    void handle(std::shared_ptr<net::messages::message_addrs> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        handshake->other_version = msg->version.get();
-        handshake->other_sub_version = msg->sub_version.get();
-        handshake->other_services = msg->services.get();
+    //TODO: test:
+    void handle(std::shared_ptr<net::messages::message_addrme> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        if (msg->nonce.get() ==
-            nonce)
-        {
-            LOG_WARNING
-                << "was connected to self";
-            //TODO: assert
-        }
+    void handle(std::shared_ptr<net::messages::message_ping> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        //detect duplicate in node->peers
-        if (peers.find(msg->nonce.get()) !=
-            peers.end())
-        {
+    //TODO: TEST
+    void handle(std::shared_ptr<net::messages::message_getaddrs> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        }
-        if (peers.count(
-                msg->nonce.get()) != 0)
-        {
-            auto addr = handshake->get_socket()->get_addr();
-            LOG_WARNING
-                << "Detected duplicate connection, disconnecting from "
-                << std::get<0>(addr)
-                << ":"
-                << std::get<1>(addr);
-            handshake->get_socket()->disconnect();
-            return;
-        }
+    void handle(std::shared_ptr<net::messages::message_shares> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        handshake->nonce = msg->nonce.get();
-        //TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
-        //*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
+    void handle(std::shared_ptr<net::messages::message_sharereq> msg, std::shared_ptr<P2PProtocol> protocol);
 
-//                                                                                                    socket->ping_timer.expires_from_now(
-//                                                                                                            boost::asio::chrono::seconds(
-//                                                                                                                    (int) c2pool::random::Expovariate(
-//                                                                                                                            1.0 /
-//                                                                                                                            100)));
-//                                                                                                    _socket->ping_timer.async_wait(
-//                                                                                                            boost::bind(
-//                                                                                                                    &P2P_Protocol::ping_timer_func,
-//                                                                                                                    this,
-//                                                                                                                    _1));
+    void handle(std::shared_ptr<net::messages::message_sharereply> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        //TODO: if (p2p_node->advertise_ip):
-        //TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
+    void handle(std::shared_ptr<net::messages::message_bestblock> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        //TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
+    void handle(std::shared_ptr<net::messages::message_have_tx> msg, std::shared_ptr<P2PProtocol> protocol);
 
-        //TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
-    }
+    void handle(std::shared_ptr<net::messages::message_losing_tx> msg, std::shared_ptr<P2PProtocol> protocol);
+
+    void handle(std::shared_ptr<net::messages::message_remember_tx> msg, std::shared_ptr<P2PProtocol> protocol);
+
+    void handle(std::shared_ptr<net::messages::message_forget_tx> msg, std::shared_ptr<P2PProtocol> protocol);
 };
