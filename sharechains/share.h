@@ -36,7 +36,7 @@ public:
 	static const int32_t gentx_size = 50000;
 
     shared_ptr<c2pool::Network> net;
-    c2pool::libnet::addr peer_addr;
+    addr_type peer_addr;
 public:
     ///objs
 	std::shared_ptr<coind::data::SmallBlockHeaderType> min_header;
@@ -80,7 +80,7 @@ public:
 
     int32_t gentx_weight;
 public:
-	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, c2pool::libnet::addr _addr) : VERSION(version)
+	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, addr_type _addr) : VERSION(version)
 	{
         net = _net;
         peer_addr = _addr;
@@ -114,4 +114,4 @@ public:
 
 typedef std::shared_ptr<Share> ShareType;
 
-ShareType load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr);
+ShareType load_share(PackStream &stream, shared_ptr<c2pool::Network> net, addr_type peer_addr);

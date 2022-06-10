@@ -27,6 +27,7 @@ public:
 public:
     void set_socket(std::shared_ptr<Socket> _socket);
     std::shared_ptr<Socket> get_socket() { return socket; }
+    auto get_addr() { return socket->get_addr(); }
 
     bool operator<(const BaseProtocol &rhs)
     {

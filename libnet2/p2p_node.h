@@ -16,6 +16,8 @@
 #include <networks/network.h>
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>
+#include <sharechains/share.h>
+#include <sharechains/tracker.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
@@ -30,7 +32,12 @@ public:
 	std::shared_ptr<io::io_context> context;
 	std::shared_ptr<c2pool::Network> net;
 	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
+    std::shared_ptr<ShareTracker> tracker;
 	HandlerManagerPtr<P2PProtocol> handler_manager;
+
+    VariableDict<uint256, coind::data::tx_type> known_txs;
+    VariableDict<uint256, coind::data::tx_type> mining_txs;
+    Variable<uint256> best_share;
 
     std::map<uint64_t, std::shared_ptr<P2PProtocol>> peers;
 public:
@@ -62,6 +69,31 @@ public:
 		addr_store = std::move(_addr_store);
 		return *this;
 	}
+
+    auto &set_tracker(std::shared_ptr<ShareTracker> _tracker)
+    {
+        tracker = std::move(_tracker);
+        return *this;
+    }
+
+public:
+    void got_addr(std::tuple<std::string, std::string> _addr, uint64_t services, int64_t timestamp)
+    {
+        if (addr_store->Check(_addr)) {
+            auto old = addr_store->Get(_addr);
+            c2pool::dev::AddrValue new_addr(services, old.first_seen, std::max(old.last_seen, timestamp));
+            addr_store->Add(_addr, new_addr);
+        } else {
+            if (addr_store->len() < 10000) {
+                c2pool::dev::AddrValue new_addr(services, timestamp, timestamp);
+                addr_store->Add(_addr, new_addr);
+            }
+        }
+    }
+
+    std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, addr_type peer_addr);
+    void handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares, std::shared_ptr<P2PProtocol> peer);
+    void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 };
 
 class P2PNodeServer : virtual P2PNodeData

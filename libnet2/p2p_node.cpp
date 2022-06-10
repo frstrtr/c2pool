@@ -1,6 +1,59 @@
 #include "p2p_node.h"
 
 #include <libdevcore/random.h>
+#include <libdevcore/common.h>
+#include <libdevcore/types.h>
+#include <sharechains/share.h>
+
+using namespace net::messages;
+
+std::vector<ShareType> P2PNodeData::handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops,
+                               addr_type peer_addr)
+{
+    parents = std::min(parents, 1000/hashes.size());
+    std::vector<ShareType> shares;
+    for (auto share_hash : hashes)
+    {
+        uint64_t n = std::min(parents+1, (uint64_t)tracker->get_height(share_hash));
+        auto get_chain_func = tracker->get_chain(share_hash, n);
+
+        uint256 _hash;
+        while(get_chain_func(_hash))
+        {
+            if (std::find(stops.begin(), stops.end(), _hash) != stops.end())
+                break;
+            shares.push_back(tracker->get(_hash));
+        }
+    }
+
+    if (shares.size() > 0)
+    {
+        LOG_INFO << "Sending " << shares.size() << " shares to " << std::get<0>(peer_addr) << ":" << std::get<1>(peer_addr);
+    }
+    return shares;
+}
+
+void P2PNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream header)
+{
+    PackStream packed_header;
+    packed_header << header;
+
+    if (net->parent->POW_FUNC(packed_header) > header.bits.bits.target())
+    {
+        throw std::invalid_argument("received block header fails PoW test");
+    }
+
+    auto _header = coind::data::BlockHeaderType();
+    _header.set_stream(header);
+
+    _coind_node->handle_header(_header);
+}
+
+void P2PNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares,
+                            std::shared_ptr<P2PProtocol> peer)
+{
+    //TODO: finish
+}
 
 std::vector<addr_type> P2PNodeClient::get_good_peers(int max_count)
 {
@@ -112,40 +165,40 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_addrs> msg, std::sha
     for (auto addr_record: msg->addrs.get())
     {
         auto addr = addr_record.get();
-        _p2p_node->got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)),
-                            addr.address.services, std::min((int64_t) dev::timestamp(), addr.timestamp));
+        got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)),
+                            addr.address.services, std::min((int64_t) c2pool::dev::timestamp(), addr.timestamp));
 
-        if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
+        if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
         {
-            auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
-            std::vector<c2pool::messages::stream::addr_stream> _addrs{addr_record};
-            _proto->write(make_message<message_addrs>(_addrs));
+            auto _proto = c2pool::random::RandomChoice(peers);
+            std::vector<::stream::addr_stream> _addrs{addr_record};
+            _proto->write(std::make_shared<message_addrs>(_addrs));
         }
     }
 }
 
 void P2PNode::handle(std::shared_ptr<net::messages::message_addrme> msg, std::shared_ptr<P2PProtocol> protocol)
 {
-    auto host = std::get<0>(_socket->get_addr());
+    auto host = std::get<0>(protocol->get_addr());
 
     if (host.compare("127.0.0.1") == 0)
     {
-        if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
+        if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
         {
-            auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
-            _proto->write(make_message<message_addrme>(msg->port.get()));
+            auto _proto = c2pool::random::RandomChoice(peers);
+            _proto->write(std::make_shared<message_addrme>(msg->port.get()));
         }
     } else
     {
-        _p2p_node->got_addr(std::make_tuple(host, std::to_string(msg->port.get())), other_services,
-                            dev::timestamp());
-        if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!_p2p_node->get_peers().empty()))
+        got_addr(std::make_tuple(host, std::to_string(msg->port.get())), protocol->other_services,
+                            c2pool::dev::timestamp());
+        if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
         {
-            auto _proto = c2pool::random::RandomChoice(_p2p_node->get_peers());
-            std::vector<c2pool::messages::addr> _addrs{
-                    c2pool::messages::addr(dev::timestamp(), other_services, host, msg->port.get())
+            auto _proto = c2pool::random::RandomChoice(peers);
+            std::vector<addr> _addrs{
+                    addr(c2pool::dev::timestamp(), protocol->other_services, host, msg->port.get())
             };
-            _proto->write(make_message<message_addrs>(_addrs));
+            _proto->write(std::make_shared<message_addrs>(_addrs));
         }
     }
 }
@@ -163,17 +216,17 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_getaddrs> msg, std::
         count = 100;
     }
 
-    std::vector<c2pool::messages::addr> _addrs;
-    for (auto v: _p2p_node->get_good_peers(count))
+    std::vector<addr> _addrs;
+    for (auto v: get_good_peers(count))
     {
-        auto _addr = _p2p_node->get_addr_store()->Get(v);
+        auto _addr = addr_store->Get(v);
         _addrs.push_back(
-                c2pool::messages::addr(_addr.last_seen,
-                                       _addr.service, std::get<0>(v), dev::str_to_int<int>(std::get<1>(v)))
+                addr(_addr.last_seen,
+                                       _addr.service, std::get<0>(v), c2pool::dev::str_to_int<int>(std::get<1>(v)))
         );
     }
 
-    write(make_message<message_addrs>(_addrs));
+    protocol->write(std::make_shared<message_addrs>(_addrs));
 }
 
 void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::shared_ptr<P2PProtocol> protocol)
@@ -189,7 +242,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::sh
         //TODO: optimize
         PackStream stream_wrappedshare;
         stream_wrappedshare << wrappedshare;
-        auto share = load_share(stream_wrappedshare, _net, _socket->get_addr());
+        auto share = load_share(stream_wrappedshare, net, protocol->get_addr());
 
         std::vector<coind::data::tx_type> txs;
         if (wrappedshare.type.get() >= 13)
@@ -197,12 +250,12 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::sh
             for (auto tx_hash: *share->new_transaction_hashes)
             {
                 coind::data::tx_type tx;
-                if (_p2p_node->known_txs.value().find(tx_hash) != _p2p_node->known_txs.value().end())
+                if (known_txs.value().find(tx_hash) != known_txs.value().end())
                 {
-                    tx = _p2p_node->known_txs.value()[tx_hash];
+                    tx = known_txs.value()[tx_hash];
                 } else
                 {
-                    for (auto cache : known_txs_cache)
+                    for (auto cache : protocol->known_txs_cache)
                     {
                         if (cache.find(tx_hash) != cache.end())
                         {
@@ -218,7 +271,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::sh
         result.emplace_back(share, txs);
     }
 
-    _p2p_node->handle_shares(result, shared_from_this());
+    handle_shares(result, protocol);
     //t1
     //TODO: if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares)))
 }
@@ -226,7 +279,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::sh
 void P2PNode::handle(std::shared_ptr<net::messages::message_sharereq> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
-    auto shares = _p2p_node->handle_get_shares(msg->hashes.get(), msg->parents.get(), msg->stops.get(), _socket->get_addr());
+    auto shares = handle_get_shares(msg->hashes.get(), msg->parents.get(), msg->stops.get(), protocol->get_addr());
 
     std::vector<PackedShareData> _shares;
     try
@@ -238,13 +291,13 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_sharereq> msg, std::
 //                    share_type _share(share->SHARE_VERSION, contents.write());
 //                    _shares.push_back(_share);
         }
-        auto reply_msg = make_message<message_sharereply>(msg->id.get(), good, _shares);
-        write(reply_msg);
+        auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), good, _shares);
+        protocol->write(reply_msg);
     }
     catch (const std::invalid_argument &e)
     {
-        auto reply_msg = make_message<message_sharereply>(msg->id.get(), too_long, _shares);
-        write(reply_msg);
+        auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), too_long, _shares);
+        protocol->write(reply_msg);
     }
 }
 
@@ -260,7 +313,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_sharereply> msg, std
                 //TODO: optimize
                 PackStream stream_content;
                 stream_content << content;
-                ShareType _share = load_share(stream_content, _net, _socket->get_addr());
+                ShareType _share = load_share(stream_content, net, protocol->get_addr());
                 res.push_back(_share);
             }
         }
@@ -273,16 +326,16 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_sharereply> msg, std
 
 void P2PNode::handle(std::shared_ptr<net::messages::message_bestblock> msg, std::shared_ptr<P2PProtocol> protocol)
 {
-    _p2p_node->handle_bestblock(msg->header);
+    handle_bestblock(msg->header);
 }
 
 void P2PNode::handle(std::shared_ptr<net::messages::message_have_tx> msg, std::shared_ptr<P2PProtocol> protocol)
 {
-    remote_tx_hashes.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
-    if (remote_tx_hashes.size() > 10000)
+    protocol->remote_tx_hashes.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
+    if (protocol->remote_tx_hashes.size() > 10000)
     {
-        remote_tx_hashes.erase(remote_tx_hashes.begin(),
-                               std::next(remote_tx_hashes.begin(), remote_tx_hashes.size() - 10000));
+        protocol->remote_tx_hashes.erase(protocol->remote_tx_hashes.begin(),
+                               std::next(protocol->remote_tx_hashes.begin(), protocol->remote_tx_hashes.size() - 10000));
     }
 }
 
@@ -293,31 +346,31 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_losing_tx> msg, std:
     losing_txs.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
 
     std::set<uint256> diff_txs;
-    std::set_difference(remote_tx_hashes.begin(), remote_tx_hashes.end(),
+    std::set_difference(protocol->remote_tx_hashes.begin(), protocol->remote_tx_hashes.end(),
                         losing_txs.begin(), losing_txs.end(),
                         std::inserter(diff_txs, diff_txs.begin()));
 
-    remote_tx_hashes = diff_txs;
+    protocol->remote_tx_hashes = diff_txs;
 }
 
 void P2PNode::handle(std::shared_ptr<net::messages::message_remember_tx> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     for (auto tx_hash: msg->tx_hashes.get())
     {
-        if (remembered_txs.find(tx_hash) != remembered_txs.end())
+        if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
         {
             LOG_WARNING << "Peer referenced transaction twice, disconnecting";
-            _socket->disconnect();
+            protocol->get_socket()->disconnect();
             return;
         }
 
         coind::data::stream::TransactionType_stream tx;
-        if (_p2p_node->known_txs.value().find(tx_hash) != _p2p_node->known_txs.value().end())
+        if (known_txs.value().find(tx_hash) != known_txs.value().end())
         {
-            tx = _p2p_node->known_txs.value()[tx_hash];
+            tx = known_txs.value()[tx_hash];
         } else
         {
-            for (auto cache : known_txs_cache)
+            for (auto cache : protocol->known_txs_cache)
             {
                 if (cache.find(tx_hash) != cache.end())
                 {
@@ -327,7 +380,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_remember_tx> msg, st
                 } else
                 {
                     LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString() << " disconnecting";
-                    _socket->disconnect();
+                    protocol->get_socket()->disconnect();
                     return;
                 }
             }
@@ -345,9 +398,9 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_forget_tx> msg, std:
     for (auto tx_hash : msg->tx_hashes.get())
     {
         PackStream stream;
-        stream << remembered_txs[tx_hash];
-        remembered_txs_size -= 100 + stream.size();
-        assert(remembered_txs_size >= 0);
-        remembered_txs.erase(tx_hash);
+        stream << protocol->remembered_txs[tx_hash];
+        protocol->remembered_txs_size -= 100 + stream.size();
+        assert(protocol->remembered_txs_size >= 0);
+        protocol->remembered_txs.erase(tx_hash);
     }
 }
