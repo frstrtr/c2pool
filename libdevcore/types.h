@@ -421,4 +421,4 @@ namespace stream
     };
 }
 
-typedef std::tuple<std::string, std::string> addr_type;
+typedef std::tuple<std::string, std::string> addr_type; //old name: c2pool::libnet::addr

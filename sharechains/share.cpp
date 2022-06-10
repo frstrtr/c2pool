@@ -217,7 +217,7 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
 
 
 
-std::shared_ptr<Share> load_share(PackStream &stream, shared_ptr<c2pool::Network> net, c2pool::libnet::addr peer_addr)
+std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, addr peer_addr)
 {
 	PackedShareData packed_share;
 	stream >> packed_share;
