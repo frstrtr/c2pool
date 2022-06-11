@@ -46,7 +46,7 @@ void P2PNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream h
     auto _header = coind::data::BlockHeaderType();
     _header.set_stream(header);
 
-    _coind_node->handle_header(_header);
+    //TODO: _coind_node->handle_header(_header);
 }
 
 void P2PNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares,

@@ -51,7 +51,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 add_subdirectory(libs)
 #---------------
-include_directories(include/jsonrpccxx)
+include_directories(libs/jsonrpccxx)
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_subdirectory(btclibs)
@@ -59,7 +59,7 @@ add_subdirectory(networks)
 add_subdirectory(libcoind)
 add_subdirectory(sharechains) #ver. 2
 add_subdirectory(libdevcore)
-add_subdirectory(libnet)
+#add_subdirectory(libnet)
 add_subdirectory(libnet2)
 add_subdirectory(libp2p)
 
