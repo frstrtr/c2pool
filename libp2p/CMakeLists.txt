@@ -6,6 +6,13 @@ set(libp2p_source
 
 # TODO: library to interface
 add_library(libp2p ${libp2p_source})
+target_link_libraries(libp2p libdevcore)
 
-target_link_libraries(libp2p libdevcore libcoind)
+set(libp2ppreset_source
+        preset/p2p_socket_data.h
+        )
+
+add_library(libp2ppreset ${libp2ppreset_source})
+target_link_libraries(libp2ppreset libp2p libcoind)
+
 #target_link_libraries(libp2p univalue networks libdevcore sharechains libcoind)

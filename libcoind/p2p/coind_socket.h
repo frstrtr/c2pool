@@ -2,14 +2,14 @@
 
 #include <memory>
 
-#include "p2p_socket_data.h"
+#include <libp2p/preset/p2p_socket_data.h>
 #include <libp2p/socket.h>
 #include <libp2p/message.h>
 #include <networks/network.h>
 
 #include <boost/asio.hpp>
 
-class P2PSocket : public Socket
+class CoindSocket : public Socket
 {
 private:
 	boost::asio::ip::tcp::socket socket;
@@ -17,12 +17,12 @@ private:
 	std::shared_ptr<c2pool::Network> net;
 public:
 
-	P2PSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
+    CoindSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
 
 	}
 
-	P2PSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), P2PSocket(std::move(_socket), std::move(_net))
+    CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), CoindSocket(std::move(_socket), std::move(_net))
 	{
 
 	}

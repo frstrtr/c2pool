@@ -36,8 +36,8 @@ struct P2PWriteSocketData : public WriteSocketData
         PackStream payload_checksum_stream;
         payload_checksum_stream << *msg;
 
-        auto __checksum = coind::data::hash256(payload_checksum_stream);
-        IntType(256) checksum_full(__checksum);
+        auto _checksum = coind::data::hash256(payload_checksum_stream);
+        IntType(256) checksum_full(_checksum);
         PackStream _packed_checksum;
         _packed_checksum << checksum_full;
 //TODO: почему результат реверснутый?
