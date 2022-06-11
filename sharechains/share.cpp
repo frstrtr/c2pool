@@ -214,10 +214,7 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
 // return gentx # only used by as_block
 }
 
-
-
-
-std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, addr peer_addr)
+std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, addr_type peer_addr)
 {
 	PackedShareData packed_share;
 	stream >> packed_share;

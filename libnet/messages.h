@@ -16,7 +16,6 @@
 #include <libdevcore/logger.h>
 #include <libcoind/transaction.h>
 
-using namespace c2pool::messages;
 using namespace c2pool::messages::stream;
 
 namespace c2pool::libnet::p2p
