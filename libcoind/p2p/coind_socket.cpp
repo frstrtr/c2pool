@@ -1,11 +1,11 @@
-#include "p2p_socket.h"
+#include "coind_socket.h"
 
-#include "p2p_socket_data.h"
+#include <libp2p/preset/p2p_socket_data.h>
 
 #include <boost/asio.hpp>
 
 // Write
-void P2PSocket::write_prefix(std::shared_ptr<Message> msg)
+void CoindSocket::write_prefix(std::shared_ptr<Message> msg)
 {
 	boost::asio::async_write(socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
 							 [this, msg](boost::system::error_code _ec, std::size_t length)
@@ -20,7 +20,7 @@ void P2PSocket::write_prefix(std::shared_ptr<Message> msg)
 							 });
 }
 
-void P2PSocket::write_message_data(std::shared_ptr<Message> msg)
+void CoindSocket::write_message_data(std::shared_ptr<Message> msg)
 {
 	std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>();
 	_msg->from_message(msg);
@@ -37,7 +37,7 @@ void P2PSocket::write_message_data(std::shared_ptr<Message> msg)
 }
 
 // Read
-void P2PSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
+void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 {
 	boost::asio::async_read(socket,
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
@@ -61,7 +61,7 @@ void P2PSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 							});
 }
 
-void P2PSocket::read_command(std::shared_ptr<ReadSocketData> msg)
+void CoindSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 {
 
 	boost::asio::async_read(socket,
@@ -82,7 +82,7 @@ void P2PSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 							});
 }
 
-void P2PSocket::read_length(std::shared_ptr<ReadSocketData> msg)
+void CoindSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 {
 	boost::asio::async_read(socket,
 							boost::asio::buffer(msg->len, msg->LEN_LEN),
@@ -102,7 +102,7 @@ void P2PSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 							});
 }
 
-void P2PSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
+void CoindSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 {
 	boost::asio::async_read(socket,
 							boost::asio::buffer(msg->checksum, msg->CHECKSUM_LEN),
@@ -122,7 +122,7 @@ void P2PSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 							});
 }
 
-void P2PSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
+void CoindSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 {
 	PackStream stream_len(msg->len, msg->LEN_LEN);
 	IntType(32) payload_len;
@@ -149,7 +149,7 @@ void P2PSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 							});
 }
 
-void P2PSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
+void CoindSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 {
 	//checksum check
 	//TODO: !!!

@@ -24,6 +24,7 @@ set(jsonrpc_sources
 
 set(coind_p2p_sources
         p2p/coind_messages.h
+        p2p/coind_socket.h p2p/coind_socket.cpp
 #        p2p/messages.h
 #        p2p/messages.cpp
 #        p2p/p2p_protocol.h
@@ -38,5 +39,5 @@ set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources})
 #find_package(CURL REQUIRED)
 
 add_library(libcoind STATIC ${coind_sources})
-target_link_libraries(libcoind btclibs libdevcore networks univalue jsonrpccxx libp2p) # ${CURL_LIBRARIES})
+target_link_libraries(libcoind btclibs libdevcore networks univalue jsonrpccxx libp2pc libp2ppreset) # ${CURL_LIBRARIES})
 #target_include_directories(libcoind PRIVATE ${CURL_INCLUDE_DIR})
