@@ -7,5 +7,5 @@ set(libp2p_source
 # TODO: library to interface
 add_library(libp2p ${libp2p_source})
 
-target_link_libraries(libp2p libdevcore)
+target_link_libraries(libp2p libdevcore libcoind)
 #target_link_libraries(libp2p univalue networks libdevcore sharechains libcoind)
