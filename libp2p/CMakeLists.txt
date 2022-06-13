@@ -10,6 +10,7 @@ target_link_libraries(libp2p libdevcore)
 
 set(libp2ppreset_source
         preset/p2p_socket_data.h
+        preset/p2p_node_interface.h
         )
 
 add_library(libp2ppreset ${libp2ppreset_source})

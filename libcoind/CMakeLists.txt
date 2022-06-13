@@ -25,6 +25,9 @@ set(jsonrpc_sources
 set(coind_p2p_sources
         p2p/coind_messages.h
         p2p/coind_socket.h p2p/coind_socket.cpp
+        p2p/coind_protocol.h p2p/coind_protocol.cpp
+        p2p/coind_protocol_data.h
+
 #        p2p/messages.h
 #        p2p/messages.cpp
 #        p2p/p2p_protocol.h
