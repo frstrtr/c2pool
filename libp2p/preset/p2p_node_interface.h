@@ -14,6 +14,7 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
+template <typename SocketType>
 class P2PListener : public Listener
 {
 private:
@@ -33,12 +34,12 @@ public:
 							  {
 								  if (!ec)
 								  {
-									  auto socket = std::make_shared<P2PSocket>(std::move(_socket), net);
+									  auto socket = std::make_shared<SocketType>(std::move(_socket), net);
 									  handle(std::move(socket));
 								  }
 								  else
 								  {
-									  LOG_ERROR << "P2PNode::listen: " << ec.message();
+									  LOG_ERROR << "P2P Listener: " << ec.message();
 								  }
 								  finish();
 							  });
@@ -46,6 +47,7 @@ public:
 
 };
 
+template <typename SocketType>
 class P2PConnector : public Connector
 {
 private:
@@ -71,7 +73,7 @@ public:
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
 							   {
 								   ip::tcp::socket _socket(*context);
-								   auto socket = std::make_shared<P2PSocket>(
+								   auto socket = std::make_shared<SocketType>(
 										   std::move(_socket), net
 								   );
 

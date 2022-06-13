@@ -10,7 +10,6 @@
 #include "p2p_socket.h"
 #include "p2p_protocol.h"
 #include "p2p_handshake.h"
-#include "p2p_node_interface.h"
 #include <libp2p/handler.h>
 #include <libp2p/node.h>
 #include <networks/network.h>
@@ -64,7 +63,7 @@ public:
 		return *this;
 	}
 
-	auto &set_net(std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
+	auto &set_addr_store(std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
 	{
 		addr_store = std::move(_addr_store);
 		return *this;
@@ -99,7 +98,7 @@ public:
 class P2PNodeServer : virtual P2PNodeData
 {
 protected:
-	std::shared_ptr<Listener> listener; // from P2PNode::init()
+	std::shared_ptr<Listener> listener; // from P2PNode::run()
 
     std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshakeServer>> server_attempts;
     std::map<HOST_IDENT, std::shared_ptr<P2PProtocol>> server_connections;
@@ -134,7 +133,7 @@ public:
 class P2PNodeClient : virtual P2PNodeData
 {
 protected:
-	std::shared_ptr<Connector> connector; // from P2PNode::init()
+	std::shared_ptr<Connector> connector; // from P2PNode::run()
 
 	std::map<HOST_IDENT, std::shared_ptr<P2PHandshakeClient>> client_attempts;
     std::map<HOST_IDENT, std::shared_ptr<P2PProtocol>> client_connections;
