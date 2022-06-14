@@ -5,8 +5,10 @@
 
 #include <libcoind/height_tracker.h>
 #include <libcoind/p2p/coind_protocol.h>
+#include <libcoind/p2p/coind_messages.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libp2p/node.h>
+#include <libdevcore/logger.h>
 #include <libdevcore/events.h>
 #include <networks/network.h>
 #include <sharechains/tracker.h>
@@ -120,6 +122,22 @@ public:
     }
 public:
 
+    void handle(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_verack> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_ping> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_pong> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_alert> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_getaddr> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_addr> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_inv> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_getdata> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_reject> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_getblocks> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_getheaders> msg, std::shared_ptr<CoindProtocol> protocol);
+
+    void handle(std::shared_ptr<coind::messages::message_tx> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_block> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle(std::shared_ptr<coind::messages::message_headers> msg, std::shared_ptr<CoindProtocol> protocol);
 private:
     boost::asio::deadline_timer work_poller_t;
     void work_poller();
