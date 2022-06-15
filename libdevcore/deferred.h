@@ -1,3 +1,4 @@
+#pragma once
 #include <boost/asio.hpp>
 #include <iostream>
 #include <future>
