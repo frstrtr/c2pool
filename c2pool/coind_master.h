@@ -13,13 +13,12 @@ using namespace std;
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/post.hpp>
 using namespace c2pool::dev;
-using namespace c2pool::libnet;
 using namespace shares;
 
 #include "node_manager.h"
 
 namespace c2pool::master {
-    shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool) {
+    shared_ptr<c2pool::libnet::NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool) {
         LOG_INFO << "Starting DGB initialization...";
         //Networks/Configs
         LOG_INFO << "DGB_parent_net initialization...";
@@ -30,7 +29,7 @@ namespace c2pool::master {
         auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
         //NodeManager
         LOG_INFO << "DGB NodeManager initialization...";
-        auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_parent_net, DGB_cfg);
+        auto DGB = std::make_shared<c2pool::libnet::NodeManager>(DGB_net, DGB_parent_net, DGB_cfg);
 
         //run manager in another thread from thread_pool.
         boost::asio::post(thread_pool, [&]() { DGB->run(); });

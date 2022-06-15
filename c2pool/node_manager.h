@@ -11,20 +11,10 @@ using std::shared_ptr;
 class ShareTracker;
 class ShareStore;
 
-namespace c2pool
-{
-    namespace libnet
-    {
-        namespace p2p
-        {
-            class P2PNode;
-        }
-        class Worker;
-        class CoindNode;
-    }
+class P2PNode;
+class CoindNode;
+//TODO: class Worker;
 
-
-}
 namespace coind
 {
     class JSONRPC_Coind;
@@ -60,12 +50,12 @@ namespace c2pool::libnet
         shared_ptr<coind::ParentNetwork> parent_net() const;
         shared_ptr<c2pool::dev::coind_config> config() const;
         shared_ptr<c2pool::dev::AddrStore> addr_store() const;
-        shared_ptr<c2pool::libnet::p2p::P2PNode> p2pNode() const;
+        shared_ptr<P2PNode> p2pNode() const;
         shared_ptr<coind::JSONRPC_Coind> coind() const;
-        shared_ptr<c2pool::libnet::CoindNode> coind_node() const;
+        shared_ptr<CoindNode> coind_node() const;
         shared_ptr<ShareTracker> tracker() const;
         shared_ptr<ShareStore> share_store() const;
-        shared_ptr<c2pool::libnet::Worker> worker() const;
+//      TODO:  shared_ptr<Worker> worker() const;
         shared_ptr<coind::jsonrpc::StratumNode> stratum() const;
 
     protected:
@@ -74,12 +64,12 @@ namespace c2pool::libnet
         shared_ptr<coind::ParentNetwork> _parent_net;
         shared_ptr<c2pool::dev::coind_config> _config;
         shared_ptr<c2pool::dev::AddrStore> _addr_store;
-        shared_ptr<c2pool::libnet::p2p::P2PNode> _p2pnode;
+        shared_ptr<P2PNode> _p2pnode;
         shared_ptr<coind::JSONRPC_Coind> _coind;
-        shared_ptr<c2pool::libnet::CoindNode> _coind_node;
+        shared_ptr<CoindNode> _coind_node;
         shared_ptr<ShareTracker> _tracker;
         shared_ptr<ShareStore> _share_store;
-        shared_ptr<c2pool::libnet::Worker> _worker;
+        //TODO: shared_ptr<Worker> _worker;
         shared_ptr<coind::jsonrpc::StratumNode> _stratum;
 
     private:
@@ -103,12 +93,12 @@ namespace c2pool::libnet
         create_set_method(coind::ParentNetwork, _parent_net);
         create_set_method(c2pool::dev::coind_config, _config);
         create_set_method(c2pool::dev::AddrStore, _addr_store);
-        create_set_method(c2pool::libnet::p2p::P2PNode, _p2pnode);
+        create_set_method(P2PNode, _p2pnode);
         create_set_method(coind::JSONRPC_Coind, _coind);
-        create_set_method(c2pool::libnet::CoindNode, _coind_node);
+        create_set_method(CoindNode, _coind_node);
         create_set_method(ShareTracker, _tracker);
         create_set_method(ShareStore, _share_store);
-        create_set_method(c2pool::libnet::Worker, _worker);
+        //TODO: create_set_method(Worker, _worker);
         create_set_method(coind::jsonrpc::StratumNode, _stratum);
     };
 #undef create_set_method

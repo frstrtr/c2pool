@@ -17,12 +17,12 @@ private:
 	std::shared_ptr<c2pool::Network> net;
 public:
 
-    CoindSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
+    CoindSocket(auto _socket, auto _net) : Socket(), socket(std::move(_socket)), net(std::move(_net))
 	{
 
 	}
 
-    CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), CoindSocket(std::move(_socket), std::move(_net))
+    CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
 
 	}
