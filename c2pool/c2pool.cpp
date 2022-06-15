@@ -11,7 +11,6 @@ using std::string;
 
 #include <boost/asio/thread_pool.hpp>
 using namespace c2pool::dev;
-using namespace c2pool::libnet;
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
