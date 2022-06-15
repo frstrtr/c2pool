@@ -22,8 +22,8 @@ namespace coind::messages
         IntType(32) version;
         IntType(64) services;
         IntType(64) timestamp;
-        stream::address_type_stream addr_to;
-        stream::address_type_stream addr_from;
+        ::stream::address_type_stream addr_to;
+        ::stream::address_type_stream addr_from;
         IntType(64) nonce;
         StrType sub_version;
         IntType(32) start_height;
@@ -178,14 +178,14 @@ namespace coind::messages
     class message_addr : public Message
     {
     public:
-        ListType<stream::addr_stream> addrs;
+        ListType<::stream::addr_stream> addrs;
 
     public:
         message_addr() : Message("addr") {}
 
         message_addr(std::vector <addr> _addrs) : message_addr()
         {
-            addrs = stream::addr_stream::make_list_type(_addrs);
+            addrs = ::stream::addr_stream::make_list_type(_addrs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -204,14 +204,14 @@ namespace coind::messages
     class message_inv : public Message
     {
     public:
-        ListType<stream::inventory_stream> invs;
+        ListType<::stream::inventory_stream> invs;
 
     public:
         message_inv() : Message("inv") { }
 
         message_inv(std::vector <inventory> _invs) : message_inv()
         {
-            invs = stream::inventory_stream::make_list_type(_invs);
+            invs = ::stream::inventory_stream::make_list_type(_invs);
         }
 
         PackStream &write(PackStream &stream) override
@@ -230,14 +230,14 @@ namespace coind::messages
     class message_getdata : public Message
     {
     public:
-        ListType<stream::inventory_stream> requests;
+        ListType<::stream::inventory_stream> requests;
 
     public:
         message_getdata() : Message("getdata") {}
 
         message_getdata(std::vector <inventory> _reqs) : message_getdata()
         {
-            requests = stream::inventory_stream::make_list_type(_reqs);
+            requests = ::stream::inventory_stream::make_list_type(_reqs);
         }
 
         PackStream &write(PackStream &stream) override

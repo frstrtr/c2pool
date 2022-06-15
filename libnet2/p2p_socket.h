@@ -22,7 +22,7 @@ public:
 
 	}
 
-	P2PSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), P2PSocket(std::move(_socket), std::move(_net))
+	P2PSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
 
 	}
