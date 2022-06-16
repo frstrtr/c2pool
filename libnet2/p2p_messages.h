@@ -57,7 +57,14 @@ namespace pool::messages
 
         PackStream &read(PackStream &stream) override
         {
-            stream >> version >> services >> addr_to >> addr_from >> nonce >> sub_version >> mode >> best_share_hash;
+            stream >> version
+                >> services
+                >> addr_to
+                >> addr_from
+                >> nonce
+                >> sub_version
+                >> mode
+                >> best_share_hash;
             return stream;
         }
     };
