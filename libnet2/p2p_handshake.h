@@ -14,11 +14,11 @@
 class P2PHandshake : public Handshake<P2PProtocol>, public P2PProtocolData
 {
 protected:
-    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> handle_message_version;
+    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<pool::messages::message_version>)> handle_message_version;
 public:
 
     P2PHandshake(auto socket, std::function<void(std::shared_ptr<P2PHandshake>,
-                                                 std::shared_ptr<net::messages::message_version>)> _handler)
+                                                 std::shared_ptr<pool::messages::message_version>)> _handler)
             : Handshake(socket), P2PProtocolData(3301), handle_message_version(std::move(_handler))
     {
 
@@ -41,7 +41,7 @@ public:
             if (raw_msg->command != "version")
                 throw std::runtime_error("msg != version"); //TODO: ERROR CODE FOR CONSOLE
 
-            auto msg = std::make_shared<net::messages::message_version>();
+            auto msg = std::make_shared<pool::messages::message_version>();
             raw_msg->value >> *msg;
 
             handle_message_version(this->shared_from_this(), msg);
@@ -68,7 +68,7 @@ public:
             if (raw_msg->command != "version")
                 throw std::runtime_error("msg != version"); //TODO: ERROR CODE FOR CONSOLE
 
-            auto msg = std::make_shared<net::messages::message_version>();
+            auto msg = std::make_shared<pool::messages::message_version>();
             raw_msg->value >> *msg;
 
             handle_message_version(this->shared_from_this(), msg);

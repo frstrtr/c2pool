@@ -103,9 +103,9 @@ protected:
     std::map<std::shared_ptr<Socket>, std::shared_ptr<P2PHandshakeServer>> server_attempts;
     std::map<HOST_IDENT, std::shared_ptr<P2PProtocol>> server_connections;
 private:
-    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> message_version_handle;
+    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
 public:
-	P2PNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> version_handle) : P2PNodeData(std::move(_context)), message_version_handle(version_handle) {}
+	P2PNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : P2PNodeData(std::move(_context)), message_version_handle(version_handle) {}
 
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
@@ -141,9 +141,9 @@ private:
 	io::steady_timer auto_connect_timer;
 	const std::chrono::seconds auto_connect_interval{1s};
 
-    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> message_version_handle;
+    std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
 public:
-	P2PNodeClient(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<net::messages::message_version>)> version_handle) : P2PNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
+	P2PNodeClient(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<P2PHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : P2PNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
@@ -223,31 +223,31 @@ public:
         auto_connect();
 	}
 
-    void handle_message_version(std::shared_ptr<P2PHandshake> handshake, std::shared_ptr<net::messages::message_version> msg);
+    void handle_message_version(std::shared_ptr<P2PHandshake> handshake, std::shared_ptr<pool::messages::message_version> msg);
 
-    void handle(std::shared_ptr<net::messages::message_addrs> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<P2PProtocol> protocol);
 
     //TODO: test:
-    void handle(std::shared_ptr<net::messages::message_addrme> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_ping> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<P2PProtocol> protocol);
 
     //TODO: TEST
-    void handle(std::shared_ptr<net::messages::message_getaddrs> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_shares> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_sharereq> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_sharereq> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_sharereply> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_sharereply> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_bestblock> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_bestblock> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_have_tx> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_losing_tx> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_remember_tx> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<P2PProtocol> protocol);
 
-    void handle(std::shared_ptr<net::messages::message_forget_tx> msg, std::shared_ptr<P2PProtocol> protocol);
+    void handle(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<P2PProtocol> protocol);
 };
