@@ -1,10 +1,10 @@
 set(libnet2_sources
-        p2p_node.cpp p2p_node.h
-        p2p_socket.cpp p2p_socket.h
-        p2p_protocol.cpp p2p_protocol.h
-        p2p_handshake.cpp p2p_handshake.h
-        p2p_protocol_data.h
-        p2p_messages.h p2p_messages.cpp
+        pool_node.cpp pool_node.h
+        pool_socket.cpp pool_socket.h
+        pool_protocol.cpp pool_protocol.h
+        pool_handshake.cpp pool_handshake.h
+        pool_protocol_data.h
+        pool_messages.h pool_messages.cpp
 
         coind_node.h coind_node.cpp
         )

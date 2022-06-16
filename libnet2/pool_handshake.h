@@ -1,0 +1,80 @@
+#pragma once
+
+#include <memory>
+
+#include "pool_socket.h"
+#include "pool_protocol.h"
+#include "pool_messages.h"
+#include "pool_protocol_data.h"
+#include <libp2p/handshake.h>
+#include <libdevcore/logger.h>
+
+#include <boost/asio.hpp>
+
+class PoolHandshake : public Handshake<PoolProtocol>, public PoolProtocolData
+{
+protected:
+    std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> handle_message_version;
+public:
+
+    PoolHandshake(auto socket, std::function<void(std::shared_ptr<PoolHandshake>,
+                                                  std::shared_ptr<pool::messages::message_version>)> _handler)
+            : Handshake(socket), PoolProtocolData(3301), handle_message_version(std::move(_handler))
+    {
+
+    }
+};
+
+class PoolHandshakeServer : public enable_shared_from_this<PoolHandshakeServer>, public PoolHandshake
+{
+    std::function<void(std::shared_ptr<PoolHandshakeServer>)> handshake_finish;
+public:
+	PoolHandshakeServer(auto _socket, auto version_handle, auto _finish) : PoolHandshake(_socket, std::move(version_handle)), handshake_finish(std::move(_finish))
+	{
+
+	}
+
+	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
+	{
+        try
+        {
+            if (raw_msg->command != "version")
+                throw std::runtime_error("msg != version"); //TODO: ERROR CODE FOR CONSOLE
+
+            auto msg = std::make_shared<pool::messages::message_version>();
+            raw_msg->value >> *msg;
+
+            handle_message_version(this->shared_from_this(), msg);
+        } catch (const std::error_code &ec)
+        {
+            // TODO: disconnect
+        }
+	}
+};
+
+class PoolHandshakeClient : public enable_shared_from_this<PoolHandshakeClient>, public PoolHandshake
+{
+    std::function<void(std::shared_ptr<PoolHandshakeClient>)> handshake_finish;
+public:
+	PoolHandshakeClient(auto _socket, auto version_handle, auto _finish) : PoolHandshake(_socket, version_handle), handshake_finish(std::move(_finish))
+	{
+
+	}
+
+	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
+	{
+        try
+        {
+            if (raw_msg->command != "version")
+                throw std::runtime_error("msg != version"); //TODO: ERROR CODE FOR CONSOLE
+
+            auto msg = std::make_shared<pool::messages::message_version>();
+            raw_msg->value >> *msg;
+
+            handle_message_version(this->shared_from_this(), msg);
+        } catch (const std::error_code &ec)
+        {
+            // TODO: disconnect
+        }
+	}
+};

@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <optional>
 
-struct P2PProtocolData
+struct PoolProtocolData
 {
     const int version;
 
@@ -11,5 +11,5 @@ struct P2PProtocolData
     uint64_t other_services;
     uint64_t nonce;
 
-    P2PProtocolData(auto _version) : version(_version) {}
+    PoolProtocolData(auto _version) : version(_version) {}
 };

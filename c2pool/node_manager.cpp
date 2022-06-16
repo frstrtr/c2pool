@@ -2,7 +2,7 @@
 
 #include <boost/asio.hpp>
 
-#include <libnet2/p2p_node.h>
+#include <libnet2/pool_node.h>
 #include <libnet2/coind_node.h>
 #include <libnet/worker.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
