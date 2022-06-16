@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <libnet2/p2p_messages.h>
+#include <libnet2/pool_messages.h>
 
 // TODO: tests for all messages
 

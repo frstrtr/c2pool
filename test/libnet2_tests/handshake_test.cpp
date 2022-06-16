@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-#include <libnet2/p2p_handshake.h>
+#include <libnet2/pool_handshake.h>
 #include <libp2p/socket.h>
 
 class VirtualSocket : public Socket
@@ -73,9 +73,9 @@ protected:
 
 TEST_F(PoolHandshake, handshake_client_virtual_socket)
 {
-    std::shared_ptr<P2PHandshakeClient> handshake = std::make_shared<P2PHandshakeClient>(
+    std::shared_ptr<PoolHandshakeClient> handshake = std::make_shared<PoolHandshakeClient>(
             socket,
-            [&](std::shared_ptr<P2PHandshake> handshake, std::shared_ptr<pool::messages::message_version> msg)
+            [&](std::shared_ptr<PoolHandshake> handshake, std::shared_ptr<pool::messages::message_version> msg)
             {
                 std::cout << "HANDLED MESSAGE VERSION: " << std::endl;
                 std::cout << "ip addr_to: " << msg->addr_to.get().address << std::endl;
@@ -97,7 +97,7 @@ TEST_F(PoolHandshake, handshake_client_virtual_socket)
                 ASSERT_EQ(18, msg->mode.get());
                 ASSERT_EQ(best_hash_test_answer, msg->best_share_hash.get());
             },
-            [&](std::shared_ptr<P2PHandshakeClient> handshake)
+            [&](std::shared_ptr<PoolHandshakeClient> handshake)
             {
 
             }

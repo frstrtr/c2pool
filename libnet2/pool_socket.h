@@ -9,7 +9,7 @@
 
 #include <boost/asio.hpp>
 
-class P2PSocket : public Socket
+class PoolSocket : public Socket
 {
 private:
 	boost::asio::ip::tcp::socket socket;
@@ -17,12 +17,12 @@ private:
 	std::shared_ptr<c2pool::Network> net;
 public:
 
-	P2PSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
+	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
 
 	}
 
-	P2PSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
+	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
 
 	}
