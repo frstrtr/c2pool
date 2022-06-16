@@ -6,7 +6,7 @@
 #include <sharechains/share_types.h>
 #include <libp2p/message.h>
 
-namespace net::messages
+namespace pool::messages
 {
     enum ShareReplyResult
     {

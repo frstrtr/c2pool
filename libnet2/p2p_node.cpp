@@ -5,7 +5,7 @@
 #include <libdevcore/types.h>
 #include <sharechains/share.h>
 
-using namespace net::messages;
+using namespace pool::messages;
 
 std::vector<ShareType> P2PNodeData::handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops,
                                addr_type peer_addr)
@@ -81,7 +81,7 @@ std::vector<addr_type> P2PNodeClient::get_good_peers(int max_count)
 }
 
 void P2PNode::handle_message_version(std::shared_ptr<P2PHandshake> handshake,
-                                     std::shared_ptr<net::messages::message_version> msg)
+                                     std::shared_ptr<pool::messages::message_version> msg)
 {
     LOG_DEBUG
         << "handle message_version";
@@ -160,7 +160,7 @@ void P2PNode::handle_message_version(std::shared_ptr<P2PHandshake> handshake,
     //TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_addrs> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     for (auto addr_record: msg->addrs.get())
     {
@@ -177,7 +177,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_addrs> msg, std::sha
     }
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_addrme> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     auto host = std::get<0>(protocol->get_addr());
 
@@ -203,12 +203,12 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_addrme> msg, std::sh
     }
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_ping> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<P2PProtocol> protocol)
 {
 
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_getaddrs> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     uint32_t count = msg->count.get();
     if (count > 100)
@@ -229,7 +229,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_getaddrs> msg, std::
     protocol->write(std::make_shared<message_addrs>(_addrs));
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     //t0
     vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
@@ -276,7 +276,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_shares> msg, std::sh
     //TODO: if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares)))
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_sharereq> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_sharereq> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
     auto shares = handle_get_shares(msg->hashes.get(), msg->parents.get(), msg->stops.get(), protocol->get_addr());
@@ -301,7 +301,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_sharereq> msg, std::
     }
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_sharereply> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_sharereply> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     std::vector<ShareType> res;
     if (msg->result.get() == ShareReplyResult::good)
@@ -324,12 +324,12 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_sharereply> msg, std
     //TODO: self.get_shares.got_response(id, res)
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_bestblock> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_bestblock> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     handle_bestblock(msg->header);
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_have_tx> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     protocol->remote_tx_hashes.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
     if (protocol->remote_tx_hashes.size() > 10000)
@@ -339,7 +339,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_have_tx> msg, std::s
     }
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_losing_tx> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     //remove all msg->txs hashes from remote_tx_hashes
     std::set<uint256> losing_txs;
@@ -353,7 +353,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_losing_tx> msg, std:
     protocol->remote_tx_hashes = diff_txs;
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_remember_tx> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     for (auto tx_hash: msg->tx_hashes.get())
     {
@@ -393,7 +393,7 @@ void P2PNode::handle(std::shared_ptr<net::messages::message_remember_tx> msg, st
 //            }
 }
 
-void P2PNode::handle(std::shared_ptr<net::messages::message_forget_tx> msg, std::shared_ptr<P2PProtocol> protocol)
+void P2PNode::handle(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<P2PProtocol> protocol)
 {
     for (auto tx_hash : msg->tx_hashes.get())
     {
