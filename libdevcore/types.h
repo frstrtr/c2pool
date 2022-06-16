@@ -293,7 +293,8 @@ namespace stream
 
         PackStream &read(PackStream &stream)
         {
-            stream >> services >> address >> port;
+            stream >> services >> address
+            >> port;
             return stream;
         }
 
