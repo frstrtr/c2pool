@@ -24,8 +24,8 @@ namespace pool::messages
     public:
         IntType(32) version;
         IntType(64) services;
-        stream::address_type_stream addr_to;
-        stream::address_type_stream addr_from;
+        ::stream::address_type_stream addr_to;
+        ::stream::address_type_stream addr_from;
         IntType(64) nonce;
         StrType sub_version;
         IntType(32) mode; //# always 1 for legacy compatibility
@@ -140,17 +140,17 @@ namespace pool::messages
     class message_addrs : public Message
     {
     public:
-        ListType<stream::addr_stream> addrs;
+        ListType<::stream::addr_stream> addrs;
 
     public:
         message_addrs() : Message("addrs") {}
 
         message_addrs(std::vector<addr> _addrs) : message_addrs()
         {
-            addrs = stream::addr_stream::make_list_type(_addrs);
+            addrs = ::stream::addr_stream::make_list_type(_addrs);
         }
 
-        message_addrs(std::vector<stream::addr_stream> _addrs) : message_addrs()
+        message_addrs(std::vector<::stream::addr_stream> _addrs) : message_addrs()
         {
             addrs = _addrs;
         }

@@ -218,9 +218,9 @@ namespace coind::data
             //TODO: Optimize
             std::vector<_hash_list_data> new_hash_list;
 
-            std::vector<_hash_list_data> evens = c2pool::math::every_nth_element(hash_list.begin(), hash_list.end(), 2);
+            std::vector<_hash_list_data> evens = math::every_nth_element(hash_list.begin(), hash_list.end(), 2);
 
-            std::vector<_hash_list_data> odds = c2pool::math::every_nth_element(hash_list.begin()+1, hash_list.end(), 2);
+            std::vector<_hash_list_data> odds = math::every_nth_element(hash_list.begin()+1, hash_list.end(), 2);
             odds.push_back(evens.back());
 
             _hash_list_data left, right;
@@ -288,9 +288,9 @@ namespace coind::data
         {
             std::vector<uint256> new_hashes;
 
-            std::vector<uint256> evens = c2pool::math::every_nth_element(hashes.begin(), hashes.end(), 2);
+            std::vector<uint256> evens = math::every_nth_element(hashes.begin(), hashes.end(), 2);
 
-            std::vector<uint256> odds = c2pool::math::every_nth_element(hashes.begin() + 1, hashes.end(), 2);
+            std::vector<uint256> odds = math::every_nth_element(hashes.begin() + 1, hashes.end(), 2);
             odds.push_back(evens.back());
 
             uint256 left, right;

@@ -1,6 +1,7 @@
 #include "math.h"
 
-namespace c2pool::math{
+namespace math
+{
     string natural_to_string(uint256 n)
     {
         auto s = n.GetHex();

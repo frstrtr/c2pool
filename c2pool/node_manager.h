@@ -7,13 +7,9 @@
 #include <boost/asio/io_context.hpp>
 
 using std::shared_ptr;
-
 class ShareTracker;
-
 class ShareStore;
-
 class P2PNode;
-
 class CoindNode;
 //TODO: class Worker;
 
