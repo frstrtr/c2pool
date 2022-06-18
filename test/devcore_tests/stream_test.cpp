@@ -69,12 +69,12 @@ TEST(Devcore_stream, list_type_uint256)
 
 TEST(Devcore_stream, type_IPV6AddressType){
     std::string ip1 = "192.168.50.31";
-    c2pool::messages::stream::IPV6AddressType pack_ip(ip1);
+    ::stream::IPV6AddressType pack_ip(ip1);
 
     PackStream stream;
     stream << pack_ip;
 
-    c2pool::messages::stream::IPV6AddressType unpack_ip;
+    ::stream::IPV6AddressType unpack_ip;
     stream >> unpack_ip;
 
     ASSERT_EQ(ip1, unpack_ip.value);
