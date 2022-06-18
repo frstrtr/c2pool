@@ -28,7 +28,7 @@ using namespace std;
 //      - format_binomial_conf
 //      - weighted_choice
 
-namespace c2pool::math
+namespace math
 {
     template <typename T>
     auto median(vector<T> values)

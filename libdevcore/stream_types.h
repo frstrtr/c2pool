@@ -555,7 +555,7 @@ struct FloatingInteger : public Getter<IntType(32)>
     //TODO: test
     static FloatingInteger from_target_upper_bound(uint256 target)
     {
-        std::string str_n = c2pool::math::natural_to_string(target);
+        std::string str_n = math::natural_to_string(target);
         list<unsigned char> n;
         n.insert(n.end(), str_n.begin(), str_n.end());
 

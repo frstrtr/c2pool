@@ -125,10 +125,10 @@ namespace shares
                 arith_uint256 _max_target_div10 = UintToArith256(previous_share->max_target)/10;
                 arith_uint256 _min_clip = _max_target_div10*9;
                 arith_uint256 _max_clip = _max_target_div10*11;
-                pre_target2 = c2pool::math::clip(pre_target, _min_clip, _max_clip);
+                pre_target2 = math::clip(pre_target, _min_clip, _max_clip);
             }
 
-            _pre_target3 = c2pool::math::clip(pre_target2, UintToArith256(net->MIN_TARGET), UintToArith256(net->MAX_TARGET));
+            _pre_target3 = math::clip(pre_target2, UintToArith256(net->MIN_TARGET), UintToArith256(net->MAX_TARGET));
 		}
         uint256 pre_target3 = ArithToUint256(_pre_target3);
 
@@ -138,7 +138,7 @@ namespace shares
             arith_uint256 __desired_target = UintToArith256(_desired_target);
             arith_uint256 _pre_target3_div30 = _pre_target3/30;
             bits = FloatingInteger::from_target_upper_bound(
-                    ArithToUint256(c2pool::math::clip(__desired_target, _pre_target3_div30, _pre_target3))
+                    ArithToUint256(math::clip(__desired_target, _pre_target3_div30, _pre_target3))
             );
         }
 

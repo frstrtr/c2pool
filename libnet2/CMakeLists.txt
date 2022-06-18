@@ -6,6 +6,7 @@ set(libnet2_sources
         pool_protocol_data.h
         pool_messages.h pool_messages.cpp
 
+        worker.h worker.cpp
         coind_node.h coind_node.cpp
         )
 

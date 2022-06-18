@@ -95,7 +95,7 @@ public:
     void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 };
 
-class P2PNodeServer : virtual PoolNodeData
+class PoolNodeServer : virtual PoolNodeData
 {
 protected:
 	std::shared_ptr<Listener> listener; // from P2PNode::run()
@@ -105,13 +105,13 @@ protected:
 private:
     std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
 public:
-	P2PNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(version_handle) {}
+	PoolNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(version_handle) {}
 
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
 		server_attempts[socket] = std::make_shared<PoolHandshakeServer>(std::move(socket),
                                                                         message_version_handle,
-                                                                        std::bind(&P2PNodeServer::handshake_handle, this, std::placeholders::_1));
+                                                                        std::bind(&PoolNodeServer::handshake_handle, this, std::placeholders::_1));
 	}
 
     void handshake_handle(std::shared_ptr<PoolHandshake> _handshake)
@@ -126,11 +126,11 @@ public:
 
 	void listen()
 	{
-		(*listener)(std::bind(&P2PNodeServer::socket_handle, this, std::placeholders::_1), std::bind(&P2PNodeServer::listen, this));
+		(*listener)(std::bind(&PoolNodeServer::socket_handle, this, std::placeholders::_1), std::bind(&PoolNodeServer::listen, this));
 	}
 };
 
-class P2PNodeClient : virtual PoolNodeData
+class PoolNodeClient : virtual PoolNodeData
 {
 protected:
 	std::shared_ptr<Connector> connector; // from P2PNode::run()
@@ -143,14 +143,14 @@ private:
 
     std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
 public:
-	P2PNodeClient(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
+	PoolNodeClient(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
         client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<PoolHandshakeClient>(std::move(socket),
                                                                                                  message_version_handle,
                                                                                                  std::bind(
-                                                                                                        &P2PNodeClient::handshake_handle,
+                                                                                                        &PoolNodeClient::handshake_handle,
                                                                                                         this,
                                                                                                         std::placeholders::_1));
     }
@@ -192,7 +192,7 @@ public:
 											  auto [ip, port] = addr;
 											  LOG_TRACE << "try to connect: " << ip << ":" << port;
 
-											  (*connector)(std::bind(&P2PNodeClient::socket_handle, this, std::placeholders::_1), addr);
+											  (*connector)(std::bind(&PoolNodeClient::socket_handle, this, std::placeholders::_1), addr);
 										  }
 										  auto_connect();
 									  });
@@ -201,15 +201,15 @@ public:
 	std::vector<addr_type> get_good_peers(int max_count);
 };
 
-class P2PNode : public virtual PoolNodeData, P2PNodeServer, P2PNodeClient
+class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient
 {
 private:
     uint64_t nonce; // node_id
 public:
-	P2PNode(std::shared_ptr<io::io_context> _context)
+	PoolNode(std::shared_ptr<io::io_context> _context)
 			: PoolNodeData(std::move(_context)),
-              P2PNodeServer(context, std::bind(&P2PNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2)),
-              P2PNodeClient(context, std::bind(&P2PNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2))
+              PoolNodeServer(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2)),
+              PoolNodeClient(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2))
 	{
 
 	}
