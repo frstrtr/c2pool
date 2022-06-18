@@ -54,7 +54,7 @@ public:
     }
 };
 
-class PoolHandshake : public ::testing::Test
+class TestPoolHandshake : public ::testing::Test
 {
 protected:
     std::shared_ptr<VirtualSocket> socket;
@@ -71,7 +71,7 @@ protected:
 };
 
 
-TEST_F(PoolHandshake, handshake_client_virtual_socket)
+TEST_F(TestPoolHandshake, handshake_client_virtual_socket)
 {
     std::shared_ptr<PoolHandshakeClient> handshake = std::make_shared<PoolHandshakeClient>(
             socket,
