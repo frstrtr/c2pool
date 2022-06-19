@@ -4,6 +4,7 @@
 #include <string>
 #include <tuple>
 #include <memory>
+#include <set>
 
 #include "btclibs/uint256.h"
 #include <libdevcore/stream.h>
@@ -30,6 +31,7 @@ namespace c2pool
     public:
         std::shared_ptr<coind::ParentNetwork> parent;
     public:
+		std::set<std::string> SOFTFORKS_REQUIRED;
         //std::tuple<std::string, std::string> = addr
         std::vector<std::tuple<std::string, std::string>> BOOTSTRAP_ADDRS; //217.72.6.241
         int PREFIX_LENGTH;

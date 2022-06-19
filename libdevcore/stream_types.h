@@ -121,14 +121,13 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 
     PackStream &write(PackStream &stream) const
     {
-        ListType<unsigned char> list_s(value);
+//        ListType<unsigned char> list_s(value);
+//        std::cout << "list_s.l: ";
+//        for (auto v : list_s.value){
+//            std::cout << (unsigned int) v << " ";
+//        }
+//        std::cout << std::endl;
 
-        //TODO: remove trace lines
-        std::cout << "list_s.l: ";
-        for (auto v : list_s.value){
-            std::cout << (unsigned int) v << " ";
-        }
-        std::cout << std::endl;
         auto _len = value.size();
         stream << _len << PackStream(value);
         return stream;

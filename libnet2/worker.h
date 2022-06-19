@@ -11,11 +11,8 @@
 
 using std::shared_ptr;
 
-
 class CoindNode;
-
 class PoolNode;
-
 
 namespace coind
 {
@@ -29,7 +26,7 @@ public:
     uint64_t version;
     uint256 previous_block;
     int32_t bits;
-    std::string coinfbaseflags;
+    std::string coinbaseflags;
     int32_t height;
     int32_t timestamp;
     vector<coind::data::tx_type> transactions;

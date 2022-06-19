@@ -11,6 +11,7 @@ namespace c2pool
 {
     DigibyteNetwork::DigibyteNetwork(std::shared_ptr<coind::ParentNetwork> _parent) : Network("DGB", _parent)
     {
+		SOFTFORKS_REQUIRED = {"nversionbips", "csv", "segwit", "reservealgo", "odo"};
         BOOTSTRAP_ADDRS = {
             //CREATE_ADDR("217.72.4.157", "5024")
 //            CREATE_ADDR("217.72.6.241", "5024")
