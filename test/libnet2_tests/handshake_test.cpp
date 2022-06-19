@@ -30,7 +30,7 @@ public:
 
 
         PackStream stream_msg;
-        stream_msg << msg;
+        stream_msg << *msg;
 
         shared_ptr<RawMessage> raw_msg = std::make_shared<RawMessage>(msg->command);
         stream_msg >> *raw_msg;
