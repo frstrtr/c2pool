@@ -142,7 +142,7 @@ namespace shares::types
     {
     public:
         uint256 previous_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
-        std::string coinbase;
+		std::vector<unsigned char> coinbase;
         uint32_t nonce;         //pack.IntType(32)
         uint160 pubkey_hash;        //pack.IntType(160)
         uint64_t subsidy; //pack.IntType(64)
@@ -155,7 +155,7 @@ namespace shares::types
 			previous_share_hash.SetHex("0");
 		}
 
-		ShareData(uint256 _prev_share_hash, std::string _coinbase, uint32_t _nonce, uint160 _pubkey_hash,
+		ShareData(uint256 _prev_share_hash, std::vector<unsigned char> _coinbase, uint32_t _nonce, uint160 _pubkey_hash,
 					unsigned long long _subsidy, unsigned short _donation, StaleInfo _stale_info, unsigned long long _desired_version)
 		{
 			previous_share_hash = _prev_share_hash;

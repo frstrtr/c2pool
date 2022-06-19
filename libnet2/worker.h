@@ -26,7 +26,7 @@ public:
     uint64_t version;
     uint256 previous_block;
     int32_t bits;
-    std::string coinbaseflags;
+    std::vector<unsigned char> coinbaseflags;
     int32_t height;
     int32_t timestamp;
     vector<coind::data::tx_type> transactions;

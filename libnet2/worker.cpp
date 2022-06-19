@@ -10,6 +10,7 @@
 #include "pool_node.h"
 #include "coind_node.h"
 #include <btclibs/uint256.h>
+#include <btclibs/script/script.h>
 #include <libdevcore/random.h>
 #include <sharechains/data.h>
 #include <sharechains/prefsum_doa.h>
@@ -246,7 +247,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	{
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
 		desired_share_target = coind::data::difficulty_to_target(uint256::ONE);
-		auto local_hash_rate = UintToArith256(local_addr_rates[pubkey_hash]); //TODO: test local_addr_rates.get(pubkey_hash, 0)
+		auto local_hash_rate = UintToArith256(local_addr_rates[pubkey_hash]);
 		if (local_hash_rate > 0)
 		{
 			// limit to 1.67% of pool shares by modulating share difficulty
@@ -294,9 +295,26 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     }
     // ShareData
     {
-        std::string coinbase; //TODO: init
-        uint16_t donation = 65535 * donation_percentage / 100; //TODO: check
-        StaleInfo stale_info; //TODO: init
+        std::vector<unsigned char> coinbase;
+		{
+			CScript _coinbase;
+			_coinbase << current_work.value().height;
+			// _coinbase << mm_data // TODO: FOR MERGED MINING
+			_coinbase << current_work.value().coinbaseflags;
+			coinbase = ToByteVector(_coinbase);
+			coinbase.resize(100);
+		}
+        uint16_t donation = 65535 * donation_percentage / 100; //TODO: test for "math.perfect_round"
+        StaleInfo stale_info;
+		{
+			auto v = get_stale_counts();
+			if (std::get<0>(v.orph_doa) > std::get<0>(v.recorded_in_chain))
+				stale_info = orphan;
+			else if (std::get<1>(v.orph_doa) > std::get<1>(v.recorded_in_chain))
+				stale_info = doa;
+			else
+				stale_info = unk;
+		}
 
         types::ShareData _share_data(
                 _pool_node->best_share.value(),
