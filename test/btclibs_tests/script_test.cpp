@@ -48,3 +48,25 @@ TEST(script, runtime_errors)
     ASSERT_THROW(ParseScript("11111111111"), std::runtime_error);
     ASSERT_THROW(ParseScript("OP_CHECKSIGADD"), std::runtime_error);
 }
+
+TEST(script, create_push_script)
+{
+	CScript script;
+	script << 123;
+
+	std::vector<unsigned char> coinbaseflag = ParseHex("062f503253482f");
+	for (auto v : coinbaseflag)
+	{
+		std::cout << (unsigned int) v << " ";
+	}
+	std::cout << std::endl;
+
+	script << coinbaseflag;
+
+	auto res = ToByteVector(script);
+	for (auto v : res)
+	{
+		std::cout << (unsigned int) v << " ";
+	}
+	std::cout << std::endl;
+}
