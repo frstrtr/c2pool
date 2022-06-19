@@ -240,49 +240,34 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     }
 
     //5
-//TODO:
-//		local_addr_rates = self.get_local_addr_rates()
-//
-//		if desired_share_target is None:
-//			desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
-//			local_hash_rate = local_addr_rates.get(pubkey_hash, 0)
-//			if local_hash_rate > 0.0:
-//			desired_share_target = min(desired_share_target,
-//									   bitcoin_data.average_attempts_to_target(local_hash_rate * self.node.net.SHARE_PERIOD / 0.0167)) # limit to 1.67% of pool shares by modulating share difficulty
-//
-//			lookbehind = 3600//self.node.net.SHARE_PERIOD
-//			block_subsidy = self.node.bitcoind_work.value['subsidy']
-//			if previous_share is not None and self.node.tracker.get_height(previous_share.hash) > lookbehind:
-//			expected_payout_per_block = local_addr_rates.get(pubkey_hash, 0)/p2pool_data.get_pool_attempts_per_second(self.node.tracker, self.node.best_share_var.value, lookbehind) \
-//      	              * block_subsidy*(1-self.donation_percentage/100) # XXX doesn't use global stale rate to compute pool hash
-//			if expected_payout_per_block < self.node.net.PARENT.DUST_THRESHOLD:
-//			desired_share_target = min(desired_share_target,
-//									   bitcoin_data.average_attempts_to_target((bitcoin_data.target_to_average_attempts(self.node.bitcoind_work.value['bits'].target)*self.node.net.SPREAD)*self.node.net.PARENT.DUST_THRESHOLD/block_subsidy)
-//			)
+	auto local_addr_rates = get_local_addr_rates();
 
-    int64_t block_subsidy = 0;
-    if (desired_share_target.IsNull())
-    {
-        arith_uint256 diff;
-        diff.SetHex("1");
-        desired_share_target = coind::data::difficulty_to_target(
-                ArithToUint256(diff / _net->parent->DUMB_SCRYPT_DIFF));
-
-        //TODO: local_hash_rate
-
-        auto lookbehind = 3600 / _net->SHARE_PERIOD;
-        block_subsidy = _coind_node->coind_work.value().subsidy;
-        if (!prev_share && _tracker->get_height(prev_share->hash) > lookbehind)
-        {
-            //TODO:
-//                expected_payout_per_block = local_addr_rates.get(pubkey_hash, 0)/p2pool_data.get_pool_attempts_per_second(self.node.tracker, self.node.best_share_var.value, lookbehind) \
-//                    * block_subsidy*(1-self.donation_percentage/100) # XXX doesn't use global stale rate to compute pool hash
-//                if expected_payout_per_block < self.node.net.PARENT.DUST_THRESHOLD:
-//                desired_share_target = min(desired_share_target,
-//                                           bitcoin_data.average_attempts_to_target((bitcoin_data.target_to_average_attempts(self.node.bitcoind_work.value['bits'].target)*self.node.net.SPREAD)*self.node.net.PARENT.DUST_THRESHOLD/block_subsidy)
-//                )
-        }
-    }
+	if (desired_share_target.IsNull())
+	{
+//		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
+		desired_share_target = coind::data::difficulty_to_target(uint256::ONE);
+		auto local_hash_rate = UintToArith256(local_addr_rates[pubkey_hash]); //TODO: test local_addr_rates.get(pubkey_hash, 0)
+		if (local_hash_rate > 0)
+		{
+			// limit to 1.67% of pool shares by modulating share difficulty
+			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
+					ArithToUint256(local_hash_rate * _net->SHARE_PERIOD / 0.0167)));
+		}
+		auto lookbehind = 3600 / _net->SHARE_PERIOD;
+		auto block_subsidy = _coind_node->coind_work.value().subsidy;
+		if (prev_share != nullptr && _tracker->get_height(prev_share->hash) > lookbehind)
+		{
+			//TODO (from p2pool): doesn't use global stale rate to compute pool hash
+			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind) * block_subsidy * (1 - donation_percentage/100);
+			if (expected_payout_per_block < _net->parent->DUST_THRESHOLD)
+			{
+				auto temp1 = UintToArith256(coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target())) * _net->SPREAD;
+				auto temp2 = temp1 * _net->parent->DUST_THRESHOLD / block_subsidy;
+				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
+						ArithToUint256(temp2)));
+			}
+		}
+	}
 
     //6
     shares::GenerateShareTransaction generate_transaction(_tracker);
