@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <tuple>
+#include <algorithm>
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
 #include <boost/tokenizer.hpp>
@@ -17,7 +18,6 @@
 
 using std::vector;
 
-
 Work Work::from_jsonrpc_data(coind::getwork_result data)
 {
     static Work result{};
@@ -25,7 +25,7 @@ Work Work::from_jsonrpc_data(coind::getwork_result data)
     result.version = data.version;
     result.previous_block = data.previous_block;
     result.bits = data.bits.get();
-    result.coinfbaseflags = std::string((char *) data.coinbaseflags.bytes());
+    result.coinbaseflags = std::string((char *) data.coinbaseflags.bytes());
     result.height = data.height;
     result.timestamp = data.time;
     result.transactions = data.transactions;
@@ -47,47 +47,8 @@ Work Work::from_jsonrpc_data(coind::getwork_result data)
 
 bool Work::operator==(const Work &value)
 {
-    if (version != value.version)
-    {
-        return false;
-    }
-    if (previous_block != value.previous_block)
-    {
-        return false;
-    }
-    if (bits != value.bits)
-    {
-        return false;
-    }
-    if (coinfbaseflags != value.coinfbaseflags)
-    {
-        return false;
-    }
-    if (height != value.height)
-    {
-        return false;
-    }
-    if (timestamp != value.timestamp)
-    {
-        return false;
-    }
-    if (transactions != value.transactions)
-    {
-        return false;
-    }
-    if (transaction_fees != value.transaction_fees)
-    {
-        return false;
-    }
-    if (merkle_link != value.merkle_link)
-    {
-        return false;
-    }
-    if (subsidy != value.subsidy)
-    {
-        return false;
-    }
-    return true;
+	return  std::tie(version, previous_block, bits, coinbaseflags, height, timestamp, transactions, transaction_fees, merkle_link, subsidy) !=
+			std::tie(value.version, value.previous_block, value.bits, value.coinbaseflags, value.height, value.timestamp, value.transactions, value.transaction_fees, value.merkle_link, value.subsidy);
 }
 
 bool Work::operator!=(const Work &value)
@@ -213,11 +174,26 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         throw std::runtime_error("c2pool is downloading shares"); //TODO: to jsonrpc_error
     }
 
-    // TODO: Check softforks
-//		unknown_rules = set(r[1:] if r.startswith('!') else r for r in self.node.bitcoind_work.value['rules']) - set(getattr(self.node.net, 'SOFTFORKS_REQUIRED', []))
-//		if unknown_rules:
-//			print "Unknown softforks found: ", unknown_rules
-//		raise jsonrpc.Error_for_code(-12345)(u'unknown rule activated')
+	// Check softforks
+	std::set<std::string> unknown_rules;
+	{
+		std::set<std::string> coind_rules;
+		for (auto rule: _coind_node->coind_work.value().rules)
+		{
+			if (rule.rfind("!", 0) == 0)
+			{
+				rule.erase(0, 1);
+				coind_rules.insert(rule);
+			}
+		}
+		std::set_intersection(coind_rules.begin(), coind_rules.end(), _net->SOFTFORKS_REQUIRED.begin(),
+							  _net->SOFTFORKS_REQUIRED.end(), std::inserter(unknown_rules, unknown_rules.begin()));
+	}
+	if (!unknown_rules.empty())
+	{
+		//TODO: LOG unknown softforks found -> <list unknown_rules>
+		//TODO: raise jsonrpc.Error_for_code(-12345)(u'unknown rule activated')
+	}
 
     //2
     //TODO: check for merged mining
