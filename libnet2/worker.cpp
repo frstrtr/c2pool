@@ -440,8 +440,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             std::max(current_work.value().version, (uint64_t) 0x20000000),
             current_work.value().previous_block,
             merkle_link,
-            std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - COINBASE_NONCE_LENGTH - 4),//TODO: init: packed_gentx[:-self.COINBASE_NONCE_LENGTH-4],
-			std::vector<unsigned char>(packed_gentx.data.end()-4, packed_gentx.data.end()),//TODO: init: packed_gentx[-4:]
+            std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - COINBASE_NONCE_LENGTH - 4),
+			std::vector<unsigned char>(packed_gentx.data.end()-4, packed_gentx.data.end()),
             current_work.value().timestamp,
             current_work.value().bits,
             target
