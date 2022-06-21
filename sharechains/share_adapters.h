@@ -63,7 +63,7 @@ struct ShareData :
 
     void _to_value() override
     {
-		make_value(_stream->previous_share_hash.get(), _stream->coinbase.get(),
+		make_value(_stream->previous_share_hash.get(), _stream->coinbase.value,
 				   _stream->nonce.get(), _stream->pubkey_hash.get(), _stream->subsidy.get(),
 				   _stream->donation.get(), _stream->stale_info.get(), _stream->desired_version.get());
     }

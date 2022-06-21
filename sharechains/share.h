@@ -51,7 +51,7 @@ public:
     ///Reference to objs
 	//============share_data=============
 	std::unique_ptr<uint256> previous_hash;
-    std::unique_ptr<string> coinbase;
+    std::unique_ptr<std::vector<unsigned char>> coinbase;
     std::unique_ptr<uint32_t> nonce;
     std::unique_ptr<uint160> pubkey_hash;
     std::unique_ptr<uint64_t> subsidy;
