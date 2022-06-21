@@ -5,9 +5,11 @@ set(libnet2_sources
         pool_handshake.cpp pool_handshake.h
         pool_protocol_data.h
         pool_messages.h pool_messages.cpp
+        pool_node_data.h pool_node_data.cpp
 
         worker.h worker.cpp
         coind_node.h coind_node.cpp
+        coind_node_data.h coind_node_data.cpp
         )
 
 add_library(libnet2 ${libnet2_sources})
