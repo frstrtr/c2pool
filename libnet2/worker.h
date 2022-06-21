@@ -47,8 +47,8 @@ struct NotifyData
     uint64_t version;
     uint256 previous_block;
     coind::data::MerkleLink merkle_link;
-    std::string coinb1;
-    std::string coinb2;
+    std::vector<unsigned char> coinb1;
+	std::vector<unsigned char> coinb2;
     int32_t timestamp;
     int32_t bits;
     uint256 share_target;
@@ -97,6 +97,7 @@ struct user_details
 
 class Worker
 {
+	const int32_t COINBASE_NONCE_LENGTH = 8;
 public:
     Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNode> pool_node,
            std::shared_ptr<CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker);

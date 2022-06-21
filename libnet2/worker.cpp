@@ -243,6 +243,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     //5
 	auto local_addr_rates = get_local_addr_rates();
 
+	int64_t block_subsidy;
 	if (desired_share_target.IsNull())
 	{
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
@@ -255,7 +256,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 					ArithToUint256(local_hash_rate * _net->SHARE_PERIOD / 0.0167)));
 		}
 		auto lookbehind = 3600 / _net->SHARE_PERIOD;
-		auto block_subsidy = _coind_node->coind_work.value().subsidy;
+		block_subsidy = _coind_node->coind_work.value().subsidy;
 		if (prev_share != nullptr && _tracker->get_height(prev_share->hash) > lookbehind)
 		{
 			//TODO (from p2pool): doesn't use global stale rate to compute pool hash
@@ -354,12 +355,13 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     {
 //		target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
 		target = coind::data::difficulty_to_target(uint256::ONE);
-		auto local_hash_rate = _esti
-
-        //TODO: local_hash_rate = self._estimate_local_hash_rate()
-        //if local_hash_rate is not None:
-        //target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1) # target 10 share responses every second by modulating pseudoshare difficulty
-        //else
+		auto local_hash_rate = _estimate_local_hash_rate();
+		if (!local_hash_rate.IsNull())
+		{
+			//in p2pool: target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1)
+			// target 10 share responses every second by modulating pseudoshare difficulty
+			target = coind::data::average_attempts_to_target(local_hash_rate);
+		} else
         {
             //# If we don't yet have an estimated node hashrate, then we still need to not undershoot the difficulty.
             //# Otherwise, we might get 1 PH/s of hashrate on difficulty settings appropriate for 1 GH/s.
@@ -438,8 +440,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             std::max(current_work.value().version, (uint64_t) 0x20000000),
             current_work.value().previous_block,
             merkle_link,
-            std::string(),//TODO: init: packed_gentx[:-self.COINBASE_NONCE_LENGTH-4],
-            std::string(),//TODO: init: packed_gentx[-4:]
+            std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - COINBASE_NONCE_LENGTH - 4),//TODO: init: packed_gentx[:-self.COINBASE_NONCE_LENGTH-4],
+			std::vector<unsigned char>(packed_gentx.data.end()-4, packed_gentx.data.end()),//TODO: init: packed_gentx[-4:]
             current_work.value().timestamp,
             current_work.value().bits,
             target
