@@ -350,11 +350,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     //8
     //TODO: part for merged mining
     uint256 target;
-    target.SetHex("1");
     if (desired_pseudoshare_target.IsNull())
     {
-        target = coind::data::difficulty_to_target(
-                target); //TODO: float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF)
+//		target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
+		target = coind::data::difficulty_to_target(uint256::ONE);
+		auto local_hash_rate = _esti
 
         //TODO: local_hash_rate = self._estimate_local_hash_rate()
         //if local_hash_rate is not None:
