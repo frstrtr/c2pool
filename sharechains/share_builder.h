@@ -46,7 +46,7 @@ protected:
         share->share_data = value;
 
         share->previous_hash = std::unique_ptr<uint256>(&(*value)->previous_share_hash);
-        share->coinbase = std::unique_ptr<std::string>(&(*value)->coinbase);
+        share->coinbase = std::unique_ptr<std::vector<unsigned char>>(&(*value)->coinbase);
         share->nonce = std::unique_ptr<uint32_t>(&(*value)->nonce);
         share->pubkey_hash = std::unique_ptr<uint160>(&(*value)->pubkey_hash);
         share->subsidy = std::unique_ptr<uint64_t>(&(*value)->subsidy);

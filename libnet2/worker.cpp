@@ -26,7 +26,7 @@ Work Work::from_jsonrpc_data(coind::getwork_result data)
     result.version = data.version;
     result.previous_block = data.previous_block;
     result.bits = data.bits.get();
-    result.coinbaseflags = std::string((char *) data.coinbaseflags.bytes());
+    result.coinbaseflags = data.coinbaseflags.data;
     result.height = data.height;
     result.timestamp = data.time;
     result.transactions = data.transactions;
@@ -816,7 +816,7 @@ void Worker::compute_work()
                     bb->version,
                     coind::data::hash256(packed_block_header),
                     bb->bits,
-                    "",
+					{},
                     t.height + 1,
                     (int32_t) std::max((uint32_t) c2pool::dev::timestamp(), bb->timestamp + 1),
                     {},
