@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "pool_node_data.h"
 #include <libcoind/height_tracker.h>
 #include <libcoind/p2p/coind_protocol.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
@@ -18,6 +19,7 @@ public:
 	std::shared_ptr<coind::ParentNetwork> parent_net;
 	std::shared_ptr<ShareTracker> tracker;
 	std::shared_ptr<coind::JSONRPC_Coind> coind;
+	std::shared_ptr<PoolNodeData> pool_node;
 //TODO:    shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
 	HandlerManagerPtr<CoindProtocol> handler_manager;
 public:
@@ -65,6 +67,12 @@ public:
 	auto &set_tracker(std::shared_ptr<ShareTracker> _tracker)
 	{
 		tracker = std::move(_tracker);
+		return *this;
+	}
+
+	auto &set_pool_node(std::shared_ptr<PoolNodeData> _pool_node)
+	{
+		pool_node = std::move(_pool_node);
 		return *this;
 	}
 public:
