@@ -35,4 +35,9 @@ public:
 		socket->disconnect();
 	}
 
+	void bad_peer_happened()
+	{
+		// TODO:
+	}
+
 };

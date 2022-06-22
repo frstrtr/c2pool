@@ -25,37 +25,20 @@ void CoindNodeData::set_best_share()
 	best_share = _best;
 	desired = _desired;
 
-	//TODO: p2p_node connect
-//    if (p2p_node)
-//    {
-//        for (auto bad_addr : _bad_peer_addresses)
-//        {
-//            //TODO: O(n) -- wanna for optimize
-//            for (auto peer : p2p_node->get_peers())
-//            {
-//                if (peer.second->get_addr())
-//                {
-//
-//                }
-//            }
-//        }
-//    }
-
-	//TODO: Проверка подключения на p2p_node.
-	// if (_node_manager->p2pNode() != nullptr)
-	// {
-	//     for (auto bad_peer_address : bad_peer_addresses)
-	//     {
-	//         for (auto peer : _node_manager->p2pNode()->peers)
-	//         {
-	//             if (peer.addr == bad_peer_address)
-	//             {
-	//                 peer.badPeerHappened();
-	//                 break;
-	//             }
-	//         }
-	//     }
-	// }
+	if (pool_node)
+	{
+		for (auto bad_peer_address : _bad_peer_addresses)
+		{
+			for (auto peer : pool_node->peers)
+			{
+				if (peer.second->get_addr() == bad_peer_address)
+				{
+					peer.second->bad_peer_happened();
+					break;
+				}
+			}
+		}
+	}
 }
 
 void CoindNodeData::clean_tracker()
