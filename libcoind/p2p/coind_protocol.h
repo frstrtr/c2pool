@@ -15,7 +15,7 @@ class CoindProtocol : public Protocol<CoindProtocol>, public CoindProtocolData, 
 {
 public:
     std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
-    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockHeaderType, uint256>> get_block_header;
+    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> get_block_header;
 
     CoindProtocol(std::shared_ptr<boost::asio::io_context> _context, std::shared_ptr<Socket> _socket,
                   HandlerManagerPtr<CoindProtocol> _handler_manager) : Protocol<CoindProtocol>(std::move(_socket), std::move(handler_manager)),
