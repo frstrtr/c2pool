@@ -27,16 +27,21 @@ protected:
 public:
     CoindNodeClient(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)){}
 
-    //TODO:
-//    void socket_handle(std::shared_ptr<Socket> socket)
-//    {
+	void connect(std::tuple<std::string, std::string> addr)
+	{
+		(*connector)(std::bind(&CoindNodeClient::socket_handle, this, std::placeholders::_1), addr);
+	}
+
+protected:
+    void socket_handle(std::shared_ptr<Socket> socket)
+    {
 //        client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<P2PHandshakeClient>(std::move(socket),
 //                                                                                                message_version_handle,
 //                                                                                                std::bind(
 //                                                                                                        &P2PNodeClient::handshake_handle,
 //                                                                                                        this,
 //                                                                                                        std::placeholders::_1));
-//    }
+    }
 //
 //    void handshake_handle(std::shared_ptr<P2PHandshake> _handshake)
 //    {
@@ -78,6 +83,8 @@ public:
     void handle(std::shared_ptr<coind::messages::message_headers> msg, std::shared_ptr<CoindProtocol> protocol);
 private:
     boost::asio::deadline_timer work_poller_t;
+
+	void start();
     void work_poller();
     void poll_header();
 
