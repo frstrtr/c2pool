@@ -142,9 +142,9 @@ public:
 	template <typename ListenerType, typename ConnectorType>
 	void run()
 	{
-		listener = std::make_shared<ListenerType>();
+		listener = std::make_shared<ListenerType>(context, net);
         listen();
-		connector = std::make_shared<ConnectorType>();
+		connector = std::make_shared<ConnectorType>(context, net);
         auto_connect();
 	}
 

@@ -39,16 +39,10 @@ public:
 		handler_manager = std::make_shared<HandlerManager<PoolProtocol>>();
 	}
 
-	auto &set_context(std::shared_ptr<io::io_context> _context)
-	{
-		context = std::move(_context);
-		return *this;
-	}
-
-	auto &set_net(std::shared_ptr<c2pool::Network> _net)
+	auto set_net(std::shared_ptr<c2pool::Network> _net)
 	{
 		net = std::move(_net);
-		return *this;
+		return this;
 	}
 
 	auto &set_config(std::shared_ptr<c2pool::dev::coind_config> _config)
