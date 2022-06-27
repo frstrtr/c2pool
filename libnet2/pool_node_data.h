@@ -45,22 +45,22 @@ public:
 		return this;
 	}
 
-	auto &set_config(std::shared_ptr<c2pool::dev::coind_config> _config)
+	auto set_config(std::shared_ptr<c2pool::dev::coind_config> _config)
 	{
 		config = std::move(_config);
-		return *this;
+		return this;
 	}
 
-	auto &set_addr_store(std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
+	auto set_addr_store(std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
 	{
 		addr_store = std::move(_addr_store);
-		return *this;
+		return this;
 	}
 
-	auto &set_tracker(std::shared_ptr<ShareTracker> _tracker)
+	auto set_tracker(std::shared_ptr<ShareTracker> _tracker)
 	{
 		tracker = std::move(_tracker);
-		return *this;
+		return this;
 	}
 
 public:

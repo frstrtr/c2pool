@@ -3,6 +3,7 @@
 #include <memory>
 #include <set>
 #include <map>
+#include <utility>
 #include <vector>
 #include <tuple>
 #include <functional>
@@ -30,7 +31,7 @@ protected:
 private:
     std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
 public:
-	PoolNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(version_handle) {}
+	PoolNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)) {}
 
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
@@ -142,7 +143,7 @@ public:
 	template <typename ListenerType, typename ConnectorType>
 	void run()
 	{
-		listener = std::make_shared<ListenerType>(context, net);
+		listener = std::make_shared<ListenerType>(context, net, config->listenPort);
         listen();
 		connector = std::make_shared<ConnectorType>(context, net);
         auto_connect();

@@ -23,9 +23,14 @@ private:
 
 	ip::tcp::acceptor acceptor;
 public:
-	P2PListener(auto _context, auto _net) : context(std::move(_context)), net(std::move(_net)), acceptor(*context)
+	P2PListener(auto _context, auto _net, auto port) : context(std::move(_context)), net(std::move(_net)), acceptor(*context)
 	{
+		ip::tcp::endpoint listen_ep(ip::tcp::v4(), port);
 
+		acceptor.open(listen_ep.protocol());
+		acceptor.set_option(io::socket_base::reuse_address(true));
+		acceptor.bind(listen_ep);
+		acceptor.listen();
 	}
 
 	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle, std::function<void()> finish) override
@@ -36,12 +41,13 @@ public:
 								  {
 									  auto socket = std::make_shared<SocketType>(std::move(_socket), net);
 									  handle(std::move(socket));
+									  finish();
 								  }
 								  else
 								  {
 									  LOG_ERROR << "P2P Listener: " << ec.message();
 								  }
-								  finish();
+//								  finish(); TODO
 							  });
 	}
 
@@ -78,8 +84,9 @@ public:
 								   );
 
 								   boost::asio::async_connect(_socket, endpoints,
-															  [&, handler = _handler](const boost::system::error_code &ec,
-																  boost::asio::ip::tcp::endpoint ep)
+															  [&, handler = _handler](
+																	  const boost::system::error_code &ec,
+																	  boost::asio::ip::tcp::endpoint ep)
 															  {
 																  LOG_INFO << "Connect to " << ep.address() << ":"
 																		   << ep.port();
