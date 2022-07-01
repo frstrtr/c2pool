@@ -32,5 +32,12 @@ int main()
 		->set_config(config)
 		->set_addr_store(addr_store);
 	node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
+
+	// DEBUG
+	boost::asio::steady_timer t(*context, 10s);
+	t.async_wait([](const boost::system::error_code &ec) {
+		LOG_DEBUG << "DEBUG TIMER";
+	});
+
 	context->run();
 }

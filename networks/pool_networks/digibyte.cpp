@@ -15,11 +15,13 @@ namespace c2pool
         BOOTSTRAP_ADDRS = {
             //CREATE_ADDR("217.72.4.157", "5024")
 //            CREATE_ADDR("217.72.6.241", "5024")
-            //CREATE_ADDR("p2p-spb.xyz", "5025")
-            //CREATE_ADDR("217.42.4.157", "5025")
+//            CREATE_ADDR("p2p-spb.xyz", "5025")
+//            CREATE_ADDR("217.42.4.157", "5025")
             //"217.42.4.157:5025"
             //CREATE_ADDR("192.168.10.10", "5024")
                 CREATE_ADDR("217.72.4.157", "5024")
+//				CREATE_ADDR("80.65.23.139", "5026")
+//				CREATE_ADDR("5.188.104.245", "5025")
         };
         PREFIX_LENGTH = 8;
         PREFIX = new unsigned char[PREFIX_LENGTH]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};

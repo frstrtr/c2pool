@@ -12,19 +12,23 @@
 class PoolSocket : public Socket
 {
 private:
-	boost::asio::ip::tcp::socket socket;
+	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 
 	std::shared_ptr<c2pool::Network> net;
 public:
 
 	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
-
+		LOG_INFO << "socket created";
 	}
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
+		LOG_INFO << "socket created";
+	}
 
+	~PoolSocket(){
+		std::cout << "socket removed" << std::endl;
 	}
 
 	// Write
@@ -52,19 +56,19 @@ public:
 
 	bool isConnected() override
 	{
-		return socket.is_open();
+		return socket->is_open();
 	}
 
 	void disconnect() override
 	{
 		// TODO: call event disconnect
-		socket.close();
+		socket->close();
 	}
 
 	tuple<std::string, std::string> get_addr() override
 	{
 		boost::system::error_code ec;
-		auto ep = socket.remote_endpoint(ec);
+		auto ep = socket->remote_endpoint(ec);
 		// TODO: log ec;
 		return {ep.address().to_string(), std::to_string(ep.port())};
 	}
