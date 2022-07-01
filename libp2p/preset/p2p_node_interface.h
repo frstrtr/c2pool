@@ -39,8 +39,10 @@ public:
 							  {
 								  if (!ec)
 								  {
-									  auto socket = std::make_shared<SocketType>(std::move(_socket), net);
+									  auto boost_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
+									  auto socket = std::make_shared<SocketType>(std::move(boost_socket), net);
 									  handle(std::move(socket));
+									  socket->read();
 									  finish();
 								  }
 								  else
@@ -65,34 +67,39 @@ private:
 public:
 	P2PConnector(auto _context, auto _net) : context(std::move(_context)), net(std::move(_net)), resolver(*context)
 	{
-
 	}
 
 	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
 					std::tuple<std::string, std::string> _addr) override
 	{
 		auto [ip, port] = _addr;
-
 		resolver.async_resolve(ip, port,
 							   [&, _ip = ip, _port = port, _handler = socket_handle](
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
 							   {
-								   ip::tcp::socket _socket(*context);
+//								   ip::tcp::socket _socket(*context);
+									if (er) {
+										LOG_WARNING << "P2PConnector[resolve]: " << er.message();
+									}
+								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
 								   auto socket = std::make_shared<SocketType>(
-										   std::move(_socket), net
+										   _socket, net
 								   );
 
-								   boost::asio::async_connect(_socket, endpoints,
-															  [&, handler = _handler](
+
+								   boost::asio::async_connect(*_socket, endpoints,
+															  [sock = std::move(socket), handler = _handler](
 																	  const boost::system::error_code &ec,
 																	  boost::asio::ip::tcp::endpoint ep)
 															  {
+									   								LOG_INFO << "IS CONNECTED?:" << sock->isConnected();
 																  LOG_INFO << "Connect to " << ep.address() << ":"
 																		   << ep.port();
 																  if (!ec)
 																  {
-																	  handler(socket);
+																	  handler(sock);
+																	  sock->read();
 //																	  std::shared_ptr<Protocol> proto = std::make_shared<P2PProtocol>(
 //																			  socket, handler_manager);
 //																	  client_connected(proto);

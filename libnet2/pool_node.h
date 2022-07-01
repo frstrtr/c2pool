@@ -73,7 +73,9 @@ public:
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
-        client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<PoolHandshakeClient>(std::move(socket),
+		auto addr = socket->get_addr();
+        client_attempts[std::get<0>(addr)] =
+				std::make_shared<PoolHandshakeClient>(std::move(socket),
                                                                                                  message_version_handle,
                                                                                                  std::bind(
                                                                                                         &PoolNodeClient::handshake_handle,
@@ -83,8 +85,8 @@ public:
 
     void handshake_handle(std::shared_ptr<PoolHandshake> _handshake)
     {
+		LOG_DEBUG << "Handshake client handle!";
         auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
-        _protocol->set_handler_manager(handler_manager);
 
         auto ip = std::get<0>(_protocol->get_socket()->get_addr());
         peers[_protocol->nonce] = _protocol;
@@ -96,6 +98,7 @@ public:
 		auto_connect_timer.expires_from_now(auto_connect_interval);
 		auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
 									  {
+										LOG_INFO << "AUTO CONNECT";
 										  if (_ec)
 										  {
 											  LOG_ERROR << "P2PNode::auto_connect: " << _ec.message();
