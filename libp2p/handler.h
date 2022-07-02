@@ -23,7 +23,7 @@ template <typename MessageType, typename ProtocolType>
 class MessageHandler : public Handler<ProtocolType>
 {
 protected:
-    handler_type<MessageType, std::shared_ptr<ProtocolType>> handlerF;
+    handler_type<MessageType, ProtocolType> handlerF;
 
     std::shared_ptr<MessageType> generate_message(PackStream &stream)
     {
@@ -33,7 +33,7 @@ protected:
     }
 
 public:
-    MessageHandler(handler_type<MessageType, std::shared_ptr<ProtocolType>> _handlerF) : handlerF(_handlerF) {}
+    MessageHandler(handler_type<MessageType, ProtocolType> _handlerF) : handlerF(_handlerF) {}
 
     void invoke(PackStream &stream, std::shared_ptr<ProtocolType> _protocol) override
     {

@@ -130,6 +130,9 @@ public:
 	std::vector<addr_type> get_good_peers(int max_count);
 };
 
+#define SET_POOL_DEFAULT_HANDLER(msg) \
+	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
+
 class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient
 {
 private:
@@ -140,7 +143,21 @@ public:
               PoolNodeServer(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2)),
               PoolNodeClient(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2))
 	{
+		SET_POOL_DEFAULT_HANDLER(addrs);
+		SET_POOL_DEFAULT_HANDLER(addrme);
+		SET_POOL_DEFAULT_HANDLER(ping);
+		SET_POOL_DEFAULT_HANDLER(getaddrs);
+		SET_POOL_DEFAULT_HANDLER(shares);
+		SET_POOL_DEFAULT_HANDLER(sharereq);
+		SET_POOL_DEFAULT_HANDLER(sharereply);
+		SET_POOL_DEFAULT_HANDLER(bestblock);
+		SET_POOL_DEFAULT_HANDLER(have_tx);
+		SET_POOL_DEFAULT_HANDLER(losing_tx);
+		SET_POOL_DEFAULT_HANDLER(remember_tx);
+		SET_POOL_DEFAULT_HANDLER(forget_tx);
 
+//		handler_manager->new_handler<pool::messages::message_addrs>("addrs", [&](auto msg, auto proto){ handle_message_addrs(msg, proto); });
+//		SET_POOL_DEFAULT_HANDLER()
 	}
 
 	template <typename ListenerType, typename ConnectorType>
@@ -152,31 +169,34 @@ public:
         auto_connect();
 	}
 
+	// Handshake handlers
     void handle_message_version(std::shared_ptr<PoolHandshake> handshake, std::shared_ptr<pool::messages::message_version> msg);
 
-    void handle(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol);
+	// Pool handlers
+    void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol);
 
     //TODO: test:
-    void handle(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_addrme(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_ping(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<PoolProtocol> protocol);
 
     //TODO: TEST
-    void handle(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_getaddrs(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_sharereq> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_sharereq(std::shared_ptr<pool::messages::message_sharereq> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_sharereply> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_sharereply(std::shared_ptr<pool::messages::message_sharereply> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_bestblock> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_bestblock(std::shared_ptr<pool::messages::message_bestblock> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_losing_tx(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    void handle(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol);
 };
+#undef SET_POOL_DEFAULT_HANDLER
