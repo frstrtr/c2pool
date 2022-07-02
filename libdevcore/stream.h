@@ -159,6 +159,7 @@ struct GetterList<GET_TYPE> : BaseGetter
 	typedef std::vector<typename GET_TYPE::get_type> get_type;
 	std::vector<GET_TYPE> value;
 
+	/// Return copy, don't use (get().begin, get().end())
 	virtual get_type get() const
 	{
 		get_type result;

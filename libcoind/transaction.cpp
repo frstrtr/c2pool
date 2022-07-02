@@ -23,6 +23,7 @@ namespace coind::data::stream
             stream << _locktime;
             return stream;
         }
+		// TODO: check bug
         TxIDType_stream tx_id(tx->version, tx->tx_ins, tx->tx_outs, tx->lock_time);
         stream << tx_id;
         return stream;

@@ -283,11 +283,8 @@ void PoolNode::handle_message_bestblock(std::shared_ptr<pool::messages::message_
 
 void PoolNode::handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-	LOG_TRACE << "tx_hashes len: " << msg->tx_hashes.get().size();
-	auto temp = msg->tx_hashes.get();
-	LOG_TRACE << std::distance(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
-	LOG_TRACE << std::distance(temp.begin(), temp.end());
-    protocol->remote_tx_hashes.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
+	auto tx_hashes = msg->tx_hashes.get();
+    protocol->remote_tx_hashes.insert(tx_hashes.begin(), tx_hashes.end());
     if (protocol->remote_tx_hashes.size() > 10000)
     {
         protocol->remote_tx_hashes.erase(protocol->remote_tx_hashes.begin(),
@@ -299,7 +296,8 @@ void PoolNode::handle_message_losing_tx(std::shared_ptr<pool::messages::message_
 {
     //remove all msg->txs hashes from remote_tx_hashes
     std::set<uint256> losing_txs;
-    losing_txs.insert(msg->tx_hashes.get().begin(), msg->tx_hashes.get().end());
+	auto tx_hashes = msg->tx_hashes.get();
+    losing_txs.insert(tx_hashes.begin(), tx_hashes.end());
 
     std::set<uint256> diff_txs;
     std::set_difference(protocol->remote_tx_hashes.begin(), protocol->remote_tx_hashes.end(),
