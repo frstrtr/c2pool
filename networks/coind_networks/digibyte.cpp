@@ -7,7 +7,7 @@
 
 #include <btclibs/uint256.h>
 // #include <libcoind/jsonrpc/coind.h>
-// #include <libcoind/data.h>
+ #include <libcoind/data.h>
 #include "dgb/digibyte_subsidy.cpp"
 
 using std::shared_ptr;
@@ -61,7 +61,7 @@ namespace coind
 
     uint256 DigibyteParentNetwork::POW_FUNC(PackStream& packed_block_header)
     {
-        //TODO: return coind::data::hash256(packed_block_header);
+        return coind::data::hash256(packed_block_header);
     }
 
 	unsigned long long DigibyteParentNetwork::SUBSIDY_FUNC(int32_t height)

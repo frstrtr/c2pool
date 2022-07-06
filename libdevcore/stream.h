@@ -308,6 +308,7 @@ struct PackStream
 		data.erase(data.begin(), data.begin() + _size);
         auto *res = reinterpret_cast<T *>(packed);
         val = *res;
+		delete[] packed;
         return *this;
     }
 

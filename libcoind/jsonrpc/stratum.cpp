@@ -2,7 +2,7 @@
 
 #include <libdevcore/random.h>
 
-Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<c2pool::libnet::Worker> _worker) : StratumProtocol(context), worker(_worker), _t_send_work(*context),
+Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<Worker> _worker) : StratumProtocol(context), worker(_worker), _t_send_work(*context),
                                                                                                       handler_map(_context, 300)
 {
     server.Add("mining.subscribe", GetUncheckedHandle([&](const json& value){
