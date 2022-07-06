@@ -20,7 +20,7 @@ public:
 	std::shared_ptr<ShareTracker> tracker;
 	std::shared_ptr<coind::JSONRPC_Coind> coind;
 	std::shared_ptr<PoolNodeData> pool_node;
-//TODO:    shared_ptr<c2pool::libnet::p2p::P2PNode> _p2p_node;
+
 	HandlerManagerPtr<CoindProtocol> handler_manager;
 public:
 	coind::TXIDCache txidcache;
@@ -46,34 +46,28 @@ public:
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
 	}
 
-	auto &set_context(std::shared_ptr<io::io_context> _context)
-	{
-		context = std::move(_context);
-		return *this;
-	}
-
-	auto &set_parent_net(std::shared_ptr<coind::ParentNetwork> _net)
+	auto set_parent_net(std::shared_ptr<coind::ParentNetwork> _net)
 	{
 		parent_net = std::move(_net);
-		return *this;
+		return this;
 	}
 
-	auto &set_coind(std::shared_ptr<coind::JSONRPC_Coind> _coind)
+	auto set_coind(std::shared_ptr<coind::JSONRPC_Coind> _coind)
 	{
 		coind = std::move(_coind);
-		return *this;
+		return this;
 	}
 
-	auto &set_tracker(std::shared_ptr<ShareTracker> _tracker)
+	auto set_tracker(std::shared_ptr<ShareTracker> _tracker)
 	{
 		tracker = std::move(_tracker);
-		return *this;
+		return this;
 	}
 
-	auto &set_pool_node(std::shared_ptr<PoolNodeData> _pool_node)
+	auto set_pool_node(std::shared_ptr<PoolNodeData> _pool_node)
 	{
 		pool_node = std::move(_pool_node);
-		return *this;
+		return this;
 	}
 public:
 	void set_best_share();

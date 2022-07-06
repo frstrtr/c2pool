@@ -31,6 +31,12 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
 	PackStream packed_header;
 	packed_header << header;
 
+	LOG_TRACE << "[HANDLE_BESTBLOCK]: header.bits.bits.target() = " << header.bits.bits.target();
+	LOG_TRACE << "[HANDLE_BESTBLOCK]: net->parent->POW_FUNC(packed_header) = " << net->parent->POW_FUNC(packed_header);
+	LOG_TRACE << "[HANDLE_BESTBLOCK]: header.previous_block = " << header.previous_block.get().ToString();
+	LOG_TRACE << "[HANDLE_BESTBLOCK]: header.bits = " << header.bits.get();
+	LOG_TRACE << "[HANDLE_BESTBLOCK]: header.bits.bits = " << header.bits.bits.get();
+
 	if (net->parent->POW_FUNC(packed_header) > header.bits.bits.target())
 	{
 		throw std::invalid_argument("received block header fails PoW test");

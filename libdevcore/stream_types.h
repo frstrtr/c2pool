@@ -602,6 +602,7 @@ struct FloatingIntegerType : public CustomGetter<typename FloatingInteger::get_t
     {
         IntType(32) _bits;
         stream >> _bits;
+		std::cout << _bits.get() << std::endl;
         bits = FloatingInteger(_bits);
 
         return stream;

@@ -349,12 +349,13 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 
 void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    for (auto tx_hash : msg->tx_hashes.get())
-    {
-        PackStream stream;
-        stream << protocol->remembered_txs[tx_hash];
-        protocol->remembered_txs_size -= 100 + stream.size();
-        assert(protocol->remembered_txs_size >= 0);
-        protocol->remembered_txs.erase(tx_hash);
-    }
+	// TODO: wanna for fix:
+//    for (auto tx_hash : msg->tx_hashes.get())
+//    {
+//        PackStream stream;
+//        stream << protocol->remembered_txs[tx_hash];
+//        protocol->remembered_txs_size -= 100 + stream.size();
+//        assert(protocol->remembered_txs_size >= 0);
+//        protocol->remembered_txs.erase(tx_hash);
+//    }
 }
