@@ -571,24 +571,99 @@ tx_type = TransactionType()
 # print('hash: {0}, hex: {1}'.format(hash256(b), hex(hash256(b))))
 # print('hash: {0}, hex: {1}'.format(b2, hex(b2)))
 
-gentx = dict(
-    version=4294967295,
-    tx_ins=[dict(
-        previous_output=None,
-        sequence=None,
-        script='015d5d52ad85411c47a5a8c71b8de0a39835891c26539eb2170eee693f08681a0302042800000003205b41960f08035d9b1ced05be46f7f8621053f1d362341dee2b9ada51abb3cf47',
-    )],
-    tx_outs=([dict(value=0, script='\x6a\x24\xaa\x21\xa9\xed' + IntType(256).pack(1234567))]),
-    lock_time=0,
-)
 
-gentx['marker'] = 3
-gentx['flag'] = 2
-gentx['witness'] = [["c2pool"*4]]
+################################################################################
+# gentx = dict(
+#     version=4294967295,
+#     tx_ins=[dict(
+#         previous_output=None,
+#         sequence=None,
+#         script='015d5d52ad85411c47a5a8c71b8de0a39835891c26539eb2170eee693f08681a0302042800000003205b41960f08035d9b1ced05be46f7f8621053f1d362341dee2b9ada51abb3cf47',
+#     )],
+#     tx_outs=([dict(value=0, script='\x6a\x24\xaa\x21\xa9\xed' + IntType(256).pack(1234567))]),
+#     lock_time=0,
+# )
+#
+# gentx['marker'] = 3
+# gentx['flag'] = 2
+# gentx['witness'] = [["c2pool"*4]]
+#
+# def postprocess(data):
+#     return [ord(x) for x in data]
+#
+# packed_gentx = tx_id_type.pack(gentx)
+# print(postprocess(packed_gentx))
+# print(postprocess(packed_gentx[:-32]))
 
-def postprocess(data):
-    return [ord(x) for x in data]
+class FloatingInteger(object):
+    __slots__ = ['bits', '_target']
 
-packed_gentx = tx_id_type.pack(gentx)
-print(postprocess(packed_gentx))
-print(postprocess(packed_gentx[:-32]))
+    # @classmethod
+    # def from_target_upper_bound(cls, target):
+    #     n = natural_to_string(target)
+    #     if n and ord(n[0]) >= 128:
+    #         n = '\x00' + n
+    #     bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
+    #     bits = IntType(32).unpack(bits2)
+    #     return cls(bits)
+
+    def __init__(self, bits, target=None):
+        self.bits = bits
+        self._target = None
+        if target is not None and self.target != target:
+            raise ValueError('target does not match')
+
+    # @property
+    # def target(self):
+    #     res = self._target
+    #     if res is None:
+    #         res = self._target = math.shift_left(self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
+    #     return res
+
+    def __hash__(self):
+        return hash(self.bits)
+
+    def __eq__(self, other):
+        return self.bits == other.bits
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __cmp__(self, other):
+        assert False
+
+    def __repr__(self):
+        return 'FloatingInteger(bits=%s, target=%s)' % (hex(self.bits), hex(self.target))
+
+class FloatingIntegerType(Type):
+    _inner = IntType(32)
+
+    def read(self, file):
+        bits = self._inner.read(file)
+        return FloatingInteger(bits)
+
+    def write(self, file, item):
+        return self._inner.write(file, item.bits)
+
+block_header_type = ComposedType([
+    ('version', IntType(32)),
+    ('previous_block', PossiblyNoneType(0, IntType(256))),
+    ('merkle_root', IntType(256)),
+    ('timestamp', IntType(32)),
+    ('bits', FloatingIntegerType()),
+    ('nonce', IntType(32)),
+])
+
+res = block_header_type.pack(dict(
+    version=1,
+    previous_block=0x000000000000038a2a86b72387f93c51298298a732079b3b686df3603d2f6282,
+    merkle_root=0x37a43a3b812e4eb665975f46393b4360008824aab180f27d642de8c28073bc44,
+    timestamp=1323752685,
+    bits=FloatingInteger(437159528),
+    nonce=3658685446,
+))
+
+res_arr = ""
+for x in res:
+    res_arr += str(ord(x)) + " "
+print(res_arr)

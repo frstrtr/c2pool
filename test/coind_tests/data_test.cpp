@@ -6,6 +6,7 @@
 
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
+#include <libcoind/types.h>
 #include <libcoind/data.h>
 
 using namespace std;
@@ -68,4 +69,28 @@ TEST(CoindDataTest, hash256_from_hash_link_test)
     auto result = coind::data::hash256_from_hash_link(_init, (unsigned char*)"12345678901234ac", (unsigned char*) "12345678901234ac", 128/8);
     std::cout << result.GetHex() << std::endl;
     ASSERT_EQ(result.GetHex(), "209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e");
+}
+
+TEST(CoindDataTest, test_header_hash)
+{
+	coind::data::BlockHeaderType header;
+	header.make_value(1, uint256S("000000000000038a2a86b72387f93c51298298a732079b3b686df3603d2f6282"), 1323752685, 437159528, 3658685446, uint256S("37a43a3b812e4eb665975f46393b4360008824aab180f27d642de8c28073bc44"));
+	ASSERT_EQ(header->version, 1);
+	ASSERT_EQ(header->previous_block, uint256S("000000000000038a2a86b72387f93c51298298a732079b3b686df3603d2f6282"));
+	ASSERT_EQ(header->timestamp, 1323752685);
+	ASSERT_EQ(header->bits, 437159528);
+	ASSERT_EQ(header->nonce, 3658685446);
+	ASSERT_EQ(header->merkle_root, uint256S("37a43a3b812e4eb665975f46393b4360008824aab180f27d642de8c28073bc44"));
+	auto stream = header.get_pack();
+
+	for (auto v : stream.data)
+	{
+		std::cout << (unsigned int) v << " ";
+	}
+	std::cout << std::endl;
+
+	auto hash_result = coind::data::hash256(stream);
+	std::cout << hash_result.ToString() << std::endl;
+
+	ASSERT_EQ(hash_result, uint256S("000000000000003aaaf7638f9f9c0d0c60e8b0eb817dcdb55fd2b1964efc5175"));
 }
