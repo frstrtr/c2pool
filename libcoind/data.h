@@ -147,17 +147,17 @@ namespace coind::data{
 namespace coind::data
 {
     //TODO: want 4 optimization???
-    uint256 hash256(std::string data);
+    uint256 hash256(std::string data, bool reverse = false);
 
-    uint256 hash256(PackStream stream);
+    uint256 hash256(PackStream stream, bool reverse = false);
 
-    uint256 hash256(uint256 data);
+    uint256 hash256(uint256 data, bool reverse = false);
 
-    uint160 hash160(string data);
+    uint160 hash160(string data, bool reverse = false);
 
-    uint160 hash160(PackStream stream);
+    uint160 hash160(PackStream stream, bool reverse = false);
 
-    uint160 hash160(uint160 data);
+    uint160 hash160(uint160 data, bool reverse = false);
 
     //TODO: Check for data & buf valid '\0x0'
     //double hash

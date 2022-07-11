@@ -131,7 +131,7 @@ namespace coind::data::stream
 {
     struct SmallBlockHeaderType_stream
     {
-        VarIntType version;
+        IntType(32) version;
         PossibleNoneType<IntType(256)> previous_block;
         IntType(32) timestamp;
         FloatingIntegerType bits;
@@ -165,7 +165,7 @@ namespace coind::data::stream
 
     struct BlockHeaderType_stream
     {
-        VarIntType version;
+		IntType(32) version;
         PossibleNoneType<IntType(256) > previous_block;
         IntType(256) merkle_root;
         IntType(32) timestamp;

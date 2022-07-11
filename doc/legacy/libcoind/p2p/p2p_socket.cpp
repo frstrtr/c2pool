@@ -144,9 +144,8 @@ namespace coind::p2p
             IntType(256) checksum_full(__checksum);
             PackStream _packed_checksum;
             _packed_checksum << checksum_full;
-            //TODO: почему результат реверснутый?
             vector<unsigned char> packed_checksum(_packed_checksum.data.end()-4, _packed_checksum.data.end());
-            std::reverse(packed_checksum.begin(), packed_checksum.end());
+//            std::reverse(packed_checksum.begin(), packed_checksum.end());
             PackStream checksum(packed_checksum);
             value << checksum;
 
