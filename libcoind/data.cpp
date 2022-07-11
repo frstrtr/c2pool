@@ -93,7 +93,7 @@ namespace coind::data
 		return hash256(packed_tx);
 	}
 
-    uint256 hash256(std::string data)
+    uint256 hash256(std::string data, bool reverse)
     {
         uint256 result;
 
@@ -108,25 +108,26 @@ namespace coind::data
 
         auto _hash = HexStr(out2);
         result.SetHex(_hash);
-//        std::reverse(result.begin(), result.end());
+		if (reverse)
+        	std::reverse(result.begin(), result.end());
 
         return result;
     }
 
-    uint256 hash256(PackStream stream)
+    uint256 hash256(PackStream stream, bool reverse)
     {
         auto _bytes = stream.bytes();
         string in(reinterpret_cast<char const *>(_bytes), stream.size());
-        return hash256(in);
+        return hash256(in, reverse);
     }
 
-    uint256 hash256(uint256 data)
+    uint256 hash256(uint256 data, bool reverse)
     {
         string in = data.GetHex();
-        return hash256(in);
+        return hash256(in, reverse);
     }
 
-    uint160 hash160(string data)
+    uint160 hash160(string data, bool reverse)
     {
         uint160 result;
 
@@ -140,20 +141,23 @@ namespace coind::data
         CRIPEMD160().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
         result.SetHex(HexStr(out2));
 
+		if (reverse)
+			std::reverse(result.begin(), result.end());
+
         return result;
     }
 
-    uint160 hash160(PackStream stream)
+    uint160 hash160(PackStream stream, bool reverse)
     {
         auto _bytes = stream.bytes();
         string in(reinterpret_cast<char const *>(_bytes), stream.size());
-        return hash160(in);
+        return hash160(in, reverse);
     }
 
-    uint160 hash160(uint160 data)
+    uint160 hash160(uint160 data, bool reverse)
     {
         string in = data.GetHex();
-        return hash160(in);
+        return hash160(in, reverse);
     }
 
     uint256 hash256_from_hash_link(uint32_t* init, unsigned char* data, unsigned char* buf, uint64_t length)

@@ -335,7 +335,7 @@ struct PackStream
     num_type *val2 = reinterpret_cast<num_type *>(packed); \
     val = *val2;                                           \
     data.erase(data.begin(), data.begin() + _size);        \
-    delete packed;                                         \
+    delete[] packed;                                       \
     return *this;
 
     template <StreamIntType T>
@@ -432,6 +432,8 @@ public:
 
     std::shared_ptr<StreamType> stream()
     {
+		if (!_stream)
+			to_stream();
         return _stream;
     }
 
@@ -469,7 +471,7 @@ public:
     PackStream get_pack()
     {
         PackStream __stream;
-        __stream << *_stream;
+        __stream << *stream();
         return std::move(__stream);
     }
 
