@@ -8,6 +8,7 @@
 #include <btclibs/arith_uint256.h>
 #include <libcoind/types.h>
 #include <libcoind/data.h>
+#include <networks/network.h>
 
 using namespace std;
 
@@ -89,8 +90,65 @@ TEST(CoindDataTest, test_header_hash)
 	}
 	std::cout << std::endl;
 
-	auto hash_result = coind::data::hash256(stream);
+	auto hash_result = coind::data::hash256(stream, true);
 	std::cout << hash_result.ToString() << std::endl;
 
 	ASSERT_EQ(hash_result, uint256S("000000000000003aaaf7638f9f9c0d0c60e8b0eb817dcdb55fd2b1964efc5175"));
+}
+
+TEST(CoindDataTest, PowFuncTest)
+{
+	std::shared_ptr<coind::DigibyteParentNetwork> parent_net = std::make_shared<coind::DigibyteParentNetwork>();
+
+	coind::data::BlockHeaderType header;
+	header.make_value(1, uint256S("d928d3066613d1c9dd424d5810cdd21bfeef3c698977e81ec1640e1084950073"), 1327807194, 0x1d01b56f, 20736, uint256S("03f4b646b58a66594a182b02e425e7b3a93c8a52b600aa468f1bc5549f395f16"));
+	ASSERT_EQ(header->version, 1);
+	ASSERT_EQ(header->previous_block, uint256S("d928d3066613d1c9dd424d5810cdd21bfeef3c698977e81ec1640e1084950073"));
+	ASSERT_EQ(header->timestamp, 1327807194);
+	ASSERT_EQ(header->bits, 0x1d01b56f);
+	ASSERT_EQ(header->nonce, 20736);
+	ASSERT_EQ(header->merkle_root, uint256S("03f4b646b58a66594a182b02e425e7b3a93c8a52b600aa468f1bc5549f395f16"));
+	auto stream = header.get_pack();
+	for (auto v : stream.data){
+		std::cout << (unsigned int) v << " ";
+	}
+	std::cout << std::endl;
+
+//	parent_net->POW_FUNC(stream);
+
+	coind::data::BlockHeaderType header2;
+//	coind::data::stream::BlockHeaderType_stream header2;
+	stream >> header2;
+
+	ASSERT_EQ(header->version, header2->version);
+	ASSERT_EQ(header->previous_block, header2->previous_block);
+	ASSERT_EQ(header->timestamp, header2->timestamp);
+	ASSERT_EQ(header->bits, header2->bits);
+	ASSERT_EQ(header->nonce, header2->nonce);
+	ASSERT_EQ(header->merkle_root, header2->merkle_root);
+
+//	ASSERT_EQ(header->version, header2.version.get());
+//	ASSERT_EQ(header->previous_block, header2.previous_block.get());
+//	ASSERT_EQ(header->timestamp, header2.timestamp.get());
+//	ASSERT_EQ(header->bits, header2.bits.get());
+//	ASSERT_EQ(header->nonce, header2.nonce.get());
+//	ASSERT_EQ(header->merkle_root, header2.merkle_root.get());
+
+//	parent_net->POW_FUNC(stream);
+	PackStream stream2;
+	stream2 << header2;
+
+	auto result = parent_net->POW_FUNC(stream2);
+	std::cout << result.ToString() << std::endl;
+	uint256 for_compare = uint256S("400000000000000000000000000000000000000000000000000000000");
+	arith_uint256 for_compare_arith = UintToArith256(for_compare);
+	arith_uint256 result_arith = UintToArith256(result);
+	std::cout << "for_compare: " << for_compare.GetHex() << std::endl;
+	std::cout << (result < uint256S("400000000000000000000000000000000000000000000000000000000")) << std::endl;
+	std::cout << "arith: " << (result_arith < for_compare_arith) << std::endl;
+	std::cout << (result == uint256S("1312dc20ce5aa3ee622f5562dfb2593ec51436aab739ef0d02189e18f")) << std::endl;
+
+	std::cout << header2->bits << " " << header2.stream()->bits.bits.target() << std::endl;
+	ASSERT_EQ(header2->bits, 486651247);
+	ASSERT_EQ(header2.stream()->bits.bits.target(), uint256S("1b56f0000000000000000000000000000000000000000000000000000"));
 }

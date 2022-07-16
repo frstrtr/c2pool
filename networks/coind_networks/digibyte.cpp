@@ -7,8 +7,11 @@
 
 #include <btclibs/uint256.h>
 // #include <libcoind/jsonrpc/coind.h>
- #include <libcoind/data.h>
+#include <libcoind/data.h>
 #include "dgb/digibyte_subsidy.cpp"
+extern "C" {
+	#include "dgb/scrypt.h"
+}
 
 using std::shared_ptr;
 
@@ -61,7 +64,22 @@ namespace coind
 
     uint256 DigibyteParentNetwork::POW_FUNC(PackStream& packed_block_header)
     {
-        return coind::data::hash256(packed_block_header);
+		const char* input = reinterpret_cast<const char*>(packed_block_header.data.data());
+		char *output = new char[32]{0};
+		std::vector<unsigned char> test_v(input, input+packed_block_header.size());
+		scrypt_1024_1_1_256(input, output);
+
+		PackStream converted_output(output, 32);
+//		std::reverse(converted_output.data.begin(), converted_output.data.end());
+		IntType(256) res;
+		converted_output >> res;
+		std::cout << res.get().ToString() << std::endl;
+		return res.get();
+//		std::cout << "output: " << output << std::endl;
+//		PackStream converted_output(output)
+//		IntType(256) res;
+
+//        return coind::data::hash256(packed_block_header);
     }
 
 	unsigned long long DigibyteParentNetwork::SUBSIDY_FUNC(int32_t height)

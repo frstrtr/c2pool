@@ -166,7 +166,7 @@ namespace coind::data::stream
     struct BlockHeaderType_stream
     {
 		IntType(32) version;
-        PossibleNoneType<IntType(256) > previous_block;
+        PossibleNoneType<IntType(256)> previous_block;
         IntType(256) merkle_root;
         IntType(32) timestamp;
         FloatingIntegerType bits;
@@ -215,8 +215,14 @@ namespace coind::data::stream
 
         PackStream &read(PackStream &stream)
         {
-            stream >> version >> previous_block >> merkle_root >> timestamp >> bits >> nonce;
-            return stream;
+//            stream >> version >> previous_block >> merkle_root >> timestamp >> bits >> nonce;
+			stream >> version;
+			stream >> previous_block;
+			stream >> merkle_root;
+			stream >> timestamp;
+			stream >> bits;
+			stream >> nonce;
+			return stream;
         }
     };
 

@@ -421,6 +421,8 @@ public:
 
     PackStream &read(PackStream &stream)
     {
+		if (!_stream)
+			_stream = std::make_shared<StreamType>();
         stream >> *_stream;
         return stream;
     }

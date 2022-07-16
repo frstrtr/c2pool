@@ -2,6 +2,12 @@ import binascii
 import struct
 import hashlib
 
+def shift_left(n, m):
+    # python: :(
+    if m >= 0:
+        return n << m
+    return n >> -m
+
 class EarlyEnd(Exception):
     pass
 
@@ -613,12 +619,20 @@ class FloatingInteger(object):
         if target is not None and self.target != target:
             raise ValueError('target does not match')
 
-    # @property
-    # def target(self):
-    #     res = self._target
-    #     if res is None:
-    #         res = self._target = math.shift_left(self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
-    #     return res
+    @property
+    def target(self):
+        res = self._target
+        if res is None:
+            res = self._target = shift_left(self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
+
+            v = self.bits & 0x00ffffff
+            # v << (8 * ((v >> 24) - 3))
+            print('Test bits: {0}').format(self.bits)
+            print('Test_target: {0}'.format(v))
+            # value.value & );
+            #
+            # res << (8 * ((value.value >> 24) - 3));
+        return res
 
     def __hash__(self):
         return hash(self.bits)
@@ -656,14 +670,25 @@ block_header_type = ComposedType([
 
 res = block_header_type.pack(dict(
     version=1,
-    previous_block=0x000000000000038a2a86b72387f93c51298298a732079b3b686df3603d2f6282,
-    merkle_root=0x37a43a3b812e4eb665975f46393b4360008824aab180f27d642de8c28073bc44,
-    timestamp=1323752685,
-    bits=FloatingInteger(437159528),
-    nonce=3658685446,
+    previous_block=0xd928d3066613d1c9dd424d5810cdd21bfeef3c698977e81ec1640e1084950073,
+    merkle_root=0x03f4b646b58a66594a182b02e425e7b3a93c8a52b600aa468f1bc5549f395f16,
+    timestamp=1327807194,
+    bits=FloatingInteger(0x1d01b56f),
+    nonce=20736,
 ))
+
+POW_FUNC = lambda data: IntType(256).unpack(__import__('ltc_scrypt').getPoWHash(data))
+print(FloatingInteger(0x1d01b56f).target)
+pow_func_res = POW_FUNC(res)
+print(pow_func_res < int("400000000000000000000000000000000000000000000000000000000", 16))
+print(hex(pow_func_res))
 
 res_arr = ""
 for x in res:
     res_arr += str(ord(x)) + " "
 print(res_arr)
+
+# 0x1312dc20ce5aa3ee622f5562dfb2593ec51436aab739ef0d02189e18f
+# 8fe18921d0f09e73ab6a4351ec9325fb2d56f522e63eaae50cc22d3101000000
+# 00000001312dc20ce5aa3ee622f5562dfb2593ec51436aab739ef0d02189e18f
+# 00000001312dc20ce5aa3ee622f5562dfb2593ec51436aab739ef0d02189e18f
