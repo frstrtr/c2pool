@@ -221,7 +221,7 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>, public Getter<
 
     PackStream &write(PackStream &stream)
     {
-//        LOG_TRACE << "IntType Worked!";
+        LOG_TRACE << "IntType Worked!";
 
         INT_T value2 = Getter<INT_T>::value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
@@ -229,7 +229,7 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>, public Getter<
 
         if (BIG_ENDIAN)
             std::reverse(packed, packed+len);
-
+		std::cout << len << std::endl;
         PackStream s(packed, len);
         stream << s;
 
@@ -544,11 +544,28 @@ struct FloatingInteger : public Getter<IntType(32)>
 
     uint256 target()
     {
-        arith_uint256 res(value.value && 0x00ffffff);
+		auto shift_left = [&](int32_t _n, int32_t _m)
+		{
+			arith_uint256 n(_n);
+			if (_m >= 0)
+			{
+				n <<= _m;
+			} else
+			{
+				_m = -_m;
+				n >>= _m;
+			}
+			return ArithToUint256(n);
+		};
+//        arith_uint256 res(value.value & 0x00ffffff);
+//
+//        res << (8 * ((value.value >> 24) - 3));
 
-        res << (8 * ((value.value >> 24) - 3));
-
-        return ArithToUint256(res);
+//		auto res = shift_left(value.get() & 0x00ffffff, 8 * ((value.get() >> 24) - 3));
+//
+//        return ArithToUint256(res);
+		auto res = shift_left(value.get() & 0x00ffffff, 8 * ((value.get() >> 24) - 3));
+		return res;
     }
 
     //TODO: test
