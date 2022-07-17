@@ -50,8 +50,13 @@ Discord:
 # Install:
 ```
 sudo apt-get update
+sudo apt install cmake
 sudo apt-get install libleveldb-dev
 sudo apt install gcc-8 g++-8
 sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 --slave /usr/bin/g++ g++ /usr/bin/g++-8
-sudo apt-get update && sudo apt-get install -yq libboost-filesystem1.71-dev && sudo apt-get install -yq libboost1.71-all-dev
+sudo apt-get install -yq libboost-filesystem1.71-dev && sudo apt-get install -yq libboost1.71-all-dev
+
+mkdir cmake-build-debug
+cmake -DCMAKE_BUILD_TYPE=Debug -S . -B /cmake-build-debug
+cmake --build /cmake-build-debug --target coind_worker -j 3
 ```
