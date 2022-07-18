@@ -9,6 +9,7 @@
 #include "message.h"
 #include "protocol_events.h"
 #include "handler.h"
+#include <libdevcore/logger.h>
 
 class BaseProtocol : public virtual ProtocolEvents
 {
@@ -69,10 +70,11 @@ public:
         auto handler = handler_manager->get_handler(raw_msg->command);
         if (handler)
         {
+			LOG_INFO << "Protocol call handler for " << raw_msg->command;
             handler->invoke(raw_msg->value, this->shared_from_this());
         } else
         {
-            //TODO: empty handler
+            LOG_WARNING << "Handler " << raw_msg->command << " not found!";
         }
     }
 

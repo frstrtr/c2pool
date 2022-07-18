@@ -98,7 +98,7 @@ public:
 		auto_connect_timer.expires_from_now(auto_connect_interval);
 		auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
 									  {
-										LOG_INFO << "AUTO CONNECT";
+//										  LOG_TRACE << "AUTO CONNECT";
 										  if (_ec)
 										  {
 											  LOG_ERROR << "P2PNode::auto_connect: " << _ec.message();

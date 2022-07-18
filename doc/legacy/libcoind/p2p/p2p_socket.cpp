@@ -198,7 +198,7 @@ namespace coind::p2p
                                 boost::asio::buffer(msg->prefix, _parent_net->PREFIX_LENGTH),
                                 [this, msg](boost::system::error_code ec, std::size_t length)
                                 {
-                                    LOG_TRACE << "try to read prefix";
+//                                    LOG_TRACE << "try to read prefix";
                                     //TODO: compare
                                     if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
                                     {
@@ -222,7 +222,7 @@ namespace coind::p2p
                                 {
                                     if (!ec)
                                     {
-                                        LOG_TRACE << "try to read command";
+//                                        LOG_TRACE << "try to read command";
                                         read_length(msg);
                                     }
                                     else
@@ -241,7 +241,7 @@ namespace coind::p2p
                                 {
                                     if (!ec)
                                     {
-                                        LOG_TRACE << "try to read length";
+//                                        LOG_TRACE << "try to read length";
                                         read_checksum(msg);
                                     }
                                     else
@@ -260,7 +260,7 @@ namespace coind::p2p
                                 {
                                     if (!ec)
                                     {
-                                        LOG_TRACE << "try to read checksum";
+//                                        LOG_TRACE << "try to read checksum";
                                         // LOG_INFO << "read_checksum";
                                         read_payload(msg);
                                     }
@@ -286,7 +286,7 @@ namespace coind::p2p
                                     if (!ec)
                                     {
                                         // LOG_INFO << "read_payload";
-                                        LOG_DEBUG << "HANDLE MESSAGE!";
+//                                        LOG_DEBUG << "HANDLE MESSAGE!";
                                         final_read_message(msg);
                                         start_read();
                                     }
