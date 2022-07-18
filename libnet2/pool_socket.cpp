@@ -39,18 +39,17 @@ void PoolSocket::write_message_data(std::shared_ptr<Message> msg)
 // Read
 void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 {
-	LOG_INFO << "IS CONNECTED?: " << isConnected();
+//	LOG_INFO << "IS CONNECTED?: " << isConnected();
 	boost::asio::async_read(*socket,
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
 							[this, msg](boost::system::error_code ec, std::size_t length)
 							{
-								LOG_TRACE << "try to read prefix";
+//								LOG_TRACE << "try to read prefix";
 								//TODO: compare
 								if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
 								{
-									LOG_TRACE << "compare prefix";
+//									LOG_TRACE << "compare prefix";
 									//c2pool::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
-									LOG_TRACE << "after debug_log";
 									// LOG_INFO << "MSG: " << tempMessage->command;
 									read_command(msg);
 								}
@@ -71,7 +70,7 @@ void PoolSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									LOG_TRACE << "try to read command: " << msg->command;
+//									LOG_TRACE << "try to read command: " << msg->command;
 									//LOG_INFO << "read_command";
 									read_length(msg);
 								}
@@ -91,7 +90,7 @@ void PoolSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									LOG_TRACE << "try to read length";
+//									LOG_TRACE << "try to read length";
 									// LOG_INFO << "read_length";
 									read_checksum(msg);
 								}
@@ -111,7 +110,7 @@ void PoolSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									LOG_TRACE << "try to read checksum";
+//									LOG_TRACE << "try to read checksum";
 									// LOG_INFO << "read_checksum";
 									read_payload(msg);
 								}
@@ -138,7 +137,7 @@ void PoolSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 								if (!ec)
 								{
 									// LOG_INFO << "read_payload";
-									LOG_DEBUG << "HANDLE MESSAGE!";
+//									LOG_DEBUG << "HANDLE MESSAGE!";
 									final_read_message(msg);
 									read();
 								}
@@ -158,14 +157,12 @@ void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 	//Make raw message
 	PackStream stream_RawMsg;
 
-//        PackStream stream_command(msg->command, msg->COMMAND_LEN);
 	std::string cmd(msg->command);
 	PackStream stream_payload(msg->payload, msg->unpacked_len);
 
 	stream_RawMsg << stream_payload;
 
 	shared_ptr<RawMessage> raw_message = std::make_shared<RawMessage>(cmd);
-	//RawMessage->name_type = reverse_string_commands(msg->command);
 	stream_RawMsg >> *raw_message;
 
 	//Protocol handle message

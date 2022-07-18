@@ -114,6 +114,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
 
 void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol)
 {
+	LOG_TRACE << "HANDLE MESSAGE_ADDRS";
     for (auto addr_record: msg->addrs.get())
     {
         auto addr = addr_record.get();

@@ -78,7 +78,6 @@ public:
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
 							   {
-//								   ip::tcp::socket _socket(*context);
 									if (er) {
 										LOG_WARNING << "P2PConnector[resolve]: " << er.message();
 									}
@@ -93,29 +92,18 @@ public:
 																	  const boost::system::error_code &ec,
 																	  boost::asio::ip::tcp::endpoint ep)
 															  {
-									   								LOG_INFO << "IS CONNECTED?:" << sock->isConnected();
 																  LOG_INFO << "Connect to " << ep.address() << ":"
 																		   << ep.port();
 																  if (!ec)
 																  {
 																	  handler(sock);
 																	  sock->read();
-//																	  std::shared_ptr<Protocol> proto = std::make_shared<P2PProtocol>(
-//																			  socket, handler_manager);
-//																	  client_connected(proto);
 																  } else
 																  {
 																	  LOG_ERROR << "async_connect: " << ec << " "
 																				<< ec.message();
 																  }
 															  });
-
-//								   auto handshake = std::make_shared<P2PHandshakeClient>(
-//										   socket, data->handler_manager);
-//								   handshake->connect(endpoints, std::bind(
-//										   &P2PNodeClient::client_connected, this,
-//										   std::placeholders::_1));
-//								   client_attempts[_ip] = std::move(handshake);
 							   });
 	}
 };

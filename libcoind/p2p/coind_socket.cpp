@@ -43,13 +43,12 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
 							[this, msg](boost::system::error_code ec, std::size_t length)
 							{
-								LOG_TRACE << "try to read prefix";
+//								LOG_TRACE << "try to read prefix";
 								//TODO: compare
 								if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
 								{
-									LOG_TRACE << "compare prefix";
+//									LOG_TRACE << "compare prefix";
 									//c2pool::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
-									LOG_TRACE << "after debug_log";
 									// LOG_INFO << "MSG: " << tempMessage->command;
 									read_command(msg);
 								}
@@ -70,7 +69,7 @@ void CoindSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									LOG_TRACE << "try to read command: " << msg->command;
+//									LOG_TRACE << "try to read command: " << msg->command;
 									//LOG_INFO << "read_command";
 									read_length(msg);
 								}
@@ -90,7 +89,7 @@ void CoindSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									LOG_TRACE << "try to read length";
+//									LOG_TRACE << "try to read length";
 									// LOG_INFO << "read_length";
 									read_checksum(msg);
 								}
@@ -110,7 +109,7 @@ void CoindSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									LOG_TRACE << "try to read checksum";
+//									LOG_TRACE << "try to read checksum";
 									// LOG_INFO << "read_checksum";
 									read_payload(msg);
 								}
@@ -137,7 +136,7 @@ void CoindSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 								if (!ec)
 								{
 									// LOG_INFO << "read_payload";
-									LOG_DEBUG << "HANDLE MESSAGE!";
+//									LOG_DEBUG << "HANDLE MESSAGE!";
 									final_read_message(msg);
 									read();
 								}

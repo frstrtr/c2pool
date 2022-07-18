@@ -19,16 +19,16 @@ public:
 
 	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
-		LOG_INFO << "socket created";
+		LOG_TRACE << "socket created";
 	}
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
-		LOG_INFO << "socket created";
+		LOG_TRACE << "socket created";
 	}
 
 	~PoolSocket(){
-		std::cout << "socket removed" << std::endl;
+		LOG_TRACE << "socket removed";
 	}
 
 	// Write
