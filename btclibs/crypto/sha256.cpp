@@ -69,12 +69,12 @@ void inline Initialize(uint32_t* s, uint32_t* custom_init_state = nullptr)
     {
         auto it = custom_init_state;
         for (int i = 0; i < 8; i++){
-            std::cout << *it << " ";
+//            std::cout << *it << " ";
             s[i] = *it;
             it++;
 
         }
-        std::cout << std::endl;
+//        std::cout << std::endl;
 //        memcpy(s, custom_init_state, 8);
         return;
     }
@@ -659,10 +659,10 @@ CSHA256& CSHA256::Write(const unsigned char* data, size_t len)
 {
     const unsigned char* end = data + len;
     size_t bufsize = bytes % 64;
-    for (auto v : s){
-        std::cout << v << " ";
-    }
-    std::cout << std::endl;
+//    for (auto v : s){
+//        std::cout << v << " ";
+//    }
+//    std::cout << std::endl;
     if (bufsize && bufsize + len >= 64) {
         // Fill the buffer, and process it.
         memcpy(buf + bufsize, data, 64 - bufsize);

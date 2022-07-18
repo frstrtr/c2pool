@@ -91,14 +91,6 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
         value.insert(value.end(), parsedHexData.begin(), parsedHexData.end());
 //        _stream << parsedHexData;
 
-//TODO: Remove
-        std::cout << "parsedHexData: ";
-        for (auto v : value)
-        {
-            std::cout << (unsigned int) v << " ";
-        }
-        std::cout << std::endl;
-
 //        _stream >> *this;
 
         return *this;
@@ -221,15 +213,12 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>, public Getter<
 
     PackStream &write(PackStream &stream)
     {
-        LOG_TRACE << "IntType Worked!";
-
         INT_T value2 = Getter<INT_T>::value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
         int32_t len = sizeof(value2) / sizeof(*packed);
 
         if (BIG_ENDIAN)
             std::reverse(packed, packed+len);
-		std::cout << len << std::endl;
         PackStream s(packed, len);
         stream << s;
 
@@ -619,7 +608,6 @@ struct FloatingIntegerType : public CustomGetter<typename FloatingInteger::get_t
     {
         IntType(32) _bits;
         stream >> _bits;
-		std::cout << _bits.get() << std::endl;
         bits = FloatingInteger(_bits);
 
         return stream;
