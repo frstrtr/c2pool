@@ -58,7 +58,7 @@ sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6AF7F09730B3F0A4
 sudo apt update
 sudo apt install cmake
 ```
-
+c2pool
 ```
 
 sudo apt-get update
