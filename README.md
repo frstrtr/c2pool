@@ -51,9 +51,10 @@ Discord:
 CMake:
 ```
 sudo apt remove --purge --auto-remove cmake
-sudo apt update && \
-sudo apt install -y software-properties-common lsb-release && \
+sudo apt update &&
+sudo apt install -y software-properties-common lsb-release &&
 sudo apt clean all
+sudo apt-add-repository "deb https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main"
 sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6AF7F09730B3F0A4
 sudo apt update
 sudo apt install cmake
