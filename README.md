@@ -48,7 +48,19 @@ Discord:
 ### https://discord.gg/yb6ujsPRsv
 
 # Install:
+CMake:
 ```
+sudo apt remove --purge --auto-remove cmake
+sudo apt update && \
+sudo apt install -y software-properties-common lsb-release && \
+sudo apt clean all
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6AF7F09730B3F0A4
+sudo apt update
+sudo apt install cmake
+```
+
+```
+
 sudo apt-get update
 sudo apt install cmake
 sudo apt-get install libleveldb-dev
