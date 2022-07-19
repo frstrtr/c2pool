@@ -73,5 +73,5 @@ git clone https://github.com/frstrtr/c2pool.git
 cd c2pool
 mkdir cmake-build-debug
 cmake -DCMAKE_BUILD_TYPE=Debug -S . -B cmake-build-debug
-cmake --build /cmake-build-debug --target coind_worker -j 3
+cmake --build cmake-build-debug --target coind_worker -j 3
 ```
