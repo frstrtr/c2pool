@@ -35,17 +35,18 @@ public:
 
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
-		server_attempts[socket] = std::make_shared<PoolHandshakeServer>(std::move(socket),
+		auto _socket = socket;
+		server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket),
                                                                         message_version_handle,
                                                                         std::bind(&PoolNodeServer::handshake_handle, this, std::placeholders::_1));
 	}
 
     void handshake_handle(std::shared_ptr<PoolHandshake> _handshake)
     {
-        auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
-        _protocol->set_handler_manager(handler_manager);
+		LOG_DEBUG << "Handshake server handle!";
+		auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
-        auto ip = std::get<0>(_protocol->get_socket()->get_addr());
+		auto ip = std::get<0>(_protocol->get_socket()->get_addr());
         peers[_protocol->nonce] = _protocol;
         server_connections[ip] = std::move(_protocol);
     }
@@ -161,12 +162,19 @@ public:
 	}
 
 	template <typename ListenerType, typename ConnectorType>
-	void run()
+	void run(NodeRunState run_state = both)
 	{
-		listener = std::make_shared<ListenerType>(context, net, config->listenPort);
-        listen();
-		connector = std::make_shared<ConnectorType>(context, net);
-        auto_connect();
+		if (run_state == both || run_state == onlyServer)
+		{
+			listener = std::make_shared<ListenerType>(context, net, config->listenPort);
+			listen();
+		}
+
+		if (run_state == both || run_state == onlyClient)
+		{
+			connector = std::make_shared<ConnectorType>(context, net);
+			auto_connect();
+		}
 	}
 
 	// Handshake handlers

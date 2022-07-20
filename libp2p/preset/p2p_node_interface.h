@@ -40,16 +40,17 @@ public:
 								  if (!ec)
 								  {
 									  auto boost_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-									  auto socket = std::make_shared<SocketType>(std::move(boost_socket), net);
+									  auto socket = std::make_shared<SocketType>(
+											  boost_socket, net
+									  );
 									  handle(std::move(socket));
 									  socket->read();
-									  finish();
 								  }
 								  else
 								  {
 									  LOG_ERROR << "P2P Listener: " << ec.message();
 								  }
-//								  finish(); TODO
+								  finish();
 							  });
 	}
 
