@@ -29,7 +29,7 @@ namespace c2pool::dev
     public:
         //TODO: initialization methods
     public:
-        int listenPort = 3035;
+        int listenPort = 3037;
         int max_conns = 40;    //server max connections
         int desired_conns = 6; //client max connections
         int max_attempts = 10; //client максимум одновременно обрабатываемых попыток подключения
