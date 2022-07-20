@@ -45,7 +45,7 @@ public:
 									  auto socket = std::make_shared<SocketType>(
 											  boost_socket, net
 									  );
-									  handle(std::move(socket));
+									  handle(socket);
 									  socket->read();
 								  }
 								  else
