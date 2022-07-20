@@ -30,7 +30,8 @@ public:
 							std::tuple<std::string, std::string> _addr) = 0;
 };
 
-enum NodeRunState{
+enum NodeRunState
+{
 	onlyClient,
 	onlyServer,
 	both

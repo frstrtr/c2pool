@@ -31,6 +31,8 @@ public:
 		acceptor.set_option(io::socket_base::reuse_address(true));
 		acceptor.bind(listen_ep);
 		acceptor.listen();
+
+		LOG_INFO << "PoolNode Listener started for port: " << listen_ep.port();
 	}
 
 	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle, std::function<void()> finish) override

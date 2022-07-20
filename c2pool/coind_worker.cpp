@@ -1,5 +1,6 @@
 #include <iostream>
 #include <memory>
+#include <sstream>
 
 #include <libnet2/worker.h>
 #include <libnet2/coind_node.h>
@@ -9,6 +10,7 @@
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>
 #include <libp2p/preset/p2p_node_interface.h>
+#include <libp2p/node.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/jsonrpc/stratum.h>
 
@@ -20,14 +22,29 @@ int main(int ac, char *av[])
 	{
 		case 1:
 			LOG_FATAL << "Enter coind ip!";
+			return 1;
 		case 2:
 			LOG_FATAL << "Enter coind port!";
+			return 2;
 		case 3:
 			LOG_FATAL << "Enter coind login [user:pass]!";
+			return 3;
 	}
 	const char *coind_ip = av[1];
 	const char *coind_port = av[2];
 	const char *coind_login = av[3];
+
+	NodeRunState pool_node_mode = both;
+	if (ac >= 5)
+	{
+		std::stringstream ss;
+		ss << av[4];
+		int _pool_node_mode;
+		ss >> _pool_node_mode;
+
+		pool_node_mode = (NodeRunState) _pool_node_mode;
+		std::cout << pool_node_mode << std::endl;
+	}
 
 
 	// boost context
@@ -49,7 +66,7 @@ int main(int ac, char *av[])
 			->set_net(net)
 			->set_config(config)
 			->set_addr_store(addr_store);
-	pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
+	pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>(pool_node_mode);
 
 	// DEBUG
 	boost::asio::steady_timer t(*context, 10s);
