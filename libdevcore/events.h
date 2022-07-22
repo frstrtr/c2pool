@@ -231,4 +231,14 @@ public:
         }
         return *this;
     }
+
+	bool exist(KeyType key)
+	{
+		if (!this->isNull())
+		{
+			if (this->_value->find(key) != this->_value->end())
+				return true;
+		}
+		return false;
+	}
 };
