@@ -325,38 +325,74 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
             tx = known_txs.value()[tx_hash];
         } else
         {
+			bool founded_cache = false;
             for (auto cache : protocol->known_txs_cache)
             {
                 if (cache.find(tx_hash) != cache.end())
                 {
                     tx = cache[tx_hash];
                     LOG_INFO << "Transaction " << tx_hash.ToString() << " rescued from peer latency cache!";
+					founded_cache = true;
                     break;
-                } else
-                {
-                    LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString() << " disconnecting";
-                    protocol->get_socket()->disconnect();
-                    return;
                 }
             }
+
+			if (!founded_cache)
+			{
+				LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString() << " disconnecting";
+				protocol->get_socket()->disconnect();
+				return;
+			}
         }
+
+		protocol->remembered_txs[tx_hash] = tx;
+		PackStream stream;
+		stream << tx;
+		protocol->remembered_txs_size += 100 + stream.size();
     }
 
-//            if (remembered_txs_size >= max_remembered_txs_size)
-//            {
-//                throw std::runtime_error("too much transaction data stored!");
-//            }
+	std::map<uint256, coind::data::tx_type> added_known_txs;
+	bool warned = false;
+	for (auto _tx : msg->txs.value)
+	{
+		PackStream stream;
+		stream << _tx;
+		auto _tx_size = stream.size();
+		auto tx_hash = coind::data::hash256(stream);
+
+		if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
+		{
+			LOG_WARNING << "Peer referenced transaction twice, disconnecting";
+			protocol->get_socket()->disconnect();
+			return;
+		}
+
+		if (known_txs.exist(tx_hash) && !warned)
+		{
+			LOG_WARNING << "Peer sent entire transaction " << tx_hash.ToString() << " that was already received";
+			warned = true;
+		}
+
+		protocol->remembered_txs[tx_hash] = _tx;
+		protocol->remembered_txs_size += 100 + _tx_size;
+		added_known_txs[tx_hash] = _tx.get();
+	}
+
+	if (protocol->remembered_txs_size >= protocol->max_remembered_txs_size)
+	{
+		throw std::runtime_error("too much transaction data stored"); // TODO: custom error
+	}
 }
 
 void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
 	// TODO: wanna for fix:
-//    for (auto tx_hash : msg->tx_hashes.get())
-//    {
-//        PackStream stream;
-//        stream << protocol->remembered_txs[tx_hash];
-//        protocol->remembered_txs_size -= 100 + stream.size();
-//        assert(protocol->remembered_txs_size >= 0);
-//        protocol->remembered_txs.erase(tx_hash);
-//    }
+    for (auto tx_hash : msg->tx_hashes.get())
+    {
+        PackStream stream;
+        stream << protocol->remembered_txs[tx_hash];
+        protocol->remembered_txs_size -= 100 + stream.size();
+        assert(protocol->remembered_txs_size >= 0);
+        protocol->remembered_txs.erase(tx_hash);
+    }
 }
