@@ -381,6 +381,16 @@ struct PackStream
     {
         return data.size() <= 0;
     }
+
+	auto begin()
+	{
+		return data.begin();
+	}
+
+	auto end()
+	{
+		return data.end();
+	}
 };
 
 #undef GET_INT
