@@ -35,81 +35,70 @@ std::vector<addr_type> PoolNodeClient::get_good_peers(int max_count)
 void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                                      std::shared_ptr<pool::messages::message_version> msg)
 {
-    LOG_DEBUG
-        << "handle message_version";
-    LOG_INFO << "Peer "
-             << msg->addr_from.address.get()
-             << ":"
-             << msg->addr_from.port.get()
-             << " says protocol version is "
-             << msg->version.get()
-             << ", client version "
-             << msg->sub_version.get();
+	LOG_DEBUG << "handle message_version";
+	LOG_INFO << "Peer "
+			 << msg->addr_from.address.get()
+			 << ":"
+			 << msg->addr_from.port.get()
+			 << " says protocol version is "
+			 << msg->version.get()
+			 << ", client version "
+			 << msg->sub_version.get();
 
-    if (handshake->other_version.has_value())
-    {
-        LOG_DEBUG
-            << "more than one version message";
-    }
-    if (msg->version.get() <
-        net->MINIMUM_PROTOCOL_VERSION)
-    {
-        LOG_DEBUG
-            << "peer too old";
-    }
+	if (handshake->other_version.has_value())
+	{
+		LOG_DEBUG
+			<< "more than one version message";
+	}
+	if (msg->version.get() < net->MINIMUM_PROTOCOL_VERSION)
+	{
+		LOG_DEBUG << "peer too old";
+	}
 
-    handshake->other_version = msg->version.get();
-    handshake->other_sub_version = msg->sub_version.get();
-    handshake->other_services = msg->services.get();
+	handshake->other_version = msg->version.get();
+	handshake->other_sub_version = msg->sub_version.get();
+	handshake->other_services = msg->services.get();
 
-    if (msg->nonce.get() ==
-        nonce)
-    {
-        LOG_WARNING
-            << "was connected to self";
-        //TODO: assert
-    }
+	if (msg->nonce.get() == nonce)
+	{
+		LOG_WARNING
+			<< "was connected to self";
+		//TODO: assert
+	}
 
-    //detect duplicate in node->peers
-    if (peers.find(msg->nonce.get()) !=
-        peers.end())
-    {
+	//detect duplicate in node->peers
+	if (peers.find(msg->nonce.get()) != peers.end())
+	{
 
-    }
-    if (peers.count(
-            msg->nonce.get()) != 0)
-    {
-        auto addr = handshake->get_socket()->get_addr();
-        LOG_WARNING
-            << "Detected duplicate connection, disconnecting from "
-            << std::get<0>(addr)
-            << ":"
-            << std::get<1>(addr);
-        handshake->get_socket()->disconnect();
-        return;
-    }
+	}
+	if (peers.count(msg->nonce.get()) != 0)
+	{
+		auto addr = handshake->get_socket()->get_addr();
+		LOG_WARNING
+			<< "Detected duplicate connection, disconnecting from "
+			<< std::get<0>(addr)
+			<< ":"
+			<< std::get<1>(addr);
+		handshake->get_socket()->disconnect();
+		return;
+	}
 
-    handshake->nonce = msg->nonce.get();
-    //TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
-    //*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
+	handshake->nonce = msg->nonce.get();
+	//TODO: После получения message_version, ожидание сообщения увеличивается с 10 секунд, до 100.
+	//*Если сообщение не было получено в течении этого таймера, то происходит дисконект.
 
-//                                                                                                    socket->ping_timer.expires_from_now(
-//                                                                                                            boost::asio::chrono::seconds(
-//                                                                                                                    (int) c2pool::random::Expovariate(
-//                                                                                                                            1.0 /
-//                                                                                                                            100)));
-//                                                                                                    _socket->ping_timer.async_wait(
-//                                                                                                            boost::bind(
-//                                                                                                                    &P2P_Protocol::ping_timer_func,
-//                                                                                                                    this,
-//                                                                                                                    _1));
 
-    //TODO: if (p2p_node->advertise_ip):
-    //TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
+	//TODO: if (p2p_node->advertise_ip):
+	//TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
 
-    //TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
+	auto best_hash = msg->best_share_hash.get();
+	if (!best_hash.IsNull())
+	{
+//		TODO: handle_share_hashes({best_hash}, handshake )
+	}
+	//TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
 
-    //TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
+	//TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
 }
 
 void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol)
