@@ -33,6 +33,7 @@ public:
 	Variable<uint256> best_share;
 
 	std::map<uint64_t, std::shared_ptr<PoolProtocol>> peers;
+	std::set<uint256> shared_share_hashes;
 public:
 	PoolNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
 	{
@@ -80,5 +81,7 @@ public:
 
 	std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, addr_type peer_addr);
 	void handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares, std::shared_ptr<PoolProtocol> peer);
+	void handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocol> peer);
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
+	void broadcast_share(uint256 share_hash);
 };
