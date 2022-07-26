@@ -342,20 +342,21 @@ namespace pool::messages
     public:
         message_remember_tx() : Message("remember_tx") {}
 
-        message_remember_tx(std::vector<uint256> _tx_hashes) : message_remember_tx()
+        message_remember_tx(std::vector<uint256> _tx_hashes, std::vector<coind::data::tx_type> _txs) : message_remember_tx()
         {
             tx_hashes = tx_hashes.make_type(_tx_hashes);
+			txs = txs.make_type(_txs);
         }
 
         PackStream &write(PackStream &stream) override
         {
-            stream << tx_hashes;
+            stream << tx_hashes << txs;
             return stream;
         }
 
         PackStream &read(PackStream &stream) override
         {
-            stream >> tx_hashes;
+            stream >> tx_hashes >> txs;
             return stream;
         }
     };
