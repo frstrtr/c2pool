@@ -91,5 +91,5 @@ public:
 	void broadcast_share(uint256 share_hash);
 
 protected:
-	void send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with = {})
+	void send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with = {});
 };

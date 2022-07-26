@@ -240,6 +240,38 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 		throw("share have too many txs");
 	peer->remote_remembered_txs_size = new_remote_remembered_txs_size;
 
-	// Fragments
-	//TODO:
+	// Send messages
+
+	// 		Send remember tx
+	{
+		std::vector<uint256> _tx_hashes;
+		std::vector<coind::data::tx_type> _txs;
+
+		for (auto x : hashes_to_send)
+		{
+			if (peer->remote_tx_hashes.count(x))
+				_tx_hashes.push_back(x);
+			else
+				_txs.push_back(known_txs.value()[x]);
+		}
+
+		auto msg_remember_tx = std::make_shared<pool::messages::message_remember_tx>(_tx_hashes, _txs);
+		peer->write(msg_remember_tx);
+	}
+	// 		Send shares
+	{
+		//TODO:
+//		std::vector<ShareType> _shares;
+//
+//		auto msg_shares = std::make_shared<pool::messages::message_shares>(_shares);
+	}
+
+	//		Send forget tx
+	{
+		auto msg_forget_tx = std::make_shared<pool::messages::message_forget_tx>(hashes_to_send);
+		peer->write(msg_forget_tx);
+	}
+
+	peer->remote_remembered_txs_size -= new_tx_size;
+	auto t1 = c2pool::dev::timestamp();
 }
