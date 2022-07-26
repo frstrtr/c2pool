@@ -151,8 +151,6 @@ void PoolNodeData::broadcast_share(uint256 share_hash)
 	for (auto peer : peers)
 	{
 		send_shares(peer.second, shares, {share_hash});
-		//TODO: write sendShares in PoolProtocol
-//		peer.second->sendShares();
 	}
 
 }
