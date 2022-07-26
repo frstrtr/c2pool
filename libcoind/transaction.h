@@ -314,7 +314,7 @@ namespace coind::data::stream
 
 #define WitnessType ListType<StrType>
 
-    struct TransactionType_stream : CustomGetter<std::shared_ptr<TransactionType>>// : public Maker<TransactionType_stream, TransactionType>
+    struct TransactionType_stream : CustomGetter<std::shared_ptr<TransactionType>>, public Maker<TransactionType_stream, tx_type>
     {
         std::shared_ptr<coind::data::TransactionType> tx;
 
