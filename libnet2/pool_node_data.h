@@ -18,6 +18,8 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
+class CoindNodeData;
+
 class PoolNodeData
 {
 public:
@@ -26,6 +28,7 @@ public:
 	std::shared_ptr<c2pool::Network> net;
 	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
 	std::shared_ptr<ShareTracker> tracker;
+	std::shared_ptr<CoindNodeData> coind_node;
 	HandlerManagerPtr<PoolProtocol> handler_manager;
 
 	VariableDict<uint256, coind::data::tx_type> known_txs;
@@ -64,6 +67,8 @@ public:
 		return this;
 	}
 
+	auto set_coind_node(std::shared_ptr<CoindNodeData> _coind_node);
+
 public:
 	void got_addr(std::tuple<std::string, std::string> _addr, uint64_t services, int64_t timestamp)
 	{
@@ -84,4 +89,7 @@ public:
 	void handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocol> peer);
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 	void broadcast_share(uint256 share_hash);
+
+protected:
+	void send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with = {})
 };
