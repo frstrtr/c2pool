@@ -116,4 +116,4 @@ typedef std::shared_ptr<Share> ShareType;
 
 ShareType load_share(PackStream &stream, shared_ptr<c2pool::Network> net, addr_type peer_addr);
 
-std::shared_ptr<PackedShareData> pack_share(ShareType share);
+PackedShareData pack_share(ShareType share);

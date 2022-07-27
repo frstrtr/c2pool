@@ -1,5 +1,7 @@
 #include "pool_node_data.h"
+
 #include "coind_node_data.h"
+#include <sharechains/share.h>
 
 auto PoolNodeData::set_coind_node(std::shared_ptr<CoindNodeData> _coind_node)
 {
@@ -151,8 +153,6 @@ void PoolNodeData::broadcast_share(uint256 share_hash)
 	for (auto peer : peers)
 	{
 		send_shares(peer.second, shares, {share_hash});
-		//TODO: write sendShares in PoolProtocol
-//		peer.second->sendShares();
 	}
 
 }
@@ -260,10 +260,15 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 	}
 	// 		Send shares
 	{
-		//TODO:
-//		std::vector<ShareType> _shares;
-//
-//		auto msg_shares = std::make_shared<pool::messages::message_shares>(_shares);
+		std::vector<PackedShareData> _shares;
+		for (auto share : shares)
+		{
+			auto packed_share = pack_share(share);
+			_shares.push_back(std::move(packed_share));
+		}
+
+		auto msg_shares = std::make_shared<pool::messages::message_shares>(_shares);
+		peer->write(msg_shares);
 	}
 
 	//		Send forget tx
