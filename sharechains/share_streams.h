@@ -208,38 +208,38 @@ namespace shares::stream
         }
     };
 
-    struct ShareType_stream {
-        coind::data::stream::SmallBlockHeaderType_stream min_header;
-        ShareInfo_stream share_info;
-        MerkleLink_stream ref_merkle_link;
-        IntType(64) last_txout_nonce;
-        HashLinkType_stream hash_link;
-        MerkleLink_stream merkle_link;
-
-        ShareType_stream() = default;
-
-		ShareType_stream(const types::ShareTypeData &val)
-		{
-			min_header = val.min_header;
-			share_info = val.share_info;
-			ref_merkle_link = val.ref_merkle_link;
-			last_txout_nonce = val.last_txout_nonce;
-			hash_link = val.hash_link;
-			merkle_link = val.merkle_link;
-		}
-
-        PackStream &write(PackStream &stream)
-        {
-            stream << min_header << share_info << ref_merkle_link << last_txout_nonce << hash_link << merkle_link;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream)
-        {
-            stream >> min_header >> share_info >> ref_merkle_link >> last_txout_nonce >> hash_link >> merkle_link;
-            return stream;
-        }
-    };
+//    struct ShareType_stream {
+//        coind::data::stream::SmallBlockHeaderType_stream min_header;
+//        ShareInfo_stream share_info;
+//        MerkleLink_stream ref_merkle_link;
+//        IntType(64) last_txout_nonce;
+//        HashLinkType_stream hash_link;
+//        MerkleLink_stream merkle_link;
+//
+//        ShareType_stream() = default;
+//
+//		ShareType_stream(const types::ShareTypeData &val)
+//		{
+//			min_header = val.min_header;
+//			share_info = val.share_info;
+//			ref_merkle_link = val.ref_merkle_link;
+//			last_txout_nonce = val.last_txout_nonce;
+//			hash_link = val.hash_link;
+//			merkle_link = val.merkle_link;
+//		}
+//
+//        PackStream &write(PackStream &stream)
+//        {
+//            stream << min_header << share_info << ref_merkle_link << last_txout_nonce << hash_link << merkle_link;
+//            return stream;
+//        }
+//
+//        PackStream &read(PackStream &stream)
+//        {
+//            stream >> min_header >> share_info >> ref_merkle_link >> last_txout_nonce >> hash_link >> merkle_link;
+//            return stream;
+//        }
+//    };
 
     struct RefType
     {

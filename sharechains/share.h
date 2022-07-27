@@ -86,32 +86,34 @@ public:
         peer_addr = _addr;
 	}
 
+	~Share()
+	{
+		//share_data reference
+		previous_hash.release();
+		coinbase.release();
+		nonce.release();
+		pubkey_hash.release();
+		subsidy.release();
+		donation.release();
+		stale_info.release();
+		desired_version.release();
+
+		//other reference
+		new_transaction_hashes.release();
+		timestamp.release();
+		absheight.release();
+		abswork.release();
+	}
+
     /// called, when Builder finished building obj.
     void init();
 
     /// check for verify share.
     void check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coind::data::tx_type> other_txs = {});
-
-    ~Share()
-    {
-        //share_data reference
-        previous_hash.release();
-        coinbase.release();
-        nonce.release();
-        pubkey_hash.release();
-        subsidy.release();
-        donation.release();
-        stale_info.release();
-        desired_version.release();
-
-        //other reference
-        new_transaction_hashes.release();
-        timestamp.release();
-        absheight.release();
-        abswork.release();
-    }
 };
 
 typedef std::shared_ptr<Share> ShareType;
 
 ShareType load_share(PackStream &stream, shared_ptr<c2pool::Network> net, addr_type peer_addr);
+
+std::shared_ptr<PackedShareData> pack_share(ShareType share);
