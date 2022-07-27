@@ -237,7 +237,7 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 	}
 }
 
-std::shared_ptr<PackedShareData> pack_share(ShareType share)
+PackedShareData pack_share(ShareType share)
 {
 	// Pack share to t['share_type'] from p2pool
 	PackStream contents;
@@ -250,7 +250,7 @@ std::shared_ptr<PackedShareData> pack_share(ShareType share)
 	contents << *share->merkle_link->stream();
 
 	// Pack share to PackedShareData
-	auto result = std::make_shared<PackedShareData>(share->VERSION, contents);
+	PackedShareData result(share->VERSION, contents);
 
 	return result;
 }
