@@ -30,10 +30,17 @@ protected:
 		socket->write(msg);
 	}
 
+private:
+	void _get_shares(uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
+	{
+		auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
+		socket->write(msg);
+	}
+
 public:
     PoolHandshake(auto socket, std::function<void(std::shared_ptr<PoolHandshake>,
                                                   std::shared_ptr<pool::messages::message_version>)> _handler)
-            : Handshake(socket), PoolProtocolData(3301), handle_message_version(std::move(_handler))
+            : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<PackedShareData>, uint256, std::vector<uint256>, uint64_t, std::vector<uint256>>(std::bind(&PoolHandshake::_get_shares, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), 15, [&](){socket->disconnect();})), handle_message_version(std::move(_handler))
     {
 
     }
