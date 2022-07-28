@@ -36,8 +36,15 @@ namespace c2pool::random
         {
             bytes.emplace_back(c2pool::random::RandomInt(0, 256));
         }
-
+		return bytes;
     }
+
+	uint256 random_uint256()
+	{
+		auto bytes = random_bytes(32);
+		uint256 result(bytes);
+		return result;
+	}
 
     template <typename T>
     T RandomChoice(std::vector<T> &list)
