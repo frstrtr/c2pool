@@ -2,6 +2,7 @@
 #include <vector>
 #include <map>
 #include <list>
+#include <btclibs/uint256.h>
 
 namespace c2pool::random
 {
@@ -12,6 +13,8 @@ namespace c2pool::random
     float RandomFloat(float min, float max);
 
     std::vector<unsigned char> random_bytes(int32_t length);
+
+	uint256 random_uint256();
 
     template <typename T>
     T RandomChoice(std::vector<T> &list);
