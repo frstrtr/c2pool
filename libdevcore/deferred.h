@@ -84,10 +84,17 @@ namespace c2pool::deferred
             callbacks.push_back(_callback);
         }
 
-        void await()
+        void await(std::function<void()> timeout_func = nullptr)
         {
             await_timer.async_wait(std::bind(&result_reply<ReturnType>::await_result, this, std::placeholders::_1));
             timeout_timer.async_wait(std::bind(&result_reply<ReturnType>::await_timeout, this, std::placeholders::_1));
+
+			if (timeout_func)
+			{
+				timeout_timer.async_wait([f = std::move(timeout_func)](){
+					f();
+				});
+			}
         }
 
         void set_value(ReturnType val)
@@ -131,6 +138,45 @@ namespace c2pool::deferred
             result[key]->add_callback(__f);
         }
     };
+
+	// in p2pool: GenericDeferrer
+	template <typename ReturnType, typename... Args>
+	struct QueryDeferrer
+	{
+		std::map<uint256, std::shared_ptr<result_reply<ReturnType>>> result;
+		std::function<void(Args...)> func;
+		time_t timeout_t;
+		std::function<void()> timeout_func;
+
+		QueryDeferrer(std::function<void(Args...)> _func, time_t _timeout_t = 5, std::function<void()> _timeout_func = nullptr) : func(_func), timeout_t(_timeout_t), timeout_func(std::move(_timeout_func)) {}
+
+		uint256 operator()(std::shared_ptr<io::io_context> _context, Args... ARGS)
+		{
+			uint256 id;
+			do
+			{
+				id = c2pool::random::random_uint256();
+			} while (result.count(id));
+
+			func(ARGS...);
+
+			result[id] = std::make_shared<result_reply<ReturnType>>(_context, timeout_t);
+			result[id]->await(timeout_func);
+
+			return id;
+		}
+
+		void got_response(uint256 id, ReturnType val)
+		{
+			result[id]->set_value(val);
+		}
+
+		void yield(std::shared_ptr<io::io_context> _context, std::function<void(ReturnType)> __f, Args... ARGS)
+		{
+			auto id = this->operator()(_context, ARGS...);
+			result[id]->add_callback([f = std::move(__f), _id = id](ReturnType return_data){f(_id, return_data);});
+		}
+	};
 
     template <typename RetType>
     class Deferred
