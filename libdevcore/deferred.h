@@ -91,7 +91,7 @@ namespace c2pool::deferred
 
 			if (timeout_func)
 			{
-				timeout_timer.async_wait([f = std::move(timeout_func)](){
+				timeout_timer.async_wait([f = std::move(timeout_func)](const boost::system::error_code &ec){
 					f();
 				});
 			}
@@ -174,7 +174,7 @@ namespace c2pool::deferred
 		void yield(std::shared_ptr<io::io_context> _context, std::function<void(ReturnType)> __f, Args... ARGS)
 		{
 			auto id = this->operator()(_context, ARGS...);
-			result[id]->add_callback([f = std::move(__f), _id = id](ReturnType return_data){f(_id, return_data);});
+			result[id]->add_callback(__f);
 		}
 	};
 
