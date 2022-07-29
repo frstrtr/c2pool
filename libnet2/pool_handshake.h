@@ -40,7 +40,7 @@ private:
 public:
     PoolHandshake(auto socket, std::function<void(std::shared_ptr<PoolHandshake>,
                                                   std::shared_ptr<pool::messages::message_version>)> _handler)
-            : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<PackedShareData>, uint256, std::vector<uint256>, uint64_t, std::vector<uint256>>(std::bind(&PoolHandshake::_get_shares, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), 15, [&](){socket->disconnect();})), handle_message_version(std::move(_handler))
+            : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(std::bind(&PoolHandshake::_get_shares, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4), 15, [&](){socket->disconnect();})), handle_message_version(std::move(_handler))
     {
 
     }

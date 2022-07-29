@@ -228,17 +228,16 @@ void PoolNode::handle_message_sharereq(std::shared_ptr<pool::messages::message_s
     {
         for (auto share: shares)
         {
-            //TODO: share->PackedShareData
-//                    auto contents = share->to_contents();
-//                    share_type _share(share->SHARE_VERSION, contents.write());
-//                    _shares.push_back(_share);
+			PackedShareData _data = pack_share(share);
+			_shares.push_back(_data);
         }
         auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), good, _shares);
         protocol->write(reply_msg);
     }
     catch (const std::invalid_argument &e)
     {
-        auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), too_long, _shares);
+		// TODO: check for too_long
+        auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), too_long, std::vector<PackedShareData>{});
         protocol->write(reply_msg);
     }
 }
@@ -263,7 +262,7 @@ void PoolNode::handle_message_sharereply(std::shared_ptr<pool::messages::message
     {
         //TODO: res = failure.Failure(self.ShareReplyError(result))
     }
-    //TODO: self.get_shares.got_response(id, res)
+	protocol->get_shares.got_response(msg->id.get(), res);
 }
 
 void PoolNode::handle_message_bestblock(std::shared_ptr<pool::messages::message_bestblock> msg, std::shared_ptr<PoolProtocol> protocol)
