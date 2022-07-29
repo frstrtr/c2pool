@@ -119,19 +119,15 @@ void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_
 	if (new_hashes.empty())
 		return;
 
-	//TODO: deferred request for shares to peer
-	/*
-	 * try:
-            shares = yield peer.get_shares(
-                hashes=new_hashes,
-                parents=0,
-                stops=[],
-            )
-        except:
-            log.err(None, 'in handle_share_hashes:')
-        else:
-            self.handle_shares([(share, []) for share in shares], peer)
-	 */
+	peer->get_shares.yield(context, [&, _peer = peer](std::vector<ShareType> shares)
+	{
+		vector<tuple<ShareType, std::vector<coind::data::tx_type>>> _shares;
+		for (auto _share: shares)
+		{
+			_shares.push_back({_share, {}});
+		}
+		handle_shares(_shares, _peer);
+	}, new_hashes, 0, {});
 }
 
 void PoolNodeData::broadcast_share(uint256 share_hash)
