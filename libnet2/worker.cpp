@@ -605,8 +605,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                         if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()) &&
                             _pool_node)
                         {
-                            //TODO:
-//                                self.node.p2p_node.broadcast_share(share.hash)
+							_pool_node->broadcast_share(share->hash);
                         }
                     } catch (const std::error_code &ec)
                     {
