@@ -144,11 +144,11 @@ namespace c2pool::deferred
 	struct QueryDeferrer
 	{
 		std::map<uint256, std::shared_ptr<result_reply<ReturnType>>> result;
-		std::function<void(Args...)> func;
+		std::function<void(uint256, Args...)> func;
 		time_t timeout_t;
 		std::function<void()> timeout_func;
 
-		QueryDeferrer(std::function<void(Args...)> _func, time_t _timeout_t = 5, std::function<void()> _timeout_func = nullptr) : func(_func), timeout_t(_timeout_t), timeout_func(std::move(_timeout_func)) {}
+		QueryDeferrer(std::function<void(uint256, Args...)> _func, time_t _timeout_t = 5, std::function<void()> _timeout_func = nullptr) : func(_func), timeout_t(_timeout_t), timeout_func(std::move(_timeout_func)) {}
 
 		uint256 operator()(std::shared_ptr<io::io_context> _context, Args... ARGS)
 		{
@@ -158,7 +158,7 @@ namespace c2pool::deferred
 				id = c2pool::random::random_uint256();
 			} while (result.count(id));
 
-			func(ARGS...);
+			func(id, ARGS...);
 
 			result[id] = std::make_shared<result_reply<ReturnType>>(_context, timeout_t);
 			result[id]->await(timeout_func);
