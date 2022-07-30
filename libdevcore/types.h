@@ -30,6 +30,8 @@ public:
 
     address_type(unsigned long long _services, std::string _address, int _port);
 
+	address_type(unsigned long long _services, std::string _address, std::string _port);
+
     address_type &operator=(UniValue value)
     {
         services = value["services"].get_uint64();

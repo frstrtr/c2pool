@@ -1,5 +1,6 @@
 #include "types.h"
 #include <iostream>
+#include <sstream>
 #include <string>
 
 address_type::address_type()
@@ -14,6 +15,16 @@ address_type::address_type(unsigned long long _services, std::string _address, i
     services = _services;
     address = _address;
     port = _port;
+}
+
+address_type::address_type(unsigned long long _services, std::string _address, std::string _port)
+{
+	services = _services;
+	address = _address;
+
+	std::stringstream ss;
+	ss << _port;
+	ss >> port;
 }
 
 bool operator==(const address_type &first, const address_type &second)

@@ -35,52 +35,70 @@ public:
 protected:
     void socket_handle(std::shared_ptr<Socket> socket)
     {
-//        client_attempts[std::get<0>(socket->get_addr())] = std::make_shared<P2PHandshakeClient>(std::move(socket),
-//                                                                                                message_version_handle,
-//                                                                                                std::bind(
-//                                                                                                        &P2PNodeClient::handshake_handle,
-//                                                                                                        this,
-//                                                                                                        std::placeholders::_1));
+		auto addr = socket->get_addr();
+
+		protocol = std::make_shared<CoindProtocol>(context, socket, handler_manager);
     }
-//
-//    void handshake_handle(std::shared_ptr<P2PHandshake> _handshake)
-//    {
-//        auto _protocol = std::make_shared<P2PProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
-//        _protocol->set_handler_manager(handler_manager);
-//
-//        auto ip = std::get<0>(_protocol->get_socket()->get_addr());
-//        peers[_protocol->nonce] = _protocol;
-//        client_connections[ip] = std::move(_protocol);
-//    }
 };
 
+#define SET_POOL_DEFAULT_HANDLER(msg) \
+	handler_manager->new_handler<coind::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
 class CoindNode : public virtual CoindNodeData, CoindNodeClient
 {
+private:
+	bool isRunning = false;
 public:
     CoindNode(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)), CoindNodeClient(context),
                                                           work_poller_t(*context)
     {
+		SET_POOL_DEFAULT_HANDLER(version);
+		SET_POOL_DEFAULT_HANDLER(verack);
+		SET_POOL_DEFAULT_HANDLER(ping);
+		SET_POOL_DEFAULT_HANDLER(pong);
+		SET_POOL_DEFAULT_HANDLER(alert);
+		SET_POOL_DEFAULT_HANDLER(getaddr);
+		SET_POOL_DEFAULT_HANDLER(addr);
+		SET_POOL_DEFAULT_HANDLER(inv);
+		SET_POOL_DEFAULT_HANDLER(getdata);
+		SET_POOL_DEFAULT_HANDLER(reject);
+		SET_POOL_DEFAULT_HANDLER(getblocks);
+		SET_POOL_DEFAULT_HANDLER(getheaders);
 
+		SET_POOL_DEFAULT_HANDLER(tx);
+		SET_POOL_DEFAULT_HANDLER(block);
+		SET_POOL_DEFAULT_HANDLER(headers);
     }
+
+	template <typename ConnectorType>
+	void run()
+	{
+		if (isRunning)
+			throw std::runtime_error("CoindNode already running");
+
+		connector = std::make_shared<ConnectorType>(context, parent_net);
+
+		start();
+		isRunning = true;
+	}
 public:
 
-    void handle(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_verack> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_ping> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_pong> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_alert> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_getaddr> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_addr> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_inv> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_getdata> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_reject> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_getblocks> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_getheaders> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_getaddr(std::shared_ptr<coind::messages::message_getaddr> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_addr(std::shared_ptr<coind::messages::message_addr> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_getdata(std::shared_ptr<coind::messages::message_getdata> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_reject(std::shared_ptr<coind::messages::message_reject> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_getblocks(std::shared_ptr<coind::messages::message_getblocks> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_getheaders(std::shared_ptr<coind::messages::message_getheaders> msg, std::shared_ptr<CoindProtocol> protocol);
 
-    void handle(std::shared_ptr<coind::messages::message_tx> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_block> msg, std::shared_ptr<CoindProtocol> protocol);
-    void handle(std::shared_ptr<coind::messages::message_headers> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, std::shared_ptr<CoindProtocol> protocol);
+    void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, std::shared_ptr<CoindProtocol> protocol);
 private:
     boost::asio::deadline_timer work_poller_t;
 
@@ -90,3 +108,4 @@ private:
 
 
 };
+#undef SET_POOL_DEFAULT_HANDLER
