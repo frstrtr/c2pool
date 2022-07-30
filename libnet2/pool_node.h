@@ -92,6 +92,7 @@ public:
         auto ip = std::get<0>(_protocol->get_socket()->get_addr());
         peers[_protocol->nonce] = _protocol;
         client_connections[ip] = std::move(_protocol);
+//	TODO:	client_attempts.erase(ip);
     }
 
 	void auto_connect()
