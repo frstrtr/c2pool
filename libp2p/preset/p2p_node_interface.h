@@ -110,3 +110,56 @@ public:
 							   });
 	}
 };
+
+template <typename SocketType>
+class CoindConnector : public Connector
+{
+private:
+	std::shared_ptr<io::io_context> context;
+	std::shared_ptr<coind::ParentNetwork> net;
+
+	ip::tcp::resolver resolver;
+
+public:
+	CoindConnector(auto _context, auto _net) : context(std::move(_context)), net(std::move(_net)), resolver(*context)
+	{
+	}
+
+	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
+					std::tuple<std::string, std::string> _addr) override
+	{
+		auto [ip, port] = _addr;
+		resolver.async_resolve(ip, port,
+							   [&, _ip = ip, _port = port, _handler = socket_handle](
+									   const boost::system::error_code &er,
+									   const boost::asio::ip::tcp::resolver::results_type endpoints)
+							   {
+								   if (er) {
+									   LOG_WARNING << "P2PConnector[resolve]: " << er.message();
+								   }
+								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
+								   auto socket = std::make_shared<SocketType>(
+										   _socket, net
+								   );
+
+
+								   boost::asio::async_connect(*_socket, endpoints,
+															  [sock = std::move(socket), handler = _handler](
+																	  const boost::system::error_code &ec,
+																	  boost::asio::ip::tcp::endpoint ep)
+															  {
+																  LOG_INFO << "Connect to " << ep.address() << ":"
+																		   << ep.port();
+																  if (!ec)
+																  {
+																	  handler(sock);
+																	  sock->read();
+																  } else
+																  {
+																	  LOG_ERROR << "async_connect: " << ec << " "
+																				<< ec.message();
+																  }
+															  });
+							   });
+	}
+};
