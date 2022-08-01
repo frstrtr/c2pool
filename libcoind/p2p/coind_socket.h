@@ -12,9 +12,9 @@
 class CoindSocket : public Socket
 {
 private:
-	boost::asio::ip::tcp::socket socket;
+	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 
-	std::shared_ptr<c2pool::Network> net;
+	std::shared_ptr<coind::ParentNetwork> net;
 public:
 
     CoindSocket(auto _socket, auto _net) : Socket(), socket(std::move(_socket)), net(std::move(_net))
@@ -52,19 +52,19 @@ public:
 
 	bool isConnected() override
 	{
-		return socket.is_open();
+		return socket->is_open();
 	}
 
 	void disconnect() override
 	{
 		// TODO: call event disconnect
-		socket.close();
+		socket->close();
 	}
 
 	tuple<std::string, std::string> get_addr() override
 	{
 		boost::system::error_code ec;
-		auto ep = socket.remote_endpoint(ec);
+		auto ep = socket->remote_endpoint(ec);
 		// TODO: log ec;
 		return {ep.address().to_string(), std::to_string(ep.port())};
 	}

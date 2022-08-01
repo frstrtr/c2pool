@@ -9,3 +9,6 @@ target_link_libraries(coind_worker libcoind libnet2 libdevcore networks sharecha
 
 add_executable(only_pool_node only_pool_node.cpp)
 target_link_libraries(only_pool_node libnet2 libdevcore networks sharechains libp2ppreset)
+
+add_executable(only_coind_node only_coind_node.cpp)
+target_link_libraries(only_coind_node libcoind libnet2 libdevcore networks sharechains libp2ppreset)
