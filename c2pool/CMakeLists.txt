@@ -12,3 +12,6 @@ target_link_libraries(only_pool_node libnet2 libdevcore networks sharechains lib
 
 add_executable(only_coind_node only_coind_node.cpp)
 target_link_libraries(only_coind_node libcoind libnet2 libdevcore networks sharechains libp2ppreset)
+
+add_executable(only_jsorpc_coind only_jsorpc_coind.cpp)
+target_link_libraries(only_jsorpc_coind libcoind libnet2 libdevcore networks sharechains libp2ppreset)
