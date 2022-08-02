@@ -134,11 +134,11 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 
 	end = c2pool::dev::timestamp();
 
-	int check_error_res = check_error(getblocktemplate_result);
-	if (!check_error_res)
+	auto [ec, ec_msg] = check_error(getblocktemplate_result);
+	if (ec)
 	{
-		//TODO: LOG ERROR 'Error: Bitcoin version too old! Upgrade to v0.5 or newer!'
-		//raise
+		LOG_ERROR << "Error code: " << ec << ", Error message: " << ec_msg;
+		throw std::runtime_error(ec_msg); // TODO: Custom error for jsonrpc
 	}
 	work = getblocktemplate_result["result"].get_obj();
 

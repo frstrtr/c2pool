@@ -49,28 +49,25 @@ namespace coind
 
 		//https://github.com/bitcoin/bitcoin/blob/master/src/rpc/protocol.h
 		//0 = OK!
-		int check_error(UniValue result)
+		std::tuple<int, std::string> check_error(UniValue result)
 		{
 			if (result.exists("error"))
 			{
 				if (result["error"].empty())
 				{
-					return 0;
+					return std::make_tuple(0, "");
 				}
 			}
 			else
 			{
-				return 0;
+				return std::make_tuple(0, "");
 			}
 
-			//-----------
 			auto error_obj = result["error"].get_obj();
-			int actual_error_code = error_obj["code"].get_int();
-			string actual_error_msg = error_obj["message"].get_str();
+			int ec = error_obj["code"].get_int();
+			string ec_msg = error_obj["message"].get_str();
 
-			//TODO: log actual_error_msg!
-
-			return actual_error_code;
+			return std::make_tuple(ec, ec_msg);
 		}
 
 	public:
@@ -99,6 +96,7 @@ namespace coind
 			// Connection
 			auto const results = resolver.resolve(ip, port);
 			stream.connect(results);
+			std::cout << "Jsonrpc Coind socket open: " << stream.socket().is_open() << std::endl;
 
 			delete[] encoded_login;
 		}
