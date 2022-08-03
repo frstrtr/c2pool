@@ -36,6 +36,10 @@ Dogecoin:
 Chia (XCH):
 
 ### xch120duz2pn97053lrd0ym4vxqe4hlv2awslc9pf4ld5vf7nvagv46s2t0azk
+  
+DASH:
+
+### XcSyqMKS1KWNnQ7nH335oiqrqvMiqXuHRw
 
 </details>
 
