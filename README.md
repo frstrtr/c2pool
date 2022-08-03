@@ -31,7 +31,7 @@ DGB:
 
 Dogecoin:
 
-### DNJx6HYka3mncLBaw1TLUARtXxe2BgjHf6
+### DF4FSgY3f2ThkNK7HpQtHNcSoyrB1bQaMN
 
 Chia (XCH):
 
