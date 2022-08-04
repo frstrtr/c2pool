@@ -18,6 +18,8 @@ TEST(TX_TEST, data_load)
 	unpacked = _unpacked.tx;
 }
 
+// TODO:
+/*
 TEST(CoindTxs, tx_hash)
 {
     vector<coind::data::TxInType> _tx_ins;
@@ -76,4 +78,34 @@ TEST(CoindTxs, tx_hash)
     arith_hash_tx2 += 1;
     auto hash_tx2 = ArithToUint256(arith_hash_tx2);
     std::cout << HexStr(hash_tx2.begin(), hash_tx2.end()) << std::endl;
+}
+*/
+
+TEST(JSONRPC_DATA, data_unpack)
+{
+    std::string x = "01000000013ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff01c40965f0020000001976a9141462c3dd3f936d595c9af55978003b27c250441f88ac80feea62";
+    PackStream packed = PackStream(ParseHex(x));
+    uint256 txid = coind::data::hash256(packed, true);
+
+//    std::cout << "TXID: " << txid.GetHex() << std::endl;
+    ASSERT_EQ(txid.GetHex(), "3cd5e16cd8caff78cec651bb72b681bd4bb6d36a0069211242f6709ca9cff7bb");
+
+    auto hex_data = ParseHex(x);
+    for (auto _x : hex_data)
+    {
+        std::cout << (unsigned int)_x << " ";
+    }
+    std::cout << std::endl;
+    arith_uint256 hex_uint;
+    hex_uint.SetHex("0100");
+    std::cout << hex_uint.ToString() << std::endl;
+
+    IntType(32) version;
+    PackStream packed_version(ParseHex("0100000001"));
+    packed_version >> version;
+    std::cout << "VERSION: " << version.get();
+
+    coind::data::stream::TransactionType_stream _unpacked;
+    packed >> _unpacked;
+
 }
