@@ -83,8 +83,10 @@ public:
     std::shared_ptr<Event<VarType, VarType>> transitioned;
 
 public:
-    Variable()
+    Variable(bool default_init = false)
     {
+        if (default_init)
+            _value = std::make_shared<VarType>();
         changed = std::make_shared<Event<VarType>>();
         transitioned = std::make_shared<Event<VarType, VarType>>();
     }
@@ -109,7 +111,7 @@ public:
 
     Variable<VarType> &operator=(const VarType &__value)
     {
-        if (_value)
+        if (!_value)
             _value = std::make_shared<VarType>();
 
         if (*_value != __value)
@@ -145,7 +147,7 @@ public:
     std::shared_ptr<Event<MapType>> added;
     std::shared_ptr<Event<MapType>> removed;
 
-    VariableDict()
+    VariableDict(bool default_init = false) : Variable<std::map<KeyType, VarType>>(default_init)
     {
         added = std::make_shared<Event<MapType>>();
         removed = std::make_shared<Event<MapType>>();
@@ -222,6 +224,9 @@ public:
 
     VariableDict<KeyType, VarType> &operator=(const MapType &__value)
     {
+        if (this->isNull())
+            return *this;
+
         if (*this->_value != __value)
         {
             auto oldvalue = *this->_value;
