@@ -96,14 +96,6 @@ TEST(JSONRPC_DATA, data_unpack)
         std::cout << (unsigned int)_x << " ";
     }
     std::cout << std::endl;
-    arith_uint256 hex_uint;
-    hex_uint.SetHex("0100");
-    std::cout << hex_uint.ToString() << std::endl;
-
-    IntType(32) version;
-    PackStream packed_version(ParseHex("0100000001"));
-    packed_version >> version;
-    std::cout << "VERSION: " << version.get();
 
     coind::data::stream::TransactionType_stream _unpacked;
     packed >> _unpacked;
