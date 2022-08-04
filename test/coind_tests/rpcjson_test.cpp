@@ -105,6 +105,6 @@ TEST_F(Bitcoind_JSONRPC, multi_getwork)
             std::cout << v->version << std::endl;
         }
         std::cout << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
