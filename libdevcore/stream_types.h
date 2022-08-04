@@ -15,6 +15,32 @@
 #include "logger.h"
 using namespace std;
 
+struct VarIntType : public Maker<VarIntType, uint64_t>, public Getter<uint64_t>
+{
+    typedef uint64_t value_type;
+
+    VarIntType() {}
+
+    VarIntType(uint64_t _v)
+    {
+        value = _v;
+    }
+
+    PackStream &write(PackStream &stream)
+    {
+        stream << value;
+
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        stream >> value;
+
+        return stream;
+    }
+};
+
 template <typename T>
 struct ListType : public MakerListType<T>, public GetterList<T>
 {
@@ -50,8 +76,10 @@ struct ListType : public MakerListType<T>, public GetterList<T>
 
     PackStream &read(PackStream &stream)
     {
-        auto len = 0;
-        stream >> len;
+        VarIntType _len;
+        stream >> _len;
+
+        auto len = _len.get();
         for (int i = 0; i < len; i++)
         {
             T temp;
@@ -113,23 +141,20 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 
     PackStream &write(PackStream &stream) const
     {
-//        ListType<unsigned char> list_s(value);
-//        std::cout << "list_s.l: ";
-//        for (auto v : list_s.value){
-//            std::cout << (unsigned int) v << " ";
-//        }
-//        std::cout << std::endl;
-
-        auto _len = value.size();
+        VarIntType _len = value.size();
         stream << _len << PackStream(value);
         return stream;
     }
 
     PackStream &read(PackStream &stream)
     {
-        ListType<unsigned char> list_s;
-        stream >> list_s;
-        value = std::move(list_s.value);
+        VarIntType _len;
+        stream >> _len;
+
+        auto len = _len.get();
+
+        value.insert(value.end(), stream.data.begin(), stream.data.begin()+len);
+        stream.data.erase(stream.data.begin(), stream.data.begin()+len);
         return stream;
     }
 
@@ -139,7 +164,7 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
     }
 };
 
-//TODO: TEST
+//TODO: TEST + UPDATE
 template <int SIZE>
 struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGetter<std::string>
 {
@@ -314,32 +339,6 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
 #define INT256 ULongIntType<uint256>
 
 #define IntType(bytes) INT##bytes
-
-struct VarIntType : public Maker<VarIntType, uint64_t>, public Getter<uint64_t>
-{
-    typedef uint64_t value_type;
-
-    VarIntType() {}
-
-    VarIntType(uint64_t _v)
-    {
-        value = _v;
-    }
-
-    PackStream &write(PackStream &stream)
-    {
-        stream << value;
-
-        return stream;
-    }
-
-    PackStream &read(PackStream &stream)
-    {
-        stream >> value;
-
-        return stream;
-    }
-};
 
 //PACK_TYPE = StreamObjType
 template <StreamEnumType ENUM_T, typename PACK_TYPE = IntType(32)>

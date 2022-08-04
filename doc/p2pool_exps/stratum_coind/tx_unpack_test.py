@@ -758,9 +758,6 @@ print(num_packed)
 start_tx_data = ComposedType([
     ('version', IntType(32)),
     ('marker', VarIntType())])
-
-_x = b'01000'
-print(start_tx_data.unpack(_x))
 #######################
 
 
@@ -770,3 +767,13 @@ for c in x:
     __x += [ord(c)]
 print(__x)
 print(start_tx_data.unpack(x))
+
+#################################
+second_tx_data = ComposedType([
+    ('version', IntType(32)),
+    ('marker', VarIntType()),
+    ('tx_in', tx_in_type)])
+
+
+x = '01000000013ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff'.decode('hex')
+print(second_tx_data.unpack(x))
