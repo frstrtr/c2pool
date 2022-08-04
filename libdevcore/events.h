@@ -55,10 +55,13 @@ public:
 //        //return bc;
 //	}
 
-    void happened(Args... args)
+    void happened(Args & ... args)
     {
-        (*sig)(args...);
-        (*sig_anon)();
+        if (!sig->empty())
+            (*sig)(args...);
+        if (!sig_anon->empty())
+            (*sig_anon)();
+
         *times += 1;
     }
 
@@ -230,7 +233,14 @@ public:
         if (*this->_value != __value)
         {
             auto oldvalue = *this->_value;
-            *this->_value = __value;
+
+            this->_value->clear();
+            for (auto [k, v] : __value)
+            {
+                (*this->_value)[k] = v;
+            }
+//            *this->_value = __value;
+
             this->changed->happened(*this->_value);
             this->transitioned->happened(oldvalue, *this->_value);
         }
