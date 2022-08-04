@@ -380,14 +380,11 @@ namespace coind::data::stream
                 {
                     TxInType_stream tx_in_stream;
                     stream >> tx_in_stream;
-                    std::cout << "seq=" << tx_in_stream.sequence.get() << std::endl;
-                    std::cout << "prev_out.hash=" << tx_in_stream.previous_output.get().hash.get().ToString() << std::endl;
 
                     auto ptr_tx_in = make_shared<coind::data::stream::TxInType_stream>(tx_in_stream);
                     TxInType tx_in(ptr_tx_in);
                     tx_ins.push_back(tx_in);
                 }
-                std::cout << "TXIN DATA: seq=" << tx_ins[0].sequence << ", previous_output.hash=" << tx_ins[0].previous_output.hash << std::endl;
 
                 NTXType next;
                 stream >> next;

@@ -39,11 +39,14 @@ public:
 	Variable<coind::getwork_result> coind_work;
 	Variable<coind::data::BlockHeaderType> best_block_header;
 	coind::HeightTracker get_height_rel_highest;
-
 public:
 	CoindNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context)), get_height_rel_highest(coind, [&](){return coind_work.value().previous_block; })
 	{
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
+
+        known_txs = VariableDict<uint256, coind::data::tx_type>(true);
+        mining_txs = VariableDict<uint256, coind::data::tx_type>(true);
+        mining2_txs = VariableDict<uint256, coind::data::tx_type>(true);
 	}
 
 	auto set_parent_net(std::shared_ptr<coind::ParentNetwork> _net)
