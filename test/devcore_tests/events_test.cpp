@@ -12,7 +12,8 @@ TEST(DevcoreEvents, event_lambda)
 						res = value;
 					});
 
-	event.happened(500);
+	int v = 500;
+	event.happened(v);
 	ASSERT_EQ(500, res);
 }
 
@@ -28,7 +29,9 @@ TEST(DevcoreEvents, event_run_and_subscribe)
     ASSERT_EQ(res, 99);
 
     res = 0;
-    event.happened(199);
+
+	auto v = 199;
+    event.happened(v);
     ASSERT_EQ(res, 99);
 
     res = 0;
@@ -36,7 +39,8 @@ TEST(DevcoreEvents, event_run_and_subscribe)
     event.subscribe([&](const int &value){
         res2 = value;
     });
-    event.happened(511);
+	auto v2 = 511;
+    event.happened(v2);
 
     ASSERT_EQ(res, 99);
     ASSERT_EQ(res2, 511);
@@ -50,7 +54,9 @@ TEST(DevcoreEvents, event_copy)
     event.subscribe([&res](const int &value){
         res = value;
     });
-    event.happened(123);
+
+	auto v = 123;
+    event.happened(v);
     ASSERT_EQ(res, 123);
 
     int res2 = res;
@@ -60,7 +66,9 @@ TEST(DevcoreEvents, event_copy)
     event_copy.subscribe([&res2] (const int &value){
         res2 += 127;
     });
-    event_copy.happened(50);
+
+	auto v2 = 50;
+    event_copy.happened(v2);
 
     ASSERT_EQ(res, 50);
     ASSERT_EQ(res2, 250);
@@ -96,7 +104,8 @@ TEST(DevcoreEvents, event_class_method)
 	//event.subscribe(&TestEvent::testF, obj);
 	event.subscribe([&](int value)
 					{ obj->testF(value); });
-	event.happened(1337);
+	auto v = 1337;
+	event.happened(v);
 
 	ASSERT_EQ(1337, obj->res);
 	delete obj;
@@ -116,7 +125,9 @@ TEST(DevcoreEvents, event_many_args)
 						res2 = value2;
 					});
 
-	event.happened(500, 10.5);
+	auto v = 500;
+	auto v2 = 10.5;
+	event.happened(v, v2);
 	ASSERT_EQ(500, res);
 	ASSERT_EQ(10.5, res2);
 }
@@ -227,4 +238,18 @@ TEST(DevcoreEvents, variabledict_set)
 
     std::map<int, int> new_var_value = {{0,1}, {2,3}};
     var = new_var_value;
+}
+
+TEST(DevcoreEvents, variabledict2_set)
+{
+	VariableDict<int, std::shared_ptr<int>> var({{1, std::make_shared<int>(2)}, {3,std::make_shared<int>(5)}});
+
+	var.changed->subscribe([](std::map<int, std::shared_ptr<int>> val){
+		std::cout << "changed" << std::endl;
+		std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
+		ASSERT_EQ(val, new_var_value);
+	});
+
+	std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
+	var = new_var_value;
 }
