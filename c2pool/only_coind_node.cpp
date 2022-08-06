@@ -57,12 +57,6 @@ int main(int ac, char *av[])
 //			->set_addr_store(addr_store);
 //	pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>(pool_node_mode);
 
-	// DEBUG
-	boost::asio::steady_timer t(*context, 10s);
-	t.async_wait([](const boost::system::error_code &ec) {
-		LOG_DEBUG << "DEBUG TIMER";
-	});
-
 	// JSONRPC Coind
 	std::shared_ptr<coind::JSONRPC_Coind> coind = std::make_shared<coind::JSONRPC_Coind>(context, parent_net, coind_ip, coind_port, coind_login);
 

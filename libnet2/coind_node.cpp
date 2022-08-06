@@ -35,19 +35,19 @@ void CoindNode::start()
 
 	// update mining_txs according to getwork results
 	coind_work.changed->run_and_subscribe([&](){
-		std::map<uint256, coind::data::tx_type> new_mining_txs;
-		auto new_known_txs = known_txs.value();
-
-		uint256 _tx_hash;
-		coind::data::tx_type _tx;
-		BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work.value().transaction_hashes,coind_work.value().transactions))
-		{
-			new_mining_txs[_tx_hash] = _tx;
-			new_known_txs[_tx_hash] = _tx;
-		}
-
-		mining_txs = new_mining_txs;
-		known_txs = new_known_txs;
+//		std::map<uint256, coind::data::tx_type> new_mining_txs;
+//		auto new_known_txs = known_txs.value();
+//
+//		uint256 _tx_hash;
+//		coind::data::tx_type _tx;
+//		BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work.value().transaction_hashes,coind_work.value().transactions))
+//		{
+//			new_mining_txs[_tx_hash] = _tx;
+//			new_known_txs[_tx_hash] = _tx;
+//		}
+//
+//		mining_txs = new_mining_txs;
+//		known_txs = new_known_txs;
 	});
 
 	// add p2p transactions from bitcoind to known_txs
@@ -60,21 +60,21 @@ void CoindNode::start()
 
 	// forward transactions seen to bitcoind
 	known_txs.transitioned->subscribe([&](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
-		//TODO: for what???
-		// yield deferral.sleep(random.expovariate(1/1))
-
+//		//TODO: for what???
+//		// yield deferral.sleep(random.expovariate(1/1))
+//
 		if (!protocol)
 			return;
-
-		std::map<uint256, coind::data::tx_type> trans_difference;
-		std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(trans_difference, trans_difference.begin()));
-
-		for (auto [tx_hash, tx] : trans_difference)
-		{
-			//TODO: update coind::message
-//                auto msg = protocol->make_message<message_tx>(tx);
-//                protocol->write(msg);
-		}
+//
+//		std::map<uint256, coind::data::tx_type> trans_difference;
+//		std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(trans_difference, trans_difference.begin()));
+//
+//		for (auto [tx_hash, tx] : trans_difference)
+//		{
+//			//TODO: update coind::message
+////                auto msg = protocol->make_message<message_tx>(tx);
+////                protocol->write(msg);
+//		}
 	});
 
 	/* TODO:
