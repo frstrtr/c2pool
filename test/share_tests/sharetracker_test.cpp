@@ -53,8 +53,65 @@ protected:
     }
 };
 
+TEST_F(SharechainsTest, tracker_base_tests)
+{
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
+    uint256 hash = uint256S("1");
+
+    // tracker assert in get_pool_attempts_per_second
+    ASSERT_DEATH({
+                     auto attempts1 = tracker->get_pool_attempts_per_second(hash, 1);
+                 }, "get_pool_attempts_per_second: assert for dist >= 2");
+}
 
 TEST_F(SharechainsTest, tracker_empty)
 {
     std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
+    uint256 hash = uint256S("1");
+
+
+    // Remove
+    std::cout << "Remove" << std::endl;
+    tracker->remove(hash);
+
+    // Pool attempts for dist = 1
+    std::cout << "Pool attempts for dist = 1" << std::endl;
+    ASSERT_DEATH({
+                     auto attempts1 = tracker->get_pool_attempts_per_second(hash, 1);
+                 }, "get_pool_attempts_per_second: assert for dist >= 2");
+
+    // Pool attempts for dist = 10
+    std::cout << "Pool attempts for dist = 10" << std::endl;
+    ASSERT_THROW({auto attempts10 = tracker->get_pool_attempts_per_second(hash, 10);}, std::invalid_argument);
+
+    // Desired version dist = 1
+    std::cout << "Desired version dist = 1" << std::endl;
+    auto desired_version1 = tracker->get_desired_version_counts(hash, 1);
+    for (auto v : desired_version1)
+    {
+        std::cout << v.first << ": " << v.second.ToString() << std::endl;
+    }
+
+    // Desired version dist = 10
+    std::cout << "Desired version dist = 10" << std::endl;
+    auto desired_version10 = tracker->get_desired_version_counts(hash, 10);
+    for (auto v : desired_version10)
+    {
+        std::cout << v.first << ": " << v.second.ToString() << std::endl;
+    }
+
+    // Get
+    std::cout << "Get" << std::endl;
+    auto share = tracker->get(hash);
+    ASSERT_EQ(share, nullptr);
+}
+
+TEST_F(SharechainsTest, tracker_one_share)
+{
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
+    PackStream stream;
+
 }
