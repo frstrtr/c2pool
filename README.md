@@ -45,7 +45,7 @@ DASH:
 
 Telegram:
 
-### t.me/c2pool
+### https://t.me/c2pool
 
 Discord:
 
