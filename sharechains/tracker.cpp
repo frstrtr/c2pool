@@ -268,7 +268,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
 
 arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
 {
-	assert(dist >= 2);
+	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
     auto far = get(PrefsumShare::get_nth_parent_hash(previous_share_hash,dist - 1));
 	auto attempts_delta = PrefsumShare::get_delta(previous_share_hash, far->hash);
