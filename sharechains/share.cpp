@@ -221,6 +221,13 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 
 	PackStream _stream(packed_share.contents.value);
 
+    //TODO: remove
+    for (auto v : _stream.data)
+    {
+        std::cout << (unsigned int) v << " ";
+    }
+    std::cout << std::endl;
+
 	ShareDirector director(net);
 	switch (packed_share.type.value)
 	{
