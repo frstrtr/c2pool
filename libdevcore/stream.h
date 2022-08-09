@@ -5,6 +5,8 @@
 #include <vector>
 #include <numeric>
 #include <memory>
+
+#include <btclibs/util/strencodings.h>
 using namespace std;
 
 class PackStream;
@@ -391,6 +393,16 @@ struct PackStream
 	{
 		return data.end();
 	}
+
+    void from_hex(const std::string &hexData)
+    {
+        PackStream _stream;
+
+        auto parsedHexData = ParseHex(hexData);
+        auto lenData = parsedHexData.size();
+
+        data.insert(data.end(), parsedHexData.begin(), parsedHexData.end());
+    }
 };
 
 #undef GET_INT
