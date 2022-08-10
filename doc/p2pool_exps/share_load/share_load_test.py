@@ -710,9 +710,81 @@ share_type = ComposedType([
 
 x = '11fda501fe02000020707524a64aa0820305612357ae0d2744695c8ba18b8e1402dc4e199b5e1bf8daae2ceb62979e001bc0006d6200000000000000000000000000000000000000000000000000000000000000003d043edaec002cfabe6d6d08d3533a81ca356a7ac1c85c9b0073aebcca7182ad83849b9498377c9a1cd8a701000000000000000a5f5f6332706f6f6c5f5f3e9922fe9ad7bdd0e20eb7f64fa6dd42734dd4f43275cc26fd4d483b0a00000000000021012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d61f2bae86d664294b8850df3f580ec9e4fb2170fe8dbae492b5159af73834eba4012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d60100000000000000000000000000000000000000000000000000000000000000000000ffff0f1effff0f1eae2ceb6201000000010010000000000000000000000000000000000000000000001fcbf0a89045913d394db52949e986b8c6385b0060cbaebf3cf7806ff1df96affd7a01012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d6'
 raw_share = share_type.unpack(x.decode('hex'))
+print(raw_share.type)
 
 share_bytes = []
 for _b in raw_share.contents:
     share_bytes += [ord(_b)]
 
 print(''.join(str(share_bytes).split(',')))
+
+# a = b''
+# for _x in '254 2 0 0 32'.split(' '):
+#     a += chr(int(_x))
+#
+# i = VarIntType().unpack('11'.decode('hex'))
+# print(i)
+
+# share info type
+
+hash_link_type = ComposedType([
+    ('state', FixedStrType(32)),
+    ('extra_data', FixedStrType(0)), # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
+    ('length', VarIntType()),
+])
+
+small_block_header_type = ComposedType([
+    ('version', VarIntType()),
+    ('previous_block', PossiblyNoneType(0, IntType(256))),
+    ('timestamp', IntType(32)),
+    ('bits', IntType(32)), #FloatingIntegerType()),
+    ('nonce', IntType(32)),
+])
+
+segwit_data = ('segwit_data', PossiblyNoneType(dict(txid_merkle_link=dict(branch=[], index=0), wtxid_merkle_root=2**256-1), ComposedType([
+    ('txid_merkle_link', ComposedType([
+        ('branch', ListType(IntType(256))),
+        ('index', IntType(0)), # it will always be 0
+    ])),
+    ('wtxid_merkle_root', IntType(256))
+])))
+
+share_info_type = ComposedType([
+    ('share_data', ComposedType([
+        ('previous_share_hash', PossiblyNoneType(0, IntType(256))),
+        ('coinbase', VarStrType()),
+        ('nonce', IntType(32)),
+        ('pubkey_hash', IntType(160)),
+        ('subsidy', IntType(64)),
+        ('donation', IntType(16)),
+        ('stale_info', EnumType(IntType(8), dict((k, {0: None, 253: 'orphan', 254: 'doa'}.get(k, 'unk%i' % (k,))) for k in xrange(256)))),
+        ('desired_version', VarIntType()),
+    ]))] + [segwit_data] + [
+    ('new_transaction_hashes', ListType(IntType(256))),
+    ('transaction_hash_refs', ListType(VarIntType(), 2)), # pairs of share_count, tx_count
+    ('far_share_hash', PossiblyNoneType(0, IntType(256))),
+    ('max_bits', IntType(32)), #FloatingIntegerType()),
+    ('bits', IntType(32)), #FloatingIntegerType()),
+    ('timestamp', IntType(32)),
+    ('absheight', IntType(32)),
+    ('abswork', IntType(128)),
+])
+
+share_type = ComposedType([
+    ('min_header', small_block_header_type),
+    ('share_info', share_info_type),
+    ('ref_merkle_link', ComposedType([
+        ('branch', ListType(IntType(256))),
+        ('index', IntType(0)),
+    ])),
+    ('last_txout_nonce', IntType(64)),
+    ('hash_link', hash_link_type),
+    ('merkle_link', ComposedType([
+        ('branch', ListType(IntType(256))),
+        ('index', IntType(0)), # it will always be 0
+    ])),
+])
+
+share = share_type.unpack(raw_share.contents)
+print(share.min_header.version)
+print(share)
