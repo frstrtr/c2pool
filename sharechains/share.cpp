@@ -232,8 +232,8 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 	switch (packed_share.type.value)
 	{
 		case 17:
-			return director.make_share(packed_share.type.value, peer_addr, _stream);
-		case 32:
+//			return director.make_share(packed_share.type.value, peer_addr, _stream);
+//		case 32:
 			return director.make_preSegwitShare(packed_share.type.value, peer_addr, _stream);
 		default:
 			if (packed_share.type.value < 17)
