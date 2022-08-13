@@ -33,6 +33,41 @@ public:
 
         MIN_TARGET.SetHex("0");
         MAX_TARGET.SetHex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"); // 2**256/2**20 - 1
+
+        DONATION_SCRIPT = ParseHex("522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c496fee2e6221023052352f04625282ffd5e5f95a4cef52107146aedb434d6300da1d34946320ea52ae");
+
+        // init gentx_before_refhash
+        {
+            PackStream gentx_stream;
+
+            StrType dnt_scpt(DONATION_SCRIPT);
+            gentx_stream << dnt_scpt;
+
+            IntType(64) empty_64int(0);
+            gentx_stream << empty_64int;
+
+            PackStream second_str_stream(std::vector<unsigned char>{0x6a, 0x28});
+            IntType(256) empty_256int(uint256::ZERO);
+            second_str_stream << empty_256int;
+            second_str_stream << empty_64int;
+//            second_str_stream.data.erase(second_str_stream.data.begin() + 3 , second_str_stream.data.end());
+
+            PackStream for_cut;
+            StrType second_str(second_str_stream.data);
+            for_cut << second_str;
+            for_cut.data.erase(for_cut.data.begin() + 3 , for_cut.data.end());
+
+            gentx_stream << for_cut;
+            gentx_before_refhash = gentx_stream.data;
+
+            std::cout << gentx_stream.size() << std::endl;
+            for (auto v : gentx_stream.data){
+                std::cout << (unsigned int) v << " ";
+            }
+            std::cout << std::endl;
+            // 71 82 33 2 237 42 38 123 181 115 192 69 239 77 190 65 64 149 238 239 231 106 176 196 119 38 7 140 155 123 28 73 111 238 46 98 33 2 48 82 53 47 4 98 82 130 255 213 229 249 90 76 239 82 16 113 70 174 219 67 77 99 0 218 29 52 148 99 32 234 82 174 0 0 0 0 0 0 0 0 3 106 40 0
+            // 71 82 33 2 237 42 38 123 181 115 192 69 239 77 190 65 64 149 238 239 231 106 176 196 119 38 7 140 155 123 28 73 111 238 46 98 33 2 48 82 53 47 4 98 82 130 255 213 229 249 90 76 239 82 16 113 70 174 219 67 77 99 0 218 29 52 148 99 32 234 82 174 0 0 0 0 0 0 0 0 42 106 40
+        }
     }
 };
 

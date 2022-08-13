@@ -49,6 +49,9 @@ struct SegwitData :
     {
 		MerkleLink merkleLink;
 		merkleLink.set_stream(_stream->txid_merkle_link);
+        auto ml_v = merkleLink.get();
+        auto wtxid_mr = _stream->wtxid_merkle_root.get();
+        shares::types::SegwitData test_segdata(*ml_v, wtxid_mr);
 		make_value(*merkleLink.get(), _stream->wtxid_merkle_root.get());
     }
 };
@@ -79,9 +82,7 @@ struct ShareInfo :
 
     void _to_value() override
     {
-        ShareData _share_data;
-        _share_data.set_stream(_stream->share_data);
-		make_value(*_share_data.get(), _stream->far_share_hash.get(), _stream->max_bits.get(), _stream->bits.get(),
+		make_value(_stream->far_share_hash.get(), _stream->max_bits.get(), _stream->bits.get(),
 				   _stream->timestamp.get(), _stream->new_transaction_hashes.get(), _stream->transaction_hash_refs.get(),
 				   _stream->absheight.get(), _stream->abswork.get());
     }

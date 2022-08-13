@@ -7,6 +7,8 @@
 #include <memory>
 
 #include <btclibs/util/strencodings.h>
+#include "logger.h"
+
 using namespace std;
 
 class PackStream;
@@ -451,6 +453,16 @@ public:
 
     std::shared_ptr<ValueType> get()
     {
+        if (!_value)
+        {
+            if (_stream)
+            {
+                to_value();
+            } else
+            {
+                LOG_WARNING << "StreamTypeAdapter operator -> error: _value and _stream - nullptr!";
+            }
+        }
         return _value;
     }
 
