@@ -58,6 +58,7 @@ namespace coind::data{
         MerkleLink()
         {
             index = 0;
+            branch = std::vector<uint256>();
         };
 
         MerkleLink(std::vector<uint256> _branch, int32_t _index = 0)//, int index)

@@ -110,7 +110,7 @@ namespace shares::types
 
         SegwitData(coind::data::MerkleLink _txid_merkle_link, uint256 _wtxid_merkle_root)
 		{
-			txid_merkle_link = _txid_merkle_link;
+			txid_merkle_link = std::move(_txid_merkle_link);
 			wtxid_merkle_root = _wtxid_merkle_root;
 		}
 
@@ -222,7 +222,6 @@ namespace shares::types
     struct ShareInfo
     {
     public:
-        ShareData share_data;
         uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
         uint32_t max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
         uint32_t bits;                                       //bitcoin_data.FloatingIntegerType() bits;
@@ -238,12 +237,11 @@ namespace shares::types
 			far_share_hash.SetHex("0");
 		}
 
-        ShareInfo(ShareData _share_data, uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
+        ShareInfo(uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
 				  unsigned int _timestamp, std::vector<uint256> _new_transaction_hashes,
 				  vector<tuple<uint64_t, uint64_t>> _transaction_hash_refs, unsigned long _absheigth,
 				  uint128 _abswork)
 		{
-            share_data = _share_data;
 			far_share_hash = _far_share_hash;
 			max_bits = _max_bits;
 			bits = _bits;

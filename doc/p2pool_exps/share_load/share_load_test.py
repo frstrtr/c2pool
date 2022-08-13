@@ -788,3 +788,17 @@ share_type = ComposedType([
 share = share_type.unpack(raw_share.contents)
 print(share.min_header.version)
 print(share)
+
+# Share construct
+DONATION_SCRIPT = '522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c496fee2e6221023052352f04625282ffd5e5f95a4cef52107146aedb434d6300da1d34946320ea52ae'.decode('hex')
+
+gentx_before_refhash = VarStrType().pack(DONATION_SCRIPT) + IntType(64).pack(0) + VarStrType().pack('\x6a\x28' + IntType(256).pack(0) + IntType(64).pack(0))[:3]
+
+
+gtx = []
+for _b in gentx_before_refhash:
+    gtx += [ord(_b)]
+
+print(''.join(str(gtx).split(',')))
+
+print(len(gentx_before_refhash))

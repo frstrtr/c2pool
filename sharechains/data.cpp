@@ -488,7 +488,7 @@ namespace shares
             }
             //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
 
-            share_info = std::make_unique<shares::types::ShareInfo>(_share_data, far_share_hash, max_bits.get(),
+            share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(),
                                                                     bits.get(), timestamp, new_transaction_hashes, transaction_hash_refs,
                                                                     _absheight, _abswork
                                                                     );

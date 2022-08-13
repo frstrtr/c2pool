@@ -198,11 +198,14 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
 
     PackStream &read(PackStream &stream)
     {
-        ListType<unsigned char> list_s;
-        stream >> list_s;
-        if (SIZE < list_s.value.size())
-            list_s.value.resize(SIZE);
-        value = std::move(list_s.value);
+        if (SIZE != 0)
+        {
+            ListType<unsigned char> list_s;
+            stream >> list_s;
+            if (SIZE < list_s.value.size())
+                list_s.value.resize(SIZE);
+            value = std::move(list_s.value);
+        }
         return stream;
     }
 
