@@ -83,7 +83,7 @@ void Share::init()
         hash_link_data.insert(hash_link_data.begin(), packed_z.data.begin(), packed_z.data.end());
     }
 
-    gentx_hash = shares::check_hash_link(hash_link, hash_link_data, std::string(net->gentx_before_refhash.begin(),net->gentx_before_refhash.end()));
+    gentx_hash = shares::check_hash_link(hash_link, hash_link_data, net->gentx_before_refhash);
     auto merkle_root = coind::data::check_merkle_link(gentx_hash, segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
     header.set_value(coind::data::types::BlockHeaderType(*min_header->get(), merkle_root));
 

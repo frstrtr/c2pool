@@ -86,6 +86,8 @@ def random_bytes(length):
 def prefix_to_hash_link(prefix, const_ending=''):
     assert prefix.endswith(const_ending), (prefix, const_ending)
     x = sha256(prefix)
+    print('buff len: {0}'.format(len(x.buf)))
+    print('buff: {0}'.format(x.buf))
     return dict(state=x.state, extra_data=x.buf[:max(0, len(x.buf)-len(const_ending))], length=x.length//8)
 
 def check_hash_link(hash_link, data, const_ending=''):
@@ -161,3 +163,27 @@ print(d.length)
 
 print(hashlib.sha256(d.digest()).hexdigest())
 print('209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e')
+
+##########################################################################
+print("\n\nrand_test:")
+
+rand_bytes = random_bytes(2048)
+print("rand_bytes[hex]:")
+print(rand_bytes.encode('hex'))
+
+int_rand_bytes = []
+for _i in rand_bytes:
+    int_rand_bytes += [ord(_i)]
+
+print(int_rand_bytes)
+
+x = prefix_to_hash_link(rand_bytes)
+print("x:")
+print(x)
+
+# print("//////////////////////")
+# d1 = random_bytes(random.randrange(2048))
+# d2 = random_bytes(random.randrange(2048))
+# print(d1.encode('hex'))
+# print(d2.encode('hex'))
+# print((d1+d2).encode('hex'))

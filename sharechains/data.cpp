@@ -19,15 +19,16 @@ namespace shares
     }
 
     //TODO: test
-    uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, string const_ending)
+    uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, std::vector<unsigned char> const_ending)
     {
         uint64_t extra_length = (*hash_link)->length % (512 / 8);
         assert((*hash_link)->extra_data.size() == max(extra_length - const_ending.size(), (uint64_t) 0));
 
-        auto extra = (*hash_link)->extra_data + const_ending;
+        auto extra = (*hash_link)->extra_data;
+        extra.insert(extra.end(), const_ending.begin(), const_ending.end());
         {
-            int32_t len = (*hash_link)->extra_data.size() + const_ending.length() - extra_length;
-            extra = string(extra, len, extra.length() - len);
+            int32_t len = (*hash_link)->extra_data.size() + const_ending.size() - extra_length;
+            extra.erase(extra.begin(), extra.begin() + len);
         }
         assert(extra.size() == extra_length);
 
@@ -43,19 +44,24 @@ namespace shares
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
     {
         //TODO: assert prefix.endswith(const_ending), (prefix, const_ending)
-        shared_ptr<::HashLinkType> result;
+        shared_ptr<::HashLinkType> result = std::make_shared<::HashLinkType>();
 
-        auto sha = CSHA256().Write(prefix.data(), prefix.size());
+        uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12};
+        auto sha = CSHA256(_init, {}, 0).Write(prefix.data(), prefix.size());
 
         uint32_t* state;
         memcpy(state, sha.s, 8); //TODO: test
 
         char* extra_data;
-        c2pool::dev::substr(extra_data, (char*) sha.buf, 0,  strlen((char*)sha.buf)-const_ending.size());
+        unsigned char* extra_data_bytes;
+
+        int32_t extra_data_length = strlen((char*)sha.buf)-const_ending.size();
+        c2pool::dev::substr(extra_data, (char*) sha.buf, 0,  64);
+        extra_data_bytes = (unsigned char*) extra_data;
 
 
-        (*result)->length = sha.bytes*8;
-        (*result)->extra_data = {extra_data};
+        (*result)->length = sha.bytes;
+        (*result)->extra_data = {extra_data_bytes, extra_data_bytes+64};
         //TODO: init state
 
         return result;

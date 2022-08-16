@@ -51,13 +51,13 @@ namespace shares::types
     class HashLinkType
     {
     public:
-        std::string state;         //pack.FixedStrType(32)
-        std::string extra_data;    //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
+        std::vector<unsigned char> state;         //pack.FixedStrType(32)
+        std::vector<unsigned char> extra_data;    //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
         uint64_t length; //pack.VarIntType()
 
         HashLinkType() = default;
 
-        HashLinkType(std::string _state, std::string _extra_data, uint64_t _length)
+        HashLinkType(std::vector<unsigned char> _state, std::vector<unsigned char> _extra_data, uint64_t _length)
 		{
 			state = _state;
 			extra_data = _extra_data;

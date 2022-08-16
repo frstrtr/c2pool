@@ -431,7 +431,8 @@ public:
                 to_value();
             } else
             {
-                throw std::runtime_error("StreamTypeAdapter operator -> error: _value and _stream - nullptr!");
+                _value = std::make_shared<ValueType>();
+                LOG_WARNING << "StreamTypeAdapter operator -> warning: _value and _stream - nullptr!";
             }
         }
         return _value;

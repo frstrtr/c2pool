@@ -111,15 +111,9 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 
     StrType &fromHex(const std::string &hexData)
     {
-        PackStream _stream;
-
+        value.clear();
         auto parsedHexData = ParseHex(hexData);
-        auto lenData = parsedHexData.size();
-
         value.insert(value.end(), parsedHexData.begin(), parsedHexData.end());
-//        _stream << parsedHexData;
-
-//        _stream >> *this;
 
         return *this;
     }
@@ -164,7 +158,6 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
     }
 };
 
-//TODO: TEST + UPDATE
 template <int SIZE>
 struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGetter<std::string>
 {
@@ -183,7 +176,26 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
 
     FixedStrType(vector<unsigned char> _c_str)
     {
+        if (_c_str.size() != SIZE)
+        {
+            throw std::invalid_argument("Incorrect length str in FixedStrType");
+        }
         value = _c_str;
+    }
+
+    StrType &fromHex(const std::string &hexData)
+    {
+        value.clear();
+        auto parsedHexData = ParseHex(hexData);
+
+        if (parsedHexData.size() != SIZE)
+        {
+            throw std::invalid_argument("Incorrect length str in FixedStrType");
+        }
+
+        value.insert(value.end(), parsedHexData.begin(), parsedHexData.end());
+
+        return *this;
     }
 
     PackStream &write(PackStream &stream) const
