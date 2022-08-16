@@ -61,11 +61,13 @@ namespace c2pool
             IntType(256) empty_256int(uint256::ZERO);
             second_str_stream << empty_256int;
             second_str_stream << empty_64int;
-            second_str_stream.data.erase(second_str_stream.data.begin(), second_str_stream.data.begin()+3);
 
+            PackStream for_cut;
             StrType second_str(second_str_stream.data);
+            for_cut << second_str;
+            for_cut.data.erase(for_cut.data.begin() + 3 , for_cut.data.end());
 
-            gentx_stream << second_str;
+            gentx_stream << for_cut;
             gentx_before_refhash = gentx_stream.data;
         }
     }

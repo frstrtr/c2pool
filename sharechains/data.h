@@ -21,7 +21,7 @@ namespace shares
 {
 	bool is_segwit_activated(int version, shared_ptr<c2pool::Network> net);
 
-	uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, string const_ending = "");
+	uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, std::vector<unsigned char> const_ending = {});
 
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending = {});
 
