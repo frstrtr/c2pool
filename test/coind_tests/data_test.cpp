@@ -72,6 +72,29 @@ TEST(CoindDataTest, hash256_from_hash_link_test)
     ASSERT_EQ(result.GetHex(), "209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e");
 }
 
+TEST(SharechainDataTest, TestCustomSha256)
+{
+    std::string data("123456789");
+    auto sha = CSHA256().Write((unsigned char *)&data[0], data.size());
+
+    vector<unsigned char> out;
+    out.resize(CSHA256::OUTPUT_SIZE);
+
+    WriteBE32((unsigned char *)&out[0], sha.s[0]);
+    WriteBE32(&out[0+4], sha.s[1]);
+    WriteBE32(&out[0+8], sha.s[2]);
+    WriteBE32(&out[0+12], sha.s[3]);
+    WriteBE32(&out[0+16], sha.s[4]);
+    WriteBE32(&out[0+20], sha.s[5]);
+    WriteBE32(&out[0+24], sha.s[6]);
+    WriteBE32(&out[0+28], sha.s[7]);
+
+
+    auto hash = HexStr(out);
+//    std::cout << hash << std::endl;
+    ASSERT_EQ(hash, "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19");
+}
+
 TEST(CoindDataTest, test_header_hash)
 {
 	coind::data::BlockHeaderType header;

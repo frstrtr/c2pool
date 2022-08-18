@@ -432,7 +432,6 @@ public:
             } else
             {
                 _value = std::make_shared<ValueType>();
-                LOG_WARNING << "StreamTypeAdapter operator -> warning: _value and _stream - nullptr!";
             }
         }
         return _value;
