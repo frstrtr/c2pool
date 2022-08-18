@@ -18,7 +18,6 @@ namespace shares
         return version >= net->SEGWIT_ACTIVATION_VERSION;
     }
 
-    //TODO: test
     uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, std::vector<unsigned char> const_ending)
     {
         uint64_t extra_length = (*hash_link)->length % (512 / 8);
@@ -45,14 +44,10 @@ namespace shares
             ReadBE32((*hash_link)->state.data() + 28),
         };
 
-
-        //pack.IntType(256).unpack(hashlib.sha256(sha256.sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
-        //TODO: test
         result = coind::data::hash256_from_hash_link(init_state, data.data(), (unsigned char*)extra.data(), hash_link->get()->length);
         return result.get();
     }
 
-    //TODO: TEST
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
     {
         //TODO: assert prefix.endswith(const_ending), (prefix, const_ending)
@@ -76,14 +71,6 @@ namespace shares
 
         std::vector<unsigned char> extra_data;
         extra_data.insert(extra_data.end(), sha.buf, sha.buf + sha.bytes%64-const_ending.size());
-
-//        char* extra_data;
-//        unsigned char* extra_data_bytes;
-//
-//        int32_t extra_data_length = strlen((char*)sha.buf)-const_ending.size();
-//        c2pool::dev::substr(extra_data, (char*) sha.buf, 0,  64);
-//        extra_data_bytes = (unsigned char*) extra_data;
-
 
         (*result)->state = state;
         (*result)->extra_data = extra_data;
