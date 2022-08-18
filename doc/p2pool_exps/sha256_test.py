@@ -61,8 +61,8 @@ class sha256(object):
         self.state = state
         self.buf = chunks[-1]
 
-        print('update_buf: {0}'.format([ord(x) for x in self.buf]))
-        print('update_state: {0}'.format([ord(x) for x in self.state]))
+        # print('update_buf: {0}'.format([ord(x) for x in self.buf]))
+        # print('update_state: {0}'.format([ord(x) for x in self.state]))
         self.length += 8*len(data)
 
     def copy(self, data=''):
@@ -71,11 +71,11 @@ class sha256(object):
     def digest(self):
         state = self.state
         buf = self.buf + '\x80' + '\x00'*((self.block_size - 9 - len(self.buf)) % self.block_size) + struct.pack('>Q', self.length)
-        print([ord(x) for x in buf])
+        # print([ord(x) for x in buf])
         for chunk in [buf[i:i + self.block_size] for i in xrange(0, len(buf), self.block_size)]:
             state = process(state, chunk)
-        print('state:')
-        print([ord(x) for x in state])
+        # print('state:')
+        # print([ord(x) for x in state])
         return state
 
     def hexdigest(self):
@@ -96,10 +96,12 @@ def random_bytes(length):
 def prefix_to_hash_link(prefix, const_ending=''):
     assert prefix.endswith(const_ending), (prefix, const_ending)
     x = sha256(prefix)
-    print('buff len: {0}'.format(len(x.buf)))
-    print('buff: {0}'.format(x.buf))
-    print('digest x:')
-    print_bytes(x.digest())
+    # print('buff len: {0}'.format(len(x.buf)))
+    # print('buff: {0}'.format(x.buf))
+    # print('digest x:')
+    # print_bytes(x.digest())
+    # print(x.hexdigest())
+    # print(x.hexdigest())
     return dict(state=x.state, extra_data=x.buf[:max(0, len(x.buf)-len(const_ending))], length=x.length//8)
 
 def check_hash_link(hash_link, data, const_ending=''):
@@ -118,80 +120,82 @@ def check_hash_link(hash_link, data, const_ending=''):
 # revert_res = prefix_to_hash_link(res)
 # print(revert_res)
 
-_initial_state = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12)
-
-data = "123456789"
-
-#(initial_state, '', 0)
-_t1 = sha256(data, (_initial_state, '', 0))
-t1 = _t1.digest()
-print(t1)
-t2 = hashlib.sha256(data).digest()
-print(t2)
-print(t1 == t2)
-#####################################################
-print("#"*16)
-print("t1:")
-print("digest: {0}".format(_t1.digest()))
-print("state: {0}".format((_t1.state)))
-print("buf: {0}".format((_t1.buf)))
-print("length: {0}".format((_t1.length)))
-_t3 = sha256(data, (initial_state, '1337', 0))
-print("t3:")
-print("digest: {0}".format(_t3.digest()))
-print("state: {0}".format(_t3.state))
-print("buf: {0}".format(_t3.buf))
-print("length: {0}".format(_t3.length))
-_t4 = sha256(data, (_initial_state, '1337', 100))
-print("t4:")
-print("digest: {0}".format(_t4.digest()))
-print("state: {0}".format(_t4.state))
-print("buf: {0}".format(_t4.buf))
-print("length: {0}".format(_t4.length))
-
-print("#"*16)
-print("#"*16)
-print("#"*16)
-
-a = sha256("123456789")
-print(a.hexdigest())
-print('15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225')
-
-b = sha256("1234567890", (_initial_state, '', 0))
-print(b.hexdigest())
-print('23de2ce70e77d80ba1c110071462e90e96710fd0b0ee3faa81b1d04b7fb58535')
-
-print(b.buf)
-print(b.length)
-
-c = sha256("123456789", (_initial_state, '1234567890', 80))
-print(c.hexdigest())
-print('7c3c79a815ce2b9b7d0e6e7a0f3ec415903ca435ef0a9f55cdd7bad317f8f225')
-
-initial_state2 = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12)
-d = sha256("12345678901234ac", (initial_state2, '12345678901234ac', 128))
-print(d.buf)
-print(d.length)
-
-print(hashlib.sha256(d.digest()).hexdigest())
-print('209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e')
+# _initial_state = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12)
+#
+# data = "123456789"
+#
+# #(initial_state, '', 0)
+# _t1 = sha256(data, (_initial_state, '', 0))
+# t1 = _t1.digest()
+# print(t1)
+# t2 = hashlib.sha256(data).digest()
+# print(t2)
+# print(t1 == t2)
+# #####################################################
+# print("#"*16)
+# print("t1:")
+# print("digest: {0}".format(_t1.digest()))
+# print("state: {0}".format((_t1.state)))
+# print("buf: {0}".format((_t1.buf)))
+# print("length: {0}".format((_t1.length)))
+# _t3 = sha256(data, (initial_state, '1337', 0))
+# print("t3:")
+# print("digest: {0}".format(_t3.digest()))
+# print("state: {0}".format(_t3.state))
+# print("buf: {0}".format(_t3.buf))
+# print("length: {0}".format(_t3.length))
+# _t4 = sha256(data, (_initial_state, '1337', 100))
+# print("t4:")
+# print("digest: {0}".format(_t4.digest()))
+# print("state: {0}".format(_t4.state))
+# print("buf: {0}".format(_t4.buf))
+# print("length: {0}".format(_t4.length))
+#
+# print("#"*16)
+# print("#"*16)
+# print("#"*16)
+#
+# a = sha256("123456789")
+# print(a.hexdigest())
+# print('15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225')
+#
+# b = sha256("1234567890", (_initial_state, '', 0))
+# print(b.hexdigest())
+# print('23de2ce70e77d80ba1c110071462e90e96710fd0b0ee3faa81b1d04b7fb58535')
+#
+# print(b.buf)
+# print(b.length)
+#
+# c = sha256("123456789", (_initial_state, '1234567890', 80))
+# print(c.hexdigest())
+# print('7c3c79a815ce2b9b7d0e6e7a0f3ec415903ca435ef0a9f55cdd7bad317f8f225')
+#
+# initial_state2 = struct.pack('>8I', 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12)
+# d = sha256("12345678901234ac", (initial_state2, '12345678901234ac', 128))
+# print(d.buf)
+# print(d.length)
+#
+# print(hashlib.sha256(d.digest()).hexdigest())
+# print('209c335d5b5d3f5735d44b33ec1706091969060fddbdb26a080eb3569717fb9e')
 
 ##########################################################################
-print("\n\nrand_test:")
+print("rand_test:")
 
 rand_bytes = random_bytes(2048)
-print("rand_bytes[hex]:")
+# print("rand_bytes[hex]:")
 print(rand_bytes.encode('hex'))
 
-int_rand_bytes = []
-for _i in rand_bytes:
-    int_rand_bytes += [ord(_i)]
-
-print(int_rand_bytes)
+# int_rand_bytes = []
+# for _i in rand_bytes:
+#     int_rand_bytes += [ord(_i)]
+#
+# print(int_rand_bytes)
 
 x = prefix_to_hash_link(rand_bytes)
 print("x:")
 print(x)
+print(x['state'].encode('hex'))
+print(hashlib.sha256(hashlib.sha256(rand_bytes).digest()).hexdigest())
 
 # print("//////////////////////")
 # d1 = random_bytes(random.randrange(2048))
@@ -199,3 +203,7 @@ print(x)
 # print(d1.encode('hex'))
 # print(d2.encode('hex'))
 # print((d1+d2).encode('hex'))
+
+print(hashlib.sha256('123456789').hexdigest())
+print(sha256('123456789').hexdigest())
+print(sha256('123456789').state.encode('hex'))

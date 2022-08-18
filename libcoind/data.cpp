@@ -165,6 +165,8 @@ namespace coind::data
         uint256 result;
 
         unsigned char _buf[CSHA256::OUTPUT_SIZE];
+        if (!buf)
+            buf = new unsigned char(0);
         CSHA256(init, buf, length).Write(data, strlen((char*)data)).Finalize(_buf);
         CSHA256().Write(_buf, CSHA256::OUTPUT_SIZE).Finalize(result.begin());
         reverse(result.begin(), result.end());

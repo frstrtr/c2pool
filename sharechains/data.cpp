@@ -34,9 +34,21 @@ namespace shares
 
         IntType(256) result;
 
+        uint32_t init_state[8]{
+            ReadBE32((*hash_link)->state.data() + 0),
+            ReadBE32((*hash_link)->state.data() + 4),
+            ReadBE32((*hash_link)->state.data() + 8),
+            ReadBE32((*hash_link)->state.data() + 12),
+            ReadBE32((*hash_link)->state.data() + 16),
+            ReadBE32((*hash_link)->state.data() + 20),
+            ReadBE32((*hash_link)->state.data() + 24),
+            ReadBE32((*hash_link)->state.data() + 28),
+        };
+
+
         //pack.IntType(256).unpack(hashlib.sha256(sha256.sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
         //TODO: test
-        //TODO: result = coind::data::hash256_from_hash_link((unsigned char*)((*hash_link)->state.data()), data.data(), (unsigned char*)extra.data(), hash_link->get()->length);
+        result = coind::data::hash256_from_hash_link(init_state, data.data(), (unsigned char*)extra.data(), hash_link->get()->length);
         return result.get();
     }
 
@@ -46,23 +58,36 @@ namespace shares
         //TODO: assert prefix.endswith(const_ending), (prefix, const_ending)
         shared_ptr<::HashLinkType> result = std::make_shared<::HashLinkType>();
 
-        uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12};
-        auto sha = CSHA256(_init, {}, 0).Write(prefix.data(), prefix.size());
+//        uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05644c, 0x1f83d9ab, 0x5be0cd12};
+        auto sha = CSHA256().Write(prefix.data(), prefix.size());
 
-        uint32_t* state;
-        memcpy(state, sha.s, 8); //TODO: test
+        std::vector<unsigned char> state;
+        state.resize(CSHA256::OUTPUT_SIZE);
 
-        char* extra_data;
-        unsigned char* extra_data_bytes;
+        WriteBE32(&state[0], sha.s[0]);
+        WriteBE32(&state[0+4], sha.s[1]);
+        WriteBE32(&state[0+8], sha.s[2]);
+        WriteBE32(&state[0+12], sha.s[3]);
+        WriteBE32(&state[0+16], sha.s[4]);
+        WriteBE32(&state[0+20], sha.s[5]);
+        WriteBE32(&state[0+24], sha.s[6]);
+        WriteBE32(&state[0+28], sha.s[7]);
 
-        int32_t extra_data_length = strlen((char*)sha.buf)-const_ending.size();
-        c2pool::dev::substr(extra_data, (char*) sha.buf, 0,  64);
-        extra_data_bytes = (unsigned char*) extra_data;
+
+        std::vector<unsigned char> extra_data;
+        extra_data.insert(extra_data.end(), sha.buf, sha.buf + sha.bytes%64-const_ending.size());
+
+//        char* extra_data;
+//        unsigned char* extra_data_bytes;
+//
+//        int32_t extra_data_length = strlen((char*)sha.buf)-const_ending.size();
+//        c2pool::dev::substr(extra_data, (char*) sha.buf, 0,  64);
+//        extra_data_bytes = (unsigned char*) extra_data;
 
 
+        (*result)->state = state;
+        (*result)->extra_data = extra_data;
         (*result)->length = sha.bytes;
-        (*result)->extra_data = {extra_data_bytes, extra_data_bytes+64};
-        //TODO: init state
 
         return result;
     }
