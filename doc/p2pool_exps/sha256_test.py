@@ -61,6 +61,8 @@ class sha256(object):
         self.state = state
         self.buf = chunks[-1]
 
+        print('update_buf: {0}'.format([ord(x) for x in self.buf]))
+        print('update_state: {0}'.format([ord(x) for x in self.state]))
         self.length += 8*len(data)
 
     def copy(self, data=''):
@@ -72,13 +74,21 @@ class sha256(object):
         print([ord(x) for x in buf])
         for chunk in [buf[i:i + self.block_size] for i in xrange(0, len(buf), self.block_size)]:
             state = process(state, chunk)
-
+        print('state:')
+        print([ord(x) for x in state])
         return state
 
     def hexdigest(self):
         return self.digest().encode('hex')
 
 ###########################
+
+def print_bytes(_b):
+    int_rand_bytes = []
+    for _i in rand_bytes:
+        int_rand_bytes += [ord(_i)]
+
+    print(int_rand_bytes)
 
 def random_bytes(length):
     return ''.join(chr(random.randrange(2**8)) for i in xrange(length))
@@ -88,6 +98,8 @@ def prefix_to_hash_link(prefix, const_ending=''):
     x = sha256(prefix)
     print('buff len: {0}'.format(len(x.buf)))
     print('buff: {0}'.format(x.buf))
+    print('digest x:')
+    print_bytes(x.digest())
     return dict(state=x.state, extra_data=x.buf[:max(0, len(x.buf)-len(const_ending))], length=x.length//8)
 
 def check_hash_link(hash_link, data, const_ending=''):
