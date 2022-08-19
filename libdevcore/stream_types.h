@@ -203,8 +203,8 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
 //        LOG_TRACE << "FixedStrType Worked!";
         ListType<unsigned char> list_s(value);
 
-        auto _len = value.size();
-        stream << _len << PackStream(value);
+//        auto _len = value.size();
+        stream << PackStream(value);
         return stream;
     }
 
@@ -212,11 +212,19 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
     {
         if (SIZE != 0)
         {
-            ListType<unsigned char> list_s;
-            stream >> list_s;
-            if (SIZE < list_s.value.size())
-                list_s.value.resize(SIZE);
-            value = std::move(list_s.value);
+            auto len = SIZE;
+            for (int i = 0; i < len; i++)
+            {
+                unsigned char temp;
+                stream >> temp;
+                value.push_back(temp);
+            }
+
+//            ListType<unsigned char> list_s;
+//            stream >> list_s;
+//            if (SIZE < list_s.value.size())
+//                list_s.value.resize(SIZE);
+//            value = std::move(list_s.value);
         }
         return stream;
     }
