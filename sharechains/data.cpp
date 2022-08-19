@@ -21,7 +21,7 @@ namespace shares
     uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, std::vector<unsigned char> const_ending)
     {
         uint64_t extra_length = (*hash_link)->length % (512 / 8);
-        assert((*hash_link)->extra_data.size() == max(extra_length - const_ending.size(), (uint64_t) 0));
+        assert((*hash_link)->extra_data.size() == max((int64_t)extra_length - (int64_t)const_ending.size(), (int64_t) 0));
 
         auto extra = (*hash_link)->extra_data;
         extra.insert(extra.end(), const_ending.begin(), const_ending.end());
@@ -44,8 +44,35 @@ namespace shares
             ReadBE32((*hash_link)->state.data() + 28),
         };
 
-        result = coind::data::hash256_from_hash_link(init_state, data.data(), (unsigned char*)extra.data(), hash_link->get()->length);
-        return result.get();
+        //TODO: REMOVE
+        std::cout << "INIT STATE" << std::endl;
+        for (uint32_t v : init_state)
+        {
+            std::cout << v << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "DATA" << std::endl;
+        for (auto v : data)
+        {
+            std::cout << (unsigned int)v << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "extra" << std::endl;
+        for (auto v : extra)
+        {
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "hash_link.length " << hash_link->get()->length << std::endl;
+
+        auto result2 = coind::data::hash256_from_hash_link(init_state, data, extra, hash_link->get()->length);
+        auto result_uint256 = result.get();
+        std::cout << "check_hash_link:  " << result_uint256.GetHex() << std::endl;
+//        return result_uint256;
+        return result2;
     }
 
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending)
