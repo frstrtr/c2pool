@@ -648,11 +648,11 @@ CSHA256::CSHA256() : bytes(0)
     sha256::Initialize(s);
 }
 
-CSHA256::CSHA256(uint32_t* custom_init, unsigned char* _buf, uint64_t _length) : bytes(_length)
+CSHA256::CSHA256(uint32_t* custom_init, std::vector<unsigned char> _buf, uint64_t _length) : bytes(_length)
 {
     sha256::Initialize(s, custom_init);
-    if (_buf)
-        memcpy(buf, _buf, strlen((char*)_buf));
+    if (!_buf.empty())
+        memcpy(buf, (unsigned char*) _buf.data(), _buf.size());
 }
 
 CSHA256& CSHA256::Write(const unsigned char* data, size_t len)

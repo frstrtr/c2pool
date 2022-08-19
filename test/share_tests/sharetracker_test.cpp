@@ -8,7 +8,7 @@
 class TestNetwork : public c2pool::Network
 {
 public:
-    TestNetwork() : c2pool::Network("test_sharechain", nullptr)
+    TestNetwork(std::shared_ptr<coind::ParentNetwork> _par) : c2pool::Network("test_sharechain", _par)
     {
         SOFTFORKS_REQUIRED = {"nversionbips", "csv", "segwit", "reservealgo", "odo"};
         BOOTSTRAP_ADDRS = {
@@ -17,7 +17,7 @@ public:
         PREFIX_LENGTH = 8;
         PREFIX = new unsigned char[PREFIX_LENGTH]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
         IDENTIFIER_LENGHT = 8;
-        IDENTIFIER = new unsigned char[IDENTIFIER_LENGHT]{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68};
+        IDENTIFIER = new unsigned char[IDENTIFIER_LENGHT]{0x1c, 0x01, 0x7d, 0xc9, 0x76, 0x93, 0xf7, 0xd5};
         MINIMUM_PROTOCOL_VERSION = 1600;
         SEGWIT_ACTIVATION_VERSION = 17;
 
@@ -58,7 +58,7 @@ public:
 
             gentx_stream << for_cut;
             gentx_before_refhash = gentx_stream.data;
-//TODO: remove
+
 //            std::cout << gentx_stream.size() << std::endl;
 //            for (auto v : gentx_stream.data){
 //                std::cout << (unsigned int) v << " ";
@@ -78,7 +78,8 @@ protected:
 
     virtual void SetUp()
     {
-        net = make_shared<TestNetwork>();
+        std::shared_ptr<coind::DigibyteParentNetwork> parent_net = std::make_shared<coind::DigibyteParentNetwork>();
+        net = make_shared<TestNetwork>(parent_net);
     }
 
     virtual void TearDown()

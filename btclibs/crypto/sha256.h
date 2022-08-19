@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string>
+#include <vector>
 
 /** A hasher class for SHA-256. */
 class CSHA256
@@ -21,7 +22,7 @@ public:
     static const size_t OUTPUT_SIZE = 32;
 
     CSHA256();
-    CSHA256(uint32_t* custom_init, unsigned char* _buf = nullptr, uint64_t _length = 0);
+    CSHA256(uint32_t* custom_init, std::vector<unsigned char> _buf = {}, uint64_t _length = 0);
     CSHA256& Write(const unsigned char* data, size_t len);
     void Finalize(unsigned char hash[OUTPUT_SIZE]);
     CSHA256& Reset();

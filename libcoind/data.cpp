@@ -160,16 +160,53 @@ namespace coind::data
         return hash160(in, reverse);
     }
 
-    uint256 hash256_from_hash_link(uint32_t* init, unsigned char* data, unsigned char* buf, uint64_t length)
+    uint256 hash256_from_hash_link(uint32_t init[8], vector<unsigned char> data, vector<unsigned char> buf, uint64_t length)
     {
         uint256 result;
 
-        unsigned char _buf[CSHA256::OUTPUT_SIZE];
-        if (!buf)
-            buf = new unsigned char(0);
-        CSHA256(init, buf, length).Write(data, strlen((char*)data)).Finalize(_buf);
-        CSHA256().Write(_buf, CSHA256::OUTPUT_SIZE).Finalize(result.begin());
-        reverse(result.begin(), result.end());
+//        unsigned char _buf[CSHA256::OUTPUT_SIZE];
+        if (!buf.size())
+            buf.push_back('\0');
+
+//        CSHA256(init, buf, length).Write(data, strlen((char*)data)).Finalize(_buf);
+//        CSHA256().Write(_buf, CSHA256::OUTPUT_SIZE).Finalize(result.begin());
+
+        std::cout << "hash256.init" << std::endl;
+        for (int i = 0; i < 8; i++)
+        {
+            std::cout << *(init+i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "hash256.data" << std::endl;
+        for (auto v : data)
+        {
+            std::cout << (unsigned int)v << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "hash256.buf" << std::endl;
+        for (auto v : buf)
+        {
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "hash256.length " << length << std::endl;
+
+        vector<unsigned char> out1;
+        out1.resize(CSHA256::OUTPUT_SIZE);
+
+        vector<unsigned char> out2;
+        out2.resize(CSHA256::OUTPUT_SIZE);
+
+        CSHA256(init, buf, length).Write((unsigned char *)&data[0], data.size()).Finalize(&out1[0]);
+        CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
+
+        result.SetHex(HexStr(out2));
+//        reverse(result.begin(), result.end());
+
+        std::cout << "hash256_from_hash_link: " << result.GetHex() << std::endl;
         return result;
     }
 

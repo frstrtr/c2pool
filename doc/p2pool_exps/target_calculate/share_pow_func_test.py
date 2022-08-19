@@ -549,57 +549,6 @@ class TransactionType(Type):
 
 tx_type2 = TransactionType()
 
-#=====================
-# tx1 = dict(
-#     version=1,
-#     tx_ins=[dict(
-#         previous_output=None,
-#         sequence=None,
-#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
-#     )],
-#     tx_outs=[dict(
-#         value=5003880250,
-#         script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
-#     )],
-#     lock_time=0,
-# )
-#
-# a = tx_type.pack(tx1)
-#
-# l_tx2 = []
-# for i in a:
-#     l_tx2 += [ord(i)]
-#
-# print(str(l_tx2).replace(',', ''))
-#
-# b = 'asdb3'
-# b2 = (hash256(b)+1)
-# print('hash: {0}, hex: {1}'.format(hash256(b), hex(hash256(b))))
-# print('hash: {0}, hex: {1}'.format(b2, hex(b2)))
-
-
-################################################################################
-# gentx = dict(
-#     version=4294967295,
-#     tx_ins=[dict(
-#         previous_output=None,
-#         sequence=None,
-#         script='015d5d52ad85411c47a5a8c71b8de0a39835891c26539eb2170eee693f08681a0302042800000003205b41960f08035d9b1ced05be46f7f8621053f1d362341dee2b9ada51abb3cf47',
-#     )],
-#     tx_outs=([dict(value=0, script='\x6a\x24\xaa\x21\xa9\xed' + IntType(256).pack(1234567))]),
-#     lock_time=0,
-# )
-#
-# gentx['marker'] = 3
-# gentx['flag'] = 2
-# gentx['witness'] = [["c2pool"*4]]
-#
-# def postprocess(data):
-#     return [ord(x) for x in data]
-#
-# packed_gentx = tx_id_type.pack(gentx)
-# print(postprocess(packed_gentx))
-# print(postprocess(packed_gentx[:-32]))
 
 class FloatingInteger(object):
     __slots__ = ['bits', '_target']
@@ -673,58 +622,6 @@ share_type = ComposedType([
     ('contents', VarStrType()),
 ])
 
-# x = '01000000013ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff01c40965f0020000001976a9141462c3dd3f936d595c9af55978003b27c250441f88ac80feea62'
-# # print(IntType(32).unpack('01000000013c'))#3ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff01c40965f0020000001976a9141462c3dd3f936d595c9af55978003b27c250441f88ac80feea62')
-# # tx_type2.unpack(x)
-# print('Version: {0}'.format(IntType(32).unpack(b'\x01\x00\x00\x00')))
-# version_packed = IntType(32).pack(1)
-# print("len: {0}".format(len(version_packed)))
-# print('Version2: {0}'.format(IntType(32).unpack(version_packed)))
-# num_packed = []
-# for _d in version_packed:
-#     num_packed += [ord(_d)]
-# print(num_packed)
-#
-# start_tx_data = ComposedType([
-#     ('version', IntType(32)),
-#     ('marker', VarIntType())])
-# #######################
-#
-#
-# x = "0100000002".decode('hex')
-# __x = []
-# for c in x:
-#     __x += [ord(c)]
-# print(__x)
-# print(start_tx_data.unpack(x))
-#
-# #################################
-# second_tx_data = ComposedType([
-#     ('version', IntType(32)),
-#     ('marker', VarIntType()),
-#     ('tx_in', tx_in_type)])
-#
-#
-# x = '01000000013ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff'.decode('hex')
-# print(second_tx_data.unpack(x))
-
-x = '11fda501fe02000020707524a64aa0820305612357ae0d2744695c8ba18b8e1402dc4e199b5e1bf8daae2ceb62979e001bc0006d6200000000000000000000000000000000000000000000000000000000000000003d043edaec002cfabe6d6d08d3533a81ca356a7ac1c85c9b0073aebcca7182ad83849b9498377c9a1cd8a701000000000000000a5f5f6332706f6f6c5f5f3e9922fe9ad7bdd0e20eb7f64fa6dd42734dd4f43275cc26fd4d483b0a00000000000021012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d61f2bae86d664294b8850df3f580ec9e4fb2170fe8dbae492b5159af73834eba4012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d60100000000000000000000000000000000000000000000000000000000000000000000ffff0f1effff0f1eae2ceb6201000000010010000000000000000000000000000000000000000000001fcbf0a89045913d394db52949e986b8c6385b0060cbaebf3cf7806ff1df96affd7a01012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d6'
-raw_share = share_type.unpack(x.decode('hex'))
-print(raw_share.type)
-
-share_bytes = []
-for _b in raw_share.contents:
-    share_bytes += [ord(_b)]
-
-print(''.join(str(share_bytes).split(',')))
-
-# a = b''
-# for _x in '254 2 0 0 32'.split(' '):
-#     a += chr(int(_x))
-#
-# i = VarIntType().unpack('11'.decode('hex'))
-# print(i)
-
 # share info type
 
 hash_link_type = ComposedType([
@@ -785,21 +682,32 @@ share_type = ComposedType([
     ])),
 ])
 
-share = share_type.unpack(raw_share.contents)
-print(share.min_header.version)
-print('Nonce = {0}'.format(share.min_header.nonce))
-print(share)
+# share = share_type.unpack(raw_share.contents)
+# print(share.min_header.version)
+# print(share)
 
 # Share construct
-DONATION_SCRIPT = '522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c496fee2e6221023052352f04625282ffd5e5f95a4cef52107146aedb434d6300da1d34946320ea52ae'.decode('hex')
+# DONATION_SCRIPT = '522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c496fee2e6221023052352f04625282ffd5e5f95a4cef52107146aedb434d6300da1d34946320ea52ae'.decode('hex')
 
-gentx_before_refhash = VarStrType().pack(DONATION_SCRIPT) + IntType(64).pack(0) + VarStrType().pack('\x6a\x28' + IntType(256).pack(0) + IntType(64).pack(0))[:3]
+POW_FUNC = lambda data: IntType(256).unpack(__import__('ltc_scrypt').getPoWHash(data))
 
+# a = POW_FUNC(block_header_type.pack(dict(
+#     version=1,
+#     previous_block=0xd928d3066613d1c9dd424d5810cdd21bfeef3c698977e81ec1640e1084950073,
+#     merkle_root=0x03f4b646b58a66594a182b02e425e7b3a93c8a52b600aa468f1bc5549f395f16,
+#     timestamp=1327807194,
+#     bits=FloatingInteger(0x1d01b56f),
+#     nonce=20736,
+# )))
 
-gtx = []
-for _b in gentx_before_refhash:
-    gtx += [ord(_b)]
+a = POW_FUNC(block_header_type.pack(dict(
+    version=536870914,
+    previous_block=99042567960937278370794190410317057162389294650298279237778909988455488714096,
+    merkle_root=0xdb909b86fc6ef2a90fc535e5e499b11ff413f417914d6d0534b9b16b2588b48f,
+    timestamp=1659579566,
+    bits=FloatingInteger(0x1b009e97),
+    nonce=1651310784
+)))
 
-print(''.join(str(gtx).split(',')))
-
-print(len(gentx_before_refhash))
+print(hex(a))
+# print(int('00000001312dc20ce5aa3ee622f5562dfb2593ec51436aab739ef0d02189e18f', 16) == a)

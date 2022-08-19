@@ -179,7 +179,23 @@ class FloatingIntegerType(Type):
 
 POW_FUNC = lambda data: IntType(256).unpack(__import__('ltc_scrypt').getPoWHash(data))
 
-v = FloatingInteger(123456789)
-print(v.target)
-print(POW_FUNC(hex(123456789)))
+# v = FloatingInteger(123456789)
+# print(v.target)
+# print(POW_FUNC(hex(123456789)))
+
+b_data = '2 0 0 32 112 117 36 166 74 160 130 3 5 97 35 87 174 13 39 68 105 92 139 161 139 142 20 2 220 78 25 155 94 27 248 218 212 185 220 86 183 20 0 180 58 20 184 233 33 183 74 66 189 207 34 9 63 16 98 239 1 223 153 223 225 209 220 0 174 44 235 98 151 158 0 27 192 0 109 98'
+b = b_data.split(' ')
+print(b)
+data_arr = [int(x) for x in b]
+data = b''
+for x in data_arr:
+    data += chr(x)
+print('bytes data: {0}'.format(data))
+
+res = POW_FUNC(data)
+print(res)
+
+# print(hex(POW_FUNC(data)))
+
+# print(hex(POW_FUNC(hex(int('02000020707524a64aa0820305612357ae0d2744695c8ba18b8e1402dc4e199b5e1bf8da42589653fe1f1e38130608349531927ba084b0f539489f6b27b61bfbcd16a61fae2ceb62979e001bc0006d62', 16)))))
 #123456789 -> 25839712958676992

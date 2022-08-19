@@ -750,25 +750,25 @@ segwit_data = ('segwit_data', PossiblyNoneType(dict(txid_merkle_link=dict(branch
 ])))
 
 share_info_type = ComposedType([
-    ('share_data', ComposedType([
-        ('previous_share_hash', PossiblyNoneType(0, IntType(256))),
-        ('coinbase', VarStrType()),
-        ('nonce', IntType(32)),
-        ('pubkey_hash', IntType(160)),
-        ('subsidy', IntType(64)),
-        ('donation', IntType(16)),
-        ('stale_info', EnumType(IntType(8), dict((k, {0: None, 253: 'orphan', 254: 'doa'}.get(k, 'unk%i' % (k,))) for k in xrange(256)))),
-        ('desired_version', VarIntType()),
-    ]))] + [segwit_data] + [
-    ('new_transaction_hashes', ListType(IntType(256))),
-    ('transaction_hash_refs', ListType(VarIntType(), 2)), # pairs of share_count, tx_count
-    ('far_share_hash', PossiblyNoneType(0, IntType(256))),
-    ('max_bits', IntType(32)), #FloatingIntegerType()),
-    ('bits', IntType(32)), #FloatingIntegerType()),
-    ('timestamp', IntType(32)),
-    ('absheight', IntType(32)),
-    ('abswork', IntType(128)),
-])
+                                   ('share_data', ComposedType([
+                                       ('previous_share_hash', PossiblyNoneType(0, IntType(256))),
+                                       ('coinbase', VarStrType()),
+                                       ('nonce', IntType(32)),
+                                       ('pubkey_hash', IntType(160)),
+                                       ('subsidy', IntType(64)),
+                                       ('donation', IntType(16)),
+                                       ('stale_info', EnumType(IntType(8), dict((k, {0: None, 253: 'orphan', 254: 'doa'}.get(k, 'unk%i' % (k,))) for k in xrange(256)))),
+                                       ('desired_version', VarIntType()),
+                                   ]))] + [segwit_data] + [
+                                   ('new_transaction_hashes', ListType(IntType(256))),
+                                   ('transaction_hash_refs', ListType(VarIntType(), 2)), # pairs of share_count, tx_count
+                                   ('far_share_hash', PossiblyNoneType(0, IntType(256))),
+                                   ('max_bits', IntType(32)), #FloatingIntegerType()),
+                                   ('bits', IntType(32)), #FloatingIntegerType()),
+                                   ('timestamp', IntType(32)),
+                                   ('absheight', IntType(32)),
+                                   ('abswork', IntType(128)),
+                               ])
 
 share_type = ComposedType([
     ('min_header', small_block_header_type),
@@ -785,9 +785,53 @@ share_type = ComposedType([
     ])),
 ])
 
+ref_type = ComposedType([
+    ('identifier', FixedStrType(64//8)),
+    ('share_info', share_info_type),
+])
+
+merkle_record_type = ComposedType([
+    ('left', IntType(256)),
+    ('right', IntType(256)),
+])
+
+def check_merkle_link(tip_hash, link):
+    if link['index'] >= 2**len(link['branch']):
+        raise ValueError('index too large')
+    return reduce(lambda c, (i, h): hash256(merkle_record_type.pack(
+        dict(left=h, right=c) if (link['index'] >> i) & 1 else
+        dict(left=c, right=h)
+    )), enumerate(link['branch']), tip_hash)
+
+def bytes_to_data(bytes):
+    res = []
+    for x in bytes:
+        res += [ord(x)]
+    #
+    # test_bytes = []
+    # for x in res:
+    #     test_bytes += [ord(x)]
+    # print(test_bytes)
+    return res
+
+def get_ref_hash(share_info, ref_merkle_link):
+    IDENTIFIER = '1c017dc97693f7d5'.decode('hex')
+    # print('share_info: {0}'.format(share_info))
+    print(bytes_to_data(ref_type.pack(dict(
+        identifier=IDENTIFIER,
+        share_info=share_info,
+    ))))
+    return IntType(256).pack(check_merkle_link(hash256(ref_type.pack(dict(
+        identifier=IDENTIFIER,
+        share_info=share_info,
+    ))), ref_merkle_link))
+
+
+###############################################3333
+
 share = share_type.unpack(raw_share.contents)
-print(share.min_header.version)
-print('Nonce = {0}'.format(share.min_header.nonce))
+# print(share.min_header.version)
+# print('Nonce = {0}'.format(share.min_header.nonce))
 print(share)
 
 # Share construct
@@ -796,10 +840,16 @@ DONATION_SCRIPT = '522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c4
 gentx_before_refhash = VarStrType().pack(DONATION_SCRIPT) + IntType(64).pack(0) + VarStrType().pack('\x6a\x28' + IntType(256).pack(0) + IntType(64).pack(0))[:3]
 
 
-gtx = []
-for _b in gentx_before_refhash:
-    gtx += [ord(_b)]
+# gtx = []
+# for _b in gentx_before_refhash:
+#     gtx += [ord(_b)]
+#
+# print(''.join(str(gtx).split(',')))
+#
+# print(len(gentx_before_refhash))
 
-print(''.join(str(gtx).split(',')))
+ref_hash = get_ref_hash(share.share_info, share.ref_merkle_link) + IntType(64).pack(share.last_txout_nonce) + IntType(32).pack(0)
+print(ref_hash)
 
-print(len(gentx_before_refhash))
+print(bytes_to_data(ref_hash))
+

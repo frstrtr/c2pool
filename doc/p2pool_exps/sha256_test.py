@@ -207,3 +207,35 @@ print(hashlib.sha256(hashlib.sha256(rand_bytes).digest()).hexdigest())
 print(hashlib.sha256('123456789').hexdigest())
 print(sha256('123456789').hexdigest())
 print(sha256('123456789').state.encode('hex'))
+
+###########################################################################
+
+def arr_bytes_to_data(bytes):
+    bytes = bytes.split(' ')
+    res = b''
+    for x in bytes:
+        res += chr((int(x)))
+    #
+    # test_bytes = []
+    # for x in res:
+    #     test_bytes += [ord(x)]
+    # print(test_bytes)
+    return res
+
+print("check_hash_link2:")
+
+h_link = {'state':arr_bytes_to_data('31 203 240 168 144 69 145 61 57 77 181 41 73 233 134 184 198 56 91 0 96 203 174 191 60 247 128 111 241 223 150 175'),
+        'length':378,
+        'extra_data' : b''
+        }
+
+h_link_data = arr_bytes_to_data('0 0 0 0 0 0 0 0 0 0 0 0 252 249 222 63 214 27 215 234 123 124 78 134 211 149 91 102 129 104 74 66 236 45 159 103 145 171 81 59 254 19 121 113')
+const_end = arr_bytes_to_data('71 82 33 2 237 42 38 123 181 115 192 69 239 77 190 65 64 149 238 239 231 106 176 196 119 38 7 140 155 123 28 73 111 238 46 98 33 2 48 82 53 47 4 98 82 130 255 213 229 249 90 76 239 82 16 113 70 174 219 67 77 99 0 218 29 52 148 99 32 234 82 174 0 0 0 0 0 0 0 0 42 106 40')
+
+
+res = check_hash_link(h_link, h_link_data, const_end)
+print(res.encode('hex'))
+res_bytes = []
+for x in res:
+    res_bytes += [ord(x)]
+print(res_bytes)
