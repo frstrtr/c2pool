@@ -821,10 +821,15 @@ def get_ref_hash(share_info, ref_merkle_link):
         identifier=IDENTIFIER,
         share_info=share_info,
     ))))
-    return IntType(256).pack(check_merkle_link(hash256(ref_type.pack(dict(
+    hash_ref_type = hash256(ref_type.pack(dict(
         identifier=IDENTIFIER,
         share_info=share_info,
-    ))), ref_merkle_link))
+    )))
+    print('hash_ref_type: {0}'.format(bytes_to_data(IntType(256).pack(hash_ref_type))))
+    _check_merkle_link = check_merkle_link(hash_ref_type, ref_merkle_link)
+    print('_check_merkle_link: {0}'.format(bytes_to_data(IntType(256).pack(_check_merkle_link))))
+    return IntType(256).pack(_check_merkle_link)
+
 
 
 ###############################################3333
@@ -852,4 +857,10 @@ ref_hash = get_ref_hash(share.share_info, share.ref_merkle_link) + IntType(64).p
 print(ref_hash)
 
 print(bytes_to_data(ref_hash))
+
+gentx_hash = check_hash_link(
+    self.hash_link,
+    self.get_ref_hash(net, self.share_info, contents['ref_merkle_link']) + pack.IntType(64).pack(self.contents['last_txout_nonce']) + pack.IntType(32).pack(0),
+    self.gentx_before_refhash,
+    )
 
