@@ -574,12 +574,18 @@ merkle_record_type = ComposedType([
 ])
 
 def check_merkle_link(tip_hash, link):
+    print("check_merkle_link")
+    print(hex(tip_hash))
+    print([hex(x) for x in link['branch']])
+
     if link['index'] >= 2**len(link['branch']):
         raise ValueError('index too large')
-    return reduce(lambda c, (i, h): hash256(merkle_record_type.pack(
-        dict(left=h, right=c) if (link['index'] >> i) & 1 else
-        dict(left=c, right=h)
-    )), enumerate(link['branch']), tip_hash)
+    return reduce(lambda c, (i, h):
+                hash256(merkle_record_type.pack(
+                    dict(left=h, right=c) if (link['index'] >> i) & 1 else
+                    dict(left=c, right=h))),
+                enumerate(link['branch']),
+                tip_hash)
 
 def bytes_to_data(bytes):
     res = []
