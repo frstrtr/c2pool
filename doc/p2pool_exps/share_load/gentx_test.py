@@ -812,7 +812,7 @@ def bytes_to_data(bytes):
     # for x in res:
     #     test_bytes += [ord(x)]
     # print(test_bytes)
-    return res
+    return str(res).replace(', ', ' ')
 
 def get_ref_hash(share_info, ref_merkle_link):
     IDENTIFIER = '1c017dc97693f7d5'.decode('hex')

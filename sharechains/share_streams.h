@@ -244,26 +244,43 @@ namespace shares::stream
 
     struct RefType
     {
+        bool __segwit_activated__;
+
         FixedStrType<8> identifier;
+        ShareData_stream share_data;
         ShareInfo_stream share_info;
+        std::shared_ptr<SegwitData_stream> segwit_data;
 
-		RefType() = default;
+		RefType(bool _segwit_activated = true)
+        {
+            __segwit_activated__ = _segwit_activated;
+        }
 
-		RefType(std::vector<unsigned char> _ident, shares::types::ShareInfo &_share_info)
+		RefType(std::vector<unsigned char> _ident, shares::types::ShareData &_share_data, shares::types::ShareInfo &_share_info, std::optional<shares::types::SegwitData> _segwit_data)
 		{
 			identifier = FixedStrType<8>(_ident);
+            share_data = ShareData_stream(_share_data);
 			share_info = ShareInfo_stream(_share_info);
+
+            if (_segwit_data.has_value())
+                segwit_data = std::make_shared<SegwitData_stream>(_segwit_data.value());
 		}
 
         PackStream &write(PackStream &stream)
         {
-            stream << identifier << share_info;
+            stream << identifier << share_data;
+            if (segwit_data)
+                stream << *segwit_data;
+            stream << share_info;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
             stream >> identifier >> share_info;
+            if (__segwit_activated__)
+                stream >> segwit_data;
+            stream >> share_info;
             return stream;
         }
     };

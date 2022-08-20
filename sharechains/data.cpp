@@ -106,12 +106,18 @@ namespace shares
         return result;
     }
 
-    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link)
+    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data)
     {
-        RefType ref_type(std::vector<unsigned char>(net->IDENTIFIER, net->IDENTIFIER+net->IDENTIFIER_LENGHT), share_info);
+        RefType ref_type(std::vector<unsigned char>(net->IDENTIFIER, net->IDENTIFIER+net->IDENTIFIER_LENGHT), share_data, share_info, segwit_data);
 
         PackStream ref_type_packed;
         ref_type_packed << ref_type;
+
+        //TODO: remove
+        std::cout << "ref_type_packed: ";
+        for (auto v : ref_type_packed.data)
+            std::cout << (unsigned int) v << " ";
+        std::cout << std::endl;
 
         auto hash_ref_type = coind::data::hash256(ref_type_packed);
         IntType(256) _check_merkle_link(coind::data::check_merkle_link(hash_ref_type, ref_merkle_link));
@@ -591,7 +597,7 @@ namespace shares
                 // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)
                 auto script = std::vector<unsigned char> {0x6a, 0x28};
 
-                auto _get_ref_hash = get_ref_hash(net, *share_info, _ref_merkle_link);
+                auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data);
                 script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
 
                 IntType(64) _last_txout_nonce(_last_txout_nonce);
