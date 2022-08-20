@@ -69,7 +69,7 @@ void Share::init()
 
     std::vector<unsigned char> hash_link_data;
     {
-        auto ref_hash = shares::get_ref_hash(net, *share_info->get(), *ref_merkle_link->get());
+        auto ref_hash = shares::get_ref_hash(net, *share_data->get(), *share_info->get(), *ref_merkle_link->get(), segwit_data ? std::make_optional(*segwit_data->get()) : nullopt);
         hash_link_data = ref_hash.data;
 
         IntType(64) _last_txout_nonce(last_txout_nonce);

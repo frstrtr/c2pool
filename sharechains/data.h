@@ -25,7 +25,7 @@ namespace shares
 
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending = {});
 
-    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link);
+    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data = nullopt);
 }
 
 //GenerateShareTransaction
