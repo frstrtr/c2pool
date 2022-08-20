@@ -4,8 +4,10 @@
 #include <univalue.h>
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
+#include <boost/algorithm/cxx17/reduce.hpp>
 
 #include <sstream>
+#include <algorithm>
 
 #include "transaction.h"
 
@@ -293,33 +295,71 @@ namespace coind::data
     //TODO: test
     uint256 check_merkle_link(uint256 tip_hash, coind::data::MerkleLink link)
     {
+        //TODO: remove
+        std::cout << "tip hash: " << tip_hash.GetHex() << std::endl;
+        std::cout << "link [BEGIN]: " << std::endl;
+        for (auto x : link.branch)
+        {
+            std::cout << x.GetHex() << std::endl;
+        }
+        std::cout << "link [END]." << std::endl;
+
+
         if (link.index >= pow(2, link.branch.size()))
         {
             throw std::invalid_argument("index too large");
         }
 
-        auto cur = tip_hash;
-
         int i = 0;
-        for (auto h : link.branch)
-        {
-            if ((link.index >> i) & 1)
-            {
-                auto merkle_rec = merkle_record_type{h, cur};
-                PackStream ps;
-                ps << merkle_rec;
-                cur = hash256(ps);
-            }
-            else
-            {
-                auto merkle_rec = merkle_record_type{cur, h};
-                PackStream ps;
-                ps << merkle_rec;
-                cur = hash256(ps);
-            }
-        }
+//        auto res =  boost::algorithm::reduce(link.branch.begin(), link.branch.end(), tip_hash,
+//                                             [&](uint256 left, uint256 right){
+//                                                    auto merkle_rec = merkle_record_type{h, cur};
+//                                                    i++;
+//                                                }
+//                                             );
 
-        return cur;
+        auto res = std::accumulate(link.branch.begin(), link.branch.end(), tip_hash,
+                                   [&] (const uint256 &c, const uint256 &h){
+                                       merkle_record_type merkle_rec;
+                                       if ((link.index >> i) & 1)
+                                       {
+                                           merkle_rec = merkle_record_type{h, c};
+                                       } else {
+                                           merkle_rec = merkle_record_type{c, h};
+                                       }
+
+                                       PackStream ps;
+                                       ps << merkle_rec;
+                                       auto result = hash256(ps, true);
+                                       i++;
+                                       return result;
+                                    }
+                                   );
+
+        return res;
+
+//        auto cur = tip_hash;
+//
+//        int i = 0;
+//        for (auto h : link.branch)
+//        {
+//            if ((link.index >> i) & 1)
+//            {
+//                auto merkle_rec = merkle_record_type{h, cur};
+//                PackStream ps;
+//                ps << merkle_rec;
+//                cur = hash256(ps);
+//            }
+//            else
+//            {
+//                auto merkle_rec = merkle_record_type{cur, h};
+//                PackStream ps;
+//                ps << merkle_rec;
+//                cur = hash256(ps);
+//            }
+//        }
+
+//        return cur;
     }
 
     uint256 merkle_hash(std::vector<uint256> hashes)
