@@ -31,6 +31,8 @@ void Share::init()
     CheckShareRequirement(hash_link);
     CheckShareRequirement(merkle_link);
 
+    std::cout << "1" << std::endl;
+
     bool segwit_activated = shares::is_segwit_activated(VERSION, net);
     if (segwit_activated && !segwit_data)
         throw std::runtime_error("Segwit activated, but segwit_data == nullptr!");
@@ -257,6 +259,7 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 	PackStream _stream(packed_share.contents.value);
 
     //TODO: remove
+    std::cout << "Stream share: ";
     for (auto v : _stream.data)
     {
         std::cout << (unsigned int) v << " ";
@@ -268,13 +271,13 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 	{
 		case 17:
 //			return director.make_share(packed_share.type.value, peer_addr, _stream);
-//		case 32:
+		case 33:
 			return director.make_preSegwitShare(packed_share.type.value, peer_addr, _stream);
 		default:
 			if (packed_share.type.value < 17)
 				throw std::runtime_error("sent an obsolete share");
 			else
-				throw std::runtime_error((boost::format("unkown share type: %1") % packed_share.type.value).str());
+				throw std::runtime_error((boost::format("unkown share type: %1%") % packed_share.type.value).str());
 			break;
 	}
 }

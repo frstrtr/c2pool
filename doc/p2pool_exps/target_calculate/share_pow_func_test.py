@@ -703,11 +703,12 @@ POW_FUNC = lambda data: IntType(256).unpack(__import__('ltc_scrypt').getPoWHash(
 a = POW_FUNC(block_header_type.pack(dict(
     version=536870914,
     previous_block=99042567960937278370794190410317057162389294650298279237778909988455488714096,
-    merkle_root=0xf149536e166be0aea4026f5fb45a12975978638f98b74775ba3da339386cb6ed,
+    merkle_root=0x2d10e65d877ca75be4268f6a96bbf04d46cc71308a29c1d6982a91b90a9596e4,
     timestamp=1659579566,
     bits=FloatingInteger(0x1b009e97),
     nonce=1651310784
 )))
 
 print(hex(a))
+print(a > 0x00000fffff000000000000000000000000000000000000000000000000000000)
 # print(int('00000001312dc20ce5aa3ee622f5562dfb2593ec51436aab739ef0d02189e18f', 16) == a)

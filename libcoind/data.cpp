@@ -204,7 +204,7 @@ namespace coind::data
         CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
 
         result.SetHex(HexStr(out2));
-//        reverse(result.begin(), result.end());
+        reverse(result.begin(), result.end());
 
         std::cout << "hash256_from_hash_link: " << result.GetHex() << std::endl;
         return result;

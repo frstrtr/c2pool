@@ -1,12 +1,7 @@
 import binascii
 import struct
-import hashlib
-
-def shift_left(n, m):
-    # python: :(
-    if m >= 0:
-        return n << m
-    return n >> -m
+import cStringIO as StringIO
+import os
 
 class EarlyEnd(Exception):
     pass
@@ -14,14 +9,12 @@ class EarlyEnd(Exception):
 class LateEnd(Exception):
     pass
 
-def read((data, pos), length):
-    data2 = data[pos:pos + length]
-    if len(data2) != length:
-        raise EarlyEnd()
-    return data2, (data, pos + length)
-
-def size((data, pos)):
-    return len(data) - pos
+def remaining(sio):
+    here = sio.tell()
+    sio.seek(0, os.SEEK_END)
+    end  = sio.tell()
+    sio.seek(here)
+    return end - here
 
 class Type(object):
     __slots__ = []
@@ -43,27 +36,19 @@ class Type(object):
         return not (self == other)
 
     def _unpack(self, data, ignore_trailing=False):
-        obj, (data2, pos) = self.read((data, 0))
-
-        assert data2 is data
-
-        if pos != len(data) and not ignore_trailing:
+        obj = self.read(data)
+        if not ignore_trailing and remaining(data):
             raise LateEnd()
-
         return obj
 
     def _pack(self, obj):
-        f = self.write(None, obj)
-
-        res = []
-        while f is not None:
-            res.append(f[1])
-            f = f[0]
-        res.reverse()
-        return ''.join(res)
-
+        f = StringIO.StringIO()
+        self.write(f, obj)
+        return f.getvalue()
 
     def unpack(self, data, ignore_trailing=False):
+        if not type(data) == StringIO.InputType:
+            data = StringIO.StringIO(data)
         obj = self._unpack(data, ignore_trailing)
 
         return obj
@@ -87,10 +72,10 @@ class Type(object):
 
 class VarIntType(Type):
     def read(self, file):
-        data, file = read(file, 1)
+        data = file.read(1)
         first = ord(data)
         if first < 0xfd:
-            return first, file
+            return first
         if first == 0xfd:
             desc, length, minimum = '<H', 2, 0xfd
         elif first == 0xfe:
@@ -99,21 +84,21 @@ class VarIntType(Type):
             desc, length, minimum = '<Q', 8, 2**32
         else:
             raise AssertionError()
-        data2, file = read(file, length)
+        data2 = file.read(length)
         res, = struct.unpack(desc, data2)
         if res < minimum:
             raise AssertionError('VarInt not canonically packed')
-        return res, file
+        return res
 
     def write(self, file, item):
         if item < 0xfd:
-            return file, struct.pack('<B', item)
+            return file.write(struct.pack('<B', item))
         elif item <= 0xffff:
-            return file, struct.pack('<BH', 0xfd, item)
+            return file.write(struct.pack('<BH', 0xfd, item))
         elif item <= 0xffffffff:
-            return file, struct.pack('<BI', 0xfe, item)
+            return file.write(struct.pack('<BI', 0xfe, item))
         elif item <= 0xffffffffffffffff:
-            return file, struct.pack('<BQ', 0xff, item)
+            return file.write(struct.pack('<BQ', 0xff, item))
         else:
             raise ValueError('int too large for varint')
 
@@ -121,11 +106,12 @@ class VarStrType(Type):
     _inner_size = VarIntType()
 
     def read(self, file):
-        length, file = self._inner_size.read(file)
-        return read(file, length)
+        length = self._inner_size.read(file)
+        return file.read(length)
 
     def write(self, file, item):
-        return self._inner_size.write(file, len(item)), item
+        self._inner_size.write(file, len(item))
+        file.write(item)
 
 class EnumType(Type):
     def __init__(self, inner, pack_to_unpack):
@@ -139,15 +125,15 @@ class EnumType(Type):
             self.unpack_to_pack[v] = k
 
     def read(self, file):
-        data, file = self.inner.read(file)
+        data = self.inner.read(file)
         if data not in self.pack_to_unpack:
             raise ValueError('enum data (%r) not in pack_to_unpack (%r)' % (data, self.pack_to_unpack))
-        return self.pack_to_unpack[data], file
+        return self.pack_to_unpack[data]
 
     def write(self, file, item):
         if item not in self.unpack_to_pack:
             raise ValueError('enum item (%r) not in unpack_to_pack (%r)' % (item, self.unpack_to_pack))
-        return self.inner.write(file, self.unpack_to_pack[item])
+        self.inner.write(file, self.unpack_to_pack[item])
 
 class ListType(Type):
     _inner_size = VarIntType()
@@ -157,19 +143,16 @@ class ListType(Type):
         self.mul = mul
 
     def read(self, file):
-        length, file = self._inner_size.read(file)
+        length = self._inner_size.read(file)
         length *= self.mul
-        res = [None]*length
-        for i in xrange(length):
-            res[i], file = self.type.read(file)
-        return res, file
+        res = [self.type.read(file) for i in xrange(length)]
+        return res
 
     def write(self, file, item):
         assert len(item) % self.mul == 0
-        file = self._inner_size.write(file, len(item)//self.mul)
+        self._inner_size.write(file, len(item)//self.mul)
         for subitem in item:
-            file = self.type.write(file, subitem)
-        return file
+            self.type.write(file, subitem)
 
 class StructType(Type):
     __slots__ = 'desc length'.split(' ')
@@ -179,11 +162,11 @@ class StructType(Type):
         self.length = struct.calcsize(self.desc)
 
     def read(self, file):
-        data, file = read(file, self.length)
-        return struct.unpack(self.desc, data)[0], file
+        data = file.read(self.length)
+        return struct.unpack(self.desc, data)[0]
 
     def write(self, file, item):
-        return file, struct.pack(self.desc, item)
+        file.write(struct.pack(self.desc, item))
 
 class IntType(Type):
     __slots__ = 'bytes step format_str max'.split(' ')
@@ -206,23 +189,23 @@ class IntType(Type):
 
     def read(self, file, b2a_hex=binascii.b2a_hex):
         if self.bytes == 0:
-            return 0, file
-        data, file = read(file, self.bytes)
-        return int(b2a_hex(data[::self.step]), 16), file
+            return 0
+        data = file.read(self.bytes)
+        return int(b2a_hex(data[::self.step]), 16)
 
     def write(self, file, item, a2b_hex=binascii.a2b_hex):
         if self.bytes == 0:
-            return file
+            return None
         if not 0 <= item < self.max:
             raise ValueError('invalid int value - %r' % (item,))
-        return file, a2b_hex(self.format_str % (item,))[::self.step]
+        file.write(a2b_hex(self.format_str % (item,))[::self.step])
 
 class IPV6AddressType(Type):
     def read(self, file):
-        data, file = read(file, 16)
+        data = file.read(16)
         if data[:12] == '00000000000000000000ffff'.decode('hex'):
-            return '.'.join(str(ord(x)) for x in data[12:]), file
-        return ':'.join(data[i*2:(i+1)*2].encode('hex') for i in xrange(8)), file
+            return '.'.join(str(ord(x)) for x in data[12:])
+        return ':'.join(data[i*2:(i+1)*2].encode('hex') for i in xrange(8))
 
     def write(self, file, item):
         if ':' in item:
@@ -233,7 +216,7 @@ class IPV6AddressType(Type):
                 raise ValueError('invalid address: %r' % (bits,))
             data = '00000000000000000000ffff'.decode('hex') + ''.join(chr(x) for x in bits)
         assert len(data) == 16, len(data)
-        return file, data
+        file.write(data)
 
 _record_types = {}
 
@@ -284,14 +267,13 @@ class ComposedType(Type):
     def read(self, file):
         item = self.record_type()
         for key, type_ in self.fields:
-            item[key], file = type_.read(file)
-        return item, file
+            item[key] = type_.read(file)
+        return item
 
     def write(self, file, item):
         assert set(item.keys()) >= self.field_names
         for key, type_ in self.fields:
-            file = type_.write(file, item[key])
-        return file
+            type_.write(file, item[key])
 
 class PossiblyNoneType(Type):
     def __init__(self, none_value, inner):
@@ -299,25 +281,25 @@ class PossiblyNoneType(Type):
         self.inner = inner
 
     def read(self, file):
-        value, file = self.inner.read(file)
-        return None if value == self.none_value else value, file
+        value = self.inner.read(file)
+        return None if value == self.none_value else value
 
     def write(self, file, item):
         if item == self.none_value:
             raise ValueError('none_value used')
-        return self.inner.write(file, self.none_value if item is None else item)
+        self.inner.write(file, self.none_value if item is None else item)
 
 class FixedStrType(Type):
     def __init__(self, length):
         self.length = length
 
     def read(self, file):
-        return read(file, self.length)
+        return file.read(self.length)
 
     def write(self, file, item):
         if len(item) != self.length:
             raise ValueError('incorrect length item!')
-        return file, item
+        file.write(item)
 
 address_type = ComposedType([
     ('services', IntType(64)),
@@ -358,120 +340,6 @@ def hash256(data):
 
 def pubkey_hash_to_script2(pubkey_hash):
     return '\x76\xa9' + ('\x14' + IntType(160).pack(pubkey_hash)) + '\x88\xac'
-
-"""
-addrs1 = dict(services=3, address="192.168.10.10", port=8)
-addrs2 = dict(services=9, address="192.168.10.11", port=9999)
-best_share_hash = int("06abb7263fc73665f1f5b129959d90419fea5b1fdbea6216e8847bcc286c14e9", 16)
-# addr = address_type.pack(dict(services=1, address="192.168.10.10", port=1))
-msg = message_version.pack(dict(version=3301, services=0, addr_to=addrs1, addr_from=addrs2, nonce=254, sub_version="c2pool-test", mode=1, best_share_hash=best_share_hash))
-print(msg)
-res = []
-res_str = ""
-for c in msg:
-    res += [ord(c)]
-    res_str += str(ord(c)) + " "
-# print(res)
-print(res_str)
-
-hash = hashlib.sha256
-
-checksum = hash(hash(msg).digest()).digest()
-hex_checksum = hash(hash(msg).digest()).hexdigest();
-print(hex_checksum)
-
-print("checksum:")
-res_str = ""
-for c in checksum:
-    res += [ord(c)]
-    res_str += str(ord(c)) + " "
-print(res_str)
-# print(checksum)
-print (checksum[:4])
-# print(msg)
-"""
-
-
-#c2pool
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 8 0 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 14 0 21 205 91 7 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-#p2pool
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 0 14 21 205 91 7 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-
-
-#========
-#Without big endian
-#c2pool
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 8 0 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 15 39 254 0 0 0 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-#p2pool
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 8 0 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 15 39 254 0 0 0 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-
-#========
-#After fix:
-#c2pool:
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 39 15 254 0 0 0 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-#p2pool:
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 39 15 254 0 0 0 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-
-#=======
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 39 15 254 0 0 0 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-#229 12 0 0 0 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 10 0 8 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 168 10 11 39 15 254 0 0 0 0 0 0 0 11 99 50 112 111 111 108 45 116 101 115 116 1 0 0 0 233 20 108 40 204 123 132 232 22 98 234 219 31 91 234 159 65 144 157 149 41 177 245 241 101 54 199 63 38 183 171 6
-
-#=======
-#checksum
-#c2pool
-#202 129 170 188 195 123 105 117 227 142 244 158 47 69 25 8 112 64 14 54 56 211 106 63 207 27 165 41 65 70 138 248
-#p2pool [True]
-#21 102 66 235 221 222 11 88 186 181 186 213 103 112 141 227 218 158 162 171 230 24 239 175 202 203 234 35 156 35 113 14
-
-#====================
-#
-# tx = tx_type.pack(dict(
-#     version=1,
-#     tx_ins=[dict(
-#         previous_output=None,
-#         sequence=None,
-#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
-#     )],
-#     tx_outs=[dict(
-#         value=5003880250,
-#         script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
-#     )],
-#     lock_time=0,
-# ))
-#
-# l_tx = []
-# for i in tx:
-#     l_tx += [ord(i)]
-#
-# print(str(l_tx).replace(',', ''))
-#
-# #===========================================================
-# tx_type2 = ComposedType([
-#     ('version', IntType(32)),
-#     ('tx_ins', ListType(ComposedType([
-#         ('previous_output', PossiblyNoneType(dict(hash=0, index=2**32 - 1), ComposedType([
-#             ('hash', IntType(256)),
-#             ('index', IntType(32)),
-#         ]))),
-#         ('script', VarStrType()),
-#         ('sequence', PossiblyNoneType(2**32 - 1, IntType(32))),
-#     ])))
-# ])
-#
-# tx2 = tx_type2.pack(dict(
-#     version=1,
-#     tx_ins=[dict(
-#         previous_output=None,
-#         sequence=None,
-#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
-#     )]
-# ))
-#
-# l_tx2 = []
-# for i in tx2:
-#     l_tx2 += [ord(i)]
-#
-# print(str(l_tx2).replace(',', ''))
 
 #==================================
 
@@ -549,69 +417,40 @@ class TransactionType(Type):
 
 tx_type2 = TransactionType()
 
-#=====================
-# tx1 = dict(
-#     version=1,
-#     tx_ins=[dict(
-#         previous_output=None,
-#         sequence=None,
-#         script='70736a0468860e1a0452389500522cfabe6d6d2b2f33cf8f6291b184f1b291d24d82229463fcec239afea0ee34b4bfc622f62401000000000000004d696e656420627920425443204775696c6420ac1eeeed88'.decode('hex'),
-#     )],
-#     tx_outs=[dict(
-#         value=5003880250,
-#         script=pubkey_hash_to_script2(IntType(160).unpack('ca975b00a8c203b8692f5a18d92dc5c2d2ebc57b'.decode('hex'))),
-#     )],
-#     lock_time=0,
-# )
-#
-# a = tx_type.pack(tx1)
-#
-# l_tx2 = []
-# for i in a:
-#     l_tx2 += [ord(i)]
-#
-# print(str(l_tx2).replace(',', ''))
-#
-# b = 'asdb3'
-# b2 = (hash256(b)+1)
-# print('hash: {0}, hex: {1}'.format(hash256(b), hex(hash256(b))))
-# print('hash: {0}, hex: {1}'.format(b2, hex(b2)))
+def shift_left(n, m):
+    # python: :(
+    if m >= 0:
+        return n << m
+    return n >> -m
 
-
-################################################################################
-# gentx = dict(
-#     version=4294967295,
-#     tx_ins=[dict(
-#         previous_output=None,
-#         sequence=None,
-#         script='015d5d52ad85411c47a5a8c71b8de0a39835891c26539eb2170eee693f08681a0302042800000003205b41960f08035d9b1ced05be46f7f8621053f1d362341dee2b9ada51abb3cf47',
-#     )],
-#     tx_outs=([dict(value=0, script='\x6a\x24\xaa\x21\xa9\xed' + IntType(256).pack(1234567))]),
-#     lock_time=0,
-# )
-#
-# gentx['marker'] = 3
-# gentx['flag'] = 2
-# gentx['witness'] = [["c2pool"*4]]
-#
-# def postprocess(data):
-#     return [ord(x) for x in data]
-#
-# packed_gentx = tx_id_type.pack(gentx)
-# print(postprocess(packed_gentx))
-# print(postprocess(packed_gentx[:-32]))
+def natural_to_string(n, alphabet=None):
+    if n < 0:
+        raise TypeError('n must be a natural')
+    if alphabet is None:
+        s = ('%x' % (n,)).lstrip('0')
+        if len(s) % 2:
+            s = '0' + s
+        return s.decode('hex')
+    else:
+        assert len(set(alphabet)) == len(alphabet)
+        res = []
+        while n:
+            n, x = divmod(n, len(alphabet))
+            res.append(alphabet[x])
+        res.reverse()
+        return ''.join(res)
 
 class FloatingInteger(object):
     __slots__ = ['bits', '_target']
 
-    # @classmethod
-    # def from_target_upper_bound(cls, target):
-    #     n = natural_to_string(target)
-    #     if n and ord(n[0]) >= 128:
-    #         n = '\x00' + n
-    #     bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
-    #     bits = IntType(32).unpack(bits2)
-    #     return cls(bits)
+    @classmethod
+    def from_target_upper_bound(cls, target):
+        n = natural_to_string(target)
+        if n and ord(n[0]) >= 128:
+            n = '\x00' + n
+        bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
+        bits = IntType(32).unpack(bits2)
+        return cls(bits)
 
     def __init__(self, bits, target=None):
         self.bits = bits
@@ -624,14 +463,6 @@ class FloatingInteger(object):
         res = self._target
         if res is None:
             res = self._target = shift_left(self.bits & 0x00ffffff, 8 * ((self.bits >> 24) - 3))
-
-            v = self.bits & 0x00ffffff
-            # v << (8 * ((v >> 24) - 3))
-            print('Test bits: {0}').format(self.bits)
-            print('Test_target: {0}'.format(v))
-            # value.value & );
-            #
-            # res << (8 * ((value.value >> 24) - 3));
         return res
 
     def __hash__(self):
@@ -668,63 +499,10 @@ block_header_type = ComposedType([
     ('nonce', IntType(32)),
 ])
 
-share_type = ComposedType([
-    ('type', VarIntType()),
-    ('contents', VarStrType()),
-])
-
-# x = '01000000013ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff01c40965f0020000001976a9141462c3dd3f936d595c9af55978003b27c250441f88ac80feea62'
-# # print(IntType(32).unpack('01000000013c'))#3ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff01c40965f0020000001976a9141462c3dd3f936d595c9af55978003b27c250441f88ac80feea62')
-# # tx_type2.unpack(x)
-# print('Version: {0}'.format(IntType(32).unpack(b'\x01\x00\x00\x00')))
-# version_packed = IntType(32).pack(1)
-# print("len: {0}".format(len(version_packed)))
-# print('Version2: {0}'.format(IntType(32).unpack(version_packed)))
-# num_packed = []
-# for _d in version_packed:
-#     num_packed += [ord(_d)]
-# print(num_packed)
-#
-# start_tx_data = ComposedType([
-#     ('version', IntType(32)),
-#     ('marker', VarIntType())])
-# #######################
-#
-#
-# x = "0100000002".decode('hex')
-# __x = []
-# for c in x:
-#     __x += [ord(c)]
-# print(__x)
-# print(start_tx_data.unpack(x))
-#
-# #################################
-# second_tx_data = ComposedType([
-#     ('version', IntType(32)),
-#     ('marker', VarIntType()),
-#     ('tx_in', tx_in_type)])
-#
-#
-# x = '01000000013ccaa9d380b87652929e5fe06c7c6ea08e16118c0a4749d0391fbe98ab6e549f00000000d74730440220197724619b7a57853c6ce6a04d933a83057629e4323ae301562b817904b321280220598f71b813045fcf500352e701b9b7cab75a5694eab374d6cdec13fd2efd8e4f0120949c9ff1f7fa8268128832fd123535ef3eae4d01c7c1aa3fa74ec38692878129004c6b630480feea62b1752102f70d90df545d767a53daa25e07875b4b588c476cba465a28dcafc4b6b792cf94ac6782012088a9142323cb36c535e5121c3409e371c1ae15011b5faf88210315d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732ac68ffffffff'.decode('hex')
-# print(second_tx_data.unpack(x))
-
-x = '11fda501fe02000020707524a64aa0820305612357ae0d2744695c8ba18b8e1402dc4e199b5e1bf8daae2ceb62979e001bc0006d6200000000000000000000000000000000000000000000000000000000000000003d043edaec002cfabe6d6d08d3533a81ca356a7ac1c85c9b0073aebcca7182ad83849b9498377c9a1cd8a701000000000000000a5f5f6332706f6f6c5f5f3e9922fe9ad7bdd0e20eb7f64fa6dd42734dd4f43275cc26fd4d483b0a00000000000021012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d61f2bae86d664294b8850df3f580ec9e4fb2170fe8dbae492b5159af73834eba4012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d60100000000000000000000000000000000000000000000000000000000000000000000ffff0f1effff0f1eae2ceb6201000000010010000000000000000000000000000000000000000000001fcbf0a89045913d394db52949e986b8c6385b0060cbaebf3cf7806ff1df96affd7a01012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d6'
-raw_share = share_type.unpack(x.decode('hex'))
-print(raw_share.type)
-
-share_bytes = []
-for _b in raw_share.contents:
-    share_bytes += [ord(_b)]
-
-print(''.join(str(share_bytes).split(',')))
-
-# a = b''
-# for _x in '254 2 0 0 32'.split(' '):
-#     a += chr(int(_x))
-#
-# i = VarIntType().unpack('11'.decode('hex'))
-# print(i)
-
+# share_type = ComposedType([
+#     ('type', VarIntType()),
+#     ('contents', VarStrType()),
+# ])
 # share info type
 
 hash_link_type = ComposedType([
@@ -737,7 +515,7 @@ small_block_header_type = ComposedType([
     ('version', VarIntType()),
     ('previous_block', PossiblyNoneType(0, IntType(256))),
     ('timestamp', IntType(32)),
-    ('bits', IntType(32)), #FloatingIntegerType()),
+    ('bits', FloatingIntegerType()),
     ('nonce', IntType(32)),
 ])
 
@@ -763,8 +541,8 @@ share_info_type = ComposedType([
                                    ('new_transaction_hashes', ListType(IntType(256))),
                                    ('transaction_hash_refs', ListType(VarIntType(), 2)), # pairs of share_count, tx_count
                                    ('far_share_hash', PossiblyNoneType(0, IntType(256))),
-                                   ('max_bits', IntType(32)), #FloatingIntegerType()),
-                                   ('bits', IntType(32)), #FloatingIntegerType()),
+                                   ('max_bits', FloatingIntegerType()),
+                                   ('bits', FloatingIntegerType()),
                                    ('timestamp', IntType(32)),
                                    ('absheight', IntType(32)),
                                    ('abswork', IntType(128)),
@@ -815,7 +593,8 @@ def bytes_to_data(bytes):
     return str(res).replace(', ', ' ')
 
 def get_ref_hash(share_info, ref_merkle_link):
-    IDENTIFIER = '1c017dc97693f7d5'.decode('hex')
+    # IDENTIFIER = '1c017dc97693f7d5'.decode('hex')
+    IDENTIFIER = '83E65D2C81BF6D66'.decode('hex')
     # print('share_info: {0}'.format(share_info))
     print(bytes_to_data(ref_type.pack(dict(
         identifier=IDENTIFIER,
@@ -937,31 +716,28 @@ def check_hash_link(hash_link, data, const_ending=''):
     # return hashlib.sha256(sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest()
     return IntType(256).unpack(hashlib.sha256(sha256(data, (hash_link['state'], extra, 8*hash_link['length'])).digest()).digest())
 
+_share_type = ComposedType([
+    ('type', VarIntType()),
+    ('contents', VarStrType()),
+])
+
 ###############################################3333
 
-share = share_type.unpack(raw_share.contents)
-# print(share.min_header.version)
-# print('Nonce = {0}'.format(share.min_header.nonce))
-print(share)
-
 # Share construct
-DONATION_SCRIPT = '522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c496fee2e6221023052352f04625282ffd5e5f95a4cef52107146aedb434d6300da1d34946320ea52ae'.decode('hex')
-
+# DONATION_SCRIPT = '522102ed2a267bb573c045ef4dbe414095eeefe76ab0c47726078c9b7b1c496fee2e6221023052352f04625282ffd5e5f95a4cef52107146aedb434d6300da1d34946320ea52ae'.decode('hex')
+#DONATION_SCRIPT = '410457a337b86557f5b15c94544ad267f96a582dc2b91e6873968ff7ba174fda6874af979cd9af41ec2032dfdfd6587be5b14a4355546d541388c3f1555a67d11c2dac'.decode('hex')
+DONATION_SCRIPT = '5221038ab82f3a4f569c4571c483d56729e83399795badb32821cab64d04e7b5d106864104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664b410457a337b86557f5b15c94544ad267f96a582dc2b91e6873968ff7ba174fda6874af979cd9af41ec2032dfdfd6587be5b14a4355546d541388c3f1555a67d11c2d53ae'.decode('hex')
 gentx_before_refhash = VarStrType().pack(DONATION_SCRIPT) + IntType(64).pack(0) + VarStrType().pack('\x6a\x28' + IntType(256).pack(0) + IntType(64).pack(0))[:3]
 
 
-# gtx = []
-# for _b in gentx_before_refhash:
-#     gtx += [ord(_b)]
-#
-# print(''.join(str(gtx).split(',')))
-#
-# print(len(gentx_before_refhash))
+# pow_hash
+POW_FUNC = lambda data: IntType(256).unpack(__import__('ltc_scrypt').getPoWHash(data))
 
-ref_hash = get_ref_hash(share.share_info, share.ref_merkle_link) + IntType(64).pack(share.last_txout_nonce) + IntType(32).pack(0)
-print(ref_hash)
-
-print(bytes_to_data(ref_hash))
+x = '21fd0702fe02000020617dfa46bf73eb96548e0b039a647d35b387ed0cb1a6e51c80092175857d3f5b3ac4ff62f1a9001bc0254dda4d00fe065ba137d8e108ef134db29b7e33f46327f13626975c0c2a190082018f3d04d03aee002cfabe6d6d21102609e852babee96639fbb3b65588bbcc419720fec56da52e47120c4804a501000000000000000a5f5f6332706f6f6c5f5ffc88aa669a2cd3c1310067ae7e47a7869b330d30b691c61b46fb483b0a0000000000002102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203517d2164368b766e6b9d0598510a7bbfc9882940ebfe3f65bb72173c3dbf105802f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5ef1025a29236b072d75cde8637584a3ed2fe0bcd4aadb5824b61cc42b4414e143d020000000195cbb26f405ead27fcd8cf84155cfcfab722a0cfdb3a2c735fce15fb19bc8ae4ffff0f1e8888001e3bc4ff62cc210000df798a25160000000000000000000000000000000001000000986dae33074d8c439a5dc61c2019a86726ebd1cf0eb0240582ccc0b249d12ba7fd9c0102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203'
+raw_share = _share_type.unpack(x.decode('hex'))
+# print(raw_share.type)
+share = share_type.unpack(raw_share.contents)
+# print(share)
 
 gentx_hash = check_hash_link(
     share.hash_link,
@@ -969,14 +745,30 @@ gentx_hash = check_hash_link(
     gentx_before_refhash,
     )
 
-print('share.hash_link = {0}'.format(share.hash_link))
-print('share.hash_link.state = {0}'.format(bytes_to_data(share.hash_link.state)))
-print('gentx_before_refhash = {0}'.format(bytes_to_data(gentx_before_refhash)))
-print('gentx_hash = {0}'.format(gentx_hash))
+print('hash_link = {0}'.format(share.hash_link)) #+
+print('data = {0}'.format(get_ref_hash(share.share_info, share.ref_merkle_link) + IntType(64).pack(share.last_txout_nonce) + IntType(32).pack(0)))
+print('gentx_before_refhash = {0}'.format(gentx_before_refhash.encode('hex')))
 print('gentx_hash = {0}'.format(hex(gentx_hash)))
-print('gentx_hash(INTTYPE) = {0}'.format(bytes_to_data(IntType(256).pack(gentx_hash))))
 
-print('link: {0}'.format(share.share_info.segwit_data.txid_merkle_link))
 merkle_root = check_merkle_link(gentx_hash, share.share_info.segwit_data.txid_merkle_link)
 print('merkle_root = {0}'.format(hex(merkle_root)))
 
+header = dict(dict(share.min_header), merkle_root=merkle_root)
+# header['bits'] = FloatingInteger(header['bits'])
+print(header)
+
+pow_hash = POW_FUNC(block_header_type.pack(header))
+target = share.share_info.bits.target
+
+MAX_TARGET = 2**256//2**20 - 1
+
+if target > MAX_TARGET:
+    print("share target invalid")
+
+if pow_hash > target:
+    print("ERROR!")
+else:
+    print("WORKED!")
+
+print('target = {0}'.format(hex(share.share_info.bits.target)))
+print('Pow Hash: {0}'.format(hex(pow_hash)))
