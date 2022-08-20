@@ -75,12 +75,12 @@ void Share::init()
         IntType(64) _last_txout_nonce(last_txout_nonce);
         PackStream packed_last_txout_nonce;
         packed_last_txout_nonce << _last_txout_nonce;
-        hash_link_data.insert(hash_link_data.begin(), packed_last_txout_nonce.data.begin(), packed_last_txout_nonce.data.end());
+        hash_link_data.insert(hash_link_data.end(), packed_last_txout_nonce.data.begin(), packed_last_txout_nonce.data.end());
 
         IntType(32) _z(0);
         PackStream packed_z;
         packed_z << _z;
-        hash_link_data.insert(hash_link_data.begin(), packed_z.data.begin(), packed_z.data.end());
+        hash_link_data.insert(hash_link_data.end(), packed_z.data.begin(), packed_z.data.end());
     }
 
     // TODO: for test

@@ -119,7 +119,7 @@ namespace shares
             std::cout << (unsigned int) v << " ";
         std::cout << std::endl;
 
-        auto hash_ref_type = coind::data::hash256(ref_type_packed);
+        auto hash_ref_type = coind::data::hash256(ref_type_packed, true);
         IntType(256) _check_merkle_link(coind::data::check_merkle_link(hash_ref_type, ref_merkle_link));
 
         PackStream result;
