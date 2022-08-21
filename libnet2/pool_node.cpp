@@ -272,6 +272,13 @@ void PoolNode::handle_message_bestblock(std::shared_ptr<pool::messages::message_
 
 void PoolNode::handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
+    }
+
 	auto tx_hashes = msg->tx_hashes.get();
     protocol->remote_tx_hashes.insert(tx_hashes.begin(), tx_hashes.end());
     if (protocol->remote_tx_hashes.size() > 10000)
@@ -279,10 +286,24 @@ void PoolNode::handle_message_have_tx(std::shared_ptr<pool::messages::message_ha
         protocol->remote_tx_hashes.erase(protocol->remote_tx_hashes.begin(),
                                std::next(protocol->remote_tx_hashes.begin(), protocol->remote_tx_hashes.size() - 10000));
     }
+
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
+    }
 }
 
 void PoolNode::handle_message_losing_tx(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
+    }
+
     //remove all msg->txs hashes from remote_tx_hashes
     std::set<uint256> losing_txs;
 	auto tx_hashes = msg->tx_hashes.get();
@@ -294,10 +315,24 @@ void PoolNode::handle_message_losing_tx(std::shared_ptr<pool::messages::message_
                         std::inserter(diff_txs, diff_txs.begin()));
 
     protocol->remote_tx_hashes = diff_txs;
+
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
+    }
 }
 
 void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
+    }
+
     for (auto tx_hash: msg->tx_hashes.get())
     {
         if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
@@ -333,6 +368,9 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 			}
         }
 
+        if (!tx.get())
+            assert(false);
+
 		protocol->remembered_txs[tx_hash] = tx;
 		PackStream stream;
 		stream << tx;
@@ -346,7 +384,7 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 		PackStream stream;
 		stream << _tx;
 		auto _tx_size = stream.size();
-		auto tx_hash = coind::data::hash256(stream);
+		auto tx_hash = coind::data::hash256(stream, true);
 
 		if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
 		{
@@ -361,6 +399,9 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 			warned = true;
 		}
 
+        if (!_tx.get())
+            assert(false);
+
 		protocol->remembered_txs[tx_hash] = _tx;
 		protocol->remembered_txs_size += 100 + _tx_size;
 		added_known_txs[tx_hash] = _tx.get();
@@ -370,17 +411,39 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 	{
 		throw std::runtime_error("too much transaction data stored"); // TODO: custom error
 	}
+
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
+    }
 }
 
 void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-	// TODO: wanna for fix:
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        LOG_INFO << "\n" <<  v.first.GetHex() << "\n";
+        if (!v.second.tx)
+            assert(false);
+    }
+
     for (auto tx_hash : msg->tx_hashes.get())
     {
         PackStream stream;
+        LOG_INFO << "FOR DEBUG TX_HASH = " << tx_hash.GetHex();
         stream << protocol->remembered_txs[tx_hash];
         protocol->remembered_txs_size -= 100 + stream.size();
         assert(protocol->remembered_txs_size >= 0);
         protocol->remembered_txs.erase(tx_hash);
+    }
+
+    LOG_INFO << "PROTOCOL: " << protocol.get();
+    for (auto v : protocol->remembered_txs)
+    {
+        if (!v.second.tx)
+            assert(false);
     }
 }
