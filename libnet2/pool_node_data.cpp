@@ -56,7 +56,10 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
 	auto _header = coind::data::BlockHeaderType();
 	_header.set_stream(header);
 
-	coind_node->handle_header(_header);
+    if (coind_node)
+	    coind_node->handle_header(_header);
+    else
+        LOG_WARNING << "COIND NODE = NULL IN POOL NODE!";
 }
 
 void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares,
