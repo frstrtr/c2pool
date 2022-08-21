@@ -25,12 +25,16 @@ int main()
 	// AddrStore
 	auto addr_store = std::make_shared<c2pool::dev::AddrStore>("only_pool_addrs	", net);
 
+    // ShareTracker
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
 	// Pool Node
 	std::shared_ptr<PoolNode> node = std::make_shared<PoolNode>(context);
 	node
 		->set_net(net)
 		->set_config(config)
-		->set_addr_store(addr_store);
+		->set_addr_store(addr_store)
+        ->set_tracker(tracker);
 	node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
 
 	// DEBUG
