@@ -162,6 +162,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     // try to get at least CHAIN_LENGTH height for each verified head, requesting parents if needed
     for (auto head : verified.sum)
     {
+        // TODO: error here
         auto [head_height, last_hash] = verified.get_height_and_last(head.first);
         auto [last_height, last_last_hash] = get_height_and_last(last_hash);
         // XXX: review boundary conditions

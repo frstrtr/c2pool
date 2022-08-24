@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <vector>
 
 namespace c2pool::dev
 {
@@ -19,6 +20,8 @@ namespace c2pool::dev
 
     //int64_t/IntType(64)
     time_t timestamp();
+
+    std::vector<unsigned char> bytes_from_uint8(std::vector<uint8_t> data);
 
     template <typename Derived, typename Base, typename Del>
     std::unique_ptr<Derived, Del>
