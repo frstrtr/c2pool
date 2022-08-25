@@ -44,34 +44,7 @@ namespace shares
             ReadBE32((*hash_link)->state.data() + 28),
         };
 
-        //TODO: REMOVE
-        std::cout << "INIT STATE" << std::endl;
-        for (uint32_t v : init_state)
-        {
-            std::cout << v << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "DATA" << std::endl;
-        for (auto v : data)
-        {
-            std::cout << (unsigned int)v << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "extra" << std::endl;
-        for (auto v : extra)
-        {
-            std::cout << (unsigned int) v << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "hash_link.length " << hash_link->get()->length << std::endl;
-
         auto result2 = coind::data::hash256_from_hash_link(init_state, data, extra, hash_link->get()->length);
-        auto result_uint256 = result.get();
-        std::cout << "check_hash_link:  " << result_uint256.GetHex() << std::endl;
-//        return result_uint256;
         return result2;
     }
 
@@ -112,12 +85,6 @@ namespace shares
 
         PackStream ref_type_packed;
         ref_type_packed << ref_type;
-
-        //TODO: remove
-        std::cout << "ref_type_packed: ";
-        for (auto v : ref_type_packed.data)
-            std::cout << (unsigned int) v << " ";
-        std::cout << std::endl;
 
         auto hash_ref_type = coind::data::hash256(ref_type_packed, true);
         IntType(256) _check_merkle_link(coind::data::check_merkle_link(hash_ref_type, ref_merkle_link));
