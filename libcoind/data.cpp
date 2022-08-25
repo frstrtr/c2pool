@@ -166,35 +166,8 @@ namespace coind::data
     {
         uint256 result;
 
-//        unsigned char _buf[CSHA256::OUTPUT_SIZE];
         if (!buf.size())
             buf.push_back('\0');
-
-//        CSHA256(init, buf, length).Write(data, strlen((char*)data)).Finalize(_buf);
-//        CSHA256().Write(_buf, CSHA256::OUTPUT_SIZE).Finalize(result.begin());
-
-        std::cout << "hash256.init" << std::endl;
-        for (int i = 0; i < 8; i++)
-        {
-            std::cout << *(init+i) << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "hash256.data" << std::endl;
-        for (auto v : data)
-        {
-            std::cout << (unsigned int)v << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "hash256.buf" << std::endl;
-        for (auto v : buf)
-        {
-            std::cout << (unsigned int) v << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "hash256.length " << length << std::endl;
 
         vector<unsigned char> out1;
         out1.resize(CSHA256::OUTPUT_SIZE);
@@ -208,7 +181,6 @@ namespace coind::data
         result.SetHex(HexStr(out2));
         reverse(result.begin(), result.end());
 
-        std::cout << "hash256_from_hash_link: " << result.GetHex() << std::endl;
         return result;
     }
 

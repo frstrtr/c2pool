@@ -64,28 +64,15 @@ namespace coind
 
     uint256 DigibyteParentNetwork::POW_FUNC(PackStream& packed_block_header)
     {
-        std::cout << "DATA: " << std::endl;
-        for (auto _v : packed_block_header.data)
-        {
-            std::cout << (unsigned int) _v << " ";
-        }
-        std::cout << std::endl;
-
 		const char* input = reinterpret_cast<const char*>(packed_block_header.data.data());
 		char *output = new char[32]{0};
 		scrypt_1024_1_1_256(input, output);
 
 		PackStream converted_output(output, 32);
-//		std::reverse(converted_output.data.begin(), converted_output.data.end());
 		IntType(256) res;
 		converted_output >> res;
 		std::cout << res.get().ToString() << std::endl;
 		return res.get();
-//		std::cout << "output: " << output << std::endl;
-//		PackStream converted_output(output)
-//		IntType(256) res;
-
-//        return coind::data::hash256(packed_block_header);
     }
 
 	unsigned long long DigibyteParentNetwork::SUBSIDY_FUNC(int32_t height)

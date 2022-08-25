@@ -31,8 +31,6 @@ void Share::init()
     CheckShareRequirement(hash_link);
     CheckShareRequirement(merkle_link);
 
-    std::cout << "1" << std::endl;
-
     bool segwit_activated = shares::is_segwit_activated(VERSION, net);
     if (segwit_activated && !segwit_data)
         throw std::runtime_error("Segwit activated, but segwit_data == nullptr!");
@@ -85,46 +83,16 @@ void Share::init()
         hash_link_data.insert(hash_link_data.end(), packed_z.data.begin(), packed_z.data.end());
     }
 
-    // TODO: for test
-//    (*hash_link)->state.insert((*hash_link)->state.begin(), (unsigned char)31);
-
-    std::cout << "HASH_LINK.length: " << (*hash_link)->length << std::endl;
-    std::cout << "HASH_LINK.state: ";
-    for (auto v : (*hash_link)->state)
-        std::cout << (unsigned int)v << " ";
-    std::cout << std::endl;
-    std::cout << "HASH_LINK.extra_data == nullptr: " << ((*hash_link)->extra_data.data() == nullptr) << std::endl;
-    std::cout << "=============" << std::endl;
-    std::cout << "HASH_LINK_DATA: ";
-    for (auto v : hash_link_data)
-        std::cout << (unsigned int)v << " ";
-    std::cout << std::endl;
-
-    std::cout << "GENTX_BEFORE_REFHASH: ";
-    for (auto v : net->gentx_before_refhash)
-        std::cout << (unsigned int)v << " ";
-    std::cout << std::endl;
-
     gentx_hash = shares::check_hash_link(hash_link, hash_link_data, net->gentx_before_refhash);
-    std::cout << "GENTX: " << gentx_hash.GetHex() << std::endl;
 
     auto merkle_root = coind::data::check_merkle_link(gentx_hash, segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
-    std::cout << "FIRST MERKLE_ROOT: " << merkle_root.GetHex() << std::endl;
     header.set_value(coind::data::types::BlockHeaderType(*min_header->get(), merkle_root));
 
     coind::data::stream::BlockHeaderType_stream header_stream(*header.get());
 
-    std::cout << "Version: " << header_stream.version.get() << std::endl;
-    std::cout << "PreviousBlock: " << header_stream.previous_block.get().GetHex() << std::endl;
-    std::cout << "MerkleRoot: " << header_stream.merkle_root.get().GetHex() << std::endl;
-    std::cout << "Timestamp: " << header_stream.timestamp.get() << std::endl;
-    std::cout << "Bits: " << header_stream.bits.get() << std::endl;
-    std::cout << "Nonce: " << header_stream.nonce.get() << std::endl;
     PackStream packed_block_header;
     packed_block_header << header_stream;
 
-
-    std::cout << "BlockHeader: " << HexStr(packed_block_header.data) << "[END]" << std::endl;
     pow_hash = net->parent->POW_FUNC(packed_block_header);
 
 
@@ -137,8 +105,6 @@ void Share::init()
         throw std::runtime_error("Share target invalid!"); //TODO: remake for c2pool::p2p::exception_from_peer
     }
 
-    std::cout << "POW_HASH:\t" << pow_hash.GetHex() << std::endl;
-    std::cout << "Target:\t\t" << target.GetHex() << std::endl;
     if (UintToArith256(pow_hash) > UintToArith256(target))
     {
         throw std::runtime_error("Share PoW indalid!"); //TODO: remake for c2pool::p2p::exception_from_peer
@@ -257,14 +223,6 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 	stream >> packed_share;
 
 	PackStream _stream(packed_share.contents.value);
-
-    //TODO: remove
-    std::cout << "Stream share: ";
-    for (auto v : _stream.data)
-    {
-        std::cout << (unsigned int) v << " ";
-    }
-    std::cout << std::endl;
 
 	ShareDirector director(net);
 	switch (packed_share.type.value)
