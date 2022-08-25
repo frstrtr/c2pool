@@ -187,6 +187,9 @@ TEST_F(SharechainsTest, tracker_get_height_and_last)
     auto hash = share->hash;
     tracker->add(share);
 
+    auto height_and_last = tracker->get_height_and_last(hash);
+    std::cout << "Height: " << std::get<0>(height_and_last) << std::endl;
+    std::cout << "Last: " << std::get<1>(height_and_last) << std::endl;
 
 }
 
@@ -214,5 +217,5 @@ TEST_F(SharechainsTest, tracker_think)
     uint32_t bits = 453027171;
     std::map<uint256, coind::data::tx_type> known_txs;
 
-    tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
+    auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
 }

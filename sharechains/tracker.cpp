@@ -216,15 +216,17 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
 
     // decide best verified head
     std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
-    for (auto h : verified.sum[best_tail].nexts)
-    {
-        auto el = std::make_tuple(
-                verified.get_work(verified.get_nth_parent_hash(h->first, std::min(5, verified.get_height(h->first)))),
-                - std::get<0>(should_punish_reason(h->second.element,previous_block, bits, known_txs)),
-                - h->second.element->time_seen
-                );
-        decorated_heads.push_back({el, h->first});
-    }
+    // TODO: +0 element
+    verified.sum[best_tail].nexts;
+//    for (auto h : verified.sum[best_tail].nexts)
+//    {
+//        auto el = std::make_tuple(
+//                verified.get_work(verified.get_nth_parent_hash(h->first, std::min(5, verified.get_height(h->first)))),
+//                - std::get<0>(should_punish_reason(h->second.element,previous_block, bits, known_txs)),
+//                - h->second.element->time_seen
+//                );
+//        decorated_heads.push_back({el, h->first});
+//    }
     std::sort(decorated_heads.begin(), decorated_heads.end()); //TODO: test for compare with p2pool
     //TODO: debug print heads. Top 10.
 
