@@ -15,11 +15,11 @@
 class CoindProtocol : public Protocol<CoindProtocol>, public CoindProtocolData, ProtocolPinger
 {
 public:
-    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
-    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> get_block_header;
+//    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
+//    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> get_block_header;
 
     CoindProtocol(std::shared_ptr<boost::asio::io_context> _context, std::shared_ptr<Socket> _socket,
-                  HandlerManagerPtr<CoindProtocol> _handler_manager) : Protocol<CoindProtocol>(std::move(_socket), std::move(handler_manager)),
+                  HandlerManagerPtr<CoindProtocol> _handler_manager) : Protocol<CoindProtocol>(std::move(_socket), std::move(_handler_manager)),
                                                                        ProtocolPinger(_context, 30, std::bind(&CoindProtocol::out_time_ping, this),
 																					  [](){return 20; /*TODO: return  random.expovariate(1/100)*/}, [&](){ send_ping(); })
     {
