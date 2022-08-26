@@ -148,14 +148,15 @@ void CoindNode::handle_message_version(std::shared_ptr<coind::messages::message_
 
 void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, std::shared_ptr<CoindProtocol> protocol)
 {
-    protocol->get_block = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>>(context, [&](uint256 hash) -> void {
+    protocol->get_block = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>>(context, [&, _proto = protocol](uint256 hash) -> void {
         auto _msg = std::make_shared<coind::messages::message_getdata>(std::vector<inventory>{{block, hash}});
-        protocol->write(_msg);
+        _proto->write(_msg);
     });
 
-    protocol->get_block_header = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> (context, [&](uint256 hash){
+    protocol->get_block_header = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> (context, [&, _proto = protocol](uint256 hash){
         auto  _msg = std::make_shared<coind::messages::message_getheaders>(1, std::vector<uint256>{}, hash);
-        protocol->write(_msg);
+        _proto->write(_msg);
+//        protocol->write(_msg);
     });
 
 //    pinger(30); //TODO: wanna for this?
@@ -262,18 +263,24 @@ void CoindNode::handle_message_headers(std::shared_ptr<coind::messages::message_
 
     for (auto _block : msg->headers.get())
     {
-        coind::data::BlockTypeA block;
-        block.set_stream(_block);
-
         PackStream packed_header;
-        packed_header << _block;
-        auto block_hash = coind::data::hash256(packed_header);
+        packed_header << _block.header;
+        auto block_hash = coind::data::hash256(packed_header, true);
 
-		coind::data::BlockHeaderType _header;
-		_header.set_value(block->header);
+        std::cout << _block.header.merkle_root.get().GetHex() << std::endl;
+        std::cout << _block.header.bits.get() << std::endl;
+        std::cout << _block.header.timestamp.get() << std::endl;
+        std::cout << _block.header.version.get() << std::endl;
+        std::cout << _block.header.nonce.get() << std::endl;
+        std::cout << _block.header.previous_block.get().GetHex() << std::endl;
+
+        coind::data::BlockHeaderType _header;
+		_header.set_stream(_block.header);
+        std::cout << block_hash.GetHex() << std::endl;
+
         protocol->get_block_header->got_response(block_hash, _header);
 
-        _new_headers.push_back(block->header);
+        _new_headers.push_back(*_header.get());
     }
 
     new_headers.happened(_new_headers);
