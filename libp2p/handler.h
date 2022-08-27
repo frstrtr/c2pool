@@ -28,6 +28,15 @@ protected:
     std::shared_ptr<MessageType> generate_message(PackStream &stream)
     {
         std::shared_ptr<MessageType> msg = std::make_shared<MessageType>();
+
+        //TODO: remove
+        std::cout << "MSG BYTES: ";
+        for (auto v : stream.data)
+        {
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << std::endl;
+
         stream >> *msg;
         return msg;
     }

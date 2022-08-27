@@ -6,8 +6,6 @@ namespace coind::data::stream
 #define WitnessType ListType<StrType>
     PackStream &TransactionType_stream::write(PackStream &stream)
     {
-        if (!tx)
-            assert(false);
         if (is_segwit_tx(tx))
         {
             assert(tx->tx_ins.size() == tx->wdata->witness.size());

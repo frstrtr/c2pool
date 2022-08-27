@@ -511,8 +511,34 @@ public:
         return std::move(__stream);
     }
 
-    friend inline bool operator==(const StreamTypeAdapter &a, const StreamTypeAdapter &b) { return *a._value == *b._value; }
-    friend inline bool operator!=(const StreamTypeAdapter &a, const StreamTypeAdapter &b) { return !(a == b); }
+//    bool operator==(StreamTypeAdapter<ValueType, StreamType> &b)
+//    {
+//        auto _a = this->get();
+//        auto _b = b.get();
+//
+//        if (_a && _b)
+//            return *_a == *_b;
+//        else
+//            false;
+//    }
+//
+//    bool operator!=(StreamTypeAdapter<ValueType, StreamType> &b)
+//    {
+//        { return !(*this == b); }
+//    }
+
+    friend inline bool operator==(StreamTypeAdapter &a, StreamTypeAdapter &b)
+    {
+        auto _a = a.get();
+        auto _b = b.get();
+
+        if (_a && _b)
+            return *a._value == *b._value;
+        else
+            return false;
+
+    }
+    friend inline bool operator!=(StreamTypeAdapter &a, StreamTypeAdapter &b) { return !(a == b); }
 protected:
     virtual void _to_stream() = 0;
 

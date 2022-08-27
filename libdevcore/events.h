@@ -112,7 +112,7 @@ public:
         return _value == nullptr;
     }
 
-    Variable<VarType> &operator=(const VarType &__value)
+    Variable<VarType> &operator=(VarType &__value)
     {
         if (!_value)
             _value = std::make_shared<VarType>();
