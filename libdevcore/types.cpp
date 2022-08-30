@@ -70,13 +70,13 @@ addr::addr()
     timestamp = 0;
 }
 
-addr::addr(int64_t t, address_type a)
+addr::addr(uint32_t t, address_type a)
 {
     address = a;
     timestamp = t;
 }
 
-addr::addr(int64_t t, int _services, std::string _address, int _port)
+addr::addr(uint32_t t, int _services, std::string _address, int _port)
 {
     address_type a = address_type(_services, _address, _port);
     address = a;

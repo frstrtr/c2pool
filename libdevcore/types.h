@@ -92,14 +92,14 @@ public:
 class addr
 {
 public:
-    int64_t timestamp;
+    uint32_t timestamp;
     address_type address;
 
     addr();
 
-    addr(int64_t t, address_type a);
+    addr(uint32_t t, address_type a);
 
-    addr(int64_t t, int _services, std::string _address, int _port);
+    addr(uint32_t t, int _services, std::string _address, int _port);
 
     addr &operator=(UniValue value)
     {
@@ -109,15 +109,15 @@ public:
         return *this;
     }
 
-    operator UniValue()
-    {
-        UniValue result(UniValue::VOBJ);
-
-        result.pushKV("timestamp", timestamp);
-        result.pushKV("contents", address);
-
-        return result;
-    }
+//    operator UniValue()
+//    {
+//        UniValue result(UniValue::VOBJ);
+//
+//        result.pushKV("timestamp", timestamp);
+//        result.pushKV("contents", address);
+//
+//        return result;
+//    }
 
     friend bool operator==(const addr &first, const addr &second);
 
@@ -175,7 +175,6 @@ public:
         return result;
     }
 };
-
 
 namespace stream
 {
@@ -315,7 +314,7 @@ namespace stream
 
     struct addr_stream : Maker<addr_stream, addr>
     {
-        IntType(64) timestamp;
+        IntType(32) timestamp;
         address_type_stream address;
 
         addr_stream()

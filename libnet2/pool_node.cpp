@@ -108,7 +108,7 @@ void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addr
     {
         auto addr = addr_record.get();
         got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)),
-                            addr.address.services, std::min((int64_t) c2pool::dev::timestamp(), addr.timestamp));
+                            addr.address.services, std::min((uint32_t) c2pool::dev::timestamp(), addr.timestamp));
 
         if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
         {
