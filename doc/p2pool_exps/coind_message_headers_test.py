@@ -580,11 +580,24 @@ def arr_bytes_to_data(bytes):
         res += chr((int(x)))
     return res
 
-data_num = arr_bytes_to_data('1 2 14 0 32 43 207 116 68 220 182 146 197 239 240 105 254 38 246 180 116 86 179 223 133 33 28 225 106 0 0 0 0 0 0 0 0 232 10 33 207 116 22 110 31 255 187 160 120 239 215 235 165 95 161 47 97 196 130 126 158 235 209 181 89 251 7 131 143 67 239 12 99 100 151 86 26 210 58 124 191 0')
+#MSG_HREADERS
+# data_num = arr_bytes_to_data('1 2 14 0 32 43 207 116 68 220 182 146 197 239 240 105 254 38 246 180 116 86 179 223 133 33 28 225 106 0 0 0 0 0 0 0 0 232 10 33 207 116 22 110 31 255 187 160 120 239 215 235 165 95 161 47 97 196 130 126 158 235 209 181 89 251 7 131 143 67 239 12 99 100 151 86 26 210 58 124 191 0')
+#
+# print(data_num)
+#
+# msg_headers = message_headers.unpack(data_num)
+# print(msg_headers)
+#
+# print(hash256(block_header_type.pack(msg_headers['headers'][0]['header'])))
 
-print(data_num)
+#MSG_ADDR
+message_addr = ComposedType([
+    ('addrs', ListType(ComposedType([
+        ('timestamp', IntType(32)),
+        ('address', address_type),
+    ]))),
+])
 
-msg_headers = message_headers.unpack(data_num)
-print(msg_headers)
-
-print(hash256(block_header_type.pack(msg_headers['headers'][0]['header'])))
+packed_addr_msg = arr_bytes_to_data('2 194 24 14 99 13 4 0 0 0 0 0 0 32 1 65 208 0 2 3 215 0 0 0 0 0 0 0 0 46 248 211 24 14 99 13 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 241 141 154 117 56')
+msg_addr = message_addr.unpack(packed_addr_msg)
+print(msg_addr)
