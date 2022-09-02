@@ -27,7 +27,7 @@ namespace coind::data
     {
         if (tx)
         {
-            return tx->wdata->marker == 0 && tx->wdata->flag >= 1;
+            return tx->wdata.has_value() && tx->wdata->marker == 0 && tx->wdata->flag >= 1;
         }
         return false;
     }

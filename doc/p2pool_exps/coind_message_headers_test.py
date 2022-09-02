@@ -591,13 +591,28 @@ def arr_bytes_to_data(bytes):
 # print(hash256(block_header_type.pack(msg_headers['headers'][0]['header'])))
 
 #MSG_ADDR
-message_addr = ComposedType([
-    ('addrs', ListType(ComposedType([
-        ('timestamp', IntType(32)),
-        ('address', address_type),
-    ]))),
+# message_addr = ComposedType([
+#     ('addrs', ListType(ComposedType([
+#         ('timestamp', IntType(32)),
+#         ('address', address_type),
+#     ]))),
+# ])
+#
+# packed_addr_msg = arr_bytes_to_data('2 194 24 14 99 13 4 0 0 0 0 0 0 32 1 65 208 0 2 3 215 0 0 0 0 0 0 0 0 46 248 211 24 14 99 13 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 241 141 154 117 56')
+# msg_addr = message_addr.unpack(packed_addr_msg)
+# print(msg_addr)
+
+#MSG_TX
+message_tx = ComposedType([
+    ('tx', tx_type),
 ])
 
-packed_addr_msg = arr_bytes_to_data('2 194 24 14 99 13 4 0 0 0 0 0 0 32 1 65 208 0 2 3 215 0 0 0 0 0 0 0 0 46 248 211 24 14 99 13 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255 255 192 241 141 154 117 56')
-msg_addr = message_addr.unpack(packed_addr_msg)
-print(msg_addr)
+packed_addr_msg = arr_bytes_to_data('1 0 0 0 1 162 34 128 143 117 163 100 188 139 217 216 61 49 191 6 117 83 57 242 132 125 171 109 251 224 104 208 112 72 218 245 235 0 0 0 0 106 71 48 68 2 32 25 176 56 95 191 207 97 86 62 194 105 38 252 110 135 96 236 0 221 79 242 18 77 207 127 124 129 174 2 186 12 164 2 32 74 93 28 99 70 54 52 149 179 165 241 58 129 104 58 209 137 239 3 255 197 81 44 156 255 107 236 80 247 191 9 97 1 33 3 255 142 255 115 225 173 218 173 169 19 0 196 157 237 62 14 165 8 168 90 108 4 134 24 130 252 197 210 9 216 113 193 254 255 255 255 2 10 3 216 227 193 4 0 0 25 118 169 20 111 148 171 228 98 165 95 17 69 129 166 85 245 94 175 11 63 170 150 128 136 172 247 53 180 206 35 0 0 0 25 118 169 20 105 90 233 184 157 15 87 12 128 160 19 78 13 26 151 242 155 236 189 58 136 172 27 135 239 0')
+msg_tx = message_tx.unpack(packed_addr_msg)
+print(msg_tx)
+
+# _hash = IntType(256).pack(106727903481638777243882317191275008109729493019831850767090927827337942672034)
+# for i in _hash:
+#     print(ord(i))
+
+print(is_segwit_tx(msg_tx['tx']))
