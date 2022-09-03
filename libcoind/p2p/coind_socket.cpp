@@ -25,6 +25,13 @@ void CoindSocket::write_message_data(std::shared_ptr<Message> msg)
 	std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>();
 	_msg->from_message(msg);
 
+    std::cout << "write_message_data: ";
+    for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
+    {
+        std::cout << (unsigned int)((unsigned char) *v) << " ";
+    }
+    std::cout << std::endl;
+//    socket->async_send(boost::asio::buffer(_msg->data, _msg->len),
 	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
 							 [&](boost::system::error_code _ec, std::size_t length)
 							 {

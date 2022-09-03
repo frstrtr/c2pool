@@ -190,6 +190,7 @@ void CoindNode::handle_message_addr(std::shared_ptr<coind::messages::message_add
 
 void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, std::shared_ptr<CoindProtocol> protocol)
 {
+    int i = 0;
     for (auto _inv : msg->invs.get())
     {
         auto inv = _inv.get();
@@ -197,10 +198,14 @@ void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv>
         {
             case inventory_type::tx:
             {
+                i++;
                 LOG_TRACE << "HANDLED TX";
                 std::vector<inventory> inv_vec = {inv};
                 auto msg_getdata = std::make_shared<coind::messages::message_getdata>(inv_vec);
                 protocol->write(msg_getdata);
+
+                if (i>=2)
+                    return;
             }
                 break;
             case inventory_type::block:
