@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <libnet2/pool_messages.h>
+#include <libdevcore/types.h>
+#include <libcoind/p2p/coind_messages.h>
 
 // TODO: tests for all messages
 
@@ -23,4 +25,26 @@ TEST(pool_messages, message_version)
     ASSERT_EQ(test_sub_ver, msg->sub_version.get());
     ASSERT_EQ(18, msg->mode.get());
     ASSERT_EQ(best_hash_test_answer, msg->best_share_hash.get());
+}
+
+TEST(coind_messages, message_inv)
+{
+    auto hash = uint256S("ebf5da4870d068e0fb6dab7d84f239537506bf313dd8d98bbc64a3758f8022a2");
+    inventory inv(inventory_type::tx, hash);
+
+    std::vector<inventory> inv_vec = {inv};
+    auto msg_getdata = std::make_shared<coind::messages::message_getdata>(inv_vec);
+    for (auto inv_stream : msg_getdata->requests.get())
+    {
+        std::cout << inv_stream.hash.get().GetHex() << std::endl;
+        std::cout << inv_stream.type.get() << std::endl;
+    }
+
+    PackStream stream;
+    stream << msg_getdata->requests;
+    for (auto v : stream.data)
+    {
+        std::cout << (unsigned int) v << " ";
+    }
+    std::cout << std::endl;
 }
