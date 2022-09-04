@@ -205,37 +205,43 @@ namespace stream
 
         PackStream &write(PackStream &stream)
         {
-            //TODO: IPV6
-//            if ':' in item:
-//                data = ''.join(item.replace(':', '')).decode('hex')
-//            else
+            vector<unsigned char> data;
 
-            std::vector<std::string> split_res;
-            boost::algorithm::split(split_res, value, boost::is_any_of("."));
-            if (split_res.size() != 4)
+            if (value.find(':') < value.size())
             {
-                throw (std::runtime_error("Invalid address in IPV6AddressType"));
-            }
-
-            vector<unsigned int> bits;
-            for (auto bit: split_res)
+                boost::erase_all(value, ":");
+                data = ParseHex(value);
+            } else
             {
-                int bit_int = 0;
-                try
+                std::vector<std::string> split_res;
+                boost::algorithm::split(split_res, value, boost::is_any_of("."));
+                if (split_res.size() != 4)
                 {
-                    bit_int = boost::lexical_cast<unsigned int>(bit);
-                } catch (boost::bad_lexical_cast const &)
-                {
-                    LOG_ERROR << "Error lexical cast in IPV6AddressType";
+                    throw (std::runtime_error("Invalid address in IPV6AddressType"));
                 }
-                bits.push_back(bit_int);
+
+                vector<unsigned int> bits;
+                for (auto bit: split_res)
+                {
+                    int bit_int = 0;
+                    try
+                    {
+                        bit_int = boost::lexical_cast<unsigned int>(bit);
+                    } catch (boost::bad_lexical_cast const &)
+                    {
+                        LOG_ERROR << "Error lexical cast in IPV6AddressType";
+                    }
+                    bits.push_back(bit_int);
+                }
+
+                data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+                for (auto x: bits)
+                {
+                    data.push_back((unsigned char) x);
+                }
             }
 
-            vector<unsigned char> data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
-            for (auto x: bits)
-            {
-                data.push_back((unsigned char) x);
-            }
+            assert(data.size() == 16);
 
             PackStream _data(data);
             stream << _data;

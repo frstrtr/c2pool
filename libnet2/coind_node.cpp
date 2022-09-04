@@ -35,19 +35,19 @@ void CoindNode::start()
 
 	// update mining_txs according to getwork results
 	coind_work.changed->run_and_subscribe([&](){
-//		std::map<uint256, coind::data::tx_type> new_mining_txs;
-//		auto new_known_txs = known_txs.value();
-//
-//		uint256 _tx_hash;
-//		coind::data::tx_type _tx;
-//		BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work.value().transaction_hashes,coind_work.value().transactions))
-//		{
-//			new_mining_txs[_tx_hash] = _tx;
-//			new_known_txs[_tx_hash] = _tx;
-//		}
-//
-//		mining_txs = new_mining_txs;
-//		known_txs = new_known_txs;
+		std::map<uint256, coind::data::tx_type> new_mining_txs;
+		auto new_known_txs = known_txs.value();
+
+		uint256 _tx_hash;
+		coind::data::tx_type _tx;
+		BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work.value().transaction_hashes,coind_work.value().transactions))
+		{
+			new_mining_txs[_tx_hash] = _tx;
+			new_known_txs[_tx_hash] = _tx;
+		}
+
+		mining_txs = new_mining_txs;
+		known_txs = new_known_txs;
 	});
 
 	// add p2p transactions from bitcoind to known_txs
