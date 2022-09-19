@@ -41,6 +41,9 @@ public:
 	PoolNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
 	{
 		handler_manager = std::make_shared<HandlerManager<PoolProtocol>>();
+
+        known_txs = VariableDict<uint256, coind::data::tx_type>(true);
+        mining_txs = VariableDict<uint256, coind::data::tx_type>(true);
 	}
 
 	auto set_net(std::shared_ptr<c2pool::Network> _net)

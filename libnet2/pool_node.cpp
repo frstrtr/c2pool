@@ -168,7 +168,11 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
         );
     }
 
-    protocol->write(std::make_shared<message_addrs>(_addrs));
+    auto answer_msg = std::make_shared<message_addrs>(_addrs);
+
+    std::cout << _addrs[0].address.address << " " << _addrs[0].address.port << " " << _addrs[0].address.services << " " << _addrs[0].timestamp << std::endl;
+
+    protocol->write(answer_msg);
 }
 
 void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol)
