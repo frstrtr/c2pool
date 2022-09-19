@@ -33,7 +33,10 @@ struct HashLinkType :
 
     void _to_value() override
     {
-		make_value(_stream->state.value, _stream->extra_data.value, _stream->length.value);
+		make_value(_stream->state.value,
+                   std::vector<unsigned char>{},
+//                   _stream->extra_data.value,
+                   _stream->length.value);
     }
 };
 

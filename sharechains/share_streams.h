@@ -38,7 +38,7 @@ namespace shares::stream
     {
         FixedStrType<32> state;
         //Костыль в p2pool, который не нужен.
-        FixedStrType<0> extra_data;
+//        FixedStrType<0> extra_data;
         VarIntType length;
 
         HashLinkType_stream() = default;
@@ -51,7 +51,9 @@ namespace shares::stream
 
         PackStream &write(PackStream &stream)
         {
-            stream << state << extra_data << length;
+            stream << state
+//            << extra_data
+            << length;
             return stream;
         }
 
@@ -59,7 +61,7 @@ namespace shares::stream
         {
             stream
                 >> state
-                >> extra_data
+//                >> extra_data
                 >> length;
             return stream;
         }
