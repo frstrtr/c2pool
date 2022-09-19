@@ -208,6 +208,9 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                             tx = cache[tx_hash];
                             LOG_INFO << boost::format("Transaction %0% rescued from peer latency cache!") % tx_hash.GetHex();
                             break;
+                        } else
+                        {
+                            //TODO: disconnect
                         }
                     }
                 }
