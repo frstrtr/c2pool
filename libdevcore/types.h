@@ -320,7 +320,7 @@ namespace stream
 
     struct addr_stream : Maker<addr_stream, addr>
     {
-        IntType(32) timestamp;
+        IntType(64) timestamp;
         address_type_stream address;
 
         addr_stream()
