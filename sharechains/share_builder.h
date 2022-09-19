@@ -17,7 +17,7 @@ public:
 		Reset();
 	}
 
-	void create(int64_t version, addr_type addr)
+	void create(uint64_t version, addr_type addr)
 	{
 		share = std::make_shared<Share>(version, net, addr);
 	}

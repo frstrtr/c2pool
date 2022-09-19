@@ -213,12 +213,10 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
         if (SIZE != 0)
         {
             auto len = SIZE;
-            for (int i = 0; i < len; i++)
-            {
-                unsigned char temp;
-                stream >> temp;
-                value.push_back(temp);
-            }
+            value.insert(value.begin(), stream.data.begin(), stream.data.begin()+len);
+            stream.data.erase(stream.data.begin(), stream.data.begin()+len);
+
+            //            std::remove_copy(stream.data.begin(), stream.data.end(), value.begin(), len);
 
 //            ListType<unsigned char> list_s;
 //            stream >> list_s;
