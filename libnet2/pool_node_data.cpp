@@ -3,10 +3,10 @@
 #include "coind_node_data.h"
 #include <sharechains/share.h>
 
-auto PoolNodeData::set_coind_node(std::shared_ptr<CoindNodeData> _coind_node)
+PoolNodeData* PoolNodeData::set_coind_node(std::shared_ptr<CoindNodeData> _coind_node)
 {
-	coind_node = std::move(_coind_node);
-	return this;
+    coind_node = std::move(_coind_node);
+    return this;
 }
 
 std::vector<ShareType> PoolNodeData::handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops,
@@ -63,11 +63,10 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
 }
 
 void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares,
-								 std::shared_ptr<PoolProtocol> peer)
+                                 std::tuple<std::string, std::string> addr)
 {
 	if (shares.size() > 5)
 	{
-		auto addr = peer->get_addr();
 		LOG_INFO << "Processing " << shares.size() << "shares from " << std::get<0>(addr) << ":" << std::get<1>(addr) << "...";
 	}
 
@@ -110,7 +109,7 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 	}
 }
 
-void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocol> peer)
+void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, std::tuple<std::string, std::string> addr)
 {
 	std::vector<uint256> new_hashes;
 	for (auto x : hashes)
@@ -125,11 +124,11 @@ void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_
 	peer->get_shares.yield(context, [&, _peer = peer](std::vector<ShareType> shares)
 	{
 		vector<tuple<ShareType, std::vector<coind::data::tx_type>>> _shares;
-		for (auto _share: shares)
+		for (const auto& _share: shares)
 		{
 			_shares.push_back({_share, {}});
 		}
-		handle_shares(_shares, _peer);
+		handle_shares(_shares, addr);
 	}, new_hashes, 0, {});
 }
 

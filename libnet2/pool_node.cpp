@@ -94,7 +94,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
 	auto best_hash = msg->best_share_hash.get();
 	if (!best_hash.IsNull())
 	{
-//		TODO: handle_share_hashes({best_hash}, handshake )
+		handle_share_hashes({best_hash}, handshake, handshake->get_addr());
 	}
 	//TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
 
