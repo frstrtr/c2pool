@@ -318,6 +318,44 @@ namespace stream
         }
     };
 
+    struct addr32_stream : Maker<addr32_stream, addr>
+    {
+        IntType(32) timestamp;
+        address_type_stream address;
+
+        addr32_stream()
+        {}
+
+        addr32_stream(const addr &value)
+        {
+            *this = value;
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << timestamp << address;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> timestamp >> address;
+            return stream;
+        }
+
+        addr32_stream &operator=(const addr &val)
+        {
+            timestamp = val.timestamp;
+            address = val.address;
+            return *this;
+        }
+
+        addr get()
+        {
+            return addr(timestamp.get(), address.services.get(), address.address.get(), address.port.get());
+        }
+    };
+
     struct addr_stream : Maker<addr_stream, addr>
     {
         IntType(64) timestamp;

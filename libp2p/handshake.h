@@ -25,6 +25,8 @@ public:
 		return socket;
 	}
 
+    auto get_addr() { return socket->get_addr(); }
+
 	virtual void handle_message(std::shared_ptr<RawMessage> raw_msg) = 0;
 };
 

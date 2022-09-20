@@ -18,3 +18,6 @@ target_link_libraries(only_jsorpc_coind libcoind libnet2 libdevcore networks sha
 
 add_executable(only_stratum only_stratum.cpp)
 target_link_libraries(only_stratum libcoind)
+
+add_executable(coind_n_pool coind_n_pool.cpp)
+target_link_libraries(coind_n_pool libcoind libnet2 libdevcore networks sharechains libp2ppreset)

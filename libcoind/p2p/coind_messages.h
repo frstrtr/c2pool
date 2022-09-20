@@ -178,14 +178,14 @@ namespace coind::messages
     class message_addr : public Message
     {
     public:
-        ListType<::stream::addr_stream> addrs;
+        ListType<::stream::addr32_stream> addrs;
 
     public:
         message_addr() : Message("addr") {}
 
         message_addr(std::vector <addr> _addrs) : message_addr()
         {
-            addrs = ::stream::addr_stream::make_list_type(_addrs);
+            addrs = ::stream::addr32_stream::make_list_type(_addrs);
         }
 
         PackStream &write(PackStream &stream) override
