@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 
+#include "common.h"
+
 
 //Example:
 //Event<item_type> remove_special;
@@ -20,6 +22,9 @@ class Event
     std::shared_ptr<boost::signals2::signal<void()>> sig_anon; //For subs without arguments;
     std::shared_ptr<int> times;
 
+    std::function<int()> get_id = c2pool::dev::count_generator();
+    std::map<int, boost::signals2::connection> unsub_by_id;
+
 public:
     Event()
     {
@@ -30,30 +35,44 @@ public:
 
     //for std::function/lambda
     template<typename Lambda>
-    void subscribe(Lambda _f)
+    int subscribe(Lambda _f)
     {
-        sig->connect(_f);
+        boost::signals2::connection bc = sig->connect(_f);
+
+        auto id = get_id();
+        unsub_by_id[id] = std::move(bc);
+
+        return id;
     }
 
-    void subscribe(std::function<void()> _f)
+    int subscribe(std::function<void()> _f)
     {
         std::cout << "SUBSCRIBE" << std::endl;
-        sig_anon->connect(_f);
+        boost::signals2::connection bc = sig_anon->connect(_f);
+
+        auto id = get_id();
+        unsub_by_id[id] = std::move(bc);
+
+        return id;
     }
 
-    void run_and_subscribe(std::function<void()> _f)
+    int run_and_subscribe(std::function<void()> _f)
     {
         _f();
-        subscribe(_f);
+        return subscribe(_f);
     }
 
-//	void unsubscribe()
-//	{
+	void unsubscribe(int id)
+	{
 //        //Дисконнект устроен по принципу:
 //        //signals2::connection bc = w.Signal.connect(bind(&Object::doSomething, o));
 //        //bc.disconnect();
 //        //return bc;
-//	}
+        if (unsub_by_id.find(id) != unsub_by_id.end())
+        {
+            unsub_by_id[id].disconnect();
+        }
+	}
 
     void happened(Args & ... args)
     {
