@@ -96,7 +96,126 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
 	{
 		handle_share_hashes({best_hash}, handshake, handshake->get_addr());
 	}
-	//TODO: msg->best_share_hash != nullptr: p2p_node.handle_share_hashes(...)
+
+    // add_to_remote_view_of_my_known_txs
+    auto id_add_to_remote_view_of_my_known_txs = known_txs.added->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> added){
+        if (!added.empty())
+        {
+            std::vector<uint256> tx_hashes;
+            for (auto v : added)
+            {
+                tx_hashes.push_back(v.first);
+            }
+
+            auto msg_have_tx = std::make_shared<message_have_tx>(tx_hashes);
+            _socket->write(msg_have_tx);
+        }
+    });
+
+    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.added.unwatch(watch_id0))
+
+    // remove_from_remote_view_of_my_known_txs
+    auto id_remove_from_remote_view_of_my_known_txs = known_txs.removed->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> removed)
+    {
+        if (!removed.empty())
+        {
+            std::vector<uint256> tx_hashes;
+            for (auto v: removed)
+            {
+                tx_hashes.push_back(v.first);
+            }
+
+            auto msg_losing_tx = std::make_shared<message_losing_tx>(tx_hashes);
+            _socket->write(msg_losing_tx);
+
+            //TODO: ???
+            /*
+                    # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
+                    key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
+                    self.known_txs_cache[key] = removed #dict((h, before[h]) for h in removed)
+                    reactor.callLater(20, self.known_txs_cache.pop, key)
+             */
+        }
+    });
+
+    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.removed.unwatch(watch_id1))
+
+
+    auto id_update_remote_view_of_my_known_txs = known_txs.transitioned->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+        std::map<uint256, coind::data::tx_type> added;
+        std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
+
+        std::map<uint256, coind::data::tx_type> removed;
+        std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(removed, removed.begin()));
+
+        // ADDED
+        if (!added.empty())
+        {
+            std::vector<uint256> tx_hashes;
+            for (auto v : added)
+            {
+                tx_hashes.push_back(v.first);
+            }
+
+            auto msg_have_tx = std::make_shared<message_have_tx>(tx_hashes);
+            _socket->write(msg_have_tx);
+        }
+
+        // REMOVED
+        if (!removed.empty())
+        {
+            std::vector<uint256> tx_hashes;
+            for (auto v: removed)
+            {
+                tx_hashes.push_back(v.first);
+            }
+
+            auto msg_losing_tx = std::make_shared<message_losing_tx>(tx_hashes);
+            _socket->write(msg_losing_tx);
+
+            //TODO: ???
+            /*
+                    # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
+                    key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
+                    self.known_txs_cache[key] = removed #dict((h, before[h]) for h in removed)
+                    reactor.callLater(20, self.known_txs_cache.pop, key)
+             */
+        }
+    });
+
+    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.transitioned.unwatch(watch_id2))
+
+
+    {
+        std::vector<uint256> tx_hashes;
+        for (auto v : known_txs.value())
+        {
+            tx_hashes.push_back(v.first);
+        }
+        auto msg_have_tx = std::make_shared<message_have_tx>(tx_hashes);
+
+        handshake->get_socket()->write(msg_have_tx);
+    }
+
+    auto id_update_remote_view_of_my_mining_txs = mining_txs.transitioned->subscribe([&, socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+        std::map<uint256, coind::data::tx_type> added;
+        std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
+
+        std::map<uint256, coind::data::tx_type> removed;
+        std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(removed, removed.begin()));
+
+        if (!removed.empty())
+        {
+            std::vector<uint256> tx_hashes;
+            for (auto v: removed)
+            {
+                tx_hashes.push_back(v.first);
+            }
+
+            auto msg_forget_tx = std::make_shared<message_forget_tx>(tx_hashes);
+            //TODO: self.remote_remembered_txs_size -= sum(100 + bitcoin_data.tx_type.packed_size(before[x]) for x in removed)
+        }
+    });
 
 	//TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
 }
