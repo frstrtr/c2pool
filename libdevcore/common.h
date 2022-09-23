@@ -8,14 +8,7 @@
 
 namespace c2pool::dev
 {
-    auto count_generator()
-    {
-        int i = 0;
-        return [=]() mutable {
-            i++;
-            return i;
-        };
-    }
+    auto count_generator();
 
     template <typename int_type>
     int_type str_to_int(std::string value)

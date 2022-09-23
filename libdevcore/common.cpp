@@ -16,5 +16,14 @@ namespace c2pool::dev
         return result;
     }
 
+    auto count_generator()
+    {
+        int i = 0;
+        return [=]() mutable {
+            i++;
+            return i;
+        };
+    }
+
     bool ExitSignalHandler::work_status = true;
 } // namespace c2pool::time

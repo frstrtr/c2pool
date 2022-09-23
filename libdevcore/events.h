@@ -22,12 +22,13 @@ class Event
     std::shared_ptr<boost::signals2::signal<void()>> sig_anon; //For subs without arguments;
     std::shared_ptr<int> times;
 
-    std::function<int()> get_id = c2pool::dev::count_generator();
+    std::function<int()> get_id;
     std::map<int, boost::signals2::connection> unsub_by_id;
 
 public:
     Event()
     {
+//        get_id = c2pool::dev::count_generator();
         sig = std::make_shared<boost::signals2::signal<void(Args...)>>();
         sig_anon = std::make_shared<boost::signals2::signal<void()>>();
         times = std::make_shared<int>(0);
