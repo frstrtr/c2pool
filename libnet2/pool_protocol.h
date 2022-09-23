@@ -17,13 +17,13 @@
 class PoolProtocol : public Protocol<PoolProtocol>, public PoolProtocolData, ProtocolPinger
 {
 public:
-	std::set<uint256> remote_tx_hashes;
-	int32_t remote_remembered_txs_size = 0;
-
-	std::map<uint256, coind::data::stream::TransactionType_stream> remembered_txs;
-	int32_t remembered_txs_size;
-	const int32_t max_remembered_txs_size = 25000000;
-	std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
+//	std::set<uint256> remote_tx_hashes;
+//	int32_t remote_remembered_txs_size = 0;
+//
+//	std::map<uint256, coind::data::stream::TransactionType_stream> remembered_txs;
+//	int32_t remembered_txs_size;
+//	const int32_t max_remembered_txs_size = 25000000;
+//	std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
 
 public:
 	PoolProtocol(std::shared_ptr<boost::asio::io_context> _context, std::shared_ptr<Socket> _socket,

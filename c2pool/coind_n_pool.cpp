@@ -14,13 +14,6 @@
 #include <libcoind/p2p/coind_socket.h>
 #include <libcoind/jsonrpc/stratum.h>
 
-#include <libnet2/pool_node.h>
-#include <libnet2/pool_socket.h>
-#include <networks/network.h>
-#include <libdevcore/config.h>
-#include <libdevcore/addr_store.h>
-#include <libp2p/preset/p2p_node_interface.h>
-
 #include <boost/asio.hpp>
 
 int main(int ac, char *av[])

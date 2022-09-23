@@ -204,6 +204,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
         std::map<uint256, coind::data::tx_type> removed;
         std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(removed, removed.begin()));
 
+        // REMOVED
         if (!removed.empty())
         {
             std::vector<uint256> tx_hashes;
@@ -213,11 +214,69 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             }
 
             auto msg_forget_tx = std::make_shared<message_forget_tx>(tx_hashes);
-            //TODO: self.remote_remembered_txs_size -= sum(100 + bitcoin_data.tx_type.packed_size(before[x]) for x in removed)
+            socket->write(msg_forget_tx);
+
+            for (auto x : removed)
+            {
+                PackStream stream;
+                coind::data::stream::TransactionType_stream packed_tx(x.second);
+                stream << packed_tx;
+
+                handshake->remote_remembered_txs_size -= 100 + stream.size();
+            }
+        }
+
+        // ADDED
+        if (!added.empty())
+        {
+            for (auto x : added)
+            {
+                PackStream stream;
+                coind::data::stream::TransactionType_stream packed_tx(x.second);
+                stream << packed_tx;
+
+                handshake->remote_remembered_txs_size += 100 + stream.size();
+            }
+
+            assert(handshake->remote_remembered_txs_size <= handshake->max_remembered_txs_size);
+
+            std::vector<uint256> _tx_hashes;
+            std::vector<coind::data::tx_type> _txs;
+
+            for (auto x : added)
+            {
+                if (handshake->remote_tx_hashes.find(x.first) != handshake->remote_tx_hashes.end())
+                {
+                    _tx_hashes.push_back(x.first);
+                } else {
+                    _txs.push_back(x.second);
+                }
+            }
+            auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
+            socket->write(msg_remember_tx);
         }
     });
+    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.mining_txs_var.transitioned.unwatch(watch_id2))
 
-	//TODO: <Методы для обработки транзакций>: send_have_tx; send_remember_tx
+    for (auto x : mining_txs.value())
+    {
+        PackStream stream;
+        coind::data::stream::TransactionType_stream packed_tx(x.second);
+        stream << packed_tx;
+
+        handshake->remote_remembered_txs_size += 100 + stream.size();
+        assert(handshake->remote_remembered_txs_size <= handshake->max_remembered_txs_size);
+    }
+
+    std::vector<uint256> _tx_hashes;
+    std::vector<coind::data::tx_type> _txs;
+
+    for (auto x : mining_txs.value())
+    {
+        _txs.push_back(x.second);
+    }
+    auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
+    handshake->get_socket()->write(msg_remember_tx);
 }
 
 void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol)
@@ -339,7 +398,7 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
         result.emplace_back(share, txs);
     }
 
-    handle_shares(result, protocol);
+    handle_shares(result, protocol->get_addr());
     //t1
     //TODO: if p2pool.BENCH: print "%8.3f ms for %i shares in handle_shares (%3.3f ms/share)" % ((t1-t0)*1000., len(shares), (t1-t0)*1000./ max(1, len(shares)))
 }
