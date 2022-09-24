@@ -73,8 +73,9 @@ int main(int ac, char *av[])
 
     pool_node->set_coind_node(coind_node);
 
-    pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
     coind_node->run<CoindConnector<CoindSocket>>();
+    pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
+
 
     // Worker
 //	std::shared_ptr<Worker> worker = std::make_shared<Worker>(net, pool_node, coind_node, tracker);
