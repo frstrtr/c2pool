@@ -28,7 +28,7 @@ class Event
 public:
     Event()
     {
-//        get_id = c2pool::dev::count_generator();
+        get_id = c2pool::dev::count_generator();
         sig = std::make_shared<boost::signals2::signal<void(Args...)>>();
         sig_anon = std::make_shared<boost::signals2::signal<void()>>();
         times = std::make_shared<int>(0);

@@ -1,6 +1,15 @@
 #include "common.h"
 namespace c2pool::dev
 {
+    std::function<int()> count_generator()
+    {
+        int i = 0;
+        return [=]() mutable {
+            i++;
+            return i;
+        };
+    }
+
     time_t timestamp()
     {
         return std::time(nullptr);
@@ -14,15 +23,6 @@ namespace c2pool::dev
             result.push_back((unsigned char) v);
         }
         return result;
-    }
-
-    auto count_generator()
-    {
-        int i = 0;
-        return [=]() mutable {
-            i++;
-            return i;
-        };
     }
 
     bool ExitSignalHandler::work_status = true;

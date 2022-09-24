@@ -5,10 +5,11 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <functional>
 
 namespace c2pool::dev
 {
-    auto count_generator();
+    std::function<int()> count_generator();
 
     template <typename int_type>
     int_type str_to_int(std::string value)
