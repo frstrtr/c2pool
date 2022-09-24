@@ -77,11 +77,12 @@ int main(int ac, char *av[])
     pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
 
 
-    // Worker
-//	std::shared_ptr<Worker> worker = std::make_shared<Worker>(net, pool_node, coind_node, tracker);
-//
-//	// Stratum: worker -> stratum
-//	std::shared_ptr<Stratum> stratum = std::make_shared<Stratum>(context, worker);
+//     Worker
+	std::shared_ptr<Worker> worker = std::make_shared<Worker>(net, pool_node, coind_node, tracker);
+
+	// Stratum: worker -> stratum
+	std::shared_ptr<Stratum> stratum = std::make_shared<Stratum>(context, worker);
+    stratum->listen();
 
     context->run();
 }

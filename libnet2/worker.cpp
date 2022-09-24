@@ -58,7 +58,7 @@ bool Work::operator!=(const Work &value)
 }
 
 Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNode> pool_node,
-               shared_ptr<CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net),
+               shared_ptr<CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net), current_work(true),
                                                                                                           _pool_node(
                                                                                                                   pool_node),
                                                                                                           _coind_node(
@@ -741,7 +741,9 @@ user_details Worker::get_user_details(std::string username)
     boost::char_separator<char> sep("+", "/");
     boost::tokenizer<boost::char_separator<char>> tokens(username, sep);
     for (std::string t: tokens)
-    { contents.push_back(t); }
+    {
+        contents.push_back(t);
+    }
 //        boost::split(contents, username, boost::is_any_of("+/"));
     assert(contents.size() % 2 == 1);
 
