@@ -10,6 +10,30 @@ namespace c2pool::dev
         };
     }
 
+    std::string swap4(std::string s)
+    {
+        if (s.size() % 4)
+            throw std::invalid_argument("swap4 -- s.size() % 4 != 0");
+
+        for (int i = 0; i+4 <= s.size(); i+=4)
+        {
+            std::reverse(s.begin()+i, s.begin()+i+4);
+        }
+        return s;
+    }
+
+    std::vector<unsigned char> swap4(std::vector<unsigned char> s)
+    {
+        if (s.size() % 4)
+            throw std::invalid_argument("swap4 -- s.size() % 4 != 0");
+
+        for (int i = 0; i+4 <= s.size(); i+=4)
+        {
+            std::reverse(s.begin()+i, s.begin()+i+4);
+        }
+        return s;
+    }
+
     time_t timestamp()
     {
         return std::time(nullptr);
