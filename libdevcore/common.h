@@ -11,6 +11,9 @@ namespace c2pool::dev
 {
     std::function<int()> count_generator();
 
+    std::string swap4(std::string s);
+    std::vector<unsigned char> swap4(std::vector<unsigned char> s);
+
     template <typename int_type>
     int_type str_to_int(std::string value)
     {
