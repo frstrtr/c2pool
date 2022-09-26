@@ -574,3 +574,13 @@ private:
         }
     }
 };
+
+template <typename StreamType, typename T>
+std::vector<unsigned char> pack(T value)
+{
+    PackStream stream;
+    StreamType stream_value(value);
+
+    stream << stream_value;
+    return stream.data;
+}
