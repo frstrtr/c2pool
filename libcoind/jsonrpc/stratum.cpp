@@ -1,6 +1,7 @@
 #include "stratum.h"
 
 #include <libdevcore/random.h>
+#include <libdevcore/common.h>
 
 Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<Worker> _worker) : StratumProtocol(context), worker(_worker), _t_send_work(*context),
                                                                                                       handler_map(_context, 300)
@@ -15,22 +16,30 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
 
 void Stratum::_send_work()
 {
+    worker_get_work_result get_work_result;
     auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = worker->preprocess_request(username);
-    auto get_work_result = worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
-    auto &[x, got_response] = get_work_result;
 
-//    try
-//    {
-//        auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = worker->preprocess_request(username);
-//        auto [x, got_response] = worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
-//    } catch (const std::error_code &ec)
-//    {
-//        LOG_ERROR << "Stratum::_send_work error: " << ec.message();
-//    }
+    try
+    {
+        get_work_result = worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
+    } catch (const std::error_code &ec)
+    {
+        LOG_ERROR << "send_work" << ec.message();
+        disconnect();
+        return;
+    }
+
+    auto &[x, got_response] = get_work_result;
 
     //TODO: test
     auto jobid = HexStr(c2pool::random::random_bytes(16)); // random_bytes(16) = random(2**128)
     mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* worker->_net->parent->DUMB_SCRYPT_DIFF);
+
+
+//    mining_notify(
+//                jobid,
+//                c2pool::dev::swap4()
+//            );
 
     //TODO:
 //    mining_notify(
@@ -77,28 +86,50 @@ json Stratum::mining_set_difficulty(difficulty_type difficulty)
     std::cout << "called mining_set_difficulty" << std::endl;
 }
 
-json Stratum::mining_notify()
+json Stratum::mining_notify(std::string jobid, uint256 prevhash, std::string coinb1, std::string coinb2, json::array_t merkle_branch, std::string version, std::string nbits, std::string ntime, bool clean_jobs)
 {
+//    json notify_data = {
+//            // jobid
+//            "ae6812eb4cd7735a302a8a9dd95cf71f",
+//            // prevhash
+//            "4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6c0440b921e00000000",
+//            // coinb1
+//            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008",
+//            // coinb2
+//            "072f736c7573682f000000000100f2052a010000001976a914d23fcdf86f7e756a64a7a9688ef9903327048ed988ac00000000",
+//            // merkle_branch
+//            json::array(),
+//            // version
+//            "00000002",
+//            // nbits
+//            "1c2ac4af",
+//            // ntime
+//            "504e86b9",
+//            // clean_jobs
+//            true
+//    };
+
     json notify_data = {
             // jobid
-            "ae6812eb4cd7735a302a8a9dd95cf71f",
+            jobid,
             // prevhash
-            "4d16b6f85af6e2198f44ae2a6de67f78487ae5611b77c6c0440b921e00000000",
+            prevhash.GetHex(),
             // coinb1
-            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008",
+            coinb1,
             // coinb2
-            "072f736c7573682f000000000100f2052a010000001976a914d23fcdf86f7e756a64a7a9688ef9903327048ed988ac00000000",
+            coinb2,
             // merkle_branch
-            json::array(),
+            merkle_branch,
             // version
-            "00000002",
+            version,
             // nbits
-            "1c2ac4af",
+            nbits,
             // ntime
-            "504e86b9",
+            ntime,
             // clean_jobs
-            true
+            clean_jobs
     };
+
     client.CallNotification("mining.notify", notify_data);
     std::cout << "called mining.notify" << std::endl;
 }
