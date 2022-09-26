@@ -9,6 +9,7 @@
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
+#include <libdevcore/common.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <thread>
 
@@ -107,4 +108,13 @@ TEST_F(Bitcoind_JSONRPC, multi_getwork)
         std::cout << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+}
+
+TEST(RPC_DATA, swap4_test)
+{
+    PackStream stream;
+    auto v = uint256S("75bcd15");
+    IntType(256) i(v);
+    auto data = c2pool::dev::swap4(stream.data);
+    std::cout << HexStr(data) << std::endl;
 }
