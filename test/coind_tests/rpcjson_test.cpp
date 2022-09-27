@@ -115,6 +115,7 @@ TEST(RPC_DATA, swap4_test)
     PackStream stream;
     auto v = uint256S("75bcd15");
     IntType(256) i(v);
+    stream << i;
     auto data = c2pool::dev::swap4(stream.data);
     std::cout << HexStr(data) << std::endl;
 }
