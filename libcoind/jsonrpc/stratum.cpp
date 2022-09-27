@@ -17,14 +17,14 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
 void Stratum::_send_work()
 {
     worker_get_work_result get_work_result;
-    auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = worker->preprocess_request(username);
 
     try
     {
+        auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = worker->preprocess_request(username);
         get_work_result = worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
-    } catch (const std::error_code &ec)
+    } catch (const std::exception &ec)
     {
-        LOG_ERROR << "send_work" << ec.message();
+        LOG_ERROR << "Stratum disconnect " << ec.what();
         disconnect();
         return;
     }
@@ -35,19 +35,22 @@ void Stratum::_send_work()
     auto jobid = HexStr(c2pool::random::random_bytes(16)); // random_bytes(16) = random(2**128)
     mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* worker->_net->parent->DUMB_SCRYPT_DIFF);
 
+    json::array_t merkle_branch;
+    for (auto s : x.merkle_link.branch)
+    {
+        merkle_branch.push_back(HexStr(pack<IntType(256)>(s)));
+    }
 
-//    mining_notify(
-//                jobid,
-//                c2pool::dev::swap4()
-//            );
-
-    //TODO:
-//    mining_notify(
-//            {
-////                jobid,
-//
-//            }
-//            );
+    mining_notify(
+                jobid,
+                HexStr(c2pool::dev::swap4(pack<IntType(256)>(x.previous_block))),
+                HexStr(x.coinb1),
+                HexStr(x.coinb2),
+                merkle_branch,
+                HexStr(c2pool::dev::swap4(pack<IntType(32)>(x.version))),
+                HexStr(c2pool::dev::swap4(pack<IntType(32)>(x.bits))),
+                HexStr(c2pool::dev::swap4(pack<IntType(32)>(x.timestamp)))
+            );
 
     handler_map.add(jobid, get_work_result);
 }
@@ -86,7 +89,7 @@ json Stratum::mining_set_difficulty(difficulty_type difficulty)
     std::cout << "called mining_set_difficulty" << std::endl;
 }
 
-json Stratum::mining_notify(std::string jobid, uint256 prevhash, std::string coinb1, std::string coinb2, json::array_t merkle_branch, std::string version, std::string nbits, std::string ntime, bool clean_jobs)
+json Stratum::mining_notify(std::string jobid, std::string prevhash, std::string coinb1, std::string coinb2, json::array_t merkle_branch, std::string version, std::string nbits, std::string ntime, bool clean_jobs)
 {
 //    json notify_data = {
 //            // jobid
@@ -113,7 +116,7 @@ json Stratum::mining_notify(std::string jobid, uint256 prevhash, std::string coi
             // jobid
             jobid,
             // prevhash
-            prevhash.GetHex(),
+            prevhash,
             // coinb1
             coinb1,
             // coinb2

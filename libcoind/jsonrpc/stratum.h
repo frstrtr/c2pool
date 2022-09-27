@@ -33,6 +33,6 @@ public:
 public:
     // Client:
     json mining_set_difficulty(difficulty_type difficulty);
-    json mining_notify(std::string jobid, uint256 prevhash, std::string coinb1, std::string coinb2, json::array_t merkle_branch, std::string version, std::string nbits, std::string ntime, bool clean_jobs = true);
+    json mining_notify(std::string jobid, std::string prevhash, std::string coinb1, std::string coinb2, json::array_t merkle_branch, std::string version, std::string nbits, std::string ntime, bool clean_jobs = true);
     
 };

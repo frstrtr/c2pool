@@ -733,6 +733,8 @@ stale_counts Worker::get_stale_counts()
 // TODO: check
 user_details Worker::get_user_details(std::string username)
 {
+    std::cout << "username: " << username << std::endl;
+
     user_details result;
     result.desired_pseudoshare_target = uint256::ZERO;
     result.desired_share_target = uint256::ZERO;
