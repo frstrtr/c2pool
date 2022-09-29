@@ -59,19 +59,15 @@ bool Work::operator!=(const Work &value)
 
 Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNode> pool_node,
                shared_ptr<CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net), current_work(true),
-                                                                                                          _pool_node(
-                                                                                                                  pool_node),
-                                                                                                          _coind_node(
-                                                                                                                  coind_node),
-                                                                                                          _tracker(
-                                                                                                                  tracker),
-                                                                                                          local_rate_monitor(
-                                                                                                                  10 *
-                                                                                                                  60),
-                                                                                                          local_addr_rate_monitor(
-                                                                                                                  10 *
-                                                                                                                  60)
+                                                                                                          _pool_node(pool_node),
+                                                                                                          _coind_node(coind_node),
+                                                                                                          _tracker(tracker),
+                                                                                                          local_rate_monitor(10 * 60),
+                                                                                                          local_addr_rate_monitor(10 * 60),
+                                                                                                          removed_unstales(std::make_tuple(0,0,0)),
+                                                                                                          removed_doa_unstales(0)
 {
+
     // Rules for doa_element_type in PrefsumShare
     shares::doa_element_type::set_rules([&](ShareType share)
                                         {
@@ -170,6 +166,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     {
         throw std::runtime_error("c2pool is not connected to any peers"); //TODO: to jsonrpc_error
     }
+
+    LOG_TRACE << "best_share in get_work: " << _pool_node->best_share.value().GetHex();
     if (_pool_node->best_share.isNull() && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is downloading shares"); //TODO: to jsonrpc_error
