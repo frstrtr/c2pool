@@ -47,6 +47,7 @@ public:
         known_txs = VariableDict<uint256, coind::data::tx_type>(true);
         mining_txs = VariableDict<uint256, coind::data::tx_type>(true);
         mining2_txs = VariableDict<uint256, coind::data::tx_type>(true);
+        best_share = Variable<uint256>(true);
 	}
 
 	auto set_parent_net(std::shared_ptr<coind::ParentNetwork> _net)

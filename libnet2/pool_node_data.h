@@ -31,6 +31,7 @@ public:
 	std::shared_ptr<CoindNodeData> coind_node;
 	HandlerManagerPtr<PoolProtocol> handler_manager;
 
+    //From CoindNode
 	VariableDict<uint256, coind::data::tx_type> known_txs;
 	VariableDict<uint256, coind::data::tx_type> mining_txs;
 	Variable<uint256> best_share;
@@ -42,8 +43,8 @@ public:
 	{
 		handler_manager = std::make_shared<HandlerManager<PoolProtocol>>();
 
-        known_txs = VariableDict<uint256, coind::data::tx_type>(true);
-        mining_txs = VariableDict<uint256, coind::data::tx_type>(true);
+//        known_txs = VariableDict<uint256, coind::data::tx_type>(true);
+//        mining_txs = VariableDict<uint256, coind::data::tx_type>(true);
 	}
 
 	auto set_net(std::shared_ptr<c2pool::Network> _net)

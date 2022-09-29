@@ -6,6 +6,11 @@
 PoolNodeData* PoolNodeData::set_coind_node(std::shared_ptr<CoindNodeData> _coind_node)
 {
     coind_node = std::move(_coind_node);
+
+    known_txs = coind_node->known_txs;
+    mining_txs = coind_node->mining_txs;
+    best_share = coind_node->best_share;
+
     return this;
 }
 
