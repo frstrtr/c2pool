@@ -147,6 +147,11 @@ public:
         return *this;
     }
 
+    void get_when_satisfies(std::function<bool(VarType)> when_f, std::function<void(VarType)> f)
+    {
+        changed->subscribe([when_f = when_f, f = f](VarType _v){ if(when_f(_v)) f(_v); });
+    }
+
     /* TODO:
     @defer.inlineCallbacks
     def get_when_satisfies(self, func):
