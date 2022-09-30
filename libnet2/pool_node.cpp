@@ -5,6 +5,8 @@
 #include <libdevcore/types.h>
 #include <sharechains/share.h>
 
+#include "coind_node_data.h"
+
 using namespace pool::messages;
 
 std::vector<addr_type> PoolNodeClient::get_good_peers(int max_count)
@@ -631,4 +633,32 @@ void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_
         if (!v.second.tx)
             assert(false);
     }
+}
+
+void PoolNode::start()
+{
+    for (const auto &item: tracker->items)
+    {
+        shared_share_hashes.insert(item.first);
+    }
+    //TODO: self.node.tracker.removed.watch_weakref(self, lambda self, share: self.shared_share_hashes.discard(share.hash))
+    coind_node->desired.get_when_satisfies(
+            [&](auto desired)
+            {
+                return desired.size() != 0;
+            },
+            [&](auto desired)
+            {
+                auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
+
+                if (peers.size() == 0)
+                {
+
+                }
+            });
+}
+
+void PoolNode::download_shares(std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired)
+{
+
 }

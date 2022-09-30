@@ -176,6 +176,7 @@ public:
 			connector = std::make_shared<ConnectorType>(context, net);
 			auto_connect();
 		}
+        start()
 	}
 
 	// Handshake handlers
@@ -207,5 +208,9 @@ public:
     void handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol);
 
     void handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+private:
+    void start();
+
+    void download_shares(std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired);
 };
 #undef SET_POOL_DEFAULT_HANDLER
