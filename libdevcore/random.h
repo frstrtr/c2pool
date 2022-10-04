@@ -17,7 +17,11 @@ namespace c2pool::random
 	uint256 random_uint256();
 
     template <typename T>
-    T RandomChoice(std::vector<T> &list);
+    T RandomChoice(std::vector<T> &list)
+    {
+        int pos = RandomInt(0, list.size());
+        return list[pos];
+    }
 
 
     template <typename Key, typename Value>
