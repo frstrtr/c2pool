@@ -270,7 +270,7 @@ namespace c2pool::deferred
             result[id]->add_callback(__f);
         }
 
-        shared_deferred<ReturnType> yield(std::shared_ptr<Fiber> fiber, Args... ARGS)
+        ReturnType yield(std::shared_ptr<Fiber> fiber, Args... ARGS)
         {
             shared_deferred<ReturnType> def = make_deferred<ReturnType>();;
 
