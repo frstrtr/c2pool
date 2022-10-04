@@ -46,13 +46,6 @@ namespace c2pool::random
 		return result;
 	}
 
-    template <typename T>
-    T RandomChoice(std::vector<T> &list)
-    {
-        int pos = RandomInt(0, list.size());
-        return list[pos];
-    }
-
     // template <typename K, typename V, typename Compare = std::less<K>,
     //     typename Alloc = std::allocator<std::pair<const K, V> > >
     // V RandomChoice(std::map<K, V, Compare, Alloc> map)
