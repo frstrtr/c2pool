@@ -3,6 +3,7 @@
 #include <libdevcore/random.h>
 #include <libdevcore/common.h>
 #include <libdevcore/types.h>
+#include <libdevcore/deferred.h>
 #include <sharechains/share.h>
 
 #include "coind_node_data.h"
@@ -642,23 +643,41 @@ void PoolNode::start()
         shared_share_hashes.insert(item.first);
     }
     //TODO: self.node.tracker.removed.watch_weakref(self, lambda self, share: self.shared_share_hashes.discard(share.hash))
-    coind_node->desired.get_when_satisfies(
-            [&](auto desired)
-            {
-                return desired.size() != 0;
-            },
-            [&](auto desired)
-            {
-                auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
 
-                if (peers.size() == 0)
-                {
 
-                }
-            });
 }
 
 void PoolNode::download_shares(std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired)
 {
+    c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
+    {
+        while (true)
+        {
+            auto desired = coind_node->desired.get_when_satisfies([&](auto desired)
+                                                                  {
+                                                                      return desired.size() != 0;
+                                                                  })->yield(fiber);
+            auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
+
+            if (peers.size() == 0)
+            {
+                fiber->sleep(1s);
+                continue;
+            }
+            auto peer = c2pool::random::RandomChoice(peers);
+            auto [peer_ip, peer_port] = peer->get_addr();
+
+            LOG_INFO << "Requesting parent share " << share_hash.GetHex() << " from " << peer_ip << ":" << peer_port;
+
+
+            try
+            {
+
+            }
+            //TODO: catch: timeout/any error
+
+
+        }
+    });
 
 }
