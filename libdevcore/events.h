@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "common.h"
+#include "deferred.h"
 
 
 //Example:
@@ -22,6 +23,9 @@ class Event
     std::shared_ptr<boost::signals2::signal<void()>> sig_anon; //For subs without arguments;
     std::shared_ptr<int> times;
 
+    std::shared_ptr<boost::signals2::signal<void(Args...)>> once;
+
+    //TODO: to shared_ptr
     std::function<int()> get_id;
     std::map<int, boost::signals2::connection> unsub_by_id;
 
@@ -31,6 +35,7 @@ public:
         get_id = c2pool::dev::count_generator();
         sig = std::make_shared<boost::signals2::signal<void(Args...)>>();
         sig_anon = std::make_shared<boost::signals2::signal<void()>>();
+        once = std::make_shared<boost::signals2::signal<void(Args...)>>();
         times = std::make_shared<int>(0);
     }
 
@@ -57,6 +62,12 @@ public:
         return id;
     }
 
+    template<typename Lambda>
+    void subscribe_once(Lambda _f)
+    {
+        once->connect(_f);
+    }
+
     int run_and_subscribe(std::function<void()> _f)
     {
         _f();
@@ -81,6 +92,11 @@ public:
             (*sig)(args...);
         if (!sig_anon->empty())
             (*sig_anon)();
+        if(!once->empty())
+        {
+            (*once)(args...);
+            once->disconnect_all_slots();
+        }
 
         *times += 1;
     }
@@ -147,9 +163,22 @@ public:
         return *this;
     }
 
-    void get_when_satisfies(std::function<bool(VarType)> when_f, std::function<void(VarType)> f)
+    c2pool::deferred::shared_deferred<VarType> get_when_satisfies(std::function<bool(VarType)> when_f, c2pool::deferred::shared_deferred<VarType> def = nullptr)
     {
-        changed->subscribe([when_f = when_f, f = f](VarType _v){ if(when_f(_v)) f(_v); });
+        if (!def)
+            def = c2pool::deferred::make_deferred<VarType>();
+
+        changed->subscribe_once([&, when_f = when_f, def = def](VarType _v)
+                                {
+                                    if (when_f(_v)){
+                                        def->result.set_value(_v);
+                                    }
+                                    else{
+                                        get_when_satisfies(when_f, def);
+                                    }
+                                });
+//        changed->subscribe([when_f = when_f, f = f](VarType _v){ if(when_f(_v)) f(_v); });
+        return def;
     }
 
     /* TODO:
