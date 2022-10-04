@@ -25,6 +25,90 @@ namespace c2pool::deferred
         return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
     }
 
+    class Fiber
+    {
+    public:
+        std::shared_ptr<boost::asio::io_context> io;
+        boost::asio::yield_context yield;
+
+        Fiber(std::shared_ptr<boost::asio::io_context> _io, boost::asio::yield_context &yieldContext) : io(std::move(_io)),
+                                                                                                        yield(std::move(yieldContext))
+        {
+
+        }
+
+    private:
+        std::map<unsigned long long, std::shared_ptr<boost::asio::steady_timer>> external_timers;
+    public:
+        //Таймер, который не блокирует yield_context
+        void external_timer(std::function<void(const boost::system::error_code &ec)> __handler,
+                            const std::chrono::_V2::steady_clock::duration &expiry_time)
+        {
+            auto __timer = std::make_shared<boost::asio::steady_timer>(*io);
+            unsigned long long _id = external_timers.size();
+
+            external_timers[_id] = __timer;
+
+            __timer->expires_from_now(expiry_time);
+            __timer->async_wait([&, __handler, _id](const boost::system::error_code &ec)
+                                {
+                                    __handler(ec);
+                                    external_timers.erase(_id);
+                                });
+        }
+
+        void sleep(const std::chrono::_V2::steady_clock::duration &expiry_time)
+        {
+            boost::asio::steady_timer timer(*io, expiry_time);
+            timer.async_wait(yield);
+        }
+
+        static std::shared_ptr<Fiber> run(std::shared_ptr<boost::asio::io_context> io, std::function<void(std::shared_ptr<Fiber>)> f)
+        {
+            std::shared_ptr<Fiber> fiber;
+            boost::asio::spawn([&](boost::asio::yield_context yieldContext){
+                fiber = std::make_shared<Fiber>(io, yieldContext);
+                f(fiber);
+            });
+
+            return fiber;
+        }
+    };
+
+    template<typename T>
+    class Deferred
+    {
+    public:
+        std::promise<T> result;
+
+        // TODO: add timeout
+        T yield(const std::shared_ptr<boost::asio::io_context>& _context, boost::asio::yield_context &_yield)
+        {
+            auto future = result.get_future();
+            while (!is_ready(future))
+            {
+                _context->post(_yield);
+            }
+            return future.get();
+        }
+
+        // TODO: add timeout
+        T yield(const std::shared_ptr<Fiber>& fiber)
+        {
+            return yield(fiber->io, fiber->yield);
+        }
+    };
+
+    template <typename T>
+    using shared_deferred = std::shared_ptr<Deferred<T>>;
+
+    template <typename T>
+    shared_deferred<T> make_deferred()
+    {
+        return std::make_shared<Deferred<T>>();
+    }
+
+
     template<typename ReturnType>
     class result_reply
     {
@@ -185,6 +269,18 @@ namespace c2pool::deferred
             auto id = this->operator()(_context, ARGS...);
             result[id]->add_callback(__f);
         }
+
+        shared_deferred<ReturnType> yield(std::shared_ptr<Fiber> fiber, Args... ARGS)
+        {
+            shared_deferred<ReturnType> def = make_deferred<ReturnType>();;
+
+            auto id = this->operator()(fiber->io, ARGS...);
+            result[id]->add_callback([&, def = def](ReturnType res){
+                def->result.set_value(res);
+            });
+
+            return def->yield(fiber);
+        }
     };
 
 //    template<typename RetType>
@@ -288,86 +384,5 @@ namespace c2pool::deferred
 //    template<typename RetType>
 //    using shared_defer_algo = std::shared_ptr<DeferredAlgo<RetType>>;
 
-    class Fiber
-    {
-    public:
-        std::shared_ptr<boost::asio::io_context> io;
-        boost::asio::yield_context yield;
 
-        Fiber(std::shared_ptr<boost::asio::io_context> _io, boost::asio::yield_context &yieldContext) : io(std::move(_io)),
-                                                                                                        yield(std::move(yieldContext))
-        {
-
-        }
-
-    private:
-        std::map<unsigned long long, std::shared_ptr<boost::asio::steady_timer>> external_timers;
-    public:
-        //Таймер, который не блокирует yield_context
-        void external_timer(std::function<void(const boost::system::error_code &ec)> __handler,
-                            const std::chrono::_V2::steady_clock::duration &expiry_time)
-        {
-            auto __timer = std::make_shared<boost::asio::steady_timer>(*io);
-            unsigned long long _id = external_timers.size();
-
-            external_timers[_id] = __timer;
-
-            __timer->expires_from_now(expiry_time);
-            __timer->async_wait([&, __handler, _id](const boost::system::error_code &ec)
-                                {
-                                    __handler(ec);
-                                    external_timers.erase(_id);
-                                });
-        }
-
-        void sleep(const std::chrono::_V2::steady_clock::duration &expiry_time)
-        {
-            boost::asio::steady_timer timer(*io, expiry_time);
-            timer.async_wait(yield);
-        }
-
-        static std::shared_ptr<Fiber> run(std::shared_ptr<boost::asio::io_context> io, std::function<void(std::shared_ptr<Fiber>)> f)
-        {
-            std::shared_ptr<Fiber> fiber;
-            boost::asio::spawn([&](boost::asio::yield_context yieldContext){
-                fiber = std::make_shared<Fiber>(io, yieldContext);
-                f(fiber);
-            });
-
-            return fiber;
-        }
-    };
-
-    template<typename T>
-    class Deferred
-    {
-    public:
-        std::promise<T> result;
-
-        // TODO: add timeout
-        T yield(const std::shared_ptr<boost::asio::io_context>& _context, boost::asio::yield_context &_yield)
-        {
-            auto future = result.get_future();
-            while (!is_ready(future))
-            {
-                _context->post(_yield);
-            }
-            return future.get();
-        }
-
-        // TODO: add timeout
-        T yield(const std::shared_ptr<Fiber>& fiber)
-        {
-            return yield(fiber->io, fiber->yield);
-        }
-    };
-
-    template <typename T>
-    using shared_deferred = std::shared_ptr<Deferred<T>>;
-
-    template <typename T>
-    shared_deferred<T> make_deferred()
-    {
-        return std::make_shared<Deferred<T>>();
-    }
 }
