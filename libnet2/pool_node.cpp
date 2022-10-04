@@ -647,7 +647,7 @@ void PoolNode::start()
 
 }
 
-void PoolNode::download_shares(std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired)
+void PoolNode::download_shares()
 {
     c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
     {
@@ -669,14 +669,31 @@ void PoolNode::download_shares(std::vector<std::tuple<std::tuple<std::string, st
 
             LOG_INFO << "Requesting parent share " << share_hash.GetHex() << " from " << peer_ip << ":" << peer_port;
 
-
-            try
-            {
-
-            }
+            std::vector<ShareType> shares;
+//            try
+//            {
+                std::vector<uint256> stops; //TODO: INIT
+                shares = peer->get_shares.yield(fiber,
+                                                     std::vector<uint256>{share_hash},
+                                                     (uint64_t)c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
+                                                     stops
+                                                     );
+//            }
             //TODO: catch: timeout/any error
 
+            if (shares.empty())
+            {
+                fiber->sleep(1s);
+                continue;
+            }
 
+            vector<tuple<ShareType, std::vector<coind::data::tx_type>>> post_shares;
+            for (const auto& _share : shares)
+            {
+                post_shares.emplace_back(_share, std::vector<coind::data::tx_type>{});
+            }
+
+            handle_shares(post_shares, peer->get_addr());
         }
     });
 

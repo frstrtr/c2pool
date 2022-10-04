@@ -176,7 +176,7 @@ public:
 			connector = std::make_shared<ConnectorType>(context, net);
 			auto_connect();
 		}
-        start()
+        start();
 	}
 
 	// Handshake handlers
@@ -211,6 +211,6 @@ public:
 private:
     void start();
 
-    void download_shares(std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired);
+    void download_shares();
 };
 #undef SET_POOL_DEFAULT_HANDLER
