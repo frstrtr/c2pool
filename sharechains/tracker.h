@@ -62,8 +62,8 @@ public:
 
 	ShareType get(uint256 hash);
 
-	void add(ShareType share);
-    void remove(uint256 hash);
+	void add(ShareType share) override;
+    void remove(uint256 hash) override;
 
 	bool attempt_verify(ShareType share);
 

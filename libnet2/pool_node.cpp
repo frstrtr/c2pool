@@ -638,19 +638,47 @@ void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_
 
 void PoolNode::start()
 {
+    LOG_DEBUG << "PoolNode started!";
     for (const auto &item: tracker->items)
     {
         shared_share_hashes.insert(item.first);
     }
     //TODO: self.node.tracker.removed.watch_weakref(self, lambda self, share: self.shared_share_hashes.discard(share.hash))
 
+    download_shares();
 
+    coind_node->best_block_header.changed->subscribe([&](coind::data::BlockHeaderType header){
+        for (auto _peer : peers)
+        {
+            auto _msg = std::make_shared<message_bestblock>(*header.get());
+            _peer.second->write(_msg);
+        }
+    });
+
+    coind_node->best_share.changed->subscribe([&](uint256 _best_share){
+        broadcast_share(_best_share);
+    });
+
+    /* TODO
+        @self.node.tracker.verified.added.watch
+        def _(share):
+            if not (share.pow_hash <= share.header['bits'].target):
+                return
+
+            def spread():
+                if (self.node.get_height_rel_highest(share.header['previous_block']) > -5 or
+                    self.node.bitcoind_work.value['previous_block'] in [share.header['previous_block'], share.header_hash]):
+                    self.broadcast_share(share.hash)
+            spread()
+            reactor.callLater(5, spread) # so get_height_rel_highest can update
+     */
 }
 
 void PoolNode::download_shares()
 {
     c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
     {
+        LOG_DEBUG << "Start download_shares!";
         while (true)
         {
             auto desired = coind_node->desired.get_when_satisfies([&](auto desired)
@@ -661,6 +689,7 @@ void PoolNode::download_shares()
 
             if (peers.size() == 0)
             {
+                LOG_WARNING << "download_shares: peers.size() == 0";
                 fiber->sleep(1s);
                 continue;
             }
@@ -672,7 +701,16 @@ void PoolNode::download_shares()
             std::vector<ShareType> shares;
 //            try
 //            {
-                std::vector<uint256> stops; //TODO: INIT
+                //TODO: init stops like in p2pool:
+//            stops=list(set(self.node.tracker.heads) | set(
+//                    self.node.tracker.get_nth_parent_hash(head, min(max(0, self.node.tracker.get_height_and_last(head)[0] - 1), 10)) for head in self.node.tracker.heads
+//            ))[:100]
+                std::vector<uint256> stops;
+                for (auto v : tracker->sum)
+                {
+                    stops.push_back(v.first);
+                }
+                //tracker->
                 shares = peer->get_shares.yield(fiber,
                                                      std::vector<uint256>{share_hash},
                                                      (uint64_t)c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
