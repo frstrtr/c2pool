@@ -435,7 +435,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //10
     NotifyData ba = {
-            std::max(current_work.value().version, (uint64_t) 0x20000000),
+            std::max(current_work.value().version, (uint64_t) 536870912),
             current_work.value().previous_block,
             merkle_link,
             std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - COINBASE_NONCE_LENGTH - 4),
