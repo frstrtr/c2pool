@@ -179,7 +179,7 @@ namespace shares
         }
 
     public:
-        void add(ShareType _share)
+        virtual void add(ShareType _share)
         {
             //TODO: throw if share exists in items;
             items[_share->hash] = _share;
@@ -205,7 +205,7 @@ namespace shares
     q.front();  \
     q.pop()
 
-        void remove(uint256 hash)
+        virtual void remove(uint256 hash)
         {
             //TODO: throw if hash not exists in items;
             auto _share = items[hash];
