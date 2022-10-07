@@ -59,11 +59,17 @@ json Stratum::mining_subscribe(const json &_params)
 {
     std::vector<std::string> params = _params.get<std::vector<std::string>>();
     auto miner_info = params[0];
-    std::cout << "mining.subscribe called: " << miner_info << std::endl;
+    LOG_DEBUG << "mining.subscribe called: " << miner_info;// << " " << _params.get<std::string>() << std::endl;
+    LOG_DEBUG << "params:";
+    for (auto p : params)
+    {
+        LOG_DEBUG << p;
+    }
 
     json res;
     //res = {{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"}, "", 8};
 
+//    _context->post([&](){_send_work();});
     _t_send_work.expires_from_now(boost::posix_time::seconds(1));
     _t_send_work.async_wait([&](const boost::system::error_code &ec){
         _send_work();

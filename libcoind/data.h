@@ -170,6 +170,11 @@ namespace coind::data
 
         PackStream &write(PackStream &stream)
         {
+            std::cout << "HumanAddressType: ";
+            for (auto v : stream.data){
+                std::cout << (unsigned int) v;
+            }
+            std::cout << std::endl;
             stream << version << pubkey_hash;
             return stream;
         }
