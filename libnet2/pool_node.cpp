@@ -358,6 +358,8 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
 
 void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol)
 {
+    //TODO: fix
+    return;
     //t0
     vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
     for (auto wrappedshare: msg->raw_shares.get())

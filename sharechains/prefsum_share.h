@@ -318,6 +318,9 @@ namespace shares
         element_delta_type get_delta_to_last(uint256 hash)
         {
             auto el = sum.find(hash);
+            if (hash.IsNull()) {
+                return element_delta_type(true);
+            }
             if (el == sum.end())
             {
                 throw invalid_argument("[get_delta_to_last] hash not exists in sum");

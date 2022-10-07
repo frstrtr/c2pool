@@ -745,7 +745,10 @@ user_details Worker::get_user_details(std::string username)
         contents.push_back(t);
     }
 //        boost::split(contents, username, boost::is_any_of("+/"));
-    assert(contents.size() % 2 == 1);
+    if (contents.size() % 2 != 1)
+    {
+        throw std::invalid_argument("Worker::get_user_details(std::__cxx11::string): 'contents.size() % 2 == 1' failed.");
+    }
 
     result.user = boost::trim_copy(contents[0]);
     contents.erase(contents.begin(), contents.begin() + 1);
@@ -773,12 +776,20 @@ user_details Worker::get_user_details(std::string username)
 //            if (c - self.pubkeys.stamp) > self.args.timeaddresses:
 //                self.freshen_addresses(c)
 
-    if (c2pool::random::RandomFloat(0, 100) < worker_fee)
+/*TODO:    if (c2pool::random::RandomFloat(0, 100) < worker_fee)
+ *              pubkey_hash = self.my_pubkey_hash
+ *         else :
+ */
+    try
     {
         result.pubkey_hash = coind::data::address_to_pubkey_hash(result.user, _net);
-        //TODO: try-except from p2pool???
-//            if self.args.address != 'dynamic':
-//                pubkey_hash = self.my_pubkey_hash
+    } catch (...)
+    {
+        /* TODO:
+         * if self.args.address != 'dynamic':
+         *      pubkey_hash = self.my_pubkey_hash
+        */
+        result.pubkey_hash.SetHex("78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
     }
 
     return result;
