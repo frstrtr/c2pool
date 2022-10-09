@@ -70,10 +70,12 @@ json Stratum::mining_subscribe(const json &_params)
     //res = {{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"}, "", 8};
 
 //    _context->post([&](){_send_work();});
-    _t_send_work.expires_from_now(boost::posix_time::seconds(1));
-    _t_send_work.async_wait([&](const boost::system::error_code &ec){
-        _send_work();
-    });
+//    _t_send_work.expires_from_now(boost::posix_time::seconds(0));
+//    _t_send_work.async_wait([&](const boost::system::error_code &ec){
+//        _send_work();
+//    });
+
+//    _send_work();
 
     res = {{{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"},{}}, "", 8};
     return res;
@@ -83,6 +85,9 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
 {
     username = _username;
     std::cout << "Auth with [username: " << _username << ", password: " << _password << "]." << std::endl;
+
+    _context->post([&](){_send_work();});
+
     return json({true});
 }
 
