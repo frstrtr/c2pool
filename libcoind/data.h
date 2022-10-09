@@ -168,20 +168,45 @@ namespace coind::data
         IntType(8) version;
         IntType(160) pubkey_hash;
 
+        PackStream checksum_func(PackStream data)
+        {
+            auto _hash = hash256(std::move(data));
+            std::vector<unsigned char> res(_hash.begin(), _hash.end());
+
+            res.resize(4);
+            return {res};
+        }
+
         PackStream &write(PackStream &stream)
         {
-            std::cout << "HumanAddressType: ";
-            for (auto v : stream.data){
-                std::cout << (unsigned int) v;
-            }
-            std::cout << std::endl;
+//            std::cout << "HumanAddressType: ";
+//            for (auto v : stream.data){
+//                std::cout << (unsigned int) v;
+//            }
+//            std::cout << std::endl;
             stream << version << pubkey_hash;
+            auto checksum = checksum_func(stream);
+            stream << checksum;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
             stream >> version >> pubkey_hash;
+
+            PackStream checksum_bytes;
+            checksum_bytes << version << pubkey_hash;
+
+            auto calculated_checksum = checksum_func(checksum_bytes);
+            if (stream.size() < calculated_checksum.size())
+                throw std::invalid_argument("invalid checksum#1");
+
+            PackStream checksum(std::vector<unsigned char>(stream.begin(), stream.begin() + (int) calculated_checksum.size()));
+            stream.data.erase(stream.begin(), stream.begin() + (int) calculated_checksum.size());
+
+            if (checksum.data != calculated_checksum.data)
+                throw std::invalid_argument("invalid checksum#2");
+
             return stream;
         }
     };
