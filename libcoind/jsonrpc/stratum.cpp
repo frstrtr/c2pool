@@ -3,12 +3,15 @@
 #include <libdevcore/random.h>
 #include <libdevcore/common.h>
 
-Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<Worker> _worker) : StratumProtocol(context), worker(_worker), _t_send_work(*context),
-                                                                                                      handler_map(_context, 300)
+#include <utility>
+
+Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::shared_ptr<Worker> worker, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event)
+                : StratumProtocol(context, std::move(socket), std::move(_disconnect_event)), _worker(std::move(worker)), _t_send_work(*context), handler_map(_context, 300)
 {
-    server.Add("mining.subscribe", GetUncheckedHandle([&](const json& value){
-        return mining_subscribe(value);
-    }));
+    server.Add("mining.subscribe", GetUncheckedHandle([&](const json &value)
+                                                      {
+                                                          return mining_subscribe(value);
+                                                      }));
 
     server.Add("mining.authorize", GetHandle(&Stratum::mining_authorize, *this));
     std::cout << "Added methods to server" << std::endl;
@@ -20,8 +23,8 @@ void Stratum::_send_work()
 
     try
     {
-        auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = worker->preprocess_request(username);
-        get_work_result = worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
+        auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
+        get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
     } catch (const std::exception &ec)
     {
         LOG_ERROR << "Stratum disconnect " << ec.what();
@@ -33,7 +36,7 @@ void Stratum::_send_work()
 
     //TODO: test
     auto jobid = HexStr(c2pool::random::random_bytes(16)); // random_bytes(16) = random(2**128)
-    mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* worker->_net->parent->DUMB_SCRYPT_DIFF);
+    mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* _worker->_net->parent->DUMB_SCRYPT_DIFF);
 
     json::array_t merkle_branch;
     for (auto s : x.merkle_link.branch)

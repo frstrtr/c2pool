@@ -4,36 +4,15 @@
 #include <string>
 
 
-StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context) : _context(context), client(*this, version::v2), acceptor(*context), resolver(*context)
+StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event) : _context(std::move(context)), _socket(std::move(socket)), client(*this, version::v2), disconnect_event(std::move(_disconnect_event)),
+    addr(std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port()))
 {
-    ip::tcp::endpoint listen_ep(ip::tcp::v4(), 1131);
-
-    acceptor.open(listen_ep.protocol());
-    acceptor.set_option(io::socket_base::reuse_address(true));
-    acceptor.bind(listen_ep);
-    acceptor.listen();
-}
-
-void StratumProtocol::listen()
-{
-    acceptor.async_accept([this](const boost::system::error_code& ec, ip::tcp::socket _socket){
-        if (!ec)
-        {
-            socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-            std::cout << "Connected!" << std::endl;
-            read();
-            listen();
-        } else
-        {
-            std::cout << ec.message() << std::endl;
-        }
-
-    });
+    read();
 }
 
 void StratumProtocol::read()
 {
-    boost::asio::async_read_until(*socket, buffer, "}\n", [&](const boost::system::error_code& ec, std::size_t len)
+    boost::asio::async_read_until(*_socket, buffer, "}\n", [&](const boost::system::error_code& ec, std::size_t len)
     {
         if (buffer.size() == 0)
             return;
@@ -59,7 +38,7 @@ std::string StratumProtocol::Send(const std::string &request)
 {
     auto _req = request + "\n";
     std::cout << "SEND DATA: " << _req << std::endl;
-    boost::asio::async_write(*socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
+    boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
         if (!ec)
         {
             //buffer.consume(buffer.size());
@@ -69,11 +48,11 @@ std::string StratumProtocol::Send(const std::string &request)
             std::cout << "Response error: " << ec.message() << std::endl;
         }
     });
-    return std::__cxx11::string();
+    return {};
 }
 
 void StratumProtocol::disconnect()
 {
-    socket->close();
-    socket = nullptr;
+    _socket->close();
+    disconnect_event(get_addr());
 }

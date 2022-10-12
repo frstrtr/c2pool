@@ -9,6 +9,8 @@ set(coind_tool_sources
         jsonrpc/jsonrpc_coind.cpp
         jsonrpc/txidcache.h
 
+        jsonrpc/stratum_node.h
+        jsonrpc/stratum_node.cpp
         jsonrpc/stratum.h
         jsonrpc/stratum.cpp
         jsonrpc/stratum_protocol.h
