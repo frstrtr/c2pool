@@ -647,6 +647,13 @@ void PoolNode::start()
     }
     //TODO: self.node.tracker.removed.watch_weakref(self, lambda self, share: self.shared_share_hashes.discard(share.hash))
 
+    //TODO: if DEBUG_MODE -- WANRING; else -- THROW!
+    if (!coind_node)
+    {
+        LOG_WARNING << "PoolNode::download_shares -- coind_node == nullptr";
+        return;
+    }
+
     download_shares();
 
     coind_node->best_block_header.changed->subscribe([&](coind::data::BlockHeaderType header){

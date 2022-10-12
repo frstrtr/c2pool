@@ -15,12 +15,16 @@ class StratumProtocol : public jsonrpccxx::IClientConnector
 {
 public:
     StratumProtocol();
-    StratumProtocol(std::shared_ptr<boost::asio::io_context> context);
+    StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event);
 
-    void listen();
     void read();
 
     std::string Send(const std::string &request) override;
+
+    auto get_addr() const
+    {
+        return std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port());
+    }
 
     void disconnect();
 
@@ -30,11 +34,9 @@ protected:
     JsonRpc2Server server;
     JsonRpcClient client;
 
-    ip::tcp::acceptor acceptor;
-    ip::tcp::resolver resolver;
-
-    std::shared_ptr<ip::tcp::socket> socket;
-
+    std::shared_ptr<ip::tcp::socket> _socket;
+    const std::tuple<std::string, unsigned short> addr;
+    std::function<void(std::tuple<std::string, unsigned short>)> disconnect_event;
 private:
     io::streambuf buffer;
 //    io::steady_timer listen_timer

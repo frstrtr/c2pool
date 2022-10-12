@@ -12,7 +12,7 @@
 #include <libp2p/node.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/p2p/coind_socket.h>
-#include <libcoind/jsonrpc/stratum.h>
+#include <libcoind/jsonrpc/stratum_node.h>
 
 #include <boost/asio.hpp>
 
@@ -81,7 +81,7 @@ int main(int ac, char *av[])
 	std::shared_ptr<Worker> worker = std::make_shared<Worker>(net, pool_node, coind_node, tracker);
 
 	// Stratum: worker -> stratum
-	std::shared_ptr<Stratum> stratum = std::make_shared<Stratum>(context, worker);
+	std::shared_ptr<StratumNode> stratum = std::make_shared<StratumNode>(context, worker);
     stratum->listen();
 
     context->run();
