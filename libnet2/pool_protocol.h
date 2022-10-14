@@ -27,7 +27,7 @@ public:
 
 public:
 	PoolProtocol(std::shared_ptr<boost::asio::io_context> _context, std::shared_ptr<Socket> _socket,
-                 HandlerManagerPtr<PoolProtocol> _handler_manager, std::shared_ptr<PoolProtocolData> _data) : Protocol<PoolProtocol>(_socket, _handler_manager), PoolProtocolData(*_data),
+                 HandlerManagerPtr<PoolProtocol> _handler_manager, std::shared_ptr<PoolProtocolData> _data) : Protocol<PoolProtocol>("Pool", _socket, _handler_manager), PoolProtocolData(*_data),
                                                                                                               ProtocolPinger(_context, 100, std::bind(&PoolProtocol::out_time_ping, this),
 																															 [](){return 20; /*TODO: return  random.expovariate(1/100)*/}, [&](){ send_ping(); })
 	{}

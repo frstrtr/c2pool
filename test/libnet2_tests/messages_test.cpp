@@ -13,7 +13,7 @@ TEST(pool_messages, message_version)
     address_type addrs1(3, "4.5.6.7", 8);
     address_type addrs2(9, "10.11.12.13", 14);
     uint256 best_hash_test_answer;
-    best_hash_test_answer.SetHex("0123");
+    best_hash_test_answer.SetHex("0");
     shared_ptr <pool::messages::message_version> msg = make_shared<pool::messages::message_version>(ver, 0, addrs1, addrs2, test_nonce,
                                                                            test_sub_ver, 18, best_hash_test_answer);
 

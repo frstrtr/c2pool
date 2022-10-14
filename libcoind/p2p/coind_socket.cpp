@@ -61,7 +61,7 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-									LOG_ERROR << "read_prefix: " << ec << " " << ec.message();
+									LOG_ERROR << "Coind read_prefix: " << ec << " " << ec.message();
 									disconnect();
 								}
 							});

@@ -17,15 +17,36 @@ void StratumNode::listen()
                           {
                               if (!ec)
                               {
-                                  LOG_INFO << "Stratum connected from: " << _socket.remote_endpoint().data();
+                                  auto _addr = std::make_tuple(_socket.remote_endpoint().address().to_string(),
+                                                               _socket.remote_endpoint().port());
+                                  LOG_INFO << "Stratum connected from: " << std::get<0>(_addr) << ":"
+                                           << std::get<1>(_addr);
+
+                                  if (bans.find(std::get<0>(_addr)) != bans.end())
+                                  {
+                                      LOG_TRACE << "BANNED!";
+                                      _socket.close();
+                                      listen();
+                                      return;
+                                  }
+
+                                  if (miners.find(_addr) != miners.end())
+                                  {
+                                      LOG_WARNING << std::get<0>(_addr) << ":" << std::get<1>(_addr)
+                                                  << " already connected!";
+                                      _socket.close();
+                                      ban(_addr);
+                                      listen();
+                                      return;
+                                  }
+
                                   auto socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
                                   auto stratum = std::make_shared<Stratum>(_context, std::move(socket), _worker,
-                                                                           [&](const addr_t& addr)
+                                                                           [&](const addr_t &addr)
                                                                            {
                                                                                disconnect(addr);
                                                                            });
-                                  auto addr = stratum->get_addr();
-                                  miners[addr] = std::move(stratum);
+                                  miners[_addr] = std::move(stratum);
                                   listen();
                               } else
                               {
@@ -35,12 +56,24 @@ void StratumNode::listen()
                           });
 }
 
+void StratumNode::ban(const StratumNode::addr_t& _addr)
+{
+    auto _ban_timer = std::make_shared<boost::asio::steady_timer>(*_context);
+    _ban_timer->expires_from_now(std::chrono::seconds(10));
+    _ban_timer->async_wait([&, addr = _addr](const auto& ec){
+        bans.erase(std::get<0>(addr));
+    });
+    bans[std::get<0>(_addr)] = std::move(_ban_timer);
+    LOG_INFO << std::get<0>(_addr) << " banned for StratumNode!";
+}
+
 void StratumNode::disconnect(const addr_t& addr)
 {
     if (miners.find(addr) != miners.end())
     {
         auto stratum = miners[addr];
         miners.erase(addr);
+        ban(addr);
         stratum.reset();
     } else
     {

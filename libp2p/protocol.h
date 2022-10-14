@@ -49,15 +49,17 @@ template <typename T>
 class Protocol : public enable_shared_from_this<T>, public BaseProtocol
 {
 protected:
+    std::string name;
     HandlerManagerPtr<T> handler_manager;
 
 public:
     // Not safe, socket->message_handler = nullptr; handler_manager = nullptr; wanna for manual setup
     Protocol() : BaseProtocol() {}
+    Protocol(std::string _name) : BaseProtocol(), name(_name) {}
 
-    Protocol (std::shared_ptr<Socket> _socket) : BaseProtocol(_socket) {}
+    Protocol (std::string _name, std::shared_ptr<Socket> _socket) : BaseProtocol(_socket), name(_name) {}
 
-    Protocol (std::shared_ptr<Socket> _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket),
+    Protocol (std::string _name, std::shared_ptr<Socket> _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket), name(_name),
                                                                                        handler_manager(_handler_manager)
     {
         _socket->set_message_handler(std::bind(&Protocol::handle, this, std::placeholders::_1));
@@ -70,7 +72,7 @@ public:
         auto handler = handler_manager->get_handler(raw_msg->command);
         if (handler)
         {
-			LOG_INFO << "Protocol call handler for " << raw_msg->command;
+			LOG_INFO << name << " protocol call handler for " << raw_msg->command;
             handler->invoke(raw_msg->value, this->shared_from_this());
         } else
         {
