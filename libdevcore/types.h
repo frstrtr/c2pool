@@ -206,7 +206,6 @@ namespace stream
         PackStream &write(PackStream &stream)
         {
             vector<unsigned char> data;
-            LOG_TRACE << "IPV6AddressType::value = " << value;
             if (value.find(':') < value.size())
             {
                 boost::erase_all(value, ":");

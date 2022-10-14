@@ -23,7 +23,7 @@ public:
 
     auto get_addr() const
     {
-        return std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port());
+        return addr;
     }
 
     void disconnect();

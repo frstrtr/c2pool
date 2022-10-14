@@ -62,7 +62,7 @@ void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-									LOG_ERROR << "read_prefix: " << ec << " " << ec.message();
+									LOG_ERROR << "Pool read_prefix: " << ec << " " << ec.message();
 									disconnect();
 								}
 							});
