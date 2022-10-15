@@ -358,8 +358,6 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
 
 void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    //TODO: fix
-    return;
     //t0
     vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
     for (auto wrappedshare: msg->raw_shares.get())
@@ -710,15 +708,12 @@ void PoolNode::download_shares()
             std::vector<ShareType> shares;
 //            try
 //            {
-                //TODO: init stops like in p2pool:
+                //TODO: init stops like in p2pool (best hashes for all forks!):
 //            stops=list(set(self.node.tracker.heads) | set(
 //                    self.node.tracker.get_nth_parent_hash(head, min(max(0, self.node.tracker.get_height_and_last(head)[0] - 1), 10)) for head in self.node.tracker.heads
 //            ))[:100]
                 std::vector<uint256> stops;
-                for (auto v : tracker->sum)
-                {
-                    stops.push_back(v.first);
-                }
+                stops.push_back(tracker->get_best());
                 //tracker->
                 shares = peer->get_shares.yield(fiber,
                                                      std::vector<uint256>{share_hash},
