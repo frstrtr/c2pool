@@ -177,21 +177,8 @@ public:
                                         get_when_satisfies(when_f, def);
                                     }
                                 });
-//        changed->subscribe([when_f = when_f, f = f](VarType _v){ if(when_f(_v)) f(_v); });
         return def;
     }
-
-    /* TODO:
-    @defer.inlineCallbacks
-    def get_when_satisfies(self, func):
-        while True:
-            if func(self.value):
-                defer.returnValue(self.value)
-            yield self.changed.once.get_deferred()
-
-    def get_not_none(self):
-        return self.get_when_satisfies(lambda val: val is not None)
-    */
 };
 
 template<typename KeyType, typename VarType>
