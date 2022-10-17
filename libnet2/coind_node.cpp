@@ -130,7 +130,7 @@ void CoindNode::start()
 void CoindNode::work_poller()
 {
     LOG_TRACE << "work_poller called!";
-    coind_work = coind->getwork(txidcache, known_txs.value());
+    coind_work.set(coind->getwork(txidcache, known_txs.value()));
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
     work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
 }
