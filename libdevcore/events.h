@@ -94,6 +94,7 @@ public:
             (*sig_anon)();
         if(!once->empty())
         {
+            LOG_DEBUG << "ONCE CALLED!";
             (*once)(args...);
             once->disconnect_all_slots();
         }
@@ -148,7 +149,7 @@ public:
         return _value == nullptr;
     }
 
-    Variable<VarType> &operator=(VarType &__value)
+    Variable<VarType> &set(VarType __value)
     {
         if (!_value)
             _value = std::make_shared<VarType>();
@@ -160,6 +161,12 @@ public:
             changed->happened(*_value);
             transitioned->happened(oldvalue, *_value);
         }
+        return *this;
+    }
+
+    Variable<VarType> &operator=(VarType __value)
+    {
+        this->set(__value);
         return *this;
     }
 
