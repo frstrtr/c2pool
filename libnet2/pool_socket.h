@@ -38,7 +38,10 @@ public:
 	void write(std::shared_ptr<Message> msg) override
 	{
         LOG_DEBUG << "Pool Socket write for " << msg->command << "!";
-		write_prefix(msg);
+//        boost::asio::post(socket->get_executor(),[&, _msg = msg](){
+//            write_prefix(_msg);
+//        });
+        write_prefix(msg);
 	}
 
 	// Read
