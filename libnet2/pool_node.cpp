@@ -97,6 +97,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
 	auto best_hash = msg->best_share_hash.get();
 	if (!best_hash.IsNull())
 	{
+        LOG_INFO << "Best share hash for " << msg->addr_from.address.get() << ":" << msg->addr_from.port.get() << " = " << best_hash;
 		handle_share_hashes({best_hash}, handshake, handshake->get_addr());
 	}
 

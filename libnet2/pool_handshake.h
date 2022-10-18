@@ -16,7 +16,6 @@ class PoolHandshake : public Handshake<PoolProtocol>, public PoolProtocolData
 {
 protected:
     std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> handle_message_version;
-
 	void send_version()
 	{
 		address_type addrs1(3, "192.168.10.10", 8);
@@ -45,9 +44,36 @@ public:
             : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
+                        LOG_DEBUG << "ID: " << _id.GetHex();
+
+                        LOG_DEBUG << "Hashes: [";
+                        for (auto _h : _hashes){
+                            LOG_DEBUG << _h.GetHex();
+                        }
+                        LOG_DEBUG << "]";
+
+                        LOG_DEBUG << "Parents: " << _parents;
+
+                        LOG_DEBUG << "Stops: [";
+                        for (auto _h : _stops){
+                            LOG_DEBUG << _h.GetHex();
+                        }
+                        LOG_DEBUG << "]";
+
+                        LOG_DEBUG << "get_shares called!";
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
-                        _socket->write(msg);
-                    }, 15, [_socket = socket](){_socket->disconnect();})), handle_message_version(std::move(_handler))
+
+                        auto* _context = new boost::asio::io_context(0);
+                        auto* _t = new boost::asio::steady_timer(*_context);
+                        _t->expires_from_now(std::chrono::seconds(2));
+                        _t->async_wait([&, _msg = msg, socket = _socket](const auto& ec){
+                            LOG_INFO << "Writed!!!";
+                            socket->write(msg);
+                        });
+                        _context->run();
+
+//                        _socket->write(msg);
+                    }, 15, [_socket = socket](){LOG_WARNING << "get_shares timeout!"; _socket->disconnect();})), handle_message_version(std::move(_handler))
     {
 
     }
