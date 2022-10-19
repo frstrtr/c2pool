@@ -41,7 +41,14 @@ public:
 //        boost::asio::post(socket->get_executor(),[&, _msg = msg](){
 //            write_prefix(_msg);
 //        });
-        write_prefix(msg);
+        auto* _t = new boost::asio::steady_timer(socket->get_executor());
+        _t->expires_from_now(std::chrono::seconds(1));
+        _t->async_wait([&, _msg = msg](const auto& ec){
+            LOG_INFO << "Writed!!!";
+            write_prefix(_msg);
+        });
+
+//        write_prefix(msg);
 	}
 
 	// Read
