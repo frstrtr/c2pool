@@ -126,14 +126,14 @@ void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_
 	if (new_hashes.empty())
 		return;
 
-	peer->get_shares.yield(context, [&, _peer = peer](std::vector<ShareType> shares)
+	peer->get_shares.yield(context, [&, _peer = peer, _addr = addr](std::vector<ShareType> shares)
 	{
 		vector<tuple<ShareType, std::vector<coind::data::tx_type>>> _shares;
 		for (const auto& _share: shares)
 		{
 			_shares.push_back({_share, {}});
 		}
-		handle_shares(_shares, addr);
+		handle_shares(_shares, _addr);
 	}, new_hashes, 0, {});
 }
 
