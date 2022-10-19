@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <queue>
 
 #include <libp2p/preset/p2p_socket_data.h>
 #include <libp2p/socket.h>
@@ -14,22 +15,49 @@ class PoolSocket : public Socket
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 
+    std::queue<std::shared_ptr<Message>> messages_pool;
+    std::shared_ptr<boost::asio::steady_timer> pool_timer;
+
 	std::shared_ptr<c2pool::Network> net;
 public:
 
 	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
 		LOG_TRACE << "socket created";
+        pool_timer = std::make_shared<boost::asio::steady_timer>(socket->get_executor());
+        pool_message_cycle();
 	}
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
 		LOG_TRACE << "socket created";
+        pool_timer = std::make_shared<boost::asio::steady_timer>(socket->get_executor());
+        pool_message_cycle();
 	}
 
 	~PoolSocket(){
 		LOG_TRACE << "socket removed";
 	}
+
+    void pool_message_cycle()
+    {
+        pool_timer->expires_from_now(std::chrono::milliseconds(100));
+        pool_timer->async_wait([&](const auto &ec)
+                               {
+                                   if (!ec)
+                                   {
+                                       if (!messages_pool.empty())
+                                       {
+                                           write_prefix(messages_pool.front());
+                                           messages_pool.pop();
+                                       }
+                                       pool_message_cycle();
+                                   } else
+                                   {
+                                       LOG_WARNING << "pool_message_cycle error!";
+                                   }
+                               });
+    }
 
 	// Write
 	void write_prefix(std::shared_ptr<Message> msg);
@@ -38,15 +66,13 @@ public:
 	void write(std::shared_ptr<Message> msg) override
 	{
         LOG_DEBUG << "Pool Socket write for " << msg->command << "!";
-//        boost::asio::post(socket->get_executor(),[&, _msg = msg](){
+
+        messages_pool.push(std::move(msg));
+//        pool_timer->expires_from_now(std::chrono::milliseconds(100));
+//        pool_timer->async_wait([&, _msg = msg](const auto& ec){
+//            LOG_INFO << "Writed!!!";
 //            write_prefix(_msg);
 //        });
-        auto* _t = new boost::asio::steady_timer(socket->get_executor());
-        _t->expires_from_now(std::chrono::seconds(1));
-        _t->async_wait([&, _msg = msg](const auto& ec){
-            LOG_INFO << "Writed!!!";
-            write_prefix(_msg);
-        });
 
 //        write_prefix(msg);
 	}
