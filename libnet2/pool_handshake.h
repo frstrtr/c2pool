@@ -62,17 +62,7 @@ public:
 
                         LOG_DEBUG << "get_shares called!";
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
-
-                        auto* _context = new boost::asio::io_context(0);
-                        auto* _t = new boost::asio::steady_timer(*_context);
-                        _t->expires_from_now(std::chrono::seconds(2));
-                        _t->async_wait([&, _msg = msg, socket = _socket](const auto& ec){
-                            LOG_INFO << "Writed!!!";
-                            socket->write(msg);
-                        });
-                        _context->run();
-
-//                        _socket->write(msg);
+                        _socket->write(msg);
                     }, 15, [_socket = socket](){LOG_WARNING << "get_shares timeout!"; _socket->disconnect();})), handle_message_version(std::move(_handler))
     {
 
