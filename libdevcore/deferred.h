@@ -180,7 +180,8 @@ namespace c2pool::deferred
             {
                 timeout_timer.async_wait([f = std::move(timeout_func)](const boost::system::error_code &ec)
                                          {
-                                             f();
+                                             if (!ec)
+                                                 f();
                                          });
             }
         }
