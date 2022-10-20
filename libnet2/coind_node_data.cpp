@@ -22,10 +22,10 @@ void CoindNodeData::set_best_share()
 {
 	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
-	best_share = _best;
+	best_share.set(_best);
     LOG_TRACE << "Tracker size:" << tracker->items.size();
     LOG_TRACE << "new best_share:" << best_share.value().GetHex();
-	desired = _desired;
+	desired.set(_desired);
 
 	if (pool_node)
 	{
