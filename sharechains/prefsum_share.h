@@ -378,7 +378,7 @@ namespace shares
                 auto &_items = this->items;
                 return [=, &_items](uint256 &ref_hash) mutable
                 {
-                    if ((cur_it != _items.end()) && (cur_pos != 0))
+                    if ((cur_it != _items.end()) && (cur_pos > 0))
                     {
                         ref_hash = cur_it->second->hash;
                         cur_it = _items.find(*cur_it->second->previous_hash);

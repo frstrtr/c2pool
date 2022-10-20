@@ -13,6 +13,8 @@ namespace c2pool::random
     ///[min, max)
     int RandomInt(int min, int max)
     {
+        if (min == max)
+            return min;
         boost::random::uniform_int_distribution<> rnd(min, max - 1);
         return rnd(generator);
     }

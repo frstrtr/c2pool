@@ -121,20 +121,29 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
                 }
                 bads.push_back(_hash);
             }
-            if (_verified && !last.IsNull())
+            if (!_verified && !last.IsNull())
             {
                 uint32_t desired_timestamp = *items[head]->timestamp;
                 uint256 desired_target = items[head]->target;
 
                 uint256 temp_hash;
-                while (get_chain(head, std::min(head_height, 5))(temp_hash))
+                auto get_chain_f2 = get_chain(head, std::min(head_height, 5));
+                while (get_chain_f2(temp_hash))
                 {
                     desired_timestamp = std::max(desired_timestamp, *items[temp_hash]->timestamp);
                     desired_target = std::min(desired_target, items[temp_hash]->target);
                 }
 
+                std::tuple<std::string, std::string> _peer_addr;
+                if (!sum[last].nexts.empty())
+                {
+                    _peer_addr = c2pool::random::RandomChoice(sum[last].nexts)->second.element->peer_addr;
+                } else {
+                    _peer_addr = sum[last].element->peer_addr;
+                }
+
                 desired.insert({
-                                       c2pool::random::RandomChoice(sum[last].nexts)->second.element->peer_addr,
+                                       _peer_addr,
                                        last,
                                        desired_timestamp,
                                        desired_target
@@ -227,7 +236,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
                     -std::get<0>(should_punish_reason(h->second.element, previous_block, bits, known_txs)),
                     -h->second.element->time_seen
             );
-            decorated_heads.push_back({el, h->first});
+            decorated_heads.emplace_back(el, h->first);
         }
     }
     std::sort(decorated_heads.begin(), decorated_heads.end()); //TODO: test for compare with p2pool
