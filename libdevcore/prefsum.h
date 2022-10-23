@@ -1,10 +1,109 @@
 #pragma once
-#include <deque>
+
+//#include <deque>
 #include <map>
 #include <vector>
 
+#include "events.h"
+
 using namespace std;
 
+template <typename Key, typename Value, typename SubElement>
+class BasePrefsumElement
+{
+public:
+    typedef Key key_type;
+    typedef Value value_type;
+    typedef SubElement sub_element_type;
+    typedef typename std::map<key_type, sub_element_type>::iterator it_element;
+public:
+    it_element prev;
+    std::vector<it_element> next;
+
+    key_type head;
+    key_type tail;
+public:
+    virtual bool is_none() = 0;
+
+//    virtual it_element get_prev() = 0;
+//    virtual std::vector<it_element> get_next() = 0;
+
+    virtual key_type get_head(value_type value) = 0;
+    virtual key_type get_tail(value_type value) = 0;
+
+public:
+    virtual sub_element_type push(sub_element_type sub) = 0;
+
+    BasePrefsumElement()
+    {
+        head = get_head();
+        tail = get_tail();
+    }
+};
+
+template <typename PrefsumElementType>
+class Prefsum
+{
+public:
+    typedef PrefsumElementType element_type;
+    typedef typename element_type::key_type key_type;
+    typedef typename element_type::value_type value_type;
+public:
+    std::map<key_type, value_type> items;
+    std::map<key_type, element_type> sum;
+
+    Event<value_type> added;
+    Event<value_type> removed;
+public:
+    virtual element_type& make_element(value_type value) = 0;
+
+    virtual void add(value_type _value)
+    {
+        // Make PrefsumElement from value_type
+        auto value = make_element(_value);
+
+        if (value.is_none())
+            throw std::invalid_argument("value is none!");
+
+        // Check for exist value in items
+        if (items.find(value) != items.end())
+            throw std::invalid_argument("item already present!");
+
+        // Add value to items
+        items[value.get_head()] = _value;
+
+        // Add value to sum
+        if (value.get_prev() != sum.end())
+        {
+            value.push(value.get_prev()->second);
+            auto &it = sum[value.get_head()];
+            it = std::move(value);
+            it.get_prev()->second.nexts.push_back(sum.find(it.get_head()));
+        } else
+        {
+            sum[value.get_head()] = std::move(value);
+        }
+
+
+
+        // Call event ADDED
+        added(_value);
+    }
+
+    virtual void remove(key_type key)
+    {
+        if (items.find(key) == items.end())
+            throw std::invalid_argument("item not exist!");
+
+        auto item = items[key];
+        items.erase(key);
+
+
+    }
+};
+
+
+/*
 //https://en.wikipedia.org/wiki/Prefix_sum
 template <typename element_type, typename reverse_key>
 class Prefsum
@@ -128,3 +227,4 @@ public:
             return false;
     }
 };
+ */
