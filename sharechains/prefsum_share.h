@@ -17,14 +17,6 @@
 
 namespace shares
 {
-    class fork
-    {
-
-    };
-}
-
-namespace shares
-{
     class element_type
     {
     public:

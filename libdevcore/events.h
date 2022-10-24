@@ -94,7 +94,6 @@ public:
             (*sig_anon)();
         if(!once->empty())
         {
-            LOG_DEBUG << "ONCE CALLED!";
             (*once)(args...);
             once->disconnect_all_slots();
         }

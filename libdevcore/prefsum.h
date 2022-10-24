@@ -25,20 +25,17 @@ public:
 public:
     virtual bool is_none() = 0;
 
+    virtual void set_value(value_type value) = 0;
 //    virtual it_element get_prev() = 0;
 //    virtual std::vector<it_element> get_next() = 0;
 
-    virtual key_type get_head(value_type value) = 0;
-    virtual key_type get_tail(value_type value) = 0;
+//    virtual key_type get_head(value_type value) = 0;
+//    virtual key_type get_tail(value_type value) = 0;
 
 public:
-    virtual sub_element_type push(sub_element_type sub) = 0;
+    virtual sub_element_type& push(sub_element_type sub) = 0;
 
-    BasePrefsumElement()
-    {
-        head = get_head();
-        tail = get_tail();
-    }
+    BasePrefsumElement() {}
 };
 
 template <typename PrefsumElementType>
@@ -55,7 +52,7 @@ public:
     Event<value_type> added;
     Event<value_type> removed;
 public:
-    virtual element_type& make_element(value_type value) = 0;
+    virtual element_type make_element(value_type value) = 0;
 
     virtual void add(value_type _value)
     {
@@ -66,28 +63,28 @@ public:
             throw std::invalid_argument("value is none!");
 
         // Check for exist value in items
-        if (items.find(value) != items.end())
+        if (items.find(value.head) != items.end())
             throw std::invalid_argument("item already present!");
 
         // Add value to items
-        items[value.get_head()] = _value;
+        items[value.head] = _value;
 
         // Add value to sum
-        if (value.get_prev() != sum.end())
+        if (value.prev != sum.end())
         {
-            value.push(value.get_prev()->second);
-            auto &it = sum[value.get_head()];
+            value.push(value.prev->second);
+            auto &it = sum[value.head];
             it = std::move(value);
-            it.get_prev()->second.nexts.push_back(sum.find(it.get_head()));
+            it.prev->second.next.push_back(sum.find(it.head));
         } else
         {
-            sum[value.get_head()] = std::move(value);
+            sum[value.head] = std::move(value);
         }
 
 
 
         // Call event ADDED
-        added(_value);
+        added.happened(_value);
     }
 
     virtual void remove(key_type key)
