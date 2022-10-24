@@ -3,6 +3,7 @@
 //#include <deque>
 #include <map>
 #include <vector>
+#include <set>
 
 #include "events.h"
 
@@ -49,6 +50,11 @@ public:
     std::map<key_type, value_type> items;
     std::map<key_type, element_type> sum;
 
+    //heads[head] -> tail
+    std::map<key_type, key_type> heads;
+    //tails[tail] -> set(head)
+    std::map<key_type, std::set<key_type>> tails;
+
     Event<value_type> added;
     Event<value_type> removed;
 public:
@@ -56,20 +62,20 @@ public:
 
     virtual void add(value_type _value)
     {
-        // Make PrefsumElement from value_type
+        //--Make PrefsumElement from value_type
         auto value = make_element(_value);
 
         if (value.is_none())
             throw std::invalid_argument("value is none!");
 
-        // Check for exist value in items
+        //--Check for exist value in items
         if (items.find(value.head) != items.end())
             throw std::invalid_argument("item already present!");
 
-        // Add value to items
+        //--Add value to items
         items[value.head] = _value;
 
-        // Add value to sum
+        //--Add value to sum
         if (value.prev != sum.end())
         {
             value.push(value.prev->second);
@@ -81,9 +87,42 @@ public:
             sum[value.head] = std::move(value);
         }
 
+        //--update heads and tails
 
+        // проверка на то, что новый элемент не является началом уже существующей части,
+        // т.е. head нового элемента -- tail уже существующего в prefsum.
+        std::set<key_type> _heads;
+        if (tails.find(value.head) != tails.end())
+        {
+            _heads = tails[value.head];
+            tails.erase(value.head);
+        } else
+        {
+            _heads = {value.head};
+        }
 
-        // Call event ADDED
+        // Проверка на то, что новый элемент не является ли продолжением уже существующей части,
+        // т.е. tail нового элемента -- head уже существующего в prefsum.
+        key_type _tail;
+        if (heads.find(value.tail) != heads.end())
+        {
+            _tail = heads[value.tail];
+            heads.erase(value.tail);
+        } else
+        {
+            _tail = get_last(value.tail);
+        }
+
+        tails[_tail] = _heads;
+        if (tails.empty() && (tails[_tail].find(value.tail) != tails[_tail].end()))
+            tails[value.tail].erase(value.tail);
+
+        for (auto _head : _heads)
+        {
+            heads[_head] = _tail;
+        }
+
+        //--Call event ADDED
         added.happened(_value);
     }
 
