@@ -41,16 +41,6 @@ public:
         i += sub.i;
         return *this;
     }
-
-//    key_type get_head(value_type value) override
-//    {
-//        return value.head;
-//    }
-//
-//    key_type get_tail(value_type value) override
-//    {
-//        return value.tail;
-//    }
 };
 
 class TestPrefsum : public Prefsum<TestPrefsumElement>
@@ -62,6 +52,14 @@ public:
         element.prev = sum.find(value.tail);
         return element;
     }
+
+    element_type none_element(key_type value) override
+    {
+        element_type element;
+        element.head = value;
+        element.tail = value;
+        return element;
+    }
 };
 
 
@@ -71,6 +69,7 @@ TEST(Prefsum_test, main_test)
     TestData first{2,1, 100};
     TestData second{3, 2, 200};
     TestData second2{33, 2, 233};
+    TestData second22{44, 33, 67};
 
     TestData first2{10, 9, 900};
 
@@ -78,15 +77,35 @@ TEST(Prefsum_test, main_test)
     prefsum.add(second);
     prefsum.add(second2);
     prefsum.add(first2);
+    prefsum.add(second22);
 
     auto sum3 = prefsum.sum[3];
     std::cout << sum3.i << " " << sum3.head << " " << sum3.tail << std::endl;
 
-    sum3 = prefsum.sum[33];
+    sum3 = prefsum.sum[44];
     std::cout << sum3.i << " " << sum3.head << " " << sum3.tail << std::endl;
 
     auto sum9 = prefsum.sum[9];
     ASSERT_EQ(sum9.i, 0);
     ASSERT_EQ(sum9.head, 0);
     ASSERT_EQ(sum9.tail, 0);
+
+
+    std::cout << "TAILS: " << std::endl;
+    for (auto tails : prefsum.tails)
+    {
+        std::cout << tails.first << ": ";
+        for (auto v2 : tails.second)
+        {
+            std::cout << v2 << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    std::cout << "HEADS: " << std::endl;
+    for (auto head : prefsum.heads)
+    {
+        std::cout << head.first << ":" << head.second << std::endl;
+    }
+    std::cout << std::endl;
 }
