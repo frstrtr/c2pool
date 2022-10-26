@@ -27,11 +27,6 @@ public:
     virtual bool is_none() = 0;
 
     virtual void set_value(value_type value) = 0;
-//    virtual it_element get_prev() = 0;
-//    virtual std::vector<it_element> get_next() = 0;
-
-//    virtual key_type get_head(value_type value) = 0;
-//    virtual key_type get_tail(value_type value) = 0;
 
 public:
     virtual sub_element_type& push(sub_element_type sub) = 0;
@@ -52,6 +47,7 @@ public:
 
     //heads[head] -> tail
     std::map<key_type, key_type> heads;
+
     //tails[tail] -> set(head)
     std::map<key_type, std::set<key_type>> tails;
 
@@ -59,6 +55,7 @@ public:
     Event<value_type> removed;
 public:
     virtual element_type make_element(value_type value) = 0;
+    virtual element_type none_element(key_type value) = 0;
 
     virtual void add(value_type _value)
     {
@@ -95,7 +92,7 @@ public:
         if (tails.find(value.head) != tails.end())
         {
             _heads = tails[value.head];
-            tails.erase(value.head);
+            tails.erase(value.head); // TODO: optimize
         } else
         {
             _heads = {value.head};
@@ -113,7 +110,10 @@ public:
             _tail = get_last(value.tail);
         }
 
-        tails[_tail] = _heads;
+        if (tails.count(_tail))
+            tails[_tail].insert(_heads.begin(), _heads.end());
+        else
+            tails[_tail] = _heads;
         if (tails.empty() && (tails[_tail].find(value.tail) != tails[_tail].end()))
             tails[value.tail].erase(value.tail);
 
@@ -135,6 +135,22 @@ public:
         items.erase(key);
 
 
+    }
+
+    key_type get_last(key_type item)
+    {
+        return get_sum_to_last(item).tail;
+    }
+
+    // get_delta_to_last in p2pool
+    element_type get_sum_to_last(key_type item)
+    {
+        auto result = none_element(item);
+
+        if (items.find(result.tail) != items.end())
+            result = sum[result.tail];
+
+        return result;
     }
 };
 
