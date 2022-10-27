@@ -134,7 +134,13 @@ public:
         auto item = items[key];
         items.erase(key);
 
+        //TODO:
 
+    }
+
+    bool exists(key_type key)
+    {
+        return (items.find(key) != items.end());
     }
 
     key_type get_last(key_type item)
