@@ -63,6 +63,17 @@ public:
 };
 
 
+void print_get_sum_to_last(TestPrefsum &prefsum, TestPrefsum::key_type key)
+{
+    auto v = prefsum.get_sum_to_last(key);
+    std::cout << "TEST get_sum_to_last(" << key << ")\n";
+    std::cout << "get_sum_to_last(" << key << ").i = " << v.i << std::endl;
+    std::cout << "get_sum_to_last(" << key << ").head = " << v.head << std::endl;
+    std::cout << "get_sum_to_last(" << key << ").tail = " << v.tail << std::endl;
+    std::cout << std::endl;
+}
+
+
 TEST(Prefsum_test, main_test)
 {
     TestPrefsum prefsum;
@@ -108,4 +119,16 @@ TEST(Prefsum_test, main_test)
         std::cout << head.first << ":" << head.second << std::endl;
     }
     std::cout << std::endl;
+
+    std::cout << "get_last for " << 44 << " = " << prefsum.get_last(44) << std::endl;
+    std::cout << "get_last for " << 33 << " = " << prefsum.get_last(33) << std::endl;
+    std::cout << "get_last for " << 22 << " = " << prefsum.get_last(22) << std::endl;
+    std::cout << "get_last for " << 10 << " = " << prefsum.get_last(10) << std::endl;
+    std::cout << std::endl;
+
+    print_get_sum_to_last(prefsum, 44);
+    print_get_sum_to_last(prefsum, 33);
+    print_get_sum_to_last(prefsum, 22);
+    print_get_sum_to_last(prefsum, 10);
+    print_get_sum_to_last(prefsum, 3);
 }
