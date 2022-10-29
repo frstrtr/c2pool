@@ -21,15 +21,26 @@ public:
     it_element prev;
     std::vector<it_element> next;
 
+    int32_t height;
     key_type head;
     key_type tail;
 public:
     virtual bool is_none() = 0;
 
     virtual void set_value(value_type value) = 0;
-
+protected:
+    virtual sub_element_type& _push(const sub_element_type &sub) = 0;
 public:
-    virtual sub_element_type& push(sub_element_type sub) = 0;
+    virtual sub_element_type& push(const sub_element_type &sub)
+    {
+        if (tail != sub.head)
+            throw std::invalid_argument("tail != sub.head");
+
+        tail = sub.tail;
+        height += sub.height;
+
+        return _push(sub);
+    }
 
     BasePrefsumElement() {}
 };
@@ -53,9 +64,27 @@ public:
 
     Event<value_type> added;
     Event<value_type> removed;
+protected:
+    virtual element_type& _make_element(element_type& element, const value_type &value) = 0;
+    virtual element_type& _none_element(element_type& element, const key_type& key) = 0;
+
 public:
-    virtual element_type make_element(value_type value) = 0;
-    virtual element_type none_element(key_type value) = 0;
+    virtual element_type make_element(value_type value)
+    {
+        element_type element {value};
+        element.prev = sum.find(element.tail);
+        element.height = 1;
+
+        return _make_element(element, value);
+    }
+
+    virtual element_type none_element(key_type key)
+    {
+        element_type element;
+        element.height = 0;
+
+        return _none_element(element, key);
+    }
 
     virtual void add(value_type _value)
     {
@@ -158,6 +187,12 @@ public:
 
         return result;
     }
+
+//    std::tuple<int32_t, key_type> get_height_and_last(key_type item)
+//    {
+//        auto _sum = get_sum_to_last(item);
+//        return {_sum };
+//    }
 };
 
 
