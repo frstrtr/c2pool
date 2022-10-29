@@ -14,6 +14,12 @@ struct TestData
 
 class TestPrefsumElement : public BasePrefsumElement<int, TestData, TestPrefsumElement>
 {
+protected:
+    TestPrefsumElement& _push(const TestPrefsumElement &sub) override
+    {
+        i += sub.i;
+        return *this;
+    }
 public:
     int i;
 
@@ -31,33 +37,20 @@ public:
         tail = value.tail;
         i = value.value;
     }
-
-    TestPrefsumElement& push(TestPrefsumElement sub) override
-    {
-        if (tail != sub.head)
-            throw std::invalid_argument("tail != sub.head");
-
-        tail = sub.tail;
-        i += sub.i;
-        return *this;
-    }
 };
 
 class TestPrefsum : public Prefsum<TestPrefsumElement>
 {
 public:
-    element_type make_element(value_type value) override
+    element_type& _make_element(element_type& element, const value_type &value) override
     {
-        element_type element {value};
-        element.prev = sum.find(value.tail);
         return element;
     }
 
-    element_type none_element(key_type value) override
+    element_type& _none_element(element_type& element, const key_type& key) override
     {
-        element_type element;
-        element.head = value;
-        element.tail = value;
+        element.head = key;
+        element.tail = key;
         return element;
     }
 };
@@ -70,6 +63,7 @@ void print_get_sum_to_last(TestPrefsum &prefsum, TestPrefsum::key_type key)
     std::cout << "get_sum_to_last(" << key << ").i = " << v.i << std::endl;
     std::cout << "get_sum_to_last(" << key << ").head = " << v.head << std::endl;
     std::cout << "get_sum_to_last(" << key << ").tail = " << v.tail << std::endl;
+    std::cout << "get_sum_to_last(" << key << ").height = " << v.height << std::endl;
     std::cout << std::endl;
 }
 
@@ -131,4 +125,5 @@ TEST(Prefsum_test, main_test)
     print_get_sum_to_last(prefsum, 22);
     print_get_sum_to_last(prefsum, 10);
     print_get_sum_to_last(prefsum, 3);
+
 }
