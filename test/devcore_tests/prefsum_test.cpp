@@ -67,6 +67,12 @@ void print_get_sum_to_last(TestPrefsum &prefsum, TestPrefsum::key_type key)
     std::cout << std::endl;
 }
 
+void print_get_height_and_last(TestPrefsum &prefsum, TestPrefsum::key_type key)
+{
+    auto [height, last] = prefsum.get_height_and_last(key);
+    std::cout << "TEST get_height_and_last(" << key << ")\n";
+    std::cout << "height = " << height << ", last = " << last << "\n\n";
+}
 
 TEST(Prefsum_test, main_test)
 {
@@ -125,5 +131,11 @@ TEST(Prefsum_test, main_test)
     print_get_sum_to_last(prefsum, 22);
     print_get_sum_to_last(prefsum, 10);
     print_get_sum_to_last(prefsum, 3);
+
+    print_get_height_and_last(prefsum, 44);
+    print_get_height_and_last(prefsum, 33);
+    print_get_height_and_last(prefsum, 22);
+    print_get_height_and_last(prefsum, 10);
+    print_get_height_and_last(prefsum, 3);
 
 }

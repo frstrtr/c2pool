@@ -188,11 +188,11 @@ public:
         return result;
     }
 
-//    std::tuple<int32_t, key_type> get_height_and_last(key_type item)
-//    {
-//        auto _sum = get_sum_to_last(item);
-//        return {_sum };
-//    }
+    std::tuple<int32_t, key_type> get_height_and_last(key_type item)
+    {
+        auto _sum = get_sum_to_last(item);
+        return {_sum.height, _sum.tail};
+    }
 };
 
 
