@@ -202,13 +202,6 @@ public:
     key_type get_nth_parent_key(key_type key, int32_t n)
     {
         auto it = sum.find(key);
-
-        std::cout << it->second.prev->first << std::endl;
-        auto teest_it = sum.find(100);
-        if (teest_it == sum.end()){
-            std::cout << teest_it->first << " " << (teest_it == sum.end()) << std::endl;
-        }
-
         key_type result = key;
         int32_t dist = 0;
 
@@ -230,7 +223,6 @@ public:
 
         if (dist != n)
             throw std::invalid_argument("dist != n");
-        std::cout << it->second.tail << " " << result << " " << dist << std::endl;
 
         return result;
     }
