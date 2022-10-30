@@ -138,4 +138,10 @@ TEST(Prefsum_test, main_test)
     print_get_height_and_last(prefsum, 10);
     print_get_height_and_last(prefsum, 3);
 
+//    ASSERT_TRUE(prefsum.is_child_of(1, 44));
+//    ASSERT_TRUE(prefsum.is_child_of(44, 1));
+//    ASSERT_TRUE(prefsum.is_child_of(1, 3));
+//    ASSERT_TRUE(prefsum.is_child_of(22, 1));
+//    ASSERT_TRUE(prefsum.is_child_of(44, 33));
+    ASSERT_TRUE(prefsum.is_child_of(1, 44));
 }
