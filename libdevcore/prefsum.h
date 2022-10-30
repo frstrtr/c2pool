@@ -172,6 +172,11 @@ public:
         return (items.find(key) != items.end());
     }
 
+    int32_t get_height(key_type item)
+    {
+        return get_sum_to_last(item).height;
+    }
+
     key_type get_last(key_type item)
     {
         return get_sum_to_last(item).tail;
@@ -192,6 +197,55 @@ public:
     {
         auto _sum = get_sum_to_last(item);
         return {_sum.height, _sum.tail};
+    }
+
+    key_type get_nth_parent_key(key_type key, int32_t n)
+    {
+        auto it = sum.find(key);
+
+        std::cout << it->second.prev->first << std::endl;
+        auto teest_it = sum.find(100);
+        if (teest_it == sum.end()){
+            std::cout << teest_it->first << " " << (teest_it == sum.end()) << std::endl;
+        }
+
+        key_type result = key;
+        int32_t dist = 0;
+
+        while((dist < n) && (it != sum.end()))
+        {
+            dist++;
+            if (it->second.prev != sum.end())
+            {
+                it = it->second.prev;
+                result = it->first;
+            } else
+            {
+                result = it->second.tail;
+                it = it->second.prev;
+            }
+        }
+//        if (it == sum.end())
+//            throw std::invalid_argument("get_nth_parent_key n < len_chain");
+
+        if (dist != n)
+            throw std::invalid_argument("dist != n");
+        std::cout << it->second.tail << " " << result << " " << dist << std::endl;
+
+        return result;
+    }
+
+    // last------item------child---best->
+    bool is_child_of(key_type item, key_type possible_child)
+    {
+        auto [height, last] = get_height_and_last(item);
+        auto [child_height, child_last] = get_height_and_last(possible_child);
+
+        if (last != child_last)
+            return false;
+
+        auto height_up = child_height - height;
+        return height_up != 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 };
 
