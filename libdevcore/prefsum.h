@@ -30,6 +30,7 @@ public:
     virtual void set_value(value_type value) = 0;
 protected:
     virtual sub_element_type& _push(const sub_element_type &sub) = 0;
+    virtual sub_element_type& _erase(const sub_element_type &sub) = 0;
 public:
     virtual sub_element_type& push(const sub_element_type &sub)
     {
@@ -40,6 +41,26 @@ public:
         height += sub.height;
 
         return _push(sub);
+    }
+
+    virtual sub_element_type& erase(const sub_element_type &sub)
+    {
+        std::cout << head << " " << tail << std::endl;
+        std::cout << sub.head << " " << sub.tail << std::endl;
+        if (head == sub.head)
+        {
+            head = sub.tail;
+            next = sub.next;
+        } else if (tail == sub.tail)
+        {
+            tail = sub.head;
+            prev = sub.prev;
+        } else
+        {
+            throw std::invalid_argument("incorrect sub element in erase()!");
+        }
+        height -= sub.height;
+        return _erase(sub);
     }
 
     BasePrefsumElement() {}
@@ -238,6 +259,17 @@ public:
 
         auto height_up = child_height - height;
         return height_up != 0 && get_nth_parent_key(possible_child, height_up) == item;
+    }
+
+    // last------[ancestor------item]--->best
+    element_type get_sum(key_type item, key_type ancestor)
+    {
+        if (!is_child_of(ancestor, item))
+            throw std::invalid_argument("get_sum item not child for ancestor");
+
+        auto result = get_sum_to_last(item);
+        auto ances = get_sum_to_last(ancestor);
+        return result.erase(ances);
     }
 };
 
