@@ -20,6 +20,12 @@ protected:
         i += sub.i;
         return *this;
     }
+
+    TestPrefsumElement& _erase(const TestPrefsumElement &sub) override
+    {
+        i -= sub.i;
+        return *this;
+    }
 public:
     int i;
 
@@ -55,6 +61,10 @@ public:
     }
 };
 
+void print_element(TestPrefsum::element_type &element)
+{
+    std::cout << element.i << " " << element.height << " " << element.head << " " << element.tail << std::endl;
+}
 
 void print_get_sum_to_last(TestPrefsum &prefsum, TestPrefsum::key_type key)
 {
@@ -144,5 +154,34 @@ TEST(Prefsum_test, main_test)
     ASSERT_TRUE(prefsum.is_child_of(1, 3));
     ASSERT_FALSE(prefsum.is_child_of(22, 1));
     ASSERT_FALSE(prefsum.is_child_of(1, 22));
+
+    // TEST for get_sum
+    // for (33->44]
+    {
+        auto get_sum_res = prefsum.get_sum(44, 33);
+        print_element(get_sum_res);
+        ASSERT_EQ(get_sum_res.i, 67);
+        ASSERT_EQ(get_sum_res.height, 1);
+        ASSERT_EQ(get_sum_res.head, 44);
+        ASSERT_EQ(get_sum_res.tail, 33);
+    }
+    // for (2->44]
+    {
+        auto get_sum_res = prefsum.get_sum(44, 2);
+        print_element(get_sum_res);
+        ASSERT_EQ(get_sum_res.i, 300);
+        ASSERT_EQ(get_sum_res.height, 2);
+        ASSERT_EQ(get_sum_res.head, 44);
+        ASSERT_EQ(get_sum_res.tail, 2);
+        {
+            // test for erase#1
+            auto erase_res = prefsum.get_sum_to_last(44).erase(get_sum_res);
+            print_element(erase_res);
+            ASSERT_EQ(erase_res.i, 100);
+            ASSERT_EQ(erase_res.height, 1);
+            ASSERT_EQ(erase_res.head, 2);
+            ASSERT_EQ(erase_res.tail, 1);
+        }
+    }
 
 }
