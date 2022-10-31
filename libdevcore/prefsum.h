@@ -271,6 +271,35 @@ public:
         auto ances = get_sum_to_last(ancestor);
         return result.erase(ances);
     }
+
+    std::function<bool(value_type &ref_hash)> get_chain(key_type key, int32_t n)
+    {
+        if (n > get_height(key))
+        {
+            throw std::invalid_argument("n > height for this key in get_chain!");
+        }
+        return [&, this]()
+        {
+            auto cur_it = sum.find(key);
+            auto cur_pos = n; //exclusive 0
+            auto &_items = this->items;
+            auto &_sum = this->sum;
+
+            return [=, &_items, &_sum](value_type &value) mutable
+            {
+                if ((cur_it != _sum.end()) && (cur_pos > 0))
+                {
+                    value = _items[cur_it->first];
+                    cur_it = cur_it->second.prev;
+                    cur_pos -= 1;
+                    return true;
+                } else
+                {
+                    return false;
+                }
+            };
+        }();
+    }
 };
 
 
