@@ -184,4 +184,16 @@ TEST(Prefsum_test, main_test)
         }
     }
 
+
+    // TEST get_chain
+    {
+        auto get_chain_f = prefsum.get_chain(44, 3);
+        TestPrefsum::value_type chain_v;
+        std::cout << "CHAIN#1: " << std::endl;
+        while (get_chain_f(chain_v))
+        {
+            std::cout << chain_v.head << " " << chain_v.tail << " " << chain_v.value << std::endl;
+        }
+    }
+
 }
