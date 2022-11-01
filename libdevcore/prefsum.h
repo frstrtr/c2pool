@@ -272,7 +272,7 @@ public:
         return result.erase(ances);
     }
 
-    std::function<bool(value_type &ref_hash)> get_chain(key_type key, int32_t n)
+    std::function<bool(key_type&)> get_chain(key_type key, int32_t n)
     {
         if (n > get_height(key))
         {
@@ -282,14 +282,13 @@ public:
         {
             auto cur_it = sum.find(key);
             auto cur_pos = n; //exclusive 0
-            auto &_items = this->items;
             auto &_sum = this->sum;
 
-            return [=, &_items, &_sum](value_type &value) mutable
+            return [=, &_sum](key_type &ref_key) mutable
             {
                 if ((cur_it != _sum.end()) && (cur_pos > 0))
                 {
-                    value = _items[cur_it->first];
+                    ref_key = cur_it->first;
                     cur_it = cur_it->second.prev;
                     cur_pos -= 1;
                     return true;
