@@ -17,7 +17,9 @@ public:
     typedef Value value_type;
     typedef SubElement sub_element_type;
     typedef typename std::map<key_type, sub_element_type>::iterator it_element;
+    typedef typename std::map<key_type, value_type>::iterator it_value;
 public:
+    it_value pvalue;
     it_element prev;
     std::vector<it_element> next;
 
@@ -28,6 +30,11 @@ public:
     virtual bool is_none() = 0;
 
     virtual void set_value(value_type value) = 0;
+    // return head value
+    virtual value_type get_value()
+    {
+        return pvalue->second;
+    }
 protected:
     virtual sub_element_type& _push(const sub_element_type &sub) = 0;
     virtual sub_element_type& _erase(const sub_element_type &sub) = 0;
@@ -63,6 +70,8 @@ public:
         return _erase(sub);
     }
 
+
+
     BasePrefsumElement() {}
 };
 
@@ -93,6 +102,7 @@ public:
     virtual element_type make_element(value_type value)
     {
         element_type element {value};
+        element.pvalue = items.end();
         element.prev = sum.find(element.tail);
         element.height = 1;
 
@@ -102,6 +112,7 @@ public:
     virtual element_type none_element(key_type key)
     {
         element_type element;
+        element.pvalue = items.end();
         element.height = 0;
 
         return _none_element(element, key);
@@ -121,6 +132,7 @@ public:
 
         //--Add value to items
         items[value.head] = _value;
+        value.pvalue = items.find(value.head);
 
         //--Add value to sum
         if (value.prev != sum.end())

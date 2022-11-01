@@ -192,9 +192,8 @@ TEST(Prefsum_test, main_test)
         std::cout << "\nCHAIN#1: " << std::endl;
         while (get_chain_f(chain_k))
         {
-            auto chain_v = prefsum.items[chain_k];
+            auto chain_v = prefsum.sum[chain_k].get_value();
             std::cout << chain_v.head << " " << chain_v.tail << " " << chain_v.value << std::endl;
         }
     }
-
 }
