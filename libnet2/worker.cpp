@@ -715,7 +715,7 @@ stale_counts Worker::get_stale_counts()
 
     auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales.value();
 
-    auto delta = _tracker->get_delta_to_last(_coind_node->best_share.value()).doa;
+    auto delta = _tracker->get_sum_to_last(_coind_node->best_share.value()).doa;
     auto my_shares_in_chain = delta.my_count + _removed_unstales;
     auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales.value();
     auto orphans_recorded_in_chain = delta.my_orphan_announce_count + _removed_unstales_orphans;

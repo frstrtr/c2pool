@@ -234,8 +234,8 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
             auto el = std::make_tuple(
                     verified.get_work(
                             verified.get_nth_parent_key(h->first, std::min(5, verified.get_height(h->first)))),
-                    -std::get<0>(should_punish_reason(h->second.element, previous_block, bits, known_txs)),
-                    -h->second.element->time_seen
+                    -std::get<0>(should_punish_reason(h->second.get_value(), previous_block, bits, known_txs)),
+                    -h->second.get_value()->time_seen
             );
             decorated_heads.emplace_back(el, h->first);
         }
@@ -286,8 +286,8 @@ arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 {
 	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
-    auto far = get(SharePrefsum2::get_nth_parent_hash(previous_share_hash,dist - 1));
-	auto attempts_delta = SharePrefsum2::get_delta(previous_share_hash, far->hash);
+    auto far = get(SharePrefsum2::get_nth_parent_key(previous_share_hash,dist - 1));
+	auto attempts_delta = SharePrefsum2::get_sum(previous_share_hash, far->hash);
 
 	auto time = *near->timestamp - *far->timestamp;
 	if (time <= 0)
