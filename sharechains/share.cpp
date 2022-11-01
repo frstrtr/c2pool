@@ -130,7 +130,7 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
         {
             //tracker.get_nth_parent_hash(previous_share.hash, self.net.CHAIN_LENGTH*9//10), self.net.CHAIN_LENGTH//10
             counts = _tracker->get_desired_version_counts(
-                    _tracker->get_nth_parent_hash(previous_share->hash, net->CHAIN_LENGTH * 9 / 10),
+                    _tracker->get_nth_parent_key(previous_share->hash, net->CHAIN_LENGTH * 9 / 10),
                     net->CHAIN_LENGTH / 10);
 
             //TODO: python check for version

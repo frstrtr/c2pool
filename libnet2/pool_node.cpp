@@ -709,13 +709,22 @@ void PoolNode::download_shares()
             std::vector<ShareType> shares;
 //            try
 //            {
-                //TODO: init stops like in p2pool (best hashes for all forks!):
-//            stops=list(set(self.node.tracker.heads) | set(
-//                    self.node.tracker.get_nth_parent_hash(head, min(max(0, self.node.tracker.get_height_and_last(head)[0] - 1), 10)) for head in self.node.tracker.heads
-//            ))[:100]
                 std::vector<uint256> stops;
-                stops.push_back(tracker->get_best());
-                //tracker->
+                {
+                    std::set<uint256> _stops;
+                    for (auto s : tracker->heads)
+                    {
+                        _stops.insert(s.first);
+                    }
+
+                    for (auto s : tracker->heads)
+                    {
+                        uint256 stop_hash = tracker->get_nth_parent_key(s.first, std::min(std::max(0, std::get<0>(tracker->get_height_and_last(s.first)) - 1), 10));
+                        _stops.insert(stop_hash);
+                    }
+                    stops = vector<uint256>{_stops.begin(), _stops.end()};
+                }
+
                 shares = peer->get_shares.yield(fiber,
                                                      std::vector<uint256>{share_hash},
                                                      (uint64_t)c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
