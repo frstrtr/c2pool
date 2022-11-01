@@ -11,8 +11,23 @@ namespace shares
 {
     class SharePrefsumElement : public BasePrefsumElement<uint256, ShareType, SharePrefsumElement>
     {
+    protected:
+        SharePrefsumElement &_push(const SharePrefsumElement &sub) override
+        {
+            work += sub.work;
+            weight += sub.weight;
+            doa += sub.doa;
+            return *this;
+        }
+
+        SharePrefsumElement &_erase(const SharePrefsumElement &sub) override
+        {
+            work -= sub.work;
+            weight -= sub.weight;
+            doa -= sub.doa;
+            return *this;
+        }
     public:
-        int32_t height;
         arith_uint256 work;
         arith_uint256 min_work;
         weight::weight_element_type weight;
@@ -37,41 +52,23 @@ namespace shares
 
             work = coind::data::target_to_average_attempts(value->target);
             min_work = coind::data::target_to_average_attempts(value->max_target);
-            height = 1;
             weight = weight::weight_element_type(value);
             doa = doa_element_type(value);
-        }
-
-        SharePrefsumElement &push(SharePrefsumElement sub) override
-        {
-            if (tail != sub.head)
-                throw std::invalid_argument("tail != sub.head");
-
-            tail = sub.tail;
-
-            work += sub.work;
-            height += sub.height;
-            weight += sub.weight;
-            doa += sub.doa;
-            return *this;
         }
     };
 
     class SharePrefsum2 : public Prefsum<SharePrefsumElement>
     {
     public:
-        element_type make_element(value_type value) override
+        element_type& _make_element(element_type& element, const value_type &value) override
         {
-            element_type element {value};
-            element.prev = sum.find(*value->previous_hash);
             return element;
         }
 
-        element_type none_element(key_type value) override
+        element_type& _none_element(element_type& element, const key_type& key) override
         {
-            element_type element;
-            element.head = value;
-            element.tail = value;
+            element.head = key;
+            element.tail = key;
             return element;
         }
 
@@ -81,4 +78,20 @@ namespace shares
             return ArithToUint256(get_sum_to_last(hash).work);
         }
     };
+
+    class VerifiedSharePrefsum2 : public SharePrefsum2
+    {
+    protected:
+        SharePrefsum2 &_prefsum_share;
+
+    public:
+        VerifiedSharePrefsum2(SharePrefsum2 &prefsum_share) : SharePrefsum2(), _prefsum_share(prefsum_share)
+        {
+        }
+
+        key_type get_nth_parent_key(key_type key, int32_t n) override
+        {
+            return _prefsum_share.get_nth_parent_key(key, n);
+        }
+    }
 }
