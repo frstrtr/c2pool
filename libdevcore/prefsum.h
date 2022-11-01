@@ -220,7 +220,7 @@ public:
         return {_sum.height, _sum.tail};
     }
 
-    key_type get_nth_parent_key(key_type key, int32_t n)
+    virtual key_type get_nth_parent_key(key_type key, int32_t n)
     {
         auto it = sum.find(key);
         key_type result = key;
