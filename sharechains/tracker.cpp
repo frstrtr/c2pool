@@ -27,7 +27,7 @@ using std::shared_ptr;
 
 #include <boost/format.hpp>
 
-ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : PrefsumShare(), verified(*this), net(_net), parent_net(_net->parent)
+ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), verified(*this), net(_net), parent_net(_net->parent)
 {
 
 }
@@ -36,7 +36,7 @@ ShareType ShareTracker::get(uint256 hash)
 {
 	try
 	{
-		auto share = PrefsumShare::items.at(hash);
+		auto share = SharePrefsum2::items.at(hash);
 		return share;
 	}
 	catch (const std::out_of_range &e)
@@ -54,9 +54,9 @@ void ShareTracker::add(ShareType share)
 		return;
 	}
 
-	if (!PrefsumShare::exists(share->hash))
+	if (!SharePrefsum2::exists(share->hash))
 	{
-        PrefsumShare::add(share);
+        SharePrefsum2::add(share);
 	} else
 	{
 		LOG_WARNING << share->hash.ToString() << " item already present";
@@ -135,11 +135,12 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
                 }
 
                 std::tuple<std::string, std::string> _peer_addr;
-                if (!sum[last].nexts.empty())
+                if (!sum[last].next.empty())
                 {
-                    _peer_addr = c2pool::random::RandomChoice(sum[last].nexts)->second.element->peer_addr;
+                    auto peer_addr_hash = c2pool::random::RandomChoice(sum[last].next)->first;
+                    _peer_addr = items[peer_addr_hash]->peer_addr;
                 } else {
-                    _peer_addr = sum[last].element->peer_addr;
+                    _peer_addr = items[last]->peer_addr;
                 }
 
                 desired.insert({
@@ -198,7 +199,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
             }
 
             desired.insert({
-                                   c2pool::random::RandomChoice(verified.sum[last_hash].nexts)->second.element->peer_addr,
+                                   items[c2pool::random::RandomChoice(verified.sum[last_hash].next)->first]->peer_addr,
                                    last_last_hash,
                                    desired_timestamp,
                                    desired_target
@@ -210,7 +211,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     std::vector<std::tuple<std::tuple<int32_t, uint256>, uint256>> decorated_tails;
     for (auto tail_hash : verified.sum)
     {
-        auto max_el = std::max_element(tail_hash.second.nexts.begin(), tail_hash.second.nexts.end(),
+        auto max_el = std::max_element(tail_hash.second.next.begin(), tail_hash.second.next.end(),
                          [&](const std::map<uint256, element_type>::iterator &a, const std::map<uint256, element_type>::iterator &b)
                          {
                             return verified.get_work(a->first) < verified.get_work(b->first);
@@ -228,11 +229,11 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     // TODO: +0 element
     if (verified.sum.find(best_tail) != verified.sum.end())
     {
-        for (auto h: verified.sum[best_tail].nexts)
+        for (auto h: verified.sum[best_tail].next)
         {
             auto el = std::make_tuple(
                     verified.get_work(
-                            verified.get_nth_parent_hash(h->first, std::min(5, verified.get_height(h->first)))),
+                            verified.get_nth_parent_key(h->first, std::min(5, verified.get_height(h->first)))),
                     -std::get<0>(should_punish_reason(h->second.element, previous_block, bits, known_txs)),
                     -h->second.element->time_seen
             );
@@ -285,8 +286,8 @@ arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 {
 	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
-    auto far = get(PrefsumShare::get_nth_parent_hash(previous_share_hash,dist - 1));
-	auto attempts_delta = PrefsumShare::get_delta(previous_share_hash, far->hash);
+    auto far = get(SharePrefsum2::get_nth_parent_hash(previous_share_hash,dist - 1));
+	auto attempts_delta = SharePrefsum2::get_delta(previous_share_hash, far->hash);
 
 	auto time = *near->timestamp - *far->timestamp;
 	if (time <= 0)

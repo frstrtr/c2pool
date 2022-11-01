@@ -11,7 +11,7 @@ using namespace std;
 #include "univalue.h"
 #include "share.h"
 #include "share_adapters.h"
-#include "prefsum_share.h"
+#include "prefsum_share2.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libcoind/data.h>
@@ -49,10 +49,10 @@ struct TrackerThinkResult
 	std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
 };
 
-class ShareTracker : public PrefsumShare, public enable_shared_from_this<ShareTracker>
+class ShareTracker : public SharePrefsum2, public enable_shared_from_this<ShareTracker>
 {
 public:
-	PrefsumVerifiedShare verified;
+    VerifiedSharePrefsum2 verified;
     Event<ShareType> removed;
 public:
 	shared_ptr<c2pool::Network> net;
@@ -81,7 +81,7 @@ public:
 			return std::make_tuple(head_height, score_res);
 		}
 
-		auto end_point = verified.get_nth_parent_hash(share_hash, net->CHAIN_LENGTH * 15 / 16);
+		auto end_point = verified.get_nth_parent_key(share_hash, net->CHAIN_LENGTH * 15 / 16);
 
 		std::optional<int32_t> block_height;
 		auto gen_verif_chain = verified.get_chain(end_point, net->CHAIN_LENGTH / 16);
@@ -104,7 +104,7 @@ public:
 			}
 		}
 
-		score_res = ArithToUint256(verified.get_delta(share_hash, end_point).work /
+		score_res = ArithToUint256(verified.get_sum(share_hash, end_point).work /
 								   ((-block_height.value() + 1) * parent_net->BLOCK_PERIOD));
 		return std::make_tuple(net->CHAIN_LENGTH, score_res);
 	}
@@ -139,7 +139,7 @@ public:
 	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint256 desired_weight)
 	{
 		// [last; best]
-		auto best = get_delta_to_last(start);
+		auto best = get_sum_to_last(start);
 		auto p = best.weight.total_weight - desired_weight;
 
 
@@ -156,21 +156,21 @@ public:
 			it = it->second.prev;
 		}
 
-		element_delta_type i;
+		element_type i;
 		if (it != sum.end())
 		{
 			if (it->second.weight.total_weight < p)
 			{
-				element_delta_type x;
+				element_type x;
 				if (it->second.prev != sum.end())
 				{
-					x = get_delta(it->first, it->second.prev->first);
+					x = get_sum(it->first, it->second.prev->first);
 				} else
 				{
-					x = get_delta_to_last(it->first);
+					x = get_sum_to_last(it->first);
 				}
 
-				auto cur = get_delta(start, it->first);
+				auto cur = get_sum(start, it->first);
 				auto script = x.weight.weights->amount.first;
 				// - new_weights = {script: (desired_weight - total_weight1)//65535*weights2[script]//(total_weight2//65535)}
 				auto new_weight = (desired_weight - cur.weight.total_weight)/65535*x.weight.weights->amount.second/(cur.weight.weights->amount.second/65535);
@@ -185,7 +185,7 @@ public:
 			} else
 			{
 				// (it; best]
-				i = get_delta(best.head, it->first);
+				i = get_sum(best.head, it->first);
 			}
 		}
 		else

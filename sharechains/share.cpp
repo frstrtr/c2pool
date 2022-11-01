@@ -153,7 +153,7 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
         auto share_count = std::get<0>(v);
         auto tx_count = std::get<1>(v);
 
-        other_tx_hashes.push_back(_tracker->get(_tracker->get_nth_parent_hash(hash,
+        other_tx_hashes.push_back(_tracker->get(_tracker->get_nth_parent_key(hash,
                                                                               share_count))->share_info->get()->new_transaction_hashes[tx_count]);
     }
 

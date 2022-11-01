@@ -469,7 +469,7 @@ namespace shares
             if (last.IsNull() && height < 99)
                 far_share_hash.SetNull();
             else
-                far_share_hash = tracker->get_nth_parent_hash(_share_data.previous_share_hash, 99);
+                far_share_hash = tracker->get_nth_parent_key(_share_data.previous_share_hash, 99);
 
             uint32_t timestamp;
 

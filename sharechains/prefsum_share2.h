@@ -93,5 +93,5 @@ namespace shares
         {
             return _prefsum_share.get_nth_parent_key(key, n);
         }
-    }
+    };
 }
