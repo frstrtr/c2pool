@@ -82,9 +82,11 @@ public:
     typedef PrefsumElementType element_type;
     typedef typename element_type::key_type key_type;
     typedef typename element_type::value_type value_type;
+    typedef typename std::map<key_type, value_type>::iterator it_items;
 public:
     std::map<key_type, value_type> items;
     std::map<key_type, element_type> sum;
+    std::map<key_type, std::vector<it_items>> reverse;
 
     //heads[head] -> tail
     std::map<key_type, key_type> heads;
@@ -133,6 +135,9 @@ public:
         //--Add value to items
         items[value.head] = _value;
         value.pvalue = items.find(value.head);
+
+        //--Add to reverse
+        reverse[value.tail].push_back(items.find(value.head));
 
         //--Add value to sum
         if (value.prev != sum.end())
