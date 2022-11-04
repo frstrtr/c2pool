@@ -84,6 +84,16 @@ void print_get_height_and_last(TestPrefsum &prefsum, TestPrefsum::key_type key)
     std::cout << "height = " << height << ", last = " << last << "\n\n";
 }
 
+std::vector<int> test_reverse(TestPrefsum &prefsum, TestPrefsum::key_type key_tail)
+{
+    std::vector<TestPrefsum::key_type> res;
+    for (auto v : prefsum.reverse[key_tail])
+    {
+        res.push_back(v->first);
+    }
+    return res;
+}
+
 TEST(Prefsum_test, main_test)
 {
     TestPrefsum prefsum;
@@ -91,7 +101,7 @@ TEST(Prefsum_test, main_test)
     TestData second{3, 2, 200};
     TestData second2{33, 2, 233};
     TestData second22{44, 33, 67};
-
+    // 2->33->44; 2->3; 9<-10
     TestData first2{10, 9, 900};
 
     prefsum.add(first);
@@ -195,5 +205,24 @@ TEST(Prefsum_test, main_test)
             auto chain_v = prefsum.sum[chain_k].get_value();
             std::cout << chain_v.head << " " << chain_v.tail << " " << chain_v.value << std::endl;
         }
+    }
+
+    // TEST reverse
+    using List = std::vector<int>;
+    {
+        List comp{2};
+        ASSERT_EQ(test_reverse(prefsum, 1), comp);
+    }
+    {
+        List comp{3,33};
+        ASSERT_EQ(test_reverse(prefsum, 2), comp);
+    }
+    {
+        List comp{44};
+        ASSERT_EQ(test_reverse(prefsum, 33), comp);
+    }
+    {
+        List comp{10};
+        ASSERT_EQ(test_reverse(prefsum, 9), comp);
     }
 }
