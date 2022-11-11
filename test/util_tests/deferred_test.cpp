@@ -144,3 +144,32 @@ TEST(Deferred, FiberDeffered)
 
     context->run();
 }
+
+class TestClass{
+    int i;
+    std::shared_ptr<boost::asio::io_context> context;
+public:
+    TestClass(std::shared_ptr<boost::asio::io_context> _context) : context(std::move(_context)) {};
+    TestClass(int _i, std::shared_ptr<boost::asio::io_context> _context) : i(_i), context(std::move(_context)) {};
+
+    void run(){
+        Fiber::run(context, [&](std::shared_ptr<Fiber> fiber)
+        {
+            value = test_deferred_method(context)->yield(fiber);
+
+            using namespace std::chrono_literals;
+            fiber->sleep(2s);
+
+            std::cout << "After sleep 2 seconds" << std::endl;
+        });
+    }
+};
+
+TEST(Deferred, FiberDeffered)
+{
+    auto context = std::make_shared<boost::asio::io_context>(1);
+
+    int value = 0;
+
+
+}
