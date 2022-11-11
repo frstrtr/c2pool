@@ -135,16 +135,19 @@ public:
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient
+class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, public enable_shared_from_this<PoolNode>
 {
 private:
     uint64_t nonce; // node_id
+
+    std::shared_ptr<c2pool::deferred::Fiber> _download_shares_fiber;
 public:
 	PoolNode(std::shared_ptr<io::io_context> _context)
 			: PoolNodeData(std::move(_context)),
               PoolNodeServer(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2)),
               PoolNodeClient(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2))
 	{
+        LOG_INFO << "PoolNode created!";
 		SET_POOL_DEFAULT_HANDLER(addrs);
 		SET_POOL_DEFAULT_HANDLER(addrme);
 		SET_POOL_DEFAULT_HANDLER(ping);
@@ -158,6 +161,7 @@ public:
 		SET_POOL_DEFAULT_HANDLER(remember_tx);
 		SET_POOL_DEFAULT_HANDLER(forget_tx);
 
+        nonce = c2pool::random::randomNonce();
 //		handler_manager->new_handler<pool::messages::message_addrs>("addrs", [&](auto msg, auto proto){ handle_message_addrs(msg, proto); });
 //		SET_POOL_DEFAULT_HANDLER()
 	}
