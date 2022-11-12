@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <libdevcore/deferred.h>
+#include <libdevcore/events.h>
 using namespace c2pool::deferred;
 
 #ifdef DefAlgo
@@ -146,16 +147,27 @@ TEST(Deferred, FiberDeffered)
 }
 
 class TestClass{
-    int i;
+
     std::shared_ptr<boost::asio::io_context> context;
 public:
+    int i;
+    Variable<int> var;
+
     TestClass(std::shared_ptr<boost::asio::io_context> _context) : context(std::move(_context)) {};
     TestClass(int _i, std::shared_ptr<boost::asio::io_context> _context) : i(_i), context(std::move(_context)) {};
 
     void run(){
-        Fiber::run(context, [&](std::shared_ptr<Fiber> fiber)
+        Fiber::run(context, [&, _i = &i](std::shared_ptr<Fiber> fiber)
         {
-            value = test_deferred_method(context)->yield(fiber);
+            auto &____i = _i;
+            std::cout << "i:" <<  *____i << std::endl;
+            auto des = var.get_when_satisfies([&](const auto &__i){
+                return __i != 0;
+            })->yield(fiber);
+            std::cout << "i:" <<  *____i << std::endl;
+            std::cout << des << std::endl;
+
+//            value = test_deferred_method(context)->yield(fiber);
 
             using namespace std::chrono_literals;
             fiber->sleep(2s);
@@ -165,11 +177,34 @@ public:
     }
 };
 
-TEST(Deferred, FiberDeffered)
+TEST(Deferred, FiberDefferedWithVariable)
 {
     auto context = std::make_shared<boost::asio::io_context>(1);
-
     int value = 0;
 
+    std::shared_ptr<TestClass> tc = std::make_shared<TestClass>(10, context);
 
+    tc->run();
+
+    boost::asio::steady_timer t1(*context, std::chrono::seconds(1));
+    t1.async_wait([&](const auto &ec){
+//        tc->i += 1;
+        tc->var.set(10);
+//        std::cout << "First check value == 0" << std::endl;
+//        ASSERT_EQ(value, 0);
+    });
+
+//    boost::asio::steady_timer t2(*context, std::chrono::seconds(4));
+//    t2.async_wait([&](const auto &ec){
+//        std::cout << "Second check value == 1337" << std::endl;
+//        ASSERT_EQ(value, 1337);
+//    });
+//
+//    boost::asio::steady_timer t3(*context, std::chrono::seconds(6));
+//    t3.async_wait([&](const auto &ec){
+//        std::cout << "Timer3 after sleep!" << std::endl;
+//        ASSERT_EQ(value, 1337);
+//    });
+
+    context->run();
 }
