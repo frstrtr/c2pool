@@ -72,7 +72,7 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 {
 	if (shares.size() > 5)
 	{
-		LOG_INFO << "Processing " << shares.size() << "shares from " << std::get<0>(addr) << ":" << std::get<1>(addr) << "...";
+		LOG_INFO << "Processing " << shares.size() << " shares from " << std::get<0>(addr) << ":" << std::get<1>(addr) << "...";
 	}
 
 	int32_t new_count = 0;
@@ -93,8 +93,8 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 
 		if (tracker->exists(share->hash))
 		{
-//			#print 'Got duplicate share, ignoring. Hash: %s' % (p2pool_data.format_hash(share.hash),)
-//			continue
+            LOG_WARNING << "Got duplicate share, ignoring. Hash: " << share->hash.ToString();
+			continue;
 		}
 
 		new_count++;
@@ -110,7 +110,7 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 
 	if (shares.size() > 5)
 	{
-		LOG_INFO << "... done processing " << shares.size() << "shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
+		LOG_INFO << "... done processing " << shares.size() << " shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
 	}
 }
 

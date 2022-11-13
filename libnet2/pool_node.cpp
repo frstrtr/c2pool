@@ -685,9 +685,9 @@ void PoolNode::start()
 void PoolNode::download_shares()
 {
     std::cout << "===============================" <<  this << " " << (this == nullptr) << " " << this->nonce << std::endl;
-    auto __node = shared_from_this();
-    _download_shares_fiber = c2pool::deferred::Fiber::run(context, [_node = std::move(__node)](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
+    _download_shares_fiber = c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
     {
+        auto _node = shared_from_this();
         LOG_DEBUG << "Start download_shares!";
         while (true)
         {
