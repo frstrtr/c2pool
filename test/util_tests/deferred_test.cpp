@@ -146,7 +146,7 @@ TEST(Deferred, FiberDeffered)
     context->run();
 }
 
-class TestClass{
+class TestClass : public std::enable_shared_from_this<TestClass> {
 
     std::shared_ptr<boost::asio::io_context> context;
 public:
@@ -159,13 +159,18 @@ public:
     void run(){
         Fiber::run(context, [&, _i = &i](std::shared_ptr<Fiber> fiber)
         {
+            auto ddd = shared_from_this();
+            int h = 123;
             auto &____i = _i;
             std::cout << "i:" <<  *____i << std::endl;
+            std::cout << "i(this):" <<  ddd->i << std::endl;
             auto des = var.get_when_satisfies([&](const auto &__i){
                 return __i != 0;
             })->yield(fiber);
             std::cout << "i:" <<  *____i << std::endl;
             std::cout << des << std::endl;
+            std::cout << h << std::endl;
+            std::cout << "i(this):" <<  ddd->i << std::endl;
 
 //            value = test_deferred_method(context)->yield(fiber);
 
