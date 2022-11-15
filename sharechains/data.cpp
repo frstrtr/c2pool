@@ -114,11 +114,10 @@ namespace shares
     {
         //t0
 		ShareType previous_share = tracker->get(_share_data.previous_share_hash);
+        uint256 prev_share_hash = previous_share ? previous_share->hash : uint256::ZERO;
 
 		//height, last
-		auto get_height_and_last = tracker->get_height_and_last(_share_data.previous_share_hash);
-		auto height = std::get<0>(get_height_and_last);
-		auto last = std::get<1>(get_height_and_last);
+		auto [height, last] = tracker->get_height_and_last(_share_data.previous_share_hash);
         assert((height >= net->REAL_CHAIN_LENGTH) || last.IsNull());
 
 		arith_uint256 _pre_target3;
@@ -169,7 +168,7 @@ namespace shares
 
 		//t1
 
-		auto past_shares_generator = tracker->get_chain(previous_share->hash, std::min(height, 100));
+		auto past_shares_generator = tracker->get_chain(prev_share_hash, std::min(height, 100));
 		map<uint256, tuple<int, int>> tx_hash_to_this;
 
 		{
