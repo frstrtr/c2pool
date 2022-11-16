@@ -102,6 +102,10 @@ namespace shares
     GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
     {
         share_info = std::move(_share_info);
+        gentx = std::move(_gentx);
+        other_transaction_hashes = _other_transaction_hashes;
+        get_share = std::move(_get_share);
+
     }
 
     GenerateShareTransaction::GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker) : tracker(_tracker), net(_tracker->net)
