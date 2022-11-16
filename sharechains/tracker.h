@@ -193,14 +193,20 @@ public:
 			i = best;
 		}
 
-		assert((i.height <= max_shares) && (i.weight.total_weight <= desired_weight));
-		assert((i.height == max_shares) || (i.weight.total_weight == desired_weight));
+        if (!i.is_none())
+        {
+            assert((i.height <= max_shares) && (i.weight.total_weight <= desired_weight));
+            assert((i.height == max_shares) || (i.weight.total_weight == desired_weight));
 
-		auto weights = i.weight.weights->get_map();
-		auto total_weight = i.weight.total_weight;
-		auto donation_weight = i.weight.total_donation_weight;
+            auto weights = i.weight.weights->get_map();
+            auto total_weight = i.weight.total_weight;
+            auto donation_weight = i.weight.total_donation_weight;
 
-		return std::make_tuple(weights, total_weight, donation_weight);
+            return std::make_tuple(weights, total_weight, donation_weight);
+        } else
+        {
+            return {{}, 0, 0};
+        }
 	}
 
     // from p2pool::share
