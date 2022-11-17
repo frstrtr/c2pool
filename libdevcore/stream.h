@@ -584,3 +584,13 @@ std::vector<unsigned char> pack(T value)
     stream << stream_value;
     return stream.data;
 }
+
+template <typename StreamType>
+typename StreamType::get_type unpack(std::vector<unsigned char> data)
+{
+    PackStream stream(data);
+
+    StreamType stream_value;
+    stream >> stream_value;
+    return stream_value.get();
+}
