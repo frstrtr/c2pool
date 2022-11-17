@@ -2,6 +2,7 @@
 
 #include <libdevcore/random.h>
 #include <libdevcore/common.h>
+#include <libdevcore/stream.h>
 
 #include <utility>
 
@@ -14,6 +15,9 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
                                                       }));
 
     server.Add("mining.authorize", GetHandle(&Stratum::mining_authorize, *this));
+
+    server.Add("mining.submit", GetHandle(&Stratum::mining_submit, *this));
+
     std::cout << "Added methods to server" << std::endl;
 }
 
@@ -21,16 +25,16 @@ void Stratum::_send_work()
 {
     worker_get_work_result get_work_result;
 
-    try
-    {
+//    try
+//    {
         auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
         get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
-    } catch (const std::exception &ec)
-    {
-        LOG_ERROR << "Stratum disconnect " << ec.what();
-        disconnect();
-        return;
-    }
+//    } catch (const std::exception &ec)
+//    {
+//        LOG_ERROR << "Stratum disconnect " << ec.what();
+//        disconnect();
+//        return;
+//    }
 
     auto &[x, got_response] = get_work_result;
 
@@ -61,6 +65,7 @@ void Stratum::_send_work()
 json Stratum::mining_subscribe(const json &_params)
 {
     std::vector<std::string> params = _params.get<std::vector<std::string>>();
+    std::cout << (_params.find("id") != _params.end()) << std::endl;
     auto miner_info = params[0];
     LOG_DEBUG << "mining.subscribe called: " << miner_info;// << " " << _params.get<std::string>() << std::endl;
     LOG_DEBUG << "params:";
@@ -84,7 +89,7 @@ json Stratum::mining_subscribe(const json &_params)
     return res;
 }
 
-json Stratum::mining_authorize(const std::string &_username, const std::string &_password)
+json Stratum::mining_authorize(const std::string &_username, const std::string &_password, const std::string &_id)
 {
     username = _username;
     std::cout << "Auth with [username: " << _username << ", password: " << _password << "]." << std::endl;
@@ -150,3 +155,38 @@ json Stratum::mining_notify(std::string jobid, std::string prevhash, std::string
     client.CallNotification("mining.notify", notify_data);
     std::cout << "called mining.notify" << std::endl;
 }
+
+json Stratum::mining_submit(const std::string &_worker_name, const std::string &_jobid, const std::string &_extranonce2, const std::string &_ntime, const std::string &_nonce, const std::string &_id)
+{
+//    json res = {false};
+
+    if (!handler_map.exist(_jobid))
+    {
+        LOG_WARNING << "Couldn't link returned work's job id with its handler. This should only happen if this process was recently restarted!";
+        return {false};
+    }
+
+    auto map_obj = handler_map.get(_jobid);
+    auto x = map_obj.value().ba;
+    auto coinb_nonce = ParseHex(_extranonce2);
+    assert(coinb_nonce.size() == _worker->COINBASE_NONCE_LENGTH);
+
+    std::vector<unsigned char> new_packed_gentx {x.coinb1.begin(), x.coinb1.end()};
+    new_packed_gentx.insert(new_packed_gentx.end(), coinb_nonce.begin(), coinb_nonce.end());
+    new_packed_gentx.insert(new_packed_gentx.end(), x.coinb2.begin(), x.coinb2.end());
+
+    uint32_t _timestamp = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_ntime)));
+    uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
+    auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), x.merkle_link);
+
+    coind::data::types::BlockHeaderType header(x.version, x.previous_block, _timestamp, x.bits, nonce, merkle_root);
+
+    // IN P2Pool -- coinb_nonce = bytes, c2pool -- IntType64
+    return map_obj->get_response(header, _worker_name, unpack<IntType(64)>(coinb_nonce));
+
+
+
+//    return {true};
+}
+
+

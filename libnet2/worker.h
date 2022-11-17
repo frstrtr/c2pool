@@ -98,6 +98,7 @@ struct user_details
 
 class Worker
 {
+public:
 	const int32_t COINBASE_NONCE_LENGTH = 8;
 public:
     Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNode> pool_node,

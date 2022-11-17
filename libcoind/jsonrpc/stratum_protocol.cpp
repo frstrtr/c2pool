@@ -22,8 +22,9 @@ void StratumProtocol::read()
             std::cout << "Message data: " << data << std::endl;
             json request = json::parse(data);
             request["jsonrpc"] = "2.0";
+            std::cout << "request: " << request.dump() << std::endl;
             auto response = server.HandleRequest(request.dump());
-            std::cout << response << std::endl;
+            std::cout << "response: " << response << std::endl;
             buffer.consume(len);
             read();
             Send(response);

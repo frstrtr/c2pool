@@ -27,7 +27,8 @@ public:
 public:
     // Server:
     json mining_subscribe(const json & _params);
-    json mining_authorize(const std::string &_username, const std::string &_password);
+    json mining_authorize(const std::string &_username, const std::string &_password, const std::string &_id);
+    json mining_submit(const std::string &_worker_name, const std::string &_jobid, const std::string &_extranonce2, const std::string &_ntime, const std::string &_nonce, const std::string &_id);
 
 public:
     // Client:
