@@ -29,8 +29,13 @@ public:
     std::optional<Value> get(Key key)
     {
         if (values.count(key))
-            return {values[key]};
+            return {std::get<0>(values.at(key))};
         else
             return std::nullopt;
+    }
+
+    bool exist(Key key) const
+    {
+        return values.count(key);
     }
 };
