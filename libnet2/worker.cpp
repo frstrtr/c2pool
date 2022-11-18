@@ -403,10 +403,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     auto lp_count = new_work.get_times();
 
     coind::data::MerkleLink merkle_link;
-    if (gen_sharetx_res->share_info->segwit_data.has_value())
+    if (!gen_sharetx_res->share_info->segwit_data.has_value())
     {
         std::vector<uint256> _copy_for_link{uint256()};
-        _copy_for_link.insert(_copy_for_link.begin(), gen_sharetx_res->other_transaction_hashes.begin(),
+        _copy_for_link.insert(_copy_for_link.end(), gen_sharetx_res->other_transaction_hashes.begin(),
                               gen_sharetx_res->other_transaction_hashes.end());
 
         merkle_link = coind::data::calculate_merkle_link(_copy_for_link, 0);
@@ -522,8 +522,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 auto user_detail = get_user_details(user);
 
                 assert(header.previous_block == ba.previous_block);
-                assert(header.merkle_root ==
-                       coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), merkle_link));
+                auto check_merkle_link1 = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), merkle_link);
+                auto check_merkle_link2 = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), merkle_link);
+                assert(header.merkle_root == check_merkle_link1);
                 assert(header.bits == ba.bits);
 
                 bool on_time = new_work.get_times() == lp_count;
