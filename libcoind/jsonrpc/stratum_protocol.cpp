@@ -12,13 +12,13 @@ StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> contex
 
 void StratumProtocol::read()
 {
-    boost::asio::async_read_until(*_socket, buffer, "}\n", [&](const boost::system::error_code& ec, std::size_t len)
+    boost::asio::async_read_until(*_socket, buffer, "\n", [&](const boost::system::error_code& ec, std::size_t len)
     {
         if (buffer.size() == 0)
             return;
         if (!ec)
         {
-            std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), buffer.size());
+            std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), len);
             std::cout << "Message data: " << data << std::endl;
             json request = json::parse(data);
             request["jsonrpc"] = "2.0";
@@ -38,7 +38,7 @@ void StratumProtocol::read()
 std::string StratumProtocol::Send(const std::string &request)
 {
     auto _req = request + "\n";
-    std::cout << "SEND DATA: " << _req << std::endl;
+    std::cout << "SEND DATA: " << _req;
     boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
         if (!ec)
         {
