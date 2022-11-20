@@ -483,7 +483,7 @@ namespace c2pool::libnet
                     auto user_detail = get_user_details(user);
 
                     assert(header.previous_block == ba.previous_block);
-                    assert(header.merkle_root == coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), merkle_link));
+                    assert(header.merkle_root == coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), merkle_link));
                     assert(header.bits == ba.bits);
 
                     bool on_time = new_work.get_times() == lp_count;

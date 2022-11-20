@@ -177,9 +177,22 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
 
     uint32_t _timestamp = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_ntime)));
     uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
-    auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), x.merkle_link);
+    auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), x.merkle_link);
 
     coind::data::types::BlockHeaderType header(x.version, x.previous_block, _timestamp, x.bits, nonce, merkle_root);
+
+    //DEBUG
+    std::cout << "coinb1: " << HexStr(x.coinb1) << std::endl;
+    std::cout << "coinb_nonce: " << HexStr(coinb_nonce) << std::endl;
+    std::cout << "coinb2: " << HexStr(x.coinb2) << std::endl;
+    std::cout << "merkle_link: " << x.merkle_link.index << " ";
+    for (auto br : x.merkle_link.branch)
+    {
+        std::cout << br.GetHex() << " ";
+    }
+    std::cout << ".\n";
+    std::cout << "merkle_root: <" << merkle_root.ToString() << ">" << std::endl;
+    //########
 
     // IN P2Pool -- coinb_nonce = bytes, c2pool -- IntType64
     return map_obj->get_response(header, _worker_name, unpack<IntType(64)>(coinb_nonce));
