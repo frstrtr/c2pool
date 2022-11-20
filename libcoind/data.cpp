@@ -264,7 +264,6 @@ namespace coind::data
         return MerkleLink(res_branch, index);
 	}
 
-    //TODO: test
     uint256 check_merkle_link(uint256 tip_hash, coind::data::MerkleLink link)
     {
 

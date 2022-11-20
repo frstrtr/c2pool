@@ -454,23 +454,32 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 auto t0 = c2pool::dev::timestamp();
 
                 PackStream new_packed_gentx;
+                if (coinbase_nonce.value != 0)
                 {
-                    new_packed_gentx
-                            << std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - 12);
-
-                    PackStream temp;
-                    temp << coinbase_nonce;
-                    if (all_of(temp.data.begin(), temp.data.end(), [](unsigned char v)
-                    { return v == '\0'; }))
-                    {
-                        temp << std::vector<unsigned char>(packed_gentx.data.end() - 4, packed_gentx.data.end());
-                    } else
-                    {
-                        temp << packed_gentx;
-                    }
-
-                    new_packed_gentx << temp;
+                    new_packed_gentx.data.insert(new_packed_gentx.data.end(), packed_gentx.data.begin(), packed_gentx.data.begin() + COINBASE_NONCE_LENGTH-4);
+                    new_packed_gentx << coinbase_nonce;
+                    new_packed_gentx.data.insert(new_packed_gentx.data.end(), packed_gentx.data.end()-4, packed_gentx.data.end());
+                } else
+                {
+                    new_packed_gentx << packed_gentx;
                 }
+//                {
+//                    new_packed_gentx
+//                            << std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - 12);
+//
+//                    PackStream temp;
+//                    temp << coinbase_nonce;
+//                    if (all_of(temp.data.begin(), temp.data.end(), [](unsigned char v)
+//                    { return v == '\0'; }))
+//                    {
+//                        temp << std::vector<unsigned char>(packed_gentx.data.end() - 4, packed_gentx.data.end());
+//                    } else
+//                    {
+//                        temp << packed_gentx;
+//                    }
+//
+//                    new_packed_gentx << temp;
+//                }
 
                 coind::data::tx_type new_gentx;
                 {
@@ -523,7 +532,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                 assert(header.previous_block == ba.previous_block);
                 auto check_merkle_link1 = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), merkle_link);
-                auto check_merkle_link2 = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx), merkle_link);
+                std::cout << "check_merkle_link1: " << check_merkle_link1.ToString() << std::endl;
+                std::cout << "new_packed_gentx: " << HexStr(new_packed_gentx.data) << std::endl;
                 assert(header.merkle_root == check_merkle_link1);
                 assert(header.bits == ba.bits);
 
