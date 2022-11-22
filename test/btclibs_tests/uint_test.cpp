@@ -148,3 +148,21 @@ TEST(Btclibs, UINT256_SERIALIZE_BYTES)
     }
     cout << endl;
 }
+
+TEST(Btclibs, UINT256_TO_UINT64)
+{
+    auto first = UintToArith256(uint256S("10000000000000000"));
+    auto first64 = first.GetLow64();
+    std::cout << first64 << std::endl;
+    ASSERT_EQ(0, first64);
+
+    auto second = UintToArith256(uint256S("ffffffffffffffff"));
+    auto second64 = second.GetLow64();
+    std::cout << second64 << std::endl;
+    ASSERT_EQ(18446744073709551615, second64);
+
+    auto third = UintToArith256(uint256S("100000000fffffffe"));
+    auto third64 = third.GetLow64();
+    std::cout << third64 << std::endl;
+    ASSERT_EQ(4294967294, third64);
+}
