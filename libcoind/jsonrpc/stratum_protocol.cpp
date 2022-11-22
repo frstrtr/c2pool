@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <string>
+#include <libdevcore/logger.h>
 
 
 StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event) : _context(std::move(context)), _socket(std::move(socket)), client(*this, version::v2), disconnect_event(std::move(_disconnect_event)),
@@ -19,8 +20,16 @@ void StratumProtocol::read()
         if (!ec)
         {
             std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), len);
-            std::cout << "Message data: " << data << std::endl;
-            json request = json::parse(data);
+            std::cout << "Message data: <" << data << ">." << std::endl;
+
+            json request;
+            try
+            {
+                request = json::parse(data);
+            } catch (const std::exception &exception)
+            {
+                LOG_WARNING << "StratumProtocol::read error while parsing: " << exception.what();
+            }
             request["jsonrpc"] = "2.0";
             std::cout << "request: " << request.dump() << std::endl;
             auto response = server.HandleRequest(request.dump());
