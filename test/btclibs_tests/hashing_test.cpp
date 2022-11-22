@@ -165,13 +165,13 @@ TEST(CSHA256TEST, custom_sha256_changed_init_test)
     ASSERT_EQ(result.GetHex(), "23de2ce70e77d80ba1c110071462e90e96710fd0b0ee3faa81b1d04b7fb58535");
 }
 
-TEST(CSHA256TEST, custom_sha256_changed_init_buf_len_test)
-{
-    uint256 result;
-    uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12};
-    CSHA256(_init, (unsigned char*)"1234567890", 80/8).Write((unsigned char*)"123456789", 9).Finalize(result.begin());
-    reverse(result.begin(), result.end());
-    std::cout << result.GetHex() << std::endl;
-    ASSERT_EQ(result.GetHex(), "7c3c79a815ce2b9b7d0e6e7a0f3ec415903ca435ef0a9f55cdd7bad317f8f225");
-}
+//TEST(CSHA256TEST, custom_sha256_changed_init_buf_len_test)
+//{
+//    uint256 result;
+//    uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12};
+//    CSHA256(_init, (unsigned char*)"1234567890", 80/8).Write((unsigned char*)"123456789", 9).Finalize(result.begin());
+//    reverse(result.begin(), result.end());
+//    std::cout << result.GetHex() << std::endl;
+//    ASSERT_EQ(result.GetHex(), "7c3c79a815ce2b9b7d0e6e7a0f3ec415903ca435ef0a9f55cdd7bad317f8f225");
+//}
 #undef print_decode_data
