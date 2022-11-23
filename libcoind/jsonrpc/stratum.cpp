@@ -163,7 +163,7 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
     if (!handler_map.exist(_jobid))
     {
         LOG_WARNING << "Couldn't link returned work's job id with its handler. This should only happen if this process was recently restarted!";
-        return {false};
+        return false;
     }
 
     auto map_obj = handler_map.get(_jobid);
