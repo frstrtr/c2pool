@@ -456,13 +456,15 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 PackStream new_packed_gentx;
                 if (coinbase_nonce.value != 0)
                 {
-                    new_packed_gentx.data.insert(new_packed_gentx.data.end(), packed_gentx.data.begin(), packed_gentx.data.begin() + COINBASE_NONCE_LENGTH-4);
+                    new_packed_gentx.data.insert(new_packed_gentx.data.end(), packed_gentx.data.begin(), packed_gentx.data.end() - COINBASE_NONCE_LENGTH-4);
                     new_packed_gentx << coinbase_nonce;
                     new_packed_gentx.data.insert(new_packed_gentx.data.end(), packed_gentx.data.end()-4, packed_gentx.data.end());
                 } else
                 {
                     new_packed_gentx << packed_gentx;
                 }
+                std::cout << "new_packed_gentx(before new_gentx): " << HexStr(new_packed_gentx.data) << std::endl;
+                std::cout << "packed_gentx: " << HexStr(packed_gentx.data) << std::endl;
 //                {
 //                    new_packed_gentx
 //                            << std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - 12);
