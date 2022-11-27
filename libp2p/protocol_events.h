@@ -19,7 +19,6 @@ protected:
     void stop() { stopped = true; }
 };
 
-// TODO: автоматическая отправка сообщения message_ping, раз в заданное время.
 class ProtocolPinger : virtual ProtocolEvents
 {
 private:

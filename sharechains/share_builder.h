@@ -240,7 +240,6 @@ public:
 	ShareType make_share(uint64_t version, const addr_type &addr, PackStream& stream)
 	{
 		builder->create(version, addr);
-		//TODO: test header->share_info->ref_merkle->
 		builder->min_header(stream)
 				->share_data(stream)
 				->share_info(stream)

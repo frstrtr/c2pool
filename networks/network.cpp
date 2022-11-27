@@ -11,8 +11,7 @@ namespace c2pool
 
     Network::Network(std::string name, std::shared_ptr<coind::ParentNetwork> _parent) : net_name(name), parent(_parent)
     {
-        //TODO
-        //LOG_INFO << "Created Network Config.";
+        LOG_INFO << "Created Network [" << name << "].";
     }
 
 } // namespace c2pool::config

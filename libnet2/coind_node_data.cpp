@@ -46,7 +46,6 @@ void CoindNodeData::set_best_share()
 void CoindNodeData::clean_tracker()
 {
 	// TODO?: Подумать, нужно ли это или очистка шар будет проходить по нашему алгоритму?
-//TODO:
 	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
 	// if (decorated_heads.size() > 0)
@@ -75,8 +74,7 @@ void CoindNodeData::clean_tracker()
 	//                 skip_flag = true;
 	//             }
 
-	//             //TODO:
-	//             //if max(self.tracker.items[after_tail_hash].time_seen for after_tail_hash in self.tracker.reverse.get(tail)) > time.time() - 120: # XXX stupid
+    //             //if max(self.tracker.items[after_tail_hash].time_seen for after_tail_hash in self.tracker.reverse.get(tail)) > time.time() - 120: # XXX stupid
 	//             //  continue
 
 	//             if (!skip_flag)

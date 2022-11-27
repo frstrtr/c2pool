@@ -30,8 +30,8 @@ public:
     int32_t height;
     int32_t timestamp;
     vector<coind::data::tx_type> transactions;
-    vector<int32_t> transaction_fees; //TODO
-    coind::data::MerkleLink merkle_link; //TODO
+    vector<int32_t> transaction_fees;
+    coind::data::MerkleLink merkle_link;
     uint64_t subsidy;
     int32_t last_update;
 

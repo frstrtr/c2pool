@@ -30,14 +30,6 @@ protected:
 		socket->write(msg);
 	}
 
-//TODO: REMOVE?
-//private:
-//	void _get_shares(uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
-//	{
-//		auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
-//		socket->write(msg);
-//	}
-
 public:
     PoolHandshake(auto socket, std::function<void(std::shared_ptr<PoolHandshake>,
                                                   std::shared_ptr<pool::messages::message_version>)> _handler)

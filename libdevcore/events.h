@@ -111,7 +111,6 @@ public:
 };
 
 
-//TODO: remove shared_ptr for Events?
 template<typename VarType>
 class Variable
 {

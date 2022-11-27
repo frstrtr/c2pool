@@ -624,7 +624,6 @@ struct FloatingInteger : public Getter<IntType(32)>
     }
 };
 
-//TODO: test
 struct FloatingIntegerType : public CustomGetter<typename FloatingInteger::get_type>
 {
     FloatingInteger bits;
