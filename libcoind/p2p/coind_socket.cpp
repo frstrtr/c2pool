@@ -161,7 +161,14 @@ void CoindSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 void CoindSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 {
 	//checksum check
-	//TODO: !!!
+    auto checksum_hash = coind::data::hash256(PackStream(msg->payload, msg->unpacked_len), true);
+    if (!c2pool::dev::compare_str(checksum_hash.data(), msg->checksum, 4))
+    {
+        auto [ip, port] = get_addr();
+        LOG_WARNING << "Invalid hash for " << ip << ":" << port << ", command = " << msg->command;
+        disconnect(); //TODO: badPeerHappened
+        return;
+    }
 
 	//Make raw message
 	PackStream stream_RawMsg;
