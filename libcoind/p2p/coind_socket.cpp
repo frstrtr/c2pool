@@ -1,6 +1,7 @@
 #include "coind_socket.h"
 
 #include <libp2p/preset/p2p_socket_data.h>
+#include <libdevcore/str.h>
 
 #include <boost/asio.hpp>
 
@@ -50,14 +51,16 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
 							[this, msg](boost::system::error_code ec, std::size_t length)
 							{
-//								LOG_TRACE << "try to read prefix";
-								//TODO: compare
-								if (!ec /*&& c2pool::dev::compare_str(tempRawMessage->converter->prefix, _net->PREFIX, tempRawMessage->converter->get_prefix_len())*/)
+//                              LOG_TRACE << "COMPARE PREFIX: " << c2pool::dev::compare_str(msg->prefix, net->PREFIX, length);
+								if (!ec)
 								{
-//									LOG_TRACE << "compare prefix";
-									//c2pool::python::other::debug_log(tempRawMessage->converter->prefix, _net->PREFIX_LENGTH);
-									// LOG_INFO << "MSG: " << tempMessage->command;
-									read_command(msg);
+                                    if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
+                                    {
+                                        read_command(msg);
+                                    } else {
+                                        LOG_WARNING << "prefix doesn't match";
+                                        disconnect();
+                                    }
 								}
 								else
 								{
