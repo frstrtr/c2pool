@@ -163,15 +163,12 @@ void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 {
 	//checksum check
 	auto checksum_hash = coind::data::hash256(PackStream(msg->payload, msg->unpacked_len), true);
+    if (!c2pool::dev::compare_str(checksum_hash.data(), msg->checksum, 4))
     {
-        auto checksum_c = checksum_hash.data();
-        vector<unsigned char> checksum{checksum_c, checksum_c+4};
-        vector<unsigned char> checksum_from_msg{msg->checksum, msg->checksum+4};
-        if (c2pool::dev::compare_str(checksum_c, msg->checksum, 4)){
-            LOG_INFO << "COMPARE CHECKSUM!";
-        } else {
-            throw runtime_error("checksum error");
-        }
+        auto [ip, port] = get_addr();
+        LOG_WARNING << "Invalid hash for " << ip << ":" << port << ", command = " << msg->command;
+        disconnect(); //TODO: badPeerHappened
+        return;
     }
 
 	//Make raw message
