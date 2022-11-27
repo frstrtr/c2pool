@@ -38,7 +38,6 @@ void Stratum::_send_work()
 
     auto &[x, got_response] = get_work_result;
 
-    //TODO: test
     auto jobid = HexStr(c2pool::random::random_bytes(16)); // random_bytes(16) = random(2**128)
     mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* _worker->_net->parent->DUMB_SCRYPT_DIFF);
 
@@ -99,7 +98,6 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
     return json({true});
 }
 
-// TODO: test
 json Stratum::mining_set_difficulty(difficulty_type difficulty)
 {
 //    std::string diff_data = "{" + difficulty.ToString() + "}";

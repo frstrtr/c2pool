@@ -125,7 +125,7 @@ public:
 
 											  (*connector)(std::bind(&PoolNodeClient::socket_handle, this, std::placeholders::_1), addr);
 										  }
-						//TODO:				  auto_connect();
+                                          auto_connect();
 									  });
 	}
 
@@ -189,12 +189,10 @@ public:
 	// Pool handlers
     void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    //TODO: test:
     void handle_message_addrme(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<PoolProtocol> protocol);
 
     void handle_message_ping(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<PoolProtocol> protocol);
 
-    //TODO: TEST
     void handle_message_getaddrs(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<PoolProtocol> protocol);
 
     void handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol);

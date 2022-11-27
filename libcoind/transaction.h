@@ -341,7 +341,7 @@ namespace coind::data::stream
 
             if (marker.value == 0)
             {
-                WTXType next; //TODO: bug here
+                WTXType next;
                 stream >> next;
 
                 vector<WitnessType> _witness;
