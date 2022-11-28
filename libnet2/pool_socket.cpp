@@ -52,7 +52,7 @@ void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
 							[this, msg](boost::system::error_code ec, std::size_t length)
 							{
-                                LOG_TRACE << "COMPARE PREFIX: " << c2pool::dev::compare_str(msg->prefix, net->PREFIX, length);
+//                                LOG_TRACE << "COMPARE PREFIX: " << c2pool::dev::compare_str(msg->prefix, net->PREFIX, length);
                                 if (!ec)
                                 {
                                     if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
