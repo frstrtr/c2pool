@@ -1,14 +1,8 @@
 #include "node_manager.h"
 
-#include <boost/asio.hpp>
+#include <memory>
 
-#include <libnet2/pool_node.h>
-#include <libnet2/coind_node.h>
-#include <libnet/worker.h>
-#include <libcoind/jsonrpc/jsonrpc_coind.h>
-#include <libcoind/jsonrpc/stratum.h>
-#include <sharechains/tracker.h>
-#include <sharechains/share_store.h>
+#include <boost/asio.hpp>
 
 using boost::asio::ip::tcp;
 using namespace shares::types;
@@ -19,6 +13,71 @@ NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<coind:
                                                                        _config(_cfg)
 {
 }
+
+void NodeManager::run()
+{
+    LOG_INFO << "Making asio io_context in NodeManager...";
+    _context = std::make_shared<boost::asio::io_context>(0);
+
+    // AddrStore
+    _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _net);
+    // TODO: Bootstrap_addrs
+    // TODO: Parse CLI args for addrs
+    // TODO: Save addrs every 60 seconds
+    //    timer in _addr_store constructor
+
+    // JSONRPC Coind
+    LOG_INFO << "Init Coind...";
+    _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, coind_ip, coind_port, coind_login);
+
+    // Determining payout address
+    // TODO
+
+    // Share Store
+    // LOG_INFO << "ShareStore initialization...";
+    // TODO: _share_store = std::make_shared<ShareStore>("dgb");
+
+    // Share Tracker
+    _tracker = std::make_shared<ShareTracker>(_net);
+    //TODO: Save shares every 60 seconds
+    // timer in _tracker constructor
+
+    // Pool Node
+    _pool_node = std::make_shared<PoolNode>(_context);
+    _pool_node
+            ->set_net(_net)
+            ->set_config(_config)
+            ->set_addr_store(_addr_store)
+            ->set_tracker(_tracker);
+
+    // CoindNode
+    _coind_node = std::make_shared<CoindNode>(_context);
+
+    _coind_node
+            ->set_parent_net(_parent_net)
+            ->set_coind(_coind)
+            ->set_tracker(_tracker)
+            ->set_pool_node(_pool_node);
+
+    _pool_node->set_coind_node(_coind_node);
+
+    _coind_node->run<CoindConnector<CoindSocket>>();
+    _pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
+
+    // Worker
+    _worker = std::make_shared<Worker>(_net, _pool_node, _coind_node, _tracker);
+
+    // Stratum
+    _stratum = std::make_shared<StratumNode>(_context, _worker);
+    _stratum->listen();
+
+    // TODO: WebRoot
+
+    //...success!
+    _is_loaded = true;
+    _context->run();
+}
+
 
 void NodeManager::run()
 {
@@ -167,7 +226,9 @@ create_set_method(CoindNode, _coind_node);
 create_set_method(ShareTracker, _tracker);
 
 create_set_method(ShareStore, _share_store);
-//TODO: create_set_method(Worker, _worker);
+
+create_set_method(Worker, _worker);
+
 create_set_method(coind::jsonrpc::StratumNode, _stratum);
 
 #undef create_set_method

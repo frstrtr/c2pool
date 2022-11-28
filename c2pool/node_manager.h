@@ -1,26 +1,17 @@
 #pragma once
 
-#include <memory>
+#include <libnet2/worker.h>
+#include <libnet2/coind_node.h>
+#include <libnet2/pool_node.h>
+#include <libnet2/pool_socket.h>
 #include <networks/network.h>
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>
-#include <boost/asio/io_context.hpp>
-
-using std::shared_ptr;
-class ShareTracker;
-class ShareStore;
-class P2PNode;
-class CoindNode;
-//TODO: class Worker;
-
-namespace coind
-{
-    class JSONRPC_Coind;
-    namespace jsonrpc
-    {
-        class StratumNode;
-    }
-}
+#include <libp2p/preset/p2p_node_interface.h>
+#include <libp2p/node.h>
+#include <libcoind/jsonrpc/jsonrpc_coind.h>
+#include <libcoind/p2p/coind_socket.h>
+#include <libcoind/jsonrpc/stratum_node.h>
 
 
 class NodeManager : public std::enable_shared_from_this<NodeManager>
@@ -54,7 +45,7 @@ public:
 
     shared_ptr<c2pool::dev::AddrStore> addr_store() const;
 
-    shared_ptr<P2PNode> p2pNode() const;
+    shared_ptr<PoolNode> pool_node() const;
 
     shared_ptr<coind::JSONRPC_Coind> coind() const;
 
@@ -62,10 +53,11 @@ public:
 
     shared_ptr<ShareTracker> tracker() const;
 
-    shared_ptr<ShareStore> share_store() const;
+//TODO:    shared_ptr<ShareStore> share_store() const;
 
-//      TODO:  shared_ptr<Worker> worker() const;
-    shared_ptr<coind::jsonrpc::StratumNode> stratum() const;
+    shared_ptr<Worker> worker() const;
+
+    shared_ptr<StratumNode> stratum() const;
 
 protected:
     shared_ptr<boost::asio::io_context> _context;
@@ -73,13 +65,13 @@ protected:
     shared_ptr<coind::ParentNetwork> _parent_net;
     shared_ptr<c2pool::dev::coind_config> _config;
     shared_ptr<c2pool::dev::AddrStore> _addr_store;
-    shared_ptr<P2PNode> _p2pnode;
+    shared_ptr<PoolNode> _pool_node;
     shared_ptr<coind::JSONRPC_Coind> _coind;
     shared_ptr<CoindNode> _coind_node;
     shared_ptr<ShareTracker> _tracker;
-    shared_ptr<ShareStore> _share_store;
-    //TODO: shared_ptr<Worker> _worker;
-    shared_ptr<coind::jsonrpc::StratumNode> _stratum;
+//TODO:    shared_ptr<ShareStore> _share_store;
+    shared_ptr<Worker> _worker;
+    shared_ptr<StratumNode> _stratum;
 
 private:
     std::atomic<bool> _is_loaded = false;
