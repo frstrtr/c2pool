@@ -52,7 +52,7 @@ int main(int ac, char *av[])
     po::options_description desc(fmt("c2pool (ver. %1%)\nAllowed options", 0.1)); //TODO: get %Version from Network config
     desc.add_options()("help", "produce help message");
 
-    desc.add_options()("version", "version");
+    desc.add_options()("version,v", "version");
     desc.add_options()("debug", po::value<c2pool::dev::DebugState>(&c2pool_config::get()->debug)->default_value(c2pool::dev::normal), "enable debugging mode");
     desc.add_options()("testnet", po::value<bool>()->default_value(false), "use the network's testnet");
     desc.add_options()("net", po::value<string>()->default_value("digibyte"), "use specified network (default: bitcoin)");
@@ -83,17 +83,25 @@ int main(int ac, char *av[])
     po::options_description coind_group("coind interface");
     coind_group.add_options()("coind-config-path", po::value<string>()->default_value(""), "custom configuration file path (when coind -conf option used)");                                        //p2pool: bitcoind_config_path
     coind_group.add_options()("coind-address", po::value<string>()->default_value("127.0.0.1"), "connect to this address (default: 127.0.0.1)");                                                    //p2pool: bitcoind_address
-    coind_group.add_options()("coind-rpc-port", po::value<string>()->default_value(""), "connect to JSON-RPC interface at this port (default: <read from bitcoin.conf if password not provided>)"); //p2pool: bitcoind_rpc_port [TODO]
+    coind_group.add_options()("coind-rpc-port", po::value<string>()->default_value(""), "connect to JSON-RPC interface at this port (default: <read from bitcoin.conf if password not provided>)"); //p2pool: bitcoind_rpc_port
+    coind_group.add_options()("coind_rpc_userpass", po::value<string>()->default_value(""), "coind RPC interface username, then password, space-separated (only one being provided will cause "     //p2pool: bitcoind_rpc_userpass
+                                                                                            "the username to default to being empty, and none will cause P2Pool to read them from bitcoin.conf)");
     coind_group.add_options()("coind-rpc-ssl", po::value<bool>()->default_value(false), "connect to JSON-RPC interface using SSL");                                                                 //p2pool: bitcoind_rpc_ssl
-    coind_group.add_options()("coind-p2p-port", po::value<string>()->default_value(""), "connect to P2P interface at this port (default: <read from bitcoin.conf if password not provided>)");      //p2pool: bitcoind_p2p_port [TODO]
-    desc.add(coind_group);
+    coind_group.add_options()("coind-p2p-port", po::value<string>()->default_value(""), "connect to P2P interface at this port (default: <read from bitcoin.conf if password not provided>)");      //p2pool: bitcoind_p2p_port
+//    desc.add(coind_group);
+
+    po::options_description cmd_options;
+    cmd_options.add(desc).add(c2pool_group).add(worker_group).add(coind_group);
 
     //=======================================
     //PARSE
 
     po::variables_map vm;
-    po::store(po::parse_command_line(ac, av, desc), vm);
+    po::parsed_options parse_option = po::parse_command_line(ac, av, cmd_options);
+    po::store(parse_option, vm);
     po::notify(vm);
+
+    std::cout << vm.count("coind interface") << std::endl;
 
     if (vm.count("help"))
     {
@@ -127,7 +135,7 @@ int main(int ac, char *av[])
     //Creating and initialization coinds network, config and NodeManager
 
     //##########################DGB###############################
-    auto DGB = c2pool::master::Make_DGB(coind_threads);
+    auto DGB = c2pool::master::Make_DGB(coind_threads, vm);
     //############################################################
 
     

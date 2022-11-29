@@ -98,7 +98,7 @@ public:
 
     create_set_method(c2pool::dev::AddrStore, _addr_store);
 
-    create_set_method(P2PNode, _p2pnode);
+    create_set_method(PoolNode, _pool_node);
 
     create_set_method(coind::JSONRPC_Coind, _coind);
 
@@ -106,9 +106,11 @@ public:
 
     create_set_method(ShareTracker, _tracker);
 
-    create_set_method(ShareStore, _share_store);
-    //TODO: create_set_method(Worker, _worker);
-    create_set_method(coind::jsonrpc::StratumNode, _stratum);
+//    create_set_method(ShareStore, _share_store);
+
+    create_set_method(Worker, _worker);
+
+    create_set_method(StratumNode, _stratum);
 };
 
 #undef create_set_method

@@ -15,10 +15,13 @@ using namespace std;
 using namespace c2pool::dev;
 using namespace shares;
 
+#include <boost/program_options.hpp>
+namespace po = boost::program_options;
+
 #include "node_manager.h"
 
 namespace c2pool::master {
-    shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool) {
+    shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool, po::variables_map &vm) {
         LOG_INFO << "Starting DGB initialization...";
         //Networks/Configs
         LOG_INFO << "DGB_parent_net initialization...";
@@ -26,7 +29,7 @@ namespace c2pool::master {
         LOG_INFO << "DGB_net initialization...";
         auto DGB_net = std::make_shared<c2pool::DigibyteNetwork>(DGB_parent_net);
         LOG_INFO << "DGB_cfg initialization...";
-        auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>();
+        auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>(vm);
         //NodeManager
         LOG_INFO << "DGB NodeManager initialization...";
         auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_parent_net, DGB_cfg);

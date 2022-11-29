@@ -96,7 +96,6 @@ namespace coind
 			// Connection
 			auto const results = resolver.resolve(ip, port);
 			stream.connect(results);
-			std::cout << "Jsonrpc Coind socket open: " << stream.socket().is_open() << std::endl;
 
 			delete[] encoded_login;
 		}
