@@ -1,5 +1,7 @@
 #include "pool_node.h"
 
+#include <algorithm>
+
 #include <libdevcore/random.h>
 #include <libdevcore/common.h>
 #include <libdevcore/types.h>
@@ -132,6 +134,11 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             auto msg_losing_tx = std::make_shared<message_losing_tx>(tx_hashes);
             _socket->write(msg_losing_tx);
 
+//            // cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
+//            auto key = std::max_element(handshake->known_txs_cache.begin(), handshake->known_txs_cache.end(), [&](const auto &a, const auto &b){
+//               return UintToArith256(a.first) < UintToArith256(b.first);
+//            });
+
             //TODO: ???
             /*
                     # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
@@ -177,13 +184,26 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             auto msg_losing_tx = std::make_shared<message_losing_tx>(tx_hashes);
             _socket->write(msg_losing_tx);
 
-            //TODO: ???
-            /*
-                    # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
-                    key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
-                    self.known_txs_cache[key] = removed #dict((h, before[h]) for h in removed)
-                    reactor.callLater(20, self.known_txs_cache.pop, key)
-             */
+            // cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
+            uint64_t key;
+            if (handshake->known_txs_cache.empty()){
+                key = 0;
+            } else
+            {
+                key = std::max_element(handshake->known_txs_cache.begin(), handshake->known_txs_cache.end(),
+                                               [&](const auto &a, const auto &b)
+                                               {
+                                                   return a.first < b.first;
+                                               })->first + 1;
+            }
+
+            std::map<uint256, coind::data::tx_type> value_for_key;
+            for (auto h : removed)
+            {
+                value_for_key[h.first] = before[h.first];
+            }
+            handshake->known_txs_cache[key] = value_for_key;
+            // TODO: reactor.callLater(20, self.known_txs_cache.pop, key)
         }
     });
 
@@ -359,6 +379,7 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
 
 void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol)
 {
+//    return;
     //t0
     vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
     for (auto wrappedshare: msg->raw_shares.get())
@@ -383,17 +404,21 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                     tx = known_txs.value()[tx_hash];
                 } else
                 {
-                    for (auto cache : protocol->known_txs_cache)
+                    bool flag = true;
+                    for (const auto& cache : protocol->known_txs_cache)
                     {
-                        if (cache.find(tx_hash) != cache.end())
+                        if (cache.second.find(tx_hash) != cache.second.end())
                         {
-                            tx = cache[tx_hash];
+                            tx = cache.second.at(tx_hash);
                             LOG_INFO << boost::format("Transaction %0% rescued from peer latency cache!") % tx_hash.GetHex();
+                            flag = false;
                             break;
-                        } else
-                        {
-                            //TODO: disconnect
                         }
+                    }
+                    if (flag)
+                    {
+                        LOG_ERROR << boost::format("Peer referenced unknown transaction %0%, disconnecting") % tx_hash.GetHex();
+                        //TODO: disconnect
                     }
                 }
                 txs.push_back(tx);
@@ -538,11 +563,11 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
         } else
         {
 			bool founded_cache = false;
-            for (auto cache : protocol->known_txs_cache)
+            for (const auto& cache : protocol->known_txs_cache)
             {
-                if (cache.find(tx_hash) != cache.end())
+                if (cache.second.find(tx_hash) != cache.second.end())
                 {
-                    tx = cache[tx_hash];
+                    tx = cache.second.at(tx_hash);
                     LOG_INFO << "Transaction " << tx_hash.ToString() << " rescued from peer latency cache!";
 					founded_cache = true;
                     break;
