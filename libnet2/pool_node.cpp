@@ -381,6 +381,8 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
 {
 //    return;
     //t0
+
+    LOG_INFO << "HANDLESHARES";
     vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
     for (auto wrappedshare: msg->raw_shares.get())
     {
@@ -399,9 +401,13 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
             for (auto tx_hash: *share->new_transaction_hashes)
             {
                 coind::data::tx_type tx;
-                if (known_txs.value().find(tx_hash) != known_txs.value().end())
+                if (known_txs._value->find(tx_hash) != known_txs._value->end())
                 {
-                    tx = known_txs.value()[tx_hash];
+                    std::cout << tx_hash.GetHex() << std::endl;
+                    std::cout << "known_txs: " << std::endl;
+                    for (auto v : *known_txs._value)
+                        std::cout << v.first.GetHex() << std::endl;
+                    tx = known_txs._value->at(tx_hash);
                 } else
                 {
                     bool flag = true;
@@ -410,15 +416,16 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                         if (cache.second.find(tx_hash) != cache.second.end())
                         {
                             tx = cache.second.at(tx_hash);
-                            LOG_INFO << boost::format("Transaction %0% rescued from peer latency cache!") % tx_hash.GetHex();
+                            LOG_INFO << boost::format("Transaction %1% rescued from peer latency cache!") % tx_hash.GetHex();
                             flag = false;
                             break;
                         }
                     }
                     if (flag)
                     {
-                        LOG_ERROR << boost::format("Peer referenced unknown transaction %0%, disconnecting") % tx_hash.GetHex();
+                        LOG_ERROR << boost::format("Peer referenced unknown transaction %1%, disconnecting") % tx_hash.GetHex();
                         //TODO: disconnect
+                        return;
                     }
                 }
                 txs.push_back(tx);

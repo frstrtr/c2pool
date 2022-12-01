@@ -114,7 +114,7 @@ public:
 template<typename VarType>
 class Variable
 {
-protected:
+public:
     std::shared_ptr<VarType> _value;
 public:
     std::shared_ptr<Event<VarType>> changed;
