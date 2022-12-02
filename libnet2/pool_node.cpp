@@ -564,9 +564,9 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
         }
 
         coind::data::stream::TransactionType_stream tx;
-        if (known_txs.value().find(tx_hash) != known_txs.value().end())
+        if (known_txs._value->find(tx_hash) != known_txs._value->end())
         {
-            tx = known_txs.value()[tx_hash];
+            tx = known_txs._value->at(tx_hash);
         } else
         {
 			bool founded_cache = false;
