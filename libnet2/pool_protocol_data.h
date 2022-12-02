@@ -27,6 +27,6 @@ struct PoolProtocolData
 
     PoolProtocolData(auto _version, auto _get_shares) : version(_version), get_shares(std::move(_get_shares))
 	{
-
+        std::cout << "remote_remembered_txs_size (init): " << remote_remembered_txs_size << std::endl;
 	}
 };
