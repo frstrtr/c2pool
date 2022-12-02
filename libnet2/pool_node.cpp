@@ -245,8 +245,10 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 PackStream stream;
                 coind::data::stream::TransactionType_stream packed_tx(x.second);
                 stream << packed_tx;
-
+                std::cout << "remote_remembered_txs_size(before removed): " << handshake->remote_remembered_txs_size;
+                std::cout << stream.size() << std::endl;
                 handshake->remote_remembered_txs_size -= 100 + stream.size();
+                std::cout << "remote_remembered_txs_size(removed): " << handshake->remote_remembered_txs_size << "/" << handshake->max_remembered_txs_size << ".\n";
             }
         }
 
@@ -259,7 +261,10 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 coind::data::stream::TransactionType_stream packed_tx(x.second);
                 stream << packed_tx;
 
+                std::cout << "remote_remembered_txs_size(before added): " << handshake->remote_remembered_txs_size;
+                std::cout << stream.size() << std::endl;
                 handshake->remote_remembered_txs_size += 100 + stream.size();
+                std::cout << "remote_remembered_txs_size(added): " << handshake->remote_remembered_txs_size << "/" << handshake->max_remembered_txs_size << ".\n";
             }
 
             assert(handshake->remote_remembered_txs_size <= handshake->max_remembered_txs_size);
@@ -288,7 +293,9 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
         coind::data::stream::TransactionType_stream packed_tx(x.second);
         stream << packed_tx;
 
+        std::cout << "remote_remembered_txs_size(before mining_txs): " << handshake->remote_remembered_txs_size;
         handshake->remote_remembered_txs_size += 100 + stream.size();
+        std::cout << "remote_remembered_txs_size(mining_txs): " << handshake->remote_remembered_txs_size << "/" << handshake->max_remembered_txs_size << ".\n";
         assert(handshake->remote_remembered_txs_size <= handshake->max_remembered_txs_size);
     }
 
@@ -547,13 +554,6 @@ void PoolNode::handle_message_losing_tx(std::shared_ptr<pool::messages::message_
 
 void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
-    }
-
     for (auto tx_hash: msg->tx_hashes.get())
     {
         if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
@@ -589,13 +589,10 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 			}
         }
 
-        if (!tx.get())
-            assert(false);
-
 		protocol->remembered_txs[tx_hash] = tx;
 		PackStream stream;
 		stream << tx;
-		protocol->remembered_txs_size += 100 + stream.size();
+		protocol->remembered_txs_size += 100 + pack<coind::data::stream::TransactionType_stream>(tx).size();
     }
 
 	std::map<uint256, coind::data::tx_type> added_known_txs;
@@ -620,36 +617,27 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 			warned = true;
 		}
 
-        if (!_tx.get())
-            assert(false);
-
 		protocol->remembered_txs[tx_hash] = _tx;
 		protocol->remembered_txs_size += 100 + _tx_size;
 		added_known_txs[tx_hash] = _tx.get();
 	}
+    known_txs.add(added_known_txs);
 
 	if (protocol->remembered_txs_size >= protocol->max_remembered_txs_size)
 	{
 		throw std::runtime_error("too much transaction data stored"); // TODO: custom error
 	}
-
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
-    }
 }
 
 void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        LOG_INFO << "\n" <<  v.first.GetHex() << "\n";
-        if (!v.second.tx)
-            assert(false);
-    }
+//    LOG_INFO << "PROTOCOL: " << protocol.get();
+//    for (auto v : protocol->remembered_txs)
+//    {
+//        LOG_INFO << "\n" <<  v.first.GetHex() << "\n";
+//        if (!v.second.tx)
+//            assert(false);
+//    }
 
     for (auto tx_hash : msg->tx_hashes.get())
     {
@@ -659,13 +647,6 @@ void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_
         protocol->remembered_txs_size -= 100 + stream.size();
         assert(protocol->remembered_txs_size >= 0);
         protocol->remembered_txs.erase(tx_hash);
-    }
-
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
     }
 }
 

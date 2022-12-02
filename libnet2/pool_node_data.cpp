@@ -241,7 +241,9 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 	auto new_remote_remembered_txs_size = peer->remote_remembered_txs_size + new_tx_size;
 	if (new_remote_remembered_txs_size > peer->max_remembered_txs_size)
 		throw("share have too many txs");
+    std::cout << "remote_remembered_txs_size(before new_remote_remembered_txs_size): " << peer->remote_remembered_txs_size;
 	peer->remote_remembered_txs_size = new_remote_remembered_txs_size;
+    std::cout << "remote_remembered_txs_size(new_remote_remembered_txs_size): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
 
 	// Send messages
 
@@ -280,6 +282,8 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 		peer->write(msg_forget_tx);
 	}
 
+    std::cout << "remote_remembered_txs_size(before send_shares): " << peer->remote_remembered_txs_size;
 	peer->remote_remembered_txs_size -= new_tx_size;
+    std::cout << "remote_remembered_txs_size(send_shares): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
 	auto t1 = c2pool::dev::timestamp();
 }
