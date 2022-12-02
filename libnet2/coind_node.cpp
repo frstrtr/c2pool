@@ -36,27 +36,27 @@ void CoindNode::start()
 
 	// update mining_txs according to getwork results
 	coind_work.changed->run_and_subscribe([&](){
-//		std::map<uint256, coind::data::tx_type> new_mining_txs;
-//		auto new_known_txs = known_txs.value();
-//
-//		uint256 _tx_hash;
-//		coind::data::tx_type _tx;
-//		BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work.value().transaction_hashes,coind_work.value().transactions))
-//		{
-//			new_mining_txs[_tx_hash] = _tx;
-//			new_known_txs[_tx_hash] = _tx;
-//		}
-//
-//		mining_txs = new_mining_txs;
-//		known_txs = new_known_txs;
+        std::map<uint256, coind::data::tx_type> new_mining_txs;
+        std::map<uint256, coind::data::tx_type> added_known_txs;
+
+        uint256 _tx_hash;
+		coind::data::tx_type _tx;
+        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work._value->transaction_hashes,coind_work._value->transactions))
+		{
+			new_mining_txs[_tx_hash] = _tx;
+
+            if (!known_txs.exist(_tx_hash))
+                added_known_txs[_tx_hash] = _tx;
+		}
+
+        mining_txs.set(new_mining_txs);
+        known_txs.add(added_known_txs);
 	});
 
 	// add p2p transactions from bitcoind to known_txs
-	new_tx.subscribe([&](coind::data::tx_type _tx){
-		coind::data::stream::TransactionType_stream packed_tx = _tx;
-		PackStream stream_tx;
-		stream_tx << packed_tx;
-		known_txs.add(coind::data::hash256(stream_tx), _tx);
+	new_tx.subscribe([&](coind::data::tx_type _tx)
+    {
+		known_txs.add(coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)), _tx);
 	});
 
 	// forward transactions seen to bitcoind
@@ -79,15 +79,6 @@ void CoindNode::start()
 	});
 
 	/* TODO:
-	 * # forward transactions seen to bitcoind
-	@self.known_txs_var.transitioned.watch
-	@defer.inlineCallbacks
-	def _(before, after):
-		yield deferral.sleep(random.expovariate(1/1))
-		if self.factory.conn.value is None:
-			return
-		for tx_hash in set(after) - set(before):
-			self.factory.conn.value.send_tx(tx=after[tx_hash])
 
 	@self.tracker.verified.added.watch
 	def _(share):
