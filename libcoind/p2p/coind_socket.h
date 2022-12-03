@@ -57,6 +57,8 @@ public:
 
 	void disconnect() override
 	{
+        auto [addr, port] = get_addr();
+        LOG_INFO << "Coind socket disconnected from " << addr << ":" << port;
 		// TODO: call event disconnect
 		socket->close();
 	}

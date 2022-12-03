@@ -222,6 +222,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
     }
 
     auto id_update_remote_view_of_my_mining_txs = mining_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+        LOG_TRACE << "id_update_remote_view_of_my_mining_txs called!";
         std::map<uint256, coind::data::tx_type> added;
         std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
 
@@ -238,6 +239,11 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             }
 
             auto msg_forget_tx = std::make_shared<message_forget_tx>(tx_hashes);
+            //DEBUG
+            for (auto v : msg_forget_tx->tx_hashes.get()){
+                LOG_TRACE << "MSG_FORGET_TX: " << v.GetHex();
+            }
+            //
             socket->write(msg_forget_tx);
 
             for (auto x : removed)
