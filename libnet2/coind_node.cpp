@@ -36,6 +36,7 @@ void CoindNode::start()
 
 	// update mining_txs according to getwork results
 	coind_work.changed->run_and_subscribe([&](){
+        LOG_TRACE << "update mining_txs according to getwork results";
         std::map<uint256, coind::data::tx_type> new_mining_txs;
         std::map<uint256, coind::data::tx_type> added_known_txs;
 
@@ -66,16 +67,15 @@ void CoindNode::start()
 //
 		if (!protocol)
 			return;
-//
-//		std::map<uint256, coind::data::tx_type> trans_difference;
-//		std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(trans_difference, trans_difference.begin()));
-//
-//		for (auto [tx_hash, tx] : trans_difference)
-//		{
-//			//TODO: update coind::message
-////                auto msg = protocol->make_message<message_tx>(tx);
-////                protocol->write(msg);
-//		}
+
+        std::map<uint256, coind::data::tx_type> diff;
+        std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(diff, diff.begin()));
+
+        for (auto [tx_hash, tx] : diff)
+        {
+            auto msg = std::make_shared<coind::messages::message_tx>(after[tx_hash]);
+            protocol->write(msg);
+        }
 	});
 
 	/* TODO:
@@ -123,7 +123,7 @@ void CoindNode::work_poller()
     LOG_TRACE << "work_poller called!";
     coind_work.set(coind->getwork(txidcache, known_txs.value())); //TODO: warning for set?
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-    work_poller_t.async_wait(bind(&CoindNode::work_poller, this));
+    work_poller_t.async_wait([&](const boost::system::error_code &ec){ work_poller(); });
 }
 
 void CoindNode::poll_header()

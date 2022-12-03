@@ -116,15 +116,14 @@ namespace coind
             latency = _latency;
         }
 
-        bool operator==(getwork_result const &val)
+        bool operator==(getwork_result const &val) const
         {
-            //TODO: for Events::Variable
-            return false;
+            return
+                    std::make_tuple(version, previous_block.GetHex(), transactions, transaction_hashes, subsidy, time, bits.get(), coinbaseflags.data, height, rules, last_update, latency) == std::make_tuple(val.version, val.previous_block.GetHex(), val.transactions, val.transaction_hashes, val.subsidy, val.time, val.bits.get(), val.coinbaseflags.data, val.height, val.rules, val.last_update, val.latency);
         }
-        bool operator!=(getwork_result const &val)
+        bool operator!=(getwork_result const &val) const
         {
-            //TODO: for Events::Variable
-            return true;
+            return !(*this == val);
         }
     };
 } // namespace coind::jsonrpc::data
