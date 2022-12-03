@@ -152,7 +152,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
     //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.removed.unwatch(watch_id1))
 
 
-    auto id_update_remote_view_of_my_known_txs = known_txs.transitioned->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+    auto id_update_remote_view_of_my_known_txs = known_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
         std::map<uint256, coind::data::tx_type> added;
         std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
 
@@ -186,11 +186,11 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
 
             // cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
             uint64_t key;
-            if (handshake->known_txs_cache.empty()){
+            if (peer->known_txs_cache.empty()){
                 key = 0;
             } else
             {
-                key = std::max_element(handshake->known_txs_cache.begin(), handshake->known_txs_cache.end(),
+                key = std::max_element(peer->known_txs_cache.begin(), peer->known_txs_cache.end(),
                                                [&](const auto &a, const auto &b)
                                                {
                                                    return a.first < b.first;
@@ -202,7 +202,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             {
                 value_for_key[h.first] = before[h.first];
             }
-            handshake->known_txs_cache[key] = value_for_key;
+            peer->known_txs_cache[key] = value_for_key;
             // TODO: reactor.callLater(20, self.known_txs_cache.pop, key)
         }
     });
@@ -221,7 +221,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
         handshake->get_socket()->write(msg_have_tx);
     }
 
-    auto id_update_remote_view_of_my_mining_txs = mining_txs.transitioned->subscribe([&, socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+    auto id_update_remote_view_of_my_mining_txs = mining_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
         std::map<uint256, coind::data::tx_type> added;
         std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
 
@@ -245,10 +245,10 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 PackStream stream;
                 coind::data::stream::TransactionType_stream packed_tx(x.second);
                 stream << packed_tx;
-                std::cout << "remote_remembered_txs_size(before removed): " << handshake->remote_remembered_txs_size;
+                std::cout << "remote_remembered_txs_size(before removed): " << peer->remote_remembered_txs_size << std::endl;
                 std::cout << stream.size() << std::endl;
-                handshake->remote_remembered_txs_size -= 100 + stream.size();
-                std::cout << "remote_remembered_txs_size(removed): " << handshake->remote_remembered_txs_size << "/" << handshake->max_remembered_txs_size << ".\n";
+                peer->remote_remembered_txs_size -= 100 + stream.size();
+                std::cout << "remote_remembered_txs_size(removed): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
             }
         }
 
@@ -261,20 +261,20 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 coind::data::stream::TransactionType_stream packed_tx(x.second);
                 stream << packed_tx;
 
-                std::cout << "remote_remembered_txs_size(before added): " << handshake->remote_remembered_txs_size;
+                std::cout << "remote_remembered_txs_size(before added): " << peer->remote_remembered_txs_size;
                 std::cout << stream.size() << std::endl;
-                handshake->remote_remembered_txs_size += 100 + stream.size();
-                std::cout << "remote_remembered_txs_size(added): " << handshake->remote_remembered_txs_size << "/" << handshake->max_remembered_txs_size << ".\n";
+                peer->remote_remembered_txs_size += 100 + stream.size();
+                std::cout << "remote_remembered_txs_size(added): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
             }
 
-            assert(handshake->remote_remembered_txs_size <= handshake->max_remembered_txs_size);
+            assert(peer->remote_remembered_txs_size <= peer->max_remembered_txs_size);
 
             std::vector<uint256> _tx_hashes;
             std::vector<coind::data::tx_type> _txs;
 
             for (auto x : added)
             {
-                if (handshake->remote_tx_hashes.find(x.first) != handshake->remote_tx_hashes.end())
+                if (peer->remote_tx_hashes.find(x.first) != peer->remote_tx_hashes.end())
                 {
                     _tx_hashes.push_back(x.first);
                 } else {
