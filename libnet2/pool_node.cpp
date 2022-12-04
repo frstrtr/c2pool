@@ -243,8 +243,8 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             for (auto v : msg_forget_tx->tx_hashes.get()){
                 LOG_TRACE << "MSG_FORGET_TX: " << v.GetHex();
             }
-            //
-            socket->write(msg_forget_tx);
+            //TODO:
+//            socket->write(msg_forget_tx);
 
             for (auto x : removed)
             {

@@ -229,7 +229,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 			hashes_to_send.push_back(x);
 
 			// new_tx_size calculate
-			coind::data::stream::TransactionType_stream _tx(known_txs.value()[x]);
+			coind::data::stream::TransactionType_stream _tx(known_txs._value->at(x));
 			PackStream packed_tx;
 			packed_tx << _tx;
 
