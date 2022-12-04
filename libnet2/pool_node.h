@@ -125,6 +125,7 @@ public:
 
 											  (*connector)(std::bind(&PoolNodeClient::socket_handle, this, std::placeholders::_1), addr);
 										  }
+                                          return;
                                           auto_connect();
 									  });
 	}
