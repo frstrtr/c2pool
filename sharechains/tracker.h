@@ -62,6 +62,8 @@ public:
 public:
 	ShareTracker(shared_ptr<c2pool::Network> _net);
 
+    void init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes);
+
 	ShareType get(uint256 hash);
 
 	void add(ShareType share) override;

@@ -27,9 +27,27 @@ using std::shared_ptr;
 
 #include <boost/format.hpp>
 
-ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), verified(*this), net(_net), parent_net(_net->parent), share_store(_net->net_name)
+ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), verified(*this), net(_net), parent_net(_net->parent), share_store(_net)
 {
 
+}
+
+void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes)
+{
+    std::cout << "shares:" << std::endl;
+    for (auto& _share : _shares)
+    {
+        std::cout << _share->hash.GetHex() << std::endl;
+        add(_share);
+    }
+
+    std::cout << "known:" << std::endl;
+    for (auto& share_hash : known_verified_share_hashes)
+    {
+        std::cout << share_hash.GetHex() << std::endl;
+        if (exists(share_hash))
+            verified.add(items.at(share_hash));
+    }
 }
 
 ShareType ShareTracker::get(uint256 hash)
