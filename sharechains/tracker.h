@@ -12,6 +12,7 @@ using namespace std;
 #include "share.h"
 #include "share_adapters.h"
 #include "prefsum_share2.h"
+#include "share_store.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libcoind/data.h>
@@ -52,6 +53,7 @@ struct TrackerThinkResult
 class ShareTracker : public SharePrefsum2, public enable_shared_from_this<ShareTracker>
 {
 public:
+    ShareStore share_store;
     VerifiedSharePrefsum2 verified;
     Event<ShareType> removed;
 public:

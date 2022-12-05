@@ -73,5 +73,6 @@ public:
 	bool IsEmpty()
 	{
 		//TODO:
+        return false;
 	}
 };
