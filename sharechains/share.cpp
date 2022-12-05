@@ -98,7 +98,7 @@ void Share::init()
 
     PackStream packed_block_header2;
     packed_block_header2 << header_stream;
-    hash = coind::data::hash256(packed_block_header2);
+    hash = coind::data::hash256(packed_block_header2, true);
 
     if (target > net->MAX_TARGET)
     {
