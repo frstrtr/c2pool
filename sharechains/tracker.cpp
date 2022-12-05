@@ -27,7 +27,7 @@ using std::shared_ptr;
 
 #include <boost/format.hpp>
 
-ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), verified(*this), net(_net), parent_net(_net->parent)
+ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), verified(*this), net(_net), parent_net(_net->parent), share_store(_net->net_name)
 {
 
 }

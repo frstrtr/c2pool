@@ -4,6 +4,7 @@
 
 #include <libdevcore/common.h>
 #include <sharechains/tracker.h>
+#include <sharechains/share_store.h>
 #include <networks/network.h>
 
 class TestNetwork : public c2pool::Network
@@ -336,4 +337,12 @@ TEST_F(SharechainsTest, tracker_think)
     auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
     std::cout << "Best = " << _best.GetHex() << std::endl;
 
+}
+
+TEST_F(SharechainsTest, sharestore_only)
+{
+    std::cout << "getProjectPath + 'data': " << c2pool::filesystem::getProjectPath() / "data" << std::endl;
+
+    auto share_store = ShareStore("dgb_test");
+    share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0");
 }

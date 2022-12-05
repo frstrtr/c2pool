@@ -13,12 +13,14 @@ Database::Database(const boost::filesystem::path &filepath, std::string _name, b
 		leveldb::Status wipe_status = leveldb::DestroyDB(name, options);
 	}
 
-	leveldb::Status status = leveldb::DB::Open(options, filepath.string(), &db);
+    boost::filesystem::create_directories(filepath);
+	leveldb::Status status = leveldb::DB::Open(options, (filepath / name).string(), &db);
 
 	if (!status.ok())
 	{
-		//LOG_ERROR << "Unable to open/create datebase with path:  " << filepath
-		//          << "; status: " << status.ToString();
+		LOG_ERROR << "Unable to open/create datebase with path:  " << filepath
+		          << "; status: " << status.ToString();
+
 		//TODO: close proj
 	}
 }
