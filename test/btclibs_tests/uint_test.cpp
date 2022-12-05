@@ -5,6 +5,8 @@
 #include <sstream>
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
+#include <btclibs/util/strencodings.h>
+#include <libdevcore/random.h>
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)
@@ -165,4 +167,36 @@ TEST(Btclibs, UINT256_TO_UINT64)
     auto third64 = third.GetLow64();
     std::cout << third64 << std::endl;
     ASSERT_EQ(4294967294, third64);
+}
+
+TEST(Btclibst, SortUINT256)
+{
+    std::vector<int> _nums = {2,4,1,3,5,7,6};
+    std::sort(_nums.begin(), _nums.end());
+    for (auto v : _nums)
+    {
+        std::cout << v << " ";
+    }
+    std::cout << std::endl << std::endl;
+
+    std::vector<uint256> nums;
+    std::vector<arith_uint256> nums2;
+    const int test_size = 3;
+
+    for (int i = 0; i < test_size; i++)
+    {
+        auto num = uint256S(HexStr(c2pool::random::random_bytes(32)));
+        auto num2 = UintToArith256(num);
+
+        nums.push_back(num);
+        nums2.push_back(num2);
+    }
+
+    std::sort(nums.begin(), nums.end());
+    std::sort(nums2.begin(), nums2.end());
+
+    for (int i = 0; i < test_size; i++)
+    {
+        std::cout << nums[i].GetHex() << "\t" << ArithToUint256(nums2[i]).GetHex() << std::endl;
+    }
 }
