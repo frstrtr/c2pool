@@ -341,8 +341,11 @@ TEST_F(SharechainsTest, tracker_think)
 
 TEST_F(SharechainsTest, sharestore_only)
 {
-    std::cout << "getProjectPath + 'data': " << c2pool::filesystem::getProjectPath() / "data" << std::endl;
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+//    std::cout << "getProjectPath + 'data': " << c2pool::filesystem::getProjectPath() / "data" << std::endl;
 
-    auto share_store = ShareStore("dgb_test");
-    share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0");
+    auto share_store = ShareStore(net);
+    share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
+
+    std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
 }
