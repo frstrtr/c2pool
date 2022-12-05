@@ -7,4 +7,4 @@ set_target_properties(btclibs_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_
 
 # target_compile_definitions(runBtclibsTests PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
 target_link_libraries(btclibs_test gtest gtest_main)
-target_link_libraries(btclibs_test btclibs util)
+target_link_libraries(btclibs_test btclibs util libdevcore)

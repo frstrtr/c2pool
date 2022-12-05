@@ -99,6 +99,7 @@ public:
 //                            continue;
 
                         auto share = load_share(stream, net, {{}, {}});
+                        share->time_seen = 0;
                         _shares.push_back(std::move(share));
                         break;
                     }
@@ -111,7 +112,8 @@ public:
 
 
                 i++; //REMOVE
-                if (i >= 10)
+//                if (i >= 2601)
+                if (i >= 34561)
                     break;
             }
 

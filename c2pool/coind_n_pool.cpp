@@ -53,6 +53,7 @@ int main(int ac, char *av[])
 
     // ShareTracker
     std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+    tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
 
     // Pool Node
     std::shared_ptr<PoolNode> pool_node = std::make_shared<PoolNode>(context);

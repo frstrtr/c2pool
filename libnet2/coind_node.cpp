@@ -121,6 +121,8 @@ void CoindNode::start()
 void CoindNode::work_poller()
 {
     LOG_TRACE << "work_poller called!";
+    LOG_TRACE << "txidcache: " << txidcache.cache.size();
+    LOG_TRACE << "known_txs: " << known_txs.value().size();
     coind_work.set(coind->getwork(txidcache, known_txs.value())); //TODO: warning for set?
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
     work_poller_t.async_wait([&](const boost::system::error_code &ec){ work_poller(); });
