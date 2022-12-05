@@ -119,6 +119,8 @@ bool coind::JSONRPC_Coind::check_block_header(uint256 header)
 
 coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs)
 {
+    LOG_TRACE << "txidcache: " << txidcache.cache.size();
+    LOG_TRACE << "known_txs: " << known_txs.size();
 	UniValue work;
 	UniValue getblocktemplate_result;
 

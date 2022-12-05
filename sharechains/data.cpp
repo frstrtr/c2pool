@@ -122,6 +122,8 @@ namespace shares
 
 		//height, last
 		auto [height, last] = tracker->get_height_and_last(_share_data.previous_share_hash);
+        LOG_TRACE << "height: " << height << ", last: " << last.IsNull() << "/" << last.GetHex();
+        LOG_TRACE << tracker->exists(last) << " " << tracker->exists(_share_data.previous_share_hash);
         assert((height >= net->REAL_CHAIN_LENGTH) || last.IsNull());
 
 		arith_uint256 _pre_target3;

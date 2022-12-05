@@ -46,7 +46,7 @@ struct TrackerThinkResult
 {
 	uint256 best;
 	std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
-    std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
+    std::vector<std::tuple<std::tuple<arith_uint256, int32_t, int32_t>, arith_uint256>> decorated_heads;
 	std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
 };
 
@@ -75,10 +75,9 @@ public:
 
 	arith_uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
-	std::tuple<int32_t, uint256> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
+	std::tuple<int32_t, arith_uint256> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
 	{
-		uint256 score_res;
-		score_res.SetNull();
+		arith_uint256 score_res;
 		auto head_height = verified.get_height(share_hash);
 		if (head_height < net->CHAIN_LENGTH)
 		{
@@ -108,8 +107,8 @@ public:
 			}
 		}
 
-		score_res = ArithToUint256(verified.get_sum(share_hash, end_point).work /
-								   ((-block_height.value() + 1) * parent_net->BLOCK_PERIOD));
+		score_res = verified.get_sum(share_hash, end_point).work /
+								   ((-block_height.value() + 1) * parent_net->BLOCK_PERIOD);
 		return std::make_tuple(net->CHAIN_LENGTH, score_res);
 	}
 
