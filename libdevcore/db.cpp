@@ -6,8 +6,6 @@
 
 Database::Database(const boost::filesystem::path &filepath, std::string _name, bool wipe) : name(_name)
 {
-	options.create_if_missing = true;
-
 	if (wipe)
 	{
 		leveldb::Status wipe_status = leveldb::DestroyDB(name, options);
