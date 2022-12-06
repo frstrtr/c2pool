@@ -175,3 +175,15 @@ TEST(CoindDataTest, PowFuncTest)
 	ASSERT_EQ(header2->bits, 486651247);
 	ASSERT_EQ(header2.stream()->bits.bits.target(), uint256S("1b56f0000000000000000000000000000000000000000000000000000"));
 }
+
+TEST(CoindDataTest, TargetToDifficulty)
+{
+    auto v1 = uint256S("100000000000000000000000000000000");
+    std::cout << std::setprecision(30) << coind::data::target_to_difficulty(v1) << std::endl;
+    auto v2 = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    std::cout  << coind::data::target_to_difficulty(v2) << std::endl;
+    auto v3 = uint256S("1");
+    std::cout << std::setprecision(70) << coind::data::target_to_difficulty(v3) << std::endl;
+    auto v4 = uint256S("1e");
+    std::cout << std::setprecision(70) << coind::data::target_to_difficulty(v4) << std::endl;
+}
