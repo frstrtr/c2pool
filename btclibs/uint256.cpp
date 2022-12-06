@@ -108,6 +108,27 @@ std::ostream &operator<<(std::ostream &os, const uint160 &value)
     return os;
 }
 
+// Explicit instantiations for base_blob<288>
+template base_blob<288>::base_blob(const std::vector<unsigned char> &);
+template std::string base_blob<288>::GetHex() const;
+template std::string base_blob<288>::ToString() const;
+template void base_blob<288>::SetHex(const char *);
+template void base_blob<288>::SetHex(const std::string &);
+
+std::istream &operator>>(std::istream &is, uint288 &value)
+{
+    std::string Hex;
+    is >> Hex;
+    value.SetHex(Hex);
+    return is;
+}
+
+std::ostream &operator<<(std::ostream &os, const uint288 &value)
+{
+    os << value.GetHex();
+    return os;
+}
+
 // Explicit instantiations for base_blob<256>
 template base_blob<256>::base_blob(const std::vector<unsigned char> &);
 template std::string base_blob<256>::GetHex() const;

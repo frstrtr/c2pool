@@ -13,6 +13,7 @@
 #include <string>
 
 class uint256;
+class uint288;
 
 class uint_error : public std::runtime_error {
 public:
@@ -278,10 +279,34 @@ public:
     arith_uint256 operator=(const uint256& v);
 };
 
+/** 288-bit unsigned big integer. */
+class arith_uint288 : public base_uint<288>
+{
+public:
+    arith_uint288()
+    {}
+
+    arith_uint288(const base_uint<288> &b) : base_uint<288>(b)
+    {}
+
+    arith_uint288(uint64_t b) : base_uint<288>(b)
+    {}
+//
+//    explicit arith_uint288(const std::string &str) : base_uint<288>(str)
+//    {}
+
+    friend arith_uint288 UintToArith288(const uint288 &);
+
+    arith_uint288& SetCompact(uint32_t nCompact, bool *pfNegative = nullptr, bool *pfOverflow = nullptr);
+    uint32_t GetCompact(bool fNegative = false) const;
+};
+
 uint256 ArithToUint256(const arith_uint256 &);
 arith_uint256 UintToArith256(const uint256 &);
+arith_uint288 UintToArith288(const uint288 &);
 
 extern template class base_uint<256>;
+extern template class base_uint<288>;
 
 uint256 operator+(const uint256 &a, const uint256 &b);
 

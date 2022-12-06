@@ -152,6 +152,20 @@ public:
     friend std::ostream &operator<<(std::ostream &os, const uint256 &value);
 };
 
+/** 288-bit opaque blob.
+ * @note This type is called uint160 for historical reasons only. It is an opaque
+ * blob of 288 bits and has no integer operations.
+ */
+class uint288 : public base_blob<288>
+{
+public:
+    constexpr uint288() {}
+    explicit uint288(const std::vector<unsigned char> &vch) : base_blob<288>(vch) {}
+
+    friend std::istream &operator>>(std::istream &is, uint288 &value);
+    friend std::ostream &operator<<(std::ostream &os, const uint288 &value);
+};
+
 /* uint256 from const char *.
  * This is a separate function because the constructor uint256(const char*) can result
  * in dangerously catching uint256(0).
