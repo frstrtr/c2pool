@@ -35,80 +35,52 @@ namespace coind::data
 
     uint256 target_to_average_attempts(uint256 target)
     {
-        //TODO: return coind::data::python::PyBitcoindData::target_to_average_attempts(target);
+        if (target.IsNull())
+            return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+        arith_uint288 targ;
+        targ.SetHex(target.GetHex());
+
+        arith_uint288 s;
+        s.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+
+        s /= (targ + 1);
+        return uint256S(s.GetHex());
     }
 
     uint256 average_attempts_to_target(uint256 average_attempts)
     {
-        //TODO: return coind::data::python::PyBitcoindData::average_attempts_to_target(average_attempts);
+        assert(!average_attempts.IsNull());
+
+        arith_uint288 att;
+        att.SetHex(average_attempts.GetHex());
+
+        std::cout << "att: " << att.GetHex() << std::endl;
+
+        arith_uint288 s;
+        s.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+        s /= att;
+        std::cout << "s: " << s.GetHex() << std::endl;
+
+        arith_uint288 _max_value;
+        _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        if (s > _max_value)
+            return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+        s -= 1;
+
+        arith_uint256 r_round;
+        r_round.SetCompact(UintToArith256(uint256S(s.GetHex())).GetCompact() + 0.5);
+        s.SetHex(ArithToUint256(r_round).GetHex());
+
+
+
+        std::cout << "Not a Double: " << s.GetHex() << std::endl;
+        return uint256S(s.GetHex()) ;
     }
 
     double target_to_difficulty(uint256 target)
     {
-//1
-//        auto bits = UintToArith256(target).GetCompact();
-//        int nShift = (bits >> 24) & 0xff;
-//        double dDiff =
-//                (double)0x0000ffff / (double)(bits & 0x00ffffff);
-//
-//        while (nShift < 29)
-//        {
-//            dDiff *= 256.0;
-//            nShift++;
-//        }
-//        while (nShift > 29)
-//        {
-//            dDiff /= 256.0;
-//            nShift--;
-//        }
-//
-//        return dDiff;
-
-// 2
-//        auto targ = UintToArith256(target);
-//        assert(!target.IsNull());
-//
-//        auto ss = UintToArith256(uint256S("ffff0000000000000000000000000000000000000000000000000001"));
-//        auto rr = (ss)/(targ+1);
-////        return rr.getdouble();
-// 3
-//        uint288 targ;
-//        targ.SetHex(target.GetHex());
-//
-//        auto v = UintToArith288(targ);
-//        std::cout << "v: " << v.GetHex() << std::endl;
-//        assert(!target.IsNull());
-//
-//        uint288 u_s;
-//        u_s.SetHex("1000000000000000000000000000000000000000000000000");
-//
-//        auto s = UintToArith288(u_s);
-//        s *= 0xffff0000;
-//        s += 1;
-//
-//        auto r = s/(v+1);
-//        return r.getdouble();
-//4
-//        uint288 targ;
-//        targ.SetHex(target.GetHex());
-//        auto bits = UintToArith288(targ).GetCompact();
-//        int nShift = (bits >> 24) & 0xff;
-//        double dDiff =
-//                (double)0x0000ffff / (double)(bits & 0x00ffffff);
-//
-//        while (nShift < 29)
-//        {
-//            dDiff *= 256.0;
-//            nShift++;
-//        }
-//        while (nShift > 29)
-//        {
-//            dDiff /= 256.0;
-//            nShift--;
-//        }
-//
-//        return dDiff;
-//5
         uint288 targ;
         targ.SetHex(target.GetHex());
 
@@ -135,7 +107,7 @@ namespace coind::data
 
         auto v = UintToArith288(targ);
         std::cout << "v: " << v.GetHex() << std::endl;
-        if (targ.IsNull() || ((v-1) < 0))
+        if (targ.IsNull())
             return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         uint288 u_s;
@@ -145,11 +117,18 @@ namespace coind::data
         s *= 0xffff0000;
         s += 1;
 
-        auto r = s/(v)-1;
+        auto r = s/v - 1;
 
         arith_uint256 r_round;
         r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
         r.SetHex(ArithToUint256(r_round).GetHex());
+
+        {
+            arith_uint288 _max_value;
+            _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            if (r > _max_value)
+                return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        }
 
         std::cout << "Not a Double: " << r.GetHex() << std::endl;
         return uint256S(r.GetHex()) ;
