@@ -147,10 +147,9 @@ namespace coind::data
 
         auto r = s/(v)-1;
 
-        std::cout << uint256S(r.GetHex()) << " " << UintToArith256(uint256S(r.GetHex())).GetCompact() << std::endl;
-        arith_uint256 r_test;
-        r_test.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
-        std:: cout << ArithToUint256(r_test);
+        arith_uint256 r_round;
+        r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
+        r.SetHex(ArithToUint256(r_round).GetHex());
 
         std::cout << "Not a Double: " << r.GetHex() << std::endl;
         return uint256S(r.GetHex()) ;
