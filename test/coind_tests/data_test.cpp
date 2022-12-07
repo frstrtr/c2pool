@@ -187,3 +187,22 @@ TEST(CoindDataTest, TargetToDifficulty)
     auto v4 = uint256S("1e");
     std::cout << std::setprecision(70) << coind::data::target_to_difficulty(v4) << std::endl;
 }
+
+TEST(CoindDataTest, DifficultyToTarget)
+{
+    std::cout << "\n1:\n";
+    auto v1 = uint256S("fffeffffffffffffffffffff");
+    std::cout << coind::data::difficulty_to_target(v1) << std::endl;
+
+    std::cout << "\n2:\n";
+    auto v2 = uint256S("0");
+    std::cout  << coind::data::difficulty_to_target(v2) << std::endl;
+
+    std::cout << "\n3:\n";
+    auto v3 = uint256S("7fff8000000000000000000000000000000000000000000000000000");
+    std::cout << coind::data::difficulty_to_target(v3) << std::endl;
+
+    std::cout << "\n4:\n";
+    auto v4 = uint256S("8420842108421084210842108421084210842108421084210842108");
+    std::cout << coind::data::difficulty_to_target(v4) << std::endl;
+}
