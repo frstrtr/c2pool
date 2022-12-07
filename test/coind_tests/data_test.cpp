@@ -206,3 +206,57 @@ TEST(CoindDataTest, DifficultyToTarget)
     auto v4 = uint256S("8420842108421084210842108421084210842108421084210842108");
     std::cout << coind::data::difficulty_to_target(v4) << std::endl;
 }
+
+TEST(CoindDataTest, TargetToAverageAttempts)
+{
+//    std::cout << "\n1:\n";
+//    auto v1 = uint256S("10000000000000000000000000000000000000000000000000000000000000000");
+//    std::cout << coind::data::target_to_average_attempts(v1) << std::endl;
+
+    std::cout << "\n2:\n";
+    auto v2 = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    std::cout  << coind::data::target_to_average_attempts(v2) << std::endl;
+
+    std::cout << "\n3:\n";
+    auto v3 = uint256S("8000000000000000000000000000000000000000000000000000000000000000");
+    std::cout << coind::data::target_to_average_attempts(v3) << std::endl;
+
+    std::cout << "\n4:\n";
+    auto v4 = uint256S("0");
+    std::cout << coind::data::target_to_average_attempts(v4) << std::endl;
+
+    std::cout << "\n5:\n";
+    auto v5 = uint256S("1");
+    std::cout << coind::data::target_to_average_attempts(v5) << std::endl;
+
+    std::cout << "\n6:\n";
+    auto v6 = uint256S("40000000");
+    std::cout << coind::data::target_to_average_attempts(v6) << std::endl;
+}
+
+TEST(CoindDataTest, AverageAttemptsToTarget)
+{
+//    std::cout << "\n1:\n";
+//    auto v1 = uint256S("10000000000000000000000000000000000000000000000000000000000000000");
+//    std::cout << coind::data::target_to_average_attempts(v1) << std::endl;
+
+    std::cout << "\n2:\n";
+    auto v2 = uint256S("1");
+    std::cout  << coind::data::average_attempts_to_target(v2) << std::endl;
+
+    std::cout << "\n3:\n";
+    auto v3 = uint256S("1");
+    std::cout << coind::data::average_attempts_to_target(v3) << std::endl;
+
+//    std::cout << "\n4:\n";
+//    auto v4 = uint256S("10000000000000000000000000000000000000000000000000000000000000000");
+//    std::cout << coind::data::average_attempts_to_target(v4) << std::endl;
+
+    std::cout << "\n5:\n";
+    auto v5 = uint256S("8000000000000000000000000000000000000000000000000000000000000000");
+    std::cout << coind::data::average_attempts_to_target(v5) << std::endl;
+
+    std::cout << "\n6:\n";
+    auto v6 = uint256S("3fffffff00000003fffffff00000003fffffff00000003fffffff0000");
+    std::cout << coind::data::average_attempts_to_target(v6) << std::endl;
+}
