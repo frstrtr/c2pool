@@ -130,7 +130,30 @@ namespace coind::data
 
     uint256 difficulty_to_target(uint256 difficulty)
     {
-        //TODO: return coind::data::python::PyBitcoindData::difficulty_to_target(difficulty);
+        uint288 targ;
+        targ.SetHex(difficulty.GetHex());
+
+        auto v = UintToArith288(targ);
+        std::cout << "v: " << v.GetHex() << std::endl;
+        if (targ.IsNull() || ((v-1) < 0))
+            return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+        uint288 u_s;
+        u_s.SetHex("1000000000000000000000000000000000000000000000000");
+
+        auto s = UintToArith288(u_s);
+        s *= 0xffff0000;
+        s += 1;
+
+        auto r = s/(v)-1;
+
+        std::cout << uint256S(r.GetHex()) << " " << UintToArith256(uint256S(r.GetHex())).GetCompact() << std::endl;
+        arith_uint256 r_test;
+        r_test.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
+        std:: cout << ArithToUint256(r_test);
+
+        std::cout << "Not a Double: " << r.GetHex() << std::endl;
+        return uint256S(r.GetHex()) ;
     }
 
 	uint256 get_txid(shared_ptr<coind::data::TransactionType> tx)
