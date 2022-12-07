@@ -41,15 +41,48 @@ def d2t_test(num):
     print('hex = {0}'.format(hex(res)))
 
 
+def at2t_test(num):
+    print('\naverage attempts to target for {0}:'.format(hex(num)))
+    res = average_attempts_to_target(num)
+    print("result = {0}".format(res))
+    print('hex = {0}'.format(hex(res)))
+
+
+def t2at_test(num):
+    print('\ntarget to average attempts for {0}:'.format(hex(num)))
+    res = target_to_average_attempts(num)
+    print("result = {0}".format(res))
+    print('hex = {0}'.format(hex(res)))
+    return res
+
+
 # target to difficulty
 diff1 = t2d_test(2 ** (256 / 2))
 diff2 = t2d_test(2 ** 256 - 1)
 diff3 = t2d_test(1)
 diff4 = t2d_test(30)
 
-print('\n###########\ndifficulty to target\n###########')
 # difficulty to target
+print('\n###########\ndifficulty to target\n###########')
 d2t_test(diff1)
 d2t_test(diff2)
 d2t_test(diff3)
 d2t_test(diff4)
+
+#target to average attempts
+print('\n###########\ntarget to average attempts\n###########')
+# att1 = t2at_test(2**256)
+att2 = t2at_test(2**256-1)
+att3 = t2at_test(2**256/2)
+att4 = t2at_test(0)
+att5 = t2at_test(1)
+att6 = t2at_test(2**30)
+
+#average attempts to target
+print('\n###########\naverage attempts to target\n###########')
+# at2t_test(att1)
+at2t_test(att2)
+at2t_test(att3)
+at2t_test(att4)
+at2t_test(att5)
+at2t_test(att6)
