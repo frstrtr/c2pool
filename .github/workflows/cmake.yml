@@ -34,12 +34,17 @@ jobs:
 
     - name: GCC INSTALL
       run: |
-        wget http://mirrors.kernel.org/ubuntu/pool/universe/g/gcc-8/gcc-8_8.5.0-0ubuntu4_amd64.deb
-        wget http://mirrors.kernel.org/ubuntu/pool/universe/g/gcc-8/gcc-8-base_8.5.0-0ubuntu4_amd64.deb
-        wget http://mirrors.kernel.org/ubuntu/pool/universe/g/gcc-8/libgcc-8-dev_8.5.0-0ubuntu4_amd64.deb
-        wget http://mirrors.kernel.org/ubuntu/pool/universe/g/gcc-8/cpp-8_8.5.0-0ubuntu4_amd64.deb
-        wget http://mirrors.kernel.org/ubuntu/pool/universe/g/gcc-8/libmpx2_8.5.0-0ubuntu4_amd64.deb
-        sudo apt install ./libmpx2_8.5.0-0ubuntu4_amd64.deb ./cpp-8_8.5.0-0ubuntu4_amd64.deb ./gcc-8-base_8.5.0-0ubuntu4_amd64.deb ./libgcc-8-dev_8.5.0-0ubuntu4_amd64.deb ./gcc-8_8.5.0-0ubuntu4_amd64.deb
+        # If we're not on 18.04 
+        sudo apt-get -y update
+
+        if [[ `lsb_release -rs` != "18.04" ]]   then   
+            echo "Adding ppa:ubuntu-toolchain-r/test apt-repository "
+            sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+            sudo apt-get -y update 
+        fi
+
+        sudo apt-get -y install build-essential
+        sudo apt-get -y install gcc-8 g++-8
 #        sudo apt install gcc-8 g++-8
 #        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 --slave /usr/bin/g++ g++ /usr/bin/g++-8
     
