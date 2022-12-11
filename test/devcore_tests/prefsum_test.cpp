@@ -226,3 +226,48 @@ TEST(Prefsum_test, main_test)
         ASSERT_EQ(test_reverse(prefsum, 9), comp);
     }
 }
+
+void write_head_n_tails(TestPrefsum& prefsum)
+{
+    //HEADS
+    std::cout << "HEADS: [";
+    for (auto head : prefsum.heads)
+    {
+        std::cout << "(" << head.first << ": " << head.second << "), ";
+    }
+    std::cout << "\b\b].\n";
+
+    //TAILS
+    std::cout << "TAILS: [";
+    for (auto tail : prefsum.tails)
+    {
+        std::cout << "(" << tail.first << ": [";
+        for (auto _h : tail.second)
+        {
+            std::cout << _h << ", ";
+        }
+        std::cout << "\b\b]), ";
+    }
+    std::cout << "\b\b].\n";
+}
+
+TEST(Prefsum_test, head_tails_test)
+{
+    TestPrefsum prefsum;
+    TestData first{1, 0, 100};
+    TestData second{3, 2, 300};
+    TestData third{2, 1, 200};
+
+
+    prefsum.add(first);
+    std::cout << "added first" << std::endl;
+    write_head_n_tails(prefsum);
+
+    prefsum.add(second);
+    std::cout << "added first" << std::endl;
+    write_head_n_tails(prefsum);
+
+    prefsum.add(third);
+    std::cout << "added first" << std::endl;
+    write_head_n_tails(prefsum);
+}

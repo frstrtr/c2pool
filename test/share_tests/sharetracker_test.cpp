@@ -348,4 +348,7 @@ TEST_F(SharechainsTest, sharestore_only)
     share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
 
     std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
+    std::cout << "shares: " << tracker->heads.size() << "/" << tracker->tails.size() << std::endl;
+    std::cout << "verified: " << tracker->verified.heads.size() << "/" << tracker->verified.tails.size() << std::endl;
+
 }

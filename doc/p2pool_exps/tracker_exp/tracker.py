@@ -251,11 +251,13 @@ class Tracker(object):
         if delta.head in self.items:
             raise ValueError('item already present')
 
+        #1
         if delta.head in self.tails:
             heads = self.tails.pop(delta.head)
         else:
             heads = set([delta.head])
 
+        #2
         if delta.tail in self.heads:
             tail = self.heads.pop(delta.tail)
         else:
@@ -264,10 +266,13 @@ class Tracker(object):
         self.items[delta.head] = item
         self.reverse.setdefault(delta.tail, set()).add(delta.head)
 
+        #3
         self.tails.setdefault(tail, set()).update(heads)
+        #4
         if delta.tail in self.tails[tail]:
             self.tails[tail].remove(delta.tail)
 
+        #5
         for head in heads:
             self.heads[head] = tail
 

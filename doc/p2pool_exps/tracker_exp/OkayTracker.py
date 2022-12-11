@@ -69,6 +69,7 @@ class OkayTracker(tracker.Tracker):
                         max(x.timestamp for x in self.get_chain(head, min(head_height, 5))),
                         min(x.target for x in self.get_chain(head, min(head_height, 5))),
                     ))
+        print('bads = {0}'.format(len(bads)))
         for bad in bads:
             assert bad not in self.verified.items
             #assert bad in self.heads
@@ -82,6 +83,7 @@ class OkayTracker(tracker.Tracker):
             except NotImplementedError:
                 pass
 
+        print('self.verified.heads len = {0}'.format(len(self.verified.heads)))
         # try to get at least CHAIN_LENGTH height for each verified head, requesting parents if needed
         for head in list(self.verified.heads):
             head_height, last_hash = self.verified.get_height_and_last(head)

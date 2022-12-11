@@ -117,11 +117,13 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
 
     std::vector<uint256> bads;
 
+    int i1 = 0;
     for (auto [head, tail] : heads)
     {
         // only unverified heads
         if (verified.heads.find(head) != verified.heads.end())
             continue;
+        i1++;
 
         auto [head_height, last] = get_height_and_last(head);
 
@@ -164,7 +166,9 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
                            });
         }
     }
+    std::cout << "heads - verified.heads = " << i1 << std::endl;
 
+    std::cout << "bads = " << bads.size() << std::endl;
     for (auto bad : bads)
     {
         if (verified.items.count(bad) != 0)
@@ -183,6 +187,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
         }
     }
 
+    std::cout << "self.verified.heads len = " << verified.heads.size() << std::endl;
     for (auto [head, tail] : verified.heads)
     {
         auto [head_height, last_hash] = verified.get_height_and_last(head);
