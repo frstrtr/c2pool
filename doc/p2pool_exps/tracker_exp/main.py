@@ -47,7 +47,9 @@ for share_hash in known_verified:
     if share_hash in tracker.items:
         tracker.verified.add(tracker.items[share_hash])
 
-
+print('{0}-{1}'.format(len(tracker.items), len(tracker.verified.items)))
+print('shares: {0}/{1}'.format(len(tracker.heads), len(tracker.tails)))
+print('verified: {0}/{1}'.format(len(tracker.verified.heads), len(tracker.verified.tails)))
 
 previous_block = None
 bits = None
