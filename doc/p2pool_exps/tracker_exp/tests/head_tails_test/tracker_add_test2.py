@@ -25,3 +25,11 @@ write_ht(track)
 third = PresudoShare([2,1])
 track.add(third)
 write_ht(track)
+
+new_end = PresudoShare([-2, 3])
+track.add(new_end)
+write_ht(track)
+
+fork = PresudoShare([-4, 2])
+track.add(fork)
+write_ht(track)
