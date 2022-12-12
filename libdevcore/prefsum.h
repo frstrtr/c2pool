@@ -228,7 +228,10 @@ public:
         auto result = none_element(item);
 
         if (items.find(result.tail) != items.end())
+        {
+            std::cout << "EXIST: " << sum[result.tail].height << std::endl;
             result = sum[result.tail];
+        }
 
         return result;
     }
