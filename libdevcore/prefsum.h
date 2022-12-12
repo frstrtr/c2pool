@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <set>
+#include <queue>
 
 #include "events.h"
 
@@ -70,8 +71,6 @@ public:
         return _erase(sub);
     }
 
-
-
     BasePrefsumElement() {}
 };
 
@@ -83,6 +82,7 @@ public:
     typedef typename element_type::key_type key_type;
     typedef typename element_type::value_type value_type;
     typedef typename std::map<key_type, value_type>::iterator it_items;
+    typedef typename std::map<key_type, element_type>::iterator it_sums;
 public:
     std::map<key_type, value_type> items;
     std::map<key_type, element_type> sum;
@@ -107,6 +107,14 @@ public:
         element.pvalue = items.end();
         element.prev = sum.find(element.tail);
         element.height = 1;
+
+        if (tails.find(element.head) != tails.end())
+        {
+            for (auto v : tails[element.head])
+            {
+                element.next.push_back(sum.find(v));
+            }
+        }
 
         return _make_element(element, value);
     }
@@ -141,16 +149,22 @@ public:
         reverse[value.tail].push_back(items.find(value.head));
 
         //--Add value to sum
-        if (value.prev != sum.end())
+        auto &it = sum[value.head];
+        it = std::move(value);
+
+        if (it.prev != sum.end())
         {
-            value.push(value.prev->second);
-            auto &it = sum[value.head];
-            it = std::move(value);
+            it.push(it.prev->second);
             it.prev->second.next.push_back(sum.find(it.head));
-        } else
-        {
-            sum[value.head] = std::move(value);
         }
+
+        //--Add this value to next sum's
+        // TODO: can be optimize: оптимизация памяти в процессе обхода дерева, путем прабавления ко всем элементам одного и того же значения, а не предыдущего к нему.
+//        std::queue<it_sums> next_tree {it.next.begin(), it.next.end()};
+//        while (!next_tree.empty())
+//        {
+//            next_tree
+//        }
 
         //--update heads and tails
 
