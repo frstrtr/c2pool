@@ -259,15 +259,17 @@ TEST(Prefsum_test, head_tails_test)
     TestData third{2, 1, 200};
 
 
+    write_head_n_tails(prefsum);
+
     prefsum.add(first);
     std::cout << "added first" << std::endl;
     write_head_n_tails(prefsum);
 
     prefsum.add(second);
-    std::cout << "added first" << std::endl;
+    std::cout << "added second" << std::endl;
     write_head_n_tails(prefsum);
 
     prefsum.add(third);
-    std::cout << "added first" << std::endl;
+    std::cout << "added third" << std::endl;
     write_head_n_tails(prefsum);
 }

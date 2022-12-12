@@ -124,6 +124,7 @@ public:
     {
         //--Make PrefsumElement from value_type
         auto value = make_element(_value);
+        auto delta = value;
 
         if (value.is_none())
             throw std::invalid_argument("value is none!");
@@ -156,33 +157,90 @@ public:
         // проверка на то, что новый элемент не является началом уже существующей части,
         // т.е. head нового элемента -- tail уже существующего в prefsum.
         std::set<key_type> _heads;
-        if (tails.find(value.head) != tails.end())
+        std::cout << "delta.head = " << delta.head << std::endl;
+        std::cout << "tails: ";
+        for (auto v : tails){
+            std::cout << v.first << " ";
+        }
+        std::cout << std::endl;
+        if (tails.find(delta.head) != tails.end())
         {
-            _heads = tails[value.head];
-            tails.erase(value.head); // TODO: optimize
+            std::cout << "tails1" << std::endl;
+            _heads = tails[delta.head];
+            tails.erase(delta.head);
         } else
         {
-            _heads = {value.head};
+            std::cout << "tails2" << std::endl;
+            _heads = {delta.head};
         }
+        std::cout << "tails: ";
+        for (auto v : tails){
+            std::cout << v.first << " [";
+            for (auto vv : v.second){
+                std::cout << vv << ",";
+            }
+            std::cout << "]; ";
+        }
+        std::cout << std::endl;
 
         // Проверка на то, что новый элемент не является ли продолжением уже существующей части,
         // т.е. tail нового элемента -- head уже существующего в prefsum.
         key_type _tail;
-        if (heads.find(value.tail) != heads.end())
+        if (heads.find(delta.tail) != heads.end())
         {
-            _tail = heads[value.tail];
-            heads.erase(value.tail);
+            std::cout << "heads1" << std::endl;
+            _tail = heads[delta.tail];
+            heads.erase(delta.tail);
         } else
         {
-            _tail = get_last(value.tail);
+            std::cout << "heads2" << std::endl;
+            _tail = get_last(delta.tail);
         }
+
+        std::cout << "_tail: " << _tail << std::endl;
+        std::cout << "_heads: ";
+        for (auto v : _heads){
+            std::cout << v << " ";
+        }
+        std::cout << std::endl;
+
+
+        std::cout << "tails: ";
+        for (auto v : tails){
+            std::cout << v.first << " [";
+            for (auto vv : v.second){
+                std::cout << vv << ",";
+            }
+            std::cout << "]; ";
+        }
+        std::cout << std::endl;
 
         if (tails.count(_tail))
             tails[_tail].insert(_heads.begin(), _heads.end());
         else
             tails[_tail] = _heads;
-        if (tails.empty() && (tails[_tail].find(value.tail) != tails[_tail].end()))
-            tails[value.tail].erase(value.tail);
+        std::cout << "tails: ";
+        for (auto v : tails){
+            std::cout << v.first << " [";
+            for (auto vv : v.second){
+                std::cout << vv << ",";
+            }
+            std::cout << "]; ";
+        }
+        std::cout << std::endl;
+
+        if (!tails.empty() && (tails[_tail].find(delta.tail) != tails[_tail].end()))
+            tails[_tail].erase(delta.tail);
+
+        std::cout << "tails: ";
+        for (auto v : tails){
+            std::cout << v.first << " [";
+            for (auto vv : v.second){
+                std::cout << vv << ",";
+            }
+            std::cout << "]; ";
+        }
+        std::cout << std::endl;
 
         for (auto _head : _heads)
         {
