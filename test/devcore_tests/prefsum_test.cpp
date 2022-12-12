@@ -272,4 +272,6 @@ TEST(Prefsum_test, head_tails_test)
     prefsum.add(third);
     std::cout << "added third" << std::endl;
     write_head_n_tails(prefsum);
+
+    std::cout << "height: " << prefsum.get_sum_to_last(3).height << std::endl;
 }

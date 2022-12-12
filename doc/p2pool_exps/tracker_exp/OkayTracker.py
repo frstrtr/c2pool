@@ -105,6 +105,15 @@ class OkayTracker(tracker.Tracker):
                 ))
 
         # decide best tree
+        
+        for tail_hash in self.verified.tails:
+            print('{0}:'.format(hex(tail_hash)))
+            print(self.verified.tails[tail_hash])
+            max_value = max(self.verified.tails[tail_hash], key=self.verified.get_work)
+            print('max_value = {0}'.format(hex(max_value)))
+            print(self.verified.get_height(max_value))
+            
+
         decorated_tails = sorted((self.score(max(self.verified.tails[tail_hash], key=self.verified.get_work), block_rel_height_func), tail_hash) for tail_hash in self.verified.tails)
         if True:
             print len(decorated_tails), 'tails:'
@@ -147,14 +156,23 @@ class OkayTracker(tracker.Tracker):
 
     def score(self, share_hash, block_rel_height_func):
         # returns approximate lower bound on chain's hashrate in the last self.net.CHAIN_LENGTH*15//16*self.net.SHARE_PERIOD time
+        
+        print("===SCORE BEGIN===")
 
         head_height = self.verified.get_height(share_hash)
+        print('head_height: {0}'.format(head_height))
         if head_height < self.net.CHAIN_LENGTH:
-            return head_height, None
+            res = head_height, None
+            print('res: {0}'.format(res))
+            print("===SCORE FINISH1===")
+            return res
 
         end_point = self.verified.get_nth_parent_hash(share_hash, self.net.CHAIN_LENGTH*15//16)
 
         block_height = max(block_rel_height_func(share.header['previous_block']) for share in
                            self.verified.get_chain(end_point, self.net.CHAIN_LENGTH//16))
-
-        return self.net.CHAIN_LENGTH, self.verified.get_delta(share_hash, end_point).work/((0 - block_height + 1)*self.net.PARENT.BLOCK_PERIOD)
+        
+        res = self.net.CHAIN_LENGTH, self.verified.get_delta(share_hash, end_point).work/((0 - block_height + 1)*self.net.PARENT.BLOCK_PERIOD)
+        print('res: {0}'.format(res))
+        print("===SCORE FINISH2===")
+        return res

@@ -351,4 +351,25 @@ TEST_F(SharechainsTest, sharestore_only)
     std::cout << "shares: " << tracker->heads.size() << "/" << tracker->tails.size() << std::endl;
     std::cout << "verified: " << tracker->verified.heads.size() << "/" << tracker->verified.tails.size() << std::endl;
 
+    for (auto v: tracker->verified.tails)
+    {
+        std::cout << v.first.GetHex() << ": " << std::endl;
+        uint256 last_el;
+        for (auto vv : v.second)
+        {
+            std::cout << vv.GetHex() << "; ";
+            last_el = vv;
+        }
+        std::cout << "\b\b\n";
+
+        std::cout << "max: " << last_el.GetHex() << std::endl;
+        std::cout << "height: " << tracker->verified.get_height(last_el) << std::endl;
+
+    }
+
+    for (auto v : tracker->sum)
+    {
+        std::cout << v.second.height << " ";
+    }
+    std::cout << std::endl;
 }
