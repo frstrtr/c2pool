@@ -75,6 +75,7 @@ public:
 
 	arith_uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
+    // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
 	std::tuple<int32_t, arith_uint256> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
 	{
 		arith_uint256 score_res;

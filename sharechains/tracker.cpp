@@ -247,6 +247,14 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     std::sort(decorated_tails.begin(), decorated_tails.end());
     auto [best_tail_score, _best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, UintToArith256(uint256::ZERO)), UintToArith256(uint256::ZERO)) : decorated_tails.back();
     auto best_tail = ArithToUint256(_best_tail);
+    if (true /*c2pool.DEBUG*/)
+    {
+        LOG_DEBUG << decorated_tails.size() << " tails";
+        for (auto [score, tail_hash] : decorated_tails)
+        {
+            LOG_DEBUG << tail_hash.GetHex() << " (" << std::get<0>(score) << ", " << std::get<1>(score).GetHex() << ")";
+        }
+    }
 
     //TODO: test for compare with p2pool
     std::vector<std::tuple<std::tuple<arith_uint256, int32_t, int32_t>, arith_uint256>> decorated_heads;
