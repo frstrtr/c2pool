@@ -260,7 +260,6 @@ class Tracker(object):
         #3
         print("_HEADS: {0}".format(heads))
         self.tails.setdefault(tail, set()).update(heads)
-        print(self.tails)
         #4
         if delta.tail in self.tails[tail]:
             self.tails[tail].remove(delta.tail)
