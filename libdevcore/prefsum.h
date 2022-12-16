@@ -5,6 +5,7 @@
 #include <vector>
 #include <set>
 #include <queue>
+#include <boost/format.hpp>
 
 #include "events.h"
 
@@ -43,7 +44,7 @@ public:
     virtual sub_element_type& push(const sub_element_type &sub)
     {
         if (tail != sub.head)
-            throw std::invalid_argument("tail != sub.head");
+            throw std::invalid_argument((boost::format("tail [%1%] != sub.head [%2%].") % tail % sub.head).str());
 
         tail = sub.tail;
         height += sub.height;
@@ -108,13 +109,20 @@ public:
         element.prev = sum.find(element.tail);
         element.height = 1;
 
-        if (tails.find(element.head) != tails.end())
+        if (reverse.find(element.head) != reverse.end())
         {
-            for (auto v : tails[element.head])
+            for (auto v : reverse[element.head])
             {
-                element.next.push_back(sum.find(v));
+                element.next.push_back(sum.find(v->first));
             }
         }
+//        if (tails.find(element.head) != tails.end())
+//        {
+//            for (auto v : tails[element.head])
+//            {
+//                element.next.push_back(sum.find(v));
+//            }
+//        }
 
         return _make_element(element, value);
     }
@@ -160,11 +168,26 @@ public:
 
         //--Add this value to next sum's
         // TODO: can be optimize: оптимизация памяти в процессе обхода дерева, путем прабавления ко всем элементам одного и того же значения, а не предыдущего к нему.
-//        std::queue<it_sums> next_tree {it.next.begin(), it.next.end()};
-//        while (!next_tree.empty())
-//        {
-//            next_tree
-//        }
+        std::queue<it_sums> next_tree;
+        for (auto v : it.next)
+            next_tree.push(v);
+
+        while (!next_tree.empty())
+        {
+            auto v = next_tree.front();
+            next_tree.pop();
+
+            for (auto v_next : v->second.next)
+            {
+                next_tree.push(v_next);
+            }
+
+            // new calculate
+            auto new_value = make_element((v->second.pvalue)->second);
+            new_value.pvalue = v->second.pvalue;
+            new_value.push(new_value.prev->second);
+            sum[v->first] = new_value;
+        }
 
         //--update heads and tails
 
@@ -243,7 +266,7 @@ public:
 
         if (items.find(result.tail) != items.end())
         {
-            std::cout << "EXIST: " << sum[result.tail].height << std::endl;
+//            std::cout << "EXIST: " << sum[result.tail].height << std::endl;
             result = sum[result.tail];
         }
 
