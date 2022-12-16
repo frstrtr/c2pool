@@ -259,6 +259,7 @@ TEST(Prefsum_test, head_tails_test)
     TestData third{2, 1, 200};
     TestData new_end{-2, 3, -200};
     TestData fork{-4, 2, -400};
+    TestData zero{0, -1, 1};
 
 
     write_head_n_tails(prefsum);
@@ -283,6 +284,10 @@ TEST(Prefsum_test, head_tails_test)
     std::cout << "added fork" << std::endl;
     write_head_n_tails(prefsum);
 
+    prefsum.add(zero);
+    std::cout << "added zero" << std::endl;
+    write_head_n_tails(prefsum);
+
 
     std::cout << "height: " << prefsum.get_sum_to_last(3).height << std::endl;
 
@@ -296,4 +301,9 @@ TEST(Prefsum_test, head_tails_test)
         std::cout << std::endl;
     }
     std::cout << std::endl;
+
+    for (auto v: prefsum.sum)
+    {
+        std::cout << v.first << "\n" << v.second.head << "->" << v.second.prev->second.head << ": " << v.second.i << " " << v.second.height << std::endl;
+    }
 }
