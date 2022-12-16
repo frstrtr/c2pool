@@ -372,4 +372,5 @@ TEST_F(SharechainsTest, sharestore_only)
         std::cout << v.second.height << " ";
     }
     std::cout << std::endl;
+
 }
