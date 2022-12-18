@@ -3,12 +3,17 @@ import argparse
 import net as _net
 import random
 import height_tracker
+import coind_data
+import pack
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-shares', action='store', dest='shares')
 args = parser.parse_args()
 
 share_store_path = args.shares
+
+# print(pack.FloatingIntegerType().unpack('1b00f7a2'.decode('hex')).target)
+# exit()
 
 # Network
 net = _net
@@ -57,4 +62,14 @@ known_txs_var = {}
 get_height_rel_highest = height_tracker.get_height_rel_highest_func(lambda: previous_block)#self.bitcoind, self.factory, lambda: self.bitcoind_work.value['previous_block'], self.net)
 best, desired, decorated_heads, bad_peer_addresses = tracker.think(get_height_rel_highest, previous_block, bits, known_txs_var)
 print(hex(best))
+b_height, b_last = tracker.get_height_and_last(best)
 print(tracker.get_height_and_last(best))
+
+
+print('\n=====================\nGetCumulativeWeights\n=====================\n')
+print(hex(coind_data.target_to_average_attempts(0)-1))
+print(hex(65535*net.SPREAD*(coind_data.target_to_average_attempts(0)-1)))
+tracker.get_cumulative_weights(best, 
+    max(0, min(b_height, net.REAL_CHAIN_LENGTH) - 1),
+    65535*net.SPREAD*coind_data.target_to_average_attempts(0)
+)

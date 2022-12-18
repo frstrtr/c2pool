@@ -33,10 +33,14 @@ namespace coind::data
         return false;
     }
 
-    uint256 target_to_average_attempts(uint256 target)
+    arith_uint288 target_to_average_attempts(uint256 target)
     {
         if (target.IsNull())
-            return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        {
+            arith_uint288 res;
+            res.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            return res;
+        }
 
         arith_uint288 targ;
         targ.SetHex(target.GetHex());
@@ -45,10 +49,10 @@ namespace coind::data
         s.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
 
         s /= (targ + 1);
-        return uint256S(s.GetHex());
+        return s;
     }
 
-    uint256 average_attempts_to_target(uint256 average_attempts)
+    uint256 average_attempts_to_target(uint288 average_attempts)
     {
         assert(!average_attempts.IsNull());
 
