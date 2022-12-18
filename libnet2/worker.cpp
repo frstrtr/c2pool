@@ -270,6 +270,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	}
 
     //6
+    LOG_TRACE << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
     shares::GenerateShareTransaction generate_transaction(_tracker);
     generate_transaction.
             set_block_target(FloatingInteger(current_work.value().bits).target()).

@@ -32,9 +32,9 @@ namespace coind::data
 
     bool is_segwit_tx(shared_ptr<coind::data::TransactionType> tx);
 
-    uint256 target_to_average_attempts(uint256 target);
+    arith_uint288 target_to_average_attempts(uint256 target);
 
-    uint256 average_attempts_to_target(uint256 average_attempts);
+    uint256 average_attempts_to_target(uint288 average_attempts);
 
     double target_to_difficulty(uint256 target);
 

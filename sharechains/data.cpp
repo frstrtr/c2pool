@@ -326,9 +326,13 @@ namespace shares
 
 			int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
 
-			arith_uint256 desired_weight =
-					UintToArith256(coind::data::target_to_average_attempts(_block_target)) * 65535 * net->SPREAD;
+            LOG_TRACE << "block_target: " << _block_target.GetHex();
+            auto _block_target_attempts = UintToArith256(coind::data::target_to_average_attempts(_block_target));
+            LOG_TRACE << "_block_target_attempts: " << _block_target_attempts.GetHex();
 
+			arith_uint256 desired_weight = _block_target_attempts * 65535 * net->SPREAD;
+
+            LOG_TRACE << "For get_cumulative_weights: " << start_hash.GetHex() << " " << max_shares << " " << desired_weight.GetHex();
 			auto weights_result = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
 			weights = std::get<0>(weights_result);
 			total_weight = std::get<1>(weights_result);

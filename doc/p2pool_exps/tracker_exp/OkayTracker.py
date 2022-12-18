@@ -26,7 +26,7 @@ class OkayTracker(tracker.Tracker):
         self.verified = tracker.SubsetTracker(delta_type=tracker.get_attributedelta_type(dict(tracker.AttributeDelta.attrs,
                                                                                             work=lambda share: coind_data.target_to_average_attempts(share.target),
                                                                                             )), subset_of=self)
-        # self.get_cumulative_weights = WeightsSkipList(self)
+        self.get_cumulative_weights = tracker.WeightsSkipList(self)
 
     def attempt_verify(self, share):
         if share.hash in self.verified.items:
