@@ -301,6 +301,13 @@ arith_uint256 UintToArith256(const uint256 &a)
     return b;
 }
 
+uint288 ArithToUint288(const arith_uint288 &a)
+{
+    uint288 b;
+    for(int x=0; x<a.WIDTH; ++x)
+        WriteLE32(b.begin() + x*4, a.pn[x]);
+    return b;
+}
 arith_uint288 UintToArith288(const uint288 &a)
 {
     arith_uint288 b;
