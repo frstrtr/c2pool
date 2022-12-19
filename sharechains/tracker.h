@@ -76,10 +76,10 @@ public:
 	arith_uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
     // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
-	std::tuple<int32_t, arith_uint256> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
+	std::tuple<int32_t, arith_uint288> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
 	{
         std::cout << "===SCORE BEGIN===" << std::endl;
-		arith_uint256 score_res;
+		arith_uint288 score_res;
 		auto head_height = verified.get_height(share_hash);
         std::cout << "head_height: " << head_height << std::endl;
 		if (head_height < net->CHAIN_LENGTH)
@@ -120,7 +120,7 @@ public:
 
     std::map<uint64_t, uint256> get_desired_version_counts(uint256 best_share_hash, uint64_t dist)
     {
-        std::map<uint64_t, arith_uint256> _result;
+        std::map<uint64_t, arith_uint288> _result;
 
         auto get_chain_func = get_chain(best_share_hash, dist);
         uint256 hash;
@@ -132,7 +132,7 @@ public:
             if (_result.find(*share->desired_version) == _result.end())
                 _result[*share->desired_version] = 0;
 
-            _result[*share->desired_version] += UintToArith256(coind::data::target_to_average_attempts(share->target)) + 1;
+            _result[*share->desired_version] += coind::data::target_to_average_attempts(share->target) + 1;
         }
 
         std::map<uint64_t, uint256> result;

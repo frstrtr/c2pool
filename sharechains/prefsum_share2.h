@@ -28,8 +28,8 @@ namespace shares
             return *this;
         }
     public:
-        arith_uint256 work;
-        arith_uint256 min_work;
+        arith_uint288 work;
+        arith_uint288 min_work;
         weight::weight_element_type weight;
         doa_element_type doa;
 
@@ -41,7 +41,7 @@ namespace shares
 
         bool is_none() override
         {
-            return ArithToUint256(work).IsNull() && ArithToUint256(min_work).IsNull() &&
+            return ArithToUint288(work).IsNull() && ArithToUint288(min_work).IsNull() &&
                    height == 0;
         }
 

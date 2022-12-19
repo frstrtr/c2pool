@@ -20,16 +20,16 @@ namespace shares::weight
 	{
 	public:
 		weight_element_ptr prev;
-		std::pair<std::vector<unsigned char>, arith_uint256> amount;
+		std::pair<std::vector<unsigned char>, arith_uint288> amount;
 
-		weight_element(std::vector<unsigned char> _key, arith_uint256 _value)
+		weight_element(std::vector<unsigned char> _key, arith_uint288 _value)
 		{
 			amount = std::make_pair(_key, _value);
 		}
 
-		std::map<std::vector<unsigned char>, arith_uint256> get_map()
+		std::map<std::vector<unsigned char>, arith_uint288> get_map()
 		{
-			std::map<std::vector<unsigned char>, arith_uint256> result;
+			std::map<std::vector<unsigned char>, arith_uint288> result;
 			auto it = shared_from_this();
 
 			while (it)
@@ -61,22 +61,22 @@ namespace shares::weight
 	{
 	public:
 		weight_element_ptr weights;
-		arith_uint256 total_weight;
-		arith_uint256 total_donation_weight;
+		arith_uint288 total_weight;
+		arith_uint288 total_donation_weight;
 
 	public:
 		weight_element_type() = default;
 
 		weight_element_type(ShareType share)
 		{
-			auto att = UintToArith256(coind::data::target_to_average_attempts(share->target));
+			auto att = coind::data::target_to_average_attempts(share->target);
 
 			weights = std::make_shared<weight_element>(share->new_script.data, att * (65535 - *share->donation));
 			total_weight = att * 65535;
 			total_donation_weight = att * (*share->donation);
 		}
 
-		weight_element_type(weight_element_ptr _weights, arith_uint256 _total_weight, arith_uint256 _total_donation_weight)
+		weight_element_type(weight_element_ptr _weights, arith_uint288 _total_weight, arith_uint288 _total_donation_weight)
 		{
 			weights = _weights;
 			total_weight = _total_weight;
