@@ -44,7 +44,17 @@ public:
         memset(m_data, 0, sizeof(m_data));
     }
 
-    inline int Compare(const base_blob& other) const { return memcmp(m_data, other.m_data, sizeof(m_data)); }
+    inline int Compare(const base_blob& other) const {
+//        return memcmp(m_data, other.m_data, sizeof(m_data));
+        for (int i = WIDTH - 1; i >= 0; i--)
+        {
+            if (m_data[i] < other.m_data[i])
+                return -1;
+            if (m_data[i] > other.m_data[i])
+                return 1;
+        }
+        return 0;
+    }
 
     friend inline bool operator==(const base_blob& a, const base_blob& b) { return a.Compare(b) == 0; }
     friend inline bool operator!=(const base_blob& a, const base_blob& b) { return a.Compare(b) != 0; }
