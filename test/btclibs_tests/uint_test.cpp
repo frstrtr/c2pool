@@ -169,6 +169,18 @@ TEST(Btclibs, UINT256_TO_UINT64)
     ASSERT_EQ(4294967294, third64);
 }
 
+int COMPARE(const uint256& a, const uint256& b)
+{
+    for (int i = a.WIDTH - 1; i >= 0; i--)
+    {
+        if (a.m_data[i] < b.m_data[i])
+            return -1;
+        if (a.m_data[i] > b.m_data[i])
+            return 1;
+    }
+    return 0;
+}
+
 TEST(Btclibst, SortUINT256)
 {
     std::vector<int> _nums = {2,4,1,3,5,7,6};
@@ -181,7 +193,8 @@ TEST(Btclibst, SortUINT256)
 
     std::vector<uint256> nums;
     std::vector<arith_uint256> nums2;
-    const int test_size = 3;
+    std::vector<uint256> nums3;
+    const int test_size = 7;
 
     for (int i = 0; i < test_size; i++)
     {
@@ -190,13 +203,23 @@ TEST(Btclibst, SortUINT256)
 
         nums.push_back(num);
         nums2.push_back(num2);
+        nums3.push_back(num);
     }
 
     std::sort(nums.begin(), nums.end());
     std::sort(nums2.begin(), nums2.end());
+    std::sort(nums3.begin(), nums3.end(), [&](const auto& a, const auto& b){
+        return COMPARE(a, b) < 0;
+    });
 
     for (int i = 0; i < test_size; i++)
     {
         std::cout << nums[i].GetHex() << "\t" << ArithToUint256(nums2[i]).GetHex() << std::endl;
+    }
+
+    std::cout << "nums3:\n";
+    for (int i = 0; i < test_size; i++)
+    {
+        std::cout << nums3[i].GetHex() << "\t" << ArithToUint256(nums2[i]).GetHex() << std::endl;
     }
 }
