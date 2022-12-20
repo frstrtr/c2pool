@@ -20,7 +20,7 @@ class base_blob
 {
 public:
     static constexpr int WIDTH = BITS / 8;
-protected:
+public:
     uint8_t m_data[WIDTH];
 public:
     /* construct 0 value by default */
