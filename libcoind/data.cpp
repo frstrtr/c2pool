@@ -52,12 +52,9 @@ namespace coind::data
         return s;
     }
 
-    uint256 average_attempts_to_target(uint288 average_attempts)
+    uint256 average_attempts_to_target(arith_uint288 att)
     {
-        assert(!average_attempts.IsNull());
-
-        arith_uint288 att;
-        att.SetHex(average_attempts.GetHex());
+        assert(!att.IsNull());
 
         std::cout << "att: " << att.GetHex() << std::endl;
 
@@ -77,10 +74,16 @@ namespace coind::data
         r_round.SetCompact(UintToArith256(uint256S(s.GetHex())).GetCompact() + 0.5);
         s.SetHex(ArithToUint256(r_round).GetHex());
 
-
-
         std::cout << "Not a Double: " << s.GetHex() << std::endl;
-        return uint256S(s.GetHex()) ;
+        return uint256S(s.GetHex());
+    }
+
+    uint256 average_attempts_to_target(uint288 average_attempts)
+    {
+        arith_uint288 att;
+        att.SetHex(average_attempts.GetHex());
+
+        return average_attempts_to_target(att);
     }
 
     double target_to_difficulty(uint256 target)

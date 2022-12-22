@@ -63,7 +63,7 @@ struct worker_get_work_result
 
 struct local_rate_datum
 {
-    uint256 work;
+    uint288 work;
     bool dead;
     std::string user; // address
     uint256 share_target;
@@ -71,7 +71,7 @@ struct local_rate_datum
 
 struct local_addr_rate_datum
 {
-    uint256 work;
+    uint288 work;
     uint160 pubkey_hash;
 };
 
@@ -109,7 +109,7 @@ public:
 
     local_rates get_local_rates();
 
-    std::map<uint160, uint256> get_local_addr_rates();
+    std::map<uint160, uint288> get_local_addr_rates();
 
     stale_counts get_stale_counts();
 

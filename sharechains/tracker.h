@@ -73,7 +73,7 @@ public:
 
 	TrackerThinkResult think(boost::function<int32_t(uint256)> block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs);
 
-	arith_uint256 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
+	arith_uint288 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
     // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
 	std::tuple<int32_t, arith_uint288> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
@@ -144,8 +144,8 @@ public:
     }
 
 	//TODO: test!
-	std::tuple<std::map<std::vector<unsigned char>, arith_uint256>, arith_uint256, arith_uint256>
-	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint256 desired_weight)
+	std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
+	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint288 desired_weight)
 	{
 		// [last; best]
 		auto best = get_sum_to_last(start);
