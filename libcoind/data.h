@@ -34,6 +34,7 @@ namespace coind::data
 
     arith_uint288 target_to_average_attempts(uint256 target);
 
+    uint256 average_attempts_to_target(arith_uint288 att);
     uint256 average_attempts_to_target(uint288 average_attempts);
 
     double target_to_difficulty(uint256 target);

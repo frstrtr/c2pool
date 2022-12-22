@@ -134,13 +134,16 @@ namespace shares
 		{
 			auto attempts_per_second = tracker->get_pool_attempts_per_second(_share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true);
 
-            arith_uint256 pre_target;
-            pre_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            if (attempts_per_second != 0)
+            arith_uint288 pre_target;
+            pre_target.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+            if (!attempts_per_second.IsNull())
             {
                 //equal: 2**256/(net.SHARE_PERIOD*attempts_per_second) - 1
-                pre_target -= attempts_per_second*net->SHARE_PERIOD;
-                pre_target /= attempts_per_second*net->SHARE_PERIOD;
+                pre_target /= attempts_per_second * net->SHARE_PERIOD;
+                pre_target -= 1;
+            } else
+            {
+                pre_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             }
 
             arith_uint256 pre_target2;
@@ -148,7 +151,7 @@ namespace shares
                 arith_uint256 _max_target_div10 = UintToArith256(previous_share->max_target)/10;
                 arith_uint256 _min_clip = _max_target_div10*9;
                 arith_uint256 _max_clip = _max_target_div10*11;
-                pre_target2 = math::clip(pre_target, _min_clip, _max_clip);
+                pre_target2 = math::clip(Arith288ToArith256(pre_target), _min_clip, _max_clip);
             }
 
             _pre_target3 = math::clip(pre_target2, UintToArith256(net->MIN_TARGET), UintToArith256(net->MAX_TARGET));
@@ -314,9 +317,9 @@ namespace shares
 		}
 
 
-		std::map<std::vector<unsigned char>, arith_uint256> weights;
-		arith_uint256 total_weight;
-		arith_uint256 donation_weight;
+		std::map<std::vector<unsigned char>, arith_uint288> weights;
+		arith_uint288 total_weight;
+		arith_uint288 donation_weight;
 		{
 			uint256 start_hash;
 			if (previous_share)
@@ -327,10 +330,10 @@ namespace shares
 			int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
 
             LOG_TRACE << "block_target: " << _block_target.GetHex();
-            auto _block_target_attempts = UintToArith256(coind::data::target_to_average_attempts(_block_target));
+            auto _block_target_attempts = coind::data::target_to_average_attempts(_block_target);
             LOG_TRACE << "_block_target_attempts: " << _block_target_attempts.GetHex();
 
-			arith_uint256 desired_weight = _block_target_attempts * 65535 * net->SPREAD;
+			auto desired_weight = _block_target_attempts * 65535 * net->SPREAD;
 
             LOG_TRACE << "For get_cumulative_weights: " << start_hash.GetHex() << " " << max_shares << " " << desired_weight.GetHex();
 			auto weights_result = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
@@ -341,7 +344,7 @@ namespace shares
 
 		//assert
 		{
-			arith_uint256 sum_weights;
+			arith_uint288 sum_weights;
 			sum_weights.SetHex("0");
 			for (auto v : weights)
 			{
@@ -352,7 +355,7 @@ namespace shares
 		}
 
 		// 99.5% goes according to weights prior to this share
-		std::map<std::vector<unsigned char>, arith_uint256> amounts;
+		std::map<std::vector<unsigned char>, arith_uint288> amounts;
 		for (auto v : weights)
 		{
 			amounts[v.first] = v.second*199*_share_data.subsidy/(200*total_weight);
@@ -373,7 +376,7 @@ namespace shares
 			if (_donation_amount == amounts.end())
 				amounts[net->DONATION_SCRIPT] = 0;
 
-			arith_uint256 sum_amounts;
+			arith_uint288 sum_amounts;
 			sum_amounts.SetHex("0");
 			for (auto v: amounts)
 			{
@@ -433,7 +436,7 @@ namespace shares
 				}
 			};
 			std::vector<__share_tx> share_txs;
-			std::vector<uint256> txids;
+			std::vector<uint256> txids; //TODO:
 			for (auto h : other_transaction_hashes)
 			{
 				auto txid = coind::data::get_txid(_known_txs[h]);
@@ -499,7 +502,7 @@ namespace shares
 
             uint128 _abswork;
             {
-                arith_uint256 _temp;
+                arith_uint288 _temp;
                 if (previous_share)
                 {
                     auto _share_abswork = *previous_share->abswork;
@@ -507,7 +510,7 @@ namespace shares
                 }
 
                 _temp = _temp + coind::data::target_to_average_attempts(bits.target());
-                arith_uint256 pow2_128; // 2^128
+                arith_uint288 pow2_128; // 2^128
                 pow2_128.SetHex("100000000000000000000000000000000");
 
                 _temp = _temp >= pow2_128 ? _temp-pow2_128 : _temp; // _temp % pow2_128;

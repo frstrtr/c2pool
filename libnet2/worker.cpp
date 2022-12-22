@@ -246,12 +246,12 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	{
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
 		desired_share_target = coind::data::difficulty_to_target(uint256::ONE);
-		auto local_hash_rate = UintToArith256(local_addr_rates[pubkey_hash]);
+		auto local_hash_rate = UintToArith288(local_addr_rates[pubkey_hash]);
 		if (local_hash_rate > 0)
 		{
 			// limit to 1.67% of pool shares by modulating share difficulty
 			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
-					ArithToUint256(local_hash_rate * _net->SHARE_PERIOD / 0.0167)));
+					local_hash_rate * _net->SHARE_PERIOD / 0.0167));
 		}
 		auto lookbehind = 3600 / _net->SHARE_PERIOD;
 		block_subsidy = _coind_node->coind_work.value().subsidy;
@@ -704,19 +704,19 @@ local_rates Worker::get_local_rates()
     return {miner_hash_rates, miner_dead_hash_rates};
 }
 
-std::map<uint160, uint256> Worker::get_local_addr_rates()
+std::map<uint160, uint288> Worker::get_local_addr_rates()
 {
-    std::map<uint160, uint256> addr_hash_rates;
+    std::map<uint160, uint288> addr_hash_rates;
     auto [datums, dt] = local_addr_rate_monitor.get_datums_in_last();
 
     for (auto datum: datums)
     {
-        arith_uint256 temp;
-        temp = ((addr_hash_rates.find(datum.pubkey_hash) != addr_hash_rates.end()) ? addr_hash_rates[datum.pubkey_hash]
-                                                                                   : uint256::ZERO);
-        temp += UintToArith256(datum.work) / dt;
+        arith_uint288 temp;
+        temp = ((addr_hash_rates.find(datum.pubkey_hash) != addr_hash_rates.end()) ? UintToArith288(addr_hash_rates[datum.pubkey_hash])
+                                                                                   : UintToArith288(uint288()));
+        temp += UintToArith288(datum.work) / dt;
 
-        addr_hash_rates[datum.pubkey_hash] = ArithToUint256(temp);
+        addr_hash_rates[datum.pubkey_hash] = uint256S(temp.GetHex());
     }
 
     return addr_hash_rates;

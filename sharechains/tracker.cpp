@@ -232,7 +232,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     }
 
     // TODO: test for compare with p2pool
-    std::vector<std::tuple<std::tuple<int32_t, arith_uint256>, arith_uint256>> decorated_tails;
+    std::vector<std::tuple<std::tuple<int32_t, arith_uint288>, arith_uint256>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
         auto max_el = std::max_element(head_hashes.begin(), head_hashes.end(),
@@ -245,7 +245,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
         decorated_tails.push_back(_score);
     }
     std::sort(decorated_tails.begin(), decorated_tails.end());
-    auto [best_tail_score, _best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, UintToArith256(uint256::ZERO)), UintToArith256(uint256::ZERO)) : decorated_tails.back();
+    auto [best_tail_score, _best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, UintToArith288(uint288())), UintToArith256(uint256::ZERO)) : decorated_tails.back();
     auto best_tail = ArithToUint256(_best_tail);
     if (true /*c2pool.DEBUG*/)
     {
@@ -290,7 +290,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     }
 
     uint32_t timestamp_cutoff;
-    arith_uint256 target_cutoff;
+//    arith_uint256 target_cutoff;
 
     if (!best.IsNull())
     {
@@ -305,16 +305,16 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
 
         timestamp_cutoff = std::min((uint32_t)c2pool::dev::timestamp(), *best_share->timestamp) - 3600;
 
-        target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        target_cutoff /= ArithToUint256(std::get<1>(best_tail_score)).IsNull() ? UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) : (std::get<1>(best_tail_score) * net->SHARE_PERIOD + 1) * 2;
+//        target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//        target_cutoff /= ArithToUint256(std::get<1>(best_tail_score)).IsNull() ? UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) : (std::get<1>(best_tail_score) * net->SHARE_PERIOD + 1) * 2;
     } else
     {
         LOG_TRACE << "best is null";
         timestamp_cutoff = c2pool::dev::timestamp() - 24*60*60;
-        target_cutoff = UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
+//        target_cutoff = UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
     }
 
-    auto _target_cutoff = ArithToUint256(target_cutoff);
+//    auto _target_cutoff = ArithToUint256(target_cutoff);
 
     std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired_result;
     for (auto [peer_addr, hash, ts, targ] : desired)
@@ -325,7 +325,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     return {best, desired_result, decorated_heads, bad_peer_addresses};
 }
 
-arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
+arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
 {
 	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
@@ -338,7 +338,7 @@ arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 		time = 1;
 	}
 
-	arith_uint256 res;
+	arith_uint288 res;
 	if (min_work)
 	{
 		res = attempts_delta.min_work;
@@ -348,7 +348,7 @@ arith_uint256 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 	}
 	res /= time;
 
-	return res;
+    return res;
 }
 
 std::vector<uint256> ShareTracker::get_other_tx_hashes(ShareType share)
