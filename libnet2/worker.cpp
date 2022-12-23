@@ -261,10 +261,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind) * block_subsidy * (1 - donation_percentage/100);
 			if (expected_payout_per_block < _net->parent->DUST_THRESHOLD)
 			{
-				auto temp1 = UintToArith256(coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target())) * _net->SPREAD;
+				auto temp1 = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target()) * _net->SPREAD;
 				auto temp2 = temp1 * _net->parent->DUST_THRESHOLD / block_subsidy;
-				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
-						ArithToUint256(temp2)));
+				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(temp2));
 			}
 		}
 	}
@@ -359,7 +358,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 		{
 			//in p2pool: target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1)
 			// target 10 share responses every second by modulating pseudoshare difficulty
-			target = coind::data::average_attempts_to_target(local_hash_rate);
+			target = coind::data::average_attempts_to_target(Uint256ToUint288(local_hash_rate));
 		} else
         {
             //# If we don't yet have an estimated node hashrate, then we still need to not undershoot the difficulty.
@@ -370,14 +369,14 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             arith_uint256 temp_target;
 
             arith_uint256 temp_target3;
-            temp_target3 = coind::data::average_attempts_to_target(_coind_node->coind_work.value().bits.target());
+            temp_target3 = coind::data::average_attempts_to_target(Uint256ToUint288(_coind_node->coind_work.value().bits.target()));
             temp_target3 *= _net->SPREAD;
 
             arith_uint256 temp_target2;
             temp_target2 = temp_target2 * _net->parent->DUST_THRESHOLD / block_subsidy;
 
             temp_target =
-                    UintToArith256(coind::data::average_attempts_to_target(ArithToUint256(temp_target2))) * 3000;
+                    UintToArith256(coind::data::average_attempts_to_target(Arith256ToArith288(temp_target2))) * 3000;
 
             if (temp_target < UintToArith256(target))
             {
@@ -642,7 +641,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     // TODO: received_header_hashes.add(header_hash)
                     // TODO: for web static: self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(target), not on_time, user)
                     recent_shares_ts_work.push_back(
-                            {c2pool::dev::timestamp(), coind::data::target_to_average_attempts(target)});
+                            {c2pool::dev::timestamp(), ArithToUint288(coind::data::target_to_average_attempts(target))});
                     if (recent_shares_ts_work.size() > 50)
                     {
                         recent_shares_ts_work.erase(recent_shares_ts_work.begin(),
@@ -650,7 +649,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     }
                     local_rate_monitor.add_datum(
                             {
-                                    coind::data::target_to_average_attempts(target),
+                                    ArithToUint288(coind::data::target_to_average_attempts(target)),
                                     !on_time,
                                     user,
                                     FloatingInteger(gen_sharetx_res->share_info->bits).target()
@@ -659,7 +658,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                     local_addr_rate_monitor.add_datum(
                             {
-                                    coind::data::target_to_average_attempts(target),
+                                    ArithToUint288(coind::data::target_to_average_attempts(target)),
                                     pubkey_hash
                             }
                     );
@@ -685,7 +684,7 @@ local_rates Worker::get_local_rates()
             arith_uint256 temp;
             temp = ((miner_hash_rates.find(datum.user) != miner_hash_rates.end()) ? miner_hash_rates[datum.user]
                                                                                   : uint256::ZERO);
-            temp += UintToArith256(datum.work) / dt;
+//            temp += UintToArith256(datum.work) / dt; //TODO:
 
             miner_hash_rates[datum.user] = ArithToUint256(temp);
         }
@@ -696,7 +695,7 @@ local_rates Worker::get_local_rates()
             temp = ((miner_dead_hash_rates.find(datum.user) != miner_dead_hash_rates.end())
                     ? miner_dead_hash_rates[datum.user]
                     : uint256::ZERO);
-            temp += UintToArith256(datum.work) / dt;
+//            temp += UintToArith256(datum.work) / dt; //TODO:
             miner_dead_hash_rates[datum.user] = ArithToUint256(temp);
         }
     }
@@ -716,7 +715,7 @@ std::map<uint160, uint288> Worker::get_local_addr_rates()
                                                                                    : UintToArith288(uint288()));
         temp += UintToArith288(datum.work) / dt;
 
-        addr_hash_rates[datum.pubkey_hash] = uint256S(temp.GetHex());
+        addr_hash_rates[datum.pubkey_hash] = ArithToUint288(temp);
     }
 
     return addr_hash_rates;
