@@ -293,6 +293,13 @@ uint256 ArithToUint256(const arith_uint256 &a)
         WriteLE32(b.begin() + x*4, a.pn[x]);
     return b;
 }
+uint256 ArithToUint256(const arith_uint288 &a)
+{
+    uint256 b;
+    for(int x=0; x<a.WIDTH; ++x)
+        WriteLE32(b.begin() + x*4, a.pn[x]);
+    return b;
+}
 arith_uint256 UintToArith256(const uint256 &a)
 {
     arith_uint256 b;

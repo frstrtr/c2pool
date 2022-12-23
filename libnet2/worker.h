@@ -124,13 +124,14 @@ private:
 	{
 		if (recent_shares_ts_work.size() == 50)
 		{
-			auto hash_rate = std::accumulate(recent_shares_ts_work.begin()+1, recent_shares_ts_work.end(),  uint256::ZERO,
-											 [&](const uint256 &x, const std::tuple<int32_t, uint256> &y){
-				return x + std::get<1>(y);
-			});
-			hash_rate = ArithToUint256(UintToArith256(hash_rate) / (std::get<0>(recent_shares_ts_work.back()) - std::get<0>(recent_shares_ts_work.front())));
-			if (!hash_rate.IsNull())
-				return hash_rate;
+            //TODO: REWORK get_work
+//			auto hash_rate = std::accumulate(recent_shares_ts_work.begin()+1, recent_shares_ts_work.end(),  uint256::ZERO,
+//											 [&](const uint256 &x, const std::tuple<int32_t, uint256> &y){
+//				return x + std::get<1>(y);
+//			});
+//			hash_rate = ArithToUint256(UintToArith256(hash_rate) / (std::get<0>(recent_shares_ts_work.back()) - std::get<0>(recent_shares_ts_work.front())));
+//			if (!hash_rate.IsNull())
+//				return hash_rate;
 		}
 		return uint256::ZERO;
 	}
@@ -151,7 +152,7 @@ public:
 
     std::set<uint256> my_share_hashes;
     std::set<uint256> my_doa_share_hashes;
-    std::vector<std::tuple<int32_t, uint256>> recent_shares_ts_work;
+    std::vector<std::tuple<int32_t, uint288>> recent_shares_ts_work;
 
     Variable<std::tuple<int32_t, int32_t, int32_t>> removed_unstales;
     Variable<int32_t> removed_doa_unstales;

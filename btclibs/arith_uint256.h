@@ -305,6 +305,7 @@ public:
 
     friend uint288 ArithToUint288(const arith_uint288 &);
     friend arith_uint288 UintToArith288(const uint288 &);
+    friend uint256 ArithToUint256(const arith_uint288 &);
 
     arith_uint288& SetCompact(uint32_t nCompact, bool *pfNegative = nullptr, bool *pfOverflow = nullptr);
     uint32_t GetCompact(bool fNegative = false) const;
@@ -312,6 +313,7 @@ public:
 
 uint256 ArithToUint256(const arith_uint256 &);
 uint256 ArithToUint256(const arith_uint288 &);
+uint288 ArithToUint288(const arith_uint288 &);
 arith_uint256 UintToArith256(const uint256 &);
 arith_uint288 UintToArith288(const uint288 &);
 
