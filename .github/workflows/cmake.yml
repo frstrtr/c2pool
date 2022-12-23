@@ -11,7 +11,7 @@ jobs:
     # well on Windows or Mac.  You can convert this to a matrix build if you need
     # cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
 
     strategy:
       fail-fast: false
@@ -39,7 +39,7 @@ jobs:
         sudo apt-get -y update 
 
         sudo apt-get -y install build-essential
-        sudo apt-get -y install gcc-9 g++-9
+        sudo apt-get -y install gcc-8 g++-8
 #        sudo apt install gcc-8 g++-8
 #        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 --slave /usr/bin/g++ g++ /usr/bin/g++-8
     
@@ -52,7 +52,7 @@ jobs:
         key: libboost1.71-all-dev
     - name: Install boost
       run: |
-          sudo apt-get update && sudo apt-get install -yq libboost1.71-all-dev
+          sudo apt-get update && sudo apt-get install -yq libboost-filesystem1.71-dev && sudo apt-get install -yq libboost1.71-all-dev
           mkdir -p ~/boost
           for dep in libboost1.71-all-dev; do
             dpkg -L $dep | while IFS= read -r f; do if test -f $f; then echo $f; fi; done | xargs cp --parents --target-directory ~/boost/
