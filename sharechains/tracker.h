@@ -150,7 +150,8 @@ public:
 		// [last; best]
 		auto best = get_sum_to_last(start);
 		auto p = best.weight.total_weight - desired_weight;
-
+        LOG_TRACE << "[get_cumulative_weights]: p = " << p.GetHex();
+        LOG_TRACE << "[get_cumulative_weights]: p = " << best.weight.total_weight.GetHex();
 
 		auto it = sum.find(start);
 
