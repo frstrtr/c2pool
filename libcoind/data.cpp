@@ -35,12 +35,12 @@ namespace coind::data
 
     arith_uint288 target_to_average_attempts(uint256 target)
     {
-        if (target.IsNull())
-        {
-            arith_uint288 res;
-            res.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            return res;
-        }
+//        if (target.IsNull())
+//        {
+//            arith_uint288 res;
+//            res.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//            return res;
+//        }
 
         arith_uint288 targ;
         targ.SetHex(target.GetHex());

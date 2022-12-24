@@ -321,11 +321,7 @@ namespace shares
 		arith_uint288 total_weight;
 		arith_uint288 donation_weight;
 		{
-			uint256 start_hash;
-			if (previous_share)
-				start_hash = *previous_share->previous_hash;
-			else
-				start_hash.SetNull();
+			uint256 start_hash = prev_share_hash;
 
 			int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
 
