@@ -372,5 +372,28 @@ TEST_F(SharechainsTest, sharestore_only)
         std::cout << v.second.height << " ";
     }
     std::cout << std::endl;
+}
 
+TEST_F(SharechainsTest, weights_test)
+{
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
+    auto share_store = ShareStore(net);
+    share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
+
+    std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
+
+    boost::function<int32_t(uint256)> test_block_rel_height_func = [&](uint256 hash){return 0;};
+
+    std::vector<uint8_t> _bytes = {103, 108, 55, 240, 5, 80, 187, 245, 215, 227, 92, 1, 210, 201, 113, 66, 242, 76, 148, 121, 29, 76, 3, 170, 153, 253, 61, 21, 199, 77, 202, 35};
+    auto bytes_prev_block = c2pool::dev::bytes_from_uint8(_bytes);
+    uint256 previous_block(bytes_prev_block);
+
+
+    uint32_t bits = 453027171;
+    std::map<uint256, coind::data::tx_type> known_txs;
+
+    auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
+    std::cout << "Best = " << _best.GetHex() << std::endl;
+    std::cout << "pre for Best = " << tracker->get(_best)->previous_hash->GetHex();
 }
