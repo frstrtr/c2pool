@@ -294,6 +294,23 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     }
     // ShareData
     {
+        std::cout << "current_work:\n";
+        std::cout << "\tIsNull?: " << current_work.isNull() << std::endl;
+        std::cout << "\theight = " << current_work.value().height << std::endl;
+        std::cout << "\tcoinbaseflags = [";
+        for (auto v : current_work.value().coinbaseflags)
+        {
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << "]\n";
+        std::cout << "\tsubsidy = " << current_work.value().subsidy << std::endl;
+        std::cout << "\ttransaction_fees = [";
+        for (auto v: current_work.value().transaction_fees)
+        {
+            std::cout << (unsigned int) v << " ";
+        }
+        std::cout << "]\n";
+
         std::vector<unsigned char> coinbase;
 		{
 			CScript _coinbase;
