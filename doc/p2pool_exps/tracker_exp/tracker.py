@@ -254,6 +254,12 @@ class WeightsSkipList(TrackerSkipList):
     def finalize(self, (share_count, weights_list, total_weight, total_donation_weight), (max_shares, desired_weight)):
         assert share_count <= max_shares and total_weight <= desired_weight
         assert share_count == max_shares or total_weight == desired_weight
+        print('share_count = {0}'.format(share_count))
+        # print('weights_list = {0}'.format(weights_list))
+        print('total_weight = {0}'.format(total_weight))
+        print('total_donation_weight = {0}'.format(total_donation_weight))
+        print('max_shares = {0}'.format(max_shares))
+        print('desired_weight = {0}'.format(desired_weight))
         return p2pool_math.add_dicts(*p2pool_math.flatten_linked_list(weights_list)), total_weight, total_donation_weight
 
 class Tracker(object):
