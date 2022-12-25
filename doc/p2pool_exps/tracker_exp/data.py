@@ -53,7 +53,8 @@ class ShareStore(object):
             with open(filename, 'rb') as f:
                 i = 0
                 for line in f:
-                    if i >= 3457:
+                    # if i >= 3457:
+                    if i >= 17508:
                         break
                     i += 1
                     # try:

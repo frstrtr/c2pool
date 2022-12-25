@@ -5,7 +5,10 @@ import random
 import height_tracker
 import coind_data
 import pack
-import share
+import share as SHARE
+import p2pool_math
+import time
+import script
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-shares', action='store', dest='shares')
@@ -48,31 +51,36 @@ best, desired, decorated_heads, bad_peer_addresses = tracker.think(get_height_re
 print('best = {0}'.format(hex(best)))
 
 print('\n=====================\nGenerateShareTransaction\n=====================\n')
-share_info, gentx, other_transaction_hashes, get_share = share.NewShare.generate_transaction(
+current_work = {'height':0, 'coinbaseflags':'', 'subsidy':0, 'transaction_fees':[], 'bits':0}
+donation_percentage = 0.0
+pubkey_hash = int('78ecd67a8695aa4adc55b70f87c2fa3279cee6d0', 16)
+desired_share_target = int('00000000359dc900000000000000000000000000000000000000000000000000', 16)
+get_stale_counts = lambda : ((0,0), 0, (0,0))
+share_type = SHARE.Share
+
+share_info, gentx, other_transaction_hashes, get_share = share_type.generate_transaction(
                 tracker=tracker,
                 share_data=dict(
                     previous_share_hash=best,
-                    coinbase=(script.create_push_script([
-                        self.current_work.value['height'],
-                         ] + ([mm_data] if mm_data else []) + [
-                    ]) + self.current_work.value['coinbaseflags'])[:100],
+                    coinbase=(script.create_push_script([current_work['height']] + []) 
+                        + current_work['coinbaseflags'])[:100],
                     nonce=random.randrange(2**32),
                     pubkey_hash=pubkey_hash,
-                    subsidy=self.current_work.value['subsidy'],
-                    donation=math.perfect_round(65535*self.donation_percentage/100),
+                    subsidy=current_work['subsidy'],
+                    donation=p2pool_math.perfect_round(65535*donation_percentage/100),
                     stale_info=(lambda (orphans, doas), total, (orphans_recorded_in_chain, doas_recorded_in_chain):
                         'orphan' if orphans > orphans_recorded_in_chain else
                         'doa' if doas > doas_recorded_in_chain else
                         None
-                    )(*self.get_stale_counts()),
-                    desired_version=(share_type.SUCCESSOR if share_type.SUCCESSOR is not None else share_type).VOTING_VERSION,
+                    )(*get_stale_counts()),
+                    desired_version=17#(share.Share.SUCCESSOR if share.Share.SUCCESSOR is not None else share.Share).VOTING_VERSION,
                 ),
-                block_target=self.current_work.value['bits'].target,
+                block_target=pack.FloatingInteger(current_work['bits']).target,
                 desired_timestamp=int(time.time() + 0.5),
                 desired_target=desired_share_target,
                 ref_merkle_link=dict(branch=[], index=0),
-                desired_other_transaction_hashes_and_fees=zip(tx_hashes, self.current_work.value['transaction_fees']),
+                desired_other_transaction_hashes_and_fees=[],
                 net=net,
-                known_txs=tx_map,
-                base_subsidy=self.node.net.PARENT.SUBSIDY_FUNC(self.current_work.value['height']),
+                known_txs=[],
+                base_subsidy=7200000000000#net.PARENT.SUBSIDY_FUNC(current_work['height']),
             )
