@@ -1,7 +1,7 @@
 import data
 import pack
 import time
-import math
+import p2pool_math as math
 import coind_data
 import array
 
@@ -92,6 +92,7 @@ class BaseShare(object):
         previous_share = tracker.items[share_data['previous_share_hash']] if share_data['previous_share_hash'] is not None else None
         
         height, last = tracker.get_height_and_last(share_data['previous_share_hash'])
+        print('{0}, {1}, {2}'.format(height, net.REAL_CHAIN_LENGTH, hex(last)))
         assert height >= net.REAL_CHAIN_LENGTH or last is None
         if height < net.TARGET_LOOKBEHIND:
             pre_target3 = net.MAX_TARGET

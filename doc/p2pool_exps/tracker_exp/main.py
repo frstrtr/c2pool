@@ -84,32 +84,3 @@ weights, total_weight, donation_weight = tracker.get_cumulative_weights(best,
 print('\nweights = {0}'.format(weights))
 print('total_weight = {0}'.format(total_weight))
 print('donation_weight = {0}'.format(donation_weight))
-
-
-print('\n=====================\nGenerateShareTransaction\n=====================\n')
-share_info, gentx, other_transaction_hashes, get_share = share.Share.generate_transaction(
-                tracker=tracker,
-                share_data=dict(
-                    previous_share_hash=best,
-                    coinbase=(script.create_push_script([self.current_work.value['height']] + []) 
-                        + self.current_work.value['coinbaseflags'])[:100],
-                    nonce=random.randrange(2**32),
-                    pubkey_hash=pubkey_hash,
-                    subsidy=self.current_work.value['subsidy'],
-                    donation=math.perfect_round(65535*self.donation_percentage/100),
-                    stale_info=(lambda (orphans, doas), total, (orphans_recorded_in_chain, doas_recorded_in_chain):
-                        'orphan' if orphans > orphans_recorded_in_chain else
-                        'doa' if doas > doas_recorded_in_chain else
-                        None
-                    )(*self.get_stale_counts()),
-                    desired_version=(share_type.SUCCESSOR if share_type.SUCCESSOR is not None else share_type).VOTING_VERSION,
-                ),
-                block_target=self.current_work.value['bits'].target,
-                desired_timestamp=int(time.time() + 0.5),
-                desired_target=desired_share_target,
-                ref_merkle_link=dict(branch=[], index=0),
-                desired_other_transaction_hashes_and_fees=zip(tx_hashes, self.current_work.value['transaction_fees']),
-                net=self.node.net,
-                known_txs=tx_map,
-                base_subsidy=self.node.net.PARENT.SUBSIDY_FUNC(self.current_work.value['height']),
-            )
