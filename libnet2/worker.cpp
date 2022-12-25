@@ -270,6 +270,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //6
     LOG_TRACE << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
+    std::cout << "base_subsidy: " << _net->parent->SUBSIDY_FUNC(current_work.value().height) << std::endl;
     shares::GenerateShareTransaction generate_transaction(_tracker);
     generate_transaction.
             set_block_target(FloatingInteger(current_work.value().bits).target()).
@@ -294,6 +295,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     }
     // ShareData
     {
+        std::cout << "previous_share_hash: " << _pool_node->best_share.value().GetHex() << std::endl;
+        std::cout << "desired_share_target: " << desired_share_target.GetHex() << std::endl;
+        std::cout << "pubkey_hash: " << pubkey_hash.GetHex() << std::endl;
         std::cout << "current_work:\n";
         std::cout << "\tIsNull?: " << current_work.isNull() << std::endl;
         std::cout << "\theight = " << current_work.value().height << std::endl;
@@ -304,10 +308,17 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         }
         std::cout << "]\n";
         std::cout << "\tsubsidy = " << current_work.value().subsidy << std::endl;
+        std::cout << "\tbits = " << current_work.value().bits << std::endl;
         std::cout << "\ttransaction_fees = [";
         for (auto v: current_work.value().transaction_fees)
         {
             std::cout << (unsigned int) v << " ";
+        }
+        std::cout << "]\n";
+        std::cout << "\ttransaction[len = " << current_work.value().transactions.size() << "] = [";
+        for (auto v : current_work.value().transactions)
+        {
+            std::cout << v->version << " " << v->lock_time << " ";
         }
         std::cout << "]\n";
 
@@ -324,6 +335,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         StaleInfo stale_info;
 		{
 			auto v = get_stale_counts();
+            std::cout << "get_stale_counts: (" << std::get<0>(v.orph_doa) << ", " << std::get<1>(v.orph_doa) << "); (" << std::get<0>(v.recorded_in_chain) << ", " << std::get<1>(v.recorded_in_chain) << "); " << v.total << std::endl;
 			if (std::get<0>(v.orph_doa) > std::get<0>(v.recorded_in_chain))
 				stale_info = orphan;
 			else if (std::get<1>(v.orph_doa) > std::get<1>(v.recorded_in_chain))
