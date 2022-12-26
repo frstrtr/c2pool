@@ -21,3 +21,6 @@ target_link_libraries(only_stratum libcoind)
 
 add_executable(coind_n_pool coind_n_pool.cpp)
 target_link_libraries(coind_n_pool libcoind libnet2 libdevcore networks sharechains libp2ppreset)
+
+add_executable(net_parser exp/network_parser.cpp)
+target_link_libraries(net_parser networks Boost::program_options btclibs)
