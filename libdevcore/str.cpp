@@ -1,6 +1,5 @@
 #include "str.h"
 #include <cstring>
-#include <sstream>
 
 namespace c2pool::dev{
     void substr(char *dest, char *source, int from, unsigned int length)
