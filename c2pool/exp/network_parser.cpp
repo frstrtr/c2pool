@@ -5,11 +5,14 @@
 #include <boost/property_tree/ini_parser.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <networks/network.h>
+#include <libdevcore/str.h>
 
 void make_default_network()
 {
 
 };
+
+//#define SAVE
 
 int main()
 {
@@ -42,8 +45,17 @@ int main()
                 s_array += v + " ";
             }
             network.add("array", s_array);
-//            network.add_child("array", array_ar);
 
+            auto pref = c2pool::dev::vector_to_string(std::vector<unsigned char>{0x83, 0xE6, 0x5D, 0x2C, 0x81, 0xBF, 0x6D, 0x68});
+            std::cout << pref << std::endl;
+            auto _pref = c2pool::dev::string_to_vector<unsigned char>(pref);
+            for (auto v : _pref)
+            {
+                std::cout << v << "-";
+            }
+            std::cout << std::endl;
+
+            network.put("pref", pref);
 
             root.push_front(
                     ptree::value_type( "network", network)
