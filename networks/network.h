@@ -9,6 +9,9 @@
 #include "btclibs/uint256.h"
 #include <libdevcore/stream.h>
 
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/ini_parser.hpp>
+
 using std::shared_ptr;
 
 namespace coind::jsonrpc
@@ -16,7 +19,8 @@ namespace coind::jsonrpc
     class Coind;
 }
 
-namespace coind{
+namespace coind
+{
     class ParentNetwork;
 }
 
@@ -30,6 +34,8 @@ namespace c2pool
         const std::string net_name;
     public:
         std::shared_ptr<coind::ParentNetwork> parent;
+
+        static boost::property_tree::ptree make_default_network();
     public:
 		std::set<std::string> SOFTFORKS_REQUIRED;
         //std::tuple<std::string, std::string> = addr
@@ -99,7 +105,8 @@ namespace coind
     {
     public:
         const std::string net_name;
-        
+
+        static boost::property_tree::ptree make_default_network();
     public:
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x

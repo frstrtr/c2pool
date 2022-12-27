@@ -61,7 +61,8 @@ int main()
                     ptree::value_type( "network", network)
             );
 
-            write_ini(f, root);
+//            write_ini(f, root);
+            write_ini(f, c2pool::Network::make_default_network());
         } else
         {
             std::cout << "Error when opening network .cfg: " << ec.message() << std::endl;
