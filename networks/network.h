@@ -27,6 +27,9 @@ namespace coind
 namespace c2pool
 {
 #define CREATE_ADDR(addr, port) std::make_tuple<std::string, std::string>(addr, port)
+    class Network;
+
+    std::shared_ptr<c2pool::Network> load_network_file(std::string net_name);
 
     class Network
     {
@@ -36,6 +39,7 @@ namespace c2pool
         std::shared_ptr<coind::ParentNetwork> parent;
 
         static boost::property_tree::ptree make_default_network();
+        static std::shared_ptr<Network> load_network(boost::filesystem::path config_file);
     public:
 		std::set<std::string> SOFTFORKS_REQUIRED;
         //std::tuple<std::string, std::string> = addr
@@ -65,8 +69,9 @@ namespace c2pool
         std::vector<unsigned char> DONATION_SCRIPT; //TODO: INIT (from share)
         std::vector<unsigned char> gentx_before_refhash; //TODO: INIT (from share)
 
-    protected:
-        Network(std::string name, std::shared_ptr<coind::ParentNetwork> _parent_net);
+    public:
+        Network(std::string name);
+        Network(std::string name, boost::property_tree::ptree &pt);
     };
 
     class DigibyteNetwork : public Network
@@ -124,7 +129,7 @@ namespace coind
         uint256 SANE_TARGET_RANGE_MAX;
     public:
         ParentNetwork(std::string name);
-
+        ParentNetwork(std::string name, boost::property_tree::ptree &pt);
         //TODO:
         // virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
         virtual bool jsonrpc_check() = 0;
