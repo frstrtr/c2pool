@@ -63,10 +63,12 @@ int main()
 
 //            write_ini(f, root);
             write_ini(f, c2pool::Network::make_default_network());
-        } else
-        {
-            std::cout << "Error when opening network .cfg: " << ec.message() << std::endl;
         }
+
+//        boost::property_tree::ptree _pt;
+//        boost::property_tree::ini_parser::read_ini((path/"test_config.cfg").string(), _pt);
+//        auto pt = _pt.get_child("network");
+//        std::cout << pt.get<std::string>("DONATION_SCRIPT") << std::endl;
 
         std::cout << path << std::endl;
     }
