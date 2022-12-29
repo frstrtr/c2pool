@@ -48,7 +48,7 @@ namespace c2pool
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
         const unsigned char *PREFIX;
 
-        int IDENTIFIER_LENGHT;
+        int IDENTIFIER_LENGTH;
         const unsigned char *IDENTIFIER;
 
         int MINIMUM_PROTOCOL_VERSION;

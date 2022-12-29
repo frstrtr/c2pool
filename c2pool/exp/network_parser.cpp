@@ -69,7 +69,7 @@ int main()
 //        boost::property_tree::ini_parser::read_ini((path/"test_config.cfg").string(), _pt);
 //        auto pt = _pt.get_child("network");
 //        std::cout << pt.get<std::string>("DONATION_SCRIPT") << std::endl;
-
+        std::cout << (unsigned int) ParseHex("83e65d2c81bf6d68")[3] << std::endl;
         std::cout << path << std::endl;
     }
     std::exit(0);
