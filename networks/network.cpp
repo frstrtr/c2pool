@@ -46,30 +46,63 @@ namespace c2pool
             }
         });
 
-        auto _prefix = pt.get<std::string>("PREFIX");
-        PREFIX_LENGTH = _prefix.length() %2;
+        // PREFIX
+        auto _prefix_str = pt.get<std::string>("PREFIX");
+        auto _prefix = ParseHex(_prefix_str);
+        PREFIX_LENGTH = _prefix_str.size() %2;
         PREFIX = new unsigned char[PREFIX_LENGTH];
-        // TODO: PARSE PREFIX
+        PREFIX = &_prefix[0];
 
-//        network.put("PREFIX", "83e65d2c81bf6d68");
-//        network.put("IDENTIFIER", "83e65d2c81bf6d66");
-//
-//        network.put("MINIMUM_PROTOCOL_VERSION", 1600);
-//        network.put("SEGWIT_ACTIVATION_VERSION", 17);
-//        network.put("TARGET_LOOKBEHIND", 200);
-//        network.put("SHARE_PERIOD", 25);
-//        network.put("BLOCK_MAX_SIZE", 1000000);
-//        network.put("BLOCK_MAX_WEIGHT", 4000000);
-//        network.put("REAL_CHAIN_LENGTH", 24 * 60 * 60 / 10);
-//        network.put("CHAIN_LENGTH", 24 * 60 * 60 / 10);
-//        network.put("SPREAD", 30);
-//        network.put("ADDRESS_VERSION", 30);
-//        network.put("PERSIST", true);
-//
-//        network.put("MIN_TARGET", "0");
-//        network.put("MAX_TARGET", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-//
-//        network.put("DONATION_SCRIPT", "5221038ab82f3a4f569c4571c483d56729e83399795badb32821cab64d04e7b5d106864104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664b410457a337b86557f5b15c94544ad267f96a582dc2b91e6873968ff7ba174fda6874af979cd9af41ec2032dfdfd6587be5b14a4355546d541388c3f1555a67d11c2d53ae");
+        // IDENTIFIER
+        auto _ident_str = pt.get<std::string>("IDENTIFIER");
+        auto _ident = ParseHex(_ident_str);
+        IDENTIFIER_LENGTH = _ident_str.size() %2;
+        IDENTIFIER = new unsigned char[IDENTIFIER_LENGTH];
+        IDENTIFIER = &_ident[0];
+
+        //
+        MINIMUM_PROTOCOL_VERSION = pt.get<int>("MINIMUM_PROTOCOL_VERSION");
+        SEGWIT_ACTIVATION_VERSION = pt.get<int>("SEGWIT_ACTIVATION_VERSION");
+        TARGET_LOOKBEHIND = pt.get<int>("TARGET_LOOKBEHIND");
+        SHARE_PERIOD = pt.get<int>("SHARE_PERIOD");
+        BLOCK_MAX_SIZE = pt.get<int>("BLOCK_MAX_SIZE");
+        BLOCK_MAX_WEIGHT = pt.get<int>("BLOCK_MAX_SIZE");
+        REAL_CHAIN_LENGTH = pt.get<int>("REAL_CHAIN_LENGTH");
+        CHAIN_LENGTH = pt.get<int>("CHAIN_LENGTH");
+        SPREAD = pt.get<int>("SPREAD");
+        ADDRESS_VERSION = pt.get<int>("ADDRESS_VERSION");
+        PERSIST = pt.get<bool>("PERSIST");
+
+        MIN_TARGET = uint256S(pt.get<std::string>("MIN_TARGET"));
+        MAX_TARGET = uint256S(pt.get<std::string>("MAX_TARGET"));
+
+        DONATION_SCRIPT = ParseHex(pt.get<std::string>("DONATION_SCRIPT"));
+
+//      init gentx_before_refhash
+        {
+            PackStream gentx_stream;
+
+            StrType dnt_scpt(DONATION_SCRIPT);
+            gentx_stream << dnt_scpt;
+
+            IntType(64) empty_64int(0);
+            gentx_stream << empty_64int;
+
+            PackStream second_str_stream(std::vector<unsigned char>{0x6a, 0x28});
+            IntType(256) empty_256int(uint256::ZERO);
+            second_str_stream << empty_256int;
+            second_str_stream << empty_64int;
+
+            PackStream for_cut;
+            StrType second_str(second_str_stream.data);
+            for_cut << second_str;
+            for_cut.data.erase(for_cut.data.begin() + 3 , for_cut.data.end());
+
+            gentx_stream << for_cut;
+            gentx_before_refhash = gentx_stream.data;
+        }
+
+        parent = std::make_shared<coind::ParentNetwork>(name, _pt.get_child("parent_network"));
     }
 
     boost::property_tree::ptree Network::make_default_network()
