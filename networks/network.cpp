@@ -14,11 +14,6 @@
 #include <btclibs/uint256.h>
 #include <btclibs/util/strencodings.h>
 #include <libdevcore/stream_types.h>
-#include <networks/dgb/digibyte_subsidy.cpp>
-#include <networks/dgb/scrypt.h>
-//extern "C" {
-//    #include <networks/dgb/scrypt.h>
-//}
 
 namespace c2pool
 {
@@ -256,52 +251,5 @@ namespace coind
         network.put("SANE_TARGET_RANGE_MAX", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         return network;
-    }
-
-    bool ParentNetwork::jsonrpc_check()
-    {
-        // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
-        //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
-        //     (yield bitcoind.rpc_getblockchaininfo())['chain'] != 'test'
-        // ))
-        //##############################
-        // uint256 blockheader;
-        // blockheader.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
-
-        // bool check_header = coind->check_block_header(blockheader);
-        // auto chain_type = coind->GetBlockChainInfo()["chain"].get_str();
-        // return check_header && (chain_type != "test");
-        return true;
-    }
-
-    bool ParentNetwork::version_check(int version)
-    {
-        //lambda v: None if 7170200 <= v else 'DigiByte version too old. Upgrade to 7.17.2 or newer!'
-        if (7170200 <= version)
-        {
-            return true;
-        }
-        else
-        {
-            return false;
-        }
-    }
-
-    uint256 ParentNetwork::POW_FUNC(PackStream &packed_block_header)
-    {
-        const char* input = reinterpret_cast<const char*>(packed_block_header.data.data());
-        char *output = new char[32]{0};
-        scrypt_1024_1_1_256(input, output);
-
-        PackStream converted_output(output, 32);
-        IntType(256) res;
-        converted_output >> res;
-        std::cout << res.get().ToString() << std::endl;
-        return res.get();
-    }
-
-    unsigned long long ParentNetwork::SUBSIDY_FUNC(int32_t height)
-    {
-        return GetBlockBaseValue(height);
     }
 }

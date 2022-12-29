@@ -132,28 +132,28 @@ namespace coind
         ParentNetwork(std::string name, boost::property_tree::ptree &pt);
         //TODO:
         // virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
-        virtual bool jsonrpc_check();
+        virtual bool jsonrpc_check() = 0;
 
-        virtual bool version_check(int version);
+        virtual bool version_check(int version) = 0;
 
-        virtual uint256 POW_FUNC(PackStream& packed_block_header);
+        virtual uint256 POW_FUNC(PackStream& packed_block_header) = 0;
 
-		virtual unsigned long long SUBSIDY_FUNC(int32_t height);
+		virtual unsigned long long SUBSIDY_FUNC(int32_t height) = 0;
     };
 
-//    class DigibyteParentNetwork : public ParentNetwork
-//    {
-//    public:
-//        DigibyteParentNetwork();
-//
-//    public:
-//        //TODO:
-//        bool jsonrpc_check() override;
-//
-//        bool version_check(int version) override;
-//
-//        virtual uint256 POW_FUNC(PackStream& packed_block_header) override;
-//
-//		virtual unsigned long long SUBSIDY_FUNC(int32_t height) override;
-//    };
+    class DigibyteParentNetwork : public ParentNetwork
+    {
+    public:
+        DigibyteParentNetwork();
+
+    public:
+        //TODO:
+        bool jsonrpc_check() override;
+
+        bool version_check(int version) override;
+
+        virtual uint256 POW_FUNC(PackStream& packed_block_header) override;
+
+		virtual unsigned long long SUBSIDY_FUNC(int32_t height) override;
+    };
 }
