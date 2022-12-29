@@ -212,7 +212,25 @@ namespace coind
 
     ParentNetwork::ParentNetwork(std::string name, boost::property_tree::ptree &pt) : ParentNetwork(name)
     {
+        // PREFIX
+        auto _prefix_str = pt.get<std::string>("PREFIX");
+        auto _prefix = ParseHex(_prefix_str);
+        PREFIX_LENGTH = _prefix_str.size() %2;
+        PREFIX = new unsigned char[PREFIX_LENGTH];
+        PREFIX = &_prefix[0];
 
+
+        BLOCK_PERIOD = pt.get<int32_t>("BLOCK_PERIOD");
+        P2P_ADDRESS = pt.get<std::string>("P2P_ADDRESS");
+        P2P_PORT = pt.get<int>("P2P_PORT");
+        ADDRESS_VERSION = pt.get<int>("ADDRESS_VERSION");
+        RPC_PORT = pt.get<int>("RPC_PORT");
+
+        DUMB_SCRYPT_DIFF = pt.get<int>("DUMB_SCRYPT_DIFF");
+        DUST_THRESHOLD = pt.get<int>("DUST_THRESHOLD");
+
+        SANE_TARGET_RANGE_MIN = uint256S(pt.get<std::string>("SANE_TARGET_RANGE_MIN"));
+        SANE_TARGET_RANGE_MAX = uint256S(pt.get<std::string>("SANE_TARGET_RANGE_MAX"));
     }
 
     boost::property_tree::ptree ParentNetwork::make_default_network()
