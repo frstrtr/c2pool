@@ -1,4 +1,4 @@
-file(GLOB sources_networks "coind_networks/*.cpp" "pool_networks/*.cpp")
+file(GLOB sources_networks "coind_networks/*.h" #[["pool_networks/*.cpp"]])
 set(sources_networks ${sources_networks} coind_networks/dgb/digibyte_subsidy.cpp coind_networks/dgb/scrypt.h coind_networks/dgb/scrypt.c)
 
 add_library(networks network.h network.cpp ${sources_networks})

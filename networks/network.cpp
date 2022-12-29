@@ -14,6 +14,7 @@
 #include <btclibs/uint256.h>
 #include <btclibs/util/strencodings.h>
 #include <libdevcore/stream_types.h>
+#include "coind_networks/parent_func.h"
 
 namespace c2pool
 {
@@ -231,6 +232,12 @@ namespace coind
 
         SANE_TARGET_RANGE_MIN = uint256S(pt.get<std::string>("SANE_TARGET_RANGE_MIN"));
         SANE_TARGET_RANGE_MAX = uint256S(pt.get<std::string>("SANE_TARGET_RANGE_MAX"));
+
+        // POW_FUNC
+        set_pow_func(pt.get<std::string>("POW_FUNC"));
+
+        // SUBSIDY_FUNC
+        set_subsidy_func(pt.get<std::string>("SUBSIDY_FUNC"));
     }
 
     boost::property_tree::ptree ParentNetwork::make_default_network()
@@ -250,6 +257,51 @@ namespace coind
         network.put("SANE_TARGET_RANGE_MIN", "10c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26f9");
         network.put("SANE_TARGET_RANGE_MAX", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
+        network.put("POW_FUNC", "scrypt");
+        network.put("SUBSIDY_FUNC", "dgb");
+
         return network;
+    }
+
+    void ParentNetwork::set_pow_func(std::string name)
+    {
+        if (name == "scrypt")
+        {
+            POW_FUNC = [](auto &packed_block_header)
+            {
+                return SCRYPT_POW_FUNC(packed_block_header);
+            };
+            return;
+        }
+
+
+        // default:
+        LOG_ERROR << "Not exist POW_FUNC with name: [" << name << "]";
+        POW_FUNC = [](auto &packed_block_header)
+        {
+            LOG_ERROR << "empty POW_FUNC";
+            return uint256::ZERO;
+        };
+    }
+
+    void ParentNetwork::set_subsidy_func(std::string name)
+    {
+        if (name == "dgb")
+        {
+            SUBSIDY_FUNC = [](int32_t height)
+            {
+                return DGB_SUBSIDY_FUNC(height);
+            };
+            return;
+        }
+
+
+        // default:
+        LOG_ERROR << "Not exist SUBSIDY_FUNC with name: [" << name << "]";
+        SUBSIDY_FUNC = [](auto height)
+        {
+            LOG_ERROR << "empty SUBSIDY_FUNC";
+            return 0;
+        };
     }
 }

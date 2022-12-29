@@ -22,6 +22,15 @@ int main()
 
     for (auto name : net_names)
     {
+        auto net = c2pool::load_network_file(name);
+        std::cout << net->parent->P2P_PORT << std::endl;
+    }
+
+    std::exit(0);
+
+
+    for (auto name : net_names)
+    {
         auto path = boost::filesystem::current_path() / name;
 
         boost::system::error_code ec;

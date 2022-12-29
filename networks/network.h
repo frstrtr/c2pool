@@ -74,11 +74,11 @@ namespace c2pool
         Network(std::string name, boost::property_tree::ptree &pt);
     };
 
-    class DigibyteNetwork : public Network
-    {
-    public:
-        DigibyteNetwork(std::shared_ptr<coind::ParentNetwork> _parent);
-    };
+//    class DigibyteNetwork : public Network
+//    {
+//    public:
+//        DigibyteNetwork(std::shared_ptr<coind::ParentNetwork> _parent);
+//    };
 
     /*
     template for test config:
@@ -112,6 +112,9 @@ namespace coind
         const std::string net_name;
 
         static boost::property_tree::ptree make_default_network();
+    private:
+        void set_pow_func(std::string name);
+        void set_subsidy_func(std::string name);
     public:
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
@@ -132,28 +135,36 @@ namespace coind
         ParentNetwork(std::string name, boost::property_tree::ptree &pt);
         //TODO:
         // virtual bool jsonrpc_check(shared_ptr<coind::jsonrpc::Coind> coind) = 0;
-        virtual bool jsonrpc_check() = 0;
+        virtual bool jsonrpc_check()
+        {
+            // defer.inlineCallbacks(lambda bitcoind: defer.returnValue(
+            //     (yield helper.check_block_header(bitcoind, '7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496')) and # genesis block
+            //     (yield bitcoind.rpc_getblockchaininfo())['chain'] != 'test'
+            // ))
+            //##############################
+            // uint256 blockheader;
+            // blockheader.SetHex("7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496");
 
-        virtual bool version_check(int version) = 0;
+            // bool check_header = coind->check_block_header(blockheader);
+            // auto chain_type = coind->GetBlockChainInfo()["chain"].get_str();
+            // return check_header && (chain_type != "test");
+            return true;
+        }
 
-        virtual uint256 POW_FUNC(PackStream& packed_block_header) = 0;
+        virtual bool version_check(int version)
+        {
+            //lambda v: None if 7170200 <= v else 'DigiByte version too old. Upgrade to 7.17.2 or newer!'
+            if (7170200 <= version)
+            {
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
 
-		virtual unsigned long long SUBSIDY_FUNC(int32_t height) = 0;
-    };
-
-    class DigibyteParentNetwork : public ParentNetwork
-    {
-    public:
-        DigibyteParentNetwork();
-
-    public:
-        //TODO:
-        bool jsonrpc_check() override;
-
-        bool version_check(int version) override;
-
-        virtual uint256 POW_FUNC(PackStream& packed_block_header) override;
-
-		virtual unsigned long long SUBSIDY_FUNC(int32_t height) override;
+        std::function<uint256 (PackStream& packed_block_header)> POW_FUNC;
+        std::function<unsigned long long (int32_t height)> SUBSIDY_FUNC;
     };
 }
