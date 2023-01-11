@@ -13,8 +13,6 @@
 #include "share_types.h"
 #include "share.h"
 
-using std::string;
-
 class ShareTracker;
 
 namespace shares
@@ -26,65 +24,4 @@ namespace shares
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending = {});
 
     PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data = nullopt);
-}
-
-//GenerateShareTransaction
-namespace shares
-{
-    typedef boost::function<ShareType(coind::data::types::BlockHeaderType, uint64_t)> get_share_method;
-
-	struct GeneratedShareTransactionResult
-	{
-		std::unique_ptr<shares::types::ShareInfo> share_info;
-        coind::data::tx_type gentx;
-		std::vector<uint256> other_transaction_hashes;
-		get_share_method get_share;
-
-        GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
-	};
-
-#define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256, std::optional<int32_t>>>
-#define type_known_txs std::map<uint256, coind::data::tx_type>
-
-#define SetProperty(type, name)          \
-    type _##name;                        \
-                                         \
-    GenerateShareTransaction &set_##name(const type &_value){ \
-        _##name = _value;                \
-		return *this; \
-    }
-
-	class GenerateShareTransaction
-	{
-	public:
-		std::shared_ptr<ShareTracker> tracker;
-		std::shared_ptr<c2pool::Network> net;
-
-		GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker);
-
-	public:
-		SetProperty(types::ShareData, share_data);
-		SetProperty(uint256, block_target);
-		SetProperty(uint32_t, desired_timestamp);
-		SetProperty(uint256, desired_target);
-		SetProperty(coind::data::MerkleLink, ref_merkle_link);
-		SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
-		SetProperty(type_known_txs, known_txs);
-		SetProperty(unsigned long long, last_txout_nonce);
-		SetProperty(unsigned long long, base_subsidy);
-
-		std::optional<shares::types::SegwitData> _segwit_data;
-
-		void set_segwit_data(const shares::types::SegwitData &_value)
-		{
-			_segwit_data = _value;
-		}
-
-	public:
-		std::shared_ptr<GeneratedShareTransactionResult> operator()(uint64_t version);
-	};
-
-#undef SetProperty
-#undef type_desired_other_transaction_hashes_and_fees
-#undef type_known_txs
 }
