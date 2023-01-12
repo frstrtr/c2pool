@@ -58,7 +58,7 @@ desired_share_target = int('00000000359dc900000000000000000000000000000000000000
 get_stale_counts = lambda : ((0,0), 0, (0,0))
 share_type = SHARE.Share
 
-share_info, gentx, other_transaction_hashes, get_share = share_type.generate_transaction(
+share_info, gentx, other_transaction_hashes, get_share = share_type.generate_transaction2(
                 tracker=tracker,
                 share_data=dict(
                     previous_share_hash=best,
