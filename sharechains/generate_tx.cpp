@@ -14,7 +14,7 @@
 namespace shares
 {
 
-    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
+    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
     {
         share_info = std::move(_share_info);
         gentx = std::move(_gentx);
@@ -158,73 +158,11 @@ namespace shares
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
 
-        unique_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs);
-
-        if (previous_share)
-        {
-            if (_desired_timestamp > (*previous_share->timestamp + 180))
-            {
-                LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n" \
-                            "Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n" \
-                            "If your clock is more than 300 seconds behind, it can result in orphaned shares.\n" \
-                            "(It's also possible that this share is just taking a long time to mine.)") %
-                                (_desired_timestamp - *previous_share->timestamp))
-                            .str();
-            }
-
-            if (*previous_share->timestamp > (c2pool::dev::timestamp() + 3))
-            {
-                LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n" \
-                                              "Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
-                                (*previous_share->timestamp - c2pool::dev::timestamp()))
-                            .str();
-            }
-        }
-
-        if (segwit_activated)
-            share_info->segwit_data = _segwit_data;
+        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs);
 
         auto gentx = gentx_generate(segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
 
-        get_share_method get_share_F([=, &share_info](coind::data::types::BlockHeaderType header, uint64_t last_txout_nonce)
-                                     {
-                                         coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
-
-                                         ShareType share;
-                                         std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
-
-                                         shared_ptr<::HashLinkType> pref_to_hash_link;
-                                         {
-                                             coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
-
-                                             PackStream txid_packed;
-                                             txid_packed << txid;
-
-                                             std::vector<unsigned char> prefix;
-                                             prefix.insert(prefix.begin(), prefix.end()-32-8-4, prefix.end());
-
-                                             pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
-                                         }
-
-                                         auto tx_hashes = other_transaction_hashes;
-                                         tx_hashes.insert(tx_hashes.begin(),uint256());
-
-                                         builder->create(version, {});
-
-                                         builder
-                                                 ->min_header(min_header)
-                                                 ->share_info(*share_info)
-                                                 ->ref_merkle_link(coind::data::MerkleLink())
-                                                 ->last_txout_nonce(last_txout_nonce)
-                                                 ->hash_link(*pref_to_hash_link->get())
-                                                 ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
-
-
-
-                                         share = builder->GetShare();
-                                         //TODO: assert(share->header == header);
-                                         return share;
-                                     });
+        get_share_method get_share_F = get_share_func(version, gentx, other_transaction_hashes, share_info);
 
 //		t5 = time.time()
 //		if p2pool.BENCH: print "%8.3f ms for data.py:generate_transaction(). Parts: %8.3f %8.3f %8.3f %8.3f %8.3f " % (
@@ -479,7 +417,7 @@ namespace shares
 //			raise ValueError()
     }
 
-    coind::data::tx_type GenerateShareTransaction::gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, unique_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
+    coind::data::tx_type GenerateShareTransaction::gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
         coind::data::tx_type gentx;
 
@@ -549,13 +487,13 @@ namespace shares
         return gentx;
     }
 
-    unique_ptr<shares::types::ShareInfo>
+    std::shared_ptr<shares::types::ShareInfo>
     GenerateShareTransaction::share_info_generate(int32_t height, uint256 last, ShareType previous_share,
                                                   uint64_t version, FloatingInteger max_bits, FloatingInteger bits,
                                                   vector<uint256> new_transaction_hashes,
-                                                  vector<tuple<uint64_t, uint64_t>> transaction_hash_refs)
+                                                  vector<tuple<uint64_t, uint64_t>> transaction_hash_refs, bool segwit_activated)
     {
-        unique_ptr<shares::types::ShareInfo> share_info;
+        std::shared_ptr<shares::types::ShareInfo> share_info;
 
         uint256 far_share_hash;
         if (last.IsNull() && height < 99)
@@ -598,11 +536,81 @@ namespace shares
         }
         //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
 
-        share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(),
+        share_info = std::make_shared<shares::types::ShareInfo>(far_share_hash, max_bits.get(),
                                                                 bits.get(), timestamp, new_transaction_hashes,
                                                                 transaction_hash_refs,
                                                                 _absheight, _abswork
         );
 
+        if (previous_share)
+        {
+            if (_desired_timestamp > (*previous_share->timestamp + 180))
+            {
+                LOG_WARNING << (boost::format("Warning: Previous share's timestamp is %1% seconds old.\n" \
+                            "Make sure your system clock is accurate, and ensure that you're connected to decent peers.\n" \
+                            "If your clock is more than 300 seconds behind, it can result in orphaned shares.\n" \
+                            "(It's also possible that this share is just taking a long time to mine.)") %
+                                (_desired_timestamp - *previous_share->timestamp))
+                        .str();
+            }
+
+            if (*previous_share->timestamp > (c2pool::dev::timestamp() + 3))
+            {
+                LOG_WARNING << (boost::format("WARNING! Previous share's timestamp is %1% seconds in the future. This is not normal.\n" \
+                                              "Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
+                                (*previous_share->timestamp - c2pool::dev::timestamp()))
+                        .str();
+            }
+        }
+
+        if (segwit_activated)
+            share_info->segwit_data = _segwit_data;
+
+        return share_info;
     }
+
+    get_share_method GenerateShareTransaction::get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info)
+    {
+        return [=](coind::data::types::BlockHeaderType header, uint64_t last_txout_nonce)
+        {
+            coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
+
+            ShareType share;
+            std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
+
+            shared_ptr<::HashLinkType> pref_to_hash_link;
+            {
+                coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
+
+                PackStream txid_packed;
+                txid_packed << txid;
+
+                std::vector<unsigned char> prefix;
+                prefix.insert(prefix.begin(), prefix.end()-32-8-4, prefix.end());
+
+                pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
+            }
+
+            auto tx_hashes = other_transaction_hashes;
+            tx_hashes.insert(tx_hashes.begin(),uint256());
+
+            builder->create(version, {});
+
+            builder
+                    ->min_header(min_header)
+                    ->share_info(*share_info)
+                    ->ref_merkle_link(coind::data::MerkleLink())
+                    ->last_txout_nonce(last_txout_nonce)
+                    ->hash_link(*pref_to_hash_link->get())
+                    ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
+
+
+
+            share = builder->GetShare();
+            //TODO: assert(share->header == header);
+            return share;
+        };
+    }
+
+
 }
