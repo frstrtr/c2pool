@@ -22,12 +22,12 @@ namespace shares
 
     struct GeneratedShareTransactionResult
     {
-        std::unique_ptr<shares::types::ShareInfo> share_info;
+        std::shared_ptr<shares::types::ShareInfo> share_info;
         coind::data::tx_type gentx;
         std::vector<uint256> other_transaction_hashes;
         get_share_method get_share;
 
-        GeneratedShareTransactionResult(std::unique_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
+        GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
     };
 
 #define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256, std::optional<int32_t>>>
@@ -74,8 +74,9 @@ namespace shares
         std::tuple<FloatingInteger, FloatingInteger> bits_calculate(const arith_uint256 &pre_target);
         std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> new_tx_hashes_calculate(uint256 prev_share_hash, int32_t height);
         std::tuple<std::map<std::vector<unsigned char>, arith_uint288>> weight_amount_calculate(uint256 prev_share_hash, int32_t height);
-        unique_ptr<shares::types::ShareInfo> share_info_generate(int32_t height, uint256 last, ShareType previous_share, uint64_t version, FloatingInteger max_bits, FloatingInteger bits, vector<uint256> new_transaction_hashes, vector<tuple<uint64_t, uint64_t>> transaction_hash_refs);
-        coind::data::tx_type gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, unique_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str);
+        std::shared_ptr<shares::types::ShareInfo> share_info_generate(int32_t height, uint256 last, ShareType previous_share, uint64_t version, FloatingInteger max_bits, FloatingInteger bits, vector<uint256> new_transaction_hashes, vector<tuple<uint64_t, uint64_t>> transaction_hash_refs, bool segwit_activated);
+        coind::data::tx_type gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str);
+        get_share_method get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info);
     };
 
 #undef SetProperty
