@@ -158,7 +158,54 @@ namespace shares
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
 
-        auto share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs);
+        unique_ptr<shares::types::ShareInfo> share_info;
+        {
+            uint256 far_share_hash;
+            if (last.IsNull() && height < 99)
+                far_share_hash.SetNull();
+            else
+                far_share_hash = tracker->get_nth_parent_key(_share_data.previous_share_hash, 99);
+
+            uint32_t timestamp;
+
+            if (previous_share != nullptr)
+            {
+                if (version < 32)
+                    timestamp = std::clamp(_desired_timestamp, *previous_share->timestamp + 1,
+                                           *previous_share->timestamp + net->SHARE_PERIOD * 2 - 1);
+                else
+                    timestamp = std::max(_desired_timestamp, *previous_share->timestamp + 1);
+            } else
+            {
+                timestamp = _desired_timestamp;
+            }
+
+            auto _absheight = ((previous_share ? *previous_share->absheight : 0) + 1) % 0x100000000; // % 2^32
+
+
+            uint128 _abswork;
+            {
+                arith_uint288 _temp;
+                if (previous_share)
+                {
+                    auto _share_abswork = *previous_share->abswork;
+                    _temp.SetHex(_share_abswork.GetHex());
+                }
+
+                _temp = _temp + coind::data::target_to_average_attempts(bits.target());
+                arith_uint288 pow2_128; // 2^128
+                pow2_128.SetHex("100000000000000000000000000000000");
+
+                _temp = _temp >= pow2_128 ? _temp-pow2_128 : _temp; // _temp % pow2_128;
+                _abswork.SetHex(_temp.GetHex());
+            }
+            //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
+
+            share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(),
+                                                                    bits.get(), timestamp, new_transaction_hashes, transaction_hash_refs,
+                                                                    _absheight, _abswork
+            );
+        }
 
         if (previous_share)
         {
@@ -547,57 +594,5 @@ namespace shares
             gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
         }
         return gentx;
-    }
-
-    unique_ptr<shares::types::ShareInfo> GenerateShareTransaction::share_info_generate(int32_t height, uint256 last, ShareType previous_share, uint64_t version, FloatingInteger max_bits, FloatingInteger bits, vector<uint256> new_transaction_hashes, vector<tuple<uint64_t, uint64_t>> transaction_hash_refs)
-    {
-        unique_ptr<shares::types::ShareInfo> share_info;
-        {
-            uint256 far_share_hash;
-            if (last.IsNull() && height < 99)
-                far_share_hash.SetNull();
-            else
-                far_share_hash = tracker->get_nth_parent_key(_share_data.previous_share_hash, 99);
-
-            uint32_t timestamp;
-
-            if (previous_share != nullptr)
-            {
-                if (version < 32)
-                    timestamp = std::clamp(_desired_timestamp, *previous_share->timestamp + 1,
-                                           *previous_share->timestamp + net->SHARE_PERIOD * 2 - 1);
-                else
-                    timestamp = std::max(_desired_timestamp, *previous_share->timestamp + 1);
-            } else
-            {
-                timestamp = _desired_timestamp;
-            }
-
-            auto _absheight = ((previous_share ? *previous_share->absheight : 0) + 1) % 0x100000000; // % 2^32
-
-
-            uint128 _abswork;
-            {
-                arith_uint288 _temp;
-                if (previous_share)
-                {
-                    auto _share_abswork = *previous_share->abswork;
-                    _temp.SetHex(_share_abswork.GetHex());
-                }
-
-                _temp = _temp + coind::data::target_to_average_attempts(bits.target());
-                arith_uint288 pow2_128; // 2^128
-                pow2_128.SetHex("100000000000000000000000000000000");
-
-                _temp = _temp >= pow2_128 ? _temp-pow2_128 : _temp; // _temp % pow2_128;
-                _abswork.SetHex(_temp.GetHex());
-            }
-            //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
-
-            share_info = std::make_unique<shares::types::ShareInfo>(far_share_hash, max_bits.get(),
-                                                                    bits.get(), timestamp, new_transaction_hashes, transaction_hash_refs,
-                                                                    _absheight, _abswork
-            );
-        }
     }
 }
