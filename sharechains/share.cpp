@@ -12,6 +12,7 @@
 #include "tracker.h"
 #include "data.h"
 #include "share_builder.h"
+#include "generate_tx.h"
 
 
 using namespace std;

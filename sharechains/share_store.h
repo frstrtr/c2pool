@@ -115,7 +115,7 @@ public:
                 i++; //REMOVE
 //                if (i >= 2601)
 //                if (i >= 34561)
-                if (i >= 3457)
+                if (i >= 17508)
                     break;
             }
 
