@@ -577,7 +577,7 @@ namespace shares
         };
     }
 
-    void GenerateShareTransaction::make_segwit_data(std::vector<uint256> other_transaction_hashes)
+    void GenerateShareTransaction::make_segwit_data(const std::vector<uint256>& other_transaction_hashes)
     {
         //	share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
         //  segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
@@ -596,26 +596,22 @@ namespace shares
             }
         };
         std::vector<__share_tx> share_txs;
-        std::vector<uint256> txids; //TODO:
+        share_txs.resize(other_transaction_hashes.size());
         for (auto h : other_transaction_hashes)
         {
-            auto txid = coind::data::get_txid(_known_txs[h]);
-            share_txs.emplace_back(_known_txs[h], txid, h);
-            txids.push_back(txid);
+            share_txs.emplace_back(_known_txs[h], coind::data::get_txid(_known_txs[h]), h);
         }
 
+        std::vector<uint256> _txids{uint256()};
+        std::vector<uint256> _wtxids{uint256()};
+        for (const auto& v : share_txs)
         {
-            std::vector<uint256> _txids{uint256()};
-            std::vector<uint256> _wtxids{uint256()};
-            for (auto v : share_txs)
-            {
-                txids.push_back(v.txid);
-                wtxids.push_back(coind::data::get_wtxid(v.tx, v.txid, v.h));
-            }
-
-            _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(txids, 0),
-                                                                 coind::data::merkle_hash(wtxids));
+            _txids.push_back(v.txid);
+            _wtxids.push_back(coind::data::get_wtxid(v.tx, v.txid, v.h));
         }
+
+        _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(_txids, 0),
+                                                             coind::data::merkle_hash(_wtxids));
     }
 
 
