@@ -82,7 +82,7 @@ namespace shares
             _share_data.subsidy = _base_subsidy + definite_fees;
         }
 
-        auto [amounts] = weight_amount_calculate(prev_share_hash, height);
+        auto [amounts] = weight_amount_calculate((*previous_share->share_data)->previous_share_hash, height);
 
         bool segwit_activated = is_segwit_activated(version, net);
         if (!_segwit_data.has_value() && _known_txs.empty())
@@ -139,11 +139,12 @@ namespace shares
 //			(t5-t4)*1000.)
 //	    */
 //
-        return std::make_shared<GeneratedShareTransactionResult>(std::move(share_info),gentx, other_transaction_hashes,get_share_F);
+        return std::make_shared<GeneratedShareTransactionResult>(share_info, gentx, other_transaction_hashes, get_share_F);
     }
 
     arith_uint256 GenerateShareTransaction::pre_target_calculate(ShareType previous_share, const int32_t &height)
     {
+        LOG_TRACE << "pre_target_calculate called";
         arith_uint256 _pre_target3;
         if (height < net->TARGET_LOOKBEHIND)
         {
@@ -181,6 +182,8 @@ namespace shares
 
     std::tuple<FloatingInteger, FloatingInteger> GenerateShareTransaction::bits_calculate(const arith_uint256 &pre_target)
     {
+        LOG_TRACE << "bits_calculate called";
+
         FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(ArithToUint256(pre_target));
         FloatingInteger bits;
         {
@@ -196,6 +199,8 @@ namespace shares
 
     std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> GenerateShareTransaction::new_tx_hashes_calculate(uint256 prev_share_hash, int32_t height)
     {
+        LOG_TRACE << "new_tx_hashes_calculate called";
+
         vector<uint256> new_transaction_hashes;
         int32_t all_transaction_stripped_size = 0;
         int32_t new_transaction_weight = 0;
@@ -313,6 +318,8 @@ namespace shares
 
     std::tuple<std::map<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height)
     {
+        LOG_TRACE << "weight_amount_calculate called";
+
         std::map<std::vector<unsigned char>, arith_uint288> weights;
         arith_uint288 total_weight;
         arith_uint288 donation_weight;
@@ -332,6 +339,7 @@ namespace shares
             weights = std::get<0>(weights_result);
             total_weight = std::get<1>(weights_result);
             donation_weight = std::get<2>(weights_result);
+            LOG_TRACE << "weights.size = " << weights.size() << ", total_weight = " << total_weight.GetHex() << ", donation_weight = " << donation_weight.GetHex();
         }
 
         //assert
@@ -384,6 +392,8 @@ namespace shares
 
     coind::data::tx_type GenerateShareTransaction::gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
+        LOG_TRACE << "gentx_generate called";
+
         coind::data::tx_type gentx;
 
         //		dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
@@ -458,6 +468,8 @@ namespace shares
                                                   vector<uint256> new_transaction_hashes,
                                                   vector<tuple<uint64_t, uint64_t>> transaction_hash_refs, bool segwit_activated)
     {
+        LOG_TRACE << "share_info_generate called";
+
         std::shared_ptr<shares::types::ShareInfo> share_info;
 
         uint256 far_share_hash;
@@ -536,6 +548,8 @@ namespace shares
 
     get_share_method GenerateShareTransaction::get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info)
     {
+        LOG_TRACE << "get_share_func called";
+
         return [=](coind::data::types::BlockHeaderType header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
@@ -579,6 +593,8 @@ namespace shares
 
     void GenerateShareTransaction::make_segwit_data(const std::vector<uint256>& other_transaction_hashes)
     {
+        LOG_TRACE << "make_segwit_data called";
+
         //	share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
         //  segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
 

@@ -8,6 +8,7 @@
 #include <sharechains/share_store.h>
 #include <sharechains/generate_tx.h>
 #include <networks/network.h>
+#include <btclibs/script/script.h>
 
 class TestNetwork : public c2pool::Network
 {
@@ -84,7 +85,8 @@ protected:
 
     virtual void SetUp()
     {
-        std::shared_ptr<coind::ParentNetwork> parent_net = std::make_shared<coind::ParentNetwork>("dgb");
+        auto pt = coind::ParentNetwork::make_default_network();
+        std::shared_ptr<coind::ParentNetwork> parent_net = std::make_shared<coind::ParentNetwork>("dgb", pt);
         net = make_shared<TestNetwork>(parent_net);
     }
 
@@ -435,9 +437,10 @@ TEST_F(SharechainsTest, gentx_test)
         vector<int32_t> transaction_fees;
         int32_t bits;
     };
-    _current_work currentWork {0, {}, 0, {}, 0};
+    _current_work current_work {0, {}, 0, {}, 0};
     double donation_percentage = 0;
-    uint256 pubkey_hash = uint256S("78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
+    uint160 pubkey_hash;
+    pubkey_hash.SetHex("78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
     uint256 desired_share_target = uint256S("00000000359dc900000000000000000000000000000000000000000000000000");
 
     struct stale_counts
@@ -448,16 +451,53 @@ TEST_F(SharechainsTest, gentx_test)
     };
     stale_counts get_stale_counts{{0,0}, 0, {0,0}};
 
-    types::ShareData share_data{_best, };
-
     GenerateShareTransaction generate_transaction(tracker);
-    generate_transaction.set_share_data().
-            set_block_target().
-            set_desired_timestamp().
-            set_desired_target().
-            set_ref_merkle_link().
-            set_desired_other_transaction_hashes_and_fees().
-            set_known_txs().
-            set_last_txout_nonce().
-            set_base_subsidy();
+    generate_transaction.
+            set_block_target(FloatingInteger(current_work.bits).target()).
+            set_desired_timestamp(c2pool::dev::timestamp() + 0.5f).
+            set_desired_target(desired_share_target).
+            set_ref_merkle_link(coind::data::MerkleLink({}, 0)).
+            set_desired_other_transaction_hashes_and_fees({}).
+            set_known_txs({}).
+            set_base_subsidy(net->parent->SUBSIDY_FUNC(current_work.height));
+
+    // ShareData
+    {
+        std::vector<unsigned char> coinbase;
+        {
+            CScript _coinbase;
+            _coinbase << current_work.height;
+            // _coinbase << mm_data // TODO: FOR MERGED MINING
+            _coinbase << current_work.coinbaseflags;
+            coinbase = ToByteVector(_coinbase);
+            coinbase.resize(100);
+        }
+        uint16_t donation = 65535 * donation_percentage / 100; //TODO: test for "math.perfect_round"
+        StaleInfo stale_info;
+        {
+            auto v = get_stale_counts;
+            std::cout << "get_stale_counts: (" << std::get<0>(v.orph_doa) << ", " << std::get<1>(v.orph_doa) << "); (" << std::get<0>(v.recorded_in_chain) << ", " << std::get<1>(v.recorded_in_chain) << "); " << v.total << std::endl;
+            if (std::get<0>(v.orph_doa) > std::get<0>(v.recorded_in_chain))
+                stale_info = orphan;
+            else if (std::get<1>(v.orph_doa) > std::get<1>(v.recorded_in_chain))
+                stale_info = doa;
+            else
+                stale_info = unk;
+        }
+
+        types::ShareData _share_data(
+                _best,
+                coinbase,
+                c2pool::random::randomNonce(),
+                pubkey_hash,
+                current_work.subsidy,
+                donation,
+                stale_info,
+                17
+        );
+        generate_transaction.set_share_data(_share_data);
+    }
+
+    auto [share_info, gentx, other_transaction_hashes, get_share] = *generate_transaction(17);
+
 }

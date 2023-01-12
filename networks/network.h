@@ -39,7 +39,6 @@ namespace c2pool
         std::shared_ptr<coind::ParentNetwork> parent;
 
         static boost::property_tree::ptree make_default_network();
-        static std::shared_ptr<Network> load_network(boost::filesystem::path config_file);
     public:
 		std::set<std::string> SOFTFORKS_REQUIRED;
         //std::tuple<std::string, std::string> = addr

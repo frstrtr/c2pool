@@ -384,7 +384,13 @@ class BaseShare(object):
             share_data = dict(share_data, subsidy=base_subsidy + definite_fees)
 
         #STOPED HERE
-        
+        print('block_target: {0}'.format(hex(block_target)))
+        print('block_target_attempts: {0}'.format(hex(coind_data.target_to_average_attempts(block_target))))
+        print('For get_cumulative_weights: {0}, {1}, {2}'.format(hex(previous_share.share_data['previous_share_hash'] if previous_share is not None else None),
+            max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
+            hex(65535*net.SPREAD*coind_data.target_to_average_attempts(block_target))))
+        001dffe20000000000000000000000000000000000000000000000000000000000000000
+        1dffe20000000000000000000000000000000000000000000000000000000
         weights, total_weight, donation_weight = tracker.get_cumulative_weights(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
             max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
             65535*net.SPREAD*coind_data.target_to_average_attempts(block_target),
