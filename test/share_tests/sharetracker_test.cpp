@@ -1,17 +1,21 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <utility>
 
 #include <libdevcore/common.h>
 #include <sharechains/tracker.h>
 #include <sharechains/share_store.h>
+#include <sharechains/generate_tx.h>
 #include <networks/network.h>
 
 class TestNetwork : public c2pool::Network
 {
 public:
-    TestNetwork(std::shared_ptr<coind::ParentNetwork> _par) : c2pool::Network("test_sharechain", _par)
+    TestNetwork(std::shared_ptr<coind::ParentNetwork> _par) : c2pool::Network("test_sharechain")
     {
+        parent = std::move(_par);
+
         SOFTFORKS_REQUIRED = {"nversionbips", "csv", "segwit", "reservealgo", "odo"};
         BOOTSTRAP_ADDRS = {
                 CREATE_ADDR("0.0.0.0", "5024")
@@ -80,7 +84,7 @@ protected:
 
     virtual void SetUp()
     {
-        std::shared_ptr<coind::DigibyteParentNetwork> parent_net = std::make_shared<coind::DigibyteParentNetwork>();
+        std::shared_ptr<coind::ParentNetwork> parent_net = std::make_shared<coind::ParentNetwork>("dgb");
         net = make_shared<TestNetwork>(parent_net);
     }
 
@@ -396,4 +400,64 @@ TEST_F(SharechainsTest, weights_test)
     auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
     std::cout << "Best = " << _best.GetHex() << std::endl;
     std::cout << "pre for Best = " << tracker->get(_best)->previous_hash->GetHex();
+}
+
+TEST_F(SharechainsTest, gentx_test)
+{
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
+    auto share_store = ShareStore(net);
+    share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
+
+    std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
+    std::cout << "shares: " << tracker->heads.size() << "/" << tracker->tails.size() << std::endl;
+    std::cout << "verified: " << tracker->verified.heads.size() << "/" << tracker->verified.tails.size() << std::endl;
+
+    boost::function<int32_t(uint256)> test_block_rel_height_func = [&](uint256 hash){return 0;};
+
+    std::vector<uint8_t> _bytes = {103, 108, 55, 240, 5, 80, 187, 245, 215, 227, 92, 1, 210, 201, 113, 66, 242, 76, 148, 121, 29, 76, 3, 170, 153, 253, 61, 21, 199, 77, 202, 35};
+    auto bytes_prev_block = c2pool::dev::bytes_from_uint8(_bytes);
+    uint256 previous_block(bytes_prev_block);
+
+
+    uint32_t bits = 453027171;
+    std::map<uint256, coind::data::tx_type> known_txs;
+
+    auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
+    std::cout << "Best = " << _best.GetHex() << std::endl;
+
+    //-------------------------------------------------------------------------------------------
+
+    struct _current_work {
+        int32_t height;
+        std::vector<unsigned char> coinbaseflags;
+        uint64_t subsidy;
+        vector<int32_t> transaction_fees;
+        int32_t bits;
+    };
+    _current_work currentWork {0, {}, 0, {}, 0};
+    double donation_percentage = 0;
+    uint256 pubkey_hash = uint256S("78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
+    uint256 desired_share_target = uint256S("00000000359dc900000000000000000000000000000000000000000000000000");
+
+    struct stale_counts
+    {
+        std::tuple<int32_t, int32_t> orph_doa; //(orphans; doas)
+        int32_t total;
+        std::tuple<int32_t, int32_t> recorded_in_chain; // (orphans_recorded_in_chain, doas_recorded_in_chain)
+    };
+    stale_counts get_stale_counts{{0,0}, 0, {0,0}};
+
+    types::ShareData share_data{_best, };
+
+    GenerateShareTransaction generate_transaction(tracker);
+    generate_transaction.set_share_data().
+            set_block_target().
+            set_desired_timestamp().
+            set_desired_target().
+            set_ref_merkle_link().
+            set_desired_other_transaction_hashes_and_fees().
+            set_known_txs().
+            set_last_txout_nonce().
+            set_base_subsidy();
 }
