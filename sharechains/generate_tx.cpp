@@ -101,44 +101,9 @@ namespace shares
             throw "segwit transaction included before activation";
         }
 
-        //	share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
-        //  segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
         if (segwit_activated && !_known_txs.empty())
         {
-            struct __share_tx{
-                std::shared_ptr<coind::data::TransactionType> tx;
-                uint256 txid;
-                uint256 h; //hash
-
-                __share_tx() = default;
-                __share_tx(std::shared_ptr<coind::data::TransactionType> _tx, uint256 _txid, uint256 _h)
-                {
-                    tx = _tx;
-                    txid = _txid;
-                    h = _h;
-                }
-            };
-            std::vector<__share_tx> share_txs;
-            std::vector<uint256> txids; //TODO:
-            for (auto h : other_transaction_hashes)
-            {
-                auto txid = coind::data::get_txid(_known_txs[h]);
-                share_txs.emplace_back(_known_txs[h], txid, h);
-                txids.push_back(txid);
-            }
-
-            {
-                std::vector<uint256> txids{uint256()};
-                std::vector<uint256> wtxids{uint256()};
-                for (auto v : share_txs)
-                {
-                    txids.push_back(v.txid);
-                    wtxids.push_back(coind::data::get_wtxid(v.tx, v.txid, v.h));
-                }
-
-                _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(txids, 0),
-                                                                     coind::data::merkle_hash(wtxids));
-            }
+            make_segwit_data(other_transaction_hashes);
         }
 
 //      witness_reserved_value_str = '[P2Pool]'*4
@@ -158,7 +123,7 @@ namespace shares
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
 
-        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs);
+        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs, segwit_activated);
 
         auto gentx = gentx_generate(segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
 
@@ -610,6 +575,47 @@ namespace shares
             //TODO: assert(share->header == header);
             return share;
         };
+    }
+
+    void GenerateShareTransaction::make_segwit_data(std::vector<uint256> other_transaction_hashes)
+    {
+        //	share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
+        //  segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
+
+        struct __share_tx{
+            std::shared_ptr<coind::data::TransactionType> tx;
+            uint256 txid;
+            uint256 h; //hash
+
+            __share_tx() = default;
+            __share_tx(std::shared_ptr<coind::data::TransactionType> _tx, uint256 _txid, uint256 _h)
+            {
+                tx = _tx;
+                txid = _txid;
+                h = _h;
+            }
+        };
+        std::vector<__share_tx> share_txs;
+        std::vector<uint256> txids; //TODO:
+        for (auto h : other_transaction_hashes)
+        {
+            auto txid = coind::data::get_txid(_known_txs[h]);
+            share_txs.emplace_back(_known_txs[h], txid, h);
+            txids.push_back(txid);
+        }
+
+        {
+            std::vector<uint256> _txids{uint256()};
+            std::vector<uint256> _wtxids{uint256()};
+            for (auto v : share_txs)
+            {
+                txids.push_back(v.txid);
+                wtxids.push_back(coind::data::get_wtxid(v.tx, v.txid, v.h));
+            }
+
+            _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(txids, 0),
+                                                                 coind::data::merkle_hash(wtxids));
+        }
     }
 
 
