@@ -159,12 +159,11 @@ public:
         // Поиск desired_weight
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
-        auto desired_sum_weight = get_sum_to_last(start).weight.total_weight - desired_weight;
+        auto desired_sum_weight = get_sum_to_last(start).weight.total_weight >= desired_weight ? get_sum_to_last(start).weight.total_weight - desired_weight : arith_uint288();
         auto cur = get_sum_to_last(start);
         auto prev = get_sum_to_last(start);
         std::optional<shares::weight::weight_data> extra_ending;
 
-        int i = 0;
         while(cur.head != last)
         {
             i++;
@@ -182,7 +181,6 @@ public:
                 }
             } else
             {
-                LOG_TRACE << "WHAT?: " << i;
 //                auto [_script, _weight] = *cur.weight.amount.begin();
                 extra_ending = std::make_optional<shares::weight::weight_data>(cur.get_value());
                 break;
