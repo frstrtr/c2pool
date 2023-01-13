@@ -4,19 +4,31 @@
 namespace shares::weight
 {
 
-//	weight_element_ptr weight_element::operator+(weight_element_ptr element)
+////	weight_element_ptr weight_element::operator+(weight_element_ptr element)
+////	{
+////		this->prev = element;
+////		return shared_from_this();
+////	}
+//
+//	weight_element_ptr weight_element::operator+=(const weight_element_ptr &element)
 //	{
-//		this->prev = element;
+//		prev = element;
 //		return shared_from_this();
 //	}
-
-	weight_element_ptr weight_element::operator+=(const weight_element_ptr &element)
-	{
-		prev = element;
-		return shared_from_this();
-	}
-
-//	weight_element_ptr weight_element::operator-(weight_element_ptr element)
+//
+////	weight_element_ptr weight_element::operator-(weight_element_ptr element)
+////	{
+////		if (this->prev != element)
+////		{
+////			//TODO: assert/debug_error
+////		}
+////
+////		this->prev = nullptr;
+////		return element;
+////	}
+//
+//
+//	weight_element_ptr weight_element::operator-=(const weight_element_ptr &element)
 //	{
 //		if (this->prev != element)
 //		{
@@ -24,20 +36,8 @@ namespace shares::weight
 //		}
 //
 //		this->prev = nullptr;
-//		return element;
+//		return shared_from_this();
 //	}
-
-
-	weight_element_ptr weight_element::operator-=(const weight_element_ptr &element)
-	{
-		if (this->prev != element)
-		{
-			//TODO: assert/debug_error
-		}
-
-		this->prev = nullptr;
-		return shared_from_this();
-	}
 }
 //
 //namespace shares::weight
