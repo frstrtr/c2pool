@@ -535,5 +535,15 @@ TEST_F(SharechainsTest, gentx_test)
     }
 
     auto [share_info, gentx, other_transaction_hashes, get_share] = *generate_transaction(17);
+    LOG_TRACE << "other_transaction_hashes size: " << other_transaction_hashes.size();
+
+    // share_info
+    LOG_TRACE << "SHARE_INFO:";
+    LOG_TRACE << "\tbits:" << share_info->bits;
+    LOG_TRACE << "\tmax_bits:" << share_info->max_bits;
+    LOG_TRACE << "\tabsheight:" << share_info->absheight;
+    LOG_TRACE << "\tabswork:" << share_info->abswork;
+    LOG_TRACE << "\tfar_share_hash:" << share_info->far_share_hash.GetHex();
+//    LOG_TRACE << "\t " << share_info->;
 
 }
