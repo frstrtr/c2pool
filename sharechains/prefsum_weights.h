@@ -8,6 +8,7 @@
 
 #include "share.h"
 #include <libcoind/data.h>
+#include <fstream>
 
 class ShareTracker;
 
@@ -32,6 +33,10 @@ namespace shares::weight
         {
             auto att = coind::data::target_to_average_attempts(share->target);
             LOG_TRACE << "att: " << att.GetHex() << ", for hash: " << share->hash.GetHex() << ", target: " << share->target.GetHex();
+
+            std::fstream f("weights.txt", ios_base::out|ios_base::app);
+            f << share->hash.GetHex() << " " << share->target.GetHex() << " " << att.GetHex() << std::endl;
+            f.close();
 
             amount = {{share->new_script.data, att * (65535 - *share->donation)}};
             total_weight = att;
