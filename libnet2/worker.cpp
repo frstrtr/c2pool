@@ -15,6 +15,7 @@
 #include <sharechains/data.h>
 #include <sharechains/prefsum_doa.h>
 #include <sharechains/share_adapters.h>
+#include <sharechains/generate_tx.h>
 #include <libcoind/jsonrpc/results.h>
 
 using std::vector;
