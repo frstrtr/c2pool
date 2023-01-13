@@ -165,7 +165,6 @@ public:
 
         while(cur.head != last)
         {
-            i++;
             if (cur.weight.total_weight >= desired_sum_weight)
             {
                 for (auto [k, v]: cur.weight.amount)
