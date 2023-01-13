@@ -8,7 +8,6 @@
 
 #include "share.h"
 #include <libcoind/data.h>
-#include <fstream>
 
 class ShareTracker;
 
@@ -18,8 +17,8 @@ namespace shares::weight
     class weight_data
     {
     public:
-        std::map<std::vector<unsigned char>, arith_uint288> amount; //weight //TODO: может быть тоже суммировать?
-        arith_uint288 total_weight; //without *65535!
+        std::map<std::vector<unsigned char>, arith_uint288> amount; //weight, not sum, just element! //TODO: может быть тоже суммировать?
+        arith_uint288 total_weight;
         arith_uint288 total_donation_weight;
 
         weight_data()
@@ -32,23 +31,10 @@ namespace shares::weight
         weight_data(const ShareType& share)
         {
             auto att = coind::data::target_to_average_attempts(share->target);
-            LOG_TRACE << "att: " << att.GetHex() << ", for hash: " << share->hash.GetHex() << ", target: " << share->target.GetHex();
-
-            std::fstream f("weights.txt", ios_base::out|ios_base::app);
-            f << share->hash.GetHex() << " " << share->target.GetHex() << " " << att.GetHex() << std::endl;
-            f.close();
 
             amount = {{share->new_script.data, att * (65535 - *share->donation)}};
-            total_weight = att;
+            total_weight = att*65535;
             total_donation_weight = att * (*share->donation);
-
-            if (UintToArith256(share->hash) == UintToArith256(uint256S("cb03713e6ef3c0b7b9558e3e6b9fde4e972e3c080ea60f6564a1f24519b81660")))
-            {
-                LOG_TRACE << "ONO";
-                LOG_TRACE << share->target.GetHex();
-                LOG_TRACE << att.GetHex();
-//                assert(false);
-            }
         }
 
         void operator+=(const weight_data &element)
