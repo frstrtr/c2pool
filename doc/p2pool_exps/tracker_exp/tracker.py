@@ -228,10 +228,6 @@ class WeightsSkipList(TrackerSkipList):
         att = bitcoin_data.target_to_average_attempts(share.target)
         print('att: {0}, for hash: {1}, target = {2}'.format(hex(att), hex(element), hex(share.target)))
 
-        file = open('weights_p2pool.txt','a')
-        file.write('{0} {1} {2}\n'.format(element, share.target, att))
-        file.close()
-
         if (element == 46728121436595531835519850090158657855065647721690516162467033698198078009934):
             print('ONO')
             print(hex(share.target))

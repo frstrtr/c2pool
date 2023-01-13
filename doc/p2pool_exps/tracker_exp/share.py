@@ -393,6 +393,8 @@ class BaseShare(object):
             max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
             65535*net.SPREAD*coind_data.target_to_average_attempts(block_target),
         )
+        print('last after max: {0}'.format(tracker.get_nth_parent_hash(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
+            max(0, min(height, net.REAL_CHAIN_LENGTH) - 1))))
         print('weights = {0}, total_weight = {1}, donation_weight = {2}'.format(weights, hex(total_weight), hex(donation_weight)))
         for k, v in weights.items():
             print('{0}:{1}'.format(k.encode('hex'), hex(v)))
