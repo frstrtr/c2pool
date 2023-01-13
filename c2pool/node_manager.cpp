@@ -8,9 +8,9 @@ using boost::asio::ip::tcp;
 using namespace shares::types;
 
 
-NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<coind::DigibyteParentNetwork> _parent_network,
-                         shared_ptr<c2pool::dev::coind_config> _cfg) : _net(_network), _parent_net(_parent_network),
-                                                                       _config(_cfg)
+NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) :
+                                                                _net(_network), _parent_net(_network->parent),
+                                                                _config(_cfg)
 {
 }
 

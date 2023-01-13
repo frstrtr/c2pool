@@ -21,8 +21,7 @@ protected:
     {}
 
 public:
-    NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<coind::DigibyteParentNetwork> _parent_network,
-                shared_ptr<c2pool::dev::coind_config> _cfg);
+    NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg);
 
     void start()
     {
