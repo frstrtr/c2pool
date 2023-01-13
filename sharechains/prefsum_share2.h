@@ -7,6 +7,8 @@
 #include <btclibs/arith_uint256.h>
 #include <libdevcore/prefsum.h>
 
+#include <utility>
+
 namespace shares
 {
     class SharePrefsumElement : public BasePrefsumElement<uint256, ShareType, SharePrefsumElement>
@@ -30,14 +32,14 @@ namespace shares
     public:
         arith_uint288 work;
         arith_uint288 min_work;
-        weight::weight_element_type weight;
+        weight::weight_data weight;
         doa_element_type doa;
 
         SharePrefsumElement() : BasePrefsumElement<uint256, ShareType, SharePrefsumElement>()
         {}
 
         SharePrefsumElement(ShareType data)
-        { set_value(data); }
+        { set_value(std::move(data)); }
 
         bool is_none() override
         {
@@ -52,7 +54,7 @@ namespace shares
 
             work = coind::data::target_to_average_attempts(value->target);
             min_work = coind::data::target_to_average_attempts(value->max_target);
-            weight = weight::weight_element_type(value);
+            weight = weight::weight_data(value);
             doa = doa_element_type(value);
         }
     };
