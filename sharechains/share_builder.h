@@ -67,7 +67,7 @@ protected:
         share->max_target = FloatingInteger((*value)->max_bits).target();
         share->target = FloatingInteger((*value)->bits).target();
         share->timestamp = std::unique_ptr<uint32_t>(&(*value)->timestamp);
-        share->absheight = std::unique_ptr<uint32_t>(&(*value)->absheigth);
+        share->absheight = std::unique_ptr<uint32_t>(&(*value)->absheight);
         share->abswork = std::unique_ptr<uint128>(&(*value)->abswork);
         share->new_transaction_hashes = std::unique_ptr<vector<uint256>>(&(*value)->new_transaction_hashes);
     }

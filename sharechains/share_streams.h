@@ -194,7 +194,7 @@ namespace shares::stream
 			max_bits = val.max_bits;
 			bits = val.bits;
 			timestamp = val.timestamp;
-			absheight = val.absheigth;
+			absheight = val.absheight;
 			abswork = val.abswork;
 		}
 
