@@ -389,12 +389,13 @@ class BaseShare(object):
         print('For get_cumulative_weights: {0}, {1}, {2}'.format(hex(previous_share.share_data['previous_share_hash'] if previous_share is not None else None),
             max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
             hex(65535*net.SPREAD*coind_data.target_to_average_attempts(block_target))))
-        001dffe20000000000000000000000000000000000000000000000000000000000000000
-        1dffe20000000000000000000000000000000000000000000000000000000
         weights, total_weight, donation_weight = tracker.get_cumulative_weights(previous_share.share_data['previous_share_hash'] if previous_share is not None else None,
             max(0, min(height, net.REAL_CHAIN_LENGTH) - 1),
             65535*net.SPREAD*coind_data.target_to_average_attempts(block_target),
         )
+        print('weights = {0}, total_weight = {1}, donation_weight = {2}'.format(weights, hex(total_weight), hex(donation_weight)))
+        for k, v in weights.items():
+            print('{0}:{1}'.format(k.encode('hex'), hex(v)))
         assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
         
         amounts = dict((script, share_data['subsidy']*(199*weight)//(200*total_weight)) for script, weight in weights.iteritems()) # 99.5% goes according to weights prior to this share

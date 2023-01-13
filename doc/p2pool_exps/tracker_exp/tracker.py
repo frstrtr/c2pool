@@ -220,13 +220,21 @@ class TrackerView(object):
         return self.get_delta_to_last(item) - self.get_delta_to_last(ancestor)
 
 class WeightsSkipList(TrackerSkipList):
-    # share_count, weights, total_weight
+    # share_count, weights, total_weight, total_donation_weight
     
     def get_delta(self, element):
         import coind_data as bitcoin_data
         share = self.tracker.items[element]
         att = bitcoin_data.target_to_average_attempts(share.target)
-        return 1, {share.new_script: att*(65535-share.share_data['donation'])}, att*65535, att*share.share_data['donation']
+        print('att: {0}, for hash: {1}, target = {2}'.format(hex(att), hex(element), hex(share.target)))
+        if (element == 46728121436595531835519850090158657855065647721690516162467033698198078009934):
+            print('ONO')
+            print(hex(share.target))
+            print(hex(att))
+            assert(False)
+        _delta = 1, {share.new_script: att*(65535-share.share_data['donation'])}, att*65535, att*share.share_data['donation']
+        print(_delta)
+        return _delta
     
     def combine_deltas(self, (share_count1, weights1, total_weight1, total_donation_weight1), (share_count2, weights2, total_weight2, total_donation_weight2)):
         return share_count1 + share_count2, p2pool_math.add_dicts(weights1, weights2), total_weight1 + total_weight2, total_donation_weight1 + total_donation_weight2
@@ -237,6 +245,7 @@ class WeightsSkipList(TrackerSkipList):
     
     def apply_delta(self, (share_count1, weights_list, total_weight1, total_donation_weight1), (share_count2, weights2, total_weight2, total_donation_weight2), (max_shares, desired_weight)):
         if total_weight1 + total_weight2 > desired_weight and share_count2 == 1:
+            assert(False)
             assert (desired_weight - total_weight1) % 65535 == 0
             script, = weights2.iterkeys()
             new_weights = {script: (desired_weight - total_weight1)//65535*weights2[script]//(total_weight2//65535)}
@@ -259,7 +268,7 @@ class WeightsSkipList(TrackerSkipList):
         print('total_weight = {0}'.format(total_weight))
         print('total_donation_weight = {0}'.format(total_donation_weight))
         print('max_shares = {0}'.format(max_shares))
-        print('desired_weight = {0}'.format(desired_weight))
+        print('desired_weight = {0}'.format(hex(desired_weight)))
         return p2pool_math.add_dicts(*p2pool_math.flatten_linked_list(weights_list)), total_weight, total_donation_weight
 
 class Tracker(object):

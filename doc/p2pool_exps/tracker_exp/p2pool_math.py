@@ -170,6 +170,7 @@ def add_tuples(res, *tuples):
 
 def flatten_linked_list(x):
     while x is not None:
+        # print(x)
         x, cur = x
         yield cur
 
