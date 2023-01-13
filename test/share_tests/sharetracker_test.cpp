@@ -402,6 +402,42 @@ TEST_F(SharechainsTest, weights_test)
     auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
     std::cout << "Best = " << _best.GetHex() << std::endl;
     std::cout << "pre for Best = " << tracker->get(_best)->previous_hash->GetHex();
+
+    ShareType previous_share = tracker->get(tracker->get(_best)->hash);
+    uint256 prev_share_hash = previous_share ? previous_share->hash : uint256::ZERO;
+
+    //height, last
+    auto [height, last] = tracker->get_height_and_last(_best);
+
+    auto _block_target = FloatingInteger(0).target();
+
+    //get_cumulative_weights
+    std::map<std::vector<unsigned char>, arith_uint288> weights;
+    arith_uint288 total_weight;
+    arith_uint288 donation_weight;
+    {
+        uint256 start_hash = *previous_share->previous_hash;
+
+        int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
+
+        LOG_TRACE << "block_target: " << _block_target.GetHex();
+        auto _block_target_attempts = coind::data::target_to_average_attempts(_block_target);
+        LOG_TRACE << "_block_target_attempts: " << _block_target_attempts.GetHex();
+
+        auto desired_weight = _block_target_attempts * 65535 * net->SPREAD;
+
+        LOG_TRACE << "For get_cumulative_weights: " << start_hash.GetHex() << " " << max_shares << " " << desired_weight.GetHex();
+        auto weights_result = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
+        weights = std::get<0>(weights_result);
+        total_weight = std::get<1>(weights_result);
+        donation_weight = std::get<2>(weights_result);
+        LOG_TRACE << "weights.size = " << weights.size() << ", total_weight = " << total_weight.GetHex() << ", donation_weight = " << donation_weight.GetHex();
+        LOG_TRACE << "Weights: ";
+        for (auto v : weights)
+        {
+            LOG_TRACE << HexStr(v.first) << " " << v.second.GetHex();
+        }
+    }
 }
 
 TEST_F(SharechainsTest, gentx_test)
