@@ -143,7 +143,6 @@ public:
         return result;
     }
 
-	//TODO: test!
 	std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
 	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint288 desired_weight)
 	{
@@ -199,6 +198,7 @@ public:
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
             auto [_script, _weight] = *extra_ending->amount.begin();
+            //TODO: test
             std::pair<std::vector<unsigned char>, arith_uint288> new_weight = {_script,
                                                                                (desired_weight - total_weights) /
                                                                                65535 * _weight /
@@ -227,184 +227,6 @@ public:
 
             return std::make_tuple(weights, total_weights, total_donation_weights);
         }
-
-
-//        auto next = cur;
-//
-//        while(cur.head != last)
-//        {
-//            if (cur.weight.total_weight > desired_sum_weight)
-//            {
-//                for (auto [k, v]: cur.weight.amount)
-//                {
-//                    if (weights.find(k) != weights.end())
-//                    {
-//                        weights[k] += v;
-//                    } else
-//                    {
-//                        weights[k] = v;
-//                    }
-//                }
-//            } else
-//            {
-//                auto [_script, _weight] = *cur.weight.amount.begin();
-//                current_value
-//                shares::weight::weight_data current_weight_data(next.get_value());
-//
-//
-//                std::map<std::vector<unsigned char>, arith_uint288> new_weight = {{_script,
-//                                                                                   (desired_weight - total_weight1) /
-//                                                                                   65535 * weights2[script] /
-//                                                                                   (total_weight2 / 65535)
-//                                                                                  }};
-//                break;
-//            }
-//
-//            next = cur;
-//            cur = cur.prev->second;
-//        }
-//
-
-
-
-
-
-
-
-
-//        if (get_sum(start, last).weight.total_weight > desired_weight)
-//        {
-////            auto desired_sum = get_sum_to_last(start).weight.total_weight - desired_weight;
-////            auto cur = get_sum_to_last(start);
-//            while (cur.prev != last)
-//            {
-//                auto prev = cur.prev->second;
-//                if (prev.weight.total_weight < desired_sum)
-//                {
-//                    cur.
-//                }
-//
-//                cur = prev;
-//            }
-//        }
-//
-//        // Если мы и так в рамках desired_weight и max_shares
-//        return
-//
-//        //
-//         auto best = get_sum_to_last(start);
-//
-//         auto max_shares_hash = get_nth_parent_key(start, max_shares);
-//         auto max_shares_data = get_sum(start, max_shares_hash);
-//         if (best.weight.total_weight <= desired_weight)
-//         {
-//             //weights
-//            std::map<std::vector<unsigned char>, arith_uint288> weights;
-//            auto it = sum.find(max_shares_data.head);
-//            while (it != sum.end())
-//            {
-//                for (auto [k, v] : it->second.weight.amount)
-//                {
-//                    if (weights.find(k) != weights.end())
-//                    {
-//                        weights[k] += v;
-//                    } else
-//                    {
-//                        weights[k] = v;
-//                    }
-//                }
-////                weights = std::accumulate(it->second.weight.amount.begin(), it->second.weight.amount.end(), weights,
-////                                     [](std::map<std::vector<unsigned char>, arith_uint288> &m, const std::pair<std::vector<unsigned char>, arith_uint288> &p)
-////                                     {
-////                                         return (m[p.first] += p.second, m);
-////                                     });
-//                it = it->second.prev;
-//            }
-//
-//            //total weights
-//            auto total_weights = max_shares_data.weight.total_weight * 65535;
-//            //total donation weights
-//            auto total_donation_weights = max_shares_data.weight.total_donation_weight;
-//
-//            return std::make_tuple(weights, total_weights, total_donation_weights);
-//
-//
-//         }
-//         auto p = best.weight.total_weight;
-//
-//         return {{}, arith_uint288(), arith_uint288()};
-//----------------------------
-
-//		// [last; best]
-//		auto best = get_sum_to_last(start);
-//		auto p = best.weight.total_weight - desired_weight;
-//        LOG_TRACE << "[get_cumulative_weights]: p = " << p.GetHex();
-//        LOG_TRACE << "[get_cumulative_weights]: p = " << best.weight.total_weight.GetHex();
-//
-//		auto it = sum.find(start);
-//
-//		while (it != sum.end())
-//		{
-//			if (it->second.weight.total_weight <= p)
-//				break;
-//
-//			if ((best.height - it->second.height) == max_shares)
-//				break;
-//
-//			it = it->second.prev;
-//		}
-//
-//		element_type i;
-//		if (it != sum.end())
-//		{
-//			if (it->second.weight.total_weight < p)
-//			{
-//				element_type x;
-//				if (it->second.prev != sum.end())
-//				{
-//					x = get_sum(it->first, it->second.prev->first);
-//				} else
-//				{
-//					x = get_sum_to_last(it->first);
-//				}
-//
-//				auto cur = get_sum(start, it->first);
-//				auto script = x.weight.weights->amount.first;
-//				// - new_weights = {script: (desired_weight - total_weight1)//65535*weights2[script]//(total_weight2//65535)}
-//				auto new_weight = (desired_weight - cur.weight.total_weight)/65535*x.weight.weights->amount.second/(cur.weight.weights->amount.second/65535);
-//				auto _weights = std::make_shared<shares::weight::weight_element>(script, new_weight);
-//
-//				// - total_donation_weight1 + (desired_weight - total_weight1)//65535*total_donation_weight2//(total_weight2//65535)
-//				auto total_donation = cur.weight.total_donation_weight + (desired_weight - cur.weight.total_weight)/65535*x.weight.total_donation_weight/(x.weight.total_weight/65535);
-//				shares::weight::weight_element_type new_weights(_weights, desired_weight, total_donation);
-//
-//				x.weight = new_weights;
-//				i = x;
-//			} else
-//			{
-//				// (it; best]
-//				i = get_sum(best.head, it->first);
-//			}
-//		}
-//		else
-//		{
-//			i = best;
-//		}
-//
-//        if (!i.is_none())
-//        {
-//            assert((i.height <= max_shares) && (i.weight.total_weight <= desired_weight));
-//            assert((i.height == max_shares) || (i.weight.total_weight == desired_weight));
-//
-//            auto weights = i.weight.weights->get_map();
-//            auto total_weight = i.weight.total_weight;
-//            auto donation_weight = i.weight.total_donation_weight;
-//
-//            return std::make_tuple(weights, total_weight, donation_weight);
-//        } else
-//        {
-//            return {{}, 0, 0};
-//        }
 	}
 
     // from p2pool::share
