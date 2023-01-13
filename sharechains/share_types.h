@@ -228,7 +228,7 @@ namespace shares::types
         uint32_t timestamp;                                  //pack.IntType(32)
         std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
         std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        uint32_t absheigth;                                 //pack.IntType(32)
+        uint32_t absheight;                                 //pack.IntType(32)
         uint128 abswork;                                         //pack.IntType(128)
         std::optional<SegwitData> segwit_data;
     public:
@@ -239,7 +239,7 @@ namespace shares::types
 
         ShareInfo(uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
 				  unsigned int _timestamp, std::vector<uint256> _new_transaction_hashes,
-				  vector<tuple<uint64_t, uint64_t>> _transaction_hash_refs, unsigned long _absheigth,
+				  vector<tuple<uint64_t, uint64_t>> _transaction_hash_refs, unsigned long _absheight,
 				  uint128 _abswork)
 		{
 			far_share_hash = _far_share_hash;
@@ -248,7 +248,7 @@ namespace shares::types
 			timestamp = _timestamp;
 			new_transaction_hashes = _new_transaction_hashes;
 			transaction_hash_refs = _transaction_hash_refs;
-			absheigth = _absheigth;
+            absheight = _absheight;
 			abswork = _abswork;
 		}
 
@@ -257,7 +257,7 @@ namespace shares::types
             return far_share_hash == value.far_share_hash && max_bits == value.max_bits &&
                    bits == value.bits && timestamp == value.timestamp &&
                    new_transaction_hashes == value.new_transaction_hashes &&
-                   transaction_hash_refs == value.transaction_hash_refs && absheigth == value.absheigth &&
+                   transaction_hash_refs == value.transaction_hash_refs && absheight == value.absheight &&
                    abswork == value.abswork;
         }
 
