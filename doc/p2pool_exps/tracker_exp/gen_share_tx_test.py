@@ -84,3 +84,9 @@ share_info, gentx, other_transaction_hashes, get_share = share_type.generate_tra
                 known_txs=[],
                 base_subsidy=7200000000000#net.PARENT.SUBSIDY_FUNC(current_work['height']),
             )
+
+#share_info, gentx, other_transaction_hashes, get_share
+print("RESULT:")
+print('share_info = {0}'.format(share_info))
+print('gentx = {0}'.format(gentx))
+print('other_tx_hashes = {0}'.format(other_transaction_hashes))

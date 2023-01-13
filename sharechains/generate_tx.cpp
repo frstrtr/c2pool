@@ -388,6 +388,8 @@ namespace shares
 //TODO: check
 //		if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
 //			raise ValueError()
+
+        return std::make_tuple(amounts);
     }
 
     coind::data::tx_type GenerateShareTransaction::gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
