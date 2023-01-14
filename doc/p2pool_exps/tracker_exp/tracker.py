@@ -226,15 +226,10 @@ class WeightsSkipList(TrackerSkipList):
         import coind_data as bitcoin_data
         share = self.tracker.items[element]
         att = bitcoin_data.target_to_average_attempts(share.target)
-        print('att: {0}, for hash: {1}, target = {2}'.format(hex(att), hex(element), hex(share.target)))
+        # print('att: {0}, for hash: {1}, target = {2}'.format(hex(att), hex(element), hex(share.target)))
 
-        if (element == 46728121436595531835519850090158657855065647721690516162467033698198078009934):
-            print('ONO')
-            print(hex(share.target))
-            print(hex(att))
-            assert(False)
         _delta = 1, {share.new_script: att*(65535-share.share_data['donation'])}, att*65535, att*share.share_data['donation']
-        print(_delta)
+        # print(_delta)
         return _delta
     
     def combine_deltas(self, (share_count1, weights1, total_weight1, total_donation_weight1), (share_count2, weights2, total_weight2, total_donation_weight2)):

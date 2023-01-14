@@ -294,12 +294,16 @@ class BaseShare(object):
         print('{0}, {1}, {2}'.format(height, net.REAL_CHAIN_LENGTH, hex(last)))
         assert height >= net.REAL_CHAIN_LENGTH or last is None
         if height < net.TARGET_LOOKBEHIND:
+            print("FIRST: {0}".format(height))
             pre_target3 = net.MAX_TARGET
         else:
             attempts_per_second = get_pool_attempts_per_second(tracker, share_data['previous_share_hash'], net.TARGET_LOOKBEHIND, min_work=True, integer=True)
+            print("attempts_per_second = {0}".format(attempts_per_second))
             pre_target = 2**256//(net.SHARE_PERIOD*attempts_per_second) - 1 if attempts_per_second else 2**256-1
             pre_target2 = math.clip(pre_target, (previous_share.max_target*9//10, previous_share.max_target*11//10))
             pre_target3 = math.clip(pre_target2, (net.MIN_TARGET, net.MAX_TARGET))
+        
+        print("pre_target3 = {0}".format(pre_target3))
         max_bits = pack.FloatingInteger.from_target_upper_bound(pre_target3)
         bits = pack.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//30, pre_target3)))
         
@@ -445,6 +449,16 @@ class BaseShare(object):
             absheight=((previous_share.absheight if previous_share is not None else 0) + 1) % 2**32,
             abswork=((previous_share.abswork if previous_share is not None else 0) + coind_data.target_to_average_attempts(bits.target)) % 2**128,
         )
+
+        print('ABSWORK:')
+        _temp = (previous_share.abswork if previous_share is not None else 0)
+        print('bits = {0}'.format(bits))
+        print('bits.target = {0}'.format(bits.target))
+        _temp_avg = coind_data.target_to_average_attempts(bits.target)
+        _abswork=(_temp + _temp_avg) % 2**128
+        print("{0} / {1} / {2}".format(_temp, _temp_avg, _abswork))
+        
+        
 
         if previous_share != None and desired_timestamp > previous_share.timestamp + 180:
             print ("Warning: Previous share's timestamp is %i seconds old." % int(desired_timestamp - previous_share.timestamp))
@@ -700,9 +714,13 @@ share_versions = {s.VERSION:s for s in [NewShare, PreSegwitShare, Share]}
 
 def get_pool_attempts_per_second(tracker, previous_share_hash, dist, min_work=False, integer=False):
     assert dist >= 2
+    print('get_pool_attempts_per_second: previous_share_hash = {0}, dist = {1}'.format(previous_share_hash, dist))
     near = tracker.items[previous_share_hash]
     far = tracker.items[tracker.get_nth_parent_hash(previous_share_hash, dist - 1)]
+    print('near = {0}'.format(near.hash))
+    print('far = {0}'.format(far.hash))
     attempts = tracker.get_delta(near.hash, far.hash).work if not min_work else tracker.get_delta(near.hash, far.hash).min_work
+    print('attempts = {0}'.format(attempts))
     time = near.timestamp - far.timestamp
     if time <= 0:
         time = 1

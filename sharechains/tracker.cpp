@@ -330,6 +330,7 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
     auto far = get(SharePrefsum2::get_nth_parent_key(previous_share_hash,dist - 1));
+    LOG_TRACE << "near = " << near->hash << ", far = " << far->hash;
 	auto attempts_delta = SharePrefsum2::get_sum(previous_share_hash, far->hash);
 
 	auto time = *near->timestamp - *far->timestamp;
@@ -346,6 +347,7 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 	{
 		res = attempts_delta.work;
 	}
+    LOG_TRACE << "res = " << res.GetHex();
 	res /= time;
 
     return res;

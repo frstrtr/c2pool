@@ -81,7 +81,7 @@ share_info, gentx, other_transaction_hashes, get_share = share_type.generate_tra
                 ref_merkle_link=dict(branch=[], index=0),
                 desired_other_transaction_hashes_and_fees=[],
                 net=net,
-                # known_txs=[],
+                known_txs=[],
                 base_subsidy=7200000000000#net.PARENT.SUBSIDY_FUNC(current_work['height']),
             )
 

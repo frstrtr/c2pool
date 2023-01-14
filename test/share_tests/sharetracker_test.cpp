@@ -544,7 +544,6 @@ TEST_F(SharechainsTest, gentx_test)
     LOG_TRACE << "\tnew_transaction_hashes: ";
     for (auto v : share_info->new_transaction_hashes)
         LOG_TRACE << v.GetHex();
-    LOG_TRACE << " ";
 
     ASSERT_EQ(share_info->far_share_hash, uint256S("ba025a80b4be4999c4c42851b395599df3770d66f892b4074698a82200ab4cfe"));
     LOG_TRACE << "\tfar_share_hash:" << share_info->far_share_hash.GetHex();
@@ -553,11 +552,10 @@ TEST_F(SharechainsTest, gentx_test)
     LOG_TRACE << "\ttransaction_hash_refs: ";
     for (auto [v1, v2] : share_info->transaction_hash_refs)
         LOG_TRACE << v1 << " " << v2;
-    LOG_TRACE << " ";
 
     LOG_TRACE << "\ttimestamp: " << share_info->timestamp;
 
-    // SHARE_INFO.SEGWIT_DATA
+    // SEGWIT_DATA
     LOG_TRACE << "\tSegwitData:";
     if (share_info->segwit_data.has_value())
     {
@@ -576,7 +574,6 @@ TEST_F(SharechainsTest, gentx_test)
     ASSERT_EQ(share_info->absheight, 259326);
 
     LOG_TRACE << "\tabswork:" << share_info->abswork;
-    LOG_TRACE << share_info->abswork.ToString();
     ASSERT_EQ(share_info->abswork.GetHex(), "44bc54f548a");
 
     LOG_TRACE << "\tbits:" << share_info->bits;
@@ -610,7 +607,6 @@ TEST_F(SharechainsTest, gentx_test)
     LOG_TRACE << "\tcoinbase: ";
     for (auto v : share_data.coinbase)
         LOG_TRACE << (unsigned int) v;
-    LOG_TRACE << " ";
 
     ASSERT_EQ(share_data.desired_version, 17);
     LOG_TRACE << "\tdesired_version: " << share_data.desired_version;
