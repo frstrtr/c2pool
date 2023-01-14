@@ -157,6 +157,7 @@ namespace shares
         } else
         {
             auto attempts_per_second = tracker->get_pool_attempts_per_second(_share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true);
+            LOG_TRACE << "attempts_per_second = " << attempts_per_second.GetHex();
 
             arith_uint288 pre_target;
             pre_target.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
@@ -181,6 +182,7 @@ namespace shares
             _pre_target3 = math::clip(pre_target2, UintToArith256(net->MIN_TARGET), UintToArith256(net->MAX_TARGET));
         }
         uint256 pre_target3 = ArithToUint256(_pre_target3);
+        LOG_TRACE << "pre_target3 = " << pre_target3.GetHex();
 
         return _pre_target3;
     }
@@ -507,16 +509,21 @@ namespace shares
             arith_uint288 _temp;
             if (previous_share)
             {
-                auto _share_abswork = *previous_share->abswork;
-                _temp.SetHex(_share_abswork.GetHex());
+                _temp.SetHex(previous_share->abswork->GetHex());
             }
+            LOG_TRACE << "_temp = " << _temp.GetHex();
+            LOG_TRACE << "bits = " << bits.value.value;
+            LOG_TRACE << "bits.target = " << bits.target().GetHex();
+            auto _temp_avg = coind::data::target_to_average_attempts(bits.target());
+            LOG_TRACE << "_temp_avg = " << _temp_avg.GetHex();
 
-            _temp = _temp + coind::data::target_to_average_attempts(bits.target());
+            _temp = _temp + _temp_avg;
             arith_uint288 pow2_128; // 2^128
             pow2_128.SetHex("100000000000000000000000000000000");
 
             _temp = _temp >= pow2_128 ? _temp - pow2_128 : _temp; // _temp % pow2_128;
             _abswork.SetHex(_temp.GetHex());
+            LOG_TRACE << "abswork = " << _abswork.GetHex();
         }
         //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
 
