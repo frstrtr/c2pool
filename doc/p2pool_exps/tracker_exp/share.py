@@ -411,8 +411,13 @@ class BaseShare(object):
         dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
 
         segwit_activated = is_segwit_activated(cls.VERSION, net)
+        print('segwit_activated: {0}'.format(segwit_activated))
+        print('segwit_data: {0}'.format(segwit_data))
+        print("known_txs = {0}".format(known_txs))
         if segwit_data is None and known_txs is None:
             segwit_activated = False
+        if segwit_activated:
+            print("SEGWIT_ACTIVATED")
         if not(segwit_activated or known_txs is None) and any(coind_data.is_segwit_tx(known_txs[h]) for h in other_transaction_hashes):
             raise ValueError('segwit transaction included before activation')
         if segwit_activated and known_txs is not None:

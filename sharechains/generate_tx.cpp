@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "tracker.h"
@@ -14,11 +15,12 @@
 namespace shares
 {
 
-    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
+    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, types::ShareData _share_data, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
     {
         share_info = std::move(_share_info);
+        share_data = std::move(_share_data);
         gentx = std::move(_gentx);
-        other_transaction_hashes = _other_transaction_hashes;
+        other_transaction_hashes = std::move(_other_transaction_hashes);
         get_share = std::move(_get_share);
 
     }
@@ -85,23 +87,26 @@ namespace shares
         auto [amounts] = weight_amount_calculate((*previous_share->share_data)->previous_share_hash, height);
 
         bool segwit_activated = is_segwit_activated(version, net);
-        if (!_segwit_data.has_value() && _known_txs.empty())
+        if (!_segwit_data.has_value() && !_known_txs.has_value())
         {
+            LOG_TRACE << "!_segwit_data.has_value(): " << !_segwit_data.has_value();
+            LOG_TRACE << "_known_txs.empty(): " << !_known_txs.has_value();
+            LOG_TRACE << "segwit_activated -> false";
             segwit_activated = false;
         }
 
         bool segwit_tx = false;
         for (auto _tx_hash: other_transaction_hashes)
         {
-            if (coind::data::is_segwit_tx(_known_txs[_tx_hash]))
+            if (coind::data::is_segwit_tx(_known_txs.value()[_tx_hash]))
                 segwit_tx = true;
         }
-        if (!(segwit_activated || _known_txs.empty()) && segwit_tx)
+        if (!(segwit_activated || !_known_txs.has_value()) && segwit_tx)
         {
             throw "segwit transaction included before activation";
         }
 
-        if (segwit_activated && !_known_txs.empty())
+        if (segwit_activated && _known_txs.has_value())
         {
             make_segwit_data(other_transaction_hashes);
         }
@@ -109,7 +114,7 @@ namespace shares
 //      witness_reserved_value_str = '[P2Pool]'*4
 //		witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
 //		witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
-        char* witness_reserved_value_str = "[C2Pool][CPool][C2Pool][C2Pool]";
+        char* witness_reserved_value_str = "[C2Pool][C2Pool][C2Pool][C2Pool]";
         uint256 witness_commitment_hash;
         if (segwit_activated && _segwit_data.has_value())
         {
@@ -139,7 +144,7 @@ namespace shares
 //			(t5-t4)*1000.)
 //	    */
 //
-        return std::make_shared<GeneratedShareTransactionResult>(share_info, gentx, other_transaction_hashes, get_share_F);
+        return std::make_shared<GeneratedShareTransactionResult>(share_info, _share_data, gentx, other_transaction_hashes, get_share_F);
     }
 
     arith_uint256 GenerateShareTransaction::pre_target_calculate(ShareType previous_share, const int32_t &height)
@@ -241,9 +246,9 @@ namespace shares
             int32_t this_stripped_size = 0;
             int32_t this_real_size = 0;
             int32_t this_weight = 0;
-            if (!_known_txs.empty())
+            if (_known_txs.has_value())
             {
-                auto _tx = _known_txs[tx_hash];
+                auto _tx = _known_txs.value()[tx_hash];
                 // this_stripped_size
                 {
 
@@ -617,7 +622,7 @@ namespace shares
         share_txs.resize(other_transaction_hashes.size());
         for (auto h : other_transaction_hashes)
         {
-            share_txs.emplace_back(_known_txs[h], coind::data::get_txid(_known_txs[h]), h);
+            share_txs.emplace_back(_known_txs.value()[h], coind::data::get_txid(_known_txs.value()[h]), h);
         }
 
         std::vector<uint256> _txids{uint256()};

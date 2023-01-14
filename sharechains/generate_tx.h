@@ -23,11 +23,12 @@ namespace shares
     struct GeneratedShareTransactionResult
     {
         std::shared_ptr<shares::types::ShareInfo> share_info;
+        types::ShareData share_data;
         coind::data::tx_type gentx;
         std::vector<uint256> other_transaction_hashes;
         get_share_method get_share;
 
-        GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
+        GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, types::ShareData _share_data, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
     };
 
 #define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256, std::optional<int32_t>>>
@@ -56,15 +57,24 @@ namespace shares
         SetProperty(uint256, desired_target);
         SetProperty(coind::data::MerkleLink, ref_merkle_link);
         SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
-        SetProperty(type_known_txs, known_txs);
+//        SetProperty(type_known_txs, known_txs);
         SetProperty(unsigned long long, last_txout_nonce);
         SetProperty(unsigned long long, base_subsidy);
 
+        std::optional<type_known_txs> _known_txs;
+
+        GenerateShareTransaction &set_known_txs(const type_known_txs &_value)
+        {
+            _known_txs = _value;
+            return *this;
+        }
+
         std::optional<shares::types::SegwitData> _segwit_data;
 
-        void set_segwit_data(const shares::types::SegwitData &_value)
+        GenerateShareTransaction &set_segwit_data(const shares::types::SegwitData &_value)
         {
             _segwit_data = _value;
+            return *this;
         }
 
     public:
