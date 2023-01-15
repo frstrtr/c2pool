@@ -320,6 +320,7 @@ class FloatingInteger(object):
         n_arr = [ord(x) for x in n]
         print('n = {0}'.format(n_arr))
         print(n.encode('hex'))
+        print('len(n) = {0}'.format(len(n)))
         if n and ord(n[0]) >= 128:
             n = '\x00' + n
         bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
@@ -327,6 +328,7 @@ class FloatingInteger(object):
         bits2_arr = [ord(x) for x in bits2]
         print('bits2 = {0}'.format(bits2_arr))
         bits = IntType(32).unpack(bits2)
+        print('bits = {0}'.format(bits))
         return cls(bits)
     
     def __init__(self, bits, target=None):
