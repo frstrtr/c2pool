@@ -298,14 +298,16 @@ class BaseShare(object):
             pre_target3 = net.MAX_TARGET
         else:
             attempts_per_second = get_pool_attempts_per_second(tracker, share_data['previous_share_hash'], net.TARGET_LOOKBEHIND, min_work=True, integer=True)
-            print("attempts_per_second = {0}".format(attempts_per_second))
+            print("attempts_per_second = {0}".format(hex(attempts_per_second)))
             pre_target = 2**256//(net.SHARE_PERIOD*attempts_per_second) - 1 if attempts_per_second else 2**256-1
             pre_target2 = math.clip(pre_target, (previous_share.max_target*9//10, previous_share.max_target*11//10))
             pre_target3 = math.clip(pre_target2, (net.MIN_TARGET, net.MAX_TARGET))
         
-        print("pre_target3 = {0}".format(pre_target3))
+        print("pre_target3 = {0}".format(hex(pre_target3)))
         max_bits = pack.FloatingInteger.from_target_upper_bound(pre_target3)
+        print('max_bits = {0}'.format(max_bits))
         bits = pack.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//30, pre_target3)))
+        print('bits = {0}'.format(bits))
         
         new_transaction_hashes = []
         new_transaction_size = 0 # including witnesses
@@ -714,16 +716,24 @@ share_versions = {s.VERSION:s for s in [NewShare, PreSegwitShare, Share]}
 
 def get_pool_attempts_per_second(tracker, previous_share_hash, dist, min_work=False, integer=False):
     assert dist >= 2
-    print('get_pool_attempts_per_second: previous_share_hash = {0}, dist = {1}'.format(previous_share_hash, dist))
+    print('get_pool_attempts_per_second: previous_share_hash = {0}, dist = {1}'.format(hex(previous_share_hash), dist))
     near = tracker.items[previous_share_hash]
+    near_work = coind_data.target_to_average_attempts(near.target)
+    print('near work = {0}'.format(hex(near_work)))
     far = tracker.items[tracker.get_nth_parent_hash(previous_share_hash, dist - 1)]
-    print('near = {0}'.format(near.hash))
-    print('far = {0}'.format(far.hash))
+    print('near = {0}'.format(hex(near.hash)))
+    print('far = {0}'.format(hex(far.hash)))
+    print('attempts.work = {0}, attempts.min_work = {1}'.format(tracker.get_delta(near.hash, far.hash).work, tracker.get_delta(near.hash, far.hash).min_work))
     attempts = tracker.get_delta(near.hash, far.hash).work if not min_work else tracker.get_delta(near.hash, far.hash).min_work
-    print('attempts = {0}'.format(attempts))
+    print('attempts = {0}'.format(hex(attempts)))
     time = near.timestamp - far.timestamp
+    print('near.timestamp = {0}, far.timestamp = {1}'.format(near.timestamp, far.timestamp))
+    print('time = {0}'.format(time))
     if time <= 0:
         time = 1
+
+    print('attempts//time = {0}'.format(attempts//time))
+    print('attempts/time = {0}'.format(attempts/time))
     if integer:
         return attempts//time
     return attempts/time

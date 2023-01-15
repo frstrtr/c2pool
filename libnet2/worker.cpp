@@ -330,7 +330,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 			// _coinbase << mm_data // TODO: FOR MERGED MINING
 			_coinbase << current_work.value().coinbaseflags;
 			coinbase = ToByteVector(_coinbase);
-			coinbase.resize(100);
+            if (coinbase.size() > 100)
+                coinbase.resize(100);
 		}
         uint16_t donation = 65535 * donation_percentage / 100; //TODO: test for "math.perfect_round"
         StaleInfo stale_info;

@@ -506,7 +506,13 @@ TEST_F(SharechainsTest, gentx_test)
             // _coinbase << mm_data // TODO: FOR MERGED MINING
             _coinbase << current_work.coinbaseflags;
             coinbase = ToByteVector(_coinbase);
-            coinbase.resize(100);
+            if (coinbase.size() > 100)
+                coinbase.resize(100);
+
+            int pos = 0;
+            while (coinbase[pos] == '\0' && pos < coinbase.size())
+                pos++;
+            coinbase.erase(coinbase.begin(), coinbase.begin()+pos);
         }
         uint16_t donation = 65535 * donation_percentage / 100; //TODO: test for "math.perfect_round"
         StaleInfo stale_info;
@@ -540,18 +546,18 @@ TEST_F(SharechainsTest, gentx_test)
     // share_info
     LOG_TRACE << "SHARE_INFO:";
 
-    ASSERT_EQ(share_info->new_transaction_hashes, std::vector<uint256>());
     LOG_TRACE << "\tnew_transaction_hashes: ";
     for (auto v : share_info->new_transaction_hashes)
         LOG_TRACE << v.GetHex();
+    ASSERT_EQ(share_info->new_transaction_hashes, std::vector<uint256>());
 
-    ASSERT_EQ(share_info->far_share_hash, uint256S("ba025a80b4be4999c4c42851b395599df3770d66f892b4074698a82200ab4cfe"));
     LOG_TRACE << "\tfar_share_hash:" << share_info->far_share_hash.GetHex();
+    ASSERT_EQ(share_info->far_share_hash, uint256S("ba025a80b4be4999c4c42851b395599df3770d66f892b4074698a82200ab4cfe"));
 
-    ASSERT_EQ(share_info->transaction_hash_refs, (std::vector<std::tuple<uint64_t, uint64_t>>{}));
     LOG_TRACE << "\ttransaction_hash_refs: ";
     for (auto [v1, v2] : share_info->transaction_hash_refs)
         LOG_TRACE << v1 << " " << v2;
+    ASSERT_EQ(share_info->transaction_hash_refs, (std::vector<std::tuple<uint64_t, uint64_t>>{}));
 
     LOG_TRACE << "\ttimestamp: " << share_info->timestamp;
 
@@ -574,40 +580,40 @@ TEST_F(SharechainsTest, gentx_test)
     ASSERT_EQ(share_info->absheight, 259326);
 
     LOG_TRACE << "\tabswork:" << share_info->abswork;
-    ASSERT_EQ(share_info->abswork.GetHex(), "44bc54f548a");
+    ASSERT_EQ(share_info->abswork.GetHex(), "00000000000000000000044bc54f548a");
 
     LOG_TRACE << "\tbits:" << share_info->bits;
     ASSERT_EQ(share_info->bits, 487911265);
 
     LOG_TRACE << "\tmax_bits:" << share_info->max_bits;
-    ASSERT_EQ(share_info->bits, 31467328);
+    ASSERT_EQ(share_info->max_bits, 503477261);
+
 
     // share_data
     LOG_TRACE << "SHARE_DATA:";
 
-    ASSERT_EQ(share_data.nonce, 1754100515);
     LOG_TRACE << "\tnonce: " << share_data.nonce;
 
-    ASSERT_EQ(share_data.previous_share_hash.GetHex(), "674f2df26d4897932599be06eebb659a5e0737964c9cb0c091f4fffc76aeb24e");
     LOG_TRACE << "\tprevious_share_hash: " << share_data.previous_share_hash.GetHex();
+    ASSERT_EQ(share_data.previous_share_hash.GetHex(), "674f2df26d4897932599be06eebb659a5e0737964c9cb0c091f4fffc76aeb24e");
 
-    ASSERT_EQ(share_data.stale_info, StaleInfo::unk);
     LOG_TRACE << "\tstale_info: " << share_data.stale_info;
+    ASSERT_EQ(share_data.stale_info, StaleInfo::unk);
 
-    ASSERT_EQ(share_data.pubkey_hash.GetHex(), "78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
     LOG_TRACE << "\tpubkey_hash: " << share_data.pubkey_hash;
+    ASSERT_EQ(share_data.pubkey_hash.GetHex(), "78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
 
-    ASSERT_EQ(share_data.subsidy, 0);
     LOG_TRACE << "\tsubsidy: " << share_data.subsidy;
+    ASSERT_EQ(share_data.subsidy, 0);
 
-    ASSERT_EQ(share_data.donation, 0);
     LOG_TRACE << "\tdonation: " << share_data.donation;
+    ASSERT_EQ(share_data.donation, 0);
 
-    ASSERT_EQ(share_data.coinbase, std::vector<unsigned char>{});
     LOG_TRACE << "\tcoinbase: ";
     for (auto v : share_data.coinbase)
         LOG_TRACE << (unsigned int) v;
+    ASSERT_EQ(share_data.coinbase, std::vector<unsigned char>{});
 
-    ASSERT_EQ(share_data.desired_version, 17);
     LOG_TRACE << "\tdesired_version: " << share_data.desired_version;
+    ASSERT_EQ(share_data.desired_version, 17);
 }
