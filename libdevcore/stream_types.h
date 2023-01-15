@@ -555,7 +555,7 @@ struct FloatingInteger : public Getter<IntType(32)>
 
     FloatingInteger(IntType(32) _bits)
     {
-        value = _bits;
+        value = std::move(_bits);
     }
 
     FloatingInteger(int32_t _bits)
@@ -578,49 +578,33 @@ struct FloatingInteger : public Getter<IntType(32)>
 			}
 			return ArithToUint256(n);
 		};
-//        arith_uint256 res(value.value & 0x00ffffff);
-//
-//        res << (8 * ((value.value >> 24) - 3));
 
-//		auto res = shift_left(value.get() & 0x00ffffff, 8 * ((value.get() >> 24) - 3));
-//
-//        return ArithToUint256(res);
 		auto res = shift_left(value.get() & 0x00ffffff, 8 * ((value.get() >> 24) - 3));
 		return res;
     }
 
-    //TODO: test
     static FloatingInteger from_target_upper_bound(uint256 target)
     {
-        std::string str_n = math::natural_to_string(target);
-        list<unsigned char> n;
-        n.insert(n.end(), str_n.begin(), str_n.end());
+        auto n = math::natural_to_string(target);
 
         if (!n.empty() && *n.begin() >= 128)
         {
-            n.push_front('\0');
+            n.insert(n.begin(), '\0');
         }
 
-        list<unsigned char> bits2;
+        std::vector<unsigned char> bits2;
         bits2.push_back((unsigned char)n.size());
-        {
-            list<unsigned char> temp_bits(n);
-            for (int i = 0; i < 3; i++)
-                temp_bits.push_back('\0');
-            auto vi = temp_bits.begin();
-            std::advance(vi, 3);
-            bits2.insert(bits2.end(), temp_bits.begin(), vi);
-        }
-        bits2.reverse();
 
-        IntType(32) unpacked_bits;
+        bits2.insert(bits2.end(), n.begin(), n.end());
+        bits2.insert(bits2.end(), {0,0,0});
+        bits2.resize(4);
+        std::reverse(bits2.begin(), bits2.end());
 
-        unsigned char *bits = new unsigned char[bits2.size()];
-        std::copy(bits2.begin(), bits2.end(), bits);
-        PackStream stream(bits, bits2.size());
-        stream >> unpacked_bits;
+        IntType(32) bits;
+        PackStream stream_bits(bits2);
+        stream_bits >> bits;
 
-        return FloatingInteger(unpacked_bits);
+        return FloatingInteger(bits);
     }
 };
 
