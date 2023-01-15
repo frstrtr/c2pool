@@ -96,3 +96,55 @@ TEST(stream_types_test, inttype)
 	std::cout << _int32.get();
 	ASSERT_EQ(i, _int32.get());
 }
+
+TEST(stream_types_test, from_target_upper_bound_test)
+{
+    // 000002740d65d4ca83388eeaf63b94010c1a58203e12d3fcc23cec9ec612729d
+    auto target = uint256S("2740d65d4ca83388eeaf63b94010c1a58203e12d3fcc23cec9ec612729d");
+
+    //--Manual
+    auto natural_str = math::natural_to_string(target);
+    ASSERT_EQ(natural_str, "02740d65d4ca83388eeaf63b94010c1a58203e12d3fcc23cec9ec612729d");
+
+    // n to vector
+    std::vector<unsigned char> n = ParseHex(natural_str);
+//    n.insert(n.end(), natural_str.begin(), natural_str.end());
+
+    std::cout << "n: ";
+    for (auto v : n)
+    {
+        std::cout << v << " ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "n(ord): ";
+    for (auto v : n)
+    {
+        std::cout << (unsigned int)v << " ";
+    }
+    std::cout << std::endl;
+
+    if (!n.empty() && *n.begin() >= 128)
+    {
+        std::cout << "pushed zero to n.begin" << std::endl;
+//        n.push_front('\0');
+    }
+
+    std::vector<unsigned char> bits2;
+//    std::cout << "(unsigned char)n.size() = " << (unsigned char)n.size() << std::endl;
+    bits2.push_back((unsigned char)n.size());
+    ASSERT_EQ(bits2, std::vector<unsigned char>{'<'});
+
+    bits2.insert(bits2.end(), n.begin(), n.end());
+    std::reverse(bits2.begin(), bits2.end());
+    std::cout << "bits2(ord): ";
+    for (auto v : bits2)
+    {
+        std::cout << (unsigned int)v << " ";
+    }
+    std::cout << std::endl;
+
+    //--FROM FloatingInteget::from_target_upper_bound
+    auto from_target2 = FloatingInteger::from_target_upper_bound(target);
+    cout << "from target2: target = " << from_target2.target() << ", value = " << from_target2.get() << std::endl;
+}
