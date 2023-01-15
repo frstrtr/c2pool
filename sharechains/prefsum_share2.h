@@ -17,6 +17,7 @@ namespace shares
         SharePrefsumElement &_push(const SharePrefsumElement &sub) override
         {
             work += sub.work;
+            min_work += sub.min_work;
             weight += sub.weight;
             doa += sub.doa;
             return *this;
@@ -25,6 +26,7 @@ namespace shares
         SharePrefsumElement &_erase(const SharePrefsumElement &sub) override
         {
             work -= sub.work;
+            min_work -= sub.min_work;
             weight -= sub.weight;
             doa -= sub.doa;
             return *this;

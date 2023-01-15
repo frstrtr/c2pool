@@ -192,6 +192,7 @@ namespace shares
         LOG_TRACE << "bits_calculate called";
 
         FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(ArithToUint256(pre_target));
+        LOG_TRACE << "max_bits.target = " << max_bits.target().GetHex() << ", max_bits.value = " << max_bits.get();
         FloatingInteger bits;
         {
             arith_uint256 __desired_target = UintToArith256(_desired_target);

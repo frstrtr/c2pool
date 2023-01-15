@@ -329,11 +329,15 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 {
 	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
+    LOG_TRACE << "near work = " << coind::data::target_to_average_attempts(near->target).GetHex();
     auto far = get(SharePrefsum2::get_nth_parent_key(previous_share_hash,dist - 1));
     LOG_TRACE << "near = " << near->hash << ", far = " << far->hash;
-	auto attempts_delta = SharePrefsum2::get_sum(previous_share_hash, far->hash);
+	auto attempts_delta = SharePrefsum2::get_sum(near->hash, far->hash);
+    LOG_TRACE << "attempts_delta.min_work = " << attempts_delta.min_work.GetHex() << ", attempts_delta.work = " << attempts_delta.work.GetHex();
 
 	auto time = *near->timestamp - *far->timestamp;
+    LOG_TRACE << "near->timestamp = " << *near->timestamp << ", far->timestamp = " << *far->timestamp;
+    LOG_TRACE << "time = " << time;
 	if (time <= 0)
 	{
 		time = 1;
@@ -349,7 +353,7 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 	}
     LOG_TRACE << "res = " << res.GetHex();
 	res /= time;
-
+    LOG_TRACE << "res /= time " << res.GetHex();
     return res;
 }
 
