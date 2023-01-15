@@ -596,7 +596,7 @@ struct FloatingInteger : public Getter<IntType(32)>
         list<unsigned char> n;
         n.insert(n.end(), str_n.begin(), str_n.end());
 
-        if (n.size() > 0 && *n.begin() >= 128)
+        if (!n.empty() && *n.begin() >= 128)
         {
             n.push_front('\0');
         }

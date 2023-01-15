@@ -317,9 +317,15 @@ class FloatingInteger(object):
     @classmethod
     def from_target_upper_bound(cls, target):
         n = p2pool_math.natural_to_string(target)
+        n_arr = [ord(x) for x in n]
+        print('n = {0}'.format(n_arr))
+        print(n.encode('hex'))
         if n and ord(n[0]) >= 128:
             n = '\x00' + n
         bits2 = (chr(len(n)) + (n + 3*chr(0))[:3])[::-1]
+        
+        bits2_arr = [ord(x) for x in bits2]
+        print('bits2 = {0}'.format(bits2_arr))
         bits = IntType(32).unpack(bits2)
         return cls(bits)
     
