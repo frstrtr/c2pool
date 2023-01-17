@@ -1,5 +1,6 @@
 #include "worker.h"
 
+#include <utility>
 #include <vector>
 #include <tuple>
 #include <algorithm>
@@ -7,8 +8,8 @@
 #include <boost/foreach.hpp>
 #include <boost/tokenizer.hpp>
 
-#include "pool_node.h"
-#include "coind_node.h"
+#include "pool_node_data.h"
+#include "coind_node_data.h"
 #include <btclibs/uint256.h>
 #include <btclibs/script/script.h>
 #include <libdevcore/random.h>
@@ -20,7 +21,7 @@
 
 using std::vector;
 
-Work Work::from_jsonrpc_data(coind::getwork_result data)
+Work Work::from_jsonrpc_data(const coind::getwork_result& data)
 {
     static Work result{};
 
@@ -58,11 +59,11 @@ bool Work::operator!=(const Work &value)
     return !(*this == value);
 }
 
-Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNode> pool_node,
-               shared_ptr<CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(net), current_work(true),
-                                                                                                          _pool_node(pool_node),
-                                                                                                          _coind_node(coind_node),
-                                                                                                          _tracker(tracker),
+Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeData> pool_node,
+               shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(std::move(net)), current_work(true),
+                                                                                                          _pool_node(std::move(pool_node)),
+                                                                                                          _coind_node(std::move(coind_node)),
+                                                                                                          _tracker(std::move(tracker)),
                                                                                                           local_rate_monitor(10 * 60),
                                                                                                           local_addr_rate_monitor(10 * 60),
                                                                                                           removed_unstales(std::make_tuple(0,0,0)),

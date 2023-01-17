@@ -11,8 +11,8 @@
 
 using std::shared_ptr;
 
-class CoindNode;
-class PoolNode;
+class CoindNodeData;
+class PoolNodeData;
 
 namespace coind
 {
@@ -35,7 +35,7 @@ public:
     uint64_t subsidy;
     int32_t last_update;
 
-    static Work from_jsonrpc_data(coind::getwork_result data);
+    static Work from_jsonrpc_data(const coind::getwork_result& data);
 
     bool operator==(const Work &value);
 
@@ -101,8 +101,8 @@ class Worker
 public:
 	const int32_t COINBASE_NONCE_LENGTH = 8;
 public:
-    Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNode> pool_node,
-           std::shared_ptr<CoindNode> coind_node, std::shared_ptr<ShareTracker> tracker);
+    Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeData> pool_node,
+           std::shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker);
 
     worker_get_work_result
     get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
@@ -137,8 +137,8 @@ private:
 	}
 public:
     std::shared_ptr<c2pool::Network> _net;
-    std::shared_ptr<PoolNode> _pool_node;
-    std::shared_ptr<CoindNode> _coind_node;
+    std::shared_ptr<PoolNodeData> _pool_node;
+    std::shared_ptr<CoindNodeData> _coind_node;
     std::shared_ptr<ShareTracker> _tracker;
 
     math::RateMonitor<local_rate_datum> local_rate_monitor;
