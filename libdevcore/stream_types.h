@@ -558,7 +558,7 @@ struct FloatingInteger : public Getter<IntType(32)>
         value = std::move(_bits);
     }
 
-    FloatingInteger(int32_t _bits)
+    FloatingInteger(uint32_t _bits)
     {
         value = _bits;
     }
