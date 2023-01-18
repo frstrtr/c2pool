@@ -120,20 +120,19 @@ public:
 private:
     void compute_work();
 
-	uint256 _estimate_local_hash_rate()
+	arith_uint288 _estimate_local_hash_rate()
 	{
 		if (recent_shares_ts_work.size() == 50)
 		{
-            //TODO: REWORK get_work
-//			auto hash_rate = std::accumulate(recent_shares_ts_work.begin()+1, recent_shares_ts_work.end(),  uint256::ZERO,
-//											 [&](const uint256 &x, const std::tuple<int32_t, uint256> &y){
-//				return x + std::get<1>(y);
-//			});
-//			hash_rate = ArithToUint256(UintToArith256(hash_rate) / (std::get<0>(recent_shares_ts_work.back()) - std::get<0>(recent_shares_ts_work.front())));
-//			if (!hash_rate.IsNull())
-//				return hash_rate;
+			auto hash_rate = std::accumulate(recent_shares_ts_work.begin()+1, recent_shares_ts_work.end(),  arith_uint288(),
+											 [&](const arith_uint288 &x, const std::tuple<int32_t, uint288> &y){
+				return x + UintToArith288(std::get<1>(y));
+			});
+			hash_rate = hash_rate / (std::get<0>(recent_shares_ts_work.back()) - std::get<0>(recent_shares_ts_work.front()));
+			if (!hash_rate.IsNull())
+				return hash_rate;
 		}
-		return uint256::ZERO;
+		return arith_uint288();
 	}
 public:
     std::shared_ptr<c2pool::Network> _net;
