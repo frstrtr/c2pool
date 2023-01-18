@@ -48,6 +48,20 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
         if (exists(share_hash))
             verified.add(items.at(share_hash));
     }
+
+    // Set DOA rule
+    //TODO
+//    doa_element_type::set_rules([&](ShareType share){
+////        my_count=lambda share: 1 if share.hash in self.my_share_hashes else 0,
+////            my_doa_count=lambda share: 1 if share.hash in self.my_doa_share_hashes else 0,
+////            my_orphan_announce_count=lambda share: 1 if share.hash in self.my_share_hashes and share.share_data['stale_info'] == 'orphan' else 0,
+////            my_dead_announce_count=lambda share: 1 if share.hash in self.my_share_hashes and share.share_data['stale_info'] == 'doa' else 0,
+////        auto result = std::make_tuple(
+////                my_sh
+////                );
+//
+//        return std::make_tuple<int32_t, int32_t, int32_t, int32_t>(0, 0, 0, 0);
+//    });
 }
 
 ShareType ShareTracker::get(uint256 hash)
