@@ -322,6 +322,8 @@ uint256 Uint288ToUint256(const uint288 &);
 arith_uint288 Arith256ToArith288(const arith_uint256 &);
 arith_uint256 Arith288ToArith256(const arith_uint288 &);
 
+arith_uint288 Uint256ToArith288(const uint256&);
+
 extern template class base_uint<256>;
 extern template class base_uint<288>;
 

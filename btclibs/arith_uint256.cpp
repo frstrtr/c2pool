@@ -354,6 +354,13 @@ arith_uint256 Arith288ToArith256(const arith_uint288 &a)
     return result;
 }
 
+arith_uint288 Uint256ToArith288(const uint256& a)
+{
+    arith_uint288 result;
+    result.SetHex(a.GetHex());
+    return result;
+}
+
 uint256 operator+(const uint256 &a, const uint256 &b)
 {
     auto _a = UintToArith256(a);
