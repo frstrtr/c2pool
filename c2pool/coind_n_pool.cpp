@@ -39,17 +39,17 @@ int main(int ac, char *av[])
     auto context = std::make_shared<boost::asio::io_context>(0);
 
     // Network
-    auto parent_net = std::make_shared<coind::DigibyteParentNetwork>();
-    auto net = std::make_shared<c2pool::DigibyteNetwork>(parent_net);
+    auto net = c2pool::load_network_file("dgb");
 
     // Config
+    //    std::make_shared<c2pool::dev::coind_config>(vm);
     auto config = std::make_shared<c2pool::dev::coind_config>();
 
     // AddrStore
     auto addr_store = std::make_shared<c2pool::dev::AddrStore>("only_pool_addrs	", net);
 
     // JSONRPC Coind
-    std::shared_ptr<coind::JSONRPC_Coind> coind = std::make_shared<coind::JSONRPC_Coind>(context, parent_net, coind_ip, coind_port, coind_login);
+    std::shared_ptr<coind::JSONRPC_Coind> coind = std::make_shared<coind::JSONRPC_Coind>(context, net->parent, coind_ip, coind_port, coind_login);
 
     // ShareTracker
     std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
@@ -67,7 +67,7 @@ int main(int ac, char *av[])
     std::shared_ptr<CoindNode> coind_node = std::make_shared<CoindNode>(context);
 
     coind_node
-            ->set_parent_net(parent_net)
+            ->set_parent_net(net->parent)
             ->set_coind(coind)
             ->set_tracker(tracker)
 			->set_pool_node(pool_node);
