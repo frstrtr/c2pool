@@ -117,21 +117,35 @@ protected:
         pool_node = std::make_shared<FakePoolNode>(context);
         coind_node = std::make_shared<FakeCoindNode>(context);
 
+        pool_node->set_coind_node(coind_node);
+
         // Tracker
         tracker = std::make_shared<ShareTracker>(net);
 
         auto share_store = ShareStore(net);
         share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
 
-//        std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
-//        std::cout << "shares: " << tracker->heads.size() << "/" << tracker->tails.size() << std::endl;
-//        std::cout << "verified: " << tracker->verified.heads.size() << "/" << tracker->verified.tails.size() << std::endl;
-//
-//        boost::function<int32_t(uint256)> test_block_rel_height_func = [&](uint256 hash){return 0;};
-//
-//        std::vector<uint8_t> _bytes = {103, 108, 55, 240, 5, 80, 187, 245, 215, 227, 92, 1, 210, 201, 113, 66, 242, 76, 148, 121, 29, 76, 3, 170, 153, 253, 61, 21, 199, 77, 202, 35};
-//        auto bytes_prev_block = c2pool::dev::bytes_from_uint8(_bytes);
-//        uint256 previous_block(bytes_prev_block);
+        // Set best share
+        boost::function<int32_t(uint256)> test_block_rel_height_func = [&](uint256 hash){return 0;};
+
+        std::vector<uint8_t> _bytes = {103, 108, 55, 240, 5, 80, 187, 245, 215, 227, 92, 1, 210, 201, 113, 66, 242, 76, 148, 121, 29, 76, 3, 170, 153, 253, 61, 21, 199, 77, 202, 35};
+        auto bytes_prev_block = c2pool::dev::bytes_from_uint8(_bytes);
+        uint256 previous_block(bytes_prev_block);
+
+
+        uint32_t bits = 453027171;
+        std::map<uint256, coind::data::tx_type> known_txs;
+
+        auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(test_block_rel_height_func, previous_block, bits, known_txs);
+        std::cout << "Best = " << _best.GetHex() << std::endl;
+
+        coind_node->best_share.set(_best);
+
+        // Coind JSONRPC
+        std::shared_ptr<coind::JSONRPC_Coind> coind = std::make_shared<coind::JSONRPC_Coind>(context, net->parent, "217.72.4.157", "14024", "user:VeryVeryLongPass123");
+
+        // set coind_node->coind_work
+        coind_node->coind_work.set(coind->getwork(coind_node->txidcache));
     }
 
     virtual void TearDown()
@@ -142,4 +156,38 @@ protected:
 TEST_F(WorkerTest, simple_test)
 {
     std::shared_ptr<Worker> worker = std::make_shared<Worker>(net,pool_node, coind_node, tracker);
+    auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = worker->preprocess_request("user:pass");
+    LOG_INFO << pubkey_hash.GetHex() << " " << desired_share_target.GetHex() << " " << desired_pseudoshare_target.GetHex() << " " << user;
+    auto [x, got_response] = worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
+
+    LOG_DEBUG << "x from get_work:";
+    LOG_DEBUG << "previous_block = " << x.previous_block;
+    LOG_DEBUG << "version = " << x.version;
+    LOG_DEBUG << "bits = " << x.bits;
+    LOG_DEBUG << "timestamp = " << x.timestamp;
+
+    std::stringstream _coinb1;
+    for (auto v : x.coinb1)
+    {
+        _coinb1 << (unsigned int) v << " ";
+    }
+    LOG_DEBUG << "coinb1 = " << _coinb1.str();
+
+    std::stringstream _coinb2;
+    for (auto v : x.coinb2)
+    {
+        _coinb2 << (unsigned int) v << " ";
+    }
+    LOG_DEBUG << "coinb2 = " << _coinb2.str();
+
+    std::stringstream _merkle_link;
+    _merkle_link << x.merkle_link.index << " ";
+    for (auto v : x.merkle_link.branch)
+    {
+        _coinb1 << v.GetHex() << " ";
+    }
+    LOG_DEBUG << "coinb1 = " << _merkle_link.str();
+
+    LOG_DEBUG << "share_target = " << x.share_target;
+//    worker->get_work()
 }
