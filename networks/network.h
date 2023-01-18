@@ -7,6 +7,7 @@
 #include <set>
 
 #include "btclibs/uint256.h"
+#include "btclibs/arith_uint256.h"
 #include <libdevcore/stream.h>
 
 #include <boost/property_tree/ptree.hpp>
@@ -127,8 +128,8 @@ namespace coind
 
 		int DUMB_SCRYPT_DIFF;
         int DUST_THRESHOLD;
-        uint256 SANE_TARGET_RANGE_MIN;
-        uint256 SANE_TARGET_RANGE_MAX;
+        arith_uint256 SANE_TARGET_RANGE_MIN;
+        arith_uint256 SANE_TARGET_RANGE_MAX;
     public:
         ParentNetwork(std::string name);
         ParentNetwork(std::string name, boost::property_tree::ptree &pt);
