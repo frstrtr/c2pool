@@ -164,7 +164,7 @@ worker_get_work_result
 Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target)
 {
     //1
-    if ((!_pool_node || _pool_node->peers.empty()) && _net->PERSIST)
+    if ((!_pool_node || !_pool_node->is_connected()) && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is not connected to any peers"); //TODO: to jsonrpc_error
     }

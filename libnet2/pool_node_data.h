@@ -94,6 +94,11 @@ public:
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 	void broadcast_share(uint256 share_hash);
 
+    virtual bool is_connected()
+    {
+        return !peers.empty();
+    }
+
 protected:
 	void send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with = {});
 };
