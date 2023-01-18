@@ -12,12 +12,8 @@
 
 namespace shares
 {
-//    class doa_element
-//    {
-//    public:
-//
-//    };
 
+    // TODO: test
     class doa_element_type
     {
     private:
@@ -30,7 +26,6 @@ namespace shares
         int32_t my_orphan_announce_count;
         int32_t my_dead_announce_count;
     public:
-        //TODO: check
         static void set_rules(std::function<std::tuple<int32_t, int32_t, int32_t, int32_t>(ShareType)> _rule)
         {
             doa_element_type::_rules_func = std::move(_rule);
