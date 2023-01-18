@@ -78,6 +78,11 @@ public:
     FakePoolNode(std::shared_ptr<boost::asio::io_context> _context) : PoolNodeData(std::move(_context))
     {
     }
+
+    bool is_connected() override
+    {
+        return true;
+    }
 };
 
 class FakeCoindNode : public CoindNodeData
