@@ -380,17 +380,17 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //8
     //TODO: part for merged mining
-    uint256 target;
+    arith_uint256 a_target;
     if (desired_pseudoshare_target.IsNull())
     {
 //		target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
-		target = coind::data::difficulty_to_target(uint256::ONE);
+        a_target = coind::data::difficulty_to_target(uint256::ONE);
 		auto local_hash_rate = _estimate_local_hash_rate();
 		if (!local_hash_rate.IsNull())
 		{
 			//in p2pool: target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1)
 			// target 10 share responses every second by modulating pseudoshare difficulty
-			target = coind::data::average_attempts_to_target(Uint256ToUint288(local_hash_rate));
+            a_target = coind::data::average_attempts_to_target(local_hash_rate);
 		} else
         {
             //# If we don't yet have an estimated node hashrate, then we still need to not undershoot the difficulty.
@@ -398,37 +398,41 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             //# 1/3000th the difficulty of a full share should be a reasonable upper bound. That way, if
             //# one node has the whole p2pool hashrate, it will still only need to process one pseudoshare
             //# every ~0.01 seconds.
-            arith_uint256 temp_target;
 
-            arith_uint256 temp_target3;
-            temp_target3 = coind::data::average_attempts_to_target(Uint256ToUint288(_coind_node->coind_work.value().bits.target()));
-            temp_target3 *= _net->SPREAD;
+            LOG_TRACE << "bits = " << _coind_node->coind_work.value().bits.get() << ", target from bits = " << _coind_node->coind_work.value().bits.target();
+            arith_uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target());
+            LOG_TRACE << "avg_attempts1 = " << avg_attempts.GetHex();
+            avg_attempts *= _net->SPREAD;
+            LOG_TRACE << "avg_attempts2 = " << avg_attempts.GetHex();
+            avg_attempts *= _net->parent->DUST_THRESHOLD;
+            avg_attempts/block_subsidy;
+            LOG_TRACE << "DUST_THRESHOLD = " << _net->parent->DUST_THRESHOLD << ", block_subsidy = " << block_subsidy;
+            LOG_TRACE << "avg_attempts3 = " << avg_attempts.GetHex();
 
-            arith_uint256 temp_target2;
-            temp_target2 = temp_target2 * _net->parent->DUST_THRESHOLD / block_subsidy;
+            auto target_from_avg = Uint256ToArith288(coind::data::average_attempts_to_target(avg_attempts));
 
-            temp_target =
-                    UintToArith256(coind::data::average_attempts_to_target(Arith256ToArith288(temp_target2))) * 3000;
+            target_from_avg *= 3000;
 
-            if (temp_target < UintToArith256(target))
+            if (target_from_avg < Arith256ToArith288(a_target))
             {
-                target = ArithToUint256(temp_target);
+                a_target = ArithToUint256(target_from_avg);
             }
         }
     } else
     {
-        target = desired_pseudoshare_target;
+        a_target = desired_pseudoshare_target;
     }
 
-    auto bits_target = FloatingInteger(gen_sharetx_res->share_info->bits).target();
-    if (target < bits_target)
+    auto bits_target = UintToArith256(FloatingInteger(gen_sharetx_res->share_info->bits).target());
+    if (a_target < bits_target)
     {
-        target = bits_target;
+        a_target = bits_target;
     }
 
     // TODO: part for merged mining
 
-    target = math::clip(target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX); //TODO: check
+    a_target = math::clip(a_target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX);
+    auto target = ArithToUint256(a_target);
 
     //9
     auto getwork_time = c2pool::dev::timestamp();
