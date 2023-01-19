@@ -161,11 +161,11 @@ base58_alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 
 def base58_encode(bindata):
     bindata2 = bindata.lstrip(chr(0))
-    return base58_alphabet[0]*(len(bindata) - len(bindata2)) + p2pool_math.natural_to_string(math.string_to_natural(bindata2), base58_alphabet)
+    return base58_alphabet[0]*(len(bindata) - len(bindata2)) + p2pool_math.natural_to_string(p2pool_math.string_to_natural(bindata2), base58_alphabet)
 
 def base58_decode(b58data):
     b58data2 = b58data.lstrip(base58_alphabet[0])
-    return chr(0)*(len(b58data) - len(b58data2)) + p2pool_math.natural_to_string(math.string_to_natural(b58data2, base58_alphabet))
+    return chr(0)*(len(b58data) - len(b58data2)) + p2pool_math.natural_to_string(p2pool_math.string_to_natural(b58data2, base58_alphabet))
 
 human_address_type = ChecksummedType(pack.ComposedType([
     ('version', pack.IntType(8)),
