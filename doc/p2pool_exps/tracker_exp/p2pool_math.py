@@ -152,7 +152,7 @@ def format_binomial_conf(x, n, conf=0.95, f=lambda x: x):
 
 def reversed(x):
     try:
-        return __builtin__.reversed(x)
+        return __builtins__.reversed(x)
     except TypeError:
         return reversed(list(x))
 
@@ -207,7 +207,7 @@ def string_to_natural(s, alphabet=None):
     else:
         assert len(set(alphabet)) == len(alphabet)
         assert not s.startswith(alphabet[0])
-        return sum(alphabet.index(char) * len(alphabet)**i for i, char in enumerate(reversed(s)))
+        return sum(alphabet.index(char) * len(alphabet)**i for i, char in enumerate(s[::-1]))
 
 class RateMonitor(object):
     def __init__(self, max_lookback_time):

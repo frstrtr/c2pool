@@ -1,0 +1,27 @@
+{
+    'new_transaction_hashes': [],
+    'far_share_hash': 84134348157695981790631764720576380863146382886339606380818960672922310233342 L,
+    'transaction_hash_refs': [],
+    'timestamp': 1670107505,
+    'segwit_data': {
+        'wtxid_merkle_root': 0,
+        'txid_merkle_link': {
+            'index': 0,
+            'branch': []
+        }
+    },
+    'absheight': 259326,
+    'share_data': {
+        'nonce': 1754100515,
+        'previous_share_hash': 46728121436595531835519850090158657855065647721690516162467033698198078009934 L,
+        'stale_info': None,
+        'pubkey_hash': 690360552088245788624462003354505911715459163856 L,
+        'subsidy': 0,
+        'donation': 0,
+        'coinbase': '\x00',
+        'desired_version': 17
+    },
+    'abswork': 4723479368842 L,
+    'bits': FloatingInteger(bits = 0x1d14ef61, target = 0x14ef610000000000000000000000000000000000000000000000000000 L),
+    'max_bits': FloatingInteger(bits = 0x1e02740d, target = 0x2740d000000000000000000000000000000000000000000000000000000 L)
+}
