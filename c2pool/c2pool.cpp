@@ -26,19 +26,6 @@ namespace po = boost::program_options;
 #define fmt(TEMPL, DATA) (boost::format{TEMPL} % DATA).str()
 #define fmt_c(TEMPL, DATA) fmt(TEMPL, DATA).data()
 
-// std::istream &operator>>(std::istream &in, c2pool::dev::DebugState &value)
-// {
-//     std::string token;
-//     in >> token;
-//     //cout << token << endl;
-//     if (token == "0")
-//         value = c2pool::dev::DebugState::trace;
-//     else if (token == "1")
-//         value = c2pool::dev::DebugState::debug;
-//     else if (token == "2")
-//         value = c2pool::dev::DebugState::normal;
-//     return in;
-// }
 
 int main(int ac, char *av[])
 {
@@ -53,7 +40,7 @@ int main(int ac, char *av[])
     desc.add_options()("help", "produce help message");
 
     desc.add_options()("version,v", "version");
-//    desc.add_options()("debug", po::value<c2pool::dev::DebugState>(&c2pool_config::get()->debug)->default_value(c2pool::dev::normal), "enable debugging mode");
+    desc.add_options()("debug", po::value<c2pool::dev::DebugState>(&c2pool_config::get()->debug)->default_value(c2pool::dev::normal), "enable debugging mode");
     desc.add_options()("testnet", po::value<bool>()->default_value(false), "use the network's testnet");
     desc.add_options()("net", po::value<string>()->default_value("digibyte"), "use specified network (default: bitcoin)");
 
