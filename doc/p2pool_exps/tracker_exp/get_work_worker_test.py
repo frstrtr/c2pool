@@ -98,13 +98,21 @@ share_type = SHARE.Share
 
 print('\n=====================\nWorker::get_work\n=====================\n')
 
-class FakeNode:
+class FakeP2PNode:
+
+    def __init__(self):
+        self.peers = [None]
+
+class FakeCoindNode:
     
-    def __init__(self, net, tracker):
+    def __init__(self, net, tracker, p2p_node):
+
         self.net = net
         self.tracker = tracker
+        self.p2p_node = p2p_node
 
         self.bitcoind_work = variable.Variable({})
+        self.best_block_header = variable.Variable(None)
     #     self.best_block_header = variable.Variable({
     #         ('version', pack.IntType(32)),
     # ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
@@ -113,11 +121,16 @@ class FakeNode:
     # ('bits', FloatingIntegerType()),
     # ('nonce', pack.IntType(32)),
     #     })
+    
 
-node = FakeNode(net, tracker)
+p2p_node = FakeP2PNode()
+coind_node = FakeCoindNode(net, tracker, p2p_node)
 
 address = 'DKCJJSrA9vAXwwbzTbD2PL3553iKX3oPv1'
 my_pubkey_hash = coind_data.address_to_pubkey_hash(address, net.PARENT)
 pubkeys = coind_data.address_to_pubkey_hash(address, net.PARENT)
 
-wb = work.WorkerBridge(node, my_pubkey_hash, donation_percentage, 0, pubkeys)
+wb = work.WorkerBridge(coind_node, my_pubkey_hash, donation_percentage, 0, pubkeys)
+_user, _pubkey_hash, _desired_share_target, _desired_pseudoshare_target = wb.preprocess_request('user:pass')
+print('user: {0}, pubkey_hash : {1}, desired_share_target: {2}, desired_pseudoshare_target: {3}'.format(_user, _pubkey_hash, _desired_share_target, _desired_pseudoshare_target))
+# wb.get_work()
