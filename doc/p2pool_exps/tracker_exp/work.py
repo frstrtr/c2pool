@@ -101,31 +101,31 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
         
         # COMBINE WORK
         #TODO:
-        # self.current_work = variable.Variable(None)
-        # def compute_work():
-        #     t = self.node.bitcoind_work.value
-        #     bb = self.node.best_block_header.value
-        #     if bb is not None and bb['previous_block'] == t['previous_block'] and self.node.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(bb)) <= t['bits'].target:
-        #         print 'Skipping from block %x to block %x!' % (bb['previous_block'],
-        #             bitcoin_data.hash256(bitcoin_data.block_header_type.pack(bb)))
-        #         t = dict(
-        #             version=bb['version'],
-        #             previous_block=bitcoin_data.hash256(bitcoin_data.block_header_type.pack(bb)),
-        #             bits=bb['bits'], # not always true
-        #             coinbaseflags='',
-        #             height=t['height'] + 1,
-        #             time=max(int(time.time() + 0.5), bb['timestamp'] + 1),
-        #             transactions=[],
-        #             transaction_fees=[],
-        #             merkle_link=bitcoin_data.calculate_merkle_link([None], 0),
-        #             subsidy=self.node.net.PARENT.SUBSIDY_FUNC(self.node.bitcoind_work.value['height']),
-        #             last_update=self.node.bitcoind_work.value['last_update'],
-        #         )
+        self.current_work = variable.Variable(None)
+        def compute_work():
+            t = self.node.bitcoind_work.value
+            bb = self.node.best_block_header.value
+            if bb is not None and bb['previous_block'] == t['previous_block'] and self.node.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(bb)) <= t['bits'].target:
+                print 'Skipping from block %x to block %x!' % (bb['previous_block'],
+                    bitcoin_data.hash256(bitcoin_data.block_header_type.pack(bb)))
+                t = dict(
+                    version=bb['version'],
+                    previous_block=bitcoin_data.hash256(bitcoin_data.block_header_type.pack(bb)),
+                    bits=bb['bits'], # not always true
+                    coinbaseflags='',
+                    height=t['height'] + 1,
+                    time=max(int(time.time() + 0.5), bb['timestamp'] + 1),
+                    transactions=[],
+                    transaction_fees=[],
+                    merkle_link=bitcoin_data.calculate_merkle_link([None], 0),
+                    subsidy=self.node.net.PARENT.SUBSIDY_FUNC(self.node.bitcoind_work.value['height']),
+                    last_update=self.node.bitcoind_work.value['last_update'],
+                )
             
-        #     self.current_work.set(t)
-        # self.node.bitcoind_work.changed.watch(lambda _: compute_work())
-        # self.node.best_block_header.changed.watch(lambda _: compute_work())
-        # compute_work()
+            self.current_work.set(t)
+        self.node.bitcoind_work.changed.watch(lambda _: compute_work())
+        self.node.best_block_header.changed.watch(lambda _: compute_work())
+        compute_work()
         
         # self.new_work_event = variable.Event()
         # @self.current_work.transitioned.watch

@@ -156,7 +156,22 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
      */
 
     // COMBINE WORK
+    //TODO:
 
+    _coind_node->coind_work.changed->subscribe([&](const auto &work){ compute_work(); });
+    _coind_node->best_block_header.changed->subscribe([&](const auto &block_header){ compute_work(); });
+    compute_work();
+
+
+    current_work.transitioned->subscribe([&](const auto& before, const auto& after){
+        //  # trigger LP if version/previous_block/bits changed or transactions changed from nothing
+        if ((std::tie(before.version, before.previous_block, before.bits) != std::tie(after.version, after.previous_block, after.bits)) || (before.transactions.empty() && !after.transactions.empty()))
+            new_work.happened();
+    });
+
+    _coind_node->best_share.changed->subscribe([&](const auto &value){
+       new_work.happened();
+    });
 
 }
 
@@ -888,6 +903,6 @@ void Worker::compute_work()
             };
 //                t = coind::getwork_result()
         }
-        current_work = t;
+        current_work.set(t);
     }
 }
