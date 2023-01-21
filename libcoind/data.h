@@ -68,13 +68,13 @@ namespace coind::data{
             index = _index;
         }
 
-        bool operator==(const MerkleLink &value)
+        bool operator==(const MerkleLink &value) const
         {
             return branch == value.branch;
             //return branch == value.branch && index == value.index;
         }
 
-        bool operator!=(const MerkleLink &value)
+        bool operator!=(const MerkleLink &value) const
         {
             return !(*this == value);
         }

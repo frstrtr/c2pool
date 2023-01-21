@@ -48,13 +48,13 @@ Work Work::from_jsonrpc_data(const coind::getwork_result& data)
     return result;
 }
 
-bool Work::operator==(const Work &value)
+bool Work::operator==(const Work &value) const
 {
-	return  std::tie(version, previous_block, bits, coinbaseflags, height, timestamp, transactions, transaction_fees, merkle_link, subsidy) !=
+	return  std::tie(version, previous_block, bits, coinbaseflags, height, timestamp, transactions, transaction_fees, merkle_link, subsidy) ==
 			std::tie(value.version, value.previous_block, value.bits, value.coinbaseflags, value.height, value.timestamp, value.transactions, value.transaction_fees, value.merkle_link, value.subsidy);
 }
 
-bool Work::operator!=(const Work &value)
+bool Work::operator!=(const Work &value) const
 {
     return !(*this == value);
 }
@@ -156,7 +156,6 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
      */
 
     // COMBINE WORK
-    //TODO:
 
     _coind_node->coind_work.changed->subscribe([&](const auto &work){ compute_work(); });
     _coind_node->best_block_header.changed->subscribe([&](const auto &block_header){ compute_work(); });
@@ -876,7 +875,7 @@ user_details Worker::preprocess_request(std::string username)
 void Worker::compute_work()
 {
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
-    if (_coind_node->best_block_header.isNull())
+    if (!_coind_node->best_block_header.isNull())
     {
         auto bb = _coind_node->best_block_header.value();
         PackStream packed_block_header = bb.get_pack();

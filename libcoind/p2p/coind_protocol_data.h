@@ -14,7 +14,7 @@ struct CoindProtocolData
     Event<std::vector<coind::data::types::BlockHeaderType>> new_headers; //bitcoin_data.block_header_type
 
     std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
-    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> get_block_header;
+    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> get_block_header; // TODO: init
 
     void init(Event<uint256> _new_block, Event<coind::data::tx_type> _new_tx, Event<std::vector<coind::data::types::BlockHeaderType>> _new_headers)
     {
