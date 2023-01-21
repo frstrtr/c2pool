@@ -37,9 +37,9 @@ public:
 
     static Work from_jsonrpc_data(const coind::getwork_result& data);
 
-    bool operator==(const Work &value);
+    bool operator==(const Work &value) const;
 
-    bool operator!=(const Work &value);
+    bool operator!=(const Work &value) const;
 };
 
 struct NotifyData
