@@ -102,12 +102,6 @@ namespace c2pool
         }
 
         parent = std::make_shared<coind::ParentNetwork>(name, _pt.get_child("parent_network"));
-
-        for (auto v = parent->PREFIX; v < parent->PREFIX+parent->PREFIX_LENGTH; v++)
-        {
-            std::cout << (unsigned int) *v << " ";
-        }
-        std::cout << std::endl;
     }
 
     boost::property_tree::ptree Network::make_default_network()
@@ -220,27 +214,8 @@ namespace coind
         // PREFIX
         auto _prefix_str = pt.get<std::string>("PREFIX");
         auto _prefix = ParseHex(_prefix_str);
-        LOG_TRACE << "ParentNet::PREFIX";
-        for (auto v : _prefix)
-        {
-            std::cout << (unsigned int) v << " ";
-        }
-        std::cout << "\n";
         PREFIX_LENGTH = _prefix.size();
         c2pool::dev::copy_to_const_c_str(_prefix, PREFIX);
-
-        for (auto v = PREFIX; v < PREFIX+PREFIX_LENGTH; v++)
-        {
-            std::cout << (unsigned int) *v << " ";
-        }
-        std::cout << std::endl;
-
-        _prefix.clear();
-        for (auto v = PREFIX; v < PREFIX+PREFIX_LENGTH; v++)
-        {
-            std::cout << (unsigned int) *v << " ";
-        }
-        std::cout << std::endl;
 
 
         BLOCK_PERIOD = pt.get<int32_t>("BLOCK_PERIOD");
