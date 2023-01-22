@@ -14,7 +14,7 @@ void PoolSocket::write_prefix(std::shared_ptr<Message> msg)
 								 LOG_DEBUG << "Write prefix called";
 								 if (_ec)
 								 {
-									 LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
 									 return;
 								 }
 								 write_message_data(msg);
@@ -39,7 +39,7 @@ void PoolSocket::write_message_data(std::shared_ptr<Message> msg)
 								 LOG_DEBUG << "Write msg data called";
 								 if (_ec)
 								 {
-									 LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
 								 }
 							 });
 }

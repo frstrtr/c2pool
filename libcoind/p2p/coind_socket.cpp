@@ -8,13 +8,19 @@
 // Write
 void CoindSocket::write_prefix(std::shared_ptr<Message> msg)
 {
+//    LOG_TRACE << "CoindSocket::write_prefix: prefix(len = " << net->PREFIX_LENGTH << "): ";
+//    for (auto v = net->PREFIX; v < net->PREFIX+net->PREFIX_LENGTH; v++)
+//    {
+//        std::cout << (unsigned int) *v << " ";
+//    }
+//    std::cout << std::endl;
 	boost::asio::async_write(*socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
 							 [this, msg](boost::system::error_code _ec, std::size_t length)
 							 {
 								 LOG_DEBUG << "Write prefix called";
 								 if (_ec)
 								 {
-									 LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+									 LOG_ERROR << "CoindSocket::write()" << _ec << ":" << _ec.message();
 									 return;
 								 }
 								 write_message_data(msg);
@@ -39,7 +45,7 @@ void CoindSocket::write_message_data(std::shared_ptr<Message> msg)
 								 LOG_DEBUG << "Write msg data called";
 								 if (_ec)
 								 {
-									 LOG_ERROR << "P2PSocket::write()" << _ec << ":" << _ec.message();
+									 LOG_ERROR << "CoinSocket::write()" << _ec << ":" << _ec.message();
 								 }
 							 });
 }

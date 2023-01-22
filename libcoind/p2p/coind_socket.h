@@ -33,6 +33,7 @@ public:
 
 	void write(std::shared_ptr<Message> msg) override
 	{
+        LOG_TRACE << "Coind socket write msg: " << msg->command;
 		write_prefix(msg);
 	}
 
