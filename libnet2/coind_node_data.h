@@ -14,6 +14,8 @@ namespace ip = io::ip;
 
 class CoindNodeData
 {
+private:
+    bool _connected = false;
 public:
 	std::shared_ptr<io::io_context> context;
 	std::shared_ptr<coind::ParentNetwork> parent_net;
@@ -78,4 +80,15 @@ public:
 	void clean_tracker();
 
 	void handle_header(coind::data::BlockHeaderType new_header);
+
+    void set_connection_status(bool value)
+    {
+        _connected = value;
+    }
+
+    // true after handle_message_verack
+    virtual bool is_connected()
+    {
+        return _connected;
+    }
 };
