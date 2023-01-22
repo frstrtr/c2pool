@@ -34,4 +34,11 @@ namespace c2pool::dev{
             return true;
         return false;
     }
+
+    void copy_to_const_c_str(const std::vector<unsigned char> &src, const unsigned char* &dest)
+    {
+        auto* temp = new unsigned char[src.size()];
+        std::copy(src.begin(), src.end(), temp);
+        dest = temp;
+    }
 }
