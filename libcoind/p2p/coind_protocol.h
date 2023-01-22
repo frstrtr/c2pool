@@ -45,6 +45,10 @@ private:
 				"C2Pool", //TODO: generate sub_version
 				0
 		);
+        LOG_TRACE << "CoindProtocol message_version:";
+        LOG_TRACE << msg->timestamp.get() << " " << msg->version.get() << " " << msg->nonce.get() << " " << msg->services.get() << " " << msg->start_height.get();
+        LOG_TRACE << "addrFrom: " << msg->addr_from.get().address << " " << msg->addr_from.get().port << " " << msg->addr_from.get().services;
+        LOG_TRACE << "addrTo: " << msg->addr_to.get().address << " " << msg->addr_to.get().port << " " << msg->addr_to.get().services;
 		write(msg);
 	}
 
