@@ -92,6 +92,11 @@ public:
     {
 
     }
+
+    bool is_connected() override
+    {
+        return true;
+    }
 };
 
 class WorkerTest : public ::testing::Test
