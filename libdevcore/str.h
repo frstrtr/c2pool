@@ -15,6 +15,8 @@ namespace c2pool::dev{
     //true - equaled
     bool compare_str(const void *first_str, const void *second_str, unsigned int length);
 
+    void copy_to_const_c_str(const std::vector<unsigned char> &src, const unsigned char* &dest);
+
     template<typename T>
     std::string vector_to_string(std::vector<T> arr)
     {
