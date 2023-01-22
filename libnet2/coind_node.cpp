@@ -123,14 +123,15 @@ void CoindNode::work_poller()
     LOG_TRACE << "work_poller called!";
     LOG_TRACE << "txidcache: " << txidcache.cache.size();
     LOG_TRACE << "known_txs: " << known_txs.value().size();
-    coind_work.set(coind->getwork(txidcache, known_txs.value())); //TODO: warning for set?
+    coind_work.set(coind->getwork(txidcache, known_txs.value()));
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
     work_poller_t.async_wait([&](const boost::system::error_code &ec){ work_poller(); });
 }
 
 void CoindNode::poll_header()
 {
-    if (!protocol)
+    LOG_TRACE << "pool_header called!";
+    if (!protocol || !is_connected())
         return;
 	protocol->get_block_header->yield(coind_work.value().previous_block, std::bind(&CoindNode::handle_header, this, placeholders::_1), coind_work.value().previous_block);
 }
@@ -151,8 +152,9 @@ void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_v
     protocol->get_block_header = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> (context, [&, _proto = protocol](uint256 hash){
         auto  _msg = std::make_shared<coind::messages::message_getheaders>(1, std::vector<uint256>{}, hash);
         _proto->write(_msg);
-//        protocol->write(_msg);
     });
+
+    set_connection_status(true);
 
 //    pinger(30); //TODO: wanna for this?
 }
