@@ -96,9 +96,9 @@ share_type = SHARE.Share
 #                         + current_work['coinbaseflags'])[:100], script.create_push_script([current_work['height']] + []), current_work['coinbaseflags']))
 
 def bytes_to_data(bytes):
-    res = []
+    res = b''
     for x in bytes:
-        res += [chr(x)]
+        res += chr(x)
     return res #str(res).replace(', ', ' ')
 
 print('\n=====================\nWorker::get_work\n=====================\n')
@@ -134,11 +134,11 @@ class FakeCoindNode:
                     tx_outs = [
                         dict(
                             value = 30000000,
-                            script = [ 118, 169, 20, 106, 8, 40, 36, 103, 106, 143, 84, 149, 179, 250, 233, 207, 37, 131, 122, 136, 58, 115, 1, 136, 172 ]
+                            script = bytes_to_data([ 118, 169, 20, 106, 8, 40, 36, 103, 106, 143, 84, 149, 179, 250, 233, 207, 37, 131, 122, 136, 58, 115, 1, 136, 172 ])
                         ),
                         dict(
                             value = 91024511644,
-                            script = [118, 169, 20, 172, 6, 156, 107, 16, 133, 34, 25, 141, 47, 231, 209, 201, 95, 208, 104, 102, 188, 183, 186, 136, 172]
+                            script = bytes_to_data([118, 169, 20, 172, 6, 156, 107, 16, 133, 34, 25, 141, 47, 231, 209, 201, 95, 208, 104, 102, 188, 183, 186, 136, 172])
                         )
                     ],
                     lock_time = 16518944
@@ -162,6 +162,7 @@ class FakeCoindNode:
 
         self.bitcoind_work = variable.Variable(self.get_fake_bitcoind_work())
         self.best_block_header = variable.Variable(None)
+        self.best_share_var = variable.Variable(best)
     #     self.best_block_header = variable.Variable({
     #         ('version', pack.IntType(32)),
     # ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
@@ -183,3 +184,5 @@ wb = work.WorkerBridge(coind_node, my_pubkey_hash, donation_percentage, 0, pubke
 _user, _pubkey_hash, _desired_share_target, _desired_pseudoshare_target = wb.preprocess_request('user:pass')
 print('user: {0}, pubkey_hash : {1}, desired_share_target: {2}, desired_pseudoshare_target: {3}'.format(_user, _pubkey_hash, _desired_share_target, _desired_pseudoshare_target))
 # wb.get_work()
+
+wb.get_work(_pubkey_hash, _desired_share_target, _desired_pseudoshare_target)
