@@ -205,8 +205,9 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
             try:
                 pubkey_hash = bitcoin_data.address_to_pubkey_hash(user, self.node.net.PARENT)
             except: # XXX blah
-                if self.args.address != 'dynamic':
-                    pubkey_hash = self.my_pubkey_hash
+                pubkey_hash = int('78ecd67a8695aa4adc55b70f87c2fa3279cee6d0', 16)
+                # if self.args.address != 'dynamic':
+                #     pubkey_hash = self.my_pubkey_hash
         
         return user, pubkey_hash, desired_share_target, desired_pseudoshare_target
     
@@ -215,10 +216,13 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
             raise BaseException('p2pool is not connected to any peers')
             # raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
         if time.time() > self.current_work.value['last_update'] + 60:
-            raise BaseException('lost contact with bitcoind')
+            pass
+            #REMOVED
+            # raise BaseException('lost contact with bitcoind')
             # raise jsonrpc.Error_for_code(-12345)(u'lost contact with bitcoind')
         user, pubkey_hash, desired_share_target, desired_pseudoshare_target = self.get_user_details(user)
-        return pubkey_hash, desired_share_target, desired_pseudoshare_target
+        return user, pubkey_hash, desired_share_target, desired_pseudoshare_target
+        #return pubkey_hash, desired_share_target, desired_pseudoshare_target
     
     def _estimate_local_hash_rate(self):
         if len(self.recent_shares_ts_work) == 50:

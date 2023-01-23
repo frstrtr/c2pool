@@ -88,6 +88,38 @@ public:
 class FakeCoindNode : public CoindNodeData
 {
 public:
+    // compute_work t: (Work:
+    // version = 536870914, previous_block = 1e47a6e2224db5bc2ddce3c31eb14dac8b02ca5a05ebd077d9f53a8d092e4226, bits = 453045919, coinbaseflags = [ ], height = 16518948, timestamp = 1674480469,
+    // transactions = [
+    //      (TxType:
+    //          version = 1,
+    //          tx_ins = [
+    //              (TxInType:
+    //                  previous_output = (PreviousOutput: hash = 46683430f87c6ceb23628e0a1908438b3288f256218acef83b8fbd524621cdcb, index = 0),
+    //                  script = [ 71 48 68 2 32 80 225 63 52 132 228 124 240 95 42 165 46 150 43 36 242 47 251 5 143 241 38 168 221 181 11 81 87 13 73 10 236 2 32 81 223 167 229 20 96 248 219 8 164 39 186 101 78 96 82 212 146 185 186 247 66 178 241 148 171 255 254 208 114 122 41 1 33 3 121 83 98 152 35 127 209 217 37 49 1 223 182 5 99 50 61 211 144 248 195 103 8 174 67 244 76 6 229 151 33 30 ],
+    //                  sequence = 4294967294
+    //          ) ],
+    //          tx_outs = [
+    //              (TxOutType:
+    //                  value = 30000000,
+    //                  script = [ 118 169 20 106 8 40 36 103 106 143 84 149 179 250 233 207 37 131 122 136 58 115 1 136 172 ]
+    //              )
+    //              (TxOutType:
+    //                  value = 91024511644,
+    //                  script = [ 118 169 20 172 6 156 107 16 133 34 25 141 47 231 209 201 95 208 104 102 188 183 186 136 172 ]
+    //              )
+    //          ],
+    //          lock_time = 16518944, wdata = null
+    //      )
+    // ],
+    // transaction_fees = [ 22655 ],
+    // merkle_link =
+    //      (MerkleLink:
+    //          branch = [ ], index = 0
+    //      ),
+    // subsidy = 41082666040,
+    // last_update = 1674480469)
+
     FakeCoindNode(std::shared_ptr<boost::asio::io_context> _context) : CoindNodeData(std::move(_context))
     {
 
