@@ -39,3 +39,17 @@ namespace c2pool::console
         static Logger* log();
     };
 } // namespace c2pool::console
+
+std::ostream &operator<<(std::ostream &stream, std::vector<unsigned char> &data);
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}

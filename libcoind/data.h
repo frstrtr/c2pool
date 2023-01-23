@@ -79,6 +79,16 @@ namespace coind::data{
             return !(*this == value);
         }
 
+        friend std::ostream &operator<<(std::ostream &stream, MerkleLink &_value)
+        {
+            stream << "(MerkleLink: ";
+            stream << "branch = " << _value.branch;
+            stream << ", index = " << _value.index;
+            stream << ")";
+
+            return stream;
+        }
+
 //        MerkleLink &operator=(UniValue value)
 //        {
 //            for (auto hex_str: value["branch"].get_array().getValues())

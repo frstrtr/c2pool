@@ -52,6 +52,16 @@ namespace coind::data
         }
 
         PreviousOutput(stream::PreviousOutput_stream obj);
+
+        friend std::ostream &operator<<(std::ostream &stream, PreviousOutput &value)
+        {
+            stream << "(PreviousOutput: ";
+            stream << "hash = " << value.hash;
+            stream << ", index = " << value.index;
+            stream << ")";
+
+            return stream;
+        }
     };
 
     struct TxInType
@@ -65,6 +75,17 @@ namespace coind::data
         TxInType(PreviousOutput _previous_output, std::vector<unsigned char> _script, unsigned long _sequence);
 
         TxInType(std::shared_ptr<stream::TxInType_stream> obj);
+
+        friend std::ostream &operator<<(std::ostream &stream, TxInType &value)
+        {
+            stream << "(TxInType: ";
+            stream << "previous_output = " << value.previous_output;
+            stream << ", script = " << value.script;
+            stream << ", sequence = " << value.sequence;
+            stream << ")";
+
+            return stream;
+        }
     };
 
     struct TxOutType
@@ -77,6 +98,16 @@ namespace coind::data
         TxOutType(int64_t _value, std::vector<unsigned char> _script);
 
         TxOutType(std::shared_ptr<stream::TxOutType_stream> obj);
+
+        friend std::ostream &operator<<(std::ostream &stream, TxOutType &_value)
+        {
+            stream << "(TxOutType: ";
+            stream << "value = " << _value.value;
+            stream << ", script = " << _value.script;
+            stream << ")";
+
+            return stream;
+        }
     };
 
     struct TxIDType
@@ -123,14 +154,26 @@ namespace coind::data
                 witness.push_back(_wit_tx);
             }
         }
+
+        friend std::ostream &operator<<(std::ostream &stream, WitnessTransactionData &value)
+        {
+            stream << "(WitnessTransactionData: ";
+            stream << "marker = " << value.marker;
+            stream << ", flag = " << value.flag;
+            stream << ", flag = " << value.flag;
+            stream << ", witness = " << value.witness;
+            stream << ")";
+
+            return stream;
+        }
     };
 
     struct TransactionType
     {
-        uint32_t version;
+        uint32_t version{};
         vector<TxInType> tx_ins;
         vector<TxOutType> tx_outs;
-        uint32_t lock_time;
+        uint32_t lock_time{};
         std::optional<WitnessTransactionData> wdata;
 
         TransactionType() = default;
@@ -144,6 +187,31 @@ namespace coind::data
             tx_outs = _tx_outs;
             lock_time = _locktime;
             wdata = _wdata;
+        }
+
+        friend std::ostream &operator<<(std::ostream &stream, const std::shared_ptr<TransactionType>& _tx)
+        {
+            stream << "(TxType: ";
+
+            if (!_tx)
+            {
+                stream << "null)";
+                return stream;
+            }
+
+            stream << "version = " << _tx->version;
+            stream << ", tx_ins = " << _tx->tx_ins;
+            stream << ", tx_outs = " << _tx->tx_outs;
+            stream << ", lock_time = " << _tx->lock_time;
+            if (_tx->wdata.has_value())
+            {
+                stream << ", wdata = " << _tx->wdata.value();
+            } else {
+                stream << ", wdata = null";
+            }
+            stream << ")";
+
+            return stream;
         }
     };
 

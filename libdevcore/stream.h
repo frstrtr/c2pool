@@ -588,7 +588,7 @@ std::vector<unsigned char> pack(T value)
 template <typename StreamType>
 typename StreamType::get_type unpack(std::vector<unsigned char> data)
 {
-    PackStream stream(data);
+    PackStream stream(std::move(data));
 
     StreamType stream_value;
     stream >> stream_value;

@@ -67,3 +67,13 @@ namespace c2pool::console
         return instance;
     }
 }; // namespace c2pool::console
+std::ostream &operator<<(std::ostream &stream, std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
