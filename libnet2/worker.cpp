@@ -875,9 +875,12 @@ user_details Worker::preprocess_request(std::string username)
 void Worker::compute_work()
 {
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
+    LOG_TRACE << "compute_work t: " << t;
     if (!_coind_node->best_block_header.isNull())
     {
+        // TODO: test
         auto bb = _coind_node->best_block_header.value();
+        LOG_TRACE << "compute_work bb: " << *bb.get();
         PackStream packed_block_header = bb.get_pack();
 
         if (bb->previous_block == t.previous_block &&
