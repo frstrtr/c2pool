@@ -43,6 +43,17 @@ namespace coind::data::types
             return !(*this == value);
         }
 
+        virtual void print(std::ostream &stream)
+        {
+            stream << "(SmallBlockHeaderType: ";
+            stream << "version = " << version;
+            stream << ", previous_block = " << previous_block;
+            stream << ", timestamp = " << timestamp;
+            stream << ", bits = " << bits;
+            stream << ", nonce = " << nonce;
+            stream << ")";
+        }
+
 //        SmallBlockHeaderType &operator=(UniValue value);
 
 //        operator UniValue()
@@ -95,7 +106,25 @@ namespace coind::data::types
         {
             return !(*this == value);
         }
+
+        void print(std::ostream &stream) override
+        {
+            stream << "(BlockHeaderType: ";
+            stream << "version = " << version;
+            stream << ", previous_block = " << previous_block;
+            stream << ", timestamp = " << timestamp;
+            stream << ", bits = " << bits;
+            stream << ", nonce = " << nonce;
+            stream << ", merkle_root = " << merkle_root;
+            stream << ")";
+        }
     };
+
+    inline std::ostream &operator<<(std::ostream &stream, SmallBlockHeaderType &value)
+    {
+        value.print(stream);
+        return stream;
+    }
 
     struct BlockType
     {

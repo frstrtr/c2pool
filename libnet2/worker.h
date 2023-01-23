@@ -40,6 +40,25 @@ public:
     bool operator==(const Work &value) const;
 
     bool operator!=(const Work &value) const;
+
+    friend std::ostream &operator<<(std::ostream &stream, Work& value)
+    {
+        stream << "(Work: ";
+        stream << "version = " << value.version;
+        stream << ", previous_block = " << value.previous_block;
+        stream << ", bits = " << value.bits;
+        stream << ", coinbaseflags = " << value.coinbaseflags;
+        stream << ", height = " << value.height;
+        stream << ", timestamp = " << value.timestamp;
+        stream << ", transactions = " << value.transactions;
+        stream << ", transaction_fees = " << value.transaction_fees;
+        stream << ", merkle_link = " << value.merkle_link;
+        stream << ", subsidy = " << value.subsidy;
+        stream << ", last_update = " << value.last_update;
+        stream << ")";
+
+        return stream;
+    }
 };
 
 struct NotifyData
