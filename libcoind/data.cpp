@@ -296,16 +296,17 @@ namespace coind::data
 			_side_data() = default;
 			_side_data(bool _side, uint256 _hash)
 			{
+                side = _side;
 				hash = _hash;
 			}
 		};
 
 		struct _hash_list_data{
 			uint256 value;
-			bool f;
+			bool f = false;
 			std::vector<_side_data> l;
 
-			_hash_list_data() = default;
+			_hash_list_data() {  }
 			_hash_list_data(uint256 _value, bool _f, std::vector<_side_data> _l) {
 				value = _value;
 				f = _f;
@@ -314,7 +315,8 @@ namespace coind::data
 		};
 
 		std::vector<_hash_list_data> hash_list;
-		for (int i = 0; i < hashes.size(); i++)
+		hash_list.reserve(hashes.size());
+        for (int i = 0; i < hashes.size(); i++)
 		{
 			hash_list.emplace_back(hashes[i], i == index, std::vector<_side_data>{});
 		}
@@ -327,7 +329,8 @@ namespace coind::data
             std::vector<_hash_list_data> evens = math::every_nth_element(hash_list.begin(), hash_list.end(), 2);
 
             std::vector<_hash_list_data> odds = math::every_nth_element(hash_list.begin()+1, hash_list.end(), 2);
-            odds.push_back(evens.back());
+            if (odds.size() < evens.size())
+                odds.push_back(evens.back());
 
             _hash_list_data left, right;
             BOOST_FOREACH(boost::tie(left, right), boost::combine(evens, odds))
@@ -344,7 +347,7 @@ namespace coind::data
                         }
             hash_list = new_hash_list;
 		}
-
+        LOG_TRACE << hash_list[0].value;
         std::vector<uint256> res_branch;
         for (auto v: hash_list[0].l){
             res_branch.push_back(v.hash);
