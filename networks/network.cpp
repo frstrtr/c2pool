@@ -102,6 +102,12 @@ namespace c2pool
         }
 
         parent = std::make_shared<coind::ParentNetwork>(name, _pt.get_child("parent_network"));
+
+//        for (auto v = parent->PREFIX; v < parent->PREFIX+parent->PREFIX_LENGTH; v++)
+//        {
+//            std::cout << (unsigned int) *v << " ";
+//        }
+//        std::cout << std::endl;
     }
 
     boost::property_tree::ptree Network::make_default_network()

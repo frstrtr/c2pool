@@ -72,6 +72,21 @@ struct NotifyData
     int32_t timestamp;
     int32_t bits;
     uint256 share_target;
+
+    friend std::ostream &operator<<(std::ostream& stream, NotifyData &data)
+    {
+        stream << "(NotifyData: ";
+        stream << "version = " << data.version;
+        stream << ", previous_block = " << data.previous_block;
+        stream << ", merkle_link = " << data.merkle_link;
+        stream << ", coinb1 = " << data.coinb1;
+        stream << ", coinb2 = " << data.coinb2;
+        stream << ", timestamp = " << data.timestamp;
+        stream << ", bits = " << data.bits;
+        stream << ", share_target = " << data.share_target;
+        stream << ")";
+        return stream;
+    }
 };
 
 struct worker_get_work_result

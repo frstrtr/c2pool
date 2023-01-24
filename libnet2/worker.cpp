@@ -258,6 +258,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	auto local_addr_rates = get_local_addr_rates();
 
 	int64_t block_subsidy;
+    std::string dst = desired_share_target.GetHex();
+    LOG_TRACE << "DESIRED_SHARE_TARGET: " << dst;
 	if (desired_share_target.IsNull())
 	{
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
@@ -905,6 +907,6 @@ void Worker::compute_work()
             };
 //                t = coind::getwork_result()
         }
-        current_work.set(t);
     }
+    current_work.set(t);
 }
