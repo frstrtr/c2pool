@@ -137,6 +137,11 @@ public:
         *_value = init_value;
     }
 
+    std::shared_ptr<VarType> pvalue()
+    {
+        return _value;
+    }
+
     VarType value() const
     {
         return *_value;
