@@ -114,10 +114,10 @@ class FakeCoindNode:
         res = dict(
             version=536870914,
             previous_block = int('1e47a6e2224db5bc2ddce3c31eb14dac8b02ca5a05ebd077d9f53a8d092e4226',16),
-            bits = 453045919,
-            coinbaseflags = [],
+            bits = pack.FloatingInteger(453045919),
+            coinbaseflags = "",
             height = 16518948,
-            timestamp = 1674480469,
+            time = 1674480469,
             transactions = [
                 dict(
                     version = 1,
@@ -163,6 +163,8 @@ class FakeCoindNode:
         self.bitcoind_work = variable.Variable(self.get_fake_bitcoind_work())
         self.best_block_header = variable.Variable(None)
         self.best_share_var = variable.Variable(best)
+
+        self.mining2_txs_var = variable.Variable({})
     #     self.best_block_header = variable.Variable({
     #         ('version', pack.IntType(32)),
     # ('previous_block', pack.PossiblyNoneType(0, pack.IntType(256))),
@@ -185,4 +187,6 @@ _user, _pubkey_hash, _desired_share_target, _desired_pseudoshare_target = wb.pre
 print('user: {0}, pubkey_hash : {1}, desired_share_target: {2}, desired_pseudoshare_target: {3}'.format(_user, _pubkey_hash, _desired_share_target, _desired_pseudoshare_target))
 # wb.get_work()
 
-wb.get_work(_pubkey_hash, _desired_share_target, _desired_pseudoshare_target)
+ba, got_response = wb.get_work(_pubkey_hash, _desired_share_target, _desired_pseudoshare_target)
+
+print(ba)

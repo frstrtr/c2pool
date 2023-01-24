@@ -19,6 +19,7 @@ import tracker
 # import jsonrpc, deferral
 import variable, p2pool_math, pack
 import data as p2pool_data
+import share
 
 print_throttle = 0.0
 DEBUG = True
@@ -320,7 +321,7 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
             lookbehind = 3600//self.node.net.SHARE_PERIOD
             block_subsidy = self.node.bitcoind_work.value['subsidy']
             if previous_share is not None and self.node.tracker.get_height(previous_share.hash) > lookbehind:
-                expected_payout_per_block = local_addr_rates.get(pubkey_hash, 0)/p2pool_data.get_pool_attempts_per_second(self.node.tracker, self.node.best_share_var.value, lookbehind) \
+                expected_payout_per_block = local_addr_rates.get(pubkey_hash, 0)/share.get_pool_attempts_per_second(self.node.tracker, self.node.best_share_var.value, lookbehind) \
                     * block_subsidy*(1-self.donation_percentage/100) # XXX doesn't use global stale rate to compute pool hash
                 if expected_payout_per_block < self.node.net.PARENT.DUST_THRESHOLD:
                     desired_share_target = min(desired_share_target,
@@ -356,7 +357,7 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
                 desired_other_transaction_hashes_and_fees=zip(tx_hashes, self.current_work.value['transaction_fees']),
                 net=self.node.net,
                 known_txs=tx_map,
-                base_subsidy=self.node.net.PARENT.SUBSIDY_FUNC(self.current_work.value['height']),
+                base_subsidy="fake_subsidy"#self.node.net.PARENT.SUBSIDY_FUNC(self.current_work.value['height']),
             )
         
         #7
