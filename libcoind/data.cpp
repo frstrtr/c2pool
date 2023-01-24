@@ -321,6 +321,7 @@ namespace coind::data
 			hash_list.emplace_back(hashes[i], i == index, std::vector<_side_data>{});
 		}
 
+        int i = 0;
 		while (hash_list.size() > 1)
 		{
             //TODO: Optimize
@@ -338,7 +339,7 @@ namespace coind::data
                             merkle_record_type record(left.value, right.value);
                             PackStream _stream;
                             _stream << record;
-                            uint256 _hash = hash256(_stream);
+                            uint256 _hash = hash256(_stream, true);
 
                             std::vector<_side_data> _l = left.f ? left.l : right.l;
                             _l.push_back(left.f ? _side_data(1, right.value) : _side_data(0, left.value));
@@ -346,6 +347,19 @@ namespace coind::data
                             new_hash_list.emplace_back(_hash, left.f || right.f, _l);
                         }
             hash_list = new_hash_list;
+
+
+            LOG_TRACE << i << ": ";
+            for (auto v : hash_list)
+            {
+                LOG_TRACE << v.value << ", " << v.f << ", (";
+                for (auto v2 : v.l)
+                {
+                    LOG_TRACE << v2.hash.GetHex() << " " << v2.side;
+                }
+                LOG_TRACE << ").";
+            }
+            i += 1;
 		}
         LOG_TRACE << hash_list[0].value;
         std::vector<uint256> res_branch;
