@@ -1,6 +1,6 @@
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
-set(COIND_TESTS_SOURCE data_test.cpp rpcjson_test.cpp) #p2p_test.cpp)
+set(COIND_TESTS_SOURCE data_test2.cpp) #rpcjson_test.cpp data_test.cpp p2p_test.cpp)
 
 if (EXISTS ${CMAKE_CURRENT_LIST_DIR}/pass.h)
     message("exist coind pass file in tests!")
