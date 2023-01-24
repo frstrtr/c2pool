@@ -215,7 +215,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //3
     std::vector<uint256> tx_hashes;
-    for (auto tx: current_work.value().transactions)
+    for (auto tx: current_work.pvalue()->transactions)
     {
         coind::data::stream::TransactionType_stream _tx(tx);
         PackStream packed_tx;
@@ -229,7 +229,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         uint256 _tx_hash;
         coind::data::tx_type _tx;
 
-        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(tx_hashes, current_work.value().transactions))
+        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(tx_hashes, current_work.pvalue()->transactions))
                     {
                         tx_map[_tx_hash] = _tx;
                     }
@@ -451,16 +451,18 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     auto target = ArithToUint256(a_target);
 
     //9
+    LOG_TRACE << "get_work#9";
     auto getwork_time = c2pool::dev::timestamp();
     auto lp_count = new_work.get_times();
 
     coind::data::MerkleLink merkle_link;
     if (!gen_sharetx_res->share_info->segwit_data.has_value())
     {
-        std::vector<uint256> _copy_for_link{uint256()};
+        std::vector<uint256> _copy_for_link{uint256::ZERO};
         _copy_for_link.insert(_copy_for_link.end(), gen_sharetx_res->other_transaction_hashes.begin(),
                               gen_sharetx_res->other_transaction_hashes.end());
 
+        LOG_TRACE << "_copy_for_link: " << _copy_for_link;
         merkle_link = coind::data::calculate_merkle_link(_copy_for_link, 0);
     } else
     {
@@ -486,6 +488,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     //TODO: for stats: self.last_work_shares.value[bitcoin_data.pubkey_hash_to_address(pubkey_hash, self.node.net.PARENT)]=share_info['bits']
 
     //10
+    LOG_TRACE << "get_work#10";
     NotifyData ba = {
             std::max(current_work.value().version, (uint64_t) 536870912),
             current_work.value().previous_block,
