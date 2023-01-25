@@ -18,7 +18,7 @@ namespace shares::stream
 
 		MerkleLink_stream(const coind::data::MerkleLink &value)
 		{
-			branch = branch.make_type(value.branch);
+			branch = ListType<IntType(256)>::make_type(value.branch);
 		}
 
         PackStream &write(PackStream &stream)
@@ -72,7 +72,10 @@ namespace shares::stream
         MerkleLink_stream txid_merkle_link;
         IntType(256) wtxid_merkle_root;
 
-        SegwitData_stream() = default;
+        SegwitData_stream() : txid_merkle_link(), wtxid_merkle_root()
+        {
+
+        }
 
 		SegwitData_stream(const types::SegwitData &val)
 		{
@@ -251,28 +254,33 @@ namespace shares::stream
         FixedStrType<8> identifier;
         ShareData_stream share_data;
         ShareInfo_stream share_info;
-        std::shared_ptr<SegwitData_stream> segwit_data;
+        PossibleNoneType<SegwitData_stream> segwit_data;
+//        std::shared_ptr<SegwitData_stream> segwit_data;
 
-		RefType(bool _segwit_activated = true)
+		RefType(bool _segwit_activated = true) : segwit_data({})
         {
             __segwit_activated__ = _segwit_activated;
         }
 
-		RefType(std::vector<unsigned char> _ident, shares::types::ShareData &_share_data, shares::types::ShareInfo &_share_info, std::optional<shares::types::SegwitData> _segwit_data)
+		RefType(std::vector<unsigned char> _ident, shares::types::ShareData &_share_data, shares::types::ShareInfo &_share_info, std::optional<shares::types::SegwitData> _segwit_data) : segwit_data({})
 		{
 			identifier = FixedStrType<8>(_ident);
             share_data = ShareData_stream(_share_data);
 			share_info = ShareInfo_stream(_share_info);
 
             if (_segwit_data.has_value())
-                segwit_data = std::make_shared<SegwitData_stream>(_segwit_data.value());
+                segwit_data = _segwit_data.value();
 		}
 
         PackStream &write(PackStream &stream)
         {
             stream << identifier << share_data;
-            if (segwit_data)
-                stream << *segwit_data;
+
+            PackStream test_stream;
+            test_stream << segwit_data;
+            LOG_TRACE << "TEST_STREAM: " << test_stream;
+
+            stream << test_stream;
             stream << share_info;
             return stream;
         }

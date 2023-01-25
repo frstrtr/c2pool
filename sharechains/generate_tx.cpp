@@ -9,7 +9,9 @@
 #include "data.h"
 #include "share_adapters.h"
 #include "share_builder.h"
+#include <libdevcore/logger.h>
 #include <networks/network.h>
+#include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
 
 namespace shares
@@ -52,13 +54,14 @@ namespace shares
                                                           other_transaction_hashes.end());
 
         vector<std::optional<int32_t>> removed_fee;
-        int32_t removed_fee_sum;
-        int32_t definite_fees;
+        int32_t removed_fee_sum = 0;
+        int32_t definite_fees = 0;
         bool fees_none_contains = false;
         for (auto item: _desired_other_transaction_hashes_and_fees)
         {
             auto tx_hash = std::get<0>(item);
             auto fee = std::get<1>(item);
+            LOG_TRACE << "from desired_other_transaction_hashes_and_fees: " << tx_hash << "; " << (fee.has_value() ? fee.value() : -1);
             if (!fee.has_value())
                 fees_none_contains = true;
 
@@ -76,7 +79,11 @@ namespace shares
             }
         }
 
-        if (!fees_none_contains)
+        LOG_TRACE << "fees_none_contains = " << fees_none_contains;
+        LOG_TRACE << "_share_data.subsidy = " << _share_data.subsidy;
+        LOG_TRACE << "_base_subsidy = " << _base_subsidy;
+        LOG_TRACE << "definite_fees = " << definite_fees;
+        if (!fees_none_contains)//TODO:
         {
             _share_data.subsidy += removed_fee_sum;
         } else
@@ -114,18 +121,20 @@ namespace shares
 //      witness_reserved_value_str = '[P2Pool]'*4
 //		witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
 //		witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
-        char* witness_reserved_value_str = "[C2Pool][C2Pool][C2Pool][C2Pool]";
+        const char* witness_reserved_value_str = "[C2Pool][C2Pool][C2Pool][C2Pool]";
         uint256 witness_commitment_hash;
         if (segwit_activated && _segwit_data.has_value())
         {
-            //TODO: TEST
             PackStream stream(witness_reserved_value_str, strlen(witness_reserved_value_str));
+            LOG_TRACE << "witness_reserved_stream: " << stream;
             IntType(256) witness_reserved_stream;
             stream >> witness_reserved_stream;
 
             uint256 witness_reserved_value = witness_reserved_stream.get();
+            LOG_TRACE << "witness_reserved_value = " << witness_reserved_value.GetHex();
 
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
+            LOG_TRACE << "witness_commitment_hash = " << witness_commitment_hash.GetHex();
         }
 
         std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs, segwit_activated);
@@ -427,34 +436,35 @@ namespace shares
 
         //TX_OUT
         vector<coind::data::TxOutType> tx_outs;
+        // tx1 [+]
         {
-            auto script = std::vector<unsigned char>{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
             if (segwit_activated)
             {
-                auto packed_witness_commitment_hash = pack<IntType(256) >(witness_commitment_hash);
+                auto script = std::vector<unsigned char>{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+                auto packed_witness_commitment_hash = pack<IntType(256)>(witness_commitment_hash); // TODO: witness_commitment_hash
                 script.insert(script.end(), packed_witness_commitment_hash.begin(),
                               packed_witness_commitment_hash.end());
+                tx_outs.emplace_back(0, script);
             }
-            tx_outs.emplace_back(0, script);
         }
-
-        for (auto script: dests)
+        // tx2 [+]
+        for (const auto& script: dests)
         {
             if (!ArithToUint256(amounts[script]).IsNull() || script == net->DONATION_SCRIPT)
             {
-                tx_outs.emplace_back(amounts[script].GetLow64(), script);
+                tx_outs.emplace_back(amounts[script].GetLow64(), script); //value, script
             }
         }
+        // tx3 [-]
         {
             // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)
             auto script = std::vector<unsigned char>{0x6a, 0x28};
 
-            auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data);
+            auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data); //TODO:
             script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
 
-
-            //ERROR HERE!
-            auto packed_last_txout_nonce = pack<IntType(64) >(_last_txout_nonce);
+            std::vector<unsigned char> packed_last_txout_nonce = pack<IntType(64)>(_last_txout_nonce);
+            LOG_TRACE.stream() << packed_last_txout_nonce;
             script.insert(script.end(), packed_last_txout_nonce.begin(), packed_last_txout_nonce.end());
 
             tx_outs.emplace_back(0, script);
@@ -469,6 +479,9 @@ namespace shares
             _witness.push_back(std::vector<string>{std::string(witness_reserved_value_str)});
             gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
         }
+
+        LOG_TRACE << "GENTX: " << gentx;
+
         return gentx;
     }
 

@@ -435,6 +435,6 @@ namespace coind::data
         merkle_record_type record(witness_root_hash, witness_reserved_value);
         PackStream _stream;
         _stream << record;
-        return hash256(_stream);
+        return hash256(_stream, true);
     }
 }

@@ -221,7 +221,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         PackStream packed_tx;
         packed_tx << _tx;
 
-        tx_hashes.push_back(coind::data::hash256(packed_tx));
+        tx_hashes.push_back(coind::data::hash256(packed_tx, true));
     }
 
     std::map<uint256, coind::data::tx_type> tx_map;

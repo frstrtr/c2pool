@@ -86,8 +86,16 @@ namespace shares
         PackStream ref_type_packed;
         ref_type_packed << ref_type;
 
+        LOG_TRACE << "packed ref_type: " << ref_type_packed;
+
         auto hash_ref_type = coind::data::hash256(ref_type_packed, true);
-        IntType(256) _check_merkle_link(coind::data::check_merkle_link(hash_ref_type, ref_merkle_link));
+        LOG_TRACE << "hash_ref_type = " << hash_ref_type.GetHex();
+        LOG_TRACE << "ref_merkle_link = " << ref_merkle_link;
+
+        auto check_merkle = coind::data::check_merkle_link(hash_ref_type, ref_merkle_link);
+        LOG_TRACE << "check_merkle = " << check_merkle.GetHex();
+        IntType(256) _check_merkle_link(check_merkle);
+
 
         PackStream result;
         result << _check_merkle_link;
