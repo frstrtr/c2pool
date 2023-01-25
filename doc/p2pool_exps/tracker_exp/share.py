@@ -431,9 +431,11 @@ class BaseShare(object):
             segwit_data = dict(txid_merkle_link=coind_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0),
                                wtxid_merkle_root=coind_data.merkle_hash([0] + [coind_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
         if segwit_activated and segwit_data is not None:
-            witness_reserved_value_str = '[P2Pool]'*4
+            witness_reserved_value_str = '[C2Pool]'*4
             witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
+            print("witness_reserved_value = {0}".format(hex(witness_reserved_value)))
             witness_commitment_hash = coind_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
+            print("witness_commitment_hash = {0}".format(hex(witness_commitment_hash)))
 
         share_info = dict(
             share_data=share_data,
@@ -475,6 +477,8 @@ class BaseShare(object):
         if segwit_activated:
             share_info['segwit_data'] = segwit_data
         
+
+        print('REF_HASH!: {0}'.format([ord(x) for x in cls.get_ref_hash(net, share_info, ref_merkle_link)]))
         gentx = dict(
             version=1,
             tx_ins=[dict(
@@ -516,10 +520,29 @@ class BaseShare(object):
     
     @classmethod
     def get_ref_hash(cls, net, share_info, ref_merkle_link):
-        return pack.IntType(256).pack(coind_data.check_merkle_link(coind_data.hash256(cls.get_dynamic_types(net)['ref_type'].pack(dict(
-            identifier=net.IDENTIFIER,
-            share_info=share_info,
-        ))), ref_merkle_link))
+        print('GET_REF_HASH: \n\t Share_info: {0}; \n\tRefMerkleLink: {1}'.format(share_info, ref_merkle_link))
+        
+        packed_ref_type = cls.get_dynamic_types(net)['ref_type'].pack(
+                        dict(
+                            identifier=net.IDENTIFIER,
+                            share_info=share_info,
+                        )
+                    )
+
+        print('PACKED_REF_TYPE: {0}'.format([ord(x) for x in packed_ref_type]))
+        print('coind_data.hash256(packed_ref_type): {0}'.format(coind_data.hash256(packed_ref_type)))
+        print('ref_merkle_link = {0}'.format(ref_merkle_link))
+        print('check_merkle_link = {0}'.format(coind_data.check_merkle_link(
+                coind_data.hash256(packed_ref_type),
+                ref_merkle_link
+            )))
+
+        return pack.IntType(256).pack(
+            coind_data.check_merkle_link(
+                coind_data.hash256(packed_ref_type),
+                ref_merkle_link
+            )
+        )
     
     __slots__ = 'net peer_addr contents min_header share_info hash_link merkle_link hash share_data max_target target timestamp previous_hash new_script desired_version gentx_hash header pow_hash header_hash new_transaction_hashes time_seen absheight abswork'.split(' ')
     
