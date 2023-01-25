@@ -275,12 +275,7 @@ namespace shares::stream
         PackStream &write(PackStream &stream)
         {
             stream << identifier << share_data;
-
-            PackStream test_stream;
-            test_stream << segwit_data;
-            LOG_TRACE << "TEST_STREAM: " << test_stream;
-
-            stream << test_stream;
+            stream << segwit_data;
             stream << share_info;
             return stream;
         }
