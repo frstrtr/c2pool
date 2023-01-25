@@ -361,6 +361,7 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
             )
         
         #7
+        print('GENTX: {0}'.format(gentx))
         packed_gentx = bitcoin_data.tx_id_type.pack(gentx) # stratum miners work with stripped transactions
         other_transactions = [tx_map[tx_hash] for tx_hash in other_transaction_hashes]
         
