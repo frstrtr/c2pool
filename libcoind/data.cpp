@@ -9,6 +9,7 @@
 
 #include <sstream>
 #include <algorithm>
+#include <utility>
 
 #include "transaction.h"
 
@@ -310,7 +311,7 @@ namespace coind::data
 			_hash_list_data(uint256 _value, bool _f, std::vector<_side_data> _l) {
 				value = _value;
 				f = _f;
-				l = _l;
+				l = std::move(_l);
 			}
 		};
 
@@ -321,7 +322,7 @@ namespace coind::data
 			hash_list.emplace_back(hashes[i], i == index, std::vector<_side_data>{});
 		}
 
-        int i = 0;
+//        int i = 0;
 		while (hash_list.size() > 1)
 		{
             //TODO: Optimize
@@ -348,22 +349,22 @@ namespace coind::data
                         }
             hash_list = new_hash_list;
 
-
-            LOG_TRACE << i << ": ";
-            for (auto v : hash_list)
-            {
-                LOG_TRACE << v.value << ", " << v.f << ", (";
-                for (auto v2 : v.l)
-                {
-                    LOG_TRACE << v2.hash.GetHex() << " " << v2.side;
-                }
-                LOG_TRACE << ").";
-            }
-            i += 1;
+//            LOG_TRACE << i << ": ";
+//            for (auto v : hash_list)
+//            {
+//                LOG_TRACE << v.value << ", " << v.f << ", (";
+//                for (auto v2 : v.l)
+//                {
+//                    LOG_TRACE << v2.hash.GetHex() << " " << v2.side;
+//                }
+//                LOG_TRACE << ").";
+//            }
+//            i += 1;
 		}
-        LOG_TRACE << hash_list[0].value;
+
         std::vector<uint256> res_branch;
-        for (auto v: hash_list[0].l){
+        for (auto v: hash_list[0].l)
+        {
             res_branch.push_back(v.hash);
         }
 
