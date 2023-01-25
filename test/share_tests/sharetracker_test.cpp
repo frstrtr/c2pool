@@ -9,6 +9,7 @@
 #include <sharechains/generate_tx.h>
 #include <networks/network.h>
 #include <btclibs/script/script.h>
+#include <sharechains/data.h>
 
 class TestNetwork : public c2pool::Network
 {
@@ -616,4 +617,51 @@ TEST_F(SharechainsTest, gentx_test)
 
     LOG_TRACE << "\tdesired_version: " << share_data.desired_version;
     ASSERT_EQ(share_data.desired_version, 17);
+
+    // gentx:
+    LOG_TRACE << "GENTX: " << gentx;
+}
+
+TEST_F(SharechainsTest, get_ref_hash_test)
+{
+    uint160 pubkey_hash;
+    pubkey_hash.SetHex("78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
+
+    types::ShareData share_data {
+        uint256S("674f2df26d4897932599be06eebb659a5e0737964c9cb0c091f4fffc76aeb24e"),
+        {'\0'},
+        3108897269,
+        pubkey_hash,
+        0,
+        0,
+        StaleInfo::unk,
+        17
+    };
+
+
+    uint128 abswork;
+    abswork.SetHex("44bc54f548a");
+
+    types::ShareInfo share_info {
+        uint256S("ba025a80b4be4999c4c42851b395599df3770d66f892b4074698a82200ab4cfe"),
+        503477261,
+        487911265,
+        1670107505,
+        {},
+        {},
+        259326,
+        abswork
+    };
+
+    coind::data::MerkleLink ref_merkle_link{
+            {},
+            0
+    };
+
+
+    std::optional<types::SegwitData> segwit_data = std::make_optional<types::SegwitData>(coind::data::MerkleLink{}, uint256::ZERO);
+    auto res = shares::get_ref_hash(net, share_data, share_info, ref_merkle_link, segwit_data);
+
+    LOG_INFO.stream() << res.data;
+    LOG_INFO << unpack<IntType(256)>(res.data).GetHex();
 }
