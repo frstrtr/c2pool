@@ -1,6 +1,7 @@
 import pack
 import hashlib
 import math,  p2pool_math
+import random
 
 
 def target_to_average_attempts(target):
@@ -202,34 +203,88 @@ def merkle_hash(hashes):
     return hash_list[0]
 
 def calculate_merkle_link(hashes, index):
-    # XXX optimize this
+    hash_list = [(lambda _h=h: _h, i == index, []) for i, h in enumerate(hashes)]
     
-    hash_list = [(h, i == index, []) for i, h in enumerate(hashes)]
-    i = 0
     while len(hash_list) > 1:
         hash_list = [
             (
-                hash256(merkle_record_type.pack(dict(left=left, right=right))),
+                lambda _left=left, _right=right: hash256(merkle_record_type.pack(dict(left=_left(), right=_right()))),
                 left_f or right_f,
                 (left_l if left_f else right_l) + [dict(side=1, hash=right) if left_f else dict(side=0, hash=left)],
             )
             for (left, left_f, left_l), (right, right_f, right_l) in
                 zip(hash_list[::2], hash_list[1::2] + [hash_list[::2][-1]])
         ]
-
-        print('{0}: {1}'.format(i, hash_list))
-        i += 1
-
-    res = [x['hash'] for x in hash_list[0][2]]
+    
+    res = [x['hash']() for x in hash_list[0][2]]
     
     assert hash_list[0][1]
-    # if p2pool.DEBUG:
-    #     new_hashes = [random.randrange(2**256) if x is None else x
-    #         for x in hashes]
-    #     assert check_merkle_link(new_hashes[index], dict(branch=res, index=index)) == merkle_hash(new_hashes)
+    if False:
+        new_hashes = [random.randrange(2**256) if x is None else x
+            for x in hashes]
+        assert check_merkle_link(new_hashes[index], dict(branch=res, index=index)) == merkle_hash(new_hashes)
     assert index == sum(k*2**i for i, k in enumerate([1-x['side'] for x in hash_list[0][2]]))
     
     return dict(branch=res, index=index)
+
+# def calculate_merkle_link(hashes, index):
+#     # XXX optimize this
+
+#     def hash_check(h):
+#         try:
+#             return hex(h()) if h() is None else None
+#         except:
+#             return None
+
+    
+#     hash_list = [(lambda _h=h: _h, i == index, []) for i, h in enumerate(hashes)]
+#     i = 0
+#     while len(hash_list) > 1:
+#         hash_list = [
+#             (
+#                 lambda _left=left, _right=right: hash256(merkle_record_type.pack(dict(left=_left(), right=_right()))),
+#                 left_f or right_f,
+#                 (left_l if left_f else right_l) + [dict(side=1, hash=right) if left_f else dict(side=0, hash=left)],
+#             )
+#             for (left, left_f, left_l), (right, right_f, right_l) in
+#                 zip(hash_list[::2], hash_list[1::2] + [hash_list[::2][-1]])
+#         ]
+
+#         print('{0}: {1}'.format(i, [(hash_check(v), f, [(hex(x['hash']()), x['side']) for x in l]) for (v, f, l) in hash_list]))
+#         i += 1
+    
+    
+
+
+#     res = [hex(x['hash']()) for x in hash_list[0][2]]
+
+
+#     # hash_list = [(h, i == index, []) for i, h in enumerate(hashes)]
+#     # i = 0
+#     # while len(hash_list) > 1:
+#     #     hash_list = [
+#     #         (
+#     #             hash256(merkle_record_type.pack(dict(left=left, right=right))),
+#     #             left_f or right_f,
+#     #             (left_l if left_f else right_l) + [dict(side=1, hash=right) if left_f else dict(side=0, hash=left)],
+#     #         )
+#     #         for (left, left_f, left_l), (right, right_f, right_l) in
+#     #             zip(hash_list[::2], hash_list[1::2] + [hash_list[::2][-1]])
+#     #     ]
+
+#     #     print('{0}: {1}'.format(i, hash_list))
+#     #     i += 1
+
+#     # res = [x['hash'] for x in hash_list[0][2]]
+    
+#     assert hash_list[0][1]
+#     # if p2pool.DEBUG:
+#     #     new_hashes = [random.randrange(2**256) if x is None else x
+#     #         for x in hashes]
+#     #     assert check_merkle_link(new_hashes[index], dict(branch=res, index=index)) == merkle_hash(new_hashes)
+#     assert index == sum(k*2**i for i, k in enumerate([1-x['side'] for x in hash_list[0][2]]))
+    
+#     return dict(branch=res, index=index)
 
 def check_merkle_link(tip_hash, link):
     if link['index'] >= 2**len(link['branch']):
