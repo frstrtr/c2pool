@@ -35,7 +35,7 @@ namespace shares
 #define type_known_txs std::map<uint256, coind::data::tx_type>
 
 #define SetProperty(type, name)          \
-    type _##name;                        \
+    type _##name{};                      \
                                          \
     GenerateShareTransaction &set_##name(const type &_value){ \
         _##name = _value;                \
