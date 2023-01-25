@@ -207,6 +207,12 @@ struct PackStream
         data = vector<unsigned char>(temp, temp + len);
     }
 
+    PackStream(const char *value, int32_t len)
+    {
+        auto temp = (unsigned char *)value;
+        data = vector<unsigned char>(temp, temp + len);
+    }
+
     PackStream &operator<<(PackStream &val)
     {
         data.insert(data.end(), val.data.begin(), val.data.end());
@@ -404,6 +410,12 @@ struct PackStream
         auto lenData = parsedHexData.size();
 
         data.insert(data.end(), parsedHexData.begin(), parsedHexData.end());
+    }
+
+    friend std::ostream &operator<<(std::ostream &stream, PackStream &packstream)
+    {
+        stream << packstream.data;
+        return stream;
     }
 };
 
