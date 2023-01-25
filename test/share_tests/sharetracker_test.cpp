@@ -630,7 +630,7 @@ TEST_F(SharechainsTest, get_ref_hash_test)
     types::ShareData share_data {
         uint256S("674f2df26d4897932599be06eebb659a5e0737964c9cb0c091f4fffc76aeb24e"),
         {'\0'},
-        3108897269,
+        895279359,
         pubkey_hash,
         0,
         0,

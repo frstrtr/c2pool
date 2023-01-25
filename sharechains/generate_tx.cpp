@@ -461,6 +461,8 @@ namespace shares
             auto script = std::vector<unsigned char>{0x6a, 0x28};
 
             auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data); //TODO:
+            LOG_TRACE << "nonce = " << _share_data.nonce;
+            LOG_TRACE << "_get_ref_hash = " << _get_ref_hash;
             script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
 
             std::vector<unsigned char> packed_last_txout_nonce = pack<IntType(64)>(_last_txout_nonce);
