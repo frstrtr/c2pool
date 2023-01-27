@@ -14,6 +14,7 @@ base_blob<BITS>::base_blob(const std::vector<unsigned char>& vch)
 {
     assert(vch.size() == sizeof(m_data));
     memcpy(m_data, vch.data(), sizeof(m_data));
+    UPDATE_HEX_STR();
 }
 
 template <unsigned int BITS>
@@ -52,12 +53,15 @@ void base_blob<BITS>::SetHex(const char* psz)
             p1++;
         }
     }
+
+    UPDATE_HEX_STR();
 }
 
 template <unsigned int BITS>
 void base_blob<BITS>::SetHex(const std::string& str)
 {
     SetHex(str.c_str());
+    UPDATE_HEX_STR();
 }
 
 template <unsigned int BITS>
