@@ -8,9 +8,9 @@
 
 #include "span.h"
 
-#include <cassert>
+#include <assert.h>
 #include <cstring>
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 
@@ -22,18 +22,14 @@ public:
     static constexpr int WIDTH = BITS / 8;
 public:
     uint8_t m_data[WIDTH];
-
-    std::string hex_data = "";
 public:
     /* construct 0 value by default */
-    base_blob() : m_data(), hex_data("") {}
+    constexpr base_blob() : m_data() {}
 
     /* constructor for constants between 1 and 255 */
-    explicit base_blob(uint8_t v) : m_data{v}, hex_data("") {}
+    constexpr explicit base_blob(uint8_t v) : m_data{v} {}
 
     explicit base_blob(const std::vector<unsigned char>& vch);
-
-    ~base_blob() {}
 
     bool IsNull() const
     {
@@ -141,7 +137,7 @@ public:
 class uint160 : public base_blob<160>
 {
 public:
-    uint160() {}
+    constexpr uint160() {}
     explicit uint160(const std::vector<unsigned char> &vch) : base_blob<160>(vch) {}
 
     friend std::istream &operator>>(std::istream &is, uint160 &value);
@@ -156,9 +152,8 @@ public:
 class uint256 : public base_blob<256>
 {
 public:
-    uint256() {}
-    ~uint256() { }
-    explicit uint256(uint8_t v) : base_blob<256>(v) {}
+    constexpr uint256() {}
+    constexpr explicit uint256(uint8_t v) : base_blob<256>(v) {}
     explicit uint256(const std::vector<unsigned char>& vch) : base_blob<256>(vch) {}
     static const uint256 ZERO;
     static const uint256 ONE;
@@ -174,7 +169,7 @@ public:
 class uint288 : public base_blob<288>
 {
 public:
-    uint288() {}
+    constexpr uint288() {}
     explicit uint288(const std::vector<unsigned char> &vch) : base_blob<288>(vch) {}
 
     friend std::istream &operator>>(std::istream &is, uint288 &value);

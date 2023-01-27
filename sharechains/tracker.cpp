@@ -276,13 +276,9 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     {
         for (auto h : verified.tails[best_tail])
         {
-            auto p_key = verified.get_nth_parent_key(
-                    h,
-                    std::min(5, verified.get_height(h)));
-            auto w = verified.get_work(p_key);
-            auto w_arith = UintToArith256(w);
             auto el = std::make_tuple(
-                    w_arith,
+                    UintToArith256(verified.get_work(
+                            verified.get_nth_parent_key(h, std::min(5, verified.get_height(h))))),
                     -std::get<0>(should_punish_reason(items[h], previous_block, bits, known_txs)),
                     -items[h]->time_seen
             );
