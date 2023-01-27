@@ -142,6 +142,13 @@ protected:
 
     virtual void SetUp()
     {
+        {
+            arith_uint256  test_b;
+            test_b.SetHex("abc");
+
+            ArithToUint256(test_b);
+        }
+
         auto context = std::make_shared<boost::asio::io_context>();
 
         // NETWORK/PARENT_NETWORK
