@@ -10,10 +10,13 @@
 #include <string.h>
 
 template <unsigned int BITS>
-base_blob<BITS>::base_blob(const std::vector<unsigned char>& vch)
+base_blob<BITS>::base_blob(const std::vector<unsigned char>& vch) //: hex_data()
 {
     assert(vch.size() == sizeof(m_data));
     memcpy(m_data, vch.data(), sizeof(m_data));
+#ifdef DEBUG
+    hex_data = GetHex();
+#endif
 }
 
 template <unsigned int BITS>
@@ -52,12 +55,19 @@ void base_blob<BITS>::SetHex(const char* psz)
             p1++;
         }
     }
+
+#ifdef DEBUG
+    hex_data = GetHex();
+#endif
 }
 
 template <unsigned int BITS>
 void base_blob<BITS>::SetHex(const std::string& str)
 {
     SetHex(str.c_str());
+#ifdef DEBUG
+    hex_data = GetHex();
+#endif
 }
 
 template <unsigned int BITS>
