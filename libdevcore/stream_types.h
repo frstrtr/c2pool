@@ -355,9 +355,13 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
 		{
 			packed[i] = stream.data[i];
 		}
+        std::vector<unsigned char> _packed;
+        _packed.insert(_packed.end(), stream.data.begin(), stream.data.begin() + value_type::WIDTH);
 		stream.data.erase(stream.data.begin(), stream.data.begin() + value_type::WIDTH);
-		auto *_value = reinterpret_cast<INT_T *>(packed);
-		Getter<INT_T>::value = *_value;
+
+        Getter<INT_T>::value = INT_T(_packed);
+//		auto *_value = reinterpret_cast<INT_T *>(packed);
+//		Getter<INT_T>::value = *_value;
 
 		return stream;
 	}
