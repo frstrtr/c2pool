@@ -201,7 +201,8 @@ class BaseShare(object):
             raise ValueError()
         
         dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
-
+        print('amounts: {0}'.format(amounts))
+        print('dest: {0}'.format([[ord(_x) for _x in x] for x in amounts]))
         segwit_activated = is_segwit_activated(cls.VERSION, net)
         if segwit_data is None and known_txs is None:
             segwit_activated = False
@@ -246,6 +247,7 @@ class BaseShare(object):
         if segwit_activated:
             share_info['segwit_data'] = segwit_data
         
+        print('last_txout_nonce = {0}'.format(last_txout_nonce))
         gentx = dict(
             version=1,
             tx_ins=[dict(
@@ -415,7 +417,7 @@ class BaseShare(object):
             raise ValueError()
         
         dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
-
+        print('dest: {0}'.format(dests))
         segwit_activated = is_segwit_activated(cls.VERSION, net)
         print('segwit_activated: {0}'.format(segwit_activated))
         print('segwit_data: {0}'.format(segwit_data))
