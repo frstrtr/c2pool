@@ -630,7 +630,7 @@ TEST_F(SharechainsTest, get_ref_hash_test)
     types::ShareData share_data {
         uint256S("674f2df26d4897932599be06eebb659a5e0737964c9cb0c091f4fffc76aeb24e"),
         {'\0'},
-        895279359,
+        1195140249,
         pubkey_hash,
         0,
         0,
@@ -664,4 +664,22 @@ TEST_F(SharechainsTest, get_ref_hash_test)
 
     LOG_INFO.stream() << res.data;
     LOG_INFO << unpack<IntType(256)>(res.data).GetHex();
+
+    //
+    auto script = std::vector<unsigned char>{0x6a, 0x28};
+
+    auto _get_ref_hash = shares::get_ref_hash(net, share_data, share_info, ref_merkle_link, segwit_data);
+    LOG_TRACE << "nonce = " << share_data.nonce;
+    LOG_TRACE << "_get_ref_hash = " << _get_ref_hash;
+    script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
+
+    std::vector<unsigned char> packed_last_txout_nonce = pack<IntType(64)>(2270414773);
+    LOG_TRACE.stream() << packed_last_txout_nonce;
+    script.insert(script.end(), packed_last_txout_nonce.begin(), packed_last_txout_nonce.end());
+
+    LOG_TRACE.stream() << "script: " << script;
+
+    std::vector<unsigned char> true_script {106, 40, 1, 255, 199, 147, 12, 16, 6, 17, 229, 114, 102, 114, 155, 195, 239, 2, 107, 179, 122, 183, 0, 216, 93, 174, 27, 154, 136, 204, 44, 120, 70, 14, 181, 199, 83, 135, 0, 0, 0, 0};
+
+    ASSERT_EQ(script, true_script);
 }
