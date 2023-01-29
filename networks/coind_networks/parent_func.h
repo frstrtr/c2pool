@@ -42,7 +42,7 @@ using std::shared_ptr;
 		PackStream converted_output(output, 32);
 		IntType(256) res;
 		converted_output >> res;
-		std::cout << res.get().ToString() << std::endl;
+//		std::cout << res.get().ToString() << std::endl;
 		return res.get();
     }
 

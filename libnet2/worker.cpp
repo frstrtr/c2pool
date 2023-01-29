@@ -414,15 +414,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             //# one node has the whole p2pool hashrate, it will still only need to process one pseudoshare
             //# every ~0.01 seconds.
 
-            LOG_TRACE << "bits = " << _coind_node->coind_work.value().bits.get() << ", target from bits = " << _coind_node->coind_work.value().bits.target();
             arith_uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target());
-            LOG_TRACE << "avg_attempts1 = " << avg_attempts.GetHex();
             avg_attempts *= _net->SPREAD;
-            LOG_TRACE << "avg_attempts2 = " << avg_attempts.GetHex();
             avg_attempts *= _net->parent->DUST_THRESHOLD;
             avg_attempts/block_subsidy;
-            LOG_TRACE << "DUST_THRESHOLD = " << _net->parent->DUST_THRESHOLD << ", block_subsidy = " << block_subsidy;
-            LOG_TRACE << "avg_attempts3 = " << avg_attempts.GetHex();
 
             auto target_from_avg = Uint256ToArith288(coind::data::average_attempts_to_target(avg_attempts));
 

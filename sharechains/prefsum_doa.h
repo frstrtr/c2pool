@@ -38,7 +38,8 @@ namespace shares
                 return _rules_func(share);
             else
             {
-                LOG_WARNING << "EMPTY RULES IN doa_element_type!";
+                //TODO:
+//                LOG_WARNING << "EMPTY RULES IN doa_element_type!";
                 return std::make_tuple<int32_t, int32_t, int32_t, int32_t>(0, 0, 0, 0);
             }
         }
