@@ -14,6 +14,12 @@
 #include <string>
 #include <vector>
 
+#ifdef DEBUG
+    #define UPDATE_HEX_STR()      \
+        hex_str = GetHex()
+#else
+    #define UPDATE_HEX_STR()
+#endif
 /** Template base class for fixed-sized opaque blobs. */
 template <unsigned int BITS>
 class base_blob
@@ -21,13 +27,23 @@ class base_blob
 public:
     static constexpr int WIDTH = BITS / 8;
 public:
+#ifdef DEBUG
+    std::string hex_str;
+#endif
+
     uint8_t m_data[WIDTH];
 public:
     /* construct 0 value by default */
-    constexpr base_blob() : m_data() {}
+    constexpr base_blob() : m_data()
+    {
+        UPDATE_HEX_STR();
+    }
 
     /* constructor for constants between 1 and 255 */
-    constexpr explicit base_blob(uint8_t v) : m_data{v} {}
+    constexpr explicit base_blob(uint8_t v) : m_data{v}
+    {
+        UPDATE_HEX_STR();
+    }
 
     explicit base_blob(const std::vector<unsigned char>& vch);
 
@@ -42,6 +58,7 @@ public:
     void SetNull()
     {
         memset(m_data, 0, sizeof(m_data));
+        UPDATE_HEX_STR();
     }
 
     inline int Compare(const base_blob& other) const {
@@ -111,6 +128,7 @@ public:
     void Serialize(Stream& s) const
     {
         s.write(MakeByteSpan(m_data));
+        UPDATE_HEX_STR();
     }
 
     template<typename Stream>

@@ -420,6 +420,7 @@ namespace shares
         for (auto v: amounts)
             dests.push_back(v.first);
 
+        //TODO: check this
         std::sort(dests.begin(), dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
         {
             if (a == net->DONATION_SCRIPT)
@@ -431,8 +432,7 @@ namespace shares
 
         //TX_IN
         vector<coind::data::TxInType> tx_ins;
-        tx_ins.emplace_back(coind::data::PreviousOutput(uint256::ZERO, 0), _share_data.coinbase,
-                            0); // TODO: check + debug
+        tx_ins.emplace_back(coind::data::PreviousOutput(uint256::ZERO, 0), _share_data.coinbase, 0); // TODO: check + debug
 
         //TX_OUT
         vector<coind::data::TxOutType> tx_outs;
@@ -441,7 +441,7 @@ namespace shares
             if (segwit_activated)
             {
                 auto script = std::vector<unsigned char>{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
-                auto packed_witness_commitment_hash = pack<IntType(256)>(witness_commitment_hash); // TODO: witness_commitment_hash
+                auto packed_witness_commitment_hash = pack<IntType(256)>(witness_commitment_hash);
                 script.insert(script.end(), packed_witness_commitment_hash.begin(),
                               packed_witness_commitment_hash.end());
                 tx_outs.emplace_back(0, script);
@@ -455,12 +455,12 @@ namespace shares
                 tx_outs.emplace_back(amounts[script].GetLow64(), script); //value, script
             }
         }
-        // tx3 [-]
+        // tx3 [+]
         {
             // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)
             auto script = std::vector<unsigned char>{0x6a, 0x28};
 
-            auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data); //TODO:
+            auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data);
             LOG_TRACE << "nonce = " << _share_data.nonce;
             LOG_TRACE << "_get_ref_hash = " << _get_ref_hash;
             script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
