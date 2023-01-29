@@ -412,9 +412,9 @@ namespace coind::data
             std::vector<uint256> new_hashes;
 
             std::vector<uint256> evens = math::every_nth_element(hashes.begin(), hashes.end(), 2);
-
             std::vector<uint256> odds = math::every_nth_element(hashes.begin() + 1, hashes.end(), 2);
-            odds.push_back(evens.back());
+            if (odds.size() < evens.size())
+                odds.push_back(evens.back());
 
             uint256 left, right;
             BOOST_FOREACH(boost::tie(left, right), boost::combine(evens, odds))
@@ -426,6 +426,8 @@ namespace coind::data
 
                             new_hashes.push_back(_hash);
                         }
+
+            hashes = new_hashes;
         }
         return hashes.front();
     }
