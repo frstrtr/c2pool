@@ -34,20 +34,20 @@ ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), 
 
 void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes)
 {
-    std::cout << "shares:" << std::endl;
+    LOG_DEBUG << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
     for (auto& _share : _shares)
     {
-        std::cout << _share->hash.GetHex() << std::endl;
         add(_share);
     }
+    LOG_DEBUG << "ShareTracker::init -- init shares finished: " << c2pool::dev::timestamp();
 
-    std::cout << "known:" << std::endl;
+    LOG_DEBUG << "ShareTracker::init -- known shares started: " << c2pool::dev::timestamp();
     for (auto& share_hash : known_verified_share_hashes)
     {
-        std::cout << share_hash.GetHex() << std::endl;
         if (exists(share_hash))
             verified.add(items.at(share_hash));
     }
+    LOG_DEBUG << "ShareTracker::init -- known shares finished: " << c2pool::dev::timestamp();
 
     // Set DOA rule
     //TODO
@@ -180,9 +180,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
                            });
         }
     }
-    std::cout << "heads - verified.heads = " << i1 << std::endl;
 
-    std::cout << "bads = " << bads.size() << std::endl;
     for (auto bad : bads)
     {
         if (verified.items.count(bad) != 0)
@@ -191,7 +189,6 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
         auto bad_share = items[bad];
         bad_peer_addresses.insert(bad_share->peer_addr);
 
-        LOG_DEBUG << "BAD!";
         try
         {
             remove(bad);
@@ -245,7 +242,6 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
         }
     }
 
-    // TODO: test for compare with p2pool
     std::vector<std::tuple<std::tuple<int32_t, arith_uint288>, arith_uint256>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
@@ -261,7 +257,7 @@ TrackerThinkResult ShareTracker::think(boost::function<int32_t(uint256)> block_r
     std::sort(decorated_tails.begin(), decorated_tails.end());
     auto [best_tail_score, _best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, UintToArith288(uint288())), UintToArith256(uint256::ZERO)) : decorated_tails.back();
     auto best_tail = ArithToUint256(_best_tail);
-    if (true /*c2pool.DEBUG*/)
+    if (true /*TODO: c2pool.DEBUG*/)
     {
         LOG_DEBUG << decorated_tails.size() << " tails";
         for (auto [score, tail_hash] : decorated_tails)
@@ -343,15 +339,10 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 {
 	assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
     auto near = get(previous_share_hash);
-    LOG_TRACE << "near work = " << coind::data::target_to_average_attempts(near->target).GetHex();
     auto far = get(SharePrefsum2::get_nth_parent_key(previous_share_hash,dist - 1));
-    LOG_TRACE << "near = " << near->hash << ", far = " << far->hash;
 	auto attempts_delta = SharePrefsum2::get_sum(near->hash, far->hash);
-    LOG_TRACE << "attempts_delta.min_work = " << attempts_delta.min_work.GetHex() << ", attempts_delta.work = " << attempts_delta.work.GetHex();
 
 	auto time = *near->timestamp - *far->timestamp;
-    LOG_TRACE << "near->timestamp = " << *near->timestamp << ", far->timestamp = " << *far->timestamp;
-    LOG_TRACE << "time = " << time;
 	if (time <= 0)
 	{
 		time = 1;
@@ -365,9 +356,7 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 	{
 		res = attempts_delta.work;
 	}
-    LOG_TRACE << "res = " << res.GetHex();
 	res /= time;
-    LOG_TRACE << "res /= time " << res.GetHex();
     return res;
 }
 

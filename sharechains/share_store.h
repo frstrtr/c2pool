@@ -100,7 +100,7 @@ public:
 
                         auto share = load_share(stream, net, {{}, {}});
                         share->time_seen = 0;
-                        std::cout << "share_hash: " << share->hash << std::endl;
+//                        std::cout << "share_hash: " << share->hash << std::endl;
                         _shares.push_back(std::move(share));
                         break;
                     }
