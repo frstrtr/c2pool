@@ -289,7 +289,7 @@ uint32_t arith_uint288::GetCompact(bool fNegative) const
 uint256 ArithToUint256(const arith_uint256 &a)
 {
     uint256 b;
-    for(int x=0; x<a.WIDTH; ++x)
+    for(int x=0; x<uint256::WIDTH / 4; ++x)
         WriteLE32(b.begin() + x*4, a.pn[x]);
     return b;
 }
