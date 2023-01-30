@@ -40,8 +40,6 @@ namespace c2pool::console
     };
 } // namespace c2pool::console
 
-std::ostream &operator<<(std::ostream &stream, std::vector<unsigned char> &data);
-
 template<typename T>
 std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
 {
@@ -49,6 +47,18 @@ std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
     for (auto v : data)
     {
         stream << v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <>
+inline std::ostream &operator<<<unsigned char>(std::ostream &stream, std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << " ";
     }
     stream << "\b ]";
     return stream;

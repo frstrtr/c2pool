@@ -417,10 +417,11 @@ namespace shares
 
         //		dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
         std::vector<std::vector<unsigned char>> dests;
+        dests.reserve(amounts.size());
+
         for (auto v: amounts)
             dests.push_back(v.first);
 
-        //TODO: check this
         std::sort(dests.begin(), dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
         {
             if (a == net->DONATION_SCRIPT)
@@ -432,7 +433,7 @@ namespace shares
 
         //TX_IN
         vector<coind::data::TxInType> tx_ins;
-        tx_ins.emplace_back(coind::data::PreviousOutput(uint256::ZERO, 0), _share_data.coinbase, 0); // TODO: check + debug
+        tx_ins.emplace_back(coind::data::PreviousOutput(uint256::ZERO, 0), _share_data.coinbase, 0);
 
         //TX_OUT
         vector<coind::data::TxOutType> tx_outs;
