@@ -405,7 +405,7 @@ namespace coind::data
     uint256 merkle_hash(std::vector<uint256> hashes)
     {
         if (hashes.empty())
-            return uint256();
+            return {};
 
         while(hashes.size() > 1)
         {

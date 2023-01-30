@@ -202,7 +202,7 @@ class BaseShare(object):
         
         dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
         print('amounts: {0}'.format(amounts))
-        print('dest: {0}'.format([[ord(_x) for _x in x] for x in amounts]))
+        print('dest: {0}'.format([[ord(_x) for _x in x] for x in dests]))
         segwit_activated = is_segwit_activated(cls.VERSION, net)
         if segwit_data is None and known_txs is None:
             segwit_activated = False
