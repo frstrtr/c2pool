@@ -11,6 +11,7 @@ void CoindNode::start()
 	connect(std::make_tuple(parent_net->P2P_ADDRESS, std::to_string(parent_net->P2P_PORT)));
 	//COIND:
 	coind_work = Variable<coind::getwork_result>(coind->getwork(txidcache));
+    get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work.pvalue()](){return _coind_work->previous_block; });
 	new_block.subscribe([&](uint256 _value)
 						{
 							//TODO: check!

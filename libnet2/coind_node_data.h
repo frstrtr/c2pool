@@ -40,9 +40,9 @@ public:
 
 	Variable<coind::getwork_result> coind_work;
 	Variable<coind::data::BlockHeaderType> best_block_header;
-	coind::HeightTracker get_height_rel_highest;
+	coind::HeightTracker get_height_rel_highest; // wanna for init get_block_height func!
 public:
-	CoindNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context)), get_height_rel_highest(coind, [&](){return coind_work.value().previous_block; })
+	CoindNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context)), get_height_rel_highest(coind)
 	{
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
 
