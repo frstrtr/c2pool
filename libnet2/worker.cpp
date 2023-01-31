@@ -303,7 +303,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         uint256 _tx_hash;
         int32_t _fee;
 
-        BOOST_FOREACH(boost::tie(_tx_hash, _fee), boost::combine(tx_hashes, current_work.value().transaction_fees))
+        BOOST_FOREACH(boost::tie(_tx_hash, _fee), boost::combine(tx_hashes, current_work.pvalue()->transaction_fees))
                     {
                         desired_other_transaction_hashes_and_fees.emplace_back(_tx_hash, std::make_optional(_fee));
                     }

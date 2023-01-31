@@ -2,8 +2,9 @@
 
 #include <cstdio>
 #include <cinttypes>
+#include <functional>
 
-#include <boost/function.hpp>
+#include <utility>
 #include <btclibs/uint256.h>
 
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
@@ -17,15 +18,20 @@ namespace coind
     {
     protected:
         std::shared_ptr<JSONRPC_Coind> _jsonrpc_coind;
-        boost::function<uint256()> get_best_block_func;
+        std::function<uint256()> get_best_block_func;
         std::map<uint256, int32_t> cached_heights;
 
-        int32_t best_height_cached;
+        int32_t best_height_cached{};
 
     public:
-        HeightTrackerBase(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind, boost::function<uint256()> _get_best_block_func) : _jsonrpc_coind(jsonrpc_coind), get_best_block_func(_get_best_block_func)
+        HeightTrackerBase(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind) : _jsonrpc_coind(std::move(jsonrpc_coind))
         {
 
+        }
+
+        void set_get_best_block_func(std::function<uint256()> _get_best_block_func)
+        {
+            get_best_block_func = std::move(_get_best_block_func);
         }
 
         virtual int64_t get_height(uint256 block_hash) = 0;
@@ -36,7 +42,7 @@ namespace coind
     {
 
     public:
-        HeightTracker(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind, boost::function<uint256()> _get_best_block_func) : HeightTrackerBase(jsonrpc_coind, _get_best_block_func)
+        HeightTracker(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind) : HeightTrackerBase(std::move(jsonrpc_coind))
         {
 
         }

@@ -225,47 +225,5 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 
 
 	getwork_result result(work, unpacked_transactions, txhashes, end - start);
-
-    LOG_TRACE << "jsonrpc::getwork result:";
-    LOG_TRACE << "time: " << result.time;
-    LOG_TRACE << "bits: " << result.bits.get();
-    LOG_TRACE << "height: " << result.height;
-    LOG_TRACE << "version: " << result.version;
-    LOG_TRACE << "transactions.size: " << result.transactions.size();
-    LOG_TRACE << "subsidy: " << result.subsidy;
-
-    std::stringstream _coinbaseflags;
-    for (auto v : result.coinbaseflags.data)
-    {
-        _coinbaseflags << (unsigned int) v << " ";
-    }
-    LOG_TRACE << "coinbaseflags: " << _coinbaseflags.str();
-
-    LOG_TRACE << "latency: " << result.latency;
-    LOG_TRACE << "last_update: " << result.last_update;
-
-    std::stringstream _rules;
-    for (auto v : result.rules)
-    {
-        _rules << v << " ";
-    }
-    LOG_TRACE << "rules: " << _rules.str();
-
-    std::stringstream _transaction_hashes;
-    for (auto v : result.transaction_hashes)
-    {
-        _transaction_hashes << v.GetHex() << " ";
-    }
-    LOG_TRACE << "transaction_hashes: " << _transaction_hashes.str();
-
-    LOG_TRACE << "previous_block: " << result.previous_block.GetHex();
-
-    std::stringstream _transaction_fees;
-    for (auto v : result.transaction_fees)
-    {
-        _transaction_fees << v.value() << " ";
-    }
-    LOG_TRACE << "transaction_fees: " << _transaction_fees.str();
-
     return result;
 }

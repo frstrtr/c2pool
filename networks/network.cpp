@@ -34,7 +34,7 @@ namespace c2pool
         SOFTFORKS_REQUIRED = std::set<std::string>(_softforks.begin(), _softforks.end());
 
         auto _bootstrap_addrs = c2pool::dev::string_to_vector<std::string>(pt.get<std::string>("BOOTSTRAP_ADDRS"));
-        std::transform(_bootstrap_addrs.begin(), _bootstrap_addrs.end(), BOOTSTRAP_ADDRS.end(), [](std::string s){
+        std::transform(_bootstrap_addrs.begin(), _bootstrap_addrs.end(), std::back_inserter(BOOTSTRAP_ADDRS), [](std::string s){
             std::vector<std::string> _addr;
             boost::split(_addr, s, boost::is_any_of(":"));
 
