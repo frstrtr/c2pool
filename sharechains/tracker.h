@@ -71,12 +71,12 @@ public:
 
 	bool attempt_verify(ShareType share);
 
-	TrackerThinkResult think(boost::function<int32_t(uint256)> block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs);
+	TrackerThinkResult think(const std::function<int32_t(uint256)>& block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs);
 
 	arith_uint288 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
     // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
-	std::tuple<int32_t, arith_uint288> score(uint256 share_hash, boost::function<int32_t(uint256)> block_rel_height_func)
+	std::tuple<int32_t, arith_uint288> score(uint256 share_hash, const std::function<int32_t(uint256)> &block_rel_height_func)
 	{
         std::cout << "===SCORE BEGIN===" << std::endl;
 		arith_uint288 score_res;
