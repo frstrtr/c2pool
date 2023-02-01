@@ -125,8 +125,6 @@ int main(int ac, char *av[])
     auto DGB = c2pool::master::Make_DGB(coind_threads, vm);
     //############################################################
 
-    
-
     //Init exit handler
     ExitSignalHandler exitSignalHandler;
     signal(SIGINT, &ExitSignalHandler::handler);

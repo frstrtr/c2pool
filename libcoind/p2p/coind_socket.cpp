@@ -17,7 +17,7 @@ void CoindSocket::write_prefix(std::shared_ptr<Message> msg)
 	boost::asio::async_write(*socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
 							 [this, msg](boost::system::error_code _ec, std::size_t length)
 							 {
-								 LOG_DEBUG << "Write prefix called";
+								 LOG_DEBUG << "CoindSocket: Write prefix called";
 								 if (_ec)
 								 {
 									 LOG_ERROR << "CoindSocket::write()" << _ec << ":" << _ec.message();
@@ -42,7 +42,7 @@ void CoindSocket::write_message_data(std::shared_ptr<Message> msg)
 	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
 							 [&](boost::system::error_code _ec, std::size_t length)
 							 {
-								 LOG_DEBUG << "Write msg data called";
+								 LOG_DEBUG << "CoindSocket: Write msg data called";
 								 if (_ec)
 								 {
 									 LOG_ERROR << "CoinSocket::write()" << _ec << ":" << _ec.message();
