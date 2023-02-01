@@ -581,11 +581,10 @@ namespace shares
     {
         LOG_TRACE << "get_share_func called";
 
-        return [=](coind::data::types::BlockHeaderType header, uint64_t last_txout_nonce)
+        return [=, _net = net](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
 
-            ShareType share;
             std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
 
             shared_ptr<::HashLinkType> pref_to_hash_link;
@@ -596,9 +595,9 @@ namespace shares
                 txid_packed << txid;
 
                 std::vector<unsigned char> prefix;
-                prefix.insert(prefix.begin(), prefix.end()-32-8-4, prefix.end());
+                prefix.insert(prefix.begin(), txid_packed.begin(), txid_packed.end()-32-8-4);
 
-                pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
+                pref_to_hash_link = prefix_to_hash_link(prefix, _net->gentx_before_refhash);
             }
 
             auto tx_hashes = other_transaction_hashes;
@@ -614,9 +613,7 @@ namespace shares
                     ->hash_link(*pref_to_hash_link->get())
                     ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
 
-
-
-            share = builder->GetShare();
+            ShareType share = builder->GetShare();
             //TODO: assert(share->header == header);
             return share;
         };

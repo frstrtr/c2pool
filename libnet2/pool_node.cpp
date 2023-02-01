@@ -506,13 +506,6 @@ void PoolNode::handle_message_bestblock(std::shared_ptr<pool::messages::message_
 
 void PoolNode::handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
-    }
-
 	auto tx_hashes = msg->tx_hashes.get();
     protocol->remote_tx_hashes.insert(tx_hashes.begin(), tx_hashes.end());
     if (protocol->remote_tx_hashes.size() > 10000)
@@ -520,24 +513,10 @@ void PoolNode::handle_message_have_tx(std::shared_ptr<pool::messages::message_ha
         protocol->remote_tx_hashes.erase(protocol->remote_tx_hashes.begin(),
                                std::next(protocol->remote_tx_hashes.begin(), protocol->remote_tx_hashes.size() - 10000));
     }
-
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
-    }
 }
 
 void PoolNode::handle_message_losing_tx(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
-    }
-
     //remove all msg->txs hashes from remote_tx_hashes
     std::set<uint256> losing_txs;
 	auto tx_hashes = msg->tx_hashes.get();
@@ -549,13 +528,6 @@ void PoolNode::handle_message_losing_tx(std::shared_ptr<pool::messages::message_
                         std::inserter(diff_txs, diff_txs.begin()));
 
     protocol->remote_tx_hashes = diff_txs;
-
-    LOG_INFO << "PROTOCOL: " << protocol.get();
-    for (auto v : protocol->remembered_txs)
-    {
-        if (!v.second.tx)
-            assert(false);
-    }
 }
 
 void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol)
@@ -637,14 +609,6 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 
 void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-//    LOG_INFO << "PROTOCOL: " << protocol.get();
-//    for (auto v : protocol->remembered_txs)
-//    {
-//        LOG_INFO << "\n" <<  v.first.GetHex() << "\n";
-//        if (!v.second.tx)
-//            assert(false);
-//    }
-
     for (auto tx_hash : msg->tx_hashes.get())
     {
         PackStream stream;
@@ -703,7 +667,6 @@ void PoolNode::start()
 
 void PoolNode::download_shares()
 {
-    std::cout << "===============================" <<  this << " " << (this == nullptr) << " " << this->nonce << std::endl;
     _download_shares_fiber = c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
     {
         auto _node = shared_from_this();
@@ -712,10 +675,10 @@ void PoolNode::download_shares()
         {
             std::cout << _node << " " << (_node == nullptr) << " " << _node->nonce << std::endl;
             auto desired = _node->coind_node->desired.get_when_satisfies([&](const auto &desired)
-                                                                  {
-                std::cout << "SATISFIES!" << std::endl;
-                                                                      return desired.size() != 0;
-                                                                  })->yield(fiber);
+                                                                         {
+                                                                             LOG_TRACE << "SATISFIES!";
+                                                                             return desired.size() != 0;
+                                                                         })->yield(fiber);
             auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
             std::cout << _node << " " << (_node == nullptr) << " " << _node->nonce << std::endl;
 
