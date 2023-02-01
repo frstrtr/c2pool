@@ -24,9 +24,11 @@ namespace coind
         int32_t best_height_cached{};
 
     public:
-        HeightTrackerBase(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind) : _jsonrpc_coind(std::move(jsonrpc_coind))
-        {
+        HeightTrackerBase() { }
 
+        void set_jsonrpc_coind(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind)
+        {
+            _jsonrpc_coind = std::move(jsonrpc_coind);
         }
 
         void set_get_best_block_func(std::function<uint256()> _get_best_block_func)
@@ -40,12 +42,8 @@ namespace coind
 
     class HeightTracker : public HeightTrackerBase
     {
-
     public:
-        HeightTracker(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind) : HeightTrackerBase(std::move(jsonrpc_coind))
-        {
-
-        }
+        HeightTracker() : HeightTrackerBase() { }
 
         int64_t get_height(uint256 block_hash) override
         {
