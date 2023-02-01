@@ -23,7 +23,7 @@ using std::vector;
 
 Work Work::from_jsonrpc_data(const coind::getwork_result& data)
 {
-    static Work result{};
+    Work result{};
 
     result.version = data.version;
     result.previous_block = data.previous_block;
@@ -873,6 +873,7 @@ user_details Worker::preprocess_request(std::string username)
 
 void Worker::compute_work()
 {
+    LOG_TRACE << "1txs = " << _coind_node->coind_work.value().transactions.size() << ", 2txs = " << _coind_node->coind_work.value().transaction_fees.size();
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
     LOG_TRACE << "compute_work t: " << t;
     if (!_coind_node->best_block_header.isNull())
@@ -898,12 +899,13 @@ void Worker::compute_work()
                     (int32_t) std::max((uint32_t) c2pool::dev::timestamp(), bb->timestamp + 1),
                     {},
                     {},
-                    coind::data::calculate_merkle_link({}, 0),
+                    coind::data::calculate_merkle_link({uint256::ZERO}, 0),
                     _net->parent->SUBSIDY_FUNC(_coind_node->coind_work.value().height),
                     (int32_t) _coind_node->coind_work.value().last_update
             };
 //                t = coind::getwork_result()
         }
     }
+    LOG_TRACE << "1T = " << t.transactions.size() << ", 2T = " << t.transaction_fees.size();
     current_work.set(t);
 }
