@@ -11,7 +11,7 @@ void PoolSocket::write_prefix(std::shared_ptr<Message> msg)
 	boost::asio::async_write(*socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
 							 [this, msg](boost::system::error_code _ec, std::size_t length)
 							 {
-								 LOG_DEBUG << "Write prefix called";
+								 LOG_DEBUG << "PoolSocket: Write prefix called";
 								 if (_ec)
 								 {
 									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
@@ -36,7 +36,7 @@ void PoolSocket::write_message_data(std::shared_ptr<Message> msg)
 	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
 							 [&](boost::system::error_code _ec, std::size_t length)
 							 {
-								 LOG_DEBUG << "Write msg data called";
+								 LOG_DEBUG << "PoolSocket: Write msg data called";
 								 if (_ec)
 								 {
 									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();

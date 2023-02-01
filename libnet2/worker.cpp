@@ -873,9 +873,7 @@ user_details Worker::preprocess_request(std::string username)
 
 void Worker::compute_work()
 {
-    LOG_TRACE << "1txs = " << _coind_node->coind_work.value().transactions.size() << ", 2txs = " << _coind_node->coind_work.value().transaction_fees.size();
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
-    LOG_TRACE << "compute_work t: " << t;
     if (!_coind_node->best_block_header.isNull())
     {
         // TODO: test
@@ -906,6 +904,5 @@ void Worker::compute_work()
 //                t = coind::getwork_result()
         }
     }
-    LOG_TRACE << "1T = " << t.transactions.size() << ", 2T = " << t.transaction_fees.size();
     current_work.set(t);
 }
