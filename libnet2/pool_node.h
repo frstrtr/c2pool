@@ -36,6 +36,7 @@ public:
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
 		auto _socket = socket;
+        socket->set_addr();
 		server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket),
                                                                         message_version_handle,
                                                                         std::bind(&PoolNodeServer::handshake_handle, this, std::placeholders::_1));
@@ -74,6 +75,7 @@ public:
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
+        socket->set_addr();
 		auto addr = socket->get_addr();
         client_attempts[std::get<0>(addr)] =
 				std::make_shared<PoolHandshakeClient>(std::move(socket),
