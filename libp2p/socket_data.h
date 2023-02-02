@@ -54,7 +54,7 @@ struct WriteSocketData
     {
         if (data != nullptr)
         {
-            delete data;
+            delete []data;
         }
     }
 

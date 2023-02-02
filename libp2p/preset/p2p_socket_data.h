@@ -3,36 +3,45 @@
 #include <libcoind/data.h>
 #include <libp2p/socket_data.h>
 
+#include <utility>
+
 struct P2PWriteSocketData : public WriteSocketData
 {
+    std::vector<unsigned char> prefix;
+
     P2PWriteSocketData() : WriteSocketData() { }
     P2PWriteSocketData(char *_data, int32_t _len) : WriteSocketData(_data, _len) { }
 
-    P2PWriteSocketData(std::shared_ptr<Message> msg) : WriteSocketData()
+    P2PWriteSocketData(std::shared_ptr<Message> msg, const unsigned char *pref, int len) : WriteSocketData()
     {
-        from_message(msg);
+        prefix = std::vector<unsigned char>(pref, pref+len);
+        from_message(std::move(msg));
     }
 
     void from_message(std::shared_ptr<Message> msg) override
     {
         PackStream value;
 
-//command [+]
+        // prefix [+]
+        PackStream prefix_stream(prefix);
+        value << prefix_stream;
+
+        //command [+]
         auto command = new char[12]{'\0'};
         memcpy(command, msg->command.c_str(), msg->command.size());
         PackStream s_command(command, 12);
         value << s_command;
         delete[] command;
 
-//-----
+        //-----
         PackStream payload_stream;
         payload_stream << *msg;
 
-//len [+]
+        //len [+]
         IntType(32) unpacked_len(payload_stream.size());
         value << unpacked_len;
 
-//checksum [+]
+        //checksum [+]
         PackStream payload_checksum_stream;
         payload_checksum_stream << *msg;
 
@@ -46,10 +55,10 @@ struct P2PWriteSocketData : public WriteSocketData
         PackStream checksum(packed_checksum);
         value << checksum;
 
-//payload [+]
+        //payload [+]
         value << payload_stream;
 
-//result
+        //result
         data = new char[value.size()];
         memcpy(data, value.bytes(), value.size());
         len = value.size();

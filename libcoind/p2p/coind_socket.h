@@ -27,14 +27,32 @@ public:
 
 	}
 
-	// Write
-	void write_prefix(std::shared_ptr<Message> msg);
-	void write_message_data(std::shared_ptr<Message> msg);
+//	// Write
+//	void write_prefix(std::shared_ptr<Message> msg);
+//	void write_message_data(std::shared_ptr<Message> msg);
 
 	void write(std::shared_ptr<Message> msg) override
 	{
         LOG_TRACE << "Coind socket write msg: " << msg->command;
-		write_prefix(msg);
+//		write_prefix(msg);
+        std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
+
+        std::cout << "write_message_data: ";
+        for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
+        {
+            std::cout << (unsigned int)((unsigned char) *v) << " ";
+        }
+        std::cout << std::endl;
+
+        boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
+                                 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
+                                 {
+                                     LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
+                                     if (_ec)
+                                     {
+                                         LOG_ERROR << "PoolSocket::write(): " << _ec << ":" << _ec.message();
+                                     }
+                                 });
 	}
 
 	// Read

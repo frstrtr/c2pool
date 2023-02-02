@@ -15,66 +15,50 @@ class PoolSocket : public Socket
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 
-    std::queue<std::shared_ptr<Message>> messages_pool;
-    std::shared_ptr<boost::asio::steady_timer> pool_timer;
-
 	std::shared_ptr<c2pool::Network> net;
 public:
 
 	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
 		LOG_TRACE << "socket created";
-        pool_timer = std::make_shared<boost::asio::steady_timer>(socket->get_executor());
-        pool_message_cycle();
 	}
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
 		LOG_TRACE << "socket created";
-        pool_timer = std::make_shared<boost::asio::steady_timer>(socket->get_executor());
-        pool_message_cycle();
 	}
 
 	~PoolSocket(){
 		LOG_TRACE << "socket removed";
 	}
 
-    void pool_message_cycle()
-    {
-        pool_timer->expires_from_now(std::chrono::milliseconds(100));
-        pool_timer->async_wait([&](const auto &ec)
-                               {
-                                   if (!ec)
-                                   {
-                                       if (!messages_pool.empty())
-                                       {
-                                           write_prefix(messages_pool.front());
-                                           messages_pool.pop();
-                                       }
-                                       pool_message_cycle();
-                                   } else
-                                   {
-                                       LOG_WARNING << "pool_message_cycle error!";
-                                   }
-                               });
-    }
-
 	// Write
-	void write_prefix(std::shared_ptr<Message> msg);
-	void write_message_data(std::shared_ptr<Message> msg);
+//	void write_prefix(std::shared_ptr<Message> msg);
+//	void write_message_data(std::shared_ptr<Message> msg);
 
 	void write(std::shared_ptr<Message> msg) override
 	{
         LOG_DEBUG << "Pool Socket write for " << msg->command << "!";
-
-        messages_pool.push(std::move(msg));
-//        pool_timer->expires_from_now(std::chrono::milliseconds(100));
-//        pool_timer->async_wait([&, _msg = msg](const auto& ec){
-//            LOG_INFO << "Writed!!!";
-//            write_prefix(_msg);
-//        });
-
 //        write_prefix(msg);
+
+        std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
+
+        std::cout << "write_message_data: ";
+        for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
+        {
+            std::cout << (unsigned int)((unsigned char) *v) << " ";
+        }
+        std::cout << std::endl;
+
+        boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
+                                 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
+                                 {
+                                     LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
+                                     if (_ec)
+                                     {
+                                         LOG_ERROR << "PoolSocket::write(): " << _ec << ":" << _ec.message();
+                                     }
+                                 });
 	}
 
 	// Read

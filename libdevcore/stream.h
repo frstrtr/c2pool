@@ -201,6 +201,11 @@ struct PackStream
         data = vector<unsigned char>(value, value + len);
     }
 
+    PackStream(const unsigned char *value, int32_t len)
+    {
+        data = vector<unsigned char>(value, value + len);
+    }
+
     PackStream(char *value, int32_t len)
     {
         auto temp = (unsigned char *)value;
