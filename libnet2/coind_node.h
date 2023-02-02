@@ -35,6 +35,7 @@ public:
 protected:
     void socket_handle(std::shared_ptr<Socket> socket)
     {
+        socket->set_addr();
 		auto addr = socket->get_addr();
 
 		protocol = std::make_shared<CoindProtocol>(context, socket, handler_manager);

@@ -13,18 +13,23 @@ class CoindSocket : public Socket
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
-
 	std::shared_ptr<coind::ParentNetwork> net;
+
+    void set_addr() override
+    {
+        boost::system::error_code ec;
+        auto ep = socket->remote_endpoint(ec);
+        // TODO: log ec;
+        addr = {ep.address().to_string(), std::to_string(ep.port())};
+    }
 public:
 
     CoindSocket(auto _socket, auto _net) : Socket(), socket(std::move(_socket)), net(std::move(_net))
 	{
-
 	}
 
     CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
-
 	}
 
 //	// Write
@@ -47,10 +52,10 @@ public:
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
                                  [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
                                  {
-                                     LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
+                                     LOG_DEBUG << "CoindSocket: Write msg data called: " << cmd;
                                      if (_ec)
                                      {
-                                         LOG_ERROR << "PoolSocket::write(): " << _ec << ":" << _ec.message();
+                                         LOG_ERROR << "CoindSocket::write(): " << _ec << ":" << _ec.message();
                                      }
                                  });
 	}
@@ -76,18 +81,9 @@ public:
 
 	void disconnect() override
 	{
-        auto [addr, port] = get_addr();
-        LOG_INFO << "Coind socket disconnected from " << addr << ":" << port;
+        auto [_addr, _port] = get_addr();
+        LOG_INFO << "Coind socket disconnected from " << _addr << ":" << _port;
 		// TODO: call event disconnect
 		socket->close();
 	}
-
-	tuple<std::string, std::string> get_addr() override
-	{
-		boost::system::error_code ec;
-		auto ep = socket->remote_endpoint(ec);
-		// TODO: log ec;
-		return {ep.address().to_string(), std::to_string(ep.port())};
-	}
-
 };
