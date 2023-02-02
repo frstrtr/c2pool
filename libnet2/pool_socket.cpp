@@ -34,9 +34,9 @@ void PoolSocket::write_message_data(std::shared_ptr<Message> msg)
     std::cout << std::endl;
 
 	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-							 [&](boost::system::error_code _ec, std::size_t length)
+							 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
 							 {
-								 LOG_DEBUG << "PoolSocket: Write msg data called";
+								 LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
 								 if (_ec)
 								 {
 									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();

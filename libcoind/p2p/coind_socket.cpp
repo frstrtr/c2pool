@@ -40,9 +40,9 @@ void CoindSocket::write_message_data(std::shared_ptr<Message> msg)
     std::cout << std::endl;
 //    socket->async_send(boost::asio::buffer(_msg->data, _msg->len),
 	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-							 [&](boost::system::error_code _ec, std::size_t length)
+							 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
 							 {
-								 LOG_DEBUG << "CoindSocket: Write msg data called";
+								 LOG_DEBUG << "CoindSocket: Write msg data called: " << cmd;
 								 if (_ec)
 								 {
 									 LOG_ERROR << "CoinSocket::write()" << _ec << ":" << _ec.message();
