@@ -6,43 +6,43 @@
 #include <boost/asio.hpp>
 
 // Write
-void PoolSocket::write_prefix(std::shared_ptr<Message> msg)
-{
-	boost::asio::async_write(*socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
-							 [this, msg](boost::system::error_code _ec, std::size_t length)
-							 {
-								 LOG_DEBUG << "PoolSocket: Write prefix called";
-								 if (_ec)
-								 {
-									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
-									 return;
-								 }
-								 write_message_data(msg);
-							 });
-}
-
-void PoolSocket::write_message_data(std::shared_ptr<Message> msg)
-{
-	std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>();
-	_msg->from_message(msg);
-
-    std::cout << "write_message_data: ";
-    for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
-    {
-        std::cout << (unsigned int)((unsigned char) *v) << " ";
-    }
-    std::cout << std::endl;
-
-	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-							 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
-							 {
-								 LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
-								 if (_ec)
-								 {
-									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
-								 }
-							 });
-}
+//void PoolSocket::write_prefix(std::shared_ptr<Message> msg)
+//{
+//	boost::asio::async_write(*socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
+//							 [this, msg](boost::system::error_code _ec, std::size_t length)
+//							 {
+//								 LOG_DEBUG << "PoolSocket: Write prefix called";
+//								 if (_ec)
+//								 {
+//									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
+//									 return;
+//								 }
+//								 write_message_data(msg);
+//							 });
+//}
+//
+//void PoolSocket::write_message_data(std::shared_ptr<Message> msg)
+//{
+//	std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>();
+//	_msg->from_message(msg);
+//
+//    std::cout << "write_message_data: ";
+//    for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
+//    {
+//        std::cout << (unsigned int)((unsigned char) *v) << " ";
+//    }
+//    std::cout << std::endl;
+//
+//	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
+//							 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
+//							 {
+//								 LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
+//								 if (_ec)
+//								 {
+//									 LOG_ERROR << "PoolSocket::write()" << _ec << ":" << _ec.message();
+//								 }
+//							 });
+//}
 
 // Read
 void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
