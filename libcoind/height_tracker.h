@@ -25,6 +25,7 @@ namespace coind
 
     public:
         HeightTrackerBase() { }
+        HeightTrackerBase(const HeightTrackerBase& copy) = delete;
 
         void set_jsonrpc_coind(std::shared_ptr<JSONRPC_Coind> jsonrpc_coind)
         {
@@ -36,6 +37,11 @@ namespace coind
             get_best_block_func = std::move(_get_best_block_func);
         }
 
+        std::function<int32_t(uint256)> ref_func()
+        {
+            return [&](const uint256 &block_hash) { return this->operator()(block_hash); };
+        }
+
         virtual int64_t get_height(uint256 block_hash) = 0;
         virtual int32_t operator ()(uint256 block_hash) = 0;
     };
@@ -44,15 +50,17 @@ namespace coind
     {
     public:
         HeightTracker() : HeightTrackerBase() { }
+        HeightTracker(const HeightTracker& copy) = delete;
 
         int64_t get_height(uint256 block_hash) override
         {
             if (cached_heights.find(block_hash) != cached_heights.end())
                 return cached_heights[block_hash];
-
+            LOG_TRACE << "GET_HEIGHT CALLED";
             UniValue x;
             try
             {
+                LOG_TRACE << "from get_height, block_hash = " << block_hash.GetHex();
                 x = _jsonrpc_coind->getblock(std::make_shared<GetBlockRequest>(get_best_block_func()));
             } catch (const std::exception &except)
             {

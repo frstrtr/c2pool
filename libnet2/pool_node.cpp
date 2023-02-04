@@ -288,6 +288,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 }
             }
             auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
+            LOG_DEBUG << "update_remote_view_of_my_mining_txs REMEMBER TX!";
             socket->write(msg_remember_tx);
         }
     });
@@ -313,6 +314,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
         _txs.push_back(x.second);
     }
     auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
+    LOG_DEBUG << "handle message version REMEMBER TX!";
     handshake->get_socket()->write(msg_remember_tx);
 }
 
