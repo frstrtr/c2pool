@@ -20,7 +20,7 @@ void CoindNodeData::handle_header(coind::data::BlockHeaderType new_header)
 
 void CoindNodeData::set_best_share()
 {
-	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
+	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
 	best_share.set(_best);
     LOG_TRACE << "Tracker size:" << tracker->items.size();
@@ -46,7 +46,7 @@ void CoindNodeData::set_best_share()
 void CoindNodeData::clean_tracker()
 {
 	// TODO?: Подумать, нужно ли это или очистка шар будет проходить по нашему алгоритму?
-	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest, coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
+	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
 
 	// if (decorated_heads.size() > 0)
 	// {

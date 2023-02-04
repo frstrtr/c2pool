@@ -261,6 +261,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 		}
 
 		auto msg_remember_tx = std::make_shared<pool::messages::message_remember_tx>(_tx_hashes, _txs);
+        LOG_DEBUG << "SEND SHARES REMEMBER TX!";
 		peer->write(msg_remember_tx);
 	}
 	// 		Send shares

@@ -124,7 +124,7 @@ bool ShareTracker::attempt_verify(ShareType share)
 	return true;
 }
 
-TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)>& block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs)
+TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs)
 {
     std::set<desired_type> desired;
     std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
