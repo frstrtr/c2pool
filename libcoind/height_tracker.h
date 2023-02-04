@@ -42,7 +42,7 @@ namespace coind
             return [&](const uint256 &block_hash) { return this->operator()(block_hash); };
         }
 
-        virtual int64_t get_height(uint256 block_hash) = 0;
+        virtual int32_t get_height(uint256 block_hash) = 0;
         virtual int32_t operator ()(uint256 block_hash) = 0;
     };
 
@@ -52,22 +52,20 @@ namespace coind
         HeightTracker() : HeightTrackerBase() { }
         HeightTracker(const HeightTracker& copy) = delete;
 
-        int64_t get_height(uint256 block_hash) override
+        int32_t get_height(uint256 block_hash) override
         {
             if (cached_heights.find(block_hash) != cached_heights.end())
                 return cached_heights[block_hash];
-            LOG_TRACE << "GET_HEIGHT CALLED";
             UniValue x;
             try
             {
-                LOG_TRACE << "from get_height, block_hash = " << block_hash.GetHex();
-                x = _jsonrpc_coind->getblock(std::make_shared<GetBlockRequest>(get_best_block_func()));
+                x = _jsonrpc_coind->getblock(std::make_shared<GetBlockRequest>(block_hash));
             } catch (const std::exception &except)
             {
                 throw except;
             }
 
-            int32_t result = x.exists("blockcount") ? x["blockcount"].get_int64() : x["height"].get_int64();
+            int32_t result = x.exists("blockcount") ? x["blockcount"].get_int() : x["height"].get_int();
             cached_heights[block_hash] = result;
 
             return result;
