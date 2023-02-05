@@ -7,6 +7,7 @@
 #include <libp2p/socket.h>
 #include <libp2p/message.h>
 #include <networks/network.h>
+#include <libdevcore/logger.h>
 
 #include <boost/asio.hpp>
 
@@ -58,13 +59,25 @@ public:
         }
         std::cout << std::endl;
 
+        LOG_DEBUG << "message length = " << _msg->len;
+        if (_msg->len > 8000000)
+        {
+            LOG_INFO << "message length > max_payload_length!";
+        }
+
+        add_not_received(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
                                  [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
                                  {
-                                     LOG_DEBUG << "PoolSocket: Write msg data called: " << cmd;
+                                     LOG_DEBUG << "[PoolSocket] peer receive message_" << cmd;
                                      if (_ec)
                                      {
-                                         LOG_ERROR << "PoolSocket::write(): " << _ec << ":" << _ec.message();
+                                         LOG_ERROR << "[PoolSocket] write error: " << _ec << ":" << _ec.message();
+                                         disconnect();
+                                     } else
+                                     {
+                                        last_message_sent = cmd;
+                                        remove_not_received(cmd);
                                      }
                                  });
 	}
@@ -92,6 +105,7 @@ public:
 	{
         auto [_addr, _port] = get_addr();
         LOG_INFO << "Pool socket disconnected from " << _addr << ":" << _port;
+        LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
 		// TODO: call event disconnect
 		socket->close();
 	}
