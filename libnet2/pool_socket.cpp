@@ -182,6 +182,9 @@ void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 	shared_ptr<RawMessage> raw_message = std::make_shared<RawMessage>(cmd);
 	stream_RawMsg >> *raw_message;
 
+    // Set last_message_received
+    last_message_received = msg->command;
+
 	//Protocol handle message
 	handler(raw_message);
 }
