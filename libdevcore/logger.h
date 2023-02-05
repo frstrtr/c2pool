@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <memory>
+#include <map>
 using std::shared_ptr;
 
 #include <boost/log/core.hpp>
@@ -59,6 +60,18 @@ inline std::ostream &operator<<<unsigned char>(std::ostream &stream, std::vector
     for (auto v : data)
     {
         stream << (unsigned int) v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <typename T, typename K>
+inline std::ostream &operator<<(std::ostream &stream, std::map<T, K> &data)
+{
+    stream << "[ ";
+    for (auto [k, v] : data)
+    {
+        stream << "(" << k << ": " << v << ");";
     }
     stream << "\b ]";
     return stream;
