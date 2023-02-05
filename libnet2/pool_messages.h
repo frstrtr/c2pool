@@ -34,7 +34,7 @@ namespace pool::messages
         //PoolVersion pool_version;
 
     public:
-        message_version() : Message("sdversionn"), best_share_hash(uint256()) {}
+        message_version() : Message("version"), best_share_hash(uint256()) {}
 
         message_version(int ver, int serv, address_type to, address_type from, unsigned long long _nonce, std::string sub_ver, int _mode, uint256 best_hash) : message_version()
         {
