@@ -189,6 +189,9 @@ void CoindSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 	//RawMessage->name_type = reverse_string_commands(msg->command);
 	stream_RawMsg >> *raw_message;
 
+    // Set last_message_received
+    last_message_received = msg->command;
+
 	//Protocol handle message
 	handler(raw_message);
 }
