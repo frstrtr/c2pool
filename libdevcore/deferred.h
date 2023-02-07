@@ -129,11 +129,24 @@ namespace c2pool::deferred
 
         void await_result(const boost::system::error_code &ec)
         {
+            std::cout << "await_result1" << std::endl;
             if (!ec.failed())
             {
-                if (is_ready(_future))
+                if (is_ready(_future) || !_future.valid())
                 {
-                    auto result = _future.get();
+                    ReturnType result;
+
+                    try
+                    {
+                        std::cout << "await_result2" << std::endl;
+                        result = _future.get();
+                    } catch (const std::runtime_error& ex)
+                    {
+                        std::cout << "await_result catch" << std::endl;
+                        throw ex;
+                        return;
+                    }
+
                     for (auto v: callbacks)
                     {
                         v(result);
@@ -144,11 +157,15 @@ namespace c2pool::deferred
 
                 await_timer.expires_from_now(100ms);
                 await_timer.async_wait(std::bind(&result_reply<ReturnType>::await_result, this, std::placeholders::_1));
+                std::cout << "await_result3" << std::endl;
+            } else {
+                std::cout << "fail: " << ec.message() << std::endl;
             }
         }
 
         void await_timeout(const boost::system::error_code &ec)
         {
+            std::cout << "TIMEOUT!" << std::endl;
             if (!ec)
             {
                 _promise.set_exception(make_exception_ptr(std::runtime_error("ReplyMatcher timeout!")));
@@ -283,107 +300,4 @@ namespace c2pool::deferred
             return def->yield(fiber);
         }
     };
-
-//    template<typename RetType>
-//    class DeferredAlgo
-//    {
-//        std::shared_ptr<io::io_context> context;
-//        io::yield_context yield_context;
-//
-//        std::vector<std::function<void(RetType)>> callbacks;
-//        std::promise<RetType> promise_result;
-//        std::optional<RetType> result;
-//
-//    public:
-//        DeferredAlgo(std::shared_ptr<io::io_context> _context, io::yield_context _yield_context) : context(_context),
-//                                                                                                   yield_context(
-//                                                                                                           std::move(
-//                                                                                                                   _yield_context)) //, result_timer(*context, callback_idle)
-//        {
-//        }
-//
-//    private:
-//        // void callback_timer(const boost::system::error_code &ec)
-//        // {
-//        //     if (!ec)
-//        //     {
-//        //     }
-//        //     else
-//        //     {
-//        //         throw(ec);
-//        //     }
-//        // }
-//
-//    public:
-//        void add_callback(std::function<void(RetType)> __callback)
-//        {
-//            callbacks.push_back(__callback);
-//        }
-//
-//    private:
-//        std::map<unsigned long long, std::shared_ptr<io::steady_timer>> external_timers;
-//    public:
-//        //Таймер, который не блокирует yield_context
-//        void external_timer(std::function<void(const boost::system::error_code &ec)> __handler,
-//                            const std::chrono::_V2::steady_clock::duration &expiry_time)
-//        {
-//            auto __timer = std::make_shared<io::steady_timer>(*context);
-//            unsigned long long _id = c2pool::random::randomNonce();
-//            while (external_timers.count(_id) != 0)
-//            {
-//                _id = c2pool::random::randomNonce();
-//            }
-//            external_timers[_id] = __timer;
-//
-//            __timer->expires_from_now(expiry_time);
-//            __timer->async_wait([&, __handler, _id](const boost::system::error_code &ec)
-//                                {
-//                                    __handler(ec);
-//                                    external_timers.erase(_id);
-//                                });
-//        }
-//
-//        static std::shared_ptr<DeferredAlgo<RetType>>
-//        make_deferred(std::shared_ptr<io::io_context> _context, io::yield_context _yield_context)
-//        {
-//            auto _share = std::make_shared<DeferredAlgo<RetType>>(_context, _yield_context);
-//
-//            return _share;
-//        }
-//
-//        void sleep(const std::chrono::_V2::steady_clock::duration &expiry_time)
-//        {
-//            io::steady_timer timer(*context, expiry_time);
-//            timer.async_wait(yield_context);
-//        }
-//
-//        void returnValue(RetType value)
-//        {
-//            promise_result.set_value(value);
-//            for (auto callback: callbacks)
-//            {
-//                callback(value);
-//            }
-//        }
-//
-//        static std::shared_ptr<DeferredAlgo<RetType>>
-//        yield(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<DeferredAlgo<RetType>>)> __f)
-//        {
-//            std::shared_ptr<DeferredAlgo<RetType>> _share;
-//
-//            io::spawn(*_context, [&](io::yield_context _yield_context)
-//            {
-//                _share = DeferredAlgo<RetType>::make_deferred(_context, _yield_context); // Создаётся объект Deferred
-//
-//                __f(_share); //Вызывается декорируемый метод.
-//            });
-//
-//            return _share;
-//        }
-//    };
-//
-//    template<typename RetType>
-//    using shared_defer_algo = std::shared_ptr<DeferredAlgo<RetType>>;
-
-
 }
