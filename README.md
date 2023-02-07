@@ -16,6 +16,8 @@ p2pool sharechain based temporal levelled blockchain DEX/mining pool/hr marketpl
 ![Time Hybrid Evaluation](/doc/concepts/THE%20coin.png)
 Time Hybrid Evaluation coin (THE coin - (experimental feature)) for node maintainers/owners
 
+"C2Pool is a cryptocurrency mining pool. A mining pool is a group of miners who work together to increase their chances of finding blocks and earning rewards. In a mining pool, miners pool their computing power and split the rewards based on the number of shares they contribute to finding a block. C2Pool specifically supports various cryptocurrencies and provides an easy-to-use platform for miners to join the pool and start mining. The aim of C2Pool is to provide a secure, stable, and efficient mining experience for miners, making it easier for them to earn rewards and benefit from the cryptocurrency market." (C) ChatGPT
+
 <details>
   
   <summary>Donations towards further development of с2pool implementation in C++</summary>
