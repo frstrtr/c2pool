@@ -33,10 +33,10 @@ public:
 	}
 
 protected:
-    void socket_handle(std::shared_ptr<Socket> socket)
+    void socket_handle(const std::shared_ptr<Socket>& socket)
     {
         socket->set_addr();
-		auto addr = socket->get_addr();
+        LOG_DEBUG << "CoindNode has been connected to: " << socket;
 
 		protocol = std::make_shared<CoindProtocol>(context, socket, handler_manager);
     }

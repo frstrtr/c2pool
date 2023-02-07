@@ -15,6 +15,8 @@ protected:
     handler_type handler;
 
     std::tuple<std::string, std::string> addr;
+    std::tuple<std::string, std::string> addr_local;
+
     std::string last_message_sent; // last message sent by me and received by peer.
     std::string last_message_received; // last message sent by peer and received by me.
     std::map<std::string, int32_t> not_received; // messages sent by me and not yet received by peer
@@ -52,5 +54,20 @@ public:
     virtual std::tuple<std::string, std::string> get_addr()
     {
         return addr;
+    }
+
+    virtual std::tuple<std::string, std::string> get_addr_local()
+    {
+        return addr_local;
+    }
+
+    friend std::ostream& operator<<(std::ostream& stream, const std::shared_ptr<Socket>& value)
+    {
+        auto [local_ip, local_port] = value->addr_local;
+        auto [ip, port] = value->addr;
+
+        stream << "(local addr = " << local_ip << ":" << local_port
+        << ", global addr = " << ip << ":" << port << ")";
+        return stream;
     }
 };

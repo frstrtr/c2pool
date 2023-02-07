@@ -83,7 +83,7 @@ json Stratum::mining_subscribe(const json &_params)
 //    });
 
 //    _send_work();
-
+    //TODO: sub id
     res = {{{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"},{}}, "", 8};
     return res;
 }

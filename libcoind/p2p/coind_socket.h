@@ -18,9 +18,16 @@ private:
     void set_addr() override
     {
         boost::system::error_code ec;
+
+        // global
         auto ep = socket->remote_endpoint(ec);
         // TODO: log ec;
         addr = {ep.address().to_string(), std::to_string(ep.port())};
+
+        // local
+        ep = socket->local_endpoint(ec);
+        // TODO: log ec;
+        addr_local = {ep.address().to_string(), std::to_string(ep.port())};
     }
 public:
 
