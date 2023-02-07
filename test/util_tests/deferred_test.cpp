@@ -77,7 +77,7 @@ TEST(Deferred, ReplyMatcher)
 {
     std::shared_ptr<boost::asio::io_context> context = std::make_shared<boost::asio::io_context>();
     ReplyMatcher<int, int, int> reply(context, [&](const int &i){
-        std::cout << "CALLED WITH PARAM: " << i << std::endl;
+        std::cout << "[" << c2pool::dev::timestamp() << "]" << "CALLED WITH PARAM: " << i << std::endl;
     });
 
     boost::asio::steady_timer timer(*context);
@@ -89,7 +89,33 @@ TEST(Deferred, ReplyMatcher)
                      });
 
     reply.yield(1337, [&](int reply_mathcer_result){
-        std::cout << reply_mathcer_result << std::endl;
+        std::cout << "[" << c2pool::dev::timestamp() << "]" << reply_mathcer_result << std::endl;
+    }, 1337);
+
+    context->run();
+}
+
+TEST(Deferred, ReplyMatcherTimeout)
+{
+    std::shared_ptr<boost::asio::io_context> context = std::make_shared<boost::asio::io_context>();
+    ReplyMatcher<int, int, int> reply(context, [&](const int &i){
+        std::cout << "[" << c2pool::dev::timestamp() << "]" << "CALLED WITH PARAM: " << i << std::endl;
+    });
+
+    boost::asio::steady_timer timer(*context);
+    timer.expires_from_now(6s);
+    timer.async_wait([&](const boost::system::error_code &ec)
+                     {
+                         if (!ec)
+                         {
+                             std::cout << "before got_response" << std::endl;
+                             reply.got_response(1337, 7331);
+                             std::cout << "after got_response" << std::endl;
+                         }
+                     });
+
+    reply.yield(1337, [&](int reply_mathcer_result){
+        std::cout << "[" << c2pool::dev::timestamp() << "]" << reply_mathcer_result << std::endl;
     }, 1337);
 
     context->run();
