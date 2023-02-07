@@ -93,10 +93,10 @@ public:
 								   boost::asio::async_connect(*_socket, endpoints,
 															  [sock = std::move(socket), handler = _handler](
 																	  const boost::system::error_code &ec,
-																	  boost::asio::ip::tcp::endpoint ep)
+																	  const boost::asio::ip::tcp::endpoint& ep)
 															  {
-																  LOG_INFO << "Connect to " << ep.address() << ":"
-																		   << ep.port();
+                                                                  LOG_INFO << "Socket try handshake with " << ep.address() << ":"
+                                                                           << ep.port();
 																  if (!ec)
 																  {
 																	  handler(sock);
@@ -148,8 +148,8 @@ public:
 																	  const boost::system::error_code &ec,
 																	  boost::asio::ip::tcp::endpoint ep)
 															  {
-																  LOG_INFO << "Connect to " << ep.address() << ":"
-																		   << ep.port();
+                                                                  LOG_INFO << "Socket try handshake with " << ep.address() << ":"
+                                                                           << ep.port();
 																  if (!ec)
 																  {
 																	  handler(sock);
