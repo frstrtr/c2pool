@@ -129,7 +129,7 @@ namespace c2pool::deferred
 
         void await_result(const boost::system::error_code &ec)
         {
-            std::cout << "await_result1" << std::endl;
+            std::cout << "await_result1: " << is_ready(_future) << " " << !_future.valid() << std::endl;
             if (!ec.failed())
             {
                 if (is_ready(_future) || !_future.valid())
@@ -144,7 +144,6 @@ namespace c2pool::deferred
                     {
                         std::cout << "await_result catch" << std::endl;
                         throw ex;
-                        return;
                     }
 
                     for (auto v: callbacks)
@@ -160,6 +159,15 @@ namespace c2pool::deferred
                 std::cout << "await_result3" << std::endl;
             } else {
                 std::cout << "fail: " << ec.message() << std::endl;
+                try
+                {
+                    std::cout << "await_result2" << std::endl;
+                    auto result = _future.get();
+                } catch (const std::runtime_error& ex)
+                {
+                    std::cout << "await_result catch" << std::endl;
+                    throw ex;
+                }
             }
         }
 
