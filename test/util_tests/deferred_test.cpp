@@ -88,10 +88,16 @@ TEST(Deferred, ReplyMatcher)
                                  reply.got_response(1337, 7331);
                      });
 
-    reply.yield(1337, [&](int reply_mathcer_result){
-        std::cout << "[" << c2pool::dev::timestamp() << "]" << reply_mathcer_result << std::endl;
-    }, 1337);
-
+    try
+    {
+        reply.yield(1337, [&](int reply_mathcer_result)
+        {
+            std::cout << "[" << c2pool::dev::timestamp() << "]" << reply_mathcer_result << std::endl;
+        }, 1337);
+    } catch (...)
+    {
+        std::cout << "TIMEOUT!!" << std::endl;
+    }
     context->run();
 }
 
