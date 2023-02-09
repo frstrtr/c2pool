@@ -37,25 +37,14 @@ public:
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
                         LOG_DEBUG << "ID: " << _id.GetHex();
-
-                        LOG_DEBUG << "Hashes: [";
-                        for (auto _h : _hashes){
-                            LOG_DEBUG << _h.GetHex();
-                        }
-                        LOG_DEBUG << "]";
-
+                        LOG_DEBUG << "Hashes: " << _hashes;
                         LOG_DEBUG << "Parents: " << _parents;
-
-                        LOG_DEBUG << "Stops: [";
-                        for (auto _h : _stops){
-                            LOG_DEBUG << _h.GetHex();
-                        }
-                        LOG_DEBUG << "]";
+                        LOG_DEBUG << "Stops: " << _stops;
 
                         LOG_DEBUG << "get_shares called!";
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
                         _socket->write(msg);
-                    }, 15, [_socket = socket](){LOG_WARNING << "get_shares timeout!"; _socket->disconnect();})), handle_message_version(std::move(_handler))
+                    }, 15, [_socket = socket](std::string msg){LOG_WARNING << msg; _socket->disconnect();})), handle_message_version(std::move(_handler))
     {
 
     }

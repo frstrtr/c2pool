@@ -122,7 +122,11 @@ TEST(Deferred, ReplyMatcherTimeout)
 
     reply.yield(1337, [&](int reply_mathcer_result){
         std::cout << "[" << c2pool::dev::timestamp() << "]" << reply_mathcer_result << std::endl;
-    }, 1337);
+    }, 1337)->add_errback([](std::string msg){
+        std::cout << "ERRBACK: " << msg << std::endl;
+    });
+
+    ASSERT_ANY_THROW({reply.got_response(1338,7332);});
 
     context->run();
 }

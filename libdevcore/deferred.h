@@ -7,6 +7,7 @@
 #include <memory>
 #include <boost/asio/spawn.hpp>
 #include <functional>
+#include <utility>
 #include <vector>
 #include <optional>
 
@@ -117,6 +118,7 @@ namespace c2pool::deferred
         std::shared_future<ReturnType> _future;
 
         std::vector<std::function<void(ReturnType)>> callbacks;
+        std::function<void(std::string)> errback;
     public:
         boost::asio::steady_timer await_timer;
         boost::asio::steady_timer timeout_timer;
@@ -129,22 +131,11 @@ namespace c2pool::deferred
 
         void await_result(const boost::system::error_code &ec)
         {
-            std::cout << "await_result1: " << is_ready(_future) << " " << !_future.valid() << std::endl;
             if (!ec.failed())
             {
-                if (is_ready(_future) || !_future.valid())
+                if (is_ready(_future))
                 {
-                    ReturnType result;
-
-                    try
-                    {
-                        std::cout << "await_result2" << std::endl;
-                        result = _future.get();
-                    } catch (const std::runtime_error& ex)
-                    {
-                        std::cout << "await_result catch" << std::endl;
-                        throw ex;
-                    }
+                    auto result = _future.get();
 
                     for (auto v: callbacks)
                     {
@@ -156,34 +147,11 @@ namespace c2pool::deferred
 
                 await_timer.expires_from_now(100ms);
                 await_timer.async_wait(std::bind(&result_reply<ReturnType>::await_result, this, std::placeholders::_1));
-                std::cout << "await_result3" << std::endl;
-            } else {
-                std::cout << "fail: " << ec.message() << std::endl;
-                try
-                {
-                    std::cout << "await_result2" << std::endl;
-                    auto result = _future.get();
-                } catch (const std::runtime_error& ex)
-                {
-                    std::cout << "await_result catch" << std::endl;
-                    throw ex;
-                }
             }
         }
-
-        void await_timeout(const boost::system::error_code &ec)
-        {
-            std::cout << "TIMEOUT!" << std::endl;
-            if (!ec)
-            {
-                _promise.set_exception(make_exception_ptr(std::runtime_error("ReplyMatcher timeout!")));
-                cancel();
-            }
-        }
-
     public:
         // + 10 milliseconds -- tip for call await_result before await_timeout if t == timeout
-        result_reply(std::shared_ptr<io::io_context> _context, time_t t) : timeout_timer(*_context,
+        result_reply(const std::shared_ptr<io::io_context>& _context, time_t t) : timeout_timer(*_context,
                                                                                          std::chrono::seconds(t) +
                                                                                          std::chrono::milliseconds(10)),
                                                                            await_timer(*_context, 1ms)
@@ -196,19 +164,26 @@ namespace c2pool::deferred
             callbacks.push_back(_callback);
         }
 
-        void await(std::function<void()> timeout_func = nullptr)
+        void add_errback(std::function<void(std::string)> _errback)
+        {
+            errback = std::move(_errback);
+        }
+
+        void await()
         {
             await_timer.async_wait(std::bind(&result_reply<ReturnType>::await_result, this, std::placeholders::_1));
-            timeout_timer.async_wait(std::bind(&result_reply<ReturnType>::await_timeout, this, std::placeholders::_1));
 
-            if (timeout_func)
-            {
-                timeout_timer.async_wait([f = std::move(timeout_func)](const boost::system::error_code &ec)
+            timeout_timer.async_wait([&](const boost::system::error_code &ec)
+                                     {
+                                         if (!ec)
                                          {
-                                             if (!ec)
-                                                 f();
-                                         });
-            }
+                                             cancel();
+
+                                             if (errback)
+                                                 errback("timeout!");
+                                         }
+                                     });
+
         }
 
         void set_value(ReturnType val)
@@ -229,8 +204,9 @@ namespace c2pool::deferred
         time_t timeout_t;
 
         ReplyMatcher(std::shared_ptr<io::io_context> _context, std::function<void(Args...)> _func,
-                     time_t _timeout_t = 5) : context(_context), func(_func), timeout_t(_timeout_t)
-        {}
+                     time_t _timeout_t = 5) : context(std::move(_context)), func(_func), timeout_t(_timeout_t)
+        {
+        }
 
         void operator()(Key key, Args... ARGS)
         {
@@ -245,13 +221,22 @@ namespace c2pool::deferred
 
         void got_response(Key key, ReturnType val)
         {
-            result[key]->set_value(val);
+            if (result.find(key) != result.end())
+            {
+                result[key]->set_value(val);
+            }
+            else
+            {
+                throw std::invalid_argument("ReplyMatcher doesn't store this key!");
+            }
         }
 
-        void yield(Key key, std::function<void(ReturnType)> __f, Args... ARGS)
+        auto &yield(Key key, std::function<void(ReturnType)> _f, Args... ARGS)
         {
             this->operator()(key, ARGS...);
-            result[key]->add_callback(__f);
+            auto &res = result[key];
+            res->add_callback(_f);
+            return res;
         }
     };
 
@@ -262,10 +247,10 @@ namespace c2pool::deferred
         std::map<uint256, std::shared_ptr<result_reply<ReturnType>>> result;
         std::function<void(uint256, Args...)> func;
         time_t timeout_t;
-        std::function<void()> timeout_func;
+        std::function<void(std::string)> timeout_func;
 
         QueryDeferrer(std::function<void(uint256, Args...)> _func, time_t _timeout_t = 5,
-                      std::function<void()> _timeout_func = nullptr) : func(_func), timeout_t(_timeout_t),
+                      std::function<void(std::string)> _timeout_func = nullptr) : func(_func), timeout_t(_timeout_t),
                                                                        timeout_func(std::move(_timeout_func))
         {}
 
@@ -280,7 +265,8 @@ namespace c2pool::deferred
             func(id, ARGS...);
 
             result[id] = std::make_shared<result_reply<ReturnType>>(_context, timeout_t);
-            result[id]->await(timeout_func);
+            result[id]->await();
+            result[id]->add_errback(timeout_func);
 
             return id;
         }
