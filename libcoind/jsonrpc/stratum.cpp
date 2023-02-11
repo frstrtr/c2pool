@@ -18,6 +18,8 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
 
     server.Add("mining.submit", GetHandle(&Stratum::mining_submit, *this));
 
+    _worker->new_work.subscribe([&](){ _send_work(); });
+
     std::cout << "Added methods to server" << std::endl;
 }
 
@@ -25,16 +27,16 @@ void Stratum::_send_work()
 {
     worker_get_work_result get_work_result;
 
-//    try
-//    {
+    try
+    {
         auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
         get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
-//    } catch (const std::exception &ec)
-//    {
-//        LOG_ERROR << "Stratum disconnect " << ec.what();
-//        disconnect();
-//        return;
-//    }
+    } catch (const std::exception &ec)
+    {
+        LOG_ERROR << "Stratum disconnect " << ec.what();
+        disconnect();
+        return;
+    }
 
     auto &[x, got_response] = get_work_result;
 
@@ -44,7 +46,7 @@ void Stratum::_send_work()
     json::array_t merkle_branch;
     for (auto s : x.merkle_link.branch)
     {
-        merkle_branch.push_back(HexStr(pack<IntType(256)>(s)));
+        merkle_branch.emplace_back(HexStr(pack<IntType(256)>(s)));
     }
 
     mining_notify(

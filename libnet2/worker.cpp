@@ -498,7 +498,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     worker_get_work_result res = {
             ba,
-            [=](coind::data::types::BlockHeaderType header, std::string user, IntType(64) coinbase_nonce)
+            [=](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
             {
                 auto t0 = c2pool::dev::timestamp();
 
@@ -514,23 +514,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 }
                 std::cout << "new_packed_gentx(before new_gentx): " << HexStr(new_packed_gentx.data) << std::endl;
                 std::cout << "packed_gentx: " << HexStr(packed_gentx.data) << std::endl;
-//                {
-//                    new_packed_gentx
-//                            << std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - 12);
-//
-//                    PackStream temp;
-//                    temp << coinbase_nonce;
-//                    if (all_of(temp.data.begin(), temp.data.end(), [](unsigned char v)
-//                    { return v == '\0'; }))
-//                    {
-//                        temp << std::vector<unsigned char>(packed_gentx.data.end() - 4, packed_gentx.data.end());
-//                    } else
-//                    {
-//                        temp << packed_gentx;
-//                    }
-//
-//                    new_packed_gentx << temp;
-//                }
 
                 coind::data::tx_type new_gentx;
                 {
@@ -563,13 +546,12 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     block_header_packed << _block_header_value;
                 }
 
-                auto header_hash = coind::data::hash256(block_header_packed);
+                auto header_hash = coind::data::hash256(block_header_packed, true);
                 auto pow_hash = _net->parent->POW_FUNC(block_header_packed);
 
                 try
                 {
-                    if (UintToArith256(pow_hash) <=
-                        UintToArith256(FloatingInteger(header.bits).target())) //XXX: or p2pool.DEBUG
+                    if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()))
                     {
                         //TODO: helper.submit_block
                         LOG_INFO << "GOT BLOCK FROM MINER! Passing to bitcoind!";
@@ -589,6 +571,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 assert(header.bits == ba.bits);
 
                 bool on_time = new_work.get_times() == lp_count;
+                LOG_TRACE << "ON TIME: " << "lp_count = " << lp_count << ", new_work = " << new_work.get_times() << ", on_time = " << on_time;
 
                 //TODO: merged mining
 //                    for aux_work, index, hashes in mm_later:
@@ -635,11 +618,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     //# job was assigned. Fortunately, the tx_map is still in in our scope from this job, so we can use that
                     //# to refill it if needed.
 
-                    auto known_txs = _coind_node->known_txs.value();
+                    auto known_txs = _coind_node->known_txs.pvalue();
 
                     std::map<uint256, coind::data::tx_type> missing;
                     for (auto [_hash, _value]: tx_map)
-                        if (known_txs.count(_hash) == 0)
+                        if (known_txs->count(_hash) == 0)
                         {
                             missing[_hash] = _value;
                         }
@@ -662,8 +645,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                     try
                     {
-                        if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()) &&
-                            _pool_node)
+                        if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()) && _pool_node)
                         {
 							_pool_node->broadcast_share(share->hash);
                         }
@@ -689,12 +671,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 {
                     // TODO: received_header_hashes.add(header_hash)
                     // TODO: for web static: self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(target), not on_time, user)
-                    recent_shares_ts_work.push_back(
-                            {c2pool::dev::timestamp(), ArithToUint288(coind::data::target_to_average_attempts(target))});
+                    recent_shares_ts_work.emplace_back(c2pool::dev::timestamp(), ArithToUint288(coind::data::target_to_average_attempts(target)));
                     if (recent_shares_ts_work.size() > 50)
                     {
                         recent_shares_ts_work.erase(recent_shares_ts_work.begin(),
-                                                    recent_shares_ts_work.end() - 50); //TODO: check
+                                                    recent_shares_ts_work.end() - 50);
                     }
                     local_rate_monitor.add_datum(
                             {
