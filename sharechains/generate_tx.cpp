@@ -584,8 +584,8 @@ namespace shares
         return [=, _net = net](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
-
-            std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
+            LOG_TRACE << "NET NAME: " << _net->net_name;
+            std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(_net);
 
             shared_ptr<::HashLinkType> pref_to_hash_link;
             {

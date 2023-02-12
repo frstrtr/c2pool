@@ -13,6 +13,7 @@
 #include <libcoind/transaction.h>
 #include <libdevcore/stream_types.h>
 #include <libdevcore/common.h>
+#include <libdevcore/logger.h>
 
 namespace coind
 {
@@ -22,7 +23,7 @@ namespace coind
         uint256 previous_block;
         vector<shared_ptr<coind::data::TransactionType>> transactions;
         vector<uint256> transaction_hashes;
-        vector<optional<uint64_t>> transaction_fees;
+        vector<std::optional<uint64_t>> transaction_fees;
         int64_t subsidy;
         time_t time;
         FloatingInteger bits;
@@ -124,6 +125,26 @@ namespace coind
         bool operator!=(getwork_result const &val) const
         {
             return !(*this == val);
+        }
+
+        friend std::ostream &operator<<(std::ostream &stream, const getwork_result &val)
+        {
+            stream << "(getwork_result: ";
+            stream << "version = " << val.version;
+            stream << ", previous_block = " << val.previous_block;
+            stream << ", transactions = " << val.transactions;
+            stream << ", transaction_hashes = " << val.transaction_hashes;
+            stream << ", transaction_fees = " << val.transaction_fees;
+            stream << ", subsidy = " << val.subsidy;
+            stream << ", time = " << val.time;
+            stream << ", bits = " << val.bits;
+            stream << ", coinbaseflags = " << val.coinbaseflags;
+            stream << ", height = " << val.height;
+            stream << ", rules = " << val.rules;
+            stream << ", last_update = " << val.last_update;
+            stream << ", latency = " << val.latency;
+
+            return stream;
         }
     };
 } // namespace coind::jsonrpc::data

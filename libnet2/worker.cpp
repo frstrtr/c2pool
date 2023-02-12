@@ -164,11 +164,18 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
 
     current_work.transitioned->subscribe([&](const auto& before, const auto& after){
         //  # trigger LP if version/previous_block/bits changed or transactions changed from nothing
+        LOG_TRACE.stream() << "Before: " << before;
+        LOG_TRACE.stream() << "After: " << after;
         if ((std::tie(before.version, before.previous_block, before.bits) != std::tie(after.version, after.previous_block, after.bits)) || (before.transactions.empty() && !after.transactions.empty()))
+        {
+            LOG_TRACE << "current_work.transitioned happened!";
             new_work.happened();
+        }
     });
 
-    _coind_node->best_share.changed->subscribe([&](const auto &value){
+    _coind_node->best_share.changed->subscribe([&](const auto &value)
+    {
+        LOG_TRACE << "_coind_node->best_share.changed!";
        new_work.happened();
     });
 
@@ -854,6 +861,7 @@ user_details Worker::preprocess_request(std::string username)
 
 void Worker::compute_work()
 {
+    LOG_TRACE.stream() << "compute_work: " << _coind_node->coind_work.value();
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
     if (!_coind_node->best_block_header.isNull())
     {

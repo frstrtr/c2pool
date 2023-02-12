@@ -79,7 +79,7 @@ namespace coind::data{
             return !(*this == value);
         }
 
-        friend std::ostream &operator<<(std::ostream &stream, MerkleLink &_value)
+        friend std::ostream &operator<<(std::ostream &stream, const MerkleLink &_value)
         {
             stream << "(MerkleLink: ";
             stream << "branch = " << _value.branch;

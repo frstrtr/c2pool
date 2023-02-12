@@ -42,7 +42,34 @@ namespace c2pool::console
 } // namespace c2pool::console
 
 template<typename T>
+std::ostream &operator<<(std::ostream &stream, const std::optional<T> &data)
+{
+    stream << "({Opt}: ";
+    if (data.has_value())
+    {
+        stream << data.value();
+    } else
+    {
+        stream << "nullopt";
+    }
+    stream << ")";
+    return stream;
+}
+
+template<typename T>
 std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, const std::vector<T> &data)
 {
     stream << "[ ";
     for (auto v : data)

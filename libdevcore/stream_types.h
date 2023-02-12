@@ -567,7 +567,7 @@ struct FloatingInteger : public Getter<IntType(32)>
         value = _bits;
     }
 
-    uint256 target()
+    uint256 target() const
     {
 		auto shift_left = [&](int32_t _n, int32_t _m)
 		{
@@ -609,6 +609,14 @@ struct FloatingInteger : public Getter<IntType(32)>
         stream_bits >> bits;
 
         return FloatingInteger(bits);
+    }
+
+    friend std::ostream &operator<<(std::ostream& stream, const FloatingInteger& v)
+    {
+        stream << "(FloatingInteger: ";
+        stream << "value = " << v.get();
+        stream << ", target = " << v.target();
+        return stream;
     }
 };
 
