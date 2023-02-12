@@ -417,7 +417,7 @@ struct PackStream
         data.insert(data.end(), parsedHexData.begin(), parsedHexData.end());
     }
 
-    friend std::ostream &operator<<(std::ostream &stream, PackStream &packstream)
+    friend std::ostream &operator<<(std::ostream &stream, const PackStream &packstream)
     {
         stream << packstream.data;
         return stream;

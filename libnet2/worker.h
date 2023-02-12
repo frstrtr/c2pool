@@ -41,7 +41,7 @@ public:
 
     bool operator!=(const Work &value) const;
 
-    friend std::ostream &operator<<(std::ostream &stream, Work& value)
+    friend std::ostream &operator<<(std::ostream &stream, const Work& value)
     {
         stream << "(Work: ";
         stream << "version = " << value.version;

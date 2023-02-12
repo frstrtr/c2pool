@@ -154,6 +154,7 @@ json Stratum::mining_notify(std::string jobid, std::string prevhash, std::string
 
     client.CallNotification("mining.notify", notify_data);
     std::cout << "called mining.notify" << std::endl;
+    return {};
 }
 
 json Stratum::mining_submit(const std::string &_worker_name, const std::string &_jobid, const std::string &_extranonce2, const std::string &_ntime, const std::string &_nonce, const std::string &_id)
