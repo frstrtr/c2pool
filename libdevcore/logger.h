@@ -92,6 +92,18 @@ inline std::ostream &operator<<<unsigned char>(std::ostream &stream, std::vector
     return stream;
 }
 
+template <>
+inline std::ostream &operator<<<unsigned char>(std::ostream &stream, const std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
 template <typename T, typename K>
 inline std::ostream &operator<<(std::ostream &stream, std::map<T, K> &data)
 {

@@ -155,7 +155,7 @@ namespace coind::data
             }
         }
 
-        friend std::ostream &operator<<(std::ostream &stream, WitnessTransactionData &value)
+        friend std::ostream &operator<<(std::ostream &stream, const WitnessTransactionData &value)
         {
             stream << "(WitnessTransactionData: ";
             stream << "marker = " << value.marker;
@@ -188,7 +188,7 @@ namespace coind::data
             wdata = _wdata;
         }
 
-        friend std::ostream &operator<<(std::ostream &stream, const std::shared_ptr<TransactionType>& _tx)
+        friend std::ostream &operator<<(std::ostream &stream, std::shared_ptr<TransactionType>& _tx)
         {
             stream << "(TxType: ";
 

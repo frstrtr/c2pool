@@ -258,7 +258,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         share_version = SHARE_VERSION;
     } else
     {
-        //TODO: Succsessor
+        share_version = prev_share->VERSION;
+        // TODO: Share -> NewShare only valid if 95% of hashes in [net.CHAIN_LENGTH*9//10, net.CHAIN_LENGTH] for new version
     }
 
     //5
@@ -455,6 +456,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     LOG_TRACE << "get_work#9";
     auto getwork_time = c2pool::dev::timestamp();
     auto lp_count = new_work.get_times();
+    LOG_TRACE << "SET LP: lp_count = " << lp_count << ", new_work.times = " << new_work.get_times();
 
     coind::data::MerkleLink merkle_link;
     if (!gen_sharetx_res->share_info->segwit_data.has_value())
@@ -505,7 +507,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     worker_get_work_result res = {
             ba,
-            [=](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
+            [=, _new_work = new_work, _lp_count = lp_count](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
             {
                 auto t0 = c2pool::dev::timestamp();
 
@@ -577,9 +579,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 assert(header.merkle_root == check_merkle_link1);
                 assert(header.bits == ba.bits);
 
-                bool on_time = new_work.get_times() == lp_count;
+                bool on_time = _new_work.get_times() == _lp_count;
                 LOG_TRACE << "ON TIME: " << "lp_count = " << lp_count << ", new_work = " << new_work.get_times() << ", on_time = " << on_time;
-
+                LOG_TRACE << "ON TIME: " << "_lp_count = " << _lp_count << ", _new_work = " << _new_work.get_times() << ", on_time = " << (_lp_count == _new_work.get_times());
                 //TODO: merged mining
 //                    for aux_work, index, hashes in mm_later:
 //                        try:
@@ -863,6 +865,7 @@ void Worker::compute_work()
 {
     LOG_TRACE.stream() << "compute_work: " << _coind_node->coind_work.value();
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
+    LOG_TRACE.stream() << "t: " << t;
     if (!_coind_node->best_block_header.isNull())
     {
         // TODO: test

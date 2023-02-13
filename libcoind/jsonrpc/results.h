@@ -143,6 +143,7 @@ namespace coind
             stream << ", rules = " << val.rules;
             stream << ", last_update = " << val.last_update;
             stream << ", latency = " << val.latency;
+            stream << " )";
 
             return stream;
         }

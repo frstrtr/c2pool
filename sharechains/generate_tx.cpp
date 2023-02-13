@@ -110,7 +110,7 @@ namespace shares
         }
         if (!(segwit_activated || !_known_txs.has_value()) && segwit_tx)
         {
-            throw "segwit transaction included before activation";
+            throw std::runtime_error("segwit transaction included before activation");
         }
 
         if (segwit_activated && _known_txs.has_value())
