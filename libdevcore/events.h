@@ -88,6 +88,8 @@ public:
 
     void happened(Args & ... args)
     {
+        *times += 1;
+
         if (!sig->empty())
             (*sig)(args...);
         if (!sig_anon->empty())
@@ -97,8 +99,6 @@ public:
             (*once)(args...);
             once->disconnect_all_slots();
         }
-
-        *times += 1;
     }
 
     int get_times() const

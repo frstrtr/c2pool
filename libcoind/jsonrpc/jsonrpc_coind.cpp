@@ -171,7 +171,7 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 		} else
 		{
 			packed = PackStream(ParseHex(x));
-			txid = coind::data::hash256(packed);
+			txid = coind::data::hash256(packed, true);
 			txidcache.add(x, txid);
 			txhashes.push_back(txid);
 		}
