@@ -683,3 +683,20 @@ TEST_F(SharechainsTest, get_ref_hash_test)
 
     ASSERT_EQ(script, true_script);
 }
+
+TEST_F(SharechainsTest, share_store_test)
+{
+    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+
+    tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known)
+    { tracker->init(shares, known); });
+
+    std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
+
+    auto [hash, share] = *tracker->items.begin();
+
+    tracker->share_store.add_share(share);
+    LOG_INFO << "ADDED SHARE " << hash;
+
+    LOG_INFO << tracker->share_store.get_share(hash)->hash;
+}
