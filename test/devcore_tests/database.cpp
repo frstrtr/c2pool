@@ -6,6 +6,8 @@
 #include <leveldb/write_batch.h>
 #include <libdevcore/db.h>
 #include <libdevcore/filesystem.h>
+#include <btclibs/uint256.h>
+#include <libdevcore/stream_types.h>
 
 namespace fs = boost::filesystem;
 
@@ -50,15 +52,36 @@ TEST(DatabaseTest, boost_database)
 
 TEST(DatabaseTest, db_test)
 {
-	std::unique_ptr<Database> db = std::make_unique<Database>(c2pool::filesystem::getProjectPath(), "DbTest1");
-	db->Write(123, 321);
+	std::unique_ptr<Database> db = std::make_unique<Database>(c2pool::filesystem::getProjectPath()/"libdevcore_test", "DbTest1", true);
+	std::string k = "321";
+    std::string v = "123";
 
-	auto _value = db->Read(123);
-	int* value = reinterpret_cast<int*>(_value.data());
+    db->Write(k, v);
 
-	ASSERT_EQ(321, *value);
-	ASSERT_TRUE(db->Exist(123));
+	auto _value = db->Read(k);
+	std::string value(_value.begin(), _value.end());
 
-	db->Remove(123);
-	ASSERT_FALSE(db->Exist(123));
+	ASSERT_EQ(v, value);
+	ASSERT_TRUE(db->Exist(k));
+
+	db->Remove(k);
+	ASSERT_FALSE(db->Exist(v));
+}
+
+TEST(DatabaseTest, db_test2)
+{
+    std::unique_ptr<Database> db = std::make_unique<Database>(c2pool::filesystem::getProjectPath()/"libdevcore_test", "DbTest2", true);
+    uint256 k = uint256S("4ce");
+    std::string v = "123";
+
+    db->Write(k, v);
+
+    auto _value = db->Read(k);
+    std::string value(_value.begin(), _value.end());
+
+    ASSERT_EQ(v, value);
+    ASSERT_TRUE(db->Exist(k));
+
+    db->Remove(k);
+    ASSERT_FALSE(db->Exist(v));
 }
