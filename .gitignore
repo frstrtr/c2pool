@@ -58,3 +58,4 @@ vc140.pdb
 
 #secp256k1 from cmake/ProjectSecp256k1.cmake
 libs/secp256k1/*
+/cmake-build-debug-coverage/
