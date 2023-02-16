@@ -262,7 +262,7 @@ namespace shares
             auto _it = sum.find(item_hash);
             if (sum.find(possible_child_hash) == sum.end())
             {
-                throw invalid_argument("is_child_of: possible_child_hash existn't in tracker");
+                throw invalid_argument("is_child_of: possible_child_hash exisn't in tracker");
             }
             while (_it != sum.end())
             {
@@ -278,11 +278,11 @@ namespace shares
         {
             if (sum.find(first_hash) == sum.end())
             {
-                throw invalid_argument("first_hash in get_delta existn't in sum!");
+                throw invalid_argument("first_hash in get_delta exisn't in sum!");
             }
             if (sum.find(second_hash) == sum.end())
             {
-                throw invalid_argument("second in get_delta existn't in sum!");
+                throw invalid_argument("second in get_delta exisn't in sum!");
             }
 
             if (!is_child_of(first_hash, second_hash))
