@@ -4,11 +4,13 @@
 #include "logger.h"
 
 
-Database::Database(const boost::filesystem::path &filepath, std::string _name, bool wipe) : name(_name)
+Database::Database(const boost::filesystem::path &filepath, const std::string &_name, bool wipe) : name(_name)
 {
+    options.create_if_missing = true;
+
 	if (wipe)
 	{
-		leveldb::Status wipe_status = leveldb::DestroyDB(name, options);
+		leveldb::Status wipe_status = leveldb::DestroyDB((filepath / name).string(), options);
 	}
 
     boost::filesystem::create_directories(filepath);
@@ -20,7 +22,10 @@ Database::Database(const boost::filesystem::path &filepath, std::string _name, b
 		          << "; status: " << status.ToString();
 
 		//TODO: close proj
-	}
+	} else
+    {
+        LOG_INFO << "DB was opened with path: " << (filepath / name).string();
+    }
 }
 
 Database::~Database()

@@ -18,13 +18,6 @@ private:
 	unique_ptr<Database> verified_shares;
 public:
     ShareStore() = delete;
-//	ShareStore()
-//	{
-//        auto filepath = c2pool::filesystem::getProjectPath() / "data" / net->net_name;
-//
-//		shares = std::make_unique<Database>(filepath, "shares");
-//		verified_shares = std::make_unique<Database>(filepath, "shares_verified");
-//	}
 
     ShareStore(std::shared_ptr<c2pool::Network> _net) : net(std::move(_net))
     {
@@ -35,8 +28,14 @@ public:
     }
 
 public:
-	void add_share(ShareType share)
+	void add_share(const ShareType& share)
 	{
+        if (!share)
+        {
+            LOG_WARNING << "try to add nullptr share!";
+            return;
+        }
+
 		PackStream packed_share;
 		packed_share << *share;
 
@@ -46,8 +45,14 @@ public:
 		shares->Write(key, value);
 	}
 
-	void add_verified(ShareType share)
+	void add_verified(const ShareType& share)
 	{
+        if (!share)
+        {
+            LOG_WARNING << "try to add nullptr verified share!";
+            return;
+        }
+
 		PackStream packed_share;
 		packed_share << *share;
 
@@ -127,7 +132,36 @@ public:
         init_f(_shares, _known_verified);
     }
 
-    //TODO: GET for what?
-    //TODO: Test for GET
+    ShareType get_share(const uint256 &hash)
+    {
+        if (!shares->Exist(hash, hash.size()))
+        {
+            throw std::invalid_argument((boost::format("Shares exisn't for %1% hash") % hash.GetHex()).str());
+        }
+
+        leveldb::Slice key(reinterpret_cast<const char*>(hash.begin()), hash.size());
+        PackStream packed_share(shares->Read(key));
+
+        ShareType share;
+        packed_share >> share;
+
+        return share;
+    }
+
+    ShareType get_verified_share(const uint256 &hash)
+    {
+        if (!verified_shares->Exist(hash))
+        {
+            throw std::invalid_argument((boost::format("Verified shares exisn't for %1% hash") % hash.GetHex()).str());
+        }
+
+        leveldb::Slice key(reinterpret_cast<const char*>(hash.begin()), hash.size());
+        PackStream packed_share(verified_shares->Read(key));
+
+        ShareType share;
+        packed_share >> share;
+
+        return share;
+    }
 };
 
