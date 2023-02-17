@@ -5,7 +5,6 @@
 #include <vector>
 #include <numeric>
 #include <memory>
-#include <cstring>
 
 #include <btclibs/util/strencodings.h>
 #include "logger.h"
@@ -384,9 +383,7 @@ struct PackStream
     unsigned char *bytes() const
     {
         unsigned char *result = new unsigned char[data.size()];
-        LOG_TRACE << data.size();
-        std::memcpy(result, data.data(), data.size());
-//        std::copy(data.begin(), data.end(), result);
+        std::copy(data.begin(), data.end(), result);
         return result;
     }
 

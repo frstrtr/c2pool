@@ -17,10 +17,10 @@ protected:
 	leveldb::DB *db;
 
 	leveldb::Options options;
-	leveldb::WriteOptions writeOptions;
-	leveldb::WriteOptions syncOptions;
-	leveldb::ReadOptions iterOptions;
-	leveldb::ReadOptions readOptions;
+//	leveldb::WriteOptions writeOptions;
+//	leveldb::WriteOptions syncOptions;
+//	leveldb::ReadOptions iterOptions;
+//	leveldb::ReadOptions readOptions;
 
 	std::string name;
 
@@ -36,24 +36,15 @@ public:
 	template<typename KeyStreamType, typename ValueStreamType, typename KEY_T, typename VALUE_T>
 	void Write(const KEY_T &key, const VALUE_T &value)
 	{
-        auto __key = pack_to_stream<KeyStreamType>(key);
-        auto _bytes = __key.bytes();
-        auto _c_bytes = (char*) _bytes;
+        // Pack key
+        auto packed_key = pack_to_stream<KeyStreamType>(key);
+        leveldb::Slice k(packed_key.c_str(), packed_key.size());
 
-        std::cout << strlen(_c_bytes) << std::endl;
+        // Pack value
+        auto packed_value = pack_to_stream<ValueStreamType>(value);
+        leveldb::Slice v(packed_value.c_str(), packed_value.size());
 
-        auto kkey = __key.data.data();
-        auto ___key = __key.c_str();
-//		leveldb::Slice _key(___key);//reinterpret_cast<const char *>(&key), key.size());
-        leveldb::Slice _key(_c_bytes, __key.size());
-        leveldb::Slice _pseudo_key("123");
-        leveldb::Slice _value(__key.c_str());
-//        auto data = reinterpret_cast<const char *>(value.data());
-//        std::string _d (data);
-//        LOG_INFO << "value = " << value << " -> _d = " << _d;
-//		leveldb::Slice _value(data, strlen(data));
-
-		auto status = db->Put(leveldb::WriteOptions(), _key, _value);
+		auto status = db->Put(leveldb::WriteOptions(), k, v);
         if (!status.ok())
         {
             LOG_WARNING << "DB::Write: " << status.ToString();
@@ -63,18 +54,18 @@ public:
 	template<typename KeyStreamType, typename ValueStreamType>
     ValueStreamType Read(const typename KeyStreamType::get_type &key)
 	{
-        auto __key = pack_to_stream<KeyStreamType>(key);
-        auto ___key = __key.c_str();
-        leveldb::Slice _key(___key);
-//		leveldb::Slice _key(reinterpret_cast<const char *>(&key), key.size());
+        // Pack key
+        auto packed_key = pack_to_stream<KeyStreamType>(key);
+        leveldb::Slice k(packed_key.c_str(), packed_key.size());
+
+        // Read from db
 		std::string data;
 
-		auto status = db->Get(leveldb::ReadOptions(), _key, &data);
+		auto status = db->Get(leveldb::ReadOptions(), k, &data);
         if (!status.ok())
         {
             LOG_WARNING << "DB::Read: " << status.ToString();
         }
-        LOG_INFO << data;
 		leveldb::Slice slice_data(data);
 
 		auto *unpacked_data = (unsigned char *) slice_data.data();
@@ -84,26 +75,32 @@ public:
 		return res;
 	}
 
-	template<typename KEY_T>
+	template<typename KeyStreamType, typename KEY_T>
 	void Remove(const KEY_T &key)
 	{
-		leveldb::Slice _key(reinterpret_cast<const char *>(&key), key.size());
-		db->Delete(leveldb::WriteOptions(), _key);
+        // Pack key
+        auto packed_key = pack_to_stream<KeyStreamType>(key);
+        leveldb::Slice k(packed_key.c_str(), packed_key.size());
+
+		db->Delete(leveldb::WriteOptions(), k);
 	}
 
-	template<typename KEY_T>
+	template<typename KeyStreamType, typename KEY_T>
 	bool Exist(const KEY_T &key)
 	{
-		leveldb::Slice _key(reinterpret_cast<const char *>(&key), key.size());
+        // Pack key
+        auto packed_key = pack_to_stream<KeyStreamType>(key);
+        leveldb::Slice k(packed_key.c_str(), packed_key.size());
+
 		std::string data;
 
-		auto status = db->Get(leveldb::ReadOptions(), _key, &data);
+		auto status = db->Get(leveldb::ReadOptions(), k, &data);
 		return !status.IsNotFound();
 	}
 
-	bool IsEmpty()
-	{
-		//TODO:
-        return false;
-	}
+//	bool IsEmpty()
+//	{
+//		//TODO:
+//        return false;
+//	}
 };
