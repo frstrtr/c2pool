@@ -267,3 +267,14 @@ TEST(Devcore_stream, getter_possible_nonetype)
 	v = 123;
 	ASSERT_EQ(v.get(), 123);
 }
+
+TEST(Devcore_stream, pack_stream_bytes)
+{
+    IntType(32) i(1000005252);
+    PackStream s;
+
+    s << i;
+
+    auto bytes = s.bytes();
+    std::cout << bytes;
+}

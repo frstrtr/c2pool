@@ -5,6 +5,7 @@
 #include <vector>
 #include <numeric>
 #include <memory>
+#include <cstring>
 
 #include <btclibs/util/strencodings.h>
 #include "logger.h"
@@ -383,7 +384,15 @@ struct PackStream
     unsigned char *bytes() const
     {
         unsigned char *result = new unsigned char[data.size()];
-        std::copy(data.begin(), data.end(), result);
+        LOG_TRACE << data.size();
+        std::memcpy(result, data.data(), data.size());
+//        std::copy(data.begin(), data.end(), result);
+        return result;
+    }
+
+    const char* c_str() const
+    {
+        const char* result = reinterpret_cast<const char*>(data.data());
         return result;
     }
 
@@ -600,6 +609,16 @@ std::vector<unsigned char> pack(T value)
 
     stream << stream_value;
     return stream.data;
+}
+
+template <typename StreamType, typename T>
+PackStream pack_to_stream(T value)
+{
+    PackStream stream;
+    StreamType stream_value(value);
+
+    stream << stream_value;
+    return stream;
 }
 
 template <typename StreamType>
