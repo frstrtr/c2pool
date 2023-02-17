@@ -62,10 +62,11 @@ TEST(DatabaseTest, db_test)
 	std::string value = _value.get();
 
 	ASSERT_EQ(v, value);
-	ASSERT_TRUE(db->Exist(k));
 
-	db->Remove(k);
-	ASSERT_FALSE(db->Exist(v));
+	ASSERT_TRUE(db->Exist<StrType>(k));
+
+	db->Remove<StrType>(k);
+	ASSERT_FALSE(db->Exist<StrType>(k));
 }
 //
 //TEST(DatabaseTest, db_test2)
