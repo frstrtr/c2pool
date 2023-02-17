@@ -69,6 +69,7 @@ public:
 
         // Pack value
         auto packed_value = pack_to_stream<ValueStreamType>(value);
+        LOG_TRACE << "PACKED VALUE: " << packed_value.size();
         leveldb::Slice v(packed_value.c_str(), packed_value.size());
 
 		auto status = db->Put(leveldb::WriteOptions(), k, v);
