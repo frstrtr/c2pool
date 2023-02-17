@@ -218,7 +218,7 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
 // return gentx # only used by as_block
 }
 
-std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, addr_type peer_addr)
+std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const addr_type& peer_addr)
 {
 	PackedShareData packed_share;
 	stream >> packed_share;
@@ -246,12 +246,15 @@ PackedShareData pack_share(ShareType share)
 	// Pack share to t['share_type'] from p2pool
 	PackStream contents;
 	contents << *share->min_header->stream();
+    contents << *share->share_data->stream();
+    if (share->segwit_data)
+        contents << *share->segwit_data->stream();
 	contents << *share->share_info->stream();
 	contents << *share->ref_merkle_link->stream();
-	IntType(64) last_txout_nonce(share->last_txout_nonce);
-	contents << last_txout_nonce;
+	contents << pack<IntType(64)>(share->last_txout_nonce);
 	contents << *share->hash_link->stream();
 	contents << *share->merkle_link->stream();
+    LOG_TRACE << "contents = " << contents.size();
 
 	// Pack share to PackedShareData
 	PackedShareData result(share->VERSION, contents);

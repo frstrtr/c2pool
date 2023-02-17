@@ -9,13 +9,36 @@
 #include <fstream>
 #include <sstream>
 
+struct ShareTypeStream : Getter<PackedShareData>
+{
+    ShareTypeStream() = default;
+
+    ShareTypeStream(const ShareType &share)
+    {
+        value = pack_share(share);
+    }
+
+    PackStream &write(PackStream &stream)
+    {
+        stream << value;
+        return stream;
+    }
+
+    PackStream &read(PackStream &stream)
+    {
+        stream >> value;
+        return stream;
+    }
+
+};
+
 class ShareStore
 {
 private:
     std::shared_ptr<c2pool::Network> net;
 
-	unique_ptr<Database> shares;
-	unique_ptr<Database> verified_shares;
+	unique_ptr<Database<IntType(256), ShareTypeStream>> shares;
+	unique_ptr<Database<IntType(256), ShareTypeStream>> verified_shares;
 public:
     ShareStore() = delete;
 
@@ -23,8 +46,8 @@ public:
     {
         auto filepath = c2pool::filesystem::getProjectPath() / "data" / net->net_name;
 
-        shares = std::make_unique<Database>(filepath, "shares");
-        verified_shares = std::make_unique<Database>(filepath, "shares_verified");
+        shares = std::make_unique<Database<IntType(256), ShareTypeStream>>(filepath, "shares");
+        verified_shares = std::make_unique<Database<IntType(256), ShareTypeStream>>(filepath, "shares_verified");
     }
 
 public:
@@ -36,13 +59,7 @@ public:
             return;
         }
 
-		PackStream packed_share;
-		packed_share << *share;
-
-		leveldb::Slice key(reinterpret_cast<const char*>(share->hash.begin()), share->hash.size());
-		leveldb::Slice value(reinterpret_cast<const char*>(packed_share.data.data()), packed_share.size());
-
-		shares->Write(key, value);
+		shares->Write(share->hash, share);
 	}
 
 	void add_verified(const ShareType& share)
@@ -53,13 +70,7 @@ public:
             return;
         }
 
-		PackStream packed_share;
-		packed_share << *share;
-
-        leveldb::Slice key(reinterpret_cast<const char*>(share->hash.begin()), share->hash.size());
-        leveldb::Slice value(reinterpret_cast<const char*>(packed_share.data.data()), packed_share.size());
-
-        shares->Write(key, value);
+        verified_shares->Write(share->hash, share);
 	}
 
     // read file from p2pool
@@ -102,7 +113,7 @@ public:
 //
 //                        if (raw_share.type.get() < 17)
 //                            continue;
-
+                        LOG_TRACE << "stream len: " << stream.size();
                         auto share = load_share(stream, net, {{}, {}});
                         share->time_seen = 0;
 //                        std::cout << "share_hash: " << share->hash << std::endl;
@@ -134,17 +145,15 @@ public:
 
     ShareType get_share(const uint256 &hash)
     {
-        if (!shares->Exist(hash, hash.size()))
+        if (!shares->Exist(hash))
         {
             throw std::invalid_argument((boost::format("Shares exisn't for %1% hash") % hash.GetHex()).str());
         }
 
-        leveldb::Slice key(reinterpret_cast<const char*>(hash.begin()), hash.size());
-        PackStream packed_share(shares->Read(key));
-
-        ShareType share;
-        packed_share >> share;
-
+        auto readed_share = shares->Read(hash);
+        auto packed_share = pack_to_stream<ShareTypeStream>(readed_share);
+        LOG_TRACE << "PACKED VALUE: " << packed_share.size();
+        auto share = load_share(packed_share, net, {"0.0.0.0", "0"});
         return share;
     }
 
@@ -155,12 +164,8 @@ public:
             throw std::invalid_argument((boost::format("Verified shares exisn't for %1% hash") % hash.GetHex()).str());
         }
 
-        leveldb::Slice key(reinterpret_cast<const char*>(hash.begin()), hash.size());
-        PackStream packed_share(verified_shares->Read(key));
-
-        ShareType share;
-        packed_share >> share;
-
+        auto packed_share = pack_to_stream<ShareTypeStream>(verified_shares->Read(hash));
+        auto share = load_share(packed_share, net, {"0.0.0.0", "0"});
         return share;
     }
 };
