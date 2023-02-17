@@ -9,6 +9,7 @@
 #include <boost/filesystem.hpp>
 
 #include "logger.h"
+#include "stream.h"
 
 class Database
 {
@@ -32,27 +33,40 @@ public:
 	Database &operator=(const Database &) = delete;
 
 	//Write value to DB
-	template<typename KEY_T, typename VALUE_T>
+	template<typename KeyStreamType, typename ValueStreamType, typename KEY_T, typename VALUE_T>
 	void Write(const KEY_T &key, const VALUE_T &value)
 	{
-		leveldb::Slice _key(reinterpret_cast<const char *>(&key), key.size());
-        auto data = reinterpret_cast<const char *>(value.data());
-        std::string _d (data);
-        LOG_INFO << "value = " << value << " -> _d = " << _d;
-		leveldb::Slice _value(data, strlen(data));
+        auto __key = pack_to_stream<KeyStreamType>(key);
+        auto _bytes = __key.bytes();
+        auto _c_bytes = (char*) _bytes;
+
+        std::cout << strlen(_c_bytes) << std::endl;
+
+        auto kkey = __key.data.data();
+        auto ___key = __key.c_str();
+//		leveldb::Slice _key(___key);//reinterpret_cast<const char *>(&key), key.size());
+        leveldb::Slice _key(_c_bytes, __key.size());
+        leveldb::Slice _pseudo_key("123");
+        leveldb::Slice _value(__key.c_str());
+//        auto data = reinterpret_cast<const char *>(value.data());
+//        std::string _d (data);
+//        LOG_INFO << "value = " << value << " -> _d = " << _d;
+//		leveldb::Slice _value(data, strlen(data));
 
 		auto status = db->Put(leveldb::WriteOptions(), _key, _value);
         if (!status.ok())
         {
             LOG_WARNING << "DB::Write: " << status.ToString();
         }
-
 	}
 
-	template<typename KEY_T>
-	std::vector<unsigned char> Read(const KEY_T &key)
+	template<typename KeyStreamType, typename ValueStreamType>
+    ValueStreamType Read(const typename KeyStreamType::get_type &key)
 	{
-		leveldb::Slice _key(reinterpret_cast<const char *>(&key), key.size());
+        auto __key = pack_to_stream<KeyStreamType>(key);
+        auto ___key = __key.c_str();
+        leveldb::Slice _key(___key);
+//		leveldb::Slice _key(reinterpret_cast<const char *>(&key), key.size());
 		std::string data;
 
 		auto status = db->Get(leveldb::ReadOptions(), _key, &data);
@@ -64,8 +78,10 @@ public:
 		leveldb::Slice slice_data(data);
 
 		auto *unpacked_data = (unsigned char *) slice_data.data();
-		std::vector<unsigned char> result(unpacked_data, unpacked_data + slice_data.size());
-		return result;
+		PackStream result(unpacked_data, slice_data.size());
+        ValueStreamType res;
+        result >> res;
+		return res;
 	}
 
 	template<typename KEY_T>
