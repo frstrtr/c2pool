@@ -52,21 +52,21 @@ TEST(DatabaseTest, boost_database)
 
 TEST(DatabaseTest, db_test)
 {
-	std::unique_ptr<Database> db = std::make_unique<Database>(c2pool::filesystem::getProjectPath()/"libdevcore_test", "DbTest1", true);
+	auto db = std::make_unique<Database<StrType, StrType>>(c2pool::filesystem::getProjectPath()/"libdevcore_test", "DbTest1", true);
 	std::string k = "2222";
     std::string v = "123";
 
-    db->Write<StrType, StrType>(k, v);
+    db->Write(k, v);
 
-	auto _value = db->Read<StrType, StrType>(k);
+	auto _value = db->Read(k);
 	std::string value = _value.get();
 
 	ASSERT_EQ(v, value);
 
-	ASSERT_TRUE(db->Exist<StrType>(k));
+	ASSERT_TRUE(db->Exist(k));
 
-	db->Remove<StrType>(k);
-	ASSERT_FALSE(db->Exist<StrType>(k));
+	db->Remove(k);
+	ASSERT_FALSE(db->Exist(k));
 }
 //
 //TEST(DatabaseTest, db_test2)
