@@ -11,6 +11,7 @@
 #include "logger.h"
 #include "stream.h"
 
+template <typename KeyStreamType, typename ValueStreamType>
 class Database
 {
 protected:
@@ -25,15 +26,41 @@ protected:
 	std::string name;
 
 public:
-	Database(const boost::filesystem::path &filepath, const std::string &_name, bool wipe = false);
-	~Database();
+	Database(const boost::filesystem::path &filepath, const std::string &_name, bool wipe = false)
+    {
+        options.create_if_missing = true;
+
+        if (wipe)
+        {
+            leveldb::Status wipe_status = leveldb::DestroyDB((filepath / name).string(), options);
+        }
+
+        boost::filesystem::create_directories(filepath);
+        leveldb::Status status = leveldb::DB::Open(options, (filepath / name).string(), &db);
+
+        if (!status.ok())
+        {
+            LOG_ERROR << "Unable to open/create datebase with path:  " << filepath
+                      << "; status: " << status.ToString();
+
+            //TODO: close proj
+        } else
+        {
+            LOG_INFO << "DB was opened with path: " << (filepath / name).string();
+        }
+    }
+
+    ~Database()
+    {
+        delete db;
+    }
 
 	Database(const Database &) = delete;
 
 	Database &operator=(const Database &) = delete;
 
 	//Write value to DB
-	template<typename KeyStreamType, typename ValueStreamType, typename KEY_T, typename VALUE_T>
+	template<typename KEY_T, typename VALUE_T>
 	void Write(const KEY_T &key, const VALUE_T &value)
 	{
         // Pack key
@@ -51,7 +78,6 @@ public:
         }
 	}
 
-	template<typename KeyStreamType, typename ValueStreamType>
     ValueStreamType Read(const typename KeyStreamType::get_type &key)
 	{
         // Pack key
@@ -75,7 +101,7 @@ public:
 		return res;
 	}
 
-	template<typename KeyStreamType, typename KEY_T>
+	template<typename KEY_T>
 	void Remove(const KEY_T &key)
 	{
         // Pack key
@@ -85,7 +111,7 @@ public:
 		db->Delete(leveldb::WriteOptions(), k);
 	}
 
-	template<typename KeyStreamType, typename KEY_T>
+	template<typename KEY_T>
 	bool Exist(const KEY_T &key)
 	{
         // Pack key
