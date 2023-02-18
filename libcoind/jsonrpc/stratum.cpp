@@ -31,7 +31,7 @@ void Stratum::_send_work()
     {
         auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
         get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
-    } catch (const std::exception &ec)
+    } catch (const std::runtime_error &ec)
     {
         LOG_ERROR << "Stratum disconnect " << ec.what();
         disconnect();
