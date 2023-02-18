@@ -253,23 +253,14 @@ public:
 	ShareType make_preSegwitShare(uint64_t version, const addr_type &addr, PackStream& stream)
 	{
 		builder->create(version, addr);
-        auto size = stream.size();
-		builder->min_header(stream);
-        LOG_DEBUG << "make preSegwitShare after min_header\t = " << stream.size() << " -- " << size - stream.size();
-        builder->share_data(stream);
-        LOG_DEBUG << "make preSegwitShare after share_data\t = " << stream.size() << " -- " << size - stream.size();
-        builder->segwit_data(stream);
-        LOG_DEBUG << "make preSegwitShare after segwit_data\t = " << stream.size() << " -- " << size - stream.size();
-        builder->share_info(stream);
-        LOG_DEBUG << "make preSegwitShare after share_info\t = " << stream.size() << " -- " << size - stream.size();
-        builder->ref_merkle_link(stream);
-        LOG_DEBUG << "make preSegwitShare after ref_merkle_link\t = " << stream.size() << " -- " << size - stream.size();
-        builder->last_txout_nonce(stream);
-        LOG_DEBUG << "make preSegwitShare after last_txout_nonce\t = " << stream.size() << " -- " << size - stream.size();
-        builder->hash_link(stream);
-        LOG_DEBUG << "make preSegwitShare after hash_link\t = " << stream.size() << " -- " << size - stream.size();
-        builder->merkle_link(stream);
-        LOG_DEBUG << "make preSegwitShare after merkle_link\t = " << stream.size() << " -- " << size - stream.size();
+		builder->min_header(stream)
+				->share_data(stream)
+				->segwit_data(stream)
+				->share_info(stream)
+				->ref_merkle_link(stream)
+				->last_txout_nonce(stream)
+				->hash_link(stream)
+				->merkle_link(stream);
         return builder->GetShare();
 	}
 };
