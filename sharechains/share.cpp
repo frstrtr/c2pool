@@ -246,14 +246,23 @@ PackedShareData pack_share(ShareType share)
 	// Pack share to t['share_type'] from p2pool
 	PackStream contents;
 	contents << *share->min_header->stream();
+    LOG_DEBUG << "contents.min_header len = " << contents.size();
     contents << *share->share_data->stream();
+    LOG_DEBUG << "contents.share_data len = " << contents.size();
     if (share->segwit_data)
         contents << *share->segwit_data->stream();
+    LOG_DEBUG << "contents.segwit_data len = " << contents.size();
 	contents << *share->share_info->stream();
+    LOG_DEBUG << "contents.share_info len = " << contents.size();
 	contents << *share->ref_merkle_link->stream();
+    LOG_DEBUG << "contents.ref_merkle_link len = " << contents.size();
 	contents << pack<IntType(64)>(share->last_txout_nonce);
+    LOG_DEBUG << "contents.last_txout_nonce len = " << contents.size();
 	contents << *share->hash_link->stream();
+    LOG_DEBUG << "contents.hash_link len = " << contents.size();
 	contents << *share->merkle_link->stream();
+    LOG_DEBUG << "contents.merkle_link len = " << contents.size();
+
     LOG_TRACE << "contents = " << contents.size();
 
 	// Pack share to PackedShareData
