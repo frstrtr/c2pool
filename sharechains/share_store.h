@@ -113,7 +113,6 @@ public:
 //
 //                        if (raw_share.type.get() < 17)
 //                            continue;
-                        LOG_TRACE << "stream len: " << stream.size();
                         auto share = load_share(stream, net, {{}, {}});
                         share->time_seen = 0;
 //                        std::cout << "share_hash: " << share->hash << std::endl;
@@ -152,7 +151,6 @@ public:
 
         auto readed_share = shares->Read(hash);
         auto packed_share = pack_to_stream<ShareTypeStream>(readed_share);
-        LOG_TRACE << "PACKED VALUE: " << packed_share.size();
         auto share = load_share(packed_share, net, {"0.0.0.0", "0"});
         return share;
     }
