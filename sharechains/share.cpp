@@ -254,7 +254,6 @@ PackedShareData pack_share(ShareType share)
 	contents << pack<IntType(64)>(share->last_txout_nonce);
 	contents << *share->hash_link->stream();
 	contents << *share->merkle_link->stream();
-    LOG_TRACE << "contents = " << contents.size();
 
 	// Pack share to PackedShareData
 	PackedShareData result(share->VERSION, contents);
