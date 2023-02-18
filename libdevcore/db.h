@@ -11,6 +11,8 @@
 #include "logger.h"
 #include "stream.h"
 
+//TODO: WriteBatch?
+
 template <typename KeyStreamType, typename ValueStreamType>
 class Database
 {
