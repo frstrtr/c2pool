@@ -33,10 +33,6 @@ void NodeManager::run()
     // Determining payout address
     // TODO
 
-    // Share Store
-    // LOG_INFO << "ShareStore initialization...";
-    // TODO: _share_store = std::make_shared<ShareStore>("dgb");
-
     // Share Tracker
     _tracker = std::make_shared<ShareTracker>(_net);
     _tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){_tracker->init(shares, known);});

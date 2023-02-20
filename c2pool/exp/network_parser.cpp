@@ -7,13 +7,6 @@
 #include <networks/network.h>
 #include <libdevcore/str.h>
 
-void make_default_network()
-{
-
-};
-
-//#define SAVE
-
 int main()
 {
     std::vector net_names {"digibyte"};
