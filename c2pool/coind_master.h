@@ -46,7 +46,7 @@ namespace c2pool::master
             std::this_thread::sleep_for(100ms);
         }
         LOG_INFO << name << " started!";
-        return node;
+        return std::move(node);
     }
 
     std::vector<std::shared_ptr<NodeManager>> make_nodes(boost::asio::thread_pool &thread_pool, po::variables_map &vm)
@@ -63,10 +63,11 @@ namespace c2pool::master
         std::vector<std::shared_ptr<NodeManager>> nodes;
         for (const auto& n : networks)
         {
-            nodes.push_back(make_node(thread_pool, n));
+            nodes.push_back(std::move(make_node(thread_pool, n)));
+            LOG_TRACE << "1";
         }
-
-        return nodes;
+        LOG_TRACE << "1";
+        return std::move(nodes);
     }
 
 //    shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool, po::variables_map &vm) {

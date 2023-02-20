@@ -1,6 +1,6 @@
 #include "stratum_node.h"
 
-StratumNode::StratumNode(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<Worker> worker) : _context(std::move(context)), acceptor(*_context), resolver(*_context), _worker(std::move(worker))
+StratumNode::StratumNode(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<Worker> worker) : _context(std::move(context)), acceptor(*_context), _worker(std::move(worker))
 {
     ip::tcp::endpoint listen_ep(ip::tcp::v4(), 1131);
 
@@ -50,7 +50,7 @@ void StratumNode::listen()
                                   listen();
                               } else
                               {
-                                  std::cout << ec.message() << std::endl;
+                                  LOG_ERROR << "Stratum node listen: " << ec << " " << ec.message() << std::endl;
                               }
 
                           });

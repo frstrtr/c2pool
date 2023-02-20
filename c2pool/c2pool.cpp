@@ -73,12 +73,13 @@ int main(int ac, char *av[])
     boost::asio::thread_pool coind_threads(1);
     //Creating and initialization coinds network, config and NodeManager
 
-    c2pool::master::make_nodes(coind_threads, vm);
+    auto nodes = c2pool::master::make_nodes(coind_threads, vm);
 
     //Init exit handler
     ExitSignalHandler exitSignalHandler;
     signal(SIGINT, &ExitSignalHandler::handler);
     signal(SIGTERM, &ExitSignalHandler::handler);
+    signal(SIGABRT, &ExitSignalHandler::handler);
 
     while (exitSignalHandler.working())
     {

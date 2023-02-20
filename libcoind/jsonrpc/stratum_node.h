@@ -12,7 +12,6 @@ class StratumNode
     std::shared_ptr<boost::asio::io_context> _context;
 
     ip::tcp::acceptor acceptor;
-    ip::tcp::resolver resolver;
 
     std::shared_ptr<Worker> _worker;
 

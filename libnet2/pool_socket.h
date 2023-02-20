@@ -107,6 +107,7 @@ public:
         LOG_INFO << "Pool socket disconnected from " << _addr << ":" << _port;
         LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
 		// TODO: call event disconnect
+
 		socket->close();
 	}
 };
