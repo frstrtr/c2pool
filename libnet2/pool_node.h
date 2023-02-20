@@ -174,7 +174,7 @@ public:
 	{
 		if (run_state == both || run_state == onlyServer)
 		{
-			listener = std::make_shared<ListenerType>(context, net, config->listenPort);
+			listener = std::make_shared<ListenerType>(context, net, config->c2pool_port);
 			listen();
 		}
 

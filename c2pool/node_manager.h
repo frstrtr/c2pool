@@ -27,7 +27,7 @@ public:
     {
     }
 
-    //TODO: ~NodeManager();
+    // ~NodeManager();
 
     void run();
 
@@ -52,8 +52,6 @@ public:
 
     shared_ptr<ShareTracker> tracker() const;
 
-//TODO:    shared_ptr<ShareStore> share_store() const;
-
     shared_ptr<Worker> worker() const;
 
     shared_ptr<StratumNode> stratum() const;
@@ -68,7 +66,6 @@ protected:
     shared_ptr<coind::JSONRPC_Coind> _coind;
     shared_ptr<CoindNode> _coind_node;
     shared_ptr<ShareTracker> _tracker;
-//TODO:    shared_ptr<ShareStore> _share_store;
     shared_ptr<Worker> _worker;
     shared_ptr<StratumNode> _stratum;
 
@@ -104,8 +101,6 @@ public:
     create_set_method(CoindNode, _coind_node);
 
     create_set_method(ShareTracker, _tracker);
-
-//    create_set_method(ShareStore, _share_store);
 
     create_set_method(Worker, _worker);
 

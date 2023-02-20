@@ -24,3 +24,6 @@ target_link_libraries(coind_n_pool libcoind libnet2 libdevcore networks sharecha
 
 add_executable(net_parser exp/network_parser.cpp)
 target_link_libraries(net_parser networks Boost::program_options btclibs)
+
+add_executable(args_parser exp/args_parser.cpp)
+target_link_libraries(args_parser networks Boost::program_options btclibs)
