@@ -160,7 +160,7 @@ namespace coind::data
             stream << "(WitnessTransactionData: ";
             stream << "marker = " << value.marker;
             stream << ", flag = " << +value.flag; // + for print uint8_t
-            stream << ", witness = " << value.witness;
+            stream << ", witness = " << value.witness; // TODO: string -> bytes
             stream << ")";
 
             return stream;
