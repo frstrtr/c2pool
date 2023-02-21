@@ -76,14 +76,14 @@ public:
     void socket_handle(std::shared_ptr<Socket> socket)
     {
         socket->set_addr();
-		auto addr = socket->get_addr();
+        auto addr = socket->get_addr();
         client_attempts[std::get<0>(addr)] =
-				std::make_shared<PoolHandshakeClient>(std::move(socket),
-                                                                                                 message_version_handle,
-                                                                                                 std::bind(
-                                                                                                        &PoolNodeClient::handshake_handle,
-                                                                                                        this,
-                                                                                                        std::placeholders::_1));
+                std::make_shared<PoolHandshakeClient>(std::move(socket),
+                                                      message_version_handle,
+                                                      std::bind(
+                                                              &PoolNodeClient::handshake_handle,
+                                                              this,
+                                                              std::placeholders::_1));
     }
 
     void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
@@ -94,7 +94,7 @@ public:
         auto ip = std::get<0>(_protocol->get_socket()->get_addr());
         peers[_protocol->nonce] = _protocol;
         client_connections[ip] = std::move(_protocol);
-//	TODO:	client_attempts.erase(ip);
+	    client_attempts.erase(ip);
     }
 
 	void auto_connect()
@@ -118,7 +118,7 @@ public:
 										  {
 											  if (client_attempts.find(std::get<0>(addr)) != client_attempts.end())
 											  {
-												  //TODO: [UNCOMMENT] LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+												  LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
 												  continue;
 											  }
 
@@ -127,6 +127,7 @@ public:
 
 											  (*connector)(std::bind(&PoolNodeClient::socket_handle, this, std::placeholders::_1), addr);
 										  }
+                                          //TODO: remove return
                                           return;
                                           auto_connect();
 									  });
