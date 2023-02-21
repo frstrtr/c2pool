@@ -98,7 +98,8 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 		}
 
 		new_count++;
-		tracker->add(share);
+        //TODO: UNCOMMENT
+//		tracker->add(share);
 	}
 
 	known_txs.add(all_new_txs);

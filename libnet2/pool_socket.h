@@ -34,7 +34,7 @@ public:
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
-		LOG_TRACE << "socket created";
+		LOG_TRACE << "socket created2";
 	}
 
 	~PoolSocket(){
@@ -72,8 +72,8 @@ public:
                                      LOG_DEBUG << "[PoolSocket] peer receive message_" << cmd;
                                      if (_ec)
                                      {
-                                         LOG_ERROR << "[PoolSocket] write error: " << _ec << ":" << _ec.message();
-                                         disconnect();
+                                         std::string reason = "[PoolSocket] write error: " + _ec.message();
+                                         bad_peer.happened(reason);
                                      } else
                                      {
                                         last_message_sent = cmd;
@@ -104,10 +104,8 @@ public:
 	void disconnect() override
 	{
         auto [_addr, _port] = get_addr();
-        LOG_INFO << "Pool socket disconnected from " << _addr << ":" << _port;
-        LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
-		// TODO: call event disconnect
-
+        LOG_INFO << "\tPool socket disconnected from " << _addr << ":" << _port;
+        LOG_INFO.stream() << "\tLast message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
 		socket->close();
 	}
 };

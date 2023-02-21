@@ -61,20 +61,21 @@ public:
 
 	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
 	{
-		LOG_DEBUG << "Pool handshake client handle message: " << raw_msg->command;
+		LOG_DEBUG << "Pool handshake server handle message: " << raw_msg->command;
 		try
 		{
 			if (raw_msg->command != "version")
-				throw std::runtime_error("msg != version"); //TODO: ERROR CODE FOR CONSOLE
+				throw std::runtime_error("msg != version");
 
 			auto msg = std::make_shared<pool::messages::message_version>();
 			raw_msg->value >> *msg;
 
 			// Если внутри handle_message_version нет никаких ошибок, throw, то вызывается handshake_finish();
 			handle_message_version(this->shared_from_this(), msg);
-		} catch (const std::error_code &ec)
+		} catch (const std::runtime_error &ec)
 		{
-			// TODO: disconnect
+            std::string reason = "[PoolHandshakeServer] handle_message error = " + std::string(ec.what());
+            disconnect(reason);
 			return;
 		}
 		send_version();
@@ -97,16 +98,17 @@ public:
         try
         {
             if (raw_msg->command != "version")
-                throw std::runtime_error("msg != version"); //TODO: ERROR CODE FOR CONSOLE
+                throw std::runtime_error("msg != version");
 
             auto msg = std::make_shared<pool::messages::message_version>();
             raw_msg->value >> *msg;
 
 			// Если внутри handle_message_version нет никаких ошибок, throw, то вызывается handshake_finish();
             handle_message_version(this->shared_from_this(), msg);
-        } catch (const std::error_code &ec)
+        } catch (const std::runtime_error &ec)
         {
-            // TODO: disconnect
+            std::string reason = "[PoolHandshakeClient] handle_message error = " + std::string(ec.what());
+            disconnect(reason);
         }
 		handshake_finish(this->shared_from_this());
 	}

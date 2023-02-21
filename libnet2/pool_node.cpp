@@ -79,12 +79,12 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
 	if (peers.count(msg->nonce.get()) != 0)
 	{
 		auto addr = handshake->get_socket()->get_addr();
-		LOG_WARNING
-			<< "Detected duplicate connection, disconnecting from "
-			<< std::get<0>(addr)
-			<< ":"
-			<< std::get<1>(addr);
-		handshake->get_socket()->disconnect();
+		std::string reason =
+			 "[handle_message_version] Detected duplicate connection, disconnecting from "
+			+ std::get<0>(addr)
+			+ ":"
+			+ std::get<1>(addr);
+        handshake->disconnect(reason);
 		return;
 	}
 
@@ -117,8 +117,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             _socket->write(msg_have_tx);
         }
     });
-
-    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.added.unwatch(watch_id0))
+    handshake->event_disconnect.subscribe([&, _id = id_add_to_remote_view_of_my_known_txs](){ known_txs.added->unsubscribe(_id); });
 
     // remove_from_remote_view_of_my_known_txs
     auto id_remove_from_remote_view_of_my_known_txs = known_txs.removed->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> removed)
@@ -148,9 +147,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
              */
         }
     });
-
-    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.removed.unwatch(watch_id1))
-
+    handshake->event_disconnect.subscribe([&, _id = id_remove_from_remote_view_of_my_known_txs](){ known_txs.removed->unsubscribe(_id); });
 
     auto id_update_remote_view_of_my_known_txs = known_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
         std::map<uint256, coind::data::tx_type> added;
@@ -206,9 +203,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             // TODO: reactor.callLater(20, self.known_txs_cache.pop, key)
         }
     });
-
-    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.known_txs_var.transitioned.unwatch(watch_id2))
-
+    handshake->event_disconnect.subscribe([&, _id = id_update_remote_view_of_my_known_txs](){ known_txs.transitioned->unsubscribe(_id); });
 
     {
         std::vector<uint256> tx_hashes;
@@ -299,7 +294,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             socket->write(msg_remember_tx);
         }
     });
-    //TODO: EVENT for connection_lost: self.connection_lost_event.watch(lambda: self.node.mining_txs_var.transitioned.unwatch(watch_id2))
+    handshake->event_disconnect.subscribe([&, _id = id_update_remote_view_of_my_mining_txs](){ mining_txs.transitioned->unsubscribe(_id); });
 
     for (auto x : mining_txs.value())
     {
@@ -445,8 +440,8 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                     }
                     if (flag)
                     {
-                        LOG_ERROR << boost::format("Peer referenced unknown transaction %1%, disconnecting") % tx_hash.GetHex();
-                        //TODO: disconnect
+                        std::string reason = (boost::format("Peer referenced unknown transaction %1%, disconnecting") % tx_hash.GetHex()).str();
+                        protocol->disconnect(reason);
                         return;
                     }
                 }
@@ -545,8 +540,8 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
     {
         if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
         {
-            LOG_WARNING << "Peer referenced transaction twice, disconnecting";
-            protocol->get_socket()->disconnect();
+            std::string reason = "[handle_message_remember_tx] Peer referenced transaction twice, disconnecting";
+            protocol->disconnect(reason);
             return;
         }
 
@@ -570,8 +565,8 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 
 			if (!founded_cache)
 			{
-				LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString() << " disconnecting";
-				protocol->get_socket()->disconnect();
+                std::string reason = "[handle_message_remember_tx] Peer referenced unknown transaction " + tx_hash.ToString() + " disconnecting";
+                protocol->disconnect(reason);
 				return;
 			}
         }
@@ -593,8 +588,8 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 
 		if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
 		{
-			LOG_WARNING << "Peer referenced transaction twice, disconnecting";
-			protocol->get_socket()->disconnect();
+            std::string reason = "[handle_message_remember_tx] Peer referenced transaction twice, disconnecting";
+            protocol->disconnect(reason);
 			return;
 		}
 
