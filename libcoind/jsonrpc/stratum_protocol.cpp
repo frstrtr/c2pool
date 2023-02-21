@@ -4,21 +4,21 @@
 #include <string>
 #include <libdevcore/logger.h>
 
-
-StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event) : _context(std::move(context)), _socket(std::move(socket)), client(*this, version::v2), disconnect_event(std::move(_disconnect_event)),
-    addr(std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port()))
+StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f) : ProtocolEvents(), _context(std::move(context)), _socket(std::move(socket)), client(*this, version::v2), disconnect_in_node_f(std::move(_disconnect_in_node_f)),
+                                                                                                                                                                                                              addr(std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port()))
 {
-    read();
+    Read();
 }
 
-void StratumProtocol::read()
+void StratumProtocol::Read()
 {
     boost::asio::async_read_until(*_socket, buffer, "\n", [&](const boost::system::error_code& ec, std::size_t len)
     {
-        if (buffer.size() == 0)
-            return;
         if (!ec)
         {
+            if (buffer.size() == 0)
+                return;
+
             std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), len);
             std::cout << "Message data: <" << data << ">." << std::endl;
 
@@ -35,11 +35,11 @@ void StratumProtocol::read()
             auto response = server.HandleRequest(request.dump());
             std::cout << "response: " << response << std::endl;
             buffer.consume(len);
-            read();
+            Read();
             Send(response);
         } else
         {
-            std::cout << "StratumProtocol::read() error: " << ec.message() << std::endl;
+            disconnect("StratumProtocol::read() error = " + ec.message());
         }
     });
 }
@@ -55,14 +55,17 @@ std::string StratumProtocol::Send(const std::string &request)
 //                    read();
             std::cout << "Writed answer" << std::endl;
         } else {
-            std::cout << "Response error: " << ec.message() << std::endl;
+            disconnect("Response error = " + ec.message());
         }
     });
     return {};
 }
 
-void StratumProtocol::disconnect()
+void StratumProtocol::disconnect(std::string reason)
 {
+    auto [ip, port] = get_addr();
+    LOG_INFO << "StratumProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
+    event_disconnect.happened();
     _socket->close();
-    disconnect_event(get_addr());
+    disconnect_in_node_f(get_addr());
 }

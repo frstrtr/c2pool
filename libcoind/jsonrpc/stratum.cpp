@@ -6,8 +6,8 @@
 
 #include <utility>
 
-Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::shared_ptr<Worker> worker, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event)
-                : StratumProtocol(context, std::move(socket), std::move(_disconnect_event)), _worker(std::move(worker)), _t_send_work(*context), handler_map(_context, 300)
+Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::shared_ptr<Worker> worker, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f)
+                : StratumProtocol(context, std::move(socket), std::move(_disconnect_in_node_f)), _worker(std::move(worker)), _t_send_work(*context), handler_map(_context, 300)
 {
     server.Add("mining.subscribe", GetUncheckedHandle([&](const json &value)
                                                       {
@@ -18,9 +18,8 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
 
     server.Add("mining.submit", GetHandle(&Stratum::mining_submit, *this));
 
-    _worker->new_work.subscribe([&](){ _send_work(); });
-
-    std::cout << "Added methods to server" << std::endl;
+    auto new_work_id = _worker->new_work.subscribe([&](){ _send_work(); });
+    event_disconnect.subscribe([&, _new_work_id = new_work_id](){ _worker->new_work.unsubscribe(_new_work_id); });
 }
 
 void Stratum::_send_work()
@@ -33,8 +32,7 @@ void Stratum::_send_work()
         get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
     } catch (const std::runtime_error &ec)
     {
-        LOG_ERROR << "Stratum disconnect " << ec.what();
-        disconnect();
+        disconnect(ec.what());
         return;
     }
 
@@ -76,15 +74,7 @@ json Stratum::mining_subscribe(const json &_params)
     }
 
     json res;
-    //res = {{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"}, "", 8};
 
-//    _context->post([&](){_send_work();});
-//    _t_send_work.expires_from_now(boost::posix_time::seconds(0));
-//    _t_send_work.async_wait([&](const boost::system::error_code &ec){
-//        _send_work();
-//    });
-
-//    _send_work();
     //TODO: sub id
     res = {{{"mining.notify", "ae6812eb4cd7735a302a8a9dd95cf71f"},{}}, "", 8};
     return res;
@@ -102,8 +92,6 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
 
 json Stratum::mining_set_difficulty(difficulty_type difficulty)
 {
-//    std::string diff_data = "{" + difficulty.ToString() + "}";
-//    json diff_json = diff_data;
     client.CallNotification("mining.set_difficulty", {difficulty});
     std::cout << "called mining_set_difficulty" << std::endl;
 }
@@ -182,25 +170,8 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
 
     coind::data::types::BlockHeaderType header(x.version, x.previous_block, _timestamp, x.bits, nonce, merkle_root);
 
-    //DEBUG
-    std::cout << "coinb1: " << HexStr(x.coinb1) << std::endl;
-    std::cout << "coinb_nonce: " << HexStr(coinb_nonce) << std::endl;
-    std::cout << "coinb2: " << HexStr(x.coinb2) << std::endl;
-    std::cout << "merkle_link: " << x.merkle_link.index << " ";
-    for (auto br : x.merkle_link.branch)
-    {
-        std::cout << br.GetHex() << " ";
-    }
-    std::cout << ".\n";
-    std::cout << "merkle_root: <" << merkle_root.ToString() << ">" << std::endl;
-    //########
-
     // IN P2Pool -- coinb_nonce = bytes, c2pool -- IntType64
     return map_obj->get_response(header, _worker_name, unpack<IntType(64)>(coinb_nonce));
-
-
-
-//    return {true};
 }
 
 

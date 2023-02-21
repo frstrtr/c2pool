@@ -5,20 +5,21 @@
 #include <boost/asio.hpp>
 #include <boost/asio/buffer.hpp>
 
+#include <libp2p/protocol_events.h>
+
 #include <memory>
 using namespace jsonrpccxx;
 
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-class StratumProtocol : public jsonrpccxx::IClientConnector
+class StratumProtocol : public jsonrpccxx::IClientConnector, protected virtual ProtocolEvents
 {
 public:
-    StratumProtocol();
-    StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event);
+//    StratumProtocol();
+    StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f);
 
-    void read();
-
+    void Read();
     std::string Send(const std::string &request) override;
 
     auto get_addr() const
@@ -26,7 +27,7 @@ public:
         return addr;
     }
 
-    void disconnect();
+    void disconnect(std::string reason);
 
 protected:
     std::shared_ptr<boost::asio::io_context> _context;
@@ -36,9 +37,7 @@ protected:
 
     std::shared_ptr<ip::tcp::socket> _socket;
     const std::tuple<std::string, unsigned short> addr;
-    std::function<void(std::tuple<std::string, unsigned short>)> disconnect_event;
+    std::function<void(std::tuple<std::string, unsigned short>)> disconnect_in_node_f;
 private:
     io::streambuf buffer;
-//    io::steady_timer listen_timer
-
 };

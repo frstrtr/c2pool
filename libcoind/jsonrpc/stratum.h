@@ -13,7 +13,7 @@ class Stratum : public StratumProtocol
 {
     typedef double difficulty_type;
 public:
-    Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::shared_ptr<Worker> worker, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_event);
+    Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::shared_ptr<Worker> worker, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f);
 
     boost::asio::deadline_timer _t_send_work;
     std::shared_ptr<Worker> _worker;
