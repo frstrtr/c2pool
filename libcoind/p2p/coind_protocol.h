@@ -15,15 +15,20 @@
 class CoindProtocol : public Protocol<CoindProtocol>, public CoindProtocolData, ProtocolPinger
 {
 public:
-//    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>> get_block;
-//    std::shared_ptr<c2pool::deferred::ReplyMatcher<uint256, coind::data::BlockHeaderType, uint256>> get_block_header;
-
-    CoindProtocol(std::shared_ptr<boost::asio::io_context> _context, std::shared_ptr<Socket> _socket,
+    CoindProtocol(const std::shared_ptr<boost::asio::io_context>& _context, std::shared_ptr<Socket> _socket,
                   HandlerManagerPtr<CoindProtocol> _handler_manager) : Protocol<CoindProtocol>("Coind", std::move(_socket), std::move(_handler_manager)),
-                                                                       ProtocolPinger(_context, 30, std::bind(&CoindProtocol::out_time_ping, this),
+                                                                       ProtocolPinger(_context, 30, [this] { out_time_ping(); },
 																					  [](){return 20; /*TODO: return  random.expovariate(1/100)*/}, [&](){ send_ping(); })
     {
 		send_version();
+    }
+
+    void disconnect(std::string reason) override
+    {
+        auto [ip, port] = get_addr();
+        LOG_WARNING << "CoindProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
+        event_disconnect.happened();
+        socket->disconnect();
     }
 
 private:
