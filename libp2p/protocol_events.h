@@ -12,7 +12,8 @@ class ProtocolEvents
 {
     bool stopped = false;
 protected:
-    Event<> event_handle_message; // Вызывается, когда мы получаем любое сообщение.
+    Event<> event_handle_message;   // Вызывается, когда мы получаем любое сообщение.
+    Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
 
     bool is_stopped() const { return stopped;}
 
@@ -37,7 +38,7 @@ private:
                          {
                              if (ec)
                              {
-                                 if (ec == errc::operation_canceled)
+                                 if (ec == boost::system::errc::operation_canceled)
                                  {
 									 // Если таймер был canceled, то он запускается заново без вызова outtimeF()
                                      start_outtime_ping();
@@ -74,12 +75,12 @@ private:
 
 public:
 
-    ProtocolPinger(std::shared_ptr<boost::asio::io_context> _context, time_t outtime_t, std::function<void()> outtime_f, std::function<time_t()> send_ping_t, std::function<void()> send_ping_f)
+    ProtocolPinger(const std::shared_ptr<boost::asio::io_context>& _context, time_t outtime_t, std::function<void()> outtime_f, std::function<time_t()> send_ping_t, std::function<void()> send_ping_f)
             : outtime_ping_time(outtime_t), timer_outtime(*_context), outtimeF(std::move(outtime_f)),
 			  send_ping_time(std::move(send_ping_t)), timer_send_ping(*_context), send_pingF(std::move(send_ping_f))
     {
         start_outtime_ping();
-        event_handle_message.subscribe(std::bind(&ProtocolPinger::restart_ping, this));
+        event_handle_message.subscribe([this] { restart_ping(); });
 
 		start_send_ping();
     }
