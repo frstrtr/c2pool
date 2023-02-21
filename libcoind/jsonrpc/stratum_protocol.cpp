@@ -64,7 +64,7 @@ std::string StratumProtocol::Send(const std::string &request)
 void StratumProtocol::disconnect(std::string reason)
 {
     auto [ip, port] = get_addr();
-    LOG_INFO << "StratumProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
+    LOG_WARNING << "StratumProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
     event_disconnect.happened();
     _socket->close();
     disconnect_in_node_f(get_addr());
