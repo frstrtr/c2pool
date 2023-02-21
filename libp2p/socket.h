@@ -6,10 +6,14 @@
 #include <functional>
 #include <utility>
 
+#include <libdevcore/events.h>
+
 #include "message.h"
 
 class Socket
 {
+public:
+    Event<std::string> bad_peer; // call disconnect from Protocol; Protocol need sub to this event
 protected:
     typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> handler_type;
     handler_type handler;
@@ -20,6 +24,8 @@ protected:
     std::string last_message_sent; // last message sent by me and received by peer.
     std::string last_message_received; // last message sent by peer and received by me.
     std::map<std::string, int32_t> not_received; // messages sent by me and not yet received by peer
+
+
 
     void add_not_received(const std::string& key)
     {
