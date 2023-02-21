@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <functional>
+#include <utility>
 
 #include "socket.h"
 #include "message.h"
@@ -23,7 +24,10 @@ public:
     // Not safe, socket->message_handler = nullptr; wanna for manual setup
     BaseProtocol() = default;
 
-    BaseProtocol (std::shared_ptr<Socket> _socket) : socket(_socket) {}
+    BaseProtocol (std::shared_ptr<Socket> _socket) : socket(std::move(_socket))
+    {
+        socket->bad_peer.subscribe([&](const std::string &reason){ disconnect(reason); });
+    }
 
 public:
     void set_socket(std::shared_ptr<Socket> _socket);
@@ -43,6 +47,8 @@ public:
 
         return socket->get_addr() < rhs.socket->get_addr();
     }
+
+    virtual void disconnect(std::string reason);
 };
 
 template <typename T>
@@ -85,5 +91,4 @@ public:
     {
         handler_manager = _mngr;
     }
-
 };

@@ -11,10 +11,10 @@
 class ProtocolEvents
 {
     bool stopped = false;
-protected:
+public:
     Event<> event_handle_message;   // Вызывается, когда мы получаем любое сообщение.
     Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
-
+protected:
     bool is_stopped() const { return stopped;}
 
     void stop() { stopped = true; }
