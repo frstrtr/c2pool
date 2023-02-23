@@ -160,8 +160,18 @@ namespace coind::data
             stream << "(WitnessTransactionData: ";
             stream << "marker = " << value.marker;
             stream << ", flag = " << +value.flag; // + for print uint8_t
-            stream << ", witness = " << value.witness; // TODO: string -> bytes
-            stream << ")";
+            stream << ", witness = [ ";
+            for (const auto &_w : value.witness)
+            {
+                stream << "[ ";
+                for (const auto &w : _w)
+                {
+                    PackStream a(w.c_str(), w.size());
+                    stream << a;
+                }
+                stream << "],";
+            }
+            stream << "\b])";
 
             return stream;
         }
