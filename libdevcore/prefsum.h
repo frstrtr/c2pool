@@ -54,8 +54,6 @@ public:
 
     virtual sub_element_type& erase(const sub_element_type &sub)
     {
-        std::cout << head << " " << tail << std::endl;
-        std::cout << sub.head << " " << sub.tail << std::endl;
         if (head == sub.head)
         {
             head = sub.tail;

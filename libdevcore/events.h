@@ -53,7 +53,6 @@ public:
 
     int subscribe(std::function<void()> _f)
     {
-        std::cout << "SUBSCRIBE" << std::endl;
         boost::signals2::connection bc = sig_anon->connect(_f);
 
         auto id = get_id();

@@ -57,12 +57,9 @@ namespace coind::data
     {
         assert(!att.IsNull());
 
-        std::cout << "att: " << att.GetHex() << std::endl;
-
         arith_uint288 s;
         s.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
         s /= att;
-        std::cout << "s: " << s.GetHex() << std::endl;
 
         arith_uint288 _max_value;
         _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -75,7 +72,6 @@ namespace coind::data
         r_round.SetCompact(UintToArith256(uint256S(s.GetHex())).GetCompact() + 0.5);
         s.SetHex(ArithToUint256(r_round).GetHex());
 
-        std::cout << "Not a Double: " << s.GetHex() << std::endl;
         return uint256S(s.GetHex());
     }
 
@@ -93,7 +89,6 @@ namespace coind::data
         targ.SetHex(target.GetHex());
 
         auto v = UintToArith288(targ);
-        std::cout << "v: " << v.GetHex() << std::endl;
         assert(!target.IsNull());
 
         uint288 u_s;
@@ -104,7 +99,6 @@ namespace coind::data
         s += 1;
 
         auto r = s/(v+1);
-        std::cout << "Not a Double: " << r.GetHex() << std::endl;
         return r.getdouble();
     }
 
@@ -114,7 +108,6 @@ namespace coind::data
         targ.SetHex(difficulty.GetHex());
 
         auto v = UintToArith288(targ);
-        std::cout << "v: " << v.GetHex() << std::endl;
         if (targ.IsNull())
             return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
@@ -138,7 +131,6 @@ namespace coind::data
                 return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         }
 
-        std::cout << "Not a Double: " << r.GetHex() << std::endl;
         return uint256S(r.GetHex()) ;
     }
 
@@ -348,18 +340,6 @@ namespace coind::data
                             new_hash_list.emplace_back(_hash, left.f || right.f, _l);
                         }
             hash_list = new_hash_list;
-
-//            LOG_TRACE << i << ": ";
-//            for (auto v : hash_list)
-//            {
-//                LOG_TRACE << v.value << ", " << v.f << ", (";
-//                for (auto v2 : v.l)
-//                {
-//                    LOG_TRACE << v2.hash.GetHex() << " " << v2.side;
-//                }
-//                LOG_TRACE << ").";
-//            }
-//            i += 1;
 		}
 
         std::vector<uint256> res_branch;

@@ -32,7 +32,6 @@ namespace shares
 
     }
 
-    //TODO: Test
     std::shared_ptr<GeneratedShareTransactionResult> GenerateShareTransaction::operator()(uint64_t version)
     {
         //t0
@@ -61,7 +60,6 @@ namespace shares
         {
             auto tx_hash = std::get<0>(item);
             auto fee = std::get<1>(item);
-            LOG_TRACE << "from desired_other_transaction_hashes_and_fees: " << tx_hash << "; " << (fee.has_value() ? fee.value() : -1);
             if (!fee.has_value())
                 fees_none_contains = true;
 
@@ -79,11 +77,7 @@ namespace shares
             }
         }
 
-        LOG_TRACE << "fees_none_contains = " << fees_none_contains;
-        LOG_TRACE << "_share_data.subsidy = " << _share_data.subsidy;
-        LOG_TRACE << "_base_subsidy = " << _base_subsidy;
-        LOG_TRACE << "definite_fees = " << definite_fees;
-        if (!fees_none_contains)//TODO:
+        if (!fees_none_contains)
         {
             _share_data.subsidy += removed_fee_sum;
         } else
@@ -96,9 +90,6 @@ namespace shares
         bool segwit_activated = is_segwit_activated(version, net);
         if (!_segwit_data.has_value() && !_known_txs.has_value())
         {
-            LOG_TRACE << "!_segwit_data.has_value(): " << !_segwit_data.has_value();
-            LOG_TRACE << "_known_txs.empty(): " << !_known_txs.has_value();
-            LOG_TRACE << "segwit_activated -> false";
             segwit_activated = false;
         }
 
@@ -126,15 +117,12 @@ namespace shares
         if (segwit_activated && _segwit_data.has_value())
         {
             PackStream stream(witness_reserved_value_str, strlen(witness_reserved_value_str));
-            LOG_TRACE << "witness_reserved_stream: " << stream;
             IntType(256) witness_reserved_stream;
             stream >> witness_reserved_stream;
 
             uint256 witness_reserved_value = witness_reserved_stream.get();
-            LOG_TRACE << "witness_reserved_value = " << witness_reserved_value.GetHex();
 
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
-            LOG_TRACE << "witness_commitment_hash = " << witness_commitment_hash.GetHex();
         }
 
         std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs, segwit_activated);
@@ -158,7 +146,6 @@ namespace shares
 
     arith_uint256 GenerateShareTransaction::pre_target_calculate(ShareType previous_share, const int32_t &height)
     {
-        LOG_TRACE << "pre_target_calculate called";
         arith_uint256 _pre_target3;
         if (height < net->TARGET_LOOKBEHIND)
         {
@@ -166,7 +153,6 @@ namespace shares
         } else
         {
             auto attempts_per_second = tracker->get_pool_attempts_per_second(_share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true);
-            LOG_TRACE << "attempts_per_second = " << attempts_per_second.GetHex();
 
             arith_uint288 pre_target;
             pre_target.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
@@ -191,17 +177,12 @@ namespace shares
             _pre_target3 = math::clip(pre_target2, UintToArith256(net->MIN_TARGET), UintToArith256(net->MAX_TARGET));
         }
         uint256 pre_target3 = ArithToUint256(_pre_target3);
-        LOG_TRACE << "pre_target3 = " << pre_target3.GetHex();
-
         return _pre_target3;
     }
 
     std::tuple<FloatingInteger, FloatingInteger> GenerateShareTransaction::bits_calculate(const arith_uint256 &pre_target)
     {
-        LOG_TRACE << "bits_calculate called";
-
         FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(ArithToUint256(pre_target));
-        LOG_TRACE << "max_bits.target = " << max_bits.target().GetHex() << ", max_bits.value = " << max_bits.get();
         FloatingInteger bits;
         {
             arith_uint256 __desired_target = UintToArith256(_desired_target);
@@ -216,8 +197,6 @@ namespace shares
 
     std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> GenerateShareTransaction::new_tx_hashes_calculate(uint256 prev_share_hash, int32_t height)
     {
-        LOG_TRACE << "new_tx_hashes_calculate called";
-
         vector<uint256> new_transaction_hashes;
         int32_t all_transaction_stripped_size = 0;
         int32_t new_transaction_weight = 0;
@@ -335,8 +314,6 @@ namespace shares
 
     std::tuple<std::map<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height)
     {
-        LOG_TRACE << "weight_amount_calculate called";
-
         std::map<std::vector<unsigned char>, arith_uint288> weights;
         arith_uint288 total_weight;
         arith_uint288 donation_weight;
@@ -345,18 +322,13 @@ namespace shares
 
             int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
 
-            LOG_TRACE << "block_target: " << _block_target.GetHex();
             auto _block_target_attempts = coind::data::target_to_average_attempts(_block_target);
-            LOG_TRACE << "_block_target_attempts: " << _block_target_attempts.GetHex();
-
             auto desired_weight = _block_target_attempts * 65535 * net->SPREAD;
-
-            LOG_TRACE << "For get_cumulative_weights: " << start_hash.GetHex() << " " << max_shares << " " << desired_weight.GetHex();
             auto weights_result = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
+
             weights = std::get<0>(weights_result);
             total_weight = std::get<1>(weights_result);
             donation_weight = std::get<2>(weights_result);
-            LOG_TRACE << "weights.size = " << weights.size() << ", total_weight = " << total_weight.GetHex() << ", donation_weight = " << donation_weight.GetHex();
         }
 
         //assert
@@ -411,11 +383,8 @@ namespace shares
 
     coind::data::tx_type GenerateShareTransaction::gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
-        LOG_TRACE << "gentx_generate called";
-
         coind::data::tx_type gentx;
 
-        //		dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
         std::vector<std::vector<unsigned char>> dests;
         dests.reserve(amounts.size());
 
@@ -462,12 +431,9 @@ namespace shares
             auto script = std::vector<unsigned char>{0x6a, 0x28};
 
             auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data);
-            LOG_TRACE << "nonce = " << _share_data.nonce;
-            LOG_TRACE << "_get_ref_hash = " << _get_ref_hash;
             script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
 
             std::vector<unsigned char> packed_last_txout_nonce = pack<IntType(64)>(_last_txout_nonce);
-            LOG_TRACE.stream() << packed_last_txout_nonce;
             script.insert(script.end(), packed_last_txout_nonce.begin(), packed_last_txout_nonce.end());
 
             tx_outs.emplace_back(0, script);
@@ -483,8 +449,6 @@ namespace shares
             gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
         }
 
-        LOG_TRACE << "GENTX: " << gentx;
-
         return gentx;
     }
 
@@ -494,8 +458,6 @@ namespace shares
                                                   vector<uint256> new_transaction_hashes,
                                                   vector<tuple<uint64_t, uint64_t>> transaction_hash_refs, bool segwit_activated)
     {
-        LOG_TRACE << "share_info_generate called";
-
         std::shared_ptr<shares::types::ShareInfo> share_info;
 
         uint256 far_share_hash;
@@ -579,12 +541,9 @@ namespace shares
 
     get_share_method GenerateShareTransaction::get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info)
     {
-        LOG_TRACE << "get_share_func called";
-
         return [=, _net = net](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
-            LOG_TRACE << "NET NAME: " << _net->net_name;
             std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(_net);
 
             shared_ptr<::HashLinkType> pref_to_hash_link;
@@ -621,11 +580,6 @@ namespace shares
 
     void GenerateShareTransaction::make_segwit_data(const std::vector<uint256>& other_transaction_hashes)
     {
-        LOG_TRACE << "make_segwit_data called";
-
-        //	share_txs = [(known_txs[h], bitcoin_data.get_txid(known_txs[h]), h) for h in other_transaction_hashes]
-        //  segwit_data = dict(txid_merkle_link=bitcoin_data.calculate_merkle_link([None] + [tx[1] for tx in share_txs], 0), wtxid_merkle_root=bitcoin_data.merkle_hash([0] + [bitcoin_data.get_wtxid(tx[0], tx[1], tx[2]) for tx in share_txs]))
-
         struct __share_tx{
             std::shared_ptr<coind::data::TransactionType> tx;
             uint256 txid;

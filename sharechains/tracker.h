@@ -78,13 +78,10 @@ public:
     // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
 	std::tuple<int32_t, arith_uint288> score(uint256 share_hash, const std::function<int32_t(uint256)> &block_rel_height_func)
 	{
-        std::cout << "===SCORE BEGIN===" << std::endl;
 		arith_uint288 score_res;
 		auto head_height = verified.get_height(share_hash);
-        std::cout << "head_height: " << head_height << std::endl;
 		if (head_height < net->CHAIN_LENGTH)
 		{
-            std::cout << "===SCORE FINISH1===" << std::endl;
 			return std::make_tuple(head_height, score_res);
 		}
 
@@ -114,7 +111,6 @@ public:
 		score_res = verified.get_sum(share_hash, end_point).work /
 								   ((-block_height.value() + 1) * parent_net->BLOCK_PERIOD);
 
-        std::cout << "===SCORE FINISH2===" << std::endl;
 		return std::make_tuple(net->CHAIN_LENGTH, score_res);
 	}
 
@@ -152,7 +148,6 @@ public:
         if (start_height > max_shares)
         {
             last = get_nth_parent_key(start, max_shares);
-            LOG_TRACE << "last after max: " << last.GetHex();
         }
 
         // Поиск desired_weight

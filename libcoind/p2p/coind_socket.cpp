@@ -5,51 +5,6 @@
 
 #include <boost/asio.hpp>
 
-// Write
-//void CoindSocket::write_prefix(std::shared_ptr<Message> msg)
-//{
-////    LOG_TRACE << "CoindSocket::write_prefix: prefix(len = " << net->PREFIX_LENGTH << "): ";
-////    for (auto v = net->PREFIX; v < net->PREFIX+net->PREFIX_LENGTH; v++)
-////    {
-////        std::cout << (unsigned int) *v << " ";
-////    }
-////    std::cout << std::endl;
-//	boost::asio::async_write(*socket, boost::asio::buffer(net->PREFIX, net->PREFIX_LENGTH),
-//							 [this, msg](boost::system::error_code _ec, std::size_t length)
-//							 {
-//								 LOG_DEBUG << "CoindSocket: Write prefix called";
-//								 if (_ec)
-//								 {
-//									 LOG_ERROR << "CoindSocket::write()" << _ec << ":" << _ec.message();
-//									 return;
-//								 }
-//								 write_message_data(msg);
-//							 });
-//}
-//
-//void CoindSocket::write_message_data(std::shared_ptr<Message> msg)
-//{
-//	std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>();
-//	_msg->from_message(msg);
-//
-//    std::cout << "write_message_data: ";
-//    for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
-//    {
-//        std::cout << (unsigned int)((unsigned char) *v) << " ";
-//    }
-//    std::cout << std::endl;
-////    socket->async_send(boost::asio::buffer(_msg->data, _msg->len),
-//	boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-//							 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
-//							 {
-//								 LOG_DEBUG << "CoindSocket: Write msg data called: " << cmd;
-//								 if (_ec)
-//								 {
-//									 LOG_ERROR << "CoinSocket::write()" << _ec << ":" << _ec.message();
-//								 }
-//							 });
-//}
-
 // Read
 void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 {
@@ -57,7 +12,6 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
 							[this, msg](boost::system::error_code ec, std::size_t length)
 							{
-//                              LOG_TRACE << "COMPARE PREFIX: " << c2pool::dev::compare_str(msg->prefix, net->PREFIX, length);
 								if (!ec)
 								{
                                     if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
@@ -85,8 +39,6 @@ void CoindSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-//									LOG_TRACE << "try to read command: " << msg->command;
-									//LOG_INFO << "read_command";
 									read_length(msg);
 								}
 								else
@@ -105,8 +57,6 @@ void CoindSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-//									LOG_TRACE << "try to read length";
-									// LOG_INFO << "read_length";
 									read_checksum(msg);
 								}
 								else
@@ -125,8 +75,6 @@ void CoindSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-//									LOG_TRACE << "try to read checksum";
-									// LOG_INFO << "read_checksum";
 									read_payload(msg);
 								}
 								else

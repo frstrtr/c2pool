@@ -29,37 +29,26 @@ public:
 
 	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
-		LOG_TRACE << "socket created";
+		LOG_DEBUG << "PoolSocket created";
 	}
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
-		LOG_TRACE << "socket created2";
+        LOG_DEBUG << "PoolSocket created2";
 	}
 
 	~PoolSocket(){
-		LOG_TRACE << "socket removed";
+        LOG_DEBUG << "PoolSocket removed";
 	}
-
-	// Write
-//	void write_prefix(std::shared_ptr<Message> msg);
-//	void write_message_data(std::shared_ptr<Message> msg);
 
 	void write(std::shared_ptr<Message> msg) override
 	{
         LOG_DEBUG << "Pool Socket write for " << msg->command << "!";
-//        write_prefix(msg);
 
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
 
-        std::cout << "write_message_data: ";
-        for (auto v = _msg->data; v != _msg->data+_msg->len; v++)
-        {
-            std::cout << (unsigned int)((unsigned char) *v) << " ";
-        }
-        std::cout << std::endl;
+        LOG_DEBUG << "\tMessage data: " << *_msg;
 
-        LOG_DEBUG << "message length = " << _msg->len;
         if (_msg->len > 8000000)
         {
             LOG_INFO << "message length > max_payload_length!";

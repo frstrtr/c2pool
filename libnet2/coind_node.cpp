@@ -14,11 +14,9 @@ void CoindNode::start()
     get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work.pvalue()](){return _coind_work->previous_block; });
 	new_block.subscribe([&](uint256 _value)
 						{
-							//TODO: check!
 							//Если получаем новый блок, то обновляем таймер
 							work_poller_t.expires_from_now(boost::posix_time::seconds(15));
 						});
-    LOG_TRACE << "work_poller first called!";
 	work_poller();
 
 	//PEER:
@@ -37,7 +35,6 @@ void CoindNode::start()
 
 	// update mining_txs according to getwork results
 	coind_work.changed->run_and_subscribe([&](){
-        LOG_TRACE << "update mining_txs according to getwork results";
         std::map<uint256, coind::data::tx_type> new_mining_txs;
         std::map<uint256, coind::data::tx_type> added_known_txs;
 
@@ -121,9 +118,6 @@ void CoindNode::start()
 
 void CoindNode::work_poller()
 {
-    LOG_TRACE << "work_poller called!";
-    LOG_TRACE << "txidcache: " << txidcache.cache.size();
-    LOG_TRACE << "known_txs: " << known_txs.value().size();
     coind_work.set(coind->getwork(txidcache, known_txs.value()));
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
     work_poller_t.async_wait([&](const boost::system::error_code &ec){ work_poller(); });
@@ -131,7 +125,6 @@ void CoindNode::work_poller()
 
 void CoindNode::poll_header()
 {
-    LOG_TRACE << "pool_header called!";
     if (!protocol || !is_connected())
         return;
 	protocol->get_block_header->yield(coind_work.value().previous_block, std::bind(&CoindNode::handle_header, this, placeholders::_1), coind_work.value().previous_block);
@@ -197,13 +190,13 @@ void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv>
         {
             case inventory_type::tx:
             {
-                LOG_TRACE << "HANDLED TX";
+//                LOG_TRACE << "HANDLED TX";
                 inv_vec.push_back(inv);
             }
                 break;
             case inventory_type::block:
-                LOG_TRACE << "HANDLED BLOCK, with hash: " << inv.hash.GetHex();
-                new_block.happened(inv.hash); //self.factory.new_block.happened(inv['hash'])
+//                LOG_TRACE << "HANDLED BLOCK, with hash: " << inv.hash.GetHex();
+                new_block.happened(inv.hash);
                 break;
             default:
                 //when Unkown inv type
@@ -271,16 +264,8 @@ void CoindNode::handle_message_headers(std::shared_ptr<coind::messages::message_
         packed_header << _block.header;
         auto block_hash = coind::data::hash256(packed_header, true);
 
-        std::cout << _block.header.merkle_root.get().GetHex() << std::endl;
-        std::cout << _block.header.bits.get() << std::endl;
-        std::cout << _block.header.timestamp.get() << std::endl;
-        std::cout << _block.header.version.get() << std::endl;
-        std::cout << _block.header.nonce.get() << std::endl;
-        std::cout << _block.header.previous_block.get().GetHex() << std::endl;
-
         coind::data::BlockHeaderType _header;
 		_header.set_stream(_block.header);
-        std::cout << block_hash.GetHex() << std::endl;
 
         protocol->get_block_header->got_response(block_hash, _header);
 

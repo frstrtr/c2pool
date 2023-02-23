@@ -115,13 +115,12 @@ public:
 //                            continue;
                         auto share = load_share(stream, net, {{}, {}});
                         share->time_seen = 0;
-//                        std::cout << "share_hash: " << share->hash << std::endl;
                         _shares.push_back(std::move(share));
                         break;
                     }
                     default:
                         //TODO raise
-                        std::cout << "NotImplementedError(ShareType " << type_id << ")." << std::endl;
+                        LOG_ERROR << "NotImplementedError(ShareType " << type_id << ").";
                         break;
                 }
 

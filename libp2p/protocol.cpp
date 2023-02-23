@@ -4,7 +4,6 @@
 
 void BaseProtocol::write(std::shared_ptr<Message> msg)
 {
-    LOG_DEBUG << "BaseProtocol write called";
     socket->write(msg);
 }
 

@@ -102,7 +102,6 @@ public:
 		auto_connect_timer.expires_from_now(auto_connect_interval);
 		auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
 									  {
-//										  LOG_TRACE << "AUTO CONNECT";
 										  if (_ec)
 										  {
 											  LOG_ERROR << "P2PNode::auto_connect: " << _ec.message();
@@ -127,9 +126,8 @@ public:
 
 											  (*connector)(std::bind(&PoolNodeClient::socket_handle, this, std::placeholders::_1), addr);
 										  }
-                                          //TODO: remove return
-                                          return;
-                                          auto_connect();
+                                          //TODO remove comment
+//                                          auto_connect();
 									  });
 	}
 
