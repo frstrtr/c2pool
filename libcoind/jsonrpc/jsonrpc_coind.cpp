@@ -68,7 +68,7 @@ bool coind::JSONRPC_Coind::check()
 	bool version_check_result = parent_net->version_check(getnetworkinfo()["version"].get_int());
 	if (!version_check_result)
 	{
-		std::cout << "Coin daemon too old! Upgrade!" << std::endl;
+		LOG_ERROR << "Coin daemon too old! Upgrade!";
 		return false;
 	}
 
@@ -120,8 +120,6 @@ bool coind::JSONRPC_Coind::check_block_header(uint256 header)
 
 coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs)
 {
-    LOG_TRACE << "txidcache: " << txidcache.cache.size();
-    LOG_TRACE << "known_txs: " << known_txs.size();
 	UniValue work;
 	UniValue getblocktemplate_result;
 
@@ -149,7 +147,6 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 	if (!txidcache.is_started())
 		txidcache.start();
 
-//	std::cout << work.write() << std::endl;
 	vector<UniValue> packed_transactions = work["transactions"].getValues();
 
 	vector<uint256> txhashes;

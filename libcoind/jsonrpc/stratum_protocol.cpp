@@ -20,20 +20,18 @@ void StratumProtocol::Read()
                 return;
 
             std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), len);
-            std::cout << "Message data: <" << data << ">." << std::endl;
 
             json request;
             try
             {
                 request = json::parse(data);
-            } catch (const std::exception &exception)
+            } catch (...)
             {
-                LOG_WARNING << "StratumProtocol::read error while parsing: " << exception.what();
+                LOG_WARNING << "StratumProtocol::read error while parsing data :" << data;
             }
             request["jsonrpc"] = "2.0";
-            std::cout << "request: " << request.dump() << std::endl;
+            LOG_DEBUG << "StratumProtocol get request = " << request.dump();
             auto response = server.HandleRequest(request.dump());
-            std::cout << "response: " << response << std::endl;
             buffer.consume(len);
             Read();
             Send(response);
@@ -47,14 +45,10 @@ void StratumProtocol::Read()
 std::string StratumProtocol::Send(const std::string &request)
 {
     auto _req = request + "\n";
-    std::cout << "SEND DATA: " << _req;
+    LOG_DEBUG << "StratumProtocol send message: " << request;
     boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
-        if (!ec)
+        if (ec)
         {
-            //buffer.consume(buffer.size());
-//                    read();
-            std::cout << "Writed answer" << std::endl;
-        } else {
             disconnect("Response error = " + ec.message());
         }
     });

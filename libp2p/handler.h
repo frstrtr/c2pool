@@ -29,13 +29,7 @@ protected:
     {
         std::shared_ptr<MessageType> msg = std::make_shared<MessageType>();
 
-        //TODO: remove
-        std::cout << "MSG BYTES: ";
-        for (auto v : stream.data)
-        {
-            std::cout << (unsigned int) v << " ";
-        }
-        std::cout << std::endl;
+        LOG_DEBUG << "\tMessage data: " << stream;
 
         stream >> *msg;
         return msg;

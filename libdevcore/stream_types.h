@@ -203,10 +203,8 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
 
     PackStream &write(PackStream &stream) const
     {
-//        LOG_TRACE << "FixedStrType Worked!";
         ListType<unsigned char> list_s(value);
 
-//        auto _len = value.size();
         stream << PackStream(value);
         return stream;
     }
@@ -331,8 +329,6 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
 
     virtual PackStream &write(PackStream &stream)
     {
-//        LOG_TRACE << "ULongIntType Worked!";
-
         INT_T value2 = Getter<INT_T>::value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
         int32_t len = std::distance(value2.begin(), value2.end());

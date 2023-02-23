@@ -217,17 +217,11 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
     }
 
     auto id_update_remote_view_of_my_mining_txs = mining_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
-        LOG_TRACE << "id_update_remote_view_of_my_mining_txs called!";
-        LOG_TRACE << "before_: " << before;
-        LOG_TRACE << "after_: " << after;
-
         std::map<uint256, coind::data::tx_type> added;
         std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
-        LOG_TRACE << "added: " << added;
 
         std::map<uint256, coind::data::tx_type> removed;
         std::set_difference(before.begin(), before.end(), after.begin(), after.end(), std::inserter(removed, removed.begin()));
-        LOG_TRACE << "removed: " << removed;
 
         // REMOVED
         if (!removed.empty())
@@ -239,10 +233,6 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
             }
 
             auto msg_forget_tx = std::make_shared<message_forget_tx>(tx_hashes);
-            //DEBUG
-            for (auto v : msg_forget_tx->tx_hashes.get()){
-                LOG_TRACE << "MSG_FORGET_TX: " << v.GetHex();
-            }
             socket->write(msg_forget_tx);
 
             for (auto x : removed)
@@ -250,10 +240,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 PackStream stream;
                 coind::data::stream::TransactionType_stream packed_tx(x.second);
                 stream << packed_tx;
-                std::cout << "remote_remembered_txs_size(before removed): " << peer->remote_remembered_txs_size << std::endl;
-                std::cout << stream.size() << std::endl;
                 peer->remote_remembered_txs_size -= 100 + stream.size();
-                std::cout << "remote_remembered_txs_size(removed): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
             }
         }
 
@@ -266,10 +253,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                 coind::data::stream::TransactionType_stream packed_tx(x.second);
                 stream << packed_tx;
 
-                std::cout << "remote_remembered_txs_size(before added): " << peer->remote_remembered_txs_size;
-                std::cout << stream.size() << std::endl;
                 peer->remote_remembered_txs_size += 100 + stream.size();
-                std::cout << "remote_remembered_txs_size(added): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
             }
 
             assert(peer->remote_remembered_txs_size <= peer->max_remembered_txs_size);
@@ -284,13 +268,11 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
                     _tx_hashes.push_back(x.first);
                 } else {
                     _txs.push_back(x.second);
-                    LOG_TRACE << "added parse: " << x.first << "; " << x.second << "; " << after[x.first];
                 }
             }
             LOG_DEBUG << "_tx_hashes: " << _tx_hashes;
             LOG_DEBUG.stream() << "_txs: " << _txs;
             auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
-            LOG_DEBUG << "update_remote_view_of_my_mining_txs REMEMBER TX!";
             socket->write(msg_remember_tx);
         }
     });
@@ -302,9 +284,7 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
         coind::data::stream::TransactionType_stream packed_tx(x.second);
         stream << packed_tx;
 
-        std::cout << "remote_remembered_txs_size(before mining_txs): " << handshake->remote_remembered_txs_size;
         handshake->remote_remembered_txs_size += 100 + stream.size();
-        std::cout << "remote_remembered_txs_size(mining_txs): " << handshake->remote_remembered_txs_size << "/" << handshake->max_remembered_txs_size << ".\n";
         assert(handshake->remote_remembered_txs_size <= handshake->max_remembered_txs_size);
     }
 
@@ -316,13 +296,11 @@ void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
         _txs.push_back(x.second);
     }
     auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
-    LOG_DEBUG << "handle message version REMEMBER TX!";
     handshake->get_socket()->write(msg_remember_tx);
 }
 
 void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-	LOG_TRACE << "HANDLE MESSAGE_ADDRS";
     for (auto addr_record: msg->addrs.get())
     {
         auto addr = addr_record.get();
@@ -366,7 +344,6 @@ void PoolNode::handle_message_addrme(std::shared_ptr<pool::messages::message_add
 
 void PoolNode::handle_message_ping(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-	LOG_DEBUG << "PING!";
 }
 
 void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<PoolProtocol> protocol)
@@ -389,17 +366,13 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
 
     auto answer_msg = std::make_shared<message_addrs>(_addrs);
 
-    std::cout << _addrs[0].address.address << " " << _addrs[0].address.port << " " << _addrs[0].address.services << " " << _addrs[0].timestamp << std::endl;
+//    LOG_TRACE << _addrs[0].address.address << " " << _addrs[0].address.port << " " << _addrs[0].address.services << " " << _addrs[0].timestamp;
 
     protocol->write(answer_msg);
 }
 
 void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-//    return;
-    //t0
-
-    LOG_INFO << "HANDLESHARES";
     vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
     for (auto wrappedshare: msg->raw_shares.get())
     {
@@ -420,10 +393,6 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                 coind::data::tx_type tx;
                 if (known_txs._value->find(tx_hash) != known_txs._value->end())
                 {
-                    std::cout << tx_hash.GetHex() << std::endl;
-                    std::cout << "known_txs: " << std::endl;
-                    for (auto v : *known_txs._value)
-                        std::cout << v.first.GetHex() << std::endl;
                     tx = known_txs._value->at(tx_hash);
                 } else
                 {
@@ -616,7 +585,6 @@ void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_
     for (auto tx_hash : msg->tx_hashes.get())
     {
         PackStream stream;
-        LOG_INFO << "FOR DEBUG TX_HASH = " << tx_hash.GetHex();
         stream << protocol->remembered_txs[tx_hash];
         protocol->remembered_txs_size -= 100 + stream.size();
         assert(protocol->remembered_txs_size >= 0);
@@ -677,14 +645,12 @@ void PoolNode::download_shares()
         LOG_DEBUG << "Start download_shares!";
         while (true)
         {
-            std::cout << _node << " " << (_node == nullptr) << " " << _node->nonce << std::endl;
             auto desired = _node->coind_node->desired.get_when_satisfies([&](const auto &desired)
                                                                          {
-                                                                             LOG_TRACE << "SATISFIES!";
+                                                                             LOG_DEBUG << "SATISFIES!";
                                                                              return desired.size() != 0;
                                                                          })->yield(fiber);
             auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
-            std::cout << _node << " " << (_node == nullptr) << " " << _node->nonce << std::endl;
 
             if (_node->peers.size() == 0)
             {

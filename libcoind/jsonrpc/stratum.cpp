@@ -64,7 +64,6 @@ void Stratum::_send_work()
 json Stratum::mining_subscribe(const json &_params)
 {
     std::vector<std::string> params = _params.get<std::vector<std::string>>();
-    std::cout << (_params.find("id") != _params.end()) << std::endl;
     auto miner_info = params[0];
     LOG_DEBUG << "mining.subscribe called: " << miner_info;// << " " << _params.get<std::string>() << std::endl;
     LOG_DEBUG << "params:";
@@ -83,7 +82,7 @@ json Stratum::mining_subscribe(const json &_params)
 json Stratum::mining_authorize(const std::string &_username, const std::string &_password, const std::string &_id)
 {
     username = _username;
-    std::cout << "Auth with [username: " << _username << ", password: " << _password << "]." << std::endl;
+    LOG_DEBUG << "Auth with [username: " << _username << ", password: " << _password << "]";
 
     _context->post([&](){_send_work();});
 
@@ -93,7 +92,8 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
 json Stratum::mining_set_difficulty(difficulty_type difficulty)
 {
     client.CallNotification("mining.set_difficulty", {difficulty});
-    std::cout << "called mining_set_difficulty" << std::endl;
+    LOG_DEBUG << "called mining_set_difficulty";
+    return {};
 }
 
 json Stratum::mining_notify(std::string jobid, std::string prevhash, std::string coinb1, std::string coinb2, json::array_t merkle_branch, std::string version, std::string nbits, std::string ntime, bool clean_jobs)
@@ -141,7 +141,6 @@ json Stratum::mining_notify(std::string jobid, std::string prevhash, std::string
     };
 
     client.CallNotification("mining.notify", notify_data);
-    std::cout << "called mining.notify" << std::endl;
     return {};
 }
 

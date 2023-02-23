@@ -64,4 +64,20 @@ struct P2PWriteSocketData : public WriteSocketData
         len = value.size();
     }
 
+    friend std::ostream &operator<<(std::ostream &stream, P2PWriteSocketData &v)
+    {
+        if (v.len > 250)
+        {
+            stream << "Msg too long for print, len = " << v.len;
+        } else
+        {
+            stream << "[ ";
+            for (auto _v = v.data; _v != v.data+v.len; _v++)
+            {
+                stream << (unsigned int)((unsigned char) *_v) << " ";
+            }
+            stream << "]";
+        }
+        return stream;
+    }
 };

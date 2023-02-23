@@ -64,9 +64,7 @@ namespace c2pool::master
         for (const auto& n : networks)
         {
             nodes.push_back(std::move(make_node(thread_pool, n)));
-            LOG_TRACE << "1";
         }
-        LOG_TRACE << "1";
         return std::move(nodes);
     }
 

@@ -198,7 +198,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         }
     }
 
-    std::cout << "self.verified.heads len = " << verified.heads.size() << std::endl;
     for (auto [head, tail] : verified.heads)
     {
         auto [head_height, last_hash] = verified.get_height_and_last(head);
@@ -266,7 +265,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         }
     }
 
-    //TODO: test for compare with p2pool
     std::vector<std::tuple<std::tuple<arith_uint256, int32_t, int32_t>, arith_uint256>> decorated_heads;
     if (verified.tails.find(best_tail) != verified.tails.end())
     {
@@ -284,9 +282,8 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     }
     auto [best_head_score, _best] = decorated_heads.empty() ? std::make_tuple(std::make_tuple(UintToArith256(uint256::ZERO), 0, 0), UintToArith256(uint256::ZERO)) : decorated_heads.back();
     auto best = ArithToUint256(_best);
-    LOG_TRACE << "from decorated heads: " << std::get<0>(best_head_score).GetHex() << " " << std::get<1>(best_head_score) << " " << std::get<2>(best_head_score) << " " << best.GetHex();
 
-    if (true /*c2pool.DEBUG*/)
+    if (true /*TODO: c2pool.DEBUG*/)
     {
         LOG_DEBUG << decorated_heads.size() << " heads. Top 10:";
         int i = decorated_heads.size() - 11;
@@ -304,7 +301,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     if (!best.IsNull())
     {
-        LOG_TRACE << "best != null";
         auto best_share = items[best];
         auto [punish,  punish_reason] = should_punish_reason(best_share, previous_block, bits, known_txs);
         if (punish > 0)
@@ -319,7 +315,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 //        target_cutoff /= ArithToUint256(std::get<1>(best_tail_score)).IsNull() ? UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) : (std::get<1>(best_tail_score) * net->SHARE_PERIOD + 1) * 2;
     } else
     {
-        LOG_TRACE << "best is null";
         timestamp_cutoff = c2pool::dev::timestamp() - 24*60*60;
 //        target_cutoff = UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
     }

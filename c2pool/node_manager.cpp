@@ -36,7 +36,6 @@ void NodeManager::run()
     // Share Tracker
     _tracker = std::make_shared<ShareTracker>(_net);
     _tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){_tracker->init(shares, known);});
-    LOG_TRACE << c2pool::filesystem::getProjectPath() / "shares.0";
     //TODO: Save shares every 60 seconds
     // timer in _tracker constructor
 

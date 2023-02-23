@@ -47,12 +47,10 @@
 // Read
 void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 {
-//	LOG_INFO << "IS CONNECTED?: " << isConnected();
 	boost::asio::async_read(*socket,
 							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
 							[this, msg](boost::system::error_code ec, std::size_t length)
 							{
-//                                LOG_TRACE << "COMPARE PREFIX: " << c2pool::dev::compare_str(msg->prefix, net->PREFIX, length);
                                 if (!ec)
                                 {
                                     if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
@@ -80,8 +78,6 @@ void PoolSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-//									LOG_TRACE << "try to read command: " << msg->command;
-									//LOG_INFO << "read_command";
 									read_length(msg);
 								}
 								else
@@ -100,8 +96,6 @@ void PoolSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-//									LOG_TRACE << "try to read length";
-									// LOG_INFO << "read_length";
 									read_checksum(msg);
 								}
 								else
@@ -120,8 +114,6 @@ void PoolSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-//									LOG_TRACE << "try to read checksum";
-									// LOG_INFO << "read_checksum";
 									read_payload(msg);
 								}
 								else

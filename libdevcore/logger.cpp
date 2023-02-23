@@ -31,7 +31,7 @@ namespace c2pool::console
             keywords::target = c2pool::filesystem::getSubDir("logs"),
             keywords::rotation_size = 10 * 1024 * 1024,                                   /*< rotate files every 10 MiB... >*/
             keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at midnight >*/
-            keywords::format = "[%TimeStamp%]<%Severity%>: %Message%"                     /*< log record format >*/
+            keywords::format = "[%TimeStamp%]<%Severity%>:\t%Message%"                     /*< log record format >*/
         );
         if (c2pool_config::get()->debug == c2pool::dev::trace)
         {
