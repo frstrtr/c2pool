@@ -230,7 +230,7 @@ TEST(Prefsum_test, main_test)
 void write_head_n_tails(TestPrefsum& prefsum)
 {
     //HEADS
-    std::cout << "HEADS: [";
+    std::cout << "HEADS: [  ";
     for (auto head : prefsum.heads)
     {
         std::cout << "(" << head.first << ": " << head.second << "), ";
@@ -238,8 +238,8 @@ void write_head_n_tails(TestPrefsum& prefsum)
     std::cout << "\b\b].\n";
 
     //TAILS
-    std::cout << "TAILS: [";
-    for (auto tail : prefsum.tails)
+    std::cout << "TAILS: [  ";
+    for (const auto& tail : prefsum.tails)
     {
         std::cout << "(" << tail.first << ": [";
         for (auto _h : tail.second)
@@ -302,8 +302,53 @@ TEST(Prefsum_test, head_tails_test)
     }
     std::cout << std::endl;
 
-    for (auto v: prefsum.sum)
+    for (const auto& v: prefsum.sum)
     {
-        std::cout << v.first << "\n" << v.second.head << "->" << v.second.prev->second.head << ": " << v.second.i << " " << v.second.height << std::endl;
+        std::cout << v.first << "\n" << v.second.head << "->" << (v.second.prev == prefsum.sum.end() ? "NULL" : std::to_string(v.second.prev->second.head)) << ": " << v.second.i << " " << v.second.height << std::endl;
     }
+}
+
+TEST(Prefsum_test, rules_test)
+{
+    TestPrefsum prefsum;
+    TestData first{2, 1, 100};
+    TestData second{3, 2, 200};
+    TestData second2{33, 2, 233};
+    TestData second22{44, 33, 67};
+    // 2->33->44; 2->3; 9<-10
+    TestData first2{10, 9, 900};
+
+    std::vector<int> check_rules_value {100, 233, 900};
+
+    prefsum.rules.add("test_rule", [&](const TestData& v){
+        std::cout << "MAKE: " << v.head << std::endl;
+        if (std::count(check_rules_value.begin(), check_rules_value.end(), v.value))
+            return 1;
+        return 0;
+    }, [](Rule& l, const Rule& r)
+    {
+        auto _l = std::any_cast<int>(&l.value);
+        auto _r = std::any_cast<int>(&r.value);
+        std::cout << "ADD: " << *_l << "+" << *_r << std::endl;
+        *_l += *_r;
+    }, [](Rule& l, const Rule& r)
+    {
+        auto _l = std::any_cast<int>(&l.value);
+        auto _r = std::any_cast<int>(&l.value);
+        std::cout << "REMOVE" << std::endl;
+        *_l -= *_r;
+    });
+
+    prefsum.add(first);
+    prefsum.add(second);
+    prefsum.add(second2);
+    prefsum.add(first2);
+    prefsum.add(second22);
+
+    for (auto& v: prefsum.sum)
+    {
+        std::cout << v.first << "\n" << v.second.head << "->" << (v.second.prev == prefsum.sum.end() ? "NULL" : std::to_string(v.second.prev->second.head)) << ": " << v.second.i << " " << v.second.height << ", test_rule = " << *v.second.rules.get<int>("test_rule") << std::endl;
+    }
+
+    ASSERT_EQ(*prefsum.get_sum_to_last(44).rules.get<int>("test_rule"), 2);
 }
