@@ -5,11 +5,61 @@
 #include <vector>
 #include <set>
 #include <queue>
+#include <any>
 #include <boost/format.hpp>
 
 #include "events.h"
 
-using namespace std;
+class Rule
+{
+public:
+    std::any value;
+private:
+    typedef std::function<void(Rule)> func_type;
+    /// addition function
+    func_type _add;
+    /// subtraction function
+    func_type _sub;
+public:
+    template <typename ValueType>
+    Rule(ValueType &v, func_type additionF, func_type subtractionF) : _add(std::move(additionF)), _sub(std::move(subtractionF))
+    {
+        value = v;
+    }
+};
+
+class PrefsumRulesElement
+{
+    std::map<std::string, std::any> rules;
+public:
+    PrefsumRulesElement() = default;
+
+    void add(std::string& key, std::any& value)
+    {
+        rules[key] = value;
+    }
+
+    template <typename TypeValue>
+    TypeValue* get(std::string &key)
+    {
+        if (rules.find(key) == rules.end())
+            throw std::invalid_argument((boost::format("PrefsumRulesElement[key = [%1%]]: key not exist in PrefsumRulesElement") % key).str());
+
+        if (rules[key].type() != typeid(TypeValue))
+            throw std::invalid_argument((boost::format("PrefsumRulesElement[key = [%1%]]: %2% != %3%  in PrefsumRulesElement") % key % typeid(TypeValue).name() % rules[key].type().name()).str());
+
+        return std::any_cast<TypeValue>(&rules[key]);
+    }
+
+    PrefsumRulesElement &operator+=(const PrefsumRulesElement &r)
+    {
+        for (const auto &[k, v] : r.rules)
+        {
+
+        }
+        return *this;
+    }
+};
 
 template <typename Key, typename Value, typename SubElement>
 class BasePrefsumElement
@@ -25,6 +75,7 @@ public:
     it_element prev;
     std::vector<it_element> next;
 
+    PrefsumRulesElement rules;
     int32_t height;
     key_type head;
     key_type tail;
@@ -48,6 +99,7 @@ public:
 
         tail = sub.tail;
         height += sub.height;
+        rules += sub.rules;
 
         return _push(sub);
     }
@@ -67,10 +119,28 @@ public:
             throw std::invalid_argument("incorrect sub element in erase()!");
         }
         height -= sub.height;
+        rules -= sub.rules;
         return _erase(sub);
     }
 
     BasePrefsumElement() {}
+};
+
+template <typename ValueType>
+class PrefsumRules
+{
+    // Словарь с функциями для инициализации (расчёта) новых значений правил.
+    std::map<std::string, std::function<std::any(ValueType)>> make_func;
+
+    PrefsumRulesElement make_rules(const ValueType &value)
+    {
+        PrefsumRulesElement rules;
+        for (const auto &[k, f] : make_func)
+        {
+            rules.add(k, f(value));
+        }
+        return rules;
+    }
 };
 
 template <typename PrefsumElementType>
@@ -93,6 +163,9 @@ public:
     //tails[tail] -> set(head)
     std::map<key_type, std::set<key_type>> tails;
 
+    // manager for rules
+    PrefsumRules<value_type> rules;
+
     Event<value_type> added;
     Event<value_type> removed;
 protected:
@@ -103,6 +176,7 @@ public:
     virtual element_type make_element(value_type value)
     {
         element_type element {value};
+        element.rules = rules.make_rules();
         element.pvalue = items.end();
         element.prev = sum.find(element.tail);
         element.height = 1;
@@ -114,13 +188,6 @@ public:
                 element.next.push_back(sum.find(v->first));
             }
         }
-//        if (tails.find(element.head) != tails.end())
-//        {
-//            for (auto v : tails[element.head])
-//            {
-//                element.next.push_back(sum.find(v));
-//            }
-//        }
 
         return _make_element(element, value);
     }
