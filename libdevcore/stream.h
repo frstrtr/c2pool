@@ -531,7 +531,7 @@ public:
     {
         PackStream __stream;
         __stream << *stream();
-        return std::move(__stream);
+        return __stream;
     }
 
 //    bool operator==(StreamTypeAdapter<ValueType, StreamType> &b)
