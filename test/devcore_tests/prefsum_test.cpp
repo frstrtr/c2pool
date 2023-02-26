@@ -101,7 +101,7 @@ TEST(Prefsum_test, main_test)
     TestData second{3, 2, 200};
     TestData second2{33, 2, 233};
     TestData second22{44, 33, 67};
-    // 2->33->44; 2->3; 9<-10
+    // (1->2->33->44]; (1->2->3]; (9->10]
     TestData first2{10, 9, 900};
 
     prefsum.add(first);
@@ -315,12 +315,23 @@ TEST(Prefsum_test, rules_test)
     TestData second{3, 2, 200};
     TestData second2{33, 2, 233};
     TestData second22{44, 33, 67};
-    // 2->33->44; 2->3; 9<-10
+    // (1->2->33->44]; (1->2->3]; (9->10]
     TestData first2{10, 9, 900};
 
-    std::vector<int> check_rules_value {100, 233, 900};
+    std::vector<int> check_rules_value {100, 233, 900, 300};
 
-    prefsum.rules.add("test_rule", [&](const TestData& v){
+    // (1->2->33->44]; (1->2->3->4]; (9->10]
+    TestData third{4, 3, 300};
+
+    prefsum.add(first);
+    prefsum.add(second);
+    prefsum.add(second2);
+    prefsum.add(first2);
+    prefsum.add(second22);
+    prefsum.add(third);
+
+    prefsum.rules.add("test_rule", [&](const TestData& v)
+    {
         std::cout << "MAKE: " << v.head << std::endl;
         if (std::count(check_rules_value.begin(), check_rules_value.end(), v.value))
             return 1;
@@ -339,15 +350,12 @@ TEST(Prefsum_test, rules_test)
         *_l -= *_r;
     });
 
-    prefsum.add(first);
-    prefsum.add(second);
-    prefsum.add(second2);
-    prefsum.add(first2);
-    prefsum.add(second22);
+    write_head_n_tails(prefsum);
 
     for (auto& v: prefsum.sum)
     {
-        std::cout << v.first << "\n" << v.second.head << "->" << (v.second.prev == prefsum.sum.end() ? "NULL" : std::to_string(v.second.prev->second.head)) << ": " << v.second.i << " " << v.second.height << ", test_rule = " << *v.second.rules.get<int>("test_rule") << std::endl;
+        auto _rule = v.second.rules.get<int>("test_rule");
+        std::cout << v.first << "\n" << v.second.head << "->" << (v.second.prev == prefsum.sum.end() ? "NULL" : std::to_string(v.second.prev->second.head)) << ": " << v.second.i << " " << v.second.height << ", test_rule = " << *_rule << std::endl;
     }
 
     ASSERT_EQ(*prefsum.get_sum_to_last(44).rules.get<int>("test_rule"), 2);
