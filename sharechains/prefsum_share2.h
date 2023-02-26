@@ -2,7 +2,6 @@
 
 #include "share.h"
 #include "prefsum_weights.h"
-#include "prefsum_doa.h"
 #include <btclibs/uint256.h>
 #include <btclibs/arith_uint256.h>
 #include <libdevcore/prefsum.h>
@@ -19,7 +18,6 @@ namespace shares
             work += sub.work;
             min_work += sub.min_work;
             weight += sub.weight;
-            doa += sub.doa;
             return *this;
         }
 
@@ -28,14 +26,12 @@ namespace shares
             work -= sub.work;
             min_work -= sub.min_work;
             weight -= sub.weight;
-            doa -= sub.doa;
             return *this;
         }
     public:
         arith_uint288 work;
         arith_uint288 min_work;
         weight::weight_data weight;
-        doa_element_type doa;
 
         SharePrefsumElement() : BasePrefsumElement<uint256, ShareType, SharePrefsumElement>()
         {}
@@ -57,7 +53,6 @@ namespace shares
             work = coind::data::target_to_average_attempts(value->target);
             min_work = coind::data::target_to_average_attempts(value->max_target);
             weight = weight::weight_data(value);
-            doa = doa_element_type(value);
         }
     };
 

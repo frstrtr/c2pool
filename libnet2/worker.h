@@ -130,6 +130,69 @@ struct user_details
     uint256 desired_pseudoshare_target;
 };
 
+class DOAElement
+{
+public:
+    int32_t my_count;
+    int32_t my_doa_count;
+    int32_t my_orphan_announce_count;
+    int32_t my_dead_announce_count;
+public:
+    DOAElement() = default;
+
+    DOAElement(int32_t count, int32_t doa_count, int32_t orphan_announce_count, int32_t dead_announce_count)
+    {
+        my_count = count;
+        my_doa_count = doa_count;
+        my_orphan_announce_count = orphan_announce_count;
+        my_dead_announce_count = dead_announce_count;
+    }
+
+    DOAElement operator+(const DOAElement &el)
+    {
+        DOAElement res = *this;
+
+        res.my_count += el.my_count;
+        res.my_doa_count += el.my_doa_count;
+        res.my_orphan_announce_count += el.my_orphan_announce_count;
+        res.my_dead_announce_count += el.my_dead_announce_count;
+
+        return res;
+    }
+
+    DOAElement operator-(const DOAElement &el)
+    {
+        DOAElement res = *this;
+
+        res.my_count -= el.my_count;
+        res.my_doa_count -= el.my_doa_count;
+        res.my_orphan_announce_count -= el.my_orphan_announce_count;
+        res.my_dead_announce_count -= el.my_dead_announce_count;
+
+        return res;
+    }
+
+    DOAElement &operator+=(const DOAElement &el)
+    {
+        this->my_count += el.my_count;
+        this->my_doa_count += el.my_doa_count;
+        this->my_orphan_announce_count += el.my_orphan_announce_count;
+        this->my_dead_announce_count += el.my_dead_announce_count;
+
+        return *this;
+    }
+
+    DOAElement &operator-=(const DOAElement &el)
+    {
+        this->my_count -= el.my_count;
+        this->my_doa_count -= el.my_doa_count;
+        this->my_orphan_announce_count -= el.my_orphan_announce_count;
+        this->my_dead_announce_count -= el.my_dead_announce_count;
+
+        return *this;
+    }
+};
+
 class Worker
 {
 public:
