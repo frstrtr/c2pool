@@ -2,6 +2,7 @@
 
 //#include <deque>
 #include <map>
+#include <utility>
 #include <vector>
 #include <set>
 #include <queue>
@@ -28,7 +29,7 @@ public:
 
     Rule(std::any v, func_type *additionF, func_type *subtractionF) : _add(additionF), _sub(subtractionF)
     {
-        value = v;
+        value = std::move(v);
     }
 
     Rule operator+(const Rule& r) const
@@ -73,13 +74,21 @@ public:
     TypeValue* get(std::string key)
     {
         if (rules.find(key) == rules.end())
-            throw std::invalid_argument((boost::format("PrefsumRulesElement[key = [%1%]]: key not exist in PrefsumRulesElement") % key).str());
+            throw std::invalid_argument((boost::format("PrefsumRulesElement::get[key = [%1%]]: key not exist in PrefsumRulesElement") % key).str());
 
         if (rules.at(key).value.type() != typeid(TypeValue))
-            throw std::invalid_argument((boost::format("PrefsumRulesElement[key = [%1%]]: %2% != %3%  in PrefsumRulesElement") % key % typeid(TypeValue).name() % rules.at(key).value.type().name()).str());
+            throw std::invalid_argument((boost::format("PrefsumRulesElement::get[key = [%1%]]: %2% != %3%  in PrefsumRulesElement") % key % typeid(TypeValue).name() % rules.at(key).value.type().name()).str());
 
         TypeValue* result = std::any_cast<TypeValue>(&rules[key].value);
         return result;
+    }
+
+    Rule get_rule(std::string key)
+    {
+        if (rules.find(key) == rules.end())
+            throw std::invalid_argument((boost::format("PrefsumRulesElement::get_rule[key = [%1%]]: key not exist in PrefsumRulesElement") % key).str());
+
+        return rules[key];
     }
 
     PrefsumRulesElement &operator+=(const PrefsumRulesElement &r)
@@ -117,18 +126,32 @@ class PrefsumRules
     std::map<std::string, RuleFunc> funcs;
 
 public:
+    Event<std::vector<std::string>> new_rule_event;
+
     void add(std::string k, std::function<std::any(const ValueType&)> _make, std::function<void(Rule&, const Rule&)> _add, std::function<void(Rule&, const Rule&)> _sub)
     {
         funcs[k] = {std::move(_make), std::move(_add), std::move(_sub)};
+
+        std::vector<std::string> new_rule_list{k};
+        new_rule_event.happened(new_rule_list);
+    }
+
+    Rule make_rule(const std::string &key, const ValueType &value)
+    {
+        if (funcs.find(key) == funcs.end())
+            throw std::invalid_argument((boost::format("%1% not exist in funcs!") % key).str());
+
+        auto &f = funcs[key];
+        return {f.make(value), &f.add, &f.sub};
     }
 
     PrefsumRulesElement make_rules(const ValueType &value)
     {
         PrefsumRulesElement rules;
-        for (auto &[k, f] : funcs)
+        for (auto kv : funcs)
         {
-            Rule rule {f.make(value), &f.add, &f.sub};
-            rules.add(k, rule);
+            auto _rule = make_rule(kv.first, value);
+            rules.add(kv.first, _rule);
         }
         return rules;
     }
@@ -199,6 +222,7 @@ public:
     BasePrefsumElement() {}
 };
 
+//https://en.wikipedia.org/wiki/Prefix_sum
 template <typename PrefsumElementType>
 class Prefsum
 {
@@ -228,7 +252,46 @@ protected:
     virtual element_type& _make_element(element_type& element, const value_type &value) = 0;
     virtual element_type& _none_element(element_type& element, const key_type& key) = 0;
 
+    void new_rules_calculate(std::vector<std::string> k_rules)
+    {
+        for (const auto &tail : tails)
+        {
+            std::queue<it_sums> next_tree;
+            for (auto v: reverse[tail.first])
+                next_tree.push(sum.find(v->first));
+
+            while (!next_tree.empty())
+            {
+                auto v = next_tree.front();
+                next_tree.pop();
+
+                for (auto v_next: v->second.next)
+                {
+                    next_tree.push(v_next);
+                }
+
+                // new calculate
+                for (auto k : k_rules)
+                {
+                    Rule new_rule = rules.make_rule(k, v->second.pvalue->second);
+                    if (v->second.prev != sum.end())
+                        new_rule += v->second.prev->second.rules.get_rule(k);
+                    v->second.rules.add(k, new_rule);
+                }
+            }
+        }
+    }
 public:
+    Prefsum()
+    {
+        std::cout << "PREFSUM START" << std::endl;
+        rules.new_rule_event.subscribe([&](const std::vector<std::string>& k_rules)
+        {
+            std::cout << "new_rules" << std::endl;
+            new_rules_calculate(k_rules);
+        });
+    }
+
     virtual element_type make_element(value_type value)
     {
         element_type element {value};
@@ -288,7 +351,8 @@ public:
         }
 
         //--Add this value to next sum's
-        // TODO: can be optimize: оптимизация памяти в процессе обхода дерева, путем прабавления ко всем элементам одного и того же значения, а не предыдущего к нему.
+        // TODO: can be optimize: оптимизация памяти в процессе обхода дерева, путем прибавления ко всем элементам одного и того же значения, а не предыдущего к нему.
+        // TODO: оптимизация с помощью изменения сразу на сумму значений, а не для каждого add в диапазоне новых добавленных. (add_range)
         std::queue<it_sums> next_tree;
         for (auto v : it.next)
             next_tree.push(v);
@@ -480,130 +544,3 @@ public:
         }();
     }
 };
-
-
-/*
-//https://en.wikipedia.org/wiki/Prefix_sum
-template <typename element_type, typename reverse_key>
-class Prefsum
-{
-public:
-    typedef typename deque<element_type>::iterator it_type;
-
-protected:
-    deque<element_type> _sum;
-    map<reverse_key, it_type> _reverse;
-    const size_t max_size;
-    const size_t real_max_size;
-
-private:
-    void reverse_add(reverse_key reverse_k, it_type _it)
-    {
-        _reverse[reverse_k] = _it;
-    }
-
-    void reverse_remove(reverse_key reverse_k)
-    {
-        _reverse.erase(reverse_k);
-    }
-
-    virtual void resize()
-    {
-        auto delta = _sum[max_size - 1];
-        for (int i = 0; i < max_size; i++)
-        {
-            reverse_remove(_sum.front().hash);
-            _sum.pop_front();
-        }
-        for (auto &item : _sum)
-        {
-            item -= delta;
-        }
-    }
-
-public:
-    Prefsum(int32_t _max_size) : max_size(_max_size), real_max_size(_max_size * 4)
-    {
-    }
-
-    size_t size() const
-    {
-        return _sum.size();
-    }
-
-    size_t get_max_size() const
-    {
-        return max_size;
-    }
-
-    virtual void add(element_type v)
-    {
-        if (_sum.size() >= real_max_size)
-        {
-            resize();
-        }
-        if (!_sum.empty())
-        {
-            v += _sum.back();
-        }
-
-        _sum.push_back(v);
-        reverse_add(v.hash, _sum.end() - 1);
-    }
-
-    void add_range(vector<element_type> items)
-    {
-        for (auto &item : items)
-        {
-            add(item);
-        }
-    }
-
-    virtual void remove(int32_t index)
-    {
-        if ((_sum.size() <= index) && (index < 0))
-        {
-            throw std::out_of_range("size of sum < index in prefix_sum.remove");
-        }
-        if (_sum.size() - 1 == index)
-        {
-            reverse_remove(_sum.back().hash);
-            _sum.pop_back();
-        }
-        else
-        {
-            element_type v;
-            if (index - 1 < 0)
-            {
-                v = _sum[index];
-            }
-            else
-            {
-                v = _sum[index] - _sum[index - 1];
-            }
-            for (auto item = _sum.begin() + index + 1; item != _sum.end(); item++)
-            {
-                *item -= v;
-            }
-
-            auto it_for_remove = _sum.begin() + index;
-            reverse_remove(it_for_remove->reverse_key()); //? it_for_remove->template reverse_key
-            _sum.erase(it_for_remove);
-        }
-    }
-
-    void remove_from_key(reverse_key key)
-    {
-        auto index_it = _reverse[key];
-        remove(distance(_sum.begin(), index_it));
-    }
-
-    bool exists(reverse_key k)
-    {
-        if (_reverse.find(k) != _reverse.end())
-            return true;
-        else
-            return false;
-    }
-};
- */
