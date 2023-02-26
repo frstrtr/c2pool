@@ -284,10 +284,8 @@ protected:
 public:
     Prefsum()
     {
-        std::cout << "PREFSUM START" << std::endl;
         rules.new_rule_event.subscribe([&](const std::vector<std::string>& k_rules)
         {
-            std::cout << "new_rules" << std::endl;
             new_rules_calculate(k_rules);
         });
     }
@@ -451,7 +449,6 @@ public:
 
         if (items.find(result.tail) != items.end())
         {
-//            std::cout << "EXIST: " << sum[result.tail].height << std::endl;
             result = sum[result.tail];
         }
 

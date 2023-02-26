@@ -14,7 +14,6 @@
 #include <btclibs/script/script.h>
 #include <libdevcore/random.h>
 #include <sharechains/data.h>
-#include <sharechains/prefsum_doa.h>
 #include <sharechains/share_adapters.h>
 #include <sharechains/generate_tx.h>
 #include <libcoind/jsonrpc/results.h>
@@ -69,45 +68,43 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
                                                                                                           removed_unstales(std::make_tuple(0,0,0)),
                                                                                                           removed_doa_unstales(0)
 {
+    // DOA Rule for PrefsumShare
+    _tracker->rules.add("doa", [&](const ShareType &share)
+    {
+        if (!share)
+        {
+            LOG_WARNING << "NULLPTR SHARE IN DOAElement MAKE!";
+            return DOAElement{};
+        }
+        int32_t my_count = 0;
+        if (my_share_hashes.count(share->hash))
+            my_count = 1;
 
-    // Rules for doa_element_type in PrefsumShare
-    shares::doa_element_type::set_rules([&](ShareType share)
-                                        {
-                                            if (!share)
-                                            {
-                                                LOG_WARNING << "NULLPTR SHARE IN doa_element_type::rule!";
-                                                return std::tuple<int32_t, int32_t, int32_t, int32_t>(0, 0, 0, 0);
-                                            }
+        int32_t my_doa_count = 0;
+        if (my_doa_share_hashes.count(share->hash))
+            my_doa_count = 1;
 
-                                            int32_t my_count = 0;
-                                            if (my_share_hashes.count(share->hash))
-                                            {
-                                                my_count = 1;
-                                            }
+        int32_t my_orphan_announce_count = 0;
+        if (my_share_hashes.count(share->hash) && (*share->share_data)->stale_info == orphan)
+            my_orphan_announce_count = 1;
 
-                                            int32_t my_doa_count = 0;
-                                            if (my_doa_share_hashes.count(share->hash))
-                                            {
-                                                my_doa_count = 1;
-                                            }
 
-                                            int32_t my_orphan_announce_count = 0;
-                                            if (my_share_hashes.count(share->hash) &&
-                                                (*share->share_data)->stale_info == orphan)
-                                            {
-                                                my_orphan_announce_count = 1;
-                                            }
+        int32_t my_dead_announce_count = 0;
+        if (my_share_hashes.count(share->hash) && (*share->share_data)->stale_info == doa)
+            my_dead_announce_count = 1;
 
-                                            int32_t my_dead_announce_count = 0;
-                                            if (my_share_hashes.count(share->hash) &&
-                                                (*share->share_data)->stale_info == doa)
-                                            {
-                                                my_dead_announce_count = 1;
-                                            }
-
-                                            return std::tuple(my_count, my_doa_count, my_orphan_announce_count,
-                                                              my_dead_announce_count);
-                                        });
+        return DOAElement{my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count};
+    }, [](Rule& l, const Rule& r)
+    {
+        auto _l = std::any_cast<DOAElement>(&l.value);
+        auto _r = std::any_cast<DOAElement>(&r.value);
+        *_l += *_r;
+    }, [](Rule& l, const Rule& r)
+    {
+        auto _l = std::any_cast<DOAElement>(&l.value);
+        auto _r = std::any_cast<DOAElement>(&l.value);
+        *_l -= *_r;
+    });
 
     // sub for removed_unstales Variable's
     _tracker->removed.subscribe([&](ShareType share)
@@ -724,11 +721,11 @@ stale_counts Worker::get_stale_counts()
 
     auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales.value();
 
-    auto delta = _tracker->get_sum_to_last(_coind_node->best_share.value()).doa;
-    auto my_shares_in_chain = delta.my_count + _removed_unstales;
-    auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales.value();
-    auto orphans_recorded_in_chain = delta.my_orphan_announce_count + _removed_unstales_orphans;
-    auto doas_recorded_in_chain = delta.my_dead_announce_count + _removed_unstales_doa;
+    const DOAElement *delta = _tracker->get_sum_to_last(_coind_node->best_share.value()).rules.get<DOAElement>("doa");
+    auto my_shares_in_chain = delta->my_count + _removed_unstales;
+    auto my_doa_shares_in_chain = delta->my_doa_count + removed_doa_unstales.value();
+    auto orphans_recorded_in_chain = delta->my_orphan_announce_count + _removed_unstales_orphans;
+    auto doas_recorded_in_chain = delta->my_dead_announce_count + _removed_unstales_doa;
 
     auto my_shares_not_in_chain = my_shares - my_shares_in_chain;
     auto my_doa_shares_not_in_chain = my_doa_shares - my_doa_shares_in_chain;
