@@ -8,7 +8,7 @@ namespace c2pool::random
 {
     using namespace boost::random;
 
-    boost::random::mt19937 generator(std::time(0));
+    boost::random::mt19937 generator(std::time(nullptr));
 
     ///[min, max)
     int RandomInt(int min, int max)
@@ -33,6 +33,7 @@ namespace c2pool::random
     std::vector<unsigned char> random_bytes(int32_t length)
     {
         std::vector<unsigned char> bytes;
+        bytes.reserve(length);
 
         for (int i = 0; i < length; i++)
         {
@@ -48,10 +49,12 @@ namespace c2pool::random
 		return result;
 	}
 
-    ///l = 1.0/<среднее желаемое число>
-    float Expovariate(float l)
+    ///l = <среднее желаемое число>
+    double Expovariate(double l)
     {
-        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1 / l);
+        boost::random::exponential_distribution<double> rnd(l);
+        return rnd(generator);
+//        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1 / l);
     }
 
     unsigned long long randomNonce()
