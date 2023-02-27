@@ -37,8 +37,7 @@ std::vector<addr_type> PoolNodeClient::get_good_peers(int max_count)
 	return result;
 }
 
-void PoolNode::handle_message_version(std::shared_ptr<PoolHandshake> handshake,
-                                     std::shared_ptr<pool::messages::message_version> msg)
+void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake)
 {
 	LOG_DEBUG << "handle message_version";
 	LOG_INFO << "Peer "
