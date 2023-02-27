@@ -44,7 +44,7 @@ public:
 
     ShareStore(std::shared_ptr<c2pool::Network> _net) : net(std::move(_net))
     {
-        auto filepath = c2pool::filesystem::getProjectPath() / "data" / net->net_name;
+        auto filepath = c2pool::filesystem::getProjectPath() / net->net_name;
 
         shares = std::make_unique<Database<IntType(256), ShareTypeStream>>(filepath, "shares");
         verified_shares = std::make_unique<Database<IntType(256), ShareTypeStream>>(filepath, "shares_verified");
