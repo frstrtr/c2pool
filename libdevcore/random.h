@@ -42,8 +42,8 @@ namespace c2pool::random
         return *item;
     }
 
-    ///l = 1.0/<среднее желаемое число>
-    float Expovariate(float l);
+    ///l = <среднее желаемое число>
+    double Expovariate(double l);
 
     unsigned long long randomNonce();
 } // namespace c2pool::random
