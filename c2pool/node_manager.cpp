@@ -20,7 +20,7 @@ void NodeManager::run()
     _context = std::make_shared<boost::asio::io_context>(0);
 
     // AddrStore
-    _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _net);
+    _addr_store = std::make_shared<c2pool::dev::AddrStore>(_net->net_name + "/addrs", _net);
     // TODO: Bootstrap_addrs
     // TODO: Parse CLI args for addrs
     // TODO: Save addrs every 60 seconds

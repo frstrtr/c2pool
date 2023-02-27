@@ -56,7 +56,7 @@ public:
 
 	void listen()
 	{
-		(*listener)([&](std::shared_ptr<Socket> socket){ socket_handle(socket);}, [&](){listen();});
+		(*listener)([&](std::shared_ptr<Socket> socket){ socket_handle(std::move(socket));}, [&](){listen();});
 	}
 };
 
