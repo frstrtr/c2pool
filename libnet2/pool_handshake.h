@@ -15,7 +15,9 @@
 class PoolHandshake : public Handshake<PoolProtocol>, public PoolProtocolData
 {
 protected:
-    std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> handle_message_version;
+    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, std::shared_ptr<PoolHandshake>)> msg_version_handler_type;
+
+    msg_version_handler_type handle_message_version;
 	void send_version()
 	{
 		address_type addrs1(3, "192.168.10.10", 8);
@@ -31,8 +33,7 @@ protected:
 	}
 
 public:
-    PoolHandshake(auto socket, std::function<void(std::shared_ptr<PoolHandshake>,
-                                                  std::shared_ptr<pool::messages::message_version>)> _handler)
+    PoolHandshake(auto socket, msg_version_handler_type _handler)
             : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
@@ -45,16 +46,14 @@ public:
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
                         _socket->write(msg);
                     }, 15, [_socket = socket](std::string msg){LOG_WARNING << msg; _socket->disconnect();})), handle_message_version(std::move(_handler))
-    {
-
-    }
+    { }
 };
 
 class PoolHandshakeServer : public enable_shared_from_this<PoolHandshakeServer>, public PoolHandshake
 {
     std::function<void(std::shared_ptr<PoolHandshakeServer>)> handshake_finish;
 public:
-	PoolHandshakeServer(auto _socket, auto version_handle, auto _finish) : PoolHandshake(_socket, std::move(version_handle)), handshake_finish(std::move(_finish))
+	PoolHandshakeServer(auto _socket, msg_version_handler_type version_handle, auto _finish) : PoolHandshake(_socket, std::move(version_handle)), handshake_finish(std::move(_finish))
 	{
 
 	}
@@ -71,7 +70,7 @@ public:
 			raw_msg->value >> *msg;
 
 			// Если внутри handle_message_version нет никаких ошибок, throw, то вызывается handshake_finish();
-			handle_message_version(this->shared_from_this(), msg);
+			handle_message_version(msg, this->shared_from_this());
 		} catch (const std::runtime_error &ec)
 		{
             std::string reason = "[PoolHandshakeServer] handle_message error = " + std::string(ec.what());
@@ -87,7 +86,7 @@ class PoolHandshakeClient : public enable_shared_from_this<PoolHandshakeClient>,
 {
     std::function<void(std::shared_ptr<PoolHandshakeClient>)> handshake_finish;
 public:
-	PoolHandshakeClient(auto _socket, auto version_handle, auto _finish) : PoolHandshake(_socket, version_handle), handshake_finish(std::move(_finish))
+	PoolHandshakeClient(auto _socket, msg_version_handler_type version_handle, auto _finish) : PoolHandshake(_socket, version_handle), handshake_finish(std::move(_finish))
 	{
 		send_version();
 	}
@@ -104,7 +103,7 @@ public:
             raw_msg->value >> *msg;
 
 			// Если внутри handle_message_version нет никаких ошибок, throw, то вызывается handshake_finish();
-            handle_message_version(this->shared_from_this(), msg);
+            handle_message_version(msg, this->shared_from_this());
         } catch (const std::runtime_error &ec)
         {
             std::string reason = "[PoolHandshakeClient] handle_message error = " + std::string(ec.what());

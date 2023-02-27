@@ -29,7 +29,7 @@ public:
 
 	void connect(std::tuple<std::string, std::string> addr)
 	{
-		(*connector)(std::bind(&CoindNodeClient::socket_handle, this, std::placeholders::_1), addr);
+		(*connector)([&](std::shared_ptr<Socket> socket){ socket_handle(socket); }, addr);
 	}
 
 protected:

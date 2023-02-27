@@ -127,7 +127,8 @@ void CoindNode::poll_header()
 {
     if (!protocol || !is_connected())
         return;
-	protocol->get_block_header->yield(coind_work.value().previous_block, std::bind(&CoindNode::handle_header, this, placeholders::_1), coind_work.value().previous_block);
+
+	protocol->get_block_header->yield(coind_work.value().previous_block, [&](coind::data::BlockHeaderType new_header){ handle_header(new_header); }, coind_work.value().previous_block);
 }
 
 void CoindNode::handle_message_version(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol)

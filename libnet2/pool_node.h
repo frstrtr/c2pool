@@ -23,15 +23,17 @@ namespace ip = io::ip;
 
 class PoolNodeServer : virtual PoolNodeData
 {
+    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, std::shared_ptr<PoolHandshake>)> msg_version_handler_type;
+
 protected:
 	std::shared_ptr<Listener> listener; // from P2PNode::run()
 
     std::map<std::shared_ptr<Socket>, std::shared_ptr<PoolHandshakeServer>> server_attempts;
     std::map<HOST_IDENT, std::shared_ptr<PoolProtocol>> server_connections;
 private:
-    std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
+    msg_version_handler_type message_version_handle;
 public:
-	PoolNodeServer(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)) {}
+	PoolNodeServer(std::shared_ptr<io::io_context> _context, msg_version_handler_type version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)) {}
 
 	void socket_handle(std::shared_ptr<Socket> socket)
 	{
@@ -39,7 +41,7 @@ public:
         socket->set_addr();
 		server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket),
                                                                         message_version_handle,
-                                                                        std::bind(&PoolNodeServer::handshake_handle, this, std::placeholders::_1));
+                                                                        [&](const std::shared_ptr<PoolHandshake>& _handshake){handshake_handle(_handshake);});
 	}
 
     void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
@@ -54,12 +56,13 @@ public:
 
 	void listen()
 	{
-		(*listener)(std::bind(&PoolNodeServer::socket_handle, this, std::placeholders::_1), std::bind(&PoolNodeServer::listen, this));
+		(*listener)([&](std::shared_ptr<Socket> socket){ socket_handle(socket);}, [&](){listen();});
 	}
 };
 
 class PoolNodeClient : virtual PoolNodeData
 {
+    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, std::shared_ptr<PoolHandshake>)> msg_version_handler_type;
 protected:
 	std::shared_ptr<Connector> connector; // from P2PNode::run()
 
@@ -69,9 +72,9 @@ private:
 	io::steady_timer auto_connect_timer;
 	const std::chrono::seconds auto_connect_interval{1s};
 
-    std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> message_version_handle;
+    msg_version_handler_type message_version_handle;
 public:
-	PoolNodeClient(std::shared_ptr<io::io_context> _context, std::function<void(std::shared_ptr<PoolHandshake>, std::shared_ptr<pool::messages::message_version>)> version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
+	PoolNodeClient(std::shared_ptr<io::io_context> _context, msg_version_handler_type version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
     void socket_handle(std::shared_ptr<Socket> socket)
     {
@@ -80,10 +83,7 @@ public:
         client_attempts[std::get<0>(addr)] =
                 std::make_shared<PoolHandshakeClient>(std::move(socket),
                                                       message_version_handle,
-                                                      std::bind(
-                                                              &PoolNodeClient::handshake_handle,
-                                                              this,
-                                                              std::placeholders::_1));
+                                                      [&](const std::shared_ptr<PoolHandshake>& _handshake){ handshake_handle(_handshake);});
     }
 
     void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
@@ -124,7 +124,7 @@ public:
 											  auto [ip, port] = addr;
 											  LOG_TRACE << "try to connect: " << ip << ":" << port;
 
-											  (*connector)(std::bind(&PoolNodeClient::socket_handle, this, std::placeholders::_1), addr);
+											  (*connector)([&](std::shared_ptr<Socket> socket){ socket_handle(socket);}, addr);
 										  }
                                           //TODO remove comment
 //                                          auto_connect();
@@ -146,8 +146,8 @@ private:
 public:
 	PoolNode(std::shared_ptr<io::io_context> _context)
 			: PoolNodeData(std::move(_context)),
-              PoolNodeServer(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2)),
-              PoolNodeClient(context, std::bind(&PoolNode::handle_message_version, this, std::placeholders::_1, std::placeholders::_2))
+              PoolNodeServer(context, [&](std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake) { handle_message_version(msg, handshake); }),
+              PoolNodeClient(context, [&](std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake) { handle_message_version(msg, handshake); })
 	{
         LOG_INFO << "PoolNode created!";
 		SET_POOL_DEFAULT_HANDLER(addrs);
@@ -186,7 +186,7 @@ public:
 	}
 
 	// Handshake handlers
-    void handle_message_version(std::shared_ptr<PoolHandshake> handshake, std::shared_ptr<pool::messages::message_version> msg);
+    void handle_message_version(std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake);
 
 	// Pool handlers
     void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol);
