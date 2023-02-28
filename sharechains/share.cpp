@@ -18,6 +18,7 @@
 using namespace std;
 
 #include <boost/format.hpp>
+#include <utility>
 
 #define CheckShareRequirement(field_name)               \
     if (!field_name)                                     \
@@ -220,12 +221,18 @@ void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coin
 
 std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const addr_type& peer_addr)
 {
-	PackedShareData packed_share;
-	stream >> packed_share;
+    PackedShareData packed_share;
+    try
+    {
+        stream >> packed_share;
+    } catch (packstream_exception &ex)
+    {
+        throw std::invalid_argument((boost::format("Failed unpack PackedShareData in load_share: %1%") % ex.what()).str());// << ex.what();
+    }
 
 	PackStream _stream(packed_share.contents.value);
 
-	ShareDirector director(net);
+	ShareDirector director(std::move(net));
 	switch (packed_share.type.value)
 	{
 		case 17:
