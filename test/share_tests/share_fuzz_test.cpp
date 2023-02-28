@@ -77,7 +77,7 @@ public:
     }
 };
 
-class FuzeShareTest : public ::testing::Test
+class FuzzShareTest : public ::testing::Test
 {
 protected:
     shared_ptr<TestNetwork> net;
@@ -97,7 +97,7 @@ protected:
 };
 
 
-TEST_F(FuzeShareTest, unpack_share)
+TEST_F(FuzzShareTest, unpack_share)
 {
     // Check for true load_share
     {
@@ -108,7 +108,7 @@ TEST_F(FuzeShareTest, unpack_share)
         auto share = load_share(stream_share, net, {"0.0.0.0", "0"});
     }
 
-    // Fuze[1]
+    // Fuzz[1]
     EXPECT_THROW(
     {
         PackStream stream_share;
@@ -118,7 +118,7 @@ TEST_F(FuzeShareTest, unpack_share)
         auto share_fuze = load_share(stream_share, net, {"0.0.0.0", "0"});
     }, std::invalid_argument);
 
-    // Fuze[2]
+    // Fuzz[2]
     {
         PackStream stream_share;
         stream_share.from_hex("asd1235131414asdcфывфывфыв1231й23у4фап каываываываываываыв");
