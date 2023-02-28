@@ -19,15 +19,6 @@ concept StreamObjType = requires(T a)
 	a.write;
 	a.read;
 };
-//{
-//    {
-//        a.write(stream)
-//        } -> PackStream &;
-//
-//    {
-//        a.read(stream)
-//        } -> PackStream &;
-//};
 
 template <typename T>
 concept C_STRING = std::is_same_v<T, const char *> || std::is_same_v<T, char *> || std::is_same_v<T, unsigned char *> || std::is_same_v<T, const unsigned char *> || std::is_same_v<T, char>;
@@ -183,6 +174,20 @@ struct CustomGetter : BaseGetter
 	virtual T get() const = 0;
 };
 
+class packstream_exception : public std::exception
+{
+private:
+    std::string err;
+public:
+    packstream_exception(std::string _err) : err(_err) {}
+    packstream_exception(const char* _err) : err(_err) {}
+
+    virtual const char *what() const throw()
+    {
+        return err.c_str();
+    }
+};
+
 /// PackStream
 
 struct PackStream
@@ -315,7 +320,9 @@ struct PackStream
     PackStream &operator>>(T &val)
     {
 		auto _size = CALC_SIZE(T);
-        unsigned char *packed = new unsigned char[_size];
+        if (data.size() < _size)
+            throw packstream_exception("PackStream >> T: data.size < CALC_SIZE(T)!");
+        auto *packed = new unsigned char[_size];
         for (int i = 0; i < _size; i++)
         {
             packed[i] = data[i];
@@ -354,6 +361,8 @@ struct PackStream
     template <StreamIntType T>
     PackStream &operator>>(T &val)
     {
+        if (data.empty())
+            throw packstream_exception("PackStream >> StreamIntType: empty data!");
         unsigned char code = data.front();
         data.erase(data.begin(), data.begin() + 1);
         if (code < 0xfd)
