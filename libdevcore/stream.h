@@ -304,7 +304,7 @@ struct PackStream
             ADDING_INT(uint64_t, 0xff)
         }
 
-        throw std::invalid_argument("int too large for varint");
+        throw packstream_exception("int too large for varint");
     }
 #undef ADDING_INT
 
@@ -345,6 +345,8 @@ struct PackStream
     PackStream& GET_INT(T &val)
     {
         auto _size = CALC_SIZE(NUM_TYPE);
+        if (data.size() < _size)
+            throw packstream_exception("GET_INT: data.size < CALC_SIZE(NUM_TYPE)!");
         auto *packed = new unsigned char[_size];
         for (int i = 0; i < _size; i++)
         {
@@ -382,7 +384,7 @@ struct PackStream
             return GET_INT<uint64_t>(val);
         } else
 		{
-			throw std::runtime_error("error in code StreamIntType");
+			throw packstream_exception("error in code StreamIntType");
 		}
         return *this;
     }
@@ -580,7 +582,7 @@ private:
             _to_stream();
         } else
         {
-            throw std::runtime_error("StreamTypeAdapter.to_stream error: _value - nullptr!");
+            throw packstream_exception("StreamTypeAdapter.to_stream error: _value - nullptr!");
         }
     }
 
@@ -598,7 +600,7 @@ private:
             _to_value();
         } else
         {
-            throw std::runtime_error("StreamTypeAdapter.to_value error: _stream - nullptr!");
+            throw packstream_exception("StreamTypeAdapter.to_value error: _stream - nullptr!");
         }
     }
 };
