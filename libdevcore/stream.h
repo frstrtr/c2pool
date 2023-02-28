@@ -330,28 +330,26 @@ struct PackStream
     template <StreamObjType T>
     PackStream &operator>>(T &val)
     {
-//      FOR TEST
-//		std::cout << "[";
-//		for (int i = 0; i < 32; i++){
-//			std::cout << (unsigned int) data[i] << ", ";
-//		}
-//		std::cout << "]" << std::endl;
         val.read(*this);
         return *this;
     }
 
-#define GET_INT(num_type)                                  \
-    auto _size = CALC_SIZE(num_type);                      \
-    unsigned char *packed = new unsigned char[_size];      \
-    for (int i = 0; i < _size; i++)                        \
-    {                                                      \
-        packed[i] = data[i];                               \
-    }                                                      \
-    num_type *val2 = reinterpret_cast<num_type *>(packed); \
-    val = *val2;                                           \
-    data.erase(data.begin(), data.begin() + _size);        \
-    delete[] packed;                                       \
-    return *this;
+    template <typename NUM_TYPE, StreamIntType T>
+    PackStream& GET_INT(T &val)
+    {
+        auto _size = CALC_SIZE(NUM_TYPE);
+        auto *packed = new unsigned char[_size];
+        for (int i = 0; i < _size; i++)
+        {
+            packed[i] = data[i];
+        }
+        auto *val2 = reinterpret_cast<NUM_TYPE *>(packed);
+        val = *val2;
+        data.erase(data.begin(), data.begin() + _size);
+        delete[] packed;
+
+        return *this;
+    }
 
     template <StreamIntType T>
     PackStream &operator>>(T &val)
@@ -364,15 +362,15 @@ struct PackStream
         }
         else if (code == 0xfd)
         {
-            GET_INT(uint16_t)
+            return GET_INT<uint16_t>(val);
         }
         else if (code == 0xfe)
         {
-            GET_INT(uint32_t)
+            return GET_INT<uint32_t>(val);
         }
         else if (code == 0xff)
         {
-            GET_INT(uint64_t)
+            return GET_INT<uint64_t>(val);
         } else
 		{
 			throw std::runtime_error("error in code StreamIntType");
@@ -429,8 +427,6 @@ struct PackStream
         return stream;
     }
 };
-
-#undef GET_INT
 
 template<typename ValueType, typename StreamType>
 class StreamTypeAdapter
