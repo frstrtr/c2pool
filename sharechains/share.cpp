@@ -20,8 +20,8 @@ using namespace std;
 #include <boost/format.hpp>
 #include <utility>
 
-#define CheckShareRequirement(field_name)               \
-    if (!field_name)                                     \
+#define CheckShareRequirement(field_name)                  \
+    if (!(field_name))                                     \
         throw std::runtime_error(#field_name " == NULL");
 
 void Share::init()
@@ -35,22 +35,22 @@ void Share::init()
 
     bool segwit_activated = shares::is_segwit_activated(VERSION, net);
     if (segwit_activated && !segwit_data)
-        throw std::runtime_error("Segwit activated, but segwit_data == nullptr!");
+        throw std::invalid_argument("Segwit activated, but segwit_data == nullptr!");
 
 
     if (!(coinbase->size() >= 2 && coinbase->size() <= 100))
     {
-        throw std::runtime_error((boost::format("bad coinbase size! %1% bytes.") % coinbase->size()).str());
+        throw std::invalid_argument((boost::format("bad coinbase size! %1% bytes.") % coinbase->size()).str());
     }
 
     if ((*merkle_link)->branch.size() > 16)
     {
-        throw std::runtime_error("Merkle branch too long#1!");
+        throw std::invalid_argument("Merkle branch too long#1!");
     }
 
     if (segwit_activated)
         if ((*segwit_data)->txid_merkle_link.branch.size() > 16)
-            throw std::runtime_error("Merkle branch too long#1!");
+            throw std::invalid_argument("Merkle branch too long#1!");
 
     assert(hash_link->get()->extra_data.empty());
 
@@ -58,7 +58,7 @@ void Share::init()
 
     if (net->net_name == "bitcoin" && *absheight > 3927800 && *desired_version == 16)
     {
-        throw std::runtime_error("This is not a hardfork-supporting share!");
+        throw std::invalid_argument("This is not a hardfork-supporting share!");
     }
 
 //TODO: check txs
@@ -104,12 +104,12 @@ void Share::init()
 
     if (target > net->MAX_TARGET)
     {
-        throw std::runtime_error("Share target invalid!"); //TODO: remake for c2pool::p2p::exception_from_peer
+        throw std::invalid_argument("Share target invalid!");
     }
 
     if (UintToArith256(pow_hash) > UintToArith256(target))
     {
-        throw std::runtime_error("Share PoW indalid!"); //TODO: remake for c2pool::p2p::exception_from_peer
+        throw std::invalid_argument("Share PoW indalid!");
     }
 }
 #undef CheckShareRequirement
@@ -227,7 +227,7 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
         stream >> packed_share;
     } catch (packstream_exception &ex)
     {
-        throw std::invalid_argument((boost::format("Failed unpack PackedShareData in load_share: %1%") % ex.what()).str());// << ex.what();
+        throw std::invalid_argument((boost::format("Failed unpack PackedShareData in load_share: [%1%]") % ex.what()).str());// << ex.what();
     }
 
 	PackStream _stream(packed_share.contents.value);

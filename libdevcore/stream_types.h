@@ -148,7 +148,7 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
         auto len = _len.get();
 
         if (stream.size() < len)
-            throw std::invalid_argument("StrType: stream size < len");
+            throw packstream_exception("StrType: stream size < len");
 
         value.insert(value.end(), stream.data.begin(), stream.data.begin()+len);
         stream.data.erase(stream.data.begin(), stream.data.begin()+len);
@@ -157,7 +157,7 @@ struct StrType : public Maker<StrType, string>, public CustomGetter<std::string>
 
     std::string get() const override
     {
-		return string(value.begin(), value.end());
+		return {value.begin(), value.end()};
     }
 };
 
@@ -172,7 +172,7 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
     {
         if (_str.length() != SIZE)
         {
-            throw std::invalid_argument("Incorrect length str in FixedStrType");
+            throw packstream_exception("Incorrect length str in FixedStrType");
         }
         value.insert(value.begin(), _str.begin(), _str.end());
     }
@@ -181,7 +181,7 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
     {
         if (_c_str.size() != SIZE)
         {
-            throw std::invalid_argument("Incorrect length str in FixedStrType");
+            throw packstream_exception("Incorrect length str in FixedStrType");
         }
         value = _c_str;
     }
@@ -193,7 +193,7 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
 
         if (parsedHexData.size() != SIZE)
         {
-            throw std::invalid_argument("Incorrect length str in FixedStrType");
+            throw packstream_exception("Incorrect length str in FixedStrType");
         }
 
         value.insert(value.end(), parsedHexData.begin(), parsedHexData.end());
@@ -215,7 +215,7 @@ struct FixedStrType : public Maker<FixedStrType<SIZE>, string>, public CustomGet
         {
             auto len = SIZE;
             if (stream.size() < len)
-                throw std::invalid_argument("FixedStr: stream size < len");
+                throw packstream_exception("FixedStr: stream size < len");
 
             value.insert(value.begin(), stream.data.begin(), stream.data.begin()+len);
             stream.data.erase(stream.data.begin(), stream.data.begin()+len);
@@ -279,7 +279,7 @@ struct IntType : public Maker<IntType<INT_T, BIG_ENDIAN>, INT_T>, public Getter<
     {
         size_t _len = CALC_SIZE(INT_T);
         if (stream.size() < _len)
-            throw std::invalid_argument("IntType: stream size < _len");
+            throw packstream_exception("IntType: stream size < _len");
 
         unsigned char *packed = new unsigned char[_len];
         //int32_t len = sizeof(value2) / sizeof(*packed);
@@ -342,9 +342,9 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
     virtual PackStream &read(PackStream &stream)
 	{
         if (stream.size() < value_type::WIDTH)
-            throw std::invalid_argument("ULongIntType: stream size < value_type::WIDTH");
+            throw packstream_exception("ULongIntType: stream size < value_type::WIDTH");
 
-		unsigned char *packed = new unsigned char[value_type::WIDTH];
+		auto *packed = new unsigned char[value_type::WIDTH];
 		//int32_t len = sizeof(value2) / sizeof(*packed);
 
 		for (int i = 0; i < value_type::WIDTH; i++)
