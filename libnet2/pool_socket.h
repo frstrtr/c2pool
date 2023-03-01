@@ -29,25 +29,25 @@ public:
 
 	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
 	{
-		LOG_DEBUG << "PoolSocket created";
+		LOG_DEBUG_POOL << "PoolSocket created";
 	}
 
 	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
 	{
-        LOG_DEBUG << "PoolSocket created2";
+        LOG_DEBUG_POOL << "PoolSocket created2";
 	}
 
 	~PoolSocket(){
-        LOG_DEBUG << "PoolSocket removed";
+        LOG_DEBUG_POOL << "PoolSocket removed";
 	}
 
 	void write(std::shared_ptr<Message> msg) override
 	{
-        LOG_DEBUG << "Pool Socket write for " << msg->command << "!";
+        LOG_DEBUG_POOL << "Pool Socket write for " << msg->command << "!";
 
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
 
-        LOG_DEBUG << "\tMessage data: " << *_msg;
+        LOG_DEBUG_POOL << "\tMessage data: " << *_msg;
 
         if (_msg->len > 8000000)
         {
@@ -58,7 +58,7 @@ public:
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
                                  [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
                                  {
-                                     LOG_DEBUG << "[PoolSocket] peer receive message_" << cmd;
+                                     LOG_DEBUG_POOL << "[PoolSocket] peer receive message_" << cmd;
                                      if (_ec)
                                      {
                                          std::string reason = "[PoolSocket] write error: " + _ec.message();

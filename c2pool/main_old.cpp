@@ -14,7 +14,7 @@ int main(int argc, char *argv[])
 {
     SetThreadUILanguage(MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US));//for test
     setlocale(LC_ALL, "rus");
-    c2pool::console::Logger::Init();
+    C2Log::Logger::Init();
 
     // LOG_TRACE << "A trace severity message" << "TEST";
     // LOG_DEBUG << "A debug severity message";

@@ -109,7 +109,7 @@ public:
     void init();
 
     /// check for verify share.
-    void check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coind::data::tx_type> other_txs = {});
+    void check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint256, coind::data::tx_type> other_txs = {});
 };
 
 typedef std::shared_ptr<Share> ShareType;

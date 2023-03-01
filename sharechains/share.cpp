@@ -114,7 +114,7 @@ void Share::init()
 }
 #undef CheckShareRequirement
 
-void Share::check(std::shared_ptr<ShareTracker> _tracker, std::map<uint256, coind::data::tx_type> other_txs)
+void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint256, coind::data::tx_type> other_txs)
 {
     if (*timestamp > (c2pool::dev::timestamp() + 600))
     {

@@ -162,7 +162,7 @@ void CoindNode::handle_message_ping(std::shared_ptr<coind::messages::message_pin
 
 void CoindNode::handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, std::shared_ptr<CoindProtocol> protocol)
 {
-    LOG_DEBUG << "Handle_PONG";
+    LOG_DEBUG_COIND << "Handle_PONG";
 }
 
 void CoindNode::handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, std::shared_ptr<CoindProtocol> protocol)

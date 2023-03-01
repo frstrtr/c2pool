@@ -46,7 +46,7 @@ public:
 
     void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
     {
-		LOG_DEBUG << "PoolServer has been connected to: " << _handshake->get_socket();
+        LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
 		auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
 		auto ip = std::get<0>(_protocol->get_socket()->get_addr());
@@ -88,7 +88,7 @@ public:
 
     void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
     {
-        LOG_DEBUG << "PoolServer has been connected to: " << _handshake->get_socket();
+        LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
         auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
         auto ip = std::get<0>(_protocol->get_socket()->get_addr());

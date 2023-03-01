@@ -30,7 +30,7 @@ void StratumProtocol::Read()
                 LOG_WARNING << "StratumProtocol::read error while parsing data :" << data;
             }
             request["jsonrpc"] = "2.0";
-            LOG_DEBUG << "StratumProtocol get request = " << request.dump();
+            LOG_DEBUG_STRATUM << "StratumProtocol get request = " << request.dump();
             auto response = server.HandleRequest(request.dump());
             buffer.consume(len);
             Read();
@@ -45,7 +45,7 @@ void StratumProtocol::Read()
 std::string StratumProtocol::Send(const std::string &request)
 {
     auto _req = request + "\n";
-    LOG_DEBUG << "StratumProtocol send message: " << request;
+    LOG_DEBUG_STRATUM << "StratumProtocol send message: " << request;
     boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
         if (ec)
         {

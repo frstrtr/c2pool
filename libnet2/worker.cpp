@@ -183,7 +183,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         throw std::runtime_error("c2pool is not connected to any peers"); //TODO: to jsonrpc_error
     }
 
-    LOG_DEBUG << "best_share in get_work: " << _pool_node->best_share.value().GetHex();
+    LOG_DEBUG_STRATUM << "best_share in get_work: " << _pool_node->best_share.value().GetHex();
     if (_pool_node->best_share.isNull() && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is downloading shares"); //TODO: to jsonrpc_error
@@ -260,7 +260,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
 	int64_t block_subsidy;
     std::string dst = desired_share_target.GetHex();
-    LOG_DEBUG << "DESIRED_SHARE_TARGET: " << dst;
+    LOG_DEBUG_STRATUM << "DESIRED_SHARE_TARGET: " << dst;
 	if (desired_share_target.IsNull())
 	{
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
@@ -288,7 +288,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	}
 
     //6
-    LOG_DEBUG << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
+    LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
     shares::GenerateShareTransaction generate_transaction(_tracker);
     generate_transaction.
             set_block_target(FloatingInteger(current_work.value().bits).target()).
@@ -737,7 +737,7 @@ stale_counts Worker::get_stale_counts()
 // TODO: check
 user_details Worker::get_user_details(std::string username)
 {
-    LOG_DEBUG << "username: " << username;
+    LOG_DEBUG_STRATUM << "username: " << username;
 
     user_details result;
     result.desired_pseudoshare_target = uint256::ZERO;
@@ -847,6 +847,6 @@ void Worker::compute_work()
 //                t = coind::getwork_result()
         }
     }
-    LOG_DEBUG.stream() << "New current_work!: " << t;
+    LOG_DEBUG_STRATUM << "New current_work!: " << t;
     current_work.set(t);
 }

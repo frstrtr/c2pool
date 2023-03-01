@@ -34,20 +34,20 @@ ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : SharePrefsum2(), 
 
 void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes)
 {
-    LOG_DEBUG << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
+    LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
     for (auto& _share : _shares)
     {
         add(_share);
     }
-    LOG_DEBUG << "ShareTracker::init -- init shares finished: " << c2pool::dev::timestamp();
+    LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares finished: " << c2pool::dev::timestamp();
 
-    LOG_DEBUG << "ShareTracker::init -- known shares started: " << c2pool::dev::timestamp();
+    LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- known shares started: " << c2pool::dev::timestamp();
     for (auto& share_hash : known_verified_share_hashes)
     {
         if (exists(share_hash))
             verified.add(items.at(share_hash));
     }
-    LOG_DEBUG << "ShareTracker::init -- known shares finished: " << c2pool::dev::timestamp();
+    LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- known shares finished: " << c2pool::dev::timestamp();
 
     // Set DOA rule
     //TODO
@@ -256,14 +256,14 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     std::sort(decorated_tails.begin(), decorated_tails.end());
     auto [best_tail_score, _best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, UintToArith288(uint288())), UintToArith256(uint256::ZERO)) : decorated_tails.back();
     auto best_tail = ArithToUint256(_best_tail);
-    if (true /*TODO: c2pool.DEBUG*/)
-    {
-        LOG_DEBUG << decorated_tails.size() << " tails";
+//    if (c2pool.DEBUG)
+//    {
+        LOG_DEBUG_SHARETRACKER << decorated_tails.size() << " tails";
         for (auto [score, tail_hash] : decorated_tails)
         {
-            LOG_DEBUG << tail_hash.GetHex() << " (" << std::get<0>(score) << ", " << std::get<1>(score).GetHex() << ")";
+            LOG_DEBUG_SHARETRACKER << tail_hash.GetHex() << " (" << std::get<0>(score) << ", " << std::get<1>(score).GetHex() << ")";
         }
-    }
+//    }
 
     std::vector<std::tuple<std::tuple<arith_uint256, int32_t, int32_t>, arith_uint256>> decorated_heads;
     if (verified.tails.find(best_tail) != verified.tails.end())
@@ -283,18 +283,18 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     auto [best_head_score, _best] = decorated_heads.empty() ? std::make_tuple(std::make_tuple(UintToArith256(uint256::ZERO), 0, 0), UintToArith256(uint256::ZERO)) : decorated_heads.back();
     auto best = ArithToUint256(_best);
 
-    if (true /*TODO: c2pool.DEBUG*/)
-    {
-        LOG_DEBUG << decorated_heads.size() << " heads. Top 10:";
+//    if (c2pool.DEBUG))
+//    {
+        LOG_DEBUG_SHARETRACKER << decorated_heads.size() << " heads. Top 10:";
         int i = decorated_heads.size() - 11;
         if (i < 0)
             i = 0;
         for (; i < decorated_heads.size(); i++)
         {
             auto _score = std::get<0>(decorated_heads[i]);
-            LOG_DEBUG << "\t" << std::get<1>(decorated_heads[i]).GetHex() << " " << items[ArithToUint256(std::get<1>(decorated_heads[i]))]->previous_hash->GetHex() << " " << ArithToUint256(std::get<0>(_score)) << " " << std::get<1>(_score) << " " << std::get<2>(_score);
+            LOG_DEBUG_SHARETRACKER << "\t" << std::get<1>(decorated_heads[i]).GetHex() << " " << items[ArithToUint256(std::get<1>(decorated_heads[i]))]->previous_hash->GetHex() << " " << ArithToUint256(std::get<0>(_score)) << " " << std::get<1>(_score) << " " << std::get<2>(_score);
         }
-    }
+//    }
 
     uint32_t timestamp_cutoff;
 //    arith_uint256 target_cutoff;

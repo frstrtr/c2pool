@@ -63,7 +63,7 @@ namespace c2pool::dev
         AddrsFile << ToJSON();
 
         AddrsFile.close();
-        LOG_DEBUG << "Addrs saved in file!";
+        LOG_DEBUG_OTHER << "Addrs saved in file!";
     }
 
     bool AddrStore::Check(addr_type key)

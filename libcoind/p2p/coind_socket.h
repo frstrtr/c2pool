@@ -45,17 +45,17 @@ public:
 
 	void write(std::shared_ptr<Message> msg) override
 	{
-        LOG_DEBUG << "Coind socket write msg: " << msg->command;
+        LOG_DEBUG_COIND << "Coind socket write msg: " << msg->command;
 //		write_prefix(msg);
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
 
-        LOG_DEBUG << "\tMessage data: " << *_msg;
+        LOG_DEBUG_COIND << "\tMessage data: " << *_msg;
 
         add_not_received(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
                                  [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
                                  {
-                                     LOG_DEBUG << "[CoindSocket] peer receive message_" << cmd;
+                                     LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
                                      if (_ec)
                                      {
                                          LOG_ERROR << "[CoindSocket] write error: " << _ec << ":" << _ec.message();
