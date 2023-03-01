@@ -29,7 +29,7 @@ protected:
     {
         std::shared_ptr<MessageType> msg = std::make_shared<MessageType>();
 
-        LOG_DEBUG << "\tMessage data: " << stream;
+        LOG_DEBUG_P2P << "\tMessage data: " << stream;
 
         stream >> *msg;
         return msg;

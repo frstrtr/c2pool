@@ -15,6 +15,6 @@ void BaseProtocol::set_socket(std::shared_ptr<Socket> _socket)
 
 void BaseProtocol::disconnect(std::string reason)
 {
-    LOG_DEBUG << "BaseProtocol disconnect called!";
+    LOG_DEBUG_P2P << "BaseProtocol disconnect called!";
     socket->disconnect();
 }

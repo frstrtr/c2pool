@@ -65,11 +65,11 @@ json Stratum::mining_subscribe(const json &_params)
 {
     std::vector<std::string> params = _params.get<std::vector<std::string>>();
     auto miner_info = params[0];
-    LOG_DEBUG << "mining.subscribe called: " << miner_info;// << " " << _params.get<std::string>() << std::endl;
-    LOG_DEBUG << "params:";
+    LOG_DEBUG_STRATUM << "mining.subscribe called: " << miner_info;// << " " << _params.get<std::string>() << std::endl;
+    LOG_DEBUG_STRATUM << "params:";
     for (auto p : params)
     {
-        LOG_DEBUG << p;
+        LOG_DEBUG_STRATUM << p;
     }
 
     json res;
@@ -82,7 +82,7 @@ json Stratum::mining_subscribe(const json &_params)
 json Stratum::mining_authorize(const std::string &_username, const std::string &_password, const std::string &_id)
 {
     username = _username;
-    LOG_DEBUG << "Auth with [username: " << _username << ", password: " << _password << "]";
+    LOG_DEBUG_STRATUM << "Auth with [username: " << _username << ", password: " << _password << "]";
 
     _context->post([&](){_send_work();});
 
@@ -92,7 +92,7 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
 json Stratum::mining_set_difficulty(difficulty_type difficulty)
 {
     client.CallNotification("mining.set_difficulty", {difficulty});
-    LOG_DEBUG << "called mining_set_difficulty";
+    LOG_DEBUG_STRATUM << "called mining_set_difficulty";
     return {};
 }
 

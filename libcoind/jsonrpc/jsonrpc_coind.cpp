@@ -32,7 +32,7 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
 	boost::beast::http::read(stream, buffer, response);
 
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
-    LOG_DEBUG << "json_result: " << json_result;
+    LOG_DEBUG_COIND_JSONRPC << "json_result: " << json_result;
 	UniValue result(UniValue::VOBJ);
 	result.read(json_result);
 
@@ -43,7 +43,7 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
 
 UniValue coind::JSONRPC_Coind::request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
 {
-    LOG_DEBUG << "JsonRPC COIND request: " << method_name;
+    LOG_DEBUG_COIND_JSONRPC << "JsonRPC COIND request: " << method_name;
 	auto result =  _request(method_name, req_params);
 	if (!result["error"].isNull())
 	{

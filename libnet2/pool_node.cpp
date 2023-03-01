@@ -39,7 +39,7 @@ std::vector<addr_type> PoolNodeClient::get_good_peers(int max_count)
 
 void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake)
 {
-	LOG_DEBUG << "handle message_version";
+    LOG_DEBUG_POOL << "handle message_version";
 	LOG_INFO << "Peer "
 			 << msg->addr_from.address.get()
 			 << ":"
@@ -51,12 +51,12 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
 
 	if (handshake->other_version.has_value())
 	{
-		LOG_DEBUG
+        LOG_DEBUG_POOL
 			<< "more than one version message";
 	}
 	if (msg->version.get() < net->MINIMUM_PROTOCOL_VERSION)
 	{
-		LOG_DEBUG << "peer too old";
+        LOG_DEBUG_POOL << "peer too old";
 	}
 
 	handshake->other_version = msg->version.get();
@@ -269,8 +269,8 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
                     _txs.push_back(x.second);
                 }
             }
-            LOG_DEBUG << "_tx_hashes: " << _tx_hashes;
-            LOG_DEBUG.stream() << "_txs: " << _txs;
+            LOG_DEBUG_POOL << "_tx_hashes: " << _tx_hashes;
+            LOG_DEBUG_POOL << "_txs: " << _txs;
             auto msg_remember_tx = std::make_shared<message_remember_tx>(_tx_hashes, _txs);
             socket->write(msg_remember_tx);
         }
@@ -593,7 +593,7 @@ void PoolNode::handle_message_forget_tx(std::shared_ptr<pool::messages::message_
 
 void PoolNode::start()
 {
-    LOG_DEBUG << "PoolNode started!";
+    LOG_DEBUG_POOL << "PoolNode started!";
     for (const auto &item: tracker->items)
     {
         shared_share_hashes.insert(item.first);
@@ -641,12 +641,12 @@ void PoolNode::download_shares()
     _download_shares_fiber = c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
     {
         auto _node = shared_from_this();
-        LOG_DEBUG << "Start download_shares!";
+        LOG_DEBUG_POOL << "Start download_shares!";
         while (true)
         {
             auto desired = _node->coind_node->desired.get_when_satisfies([&](const auto &desired)
                                                                          {
-                                                                             LOG_DEBUG << "SATISFIES!";
+                                                                             LOG_DEBUG_POOL << "SATISFIES!";
                                                                              return desired.size() != 0;
                                                                          })->yield(fiber);
             auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);

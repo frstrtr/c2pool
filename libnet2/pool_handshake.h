@@ -37,12 +37,12 @@ public:
             : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
-                        LOG_DEBUG << "ID: " << _id.GetHex();
-                        LOG_DEBUG << "Hashes: " << _hashes;
-                        LOG_DEBUG << "Parents: " << _parents;
-                        LOG_DEBUG << "Stops: " << _stops;
+                        LOG_DEBUG_POOL << "ID: " << _id.GetHex();
+                        LOG_DEBUG_POOL << "Hashes: " << _hashes;
+                        LOG_DEBUG_POOL << "Parents: " << _parents;
+                        LOG_DEBUG_POOL << "Stops: " << _stops;
 
-                        LOG_DEBUG << "get_shares called!";
+                        LOG_DEBUG_POOL << "get_shares called!";
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
                         _socket->write(msg);
                     }, 15, [_socket = socket](std::string msg){LOG_WARNING << msg; _socket->disconnect();})), handle_message_version(std::move(_handler))
@@ -60,7 +60,7 @@ public:
 
 	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
 	{
-		LOG_DEBUG << "Pool handshake server handle message: " << raw_msg->command;
+        LOG_DEBUG_POOL << "Pool handshake server handle message: " << raw_msg->command;
 		try
 		{
 			if (raw_msg->command != "version")
@@ -93,7 +93,7 @@ public:
 
 	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
 	{
-		LOG_DEBUG << "Pool handshake client handle message: " << raw_msg->command;
+        LOG_DEBUG_POOL << "Pool handshake client handle message: " << raw_msg->command;
         try
         {
             if (raw_msg->command != "version")

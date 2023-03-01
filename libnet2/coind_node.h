@@ -36,7 +36,7 @@ protected:
     void socket_handle(const std::shared_ptr<Socket>& socket)
     {
         socket->set_addr();
-        LOG_DEBUG << "CoindNode has been connected to: " << socket;
+        LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
 
 		protocol = std::make_shared<CoindProtocol>(context, socket, handler_manager);
     }

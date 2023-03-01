@@ -41,7 +41,7 @@ public:
 
     virtual void disconnect(std::string reason)
     {
-        LOG_DEBUG << "Base Handshake disconnect called with reason: " << reason;
+        LOG_DEBUG_P2P << "Base Handshake disconnect called with reason: " << reason;
         event_disconnect.happened();
         socket->disconnect();
     }
