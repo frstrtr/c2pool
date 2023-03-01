@@ -40,7 +40,8 @@ int main(int ac, char *av[])
     // args main
     desc.add_options()("help", "produce help message");
     desc.add_options()("version,v", "version");
-    desc.add_options()("debug", po::value<c2pool::dev::DebugState>(&c2pool_config::get()->debug)->default_value(c2pool::dev::normal), "enable debugging mode");
+    desc.add_options()("trace", "enable trace logs");
+    desc.add_options()("debug", po::value<std::vector<std::string>>()->multitoken(), "");
     desc.add_options()("networks", po::value<std::vector<std::string>>()->multitoken(), "");
     desc.add_options()("datadir", po::value<string>()->default_value(""), "store data in this directory (default: <directory with c2pool build>/data)");
     desc.add_options()("give-author", po::value<float>()->default_value(0), "donate this percentage of work towards the development of p2pool (default: 0.0)");
@@ -65,8 +66,20 @@ int main(int ac, char *av[])
         return C2PoolErrors::success;
     }
 
+    C2Log::Logger::Init();
+
+    if (vm.count("trace"))
+        C2Log::Logger::enable_trace();
+
+    if (vm.count("debug"))
+    {
+        for (const auto &v: vm["debug"].as < std::vector < std::string >> ())
+        {
+            C2Log::Logger::add_category(v);
+        }
+    }
+
     //============================================================
-    c2pool::console::Logger::Init();
     LOG_INFO << "Start c2pool...";
     // каждый второй поток для coind'a/stratum'a
     //boost::asio::thread_pool coind_threads(thread::hardware_concurrency()/2); //TODO: количество через аргументы запуска.
