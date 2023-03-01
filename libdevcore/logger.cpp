@@ -22,7 +22,7 @@ namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
 
-namespace c2pool::console
+namespace C2Log
 {
     Logger::Logger()
     {
@@ -33,23 +33,8 @@ namespace c2pool::console
             keywords::time_based_rotation = sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at midnight >*/
             keywords::format = "[%TimeStamp%]<%Severity%>:\t%Message%"                     /*< log record format >*/
         );
-        if (c2pool_config::get()->debug == c2pool::dev::trace)
-        {
-            logging::core::get()->set_filter(
-                logging::trivial::severity >= logging::trivial::trace);
-        }
-        if (c2pool_config::get()->debug == c2pool::dev::debug)
-        {
-            logging::core::get()->set_filter(
-                logging::trivial::severity >= logging::trivial::debug);
-        }
-        if (c2pool_config::get()->debug == c2pool::dev::normal)
-        {
-
-            logging::core::get()->set_filter(
-                logging::trivial::severity >= logging::trivial::info);
-        }
-        logging::add_console_log(std::cout, boost::log::keywords::format = "[%TimeStamp%]<%Severity%>: %Message%");
+        logging::core::get()->set_filter(logging::trivial::severity >= logging::trivial::debug);
+        logging::add_console_log(std::cout, boost::log::keywords::format = "[%TimeStamp%][%Severity%]%Message%");
 
         logging::add_common_attributes();
     }
@@ -66,5 +51,63 @@ namespace c2pool::console
     {
         return instance;
     }
-}; // namespace c2pool::console
+
+    struct C2LogCategoryDesc{
+        C2Log::Flags flag;
+        std::string category;
+    };
+
+    const std::map<std::string, C2Log::Flags> LogCategories =
+    {
+            {"0", C2Log::NONE},
+            {"none", C2Log::NONE},
+            {"pool", C2Log::POOL},
+            {"coind", C2Log::COIND},
+            {"coind_jsonrpc", C2Log::COIND_JSONRPC},
+            {"sharetracker", C2Log::SHARETRACKER},
+            {"db", C2Log::DB},
+            {"1", C2Log::ALL},
+            {"all", C2Log::ALL},
+    };
+
+    void Logger::add_category(const std::string &str)
+    {
+        if (str.empty())
+        {
+            instance->categories = C2Log::ALL;
+            return;
+        }
+
+        if (LogCategories.find(str) == LogCategories.end())
+            return;
+
+        instance->categories |= LogCategories.at(str);
+    }
+
+    void Logger::remove_category(const std::string &str)
+    {
+        if (str.empty())
+        {
+            instance->categories = C2Log::NONE;
+            return;
+        }
+
+        if (LogCategories.find(str) == LogCategories.end())
+            return;
+
+        instance->categories &= ~LogCategories.at(str);
+    }
+
+    void Logger::enable_trace()
+    {
+        logging::core::get()->set_filter(
+                logging::trivial::severity >= logging::trivial::trace);
+    }
+
+    void Logger::disable_trace()
+    {
+        logging::core::get()->set_filter(
+                logging::trivial::severity >= logging::trivial::debug);
+    }
+}; // namespace C2Log
 //std::ostream &operator<<(std::ostream &stream, std::vector<unsigned char> &data)

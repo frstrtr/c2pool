@@ -12,19 +12,8 @@ namespace po = boost::program_options;
 
 namespace c2pool::dev
 {
-    enum DebugState
-    {
-        trace = 0,
-        debug = 1,
-        normal = 2
-    };
-
-    std::istream &operator>>(std::istream &in, c2pool::dev::DebugState &value);
     class c2pool_config
     {
-    public:
-        DebugState debug = normal;
-
     private:
         static c2pool_config *_instance;
 
