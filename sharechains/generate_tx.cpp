@@ -85,7 +85,7 @@ namespace shares
             _share_data.subsidy = _base_subsidy + definite_fees;
         }
 
-        auto [amounts] = weight_amount_calculate((*previous_share->share_data)->previous_share_hash, height);
+        auto [amounts] = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height);
 
         bool segwit_activated = is_segwit_activated(version, net);
         if (!_segwit_data.has_value() && !_known_txs.has_value())
