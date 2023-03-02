@@ -721,11 +721,16 @@ stale_counts Worker::get_stale_counts()
 
     auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales.value();
 
-    const DOAElement *delta = _tracker->get_sum_to_last(_coind_node->best_share.value()).rules.get<DOAElement>("doa");
-    auto my_shares_in_chain = delta->my_count + _removed_unstales;
-    auto my_doa_shares_in_chain = delta->my_doa_count + removed_doa_unstales.value();
-    auto orphans_recorded_in_chain = delta->my_orphan_announce_count + _removed_unstales_orphans;
-    auto doas_recorded_in_chain = delta->my_dead_announce_count + _removed_unstales_doa;
+    DOAElement delta;
+    if (_coind_node->best_share.value().IsNull())
+        delta = DOAElement{0,0,0,0};
+    else
+        delta = *_tracker->get_sum_to_last(_coind_node->best_share.value()).rules.get<DOAElement>("doa");
+
+    auto my_shares_in_chain = delta.my_count + _removed_unstales;
+    auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales.value();
+    auto orphans_recorded_in_chain = delta.my_orphan_announce_count + _removed_unstales_orphans;
+    auto doas_recorded_in_chain = delta.my_dead_announce_count + _removed_unstales_doa;
 
     auto my_shares_not_in_chain = my_shares - my_shares_in_chain;
     auto my_doa_shares_not_in_chain = my_doa_shares - my_doa_shares_in_chain;

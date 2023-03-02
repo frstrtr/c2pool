@@ -142,6 +142,10 @@ public:
 	std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
 	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint288 desired_weight)
 	{
+        // Если start -- None/Null/0 шара.
+        if (start.IsNull())
+            return {{},{}, {}};
+
         auto [start_height, last] = get_height_and_last(start);
 
         // Ограничиваем цепочку до размера max_shares.

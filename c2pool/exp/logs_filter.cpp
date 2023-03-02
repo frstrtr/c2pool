@@ -55,7 +55,7 @@ int main()
 {
     src::severity_logger<severity_level> slg;
     logging::add_console_log(std::cout, boost::log::keywords::format = "[%TimeStamp%]<%Severity%>:\t%Message%");
-    BOOST_LOG_TRIVIAL(debug) << "\033[33m" <<  "HELLO\033[0m"; // Yellow color
+    BOOST_LOG_TRIVIAL(debug) << "\033[31m" <<  "HELLO\033[0m"; // Yellow color
     BOOST_LOG_TRIVIAL(debug) << "HI2";
     LOG_DEBUG(Flag::AA) << " ASD";
     LOG_DEBUG_AA << "test AA";
