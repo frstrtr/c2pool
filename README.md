@@ -80,5 +80,5 @@ cd c2pool
 git pull
 mkdir cmake-build-debug
 cmake -DCMAKE_BUILD_TYPE=Debug -S . -B cmake-build-debug
-cmake --build cmake-build-debug --target coind_n_pool -j 3
+cmake --build cmake-build-debug --target c2pool_main -j 6
 ```
