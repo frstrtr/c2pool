@@ -66,6 +66,9 @@ namespace C2Log
             {"coind_jsonrpc", C2Log::COIND_JSONRPC},
             {"sharetracker", C2Log::SHARETRACKER},
             {"db", C2Log::DB},
+            {"other", C2Log::OTHER},
+            {"p2p", C2Log::P2P},
+            {"stratum", C2Log::STRATUM},
             {"1", C2Log::ALL},
             {"all", C2Log::ALL},
     };
