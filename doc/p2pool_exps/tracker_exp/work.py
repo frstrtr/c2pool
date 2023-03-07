@@ -288,7 +288,8 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
         #4
         previous_share = self.node.tracker.items[self.node.best_share_var.value] if self.node.best_share_var.value is not None else None
         if previous_share is None:
-            share_type = p2pool_data.Share
+            # share_type = p2pool_data.Share
+            share_type = share.Share
         else:
             previous_share_type = type(previous_share)
             
@@ -370,9 +371,12 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
         
         if desired_pseudoshare_target is None:
             target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
+            print('target[#1] = {0}'.format(hex(target)))
             local_hash_rate = self._estimate_local_hash_rate()
+            print('local_hash_rate = {0}'.format(local_hash_rate))
             if local_hash_rate is not None:
                 target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1) # target 10 share responses every second by modulating pseudoshare difficulty
+                print('target[#2.1] = {0}'.format(hex(target)))
             else:
                 # If we don't yet have an estimated node hashrate, then we still need to not undershoot the difficulty.
                 # Otherwise, we might get 1 PH/s of hashrate on difficulty settings appropriate for 1 GH/s.
@@ -381,12 +385,16 @@ class WorkerBridge(coind_worker_interface.WorkerBridge):
                 # every ~0.01 seconds.
                 target = min(target, 3000 * bitcoin_data.average_attempts_to_target((bitcoin_data.target_to_average_attempts(
                     self.node.bitcoind_work.value['bits'].target)*self.node.net.SPREAD)*self.node.net.PARENT.DUST_THRESHOLD/block_subsidy))
+                print('target[#2.2] = {0}'.format(hex(target)))
         else:
             target = desired_pseudoshare_target
+            print('target[#1.alternative] = {0}'.format(hex(target)))
         target = max(target, share_info['bits'].target)
+        print('target[#3] = {0}'.format(hex(target)))
         # for aux_work, index, hashes in mm_later:
         #     target = max(target, aux_work['target'])
         target = p2pool_math.clip(target, self.node.net.PARENT.SANE_TARGET_RANGE)
+        print('target[#4] = {0}'.format(hex(target)))
         
         #9
         getwork_time = time.time()
