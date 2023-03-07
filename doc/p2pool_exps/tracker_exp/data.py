@@ -43,11 +43,15 @@ def load_share(share, net, peer_addr):
 
 class ShareStore(object):
     def __init__(self, net, path_shares, share_cb, verified_hash_cb):
-
         start = time.time()
-        
+
+        load_tracker = False # false -- empty tracker
+
         known = {}
-        filenames = [path_shares]
+        if load_tracker:
+            filenames = [path_shares]
+        else:
+            filenames = []
         for filename in filenames:
             share_hashes, verified_hashes = known.setdefault(filename, (set(), set()))
             with open(filename, 'rb') as f:

@@ -92,7 +92,7 @@ class BaseShare(object):
         previous_share = tracker.items[share_data['previous_share_hash']] if share_data['previous_share_hash'] is not None else None
         
         height, last = tracker.get_height_and_last(share_data['previous_share_hash'])
-        print('{0}, {1}, {2}'.format(height, net.REAL_CHAIN_LENGTH, hex(last)))
+        print('{0}, {1}, {2}'.format(height, net.REAL_CHAIN_LENGTH, hex(last) if last is not None else last))
         assert height >= net.REAL_CHAIN_LENGTH or last is None
         if height < net.TARGET_LOOKBEHIND:
             pre_target3 = net.MAX_TARGET
@@ -103,7 +103,10 @@ class BaseShare(object):
             pre_target3 = math.clip(pre_target2, (net.MIN_TARGET, net.MAX_TARGET))
         max_bits = pack.FloatingInteger.from_target_upper_bound(pre_target3)
         bits = pack.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//30, pre_target3)))
-        
+        print('bits.target = {0}'.format(hex(bits.target)))
+        print('clip.target = {0}'.format(hex(math.clip(desired_target, (pre_target3//30, pre_target3)))))
+
+
         new_transaction_hashes = []
         new_transaction_size = 0 # including witnesses
         all_transaction_stripped_size = 0 # stripped size
