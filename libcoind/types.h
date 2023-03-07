@@ -43,7 +43,7 @@ namespace coind::data::types
             return !(*this == value);
         }
 
-        virtual void print(std::ostream &stream)
+        virtual void print(std::ostream &stream) const
         {
             stream << "(SmallBlockHeaderType: ";
             stream << "version = " << version;
@@ -107,7 +107,7 @@ namespace coind::data::types
             return !(*this == value);
         }
 
-        void print(std::ostream &stream) override
+        void print(std::ostream &stream) const override
         {
             stream << "(BlockHeaderType: ";
             stream << "version = " << version;
@@ -120,7 +120,13 @@ namespace coind::data::types
         }
     };
 
-    inline std::ostream &operator<<(std::ostream &stream, SmallBlockHeaderType &value)
+    inline std::ostream &operator<<(std::ostream &stream, const SmallBlockHeaderType &value)
+    {
+        value.print(stream);
+        return stream;
+    }
+
+    inline std::ostream &operator<<(std::ostream &stream, const BlockHeaderType &value)
     {
         value.print(stream);
         return stream;

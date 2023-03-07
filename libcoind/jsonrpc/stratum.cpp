@@ -37,6 +37,7 @@ void Stratum::_send_work()
     }
 
     auto &[x, got_response] = get_work_result;
+    LOG_DEBUG_STRATUM << "X: " << x;
 
     auto jobid = HexStr(c2pool::random::random_bytes(16)); // random_bytes(16) = random(2**128)
     mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* _worker->_net->parent->DUMB_SCRYPT_DIFF);
@@ -46,6 +47,8 @@ void Stratum::_send_work()
     {
         merkle_branch.emplace_back(HexStr(pack<IntType(256)>(s)));
     }
+
+    LOG_DEBUG_STRATUM << "x.bits = " << x.bits << ", swap4 = " << HexStr(c2pool::dev::swap4(pack<IntType(32)>(x.bits)));
 
     mining_notify(
                 jobid,
@@ -92,7 +95,7 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
 json Stratum::mining_set_difficulty(difficulty_type difficulty)
 {
     client.CallNotification("mining.set_difficulty", {difficulty});
-    LOG_DEBUG_STRATUM << "called mining_set_difficulty";
+    LOG_DEBUG_STRATUM << "called mining_set_difficulty = " << difficulty;
     return {};
 }
 
@@ -147,6 +150,7 @@ json Stratum::mining_notify(std::string jobid, std::string prevhash, std::string
 json Stratum::mining_submit(const std::string &_worker_name, const std::string &_jobid, const std::string &_extranonce2, const std::string &_ntime, const std::string &_nonce, const std::string &_id)
 {
 //    json res = {false};
+    LOG_TRACE << "MINING_SUBMIT_ARGS: " << _worker_name << "; " << _jobid << "; " << _extranonce2 << "; " << _ntime << "; " << _nonce << "; "  << _id << "; ";
 
     if (!handler_map.exist(_jobid))
     {
@@ -158,14 +162,20 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
     auto x = map_obj.value().ba;
     auto coinb_nonce = ParseHex(_extranonce2);
     assert(coinb_nonce.size() == _worker->COINBASE_NONCE_LENGTH);
+    LOG_TRACE.stream() << "coinb_nonce = " << coinb_nonce;
 
     std::vector<unsigned char> new_packed_gentx {x.coinb1.begin(), x.coinb1.end()};
     new_packed_gentx.insert(new_packed_gentx.end(), coinb_nonce.begin(), coinb_nonce.end());
     new_packed_gentx.insert(new_packed_gentx.end(), x.coinb2.begin(), x.coinb2.end());
+    LOG_TRACE.stream() << "new_packed_gentx = " << new_packed_gentx;
 
     uint32_t _timestamp = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_ntime)));
+    LOG_TRACE.stream() << "_timestamp = " << _timestamp;
     uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
+    LOG_TRACE.stream() << "nonce = " << nonce;
     auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), x.merkle_link);
+    LOG_TRACE.stream() << "merkle_root = " << merkle_root;
+    LOG_TRACE.stream() << "coind::data::hash256(new_packed_gentx, true) = " << coind::data::hash256(new_packed_gentx, true);
 
     coind::data::types::BlockHeaderType header(x.version, x.previous_block, _timestamp, x.bits, nonce, merkle_root);
 
