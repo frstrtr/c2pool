@@ -126,7 +126,7 @@ namespace coind
         int ADDRESS_VERSION;
         int RPC_PORT;
 
-		int DUMB_SCRYPT_DIFF;
+		uint256 DUMB_SCRYPT_DIFF;
         int DUST_THRESHOLD;
         arith_uint256 SANE_TARGET_RANGE_MIN;
         arith_uint256 SANE_TARGET_RANGE_MAX;

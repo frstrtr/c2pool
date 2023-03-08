@@ -263,7 +263,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         auto local_hash_rates = get_local_addr_rates();
 
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
-		desired_share_target = coind::data::difficulty_to_target(uint256::ONE);
+		desired_share_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
 
 		auto local_hash_rate = local_hash_rates.count(pubkey_hash) > 0 ? UintToArith288(local_hash_rates[pubkey_hash]) : arith_uint288();
 		if (local_hash_rate > 0)
@@ -372,7 +372,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     if (desired_pseudoshare_target.IsNull())
     {
 //		target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
-        a_target = coind::data::difficulty_to_target(uint256::ONE);
+        a_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
         LOG_DEBUG_STRATUM << "target[#1] = " << a_target.GetHex();
 		auto local_hash_rate = _estimate_local_hash_rate();
         LOG_DEBUG_STRATUM << "local_hash_rate = " << local_hash_rate.GetHex();
@@ -384,6 +384,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             LOG_DEBUG_STRATUM << "target[#2.1] = " << a_target.GetHex();
 		} else
         {
+            //TODO: TEST
             //# If we don't yet have an estimated node hashrate, then we still need to not undershoot the difficulty.
             //# Otherwise, we might get 1 PH/s of hashrate on difficulty settings appropriate for 1 GH/s.
             //# 1/3000th the difficulty of a full share should be a reasonable upper bound. That way, if
@@ -423,7 +424,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     a_target = math::clip(a_target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX);
     LOG_DEBUG_STRATUM << "target[#4] = " << a_target.GetHex();
     auto target = ArithToUint256(a_target);
-    LOG_DEBUG_STRATUM << "target = " << a_target.GetHex();
+    LOG_DEBUG_STRATUM << "target =  " << a_target.GetHex();
 
 
     //9

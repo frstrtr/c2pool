@@ -32,6 +32,7 @@ void StratumProtocol::Read()
             request["jsonrpc"] = "2.0";
             LOG_DEBUG_STRATUM << "StratumProtocol get request = " << request.dump();
             auto response = server.HandleRequest(request.dump());
+
             buffer.consume(len);
             Read();
             Send(response);
