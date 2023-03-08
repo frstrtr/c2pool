@@ -14,11 +14,12 @@
 
 TEST(SharechainDataTest, TestCheckHashLink)
 {
+    std::cout << coind::data::hash256("1234", true) << std::endl;
     for (int i = 0; i < 100; i++)
     {
         auto d = c2pool::random::random_bytes(2048);
         auto x = shares::prefix_to_hash_link(d);
-        ASSERT_EQ(shares::check_hash_link(x, std::vector<unsigned char>{'\0'}), coind::data::hash256(PackStream(d)));
+        ASSERT_EQ(shares::check_hash_link(x, std::vector<unsigned char>{}), coind::data::hash256(PackStream(d), true));
     }
 }
 
@@ -26,8 +27,9 @@ TEST(SharechainDataTest, TestForOneHashLink)
 {
     auto d = ParseHex("1a771dd7911edade4d63db5cfda8e7595e29c089580302c4dffb2bf6bbc48e2d1621420932820f43a46e4a452cf9d2e2f281d337eb5e082b114391408a0ad12cb716f4e66327fe751968d6046009b33abd1b91538b9be0261572363deb7b4c2a1eb02e3604e57788b210e6a833177060ab5497b29f8e80eebce8c798baa218823eba857949b634dad92f1b219d9f46526744ecd9dc149412b002270f95e4d20b9427f7b924bdfba1f628a204949b47c4812d7a0cdeaa2990e7ab8f5ae75d6efa1e7729a6a85b4f256055f48a6e14144a0fbe7bc286301fb1f6aa20f31787d0e55245dc609df4ee7fd22c94c5d479e02aa00695d7038806fb35dac826e62607b1c58e8292575ae3b04cb153457b78d0757ac7eb79db9869a1a8b3bf806f904c7bdedf0dbee8ec7a23abeea3f6bed5e638e61298a134c3de88c6e15c4260b52a952c447f707ee278b386fd904025a2ac608dcdb4d9015b865d888c0e8becd93c74350b6f60b78f2299240bd7bdb08858160ae734501a412fffbb0ec5188fef45c3ee9502ada21e8fc41fe244e9b2fa1cd053630d2a07b611489e98414d88a50d1f42477dd531246399816ce89c35276420d37e1665506de3d1aff50166c171e99ac8293fa3e1bb86f247f1e950c75a2293eaf46ee3244a443c277def788df3e5f6d87dbe45b7917fa55f4f959b37567e75e92e4484e40bc6f3b4eefe0c8983bcd2bf7cfc11d4a141c7a1e32f13b1eb52e2e5ce7bff5321c7df68295823b2486718bf3efbc2e48cdff3f3b93ad1c1e165d9145c9556d5f600f09898844b99370919f3b1ab2569aee055ca8a011f4eda7bc493d9157dde1b25b80d2ace3ef6736e7736142c38845aca8186b1fb12cc516a62ae066fe367704f07a144df59822506242b4380a3222a5bef6016309d16984f87432c8c0189588dd5404f24851d433c62b56d513bf4c688c150120e36672c53d9285e05847fe8b2d2b70d04f4ba56e1137849f7e8c81380f30a38d0fae4d81cbb50d9704a45ac84d691743c60475c7082ccb142aa6ced197f35a7acfe29b4c2c514368e81334d26afe31374b33e41bd919c89f333a4f0489e0e96eca7439787288c997574ec5c09d0832b008b520407329e1c60b22ebc014865b243cf67dfb15069ef3af3edd02fcc6233bc4bd8283dd1684c4643f243b7d65d242bae3d617213bfcf295d2fad0b11fb68a0dc1ee97aea03d56fc59592a2ed991c23ee47a19904c77a43b93095ea9a090189a5a81c7e4f848880378d4ce3333e7a7c4d5a9ce04e612241e7eb1dd6c72afd28ee8f1fd1972c8f3cab189ee4090026490a9e41e269297260e932c20a03fce7ee21e3477e5bdab80ad5851814e2ce1b2e8faf087222558806328cbd02727f938599d1322f5179c050db0ee08337000d84063a03f6ac48f950b072b37fe55a2d77a3dac4453518edfc54383dd2a662c35f30d214d7915c482012edf08c1b42c0a90dcf56b9358e2abbd44c276024314f62b33f3482a886f5881d2ac742db27a736bcb087753fdfd5eba4b7d9badb13cef1cbfdafae8b3ff3d86f5150bdd549eb6a3d4fcc31f62d96e9aae8a66b7b398622ffe0a39e8fe87e79f8edb3bcb5f82c5e51cfe68a69897cc60f5ccea4c8160b4885c06b9ae4dd7cba5f0dd89a0b27e5ca38fe121cd551d9f405946086d4b3ab9e5ebb635b28006c66c29a33a59909c276fc5a9b3ce5b0f792890b71e22d9d580dadea5e2aac3d15a98530ba3e64535a1a37b0b6fb02e77f53359dc583cc591c86a25213cbfb99706df4c7ba57f9efcaa043d86951e6343ff24fc7767da5784e9541cfa806d15461370e767dbb954a7b58b1106a161157bf9e5a1a8ca57fbd42d7f9c17fd5562713ef65cd46499e80aa6507873354329b5c2c15b5ddb974138c1686d934c2ebe323e4c3a8d480cca21885dd1fb15565f4d7fef6660d5519842791990f888d81d057c4be40c88c6c993eaafa208cbf0712cf4872b9e36ae744a73b7f4a83471e7f59e72784be17b3d403eb4c3bf385e3c0a9e67a0073d2d2b92d30a9ba5c08cf8e2e8d535f6107a20b0b7c852f84b82675e0a765feac1b41703a9bbfc0c9b0e615915992325ee2d8a0e76d496b75451c39308efead38a96a989e86621e8802a52a707ff8746cff6aec62f45230da1e689cd0ecf662d6faa0c19bb49fe77fa173538bd0502ab2708acb761f662aa4bdcaabc807c08547e5ee7da38ff9826ed2568b3f44aa3d510bd6d4c26530dd12ec2c9389ab94bfc7f26ac5c5fd036e7fa3e90172b6301f91917662a3631cb7bd9d5b135a8b3819ab279ec764e8d59b69bfe7fa697f630dd5d7437ffa848e03f4c0822f7af80bab506f07877d740f449f8de0c374002b79fa370f3c3a6406723591f1f3b412e8fcb8193698cc79103dee2aa11943b98c0d8d5adef453d4bc2d281752e59e3ecebb871bb84ab8709010615b3b66e2af9e769ba5d9adfff79ade63168b1c3497765e09600de8b6e252d5900427e788c83754349839e6973c51ba81570bfeed45207249fe0508193bd9f3c12903012b92c7a252d5efdcddc5fa59c46f7aa376f7aadabe6142d7f39ad2f54d7fd155c672a211915e310ec2af4171eea9dba04f4bfd5c5223ad4ff661384547eb381c7f09cfb1e47f9007f2cd68ba5c7df67d38c6fe9486d5ba6b9c3d438d15e22528aecdf3add0e2c68f7a5a13421130ec07d15d242fadc2fd234d68f36d108e8ff8779bd14baf9296c90d280ce12202bc59785e4811a96f269a0dbbb59d7743a4f74cf0c32374f27e5b1f0d5e0326d2022260b36524f5890f5661d90d44d972bb5929295dc101f1df23b0e75d0167989da027939e7ce9357fc9e221201c9ee42eb8f06d621e0fb7ab53a3036ea6947ed6");
     auto x = shares::prefix_to_hash_link(d);
+    std::cout << x->get()->length << " " << x->get()->extra_data << " " << x->get()->state << std::endl;
 
-    ASSERT_EQ(shares::check_hash_link(x, std::vector<unsigned char>{'\0'}), coind::data::hash256(PackStream(d)));
+    ASSERT_EQ(shares::check_hash_link(x, std::vector<unsigned char>{}), coind::data::hash256(PackStream(d), true));
 
     std::cout << "test" << std::endl;
 }
@@ -51,4 +53,27 @@ TEST(SharechainDataTest, TestForCustomState)
     auto hex_hash = HexStr(out);
     ASSERT_EQ(hex_hash, "879387d528687af19a517741752be3ae32b2e472052cba9152e1fa978e3a33e9");
 
+}
+
+TEST(SharechainDataTest, TestCheckHashLinkMax)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        auto d = c2pool::random::random_bytes(2048);
+        std::cout << "d: " << HexStr(d) << std::endl;
+        auto d2 = c2pool::random::random_bytes(2048);
+        std::cout << "d2: " << HexStr(d2) << std::endl;
+        auto d3 = c2pool::random::random_bytes(2048);
+        std::cout << "d3: " << HexStr(d3) << std::endl;
+
+        PackStream for_prefix(d);
+        for_prefix << d2;
+        auto x = shares::prefix_to_hash_link(for_prefix.data, d2);
+
+        std::cout << "x: " << x->get()->length << " " << x->get()->extra_data << " " << x->get()->state << std::endl;
+        auto for_hash = PackStream(d);
+        for_hash << d2 << d3;
+        std::cout << "for_hash: " << HexStr(for_hash.data) << std::endl;
+        ASSERT_EQ(shares::check_hash_link(x, d3, d2), coind::data::hash256(for_hash, true));
+    }
 }
