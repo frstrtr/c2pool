@@ -39,7 +39,10 @@ namespace coind::data
 
     double target_to_difficulty(uint256 target);
 
+    /// max_target/difficulty
     uint256 difficulty_to_target(uint256 difficulty);
+    /// max_target/(1/difficulty) -> max_target * difficulty
+    uint256 difficulty_to_target_1(uint256 difficulty);
 
 	uint256 get_txid(shared_ptr<coind::data::TransactionType> tx);
 
