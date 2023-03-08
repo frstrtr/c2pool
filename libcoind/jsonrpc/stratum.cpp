@@ -40,7 +40,8 @@ void Stratum::_send_work()
     LOG_DEBUG_STRATUM << "X: " << x;
 
     auto jobid = HexStr(c2pool::random::random_bytes(16)); // random_bytes(16) = random(2**128)
-    mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)* _worker->_net->parent->DUMB_SCRYPT_DIFF);
+    mining_set_difficulty(coind::data::target_to_difficulty(x.share_target)*_worker->_net->parent->DUMB_SCRYPT_DIFF.GetUint64(0));
+    LOG_DEBUG_STRATUM << "mining diff: " << coind::data::target_to_difficulty(x.share_target)*_worker->_net->parent->DUMB_SCRYPT_DIFF.GetUint64(0) << "; target_to_diff = " << coind::data::target_to_difficulty(x.share_target) << "; DUMB_SCRYPT_DIFF = " << _worker->_net->parent->DUMB_SCRYPT_DIFF.GetUint64(0);
 
     json::array_t merkle_branch;
     for (auto s : x.merkle_link.branch)

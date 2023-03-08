@@ -202,7 +202,7 @@ namespace coind
         ADDRESS_VERSION = pt.get<int>("ADDRESS_VERSION");
         RPC_PORT = pt.get<int>("RPC_PORT");
 
-        DUMB_SCRYPT_DIFF = pt.get<int>("DUMB_SCRYPT_DIFF");
+        DUMB_SCRYPT_DIFF = uint256S(pt.get<std::string>("DUMB_SCRYPT_DIFF"));
         DUST_THRESHOLD = pt.get<int>("DUST_THRESHOLD");
 
         SANE_TARGET_RANGE_MIN = uint256S(pt.get<std::string>("SANE_TARGET_RANGE_MIN"));
@@ -226,11 +226,11 @@ namespace coind
         network.put("ADDRESS_VERSION", 30);
         network.put("RPC_PORT", 14024);
         network.put("BLOCK_PERIOD", 150);
-        network.put("DUMB_SCRYPT_DIFF", 1);
-        network.put("DUST_THRESHOLD", 0.001e8);
+        network.put("DUMB_SCRYPT_DIFF", "10000");
+        network.put("DUST_THRESHOLD", 3000000);
 
-        network.put("SANE_TARGET_RANGE_MIN", "10c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26f9");
-        network.put("SANE_TARGET_RANGE_MAX", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        network.put("SANE_TARGET_RANGE_MIN", "7fffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        network.put("SANE_TARGET_RANGE_MAX", "1ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         network.put("POW_FUNC", "scrypt");
         network.put("SUBSIDY_FUNC", "dgb");
