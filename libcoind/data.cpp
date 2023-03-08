@@ -104,11 +104,8 @@ namespace coind::data
 
     uint256 difficulty_to_target(uint256 difficulty)
     {
-        uint288 targ;
-        targ.SetHex(difficulty.GetHex());
-
-        auto v = UintToArith288(targ);
-        if (targ.IsNull())
+        auto v = Uint256ToArith288(difficulty);
+        if (v.IsNull())
             return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         uint288 u_s;
@@ -119,6 +116,35 @@ namespace coind::data
         s += 1;
 
         auto r = s/v - 1;
+
+        arith_uint256 r_round;
+        r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
+        r.SetHex(ArithToUint256(r_round).GetHex());
+
+        {
+            arith_uint288 _max_value;
+            _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            if (r > _max_value)
+                return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        }
+
+        return uint256S(r.GetHex()) ;
+    }
+
+    uint256 difficulty_to_target_1(uint256 difficulty)
+    {
+        auto v = Uint256ToArith288(difficulty);
+        if (v.IsNull())
+            return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+        uint288 u_s;
+        u_s.SetHex("1000000000000000000000000000000000000000000000000");
+
+        auto s = UintToArith288(u_s);
+        s *= 0xffff0000;
+        s += 1;
+
+        auto r = s*v - 1;
 
         arith_uint256 r_round;
         r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
