@@ -74,3 +74,11 @@ print('pow_hash <= share_info[\'bits\'].target: {0}'.format(pow_hash <= share_in
 print('pow_hash > target: {0}'.format(pow_hash > target))
 
 ######################################################################
+print(extranonce2)
+decoded_extranonce2 = extranonce2.decode('hex')
+print(decoded_extranonce2)
+print(len(decoded_extranonce2))
+print(pack.IntType(64).unpack(decoded_extranonce2))
+
+######################################################################
+

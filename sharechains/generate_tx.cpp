@@ -17,14 +17,13 @@
 namespace shares
 {
 
-    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, types::ShareData _share_data, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share)
+    GeneratedShareTransactionResult::GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, types::ShareData _share_data, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method _get_share)
     {
         share_info = std::move(_share_info);
         share_data = std::move(_share_data);
         gentx = std::move(_gentx);
         other_transaction_hashes = std::move(_other_transaction_hashes);
         get_share = std::move(_get_share);
-
     }
 
     GenerateShareTransaction::GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker) : tracker(_tracker), net(_tracker->net)
@@ -141,7 +140,7 @@ namespace shares
 //			(t5-t4)*1000.)
 //	    */
 //
-        return std::make_shared<GeneratedShareTransactionResult>(share_info, _share_data, gentx, other_transaction_hashes, get_share_F);
+        return std::make_shared<GeneratedShareTransactionResult>(share_info, _share_data, gentx, other_transaction_hashes, std::move(get_share_F));
     }
 
     arith_uint256 GenerateShareTransaction::pre_target_calculate(ShareType previous_share, const int32_t &height)
@@ -541,22 +540,28 @@ namespace shares
 
     get_share_method GenerateShareTransaction::get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info)
     {
-        return [=, _net = net](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
+        return [=, gentx_data = shared_from_this()](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
-            std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(_net);
+            std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
 
             shared_ptr<::HashLinkType> pref_to_hash_link;
             {
                 coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
-
+                LOG_TRACE.stream() << "gentx: " << *gentx;
                 PackStream txid_packed;
                 txid_packed << txid;
 
+                LOG_TRACE.stream() << "txid_packed: " << txid_packed;
+
                 std::vector<unsigned char> prefix;
                 prefix.insert(prefix.begin(), txid_packed.begin(), txid_packed.end()-32-8-4);
+                LOG_TRACE.stream() << "prefix: " << prefix;
+                LOG_TRACE.stream() << "gentx_before_refhash: " << net->gentx_before_refhash;
 
-                pref_to_hash_link = prefix_to_hash_link(prefix, _net->gentx_before_refhash);
+                pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
+
+                LOG_TRACE.stream() << "pref_to_hash_link: " << pref_to_hash_link->get()->length << " " << pref_to_hash_link->get()->extra_data << " " << pref_to_hash_link->get()->state;
             }
 
             auto tx_hashes = other_transaction_hashes;
@@ -566,11 +571,15 @@ namespace shares
 
             builder
                     ->min_header(min_header)
+                    ->share_data(_share_data)
                     ->share_info(*share_info)
                     ->ref_merkle_link(coind::data::MerkleLink())
                     ->last_txout_nonce(last_txout_nonce)
                     ->hash_link(*pref_to_hash_link->get())
                     ->merkle_link(coind::data::calculate_merkle_link(tx_hashes, 0));
+
+            if (_segwit_data.has_value())
+                builder->segwit_data(_segwit_data.value());
 
             ShareType share = builder->GetShare();
             //TODO: assert(share->header == header);

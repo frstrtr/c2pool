@@ -222,6 +222,25 @@ namespace coind::data
 
             return stream;
         }
+
+        friend std::ostream &operator<<(std::ostream &stream, const TransactionType& _tx)
+        {
+            stream << "(TxType: ";
+
+            stream << "version = " << _tx.version;
+            stream << ", tx_ins = " << _tx.tx_ins;
+            stream << ", tx_outs = " << _tx.tx_outs;
+            stream << ", lock_time = " << _tx.lock_time;
+            if (_tx.wdata.has_value())
+            {
+                stream << ", wdata = " << _tx.wdata.value();
+            } else {
+                stream << ", wdata = null";
+            }
+            stream << ")";
+
+            return stream;
+        }
     };
 
     typedef shared_ptr<TransactionType> tx_type;

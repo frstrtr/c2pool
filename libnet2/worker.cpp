@@ -290,8 +290,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //6
     LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
-    shares::GenerateShareTransaction generate_transaction(_tracker);
-    generate_transaction.
+    std::shared_ptr<shares::GenerateShareTransaction> generate_transaction = std::make_shared<shares::GenerateShareTransaction>(_tracker);
+    generate_transaction->
             set_block_target(FloatingInteger(current_work.value().bits).target()).
             set_desired_timestamp(c2pool::dev::timestamp() + 0.5f).
             set_desired_target(desired_share_target).
@@ -308,7 +308,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     {
                         desired_other_transaction_hashes_and_fees.emplace_back(_tx_hash, std::make_optional(_fee));
                     }
-        generate_transaction.set_desired_other_transaction_hashes_and_fees(
+        generate_transaction->set_desired_other_transaction_hashes_and_fees(
                 desired_other_transaction_hashes_and_fees);
     }
     // ShareData
@@ -346,10 +346,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 share_version
         );
 
-        generate_transaction.set_share_data(_share_data);
+        generate_transaction->set_share_data(_share_data);
     }
 
-    auto gen_sharetx_res = generate_transaction(share_version);
+    auto gen_sharetx_res = (*generate_transaction)(share_version);
 
     //7
     PackStream packed_gentx;
@@ -478,7 +478,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     worker_get_work_result res = {
             ba,
-            [=, _new_work = new_work, _lp_count = lp_count](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
+            [=, _gen_sharetx_res = std::move(gen_sharetx_res), _new_work = new_work, _lp_count = lp_count](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
             {
                 auto t0 = c2pool::dev::timestamp();
                 LOG_DEBUG_STRATUM << "HEADER get_work_result: " << header;
@@ -506,15 +506,15 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                         new_gentx = temp.tx;
                     } else
                     {
-                        new_gentx = gen_sharetx_res->gentx;
+                        new_gentx = _gen_sharetx_res->gentx;
                     }
 
                     // reintroduce witness data to the gentx produced by stratum miners
-                    if (coind::data::is_segwit_tx(gen_sharetx_res->gentx))
+                    if (coind::data::is_segwit_tx(_gen_sharetx_res->gentx))
                     {
                         new_gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0,
-                                                                                                   gen_sharetx_res->gentx->wdata->flag,
-                                                                                                   gen_sharetx_res->gentx->wdata->witness);
+                                                                                                   _gen_sharetx_res->gentx->wdata->flag,
+                                                                                                   _gen_sharetx_res->gentx->wdata->witness);
                     }
                 }
 
@@ -529,7 +529,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                 LOG_DEBUG_STRATUM << "header_hash = " << header_hash;
                 LOG_DEBUG_STRATUM << "pow_hash = " << pow_hash;
-                LOG_DEBUG_STRATUM << "gen_sharetx_res->share_info->bits = " << gen_sharetx_res->share_info->bits;
+                LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "target = " << target;
 
                 try
@@ -583,10 +583,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                 // TODO: and header_hash not in received_header_hashes:
                 if (UintToArith256(pow_hash) <=
-                    UintToArith256(FloatingInteger(gen_sharetx_res->share_info->bits).target()))
+                    UintToArith256(FloatingInteger(_gen_sharetx_res->share_info->bits).target()))
                 {
                     auto last_txout_nonce = coinbase_nonce.get();
-                    auto share = gen_sharetx_res->get_share(header, last_txout_nonce);
+                    auto share = _gen_sharetx_res->get_share(header, last_txout_nonce);
 
                     LOG_INFO << "GOT SHARE! " << user << " " << share->hash
                              << " prev " << c2pool::dev::timestamp() - getwork_time
@@ -662,7 +662,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                                     ArithToUint288(coind::data::target_to_average_attempts(target)),
                                     !on_time,
                                     user,
-                                    FloatingInteger(gen_sharetx_res->share_info->bits).target()
+                                    FloatingInteger(_gen_sharetx_res->share_info->bits).target()
                             }
                     );
 

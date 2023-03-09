@@ -70,7 +70,12 @@ namespace shares
 
 
         std::vector<unsigned char> extra_data;
-        extra_data.insert(extra_data.end(), sha.buf, sha.buf + (sha.bytes-const_ending.size())%64);
+        int64_t buf_size = sha.bytes % 64;
+        if (const_ending.size() < buf_size)
+        {
+            extra_data.insert(extra_data.end(), sha.buf, sha.buf + sha.bytes%64-const_ending.size());
+        }
+
 
         (*result)->state = state;
         (*result)->extra_data = extra_data;

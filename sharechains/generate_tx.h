@@ -28,7 +28,7 @@ namespace shares
         std::vector<uint256> other_transaction_hashes;
         get_share_method get_share;
 
-        GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, types::ShareData _share_data, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method &_get_share);
+        GeneratedShareTransactionResult(std::shared_ptr<shares::types::ShareInfo> _share_info, types::ShareData _share_data, coind::data::tx_type _gentx, std::vector<uint256> _other_transaction_hashes, get_share_method _get_share);
     };
 
 #define type_desired_other_transaction_hashes_and_fees std::vector<std::tuple<uint256, std::optional<int32_t>>>
@@ -42,7 +42,7 @@ namespace shares
 		return *this; \
     }
 
-    class GenerateShareTransaction
+    class GenerateShareTransaction : public std::enable_shared_from_this<GenerateShareTransaction>
     {
     public:
         std::shared_ptr<ShareTracker> tracker;
