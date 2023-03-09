@@ -16,6 +16,8 @@ hash_link_type = pack.ComposedType([
 def prefix_to_hash_link(prefix, const_ending=''):
     assert prefix.endswith(const_ending), (prefix, const_ending)
     x = sha256.sha256(prefix)
+    print('len(x.buf) = {0}'.format(len(x.buf)))
+    print('len(const_ending) = {0}'.format(len(const_ending)))
     return dict(state=x.state, extra_data=x.buf[:max(0, len(x.buf)-len(const_ending))], length=x.length//8)
 
 def check_hash_link(hash_link, data, const_ending=''):

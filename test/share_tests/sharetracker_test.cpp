@@ -86,6 +86,8 @@ protected:
 
     virtual void SetUp()
     {
+        C2Log::Logger::Init();
+
         auto pt = coind::ParentNetwork::make_default_network();
         std::shared_ptr<coind::ParentNetwork> parent_net = std::make_shared<coind::ParentNetwork>("dgb", pt);
         net = make_shared<TestNetwork>(parent_net);
@@ -620,6 +622,8 @@ TEST_F(SharechainsTest, gentx_test)
 
     // gentx:
     LOG_TRACE << "GENTX: " << gentx;
+
+    // get_share:
 }
 
 TEST_F(SharechainsTest, get_ref_hash_test)
