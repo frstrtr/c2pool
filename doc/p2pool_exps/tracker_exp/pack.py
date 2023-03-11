@@ -158,6 +158,8 @@ class ListType(Type):
         return res
     
     def write(self, file, item):
+        print(item)
+        print(self.mul)
         assert len(item) % self.mul == 0
         self._inner_size.write(file, len(item)//self.mul)
         for subitem in item:
@@ -281,6 +283,8 @@ class ComposedType(Type):
         return item
     
     def write(self, file, item):
+        print('fields: {0}'.format(self.field_names))
+        print('item.keys: {0}'.format(set(item.keys())))
         assert set(item.keys()) >= self.field_names
         for key, type_ in self.fields:
             type_.write(file, item[key])
