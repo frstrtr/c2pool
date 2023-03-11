@@ -74,6 +74,17 @@ namespace shares::types
             return !(*this == value);
         }
 
+        friend std::ostream &operator<<(std::ostream& stream, const HashLinkType& v)
+        {
+            stream << "(HashLinkType: ";
+            stream << " state = " << v.state;
+            stream << ", extra_data = " << v.extra_data;
+            stream << ", length = " << v.length;
+            stream << ")";
+
+            return stream;
+        }
+
 //        HashLinkType &operator=(UniValue value)
 //        {
 //            state = value["state"].get_str();
@@ -122,6 +133,16 @@ namespace shares::types
         bool operator!=(const SegwitData &value)
         {
             return !(*this == value);
+        }
+
+        friend std::ostream &operator<<(std::ostream& stream, const SegwitData& v)
+        {
+            stream << "(ShareInfo: ";
+            stream << "txid_merkle_link = " << v.txid_merkle_link;
+            stream << ", wtxid_merkle_root = " << v.wtxid_merkle_root.GetHex();
+            stream << ")";
+
+            return stream;
         }
 
 //        SegwitData &operator=(UniValue value)
@@ -186,6 +207,22 @@ namespace shares::types
         bool operator!=(const ShareData &value)
         {
             return !(*this == value);
+        }
+
+        friend std::ostream &operator<<(std::ostream& stream, const ShareData& v)
+        {
+            stream << "(ShareData: ";
+            stream << "previous_share_hash = " << v.previous_share_hash;
+            stream << ", coinbase = " << v.coinbase;
+            stream << ", nonce = " << v.nonce;
+            stream << ", pubkey_hash = " << v.pubkey_hash;
+            stream << ", subsidy = " << v.subsidy;
+            stream << ", donation = " << v.donation;
+            stream << ", stale_info = " << v.stale_info;
+            stream << ", desired_version = " << v.desired_version;
+            stream << ")";
+
+            return stream;
         }
 
 //        ShareData &operator=(UniValue value)
@@ -264,6 +301,26 @@ namespace shares::types
         bool operator!=(const ShareInfo &value)
         {
             return !(*this == value);
+        }
+
+        friend std::ostream &operator<<(std::ostream& stream, const ShareInfo& v)
+        {
+            stream << "(ShareInfo: ";
+            stream << " far_share_hash = " << v.far_share_hash;
+            stream << ", max_bits = " << v.max_bits;
+            stream << ", bits = " << v.bits;
+            stream << ", timestamp = " << v.timestamp;
+            stream << ", new_transaction_hashes = " << v.new_transaction_hashes;
+            stream << ", transaction_hash_refs = [";
+            for (auto &[x1,x2] : v.transaction_hash_refs)
+            {
+                stream << "(" << x1 << "; " << x2 << "), ";
+            }
+            stream << "], absheight = " << v.absheight;
+            stream << ", abswork = " << v.abswork;
+            stream << ", segwit_data = " << v.segwit_data;
+            stream << ")";
+            return stream;
         }
     };
 

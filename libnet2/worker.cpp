@@ -261,20 +261,25 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	if (desired_share_target.IsNull())
 	{
         auto local_hash_rates = get_local_addr_rates();
-
+        LOG_DEBUG_STRATUM << "local_hash_rates = " << local_hash_rates;
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
 		desired_share_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
+        LOG_DEBUG_STRATUM << "desired_share_target[#1] = " << desired_share_target.GetHex();
 
 		auto local_hash_rate = local_hash_rates.count(pubkey_hash) > 0 ? UintToArith288(local_hash_rates[pubkey_hash]) : arith_uint288();
+        LOG_DEBUG_STRATUM << "local_hash_rate = " << local_hash_rate.GetHex();
 		if (local_hash_rate > 0)
 		{
             // TODO: CHECK
 			// limit to 1.67% of pool shares by modulating share difficulty
 			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
 					local_hash_rate * _net->SHARE_PERIOD / 0.0167));
+            LOG_DEBUG_STRATUM << "desired_share_target[#2] = " << desired_share_target.GetHex();
 		}
 		auto lookbehind = 3600 / _net->SHARE_PERIOD;
+        LOG_DEBUG_STRATUM << "lookbehind = " << lookbehind;
 		block_subsidy = _coind_node->coind_work.value().subsidy;
+        LOG_DEBUG_STRATUM << "block_subsidy = " << block_subsidy;
 		if (prev_share && _tracker->get_height(prev_share->hash) > lookbehind)
 		{
 			//TODO (from p2pool): doesn't use global stale rate to compute pool hash
@@ -284,9 +289,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 				auto temp1 = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target()) * _net->SPREAD;
 				auto temp2 = temp1 * _net->parent->DUST_THRESHOLD / block_subsidy;
 				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(temp2));
+                LOG_DEBUG_STRATUM << "desired_share_target[#3] = " << desired_share_target.GetHex();
 			}
 		}
 	}
+    LOG_DEBUG_STRATUM << "desired_share_target = " << desired_share_target.GetHex();
 
     //6
     LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();

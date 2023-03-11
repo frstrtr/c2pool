@@ -38,6 +38,14 @@ void Share::init()
         throw std::invalid_argument("Segwit activated, but segwit_data == nullptr!");
 
 
+    LOG_TRACE << "min_header = " << *min_header->get();
+    LOG_TRACE << "share_data = " << *share_data->get();
+    LOG_TRACE << "share_info = " << *share_info->get();
+    LOG_TRACE << "hash_link = " << *hash_link->get();
+    LOG_TRACE << "ref_merkle_link = " << *ref_merkle_link->get();
+    LOG_TRACE << "last_txout_nonce = " << last_txout_nonce;
+
+
     if (!(coinbase->size() >= 2 && coinbase->size() <= 100))
     {
         throw std::invalid_argument((boost::format("bad coinbase size! %1% bytes.") % coinbase->size()).str());
