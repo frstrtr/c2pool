@@ -101,7 +101,7 @@ std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
     stream << "[ ";
     for (auto v : data)
     {
-        stream << v << " ";
+        stream << v << ", ";
     }
     stream << "\b ]";
     return stream;
@@ -113,7 +113,7 @@ std::ostream &operator<<(std::ostream &stream, const std::vector<T> &data)
     stream << "[ ";
     for (auto v : data)
     {
-        stream << v << " ";
+        stream << v << ", ";
     }
     stream << "\b ]";
     return stream;
@@ -125,7 +125,7 @@ inline std::ostream &operator<<<unsigned char>(std::ostream &stream, std::vector
     stream << "[ ";
     for (auto v : data)
     {
-        stream << (unsigned int) v << " ";
+        stream << (unsigned int) v << ", ";
     }
     stream << "\b ]";
     return stream;
