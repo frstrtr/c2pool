@@ -87,6 +87,7 @@ protected:
     virtual void SetUp()
     {
         C2Log::Logger::Init();
+        C2Log::Logger::enable_trace();
 
         auto pt = coind::ParentNetwork::make_default_network();
         std::shared_ptr<coind::ParentNetwork> parent_net = std::make_shared<coind::ParentNetwork>("dgb", pt);
@@ -250,14 +251,14 @@ TEST_F(SharechainsTest, handle_share_test)
 }
 
 
-
 TEST_F(SharechainsTest, tracker_one_share)
 {
     std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
 
     PackStream stream_share;
 //    stream_share.from_hex("11fda501fe02000020707524a64aa0820305612357ae0d2744695c8ba18b8e1402dc4e199b5e1bf8daae2ceb62979e001bc0006d6200000000000000000000000000000000000000000000000000000000000000003d043edaec002cfabe6d6d08d3533a81ca356a7ac1c85c9b0073aebcca7182ad83849b9498377c9a1cd8a701000000000000000a5f5f6332706f6f6c5f5f3e9922fe9ad7bdd0e20eb7f64fa6dd42734dd4f43275cc26fd4d483b0a00000000000021012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d61f2bae86d664294b8850df3f580ec9e4fb2170fe8dbae492b5159af73834eba4012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d60100000000000000000000000000000000000000000000000000000000000000000000ffff0f1effff0f1eae2ceb6201000000010010000000000000000000000000000000000000000000001fcbf0a89045913d394db52949e986b8c6385b0060cbaebf3cf7806ff1df96affd7a01012f85ab444002e4ffec67106f9f0ee77405296818a224f641a0b2bbfe9f8d22d6");
-    stream_share.from_hex("21fd0702fe02000020617dfa46bf73eb96548e0b039a647d35b387ed0cb1a6e51c80092175857d3f5b3ac4ff62f1a9001bc0254dda4d00fe065ba137d8e108ef134db29b7e33f46327f13626975c0c2a190082018f3d04d03aee002cfabe6d6d21102609e852babee96639fbb3b65588bbcc419720fec56da52e47120c4804a501000000000000000a5f5f6332706f6f6c5f5ffc88aa669a2cd3c1310067ae7e47a7869b330d30b691c61b46fb483b0a0000000000002102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203517d2164368b766e6b9d0598510a7bbfc9882940ebfe3f65bb72173c3dbf105802f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5ef1025a29236b072d75cde8637584a3ed2fe0bcd4aadb5824b61cc42b4414e143d020000000195cbb26f405ead27fcd8cf84155cfcfab722a0cfdb3a2c735fce15fb19bc8ae4ffff0f1e8888001e3bc4ff62cc210000df798a25160000000000000000000000000000000001000000986dae33074d8c439a5dc61c2019a86726ebd1cf0eb0240582ccc0b249d12ba7fd9c0102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203");
+//    stream_share.from_hex("21fd0702fe02000020617dfa46bf73eb96548e0b039a647d35b387ed0cb1a6e51c80092175857d3f5b3ac4ff62f1a9001bc0254dda4d00fe065ba137d8e108ef134db29b7e33f46327f13626975c0c2a190082018f3d04d03aee002cfabe6d6d21102609e852babee96639fbb3b65588bbcc419720fec56da52e47120c4804a501000000000000000a5f5f6332706f6f6c5f5ffc88aa669a2cd3c1310067ae7e47a7869b330d30b691c61b46fb483b0a0000000000002102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203517d2164368b766e6b9d0598510a7bbfc9882940ebfe3f65bb72173c3dbf105802f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5ef1025a29236b072d75cde8637584a3ed2fe0bcd4aadb5824b61cc42b4414e143d020000000195cbb26f405ead27fcd8cf84155cfcfab722a0cfdb3a2c735fce15fb19bc8ae4ffff0f1e8888001e3bc4ff62cc210000df798a25160000000000000000000000000000000001000000986dae33074d8c439a5dc61c2019a86726ebd1cf0eb0240582ccc0b249d12ba7fd9c0102f24e44938c7bde43245d2a17c7fe424fbebc63f05317dfdace08a95a2f10d5efe4248d9eb63c2de431a93f0c94e857920cb3f70163dba595de7720e6cc014203");
+    stream_share.from_hex("21fd4301fe02000020d015122ac6c9b4ec0b3b0f684dcb88fedc106c22d66b8583d67bcdf7fa2fbe37542188632205011b492009eaa2bfe882e1f6f99596e720c18657a1dde02bdc10dcb3a8725c765625db9c3ea73d04ec59f7002cfabe6d6d9af7e5ceeeb550fe519d93acf6180dfac960ba8de50867804e3e1266e46b954a01000000000000000a5f5f6332706f6f6c5f5f04d213ddbb351fc9fbbd8e1f40942130e77131978df6de416cea4cc8090000000000002100000000000000000000000000000000000000000000000000000000000000000000009678d14ad4c5e2859d7d036b8f69b8211884a6b63711d6c3ee3c633d61610bf45d31041efb45011e552188630cd30300d98b6cb72504000000000000000000000000000000010000007e0fa5ede3dae6732ef68a7447180e26ef694d17a37d2e4c406244004c839722fd7a0100");
     auto share = load_share(stream_share, net, {"0.0.0.0", "0"});
 
     auto hash = share->hash;
@@ -490,8 +491,8 @@ TEST_F(SharechainsTest, gentx_test)
     };
     stale_counts get_stale_counts{{0,0}, 0, {0,0}};
 
-    GenerateShareTransaction generate_transaction(tracker);
-    generate_transaction.
+    auto generate_transaction = std::make_shared<GenerateShareTransaction>(tracker);
+    generate_transaction->
             set_block_target(FloatingInteger(current_work.bits).target()).
             set_desired_timestamp(c2pool::dev::timestamp() + 0.5f).
             set_desired_target(desired_share_target).
@@ -540,10 +541,10 @@ TEST_F(SharechainsTest, gentx_test)
                 stale_info,
                 17
         );
-        generate_transaction.set_share_data(_share_data);
+        generate_transaction->set_share_data(_share_data);
     }
 
-    auto [share_info, share_data, gentx, other_transaction_hashes, get_share] = *generate_transaction(17);
+    auto [share_info, share_data, gentx, other_transaction_hashes, get_share] = *(*generate_transaction)(17);
     LOG_TRACE << "other_transaction_hashes size: " << other_transaction_hashes.size();
 
     // share_info
@@ -721,4 +722,9 @@ TEST_F(SharechainsTest, share_store_test)
     LOG_INFO << "ADDED SHARE " << hash;
 
     LOG_INFO << tracker->share_store.get_share(hash)->hash;
+}
+
+TEST(GenShareTxTest, get_ref_hash_test)
+{
+
 }
