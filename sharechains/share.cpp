@@ -34,6 +34,8 @@ void Share::init()
     CheckShareRequirement(merkle_link);
 
     bool segwit_activated = shares::is_segwit_activated(VERSION, net);
+    LOG_TRACE << "segwit_activated = " << (segwit_activated ? "true" : "false");
+    LOG_TRACE << "segwit_data = " << *(*segwit_data).get();
     if (segwit_activated && !segwit_data)
         throw std::invalid_argument("Segwit activated, but segwit_data == nullptr!");
 
@@ -69,13 +71,17 @@ void Share::init()
         throw std::invalid_argument("This is not a hardfork-supporting share!");
     }
 
-//TODO: check txs
-//    std::set<int32_t> n;
-//    for share_count, tx_count in self.iter_transaction_hash_refs():
-//      assert share_count < 110
-//      if share_count == 0:
-//          n.add(tx_count)
-//    assert n == set(range(len(self.share_info['new_transaction_hashes'])))
+    // check txs
+    std::set<uint64_t> n;
+    for (uint64_t i = 0; i < new_transaction_hashes->size(); i++)
+        n.insert(i);
+    for (auto [share_count, tx_count] : share_info->get()->transaction_hash_refs)
+    {
+        assert(share_count < 110);
+        if (share_count == 0)
+            n.erase(tx_count);
+    }
+    assert(n.empty());
 
     std::vector<unsigned char> hash_link_data;
     {
@@ -92,18 +98,29 @@ void Share::init()
         packed_z << _z;
         hash_link_data.insert(hash_link_data.end(), packed_z.data.begin(), packed_z.data.end());
     }
+    LOG_TRACE.stream() << "gentx[hash_link] = " << *hash_link->get();
+    LOG_TRACE.stream() << "gentx[hash_link_data] = " << hash_link_data;
+    LOG_TRACE.stream() << "gentx[net->gentx_before_refhash] = " << net->gentx_before_refhash;
+    LOG_TRACE.stream() << "hash_link_data: " << hash_link_data;
 
     gentx_hash = shares::check_hash_link(hash_link, hash_link_data, net->gentx_before_refhash);
+    LOG_TRACE << "gentx_hash: " << gentx_hash;
 
     auto merkle_root = coind::data::check_merkle_link(gentx_hash, segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
+    LOG_TRACE << "merkle_root: " << merkle_root;
+    LOG_TRACE << "segwit_activated = " << (segwit_activated ? "true" : "false");
+    LOG_TRACE << "merkle_link2 " << (segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
     header.set_value(coind::data::types::BlockHeaderType(*min_header->get(), merkle_root));
+    LOG_TRACE << *(header.get());
 
     coind::data::stream::BlockHeaderType_stream header_stream(*header.get());
 
     PackStream packed_block_header;
     packed_block_header << header_stream;
+    LOG_TRACE << "packed_block_header: " << packed_block_header;
 
     pow_hash = net->parent->POW_FUNC(packed_block_header);
+    LOG_TRACE << "pow_hash = " << pow_hash;
 
 
     PackStream packed_block_header2;

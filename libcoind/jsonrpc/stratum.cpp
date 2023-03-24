@@ -175,6 +175,7 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
     uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
     LOG_TRACE.stream() << "nonce = " << nonce;
     auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), x.merkle_link);
+    LOG_TRACE.stream() << "x.merkle_link1 = " << x.merkle_link;
     LOG_TRACE.stream() << "merkle_root = " << merkle_root;
     LOG_TRACE.stream() << "coind::data::hash256(new_packed_gentx, true) = " << coind::data::hash256(new_packed_gentx, true);
 
