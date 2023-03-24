@@ -59,3 +59,11 @@ merkle_hash2 = coind_data.merkle_hash([
         ])
 
 print('Merkle_hash2 = {0}'.format(hex(merkle_hash2)))
+
+
+###############
+
+print(pack.FloatingInteger(504365055).target)
+print(int('00000fffff000000000000000000000000000000000000000000000000000000', 16))
+
+print(pack.FloatingInteger(504365055).target == int('00000fffff000000000000000000000000000000000000000000000000000000', 16))

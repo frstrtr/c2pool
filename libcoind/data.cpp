@@ -165,7 +165,7 @@ namespace coind::data
 		coind::data::stream::TxIDType_stream txid_stream(tx->version, tx->tx_ins, tx->tx_outs, tx->lock_time);
 		PackStream stream;
 		stream << txid_stream;
-		return hash256(stream);
+		return hash256(stream, true);
 	}
 
 	uint256 get_wtxid(shared_ptr<coind::data::TransactionType> tx, uint256 txid, uint256 txhash)
@@ -200,7 +200,7 @@ namespace coind::data
 			coind::data::stream::TxIDType_stream _tx(tx->version,tx->tx_ins, tx->tx_outs, tx->lock_time);
 			packed_tx << _tx;
 		}
-		return hash256(packed_tx);
+		return hash256(packed_tx, true);
 	}
 
     uint256 hash256(std::string data, bool reverse)
@@ -428,7 +428,7 @@ namespace coind::data
                             merkle_record_type record(left, right);
                             PackStream _stream;
                             _stream << record;
-                            uint256 _hash = hash256(_stream);
+                            uint256 _hash = hash256(_stream, true);
 
                             new_hashes.push_back(_hash);
                         }
