@@ -34,18 +34,17 @@ void Share::init()
     CheckShareRequirement(merkle_link);
 
     bool segwit_activated = shares::is_segwit_activated(VERSION, net);
-    LOG_TRACE << "segwit_activated = " << (segwit_activated ? "true" : "false");
-    LOG_TRACE << "segwit_data = " << *(*segwit_data).get();
+
     if (segwit_activated && !segwit_data)
         throw std::invalid_argument("Segwit activated, but segwit_data == nullptr!");
 
 
-    LOG_TRACE << "min_header = " << *min_header->get();
-    LOG_TRACE << "share_data = " << *share_data->get();
-    LOG_TRACE << "share_info = " << *share_info->get();
-    LOG_TRACE << "hash_link = " << *hash_link->get();
-    LOG_TRACE << "ref_merkle_link = " << *ref_merkle_link->get();
-    LOG_TRACE << "last_txout_nonce = " << last_txout_nonce;
+//    LOG_TRACE << "min_header = " << *min_header->get();
+//    LOG_TRACE << "share_data = " << *share_data->get();
+//    LOG_TRACE << "share_info = " << *share_info->get();
+//    LOG_TRACE << "hash_link = " << *hash_link->get();
+//    LOG_TRACE << "ref_merkle_link = " << *ref_merkle_link->get();
+//    LOG_TRACE << "last_txout_nonce = " << last_txout_nonce;
 
 
     if (!(coinbase->size() >= 2 && coinbase->size() <= 100))
@@ -98,29 +97,18 @@ void Share::init()
         packed_z << _z;
         hash_link_data.insert(hash_link_data.end(), packed_z.data.begin(), packed_z.data.end());
     }
-    LOG_TRACE.stream() << "gentx[hash_link] = " << *hash_link->get();
-    LOG_TRACE.stream() << "gentx[hash_link_data] = " << hash_link_data;
-    LOG_TRACE.stream() << "gentx[net->gentx_before_refhash] = " << net->gentx_before_refhash;
-    LOG_TRACE.stream() << "hash_link_data: " << hash_link_data;
 
     gentx_hash = shares::check_hash_link(hash_link, hash_link_data, net->gentx_before_refhash);
-    LOG_TRACE << "gentx_hash: " << gentx_hash;
 
     auto merkle_root = coind::data::check_merkle_link(gentx_hash, segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
-    LOG_TRACE << "merkle_root: " << merkle_root;
-    LOG_TRACE << "segwit_activated = " << (segwit_activated ? "true" : "false");
-    LOG_TRACE << "merkle_link2 " << (segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
     header.set_value(coind::data::types::BlockHeaderType(*min_header->get(), merkle_root));
-    LOG_TRACE << *(header.get());
 
     coind::data::stream::BlockHeaderType_stream header_stream(*header.get());
 
     PackStream packed_block_header;
     packed_block_header << header_stream;
-    LOG_TRACE << "packed_block_header: " << packed_block_header;
 
     pow_hash = net->parent->POW_FUNC(packed_block_header);
-    LOG_TRACE << "pow_hash = " << pow_hash;
 
 
     PackStream packed_block_header2;
@@ -187,38 +175,50 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint25
     // TODO: Check type in python???
     //if other_txs is not None and not isinstance(other_txs, dict): other_txs = dict((bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx)), tx) for tx in other_txs)
 
-    auto gentx_F = GenerateShareTransaction(_tracker);
-    gentx_F.set_share_data(*share_data->get());
-    gentx_F.set_block_target(FloatingInteger(header->bits).target()); //TODO: check
-    gentx_F.set_desired_timestamp(*timestamp);
-    gentx_F.set_desired_target(FloatingInteger((*share_info)->bits).target()); //TODO: check
-    gentx_F.set_ref_merkle_link(*ref_merkle_link->get());
-    {
-        std::vector<std::tuple<uint256, std::optional<int32_t>>> _desired_other_transaction_hashes_and_fees;
-        for (auto v: other_tx_hashes)
-        {
-            std::optional<int32_t> temp_value{};
-            _desired_other_transaction_hashes_and_fees.emplace_back(v, temp_value);
-        }
-        gentx_F.set_desired_other_transaction_hashes_and_fees(_desired_other_transaction_hashes_and_fees);
-    }
-    gentx_F.set_known_txs(other_txs);
-    gentx_F.set_last_txout_nonce(last_txout_nonce);
+    auto gentx_F = std::make_shared<shares::GenerateShareTransaction>(_tracker);
+    gentx_F->
+            set_share_data(*share_data->get()).
+            set_block_target(FloatingInteger(header->bits).target()).
+            set_desired_timestamp(*timestamp).
+            set_desired_target(FloatingInteger((*share_info)->bits).target()).
+            set_ref_merkle_link(*ref_merkle_link->get()).
+            set_known_txs(other_txs).
+            set_last_txout_nonce(last_txout_nonce);
+
+    // set_segwit_data
     if (segwit_data)
+        gentx_F->set_segwit_data(*segwit_data->get());
+
+    // set_desired_other_transaction_hashes_and_fees
     {
-        gentx_F.set_segwit_data(*segwit_data->get());
+        std::vector<std::tuple<uint256, std::optional<int32_t>>> desired_other_transaction_hashes_and_fees;
+        for (auto h : other_tx_hashes)
+        {
+            desired_other_transaction_hashes_and_fees.emplace_back(h, std::nullopt);
+        }
+
+        gentx_F->set_desired_other_transaction_hashes_and_fees(
+                desired_other_transaction_hashes_and_fees);
     }
 
-    auto gentx = gentx_F(VERSION);
+    auto gentx = (*gentx_F)(VERSION);
 
-    //TODO: just check
-//    assert other_tx_hashes2 == other_tx_hashes
-//    if share_info != self.share_info:
-//        raise ValueError('share_info invalid')
-//    if bitcoin_data.get_txid(gentx) != self.gentx_hash:
-//        raise ValueError('''gentx doesn't match hash_link''')
-//    if bitcoin_data.calculate_merkle_link([None] + other_tx_hashes, 0) != self.merkle_link: # the other hash commitments are checked in the share_info assertion
-//        raise ValueError('merkle_link and other_tx_hashes do not match')
+    assert(other_tx_hashes == gentx->other_transaction_hashes);
+    if (*share_info->get() != *gentx->share_info)
+        throw std::invalid_argument("share_info invalid");
+    if (coind::data::get_txid(gentx->gentx) != gentx_hash)
+        throw std::invalid_argument("gentx doesn't match hash_link");
+
+    // Check merkle link
+    {
+        std::vector<uint256> _copy_for_link{uint256::ZERO};
+        _copy_for_link.insert(_copy_for_link.end(), gentx->other_transaction_hashes.begin(),
+                              gentx->other_transaction_hashes.end());
+
+        auto _merkle_link = coind::data::calculate_merkle_link(_copy_for_link, 0);
+        if (_merkle_link != *merkle_link->get())
+            throw std::invalid_argument("merkle_link and other_tx_hashes do not match");
+    }
 
     //TODO: wanna for upd protocol version???
     // update_min_protocol_version(counts, self)
@@ -226,7 +226,6 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint25
     //TODO: Нужно ли это делать в c2pool???
 //    self.gentx_size = len(bitcoin_data.tx_id_type.pack(gentx))
 
-    //    self.gentx_weight = len(bitcoin_data.tx_type.pack(gentx)) + 3*self.gentx_size
     {
         PackStream weight_stream;
         coind::data::stream::TransactionType_stream tx_type_data = gentx->gentx;

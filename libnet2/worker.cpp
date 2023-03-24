@@ -297,7 +297,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //6
     LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
-    std::shared_ptr<shares::GenerateShareTransaction> generate_transaction = std::make_shared<shares::GenerateShareTransaction>(_tracker);
+    auto generate_transaction = std::make_shared<shares::GenerateShareTransaction>(_tracker);
     generate_transaction->
             set_block_target(FloatingInteger(current_work.value().bits).target()).
             set_desired_timestamp(c2pool::dev::timestamp() + 0.5f).
@@ -361,10 +361,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     //7
     PackStream packed_gentx;
     {
-        LOG_TRACE.stream() << "gentx before packed_gentx: " << gen_sharetx_res->gentx;
         coind::data::stream::TxIDType_stream _gentx(gen_sharetx_res->gentx->version, gen_sharetx_res->gentx->tx_ins, gen_sharetx_res->gentx->tx_outs, gen_sharetx_res->gentx->lock_time);
         packed_gentx << _gentx;
-        LOG_TRACE.stream() << "-packed_gentx: " << packed_gentx;
     }
 
     std::vector<coind::data::tx_type> other_transactions;

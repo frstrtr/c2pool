@@ -163,21 +163,14 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
     auto x = map_obj.value().ba;
     auto coinb_nonce = ParseHex(_extranonce2);
     assert(coinb_nonce.size() == _worker->COINBASE_NONCE_LENGTH);
-    LOG_TRACE.stream() << "coinb_nonce = " << coinb_nonce;
 
     std::vector<unsigned char> new_packed_gentx {x.coinb1.begin(), x.coinb1.end()};
     new_packed_gentx.insert(new_packed_gentx.end(), coinb_nonce.begin(), coinb_nonce.end());
     new_packed_gentx.insert(new_packed_gentx.end(), x.coinb2.begin(), x.coinb2.end());
-    LOG_TRACE.stream() << "new_packed_gentx = " << new_packed_gentx;
 
     uint32_t _timestamp = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_ntime)));
-    LOG_TRACE.stream() << "_timestamp = " << _timestamp;
     uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
-    LOG_TRACE.stream() << "nonce = " << nonce;
     auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), x.merkle_link);
-    LOG_TRACE.stream() << "x.merkle_link1 = " << x.merkle_link;
-    LOG_TRACE.stream() << "merkle_root = " << merkle_root;
-    LOG_TRACE.stream() << "coind::data::hash256(new_packed_gentx, true) = " << coind::data::hash256(new_packed_gentx, true);
 
     coind::data::types::BlockHeaderType header(x.version, x.previous_block, _timestamp, x.bits, nonce, merkle_root);
 

@@ -448,7 +448,6 @@ namespace shares
             gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
         }
 
-        LOG_TRACE.stream() << "MAKE GENTX: " << gentx;
         return gentx;
     }
 
@@ -490,11 +489,7 @@ namespace shares
             {
                 _temp.SetHex(previous_share->abswork->GetHex());
             }
-            LOG_TRACE << "_temp = " << _temp.GetHex();
-            LOG_TRACE << "bits = " << bits.value.value;
-            LOG_TRACE << "bits.target = " << bits.target().GetHex();
             auto _temp_avg = coind::data::target_to_average_attempts(bits.target());
-            LOG_TRACE << "_temp_avg = " << _temp_avg.GetHex();
 
             _temp = _temp + _temp_avg;
             arith_uint288 pow2_128; // 2^128
@@ -502,7 +497,6 @@ namespace shares
 
             _temp = _temp >= pow2_128 ? _temp - pow2_128 : _temp; // _temp % pow2_128;
             _abswork.SetHex(_temp.GetHex());
-            LOG_TRACE << "abswork = " << _abswork.GetHex();
         }
         //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
 
@@ -549,20 +543,13 @@ namespace shares
             shared_ptr<::HashLinkType> pref_to_hash_link;
             {
                 coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
-                LOG_TRACE.stream() << "gentx: " << *gentx;
                 PackStream txid_packed;
                 txid_packed << txid;
 
-                LOG_TRACE.stream() << "txid_packed: " << txid_packed;
-
                 std::vector<unsigned char> prefix;
                 prefix.insert(prefix.begin(), txid_packed.begin(), txid_packed.end()-32-8-4);
-                LOG_TRACE.stream() << "prefix: " << prefix;
-                LOG_TRACE.stream() << "gentx_before_refhash: " << net->gentx_before_refhash;
 
                 pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
-
-                LOG_TRACE.stream() << "pref_to_hash_link: " << pref_to_hash_link->get()->length << " " << pref_to_hash_link->get()->extra_data << " " << pref_to_hash_link->get()->state;
             }
 
             auto tx_hashes = other_transaction_hashes;
@@ -590,8 +577,6 @@ namespace shares
 
     void GenerateShareTransaction::make_segwit_data(const std::vector<uint256>& other_transaction_hashes)
     {
-        LOG_TRACE << "MAKE_SEGWIT_DATA CALLED!";
-
         struct __share_tx{
             std::shared_ptr<coind::data::TransactionType> tx;
             uint256 txid;
@@ -610,11 +595,6 @@ namespace shares
         {
             share_txs.emplace_back(_known_txs.value()[h], coind::data::get_txid(_known_txs.value()[h]), h);
         }
-        LOG_TRACE << "share_txs: ";
-        for (auto v : share_txs)
-        {
-            LOG_TRACE << "\t txid =" << v.txid << ", h = " << v.h << ", tx = " << v.tx;
-        }
 
         std::vector<uint256> _txids{uint256()};
         std::vector<uint256> _wtxids{uint256()};
@@ -626,15 +606,6 @@ namespace shares
 
         _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(_txids, 0),
                                                              coind::data::merkle_hash(_wtxids));
-
-
-        LOG_TRACE.stream() << "known_txs: ";
-        for (auto [_hash, _tx] : _known_txs.value())
-        {
-            LOG_TRACE.stream() << "\t " << _hash << _tx;
-        }
-        LOG_TRACE.stream() << "other_transaction_hashes: " << other_transaction_hashes;
-        LOG_TRACE.stream() << "MAKE SEGWIT: " << _segwit_data;
     }
 
 
