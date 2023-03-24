@@ -137,7 +137,7 @@ namespace shares::types
 
         friend std::ostream &operator<<(std::ostream& stream, const SegwitData& v)
         {
-            stream << "(ShareInfo: ";
+            stream << "(SegwitData: ";
             stream << "txid_merkle_link = " << v.txid_merkle_link;
             stream << ", wtxid_merkle_root = " << v.wtxid_merkle_root.GetHex();
             stream << ")";
@@ -197,7 +197,7 @@ namespace shares::types
 			desired_version = _desired_version;
 		}
 
-        bool operator==(const ShareData &value)
+        bool operator==(const ShareData &value) const
         {
             return previous_share_hash == value.previous_share_hash && coinbase == value.coinbase && nonce == value.nonce &&
                    pubkey_hash == value.pubkey_hash && subsidy == value.subsidy && donation == value.donation &&

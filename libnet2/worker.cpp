@@ -361,8 +361,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     //7
     PackStream packed_gentx;
     {
-        coind::data::stream::TransactionType_stream _gentx(gen_sharetx_res->gentx);
+        LOG_TRACE.stream() << "gentx before packed_gentx: " << gen_sharetx_res->gentx;
+        coind::data::stream::TxIDType_stream _gentx(gen_sharetx_res->gentx->version, gen_sharetx_res->gentx->tx_ins, gen_sharetx_res->gentx->tx_outs, gen_sharetx_res->gentx->lock_time);
         packed_gentx << _gentx;
+        LOG_TRACE.stream() << "-packed_gentx: " << packed_gentx;
     }
 
     std::vector<coind::data::tx_type> other_transactions;

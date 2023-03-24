@@ -448,6 +448,7 @@ namespace shares
             gentx->wdata = std::make_optional<coind::data::WitnessTransactionData>(0, 1, _witness);
         }
 
+        LOG_TRACE.stream() << "MAKE GENTX: " << gentx;
         return gentx;
     }
 
@@ -582,13 +583,15 @@ namespace shares
                 builder->segwit_data(_segwit_data.value());
 
             ShareType share = builder->GetShare();
-            //TODO: assert(share->header == header);
+            assert(*share->header.get() == header);
             return share;
         };
     }
 
     void GenerateShareTransaction::make_segwit_data(const std::vector<uint256>& other_transaction_hashes)
     {
+        LOG_TRACE << "MAKE_SEGWIT_DATA CALLED!";
+
         struct __share_tx{
             std::shared_ptr<coind::data::TransactionType> tx;
             uint256 txid;
@@ -603,10 +606,14 @@ namespace shares
             }
         };
         std::vector<__share_tx> share_txs;
-        share_txs.resize(other_transaction_hashes.size());
         for (auto h : other_transaction_hashes)
         {
             share_txs.emplace_back(_known_txs.value()[h], coind::data::get_txid(_known_txs.value()[h]), h);
+        }
+        LOG_TRACE << "share_txs: ";
+        for (auto v : share_txs)
+        {
+            LOG_TRACE << "\t txid =" << v.txid << ", h = " << v.h << ", tx = " << v.tx;
         }
 
         std::vector<uint256> _txids{uint256()};
@@ -619,6 +626,15 @@ namespace shares
 
         _segwit_data = std::make_optional<types::SegwitData>(coind::data::calculate_merkle_link(_txids, 0),
                                                              coind::data::merkle_hash(_wtxids));
+
+
+        LOG_TRACE.stream() << "known_txs: ";
+        for (auto [_hash, _tx] : _known_txs.value())
+        {
+            LOG_TRACE.stream() << "\t " << _hash << _tx;
+        }
+        LOG_TRACE.stream() << "other_transaction_hashes: " << other_transaction_hashes;
+        LOG_TRACE.stream() << "MAKE SEGWIT: " << _segwit_data;
     }
 
 
