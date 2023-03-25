@@ -595,9 +595,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     auto last_txout_nonce = coinbase_nonce.get();
                     auto share = _gen_sharetx_res->get_share(header, last_txout_nonce);
 
-                    LOG_INFO << "GOT SHARE! " << user << " " << share->hash
-                             << " prev " << c2pool::dev::timestamp() - getwork_time
-                             << " age " << (!on_time ? "DEAD OR ARRIVAL" : "");
+                    LOG_INFO << "GOT SHARE! " << user << ", " << share->hash
+                             << ", prev = " << (share->previous_hash ? share->previous_hash->GetHex() : "null") << ", age " << c2pool::dev::timestamp() - getwork_time
+                             << "s, " << (!on_time ? "DEAD OR ARRIVAL" : "");
 
                     // XXX: ???
                     //# node.py will sometimes forget transactions if bitcoind's work has changed since this stratum

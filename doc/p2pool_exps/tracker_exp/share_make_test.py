@@ -118,8 +118,29 @@ if desired_share_target is None:
 print('desired_share_target = {0}'.format(hex(desired_share_target)))
 pre_target3 = net.MAX_TARGET
 bits = pack.FloatingInteger.from_target_upper_bound(p2pool_math.clip(desired_share_target, (pre_target3//30, pre_target3)))
+desired_pseudoshare_target = None
+if desired_pseudoshare_target is None:
+    target = coind_data.difficulty_to_target(float(1.0 / net.PARENT.DUMB_SCRYPT_DIFF))
+    local_hash_rate = None
+    if local_hash_rate is not None:
+        target = coind_data.average_attempts_to_target(local_hash_rate * 1) # target 10 share responses every second by modulating pseudoshare difficulty
+    else:
+        # If we don't yet have an estimated node hashrate, then we still need to not undershoot the difficulty.
+        # Otherwise, we might get 1 PH/s of hashrate on difficulty settings appropriate for 1 GH/s.
+        # 1/3000th the difficulty of a full share should be a reasonable upper bound. That way, if
+        # one node has the whole p2pool hashrate, it will still only need to process one pseudoshare
+        # every ~0.01 seconds.
+        target = min(target, 3000 * coind_data.average_attempts_to_target((coind_data.target_to_average_attempts(
+            pack.FloatingInteger(444073888).target)*net.SPREAD)*net.PARENT.DUST_THRESHOLD/block_subsidy))
+else:
+    target = desired_pseudoshare_target
+print('TARGET = {0}'.format(hex(target)))
+# target = max(target, bits.target)
+target = p2pool_math.clip(target, net.PARENT.SANE_TARGET_RANGE)
 
 print('bits.target = {0}'.format(hex(bits.target)))
+print(hex(p2pool_math.clip(bits.target, net.PARENT.SANE_TARGET_RANGE)))
+print('target = {0}'.format(hex(target)))
 #=======================
 
 if not (2 <= len(share_info['share_data']['coinbase']) <= 100):
@@ -223,7 +244,7 @@ assert not hash_link['extra_data'], repr(hash_link['extra_data'])
 
 ####################
 
-
+print(hex(target))
 print('pow_hash = {0}'.format(hex(pow_hash)))
 if pow_hash > target:
     raise Exception('share PoW invalid')
