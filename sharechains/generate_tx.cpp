@@ -238,10 +238,12 @@ namespace shares
             int32_t this_weight = 0;
             if (_known_txs.has_value())
             {
+                for (auto _vs : _known_txs.value())
+                    LOG_TRACE << _vs.first;
+                LOG_TRACE << "tx_hash = " << tx_hash;
                 auto _tx = _known_txs.value()[tx_hash];
                 // this_stripped_size
                 {
-
                     PackStream temp_txid;
                     auto stream_txid = coind::data::stream::TxIDType_stream(_tx->version,_tx->tx_ins, _tx->tx_outs, _tx->lock_time);
                     temp_txid << stream_txid;
