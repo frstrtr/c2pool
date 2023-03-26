@@ -45,7 +45,7 @@ struct P2PWriteSocketData : public WriteSocketData
         PackStream payload_checksum_stream;
         payload_checksum_stream << *msg;
 
-        auto _checksum = coind::data::hash256(payload_checksum_stream);
+        auto _checksum = coind::data::hash256(payload_checksum_stream, false);
 
         IntType(256) checksum_full(_checksum);
         PackStream _packed_checksum;
