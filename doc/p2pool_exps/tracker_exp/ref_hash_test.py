@@ -1,0 +1,15 @@
+import data
+import share as pool_share
+import net as _net
+import pack
+
+net = _net
+
+raw_share = data.share_type.unpack('21fd4301fe0200002069a23207be25e7a85c90503b49c3afa2a1f81932d4e849db0000000000000000c35b4b637ecb001b18f3c4e670b789e2dc2fd0ead0e49f52699176d7a7a96730837024b5c8a5d4a7f5bc2e2c3d043c49f3002cfabe6d6d265e57d73d2102c2d426c33c427a5ac70d92d50b018a3ffd2f325c5bb585d01601000000000000000a5f5f6332706f6f6c5f5f2f6d9d23bb351fc9fbbd8e1f40942130e77131978df6de411a7125010a00000000000021000000000000000000000000000000000000000000000000000000000000000000000055ac137f1b1995004f2fc98705c3ed7f9cc5f8e8551c96ed0316cb4bf764ceea6709021e6709021ec85b4b637dd401008d6ebd31f80100000000000000000000000000000001000000d53919c88fe180f62b333d9a57f00b4483ed0cac2793fe3a18f2501c3156f924fd7a0100'.decode('hex'))
+share = data.load_share(raw_share, net, None)
+print(share)
+
+
+_ref_hash = pool_share.NewShare.get_ref_hash(net, share.share_info, share.contents['ref_merkle_link'])# contents['ref_merkle_link'])
+ref_hash = pack.IntType(256).unpack(_ref_hash)
+print('ref_hash = {0}'.format(hex(ref_hash)))
