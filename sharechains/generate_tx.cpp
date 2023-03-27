@@ -279,7 +279,7 @@ namespace shares
                 new_transaction_hashes.push_back(tx_hash);
                 _this = std::make_tuple(0, new_transaction_hashes.size() - 1);
             }
-            transaction_hash_refs.push_back(_this);
+            transaction_hash_refs.emplace_back(_this);
             other_transaction_hashes.push_back(tx_hash);
         }
 
@@ -367,21 +367,23 @@ namespace shares
 
             arith_uint288 sum_amounts;
             sum_amounts.SetHex("0");
-            for (auto v: amounts)
+            for (const auto& v: amounts)
             {
                 sum_amounts += v.second;
             }
 
             amounts[net->DONATION_SCRIPT] += _share_data.subsidy - sum_amounts;
         }
-//TODO: check
-//		if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
-//			raise ValueError()
+
+        if (std::accumulate(amounts.begin(), amounts.end(), arith_uint288{}, [&](arith_uint288 v, const std::map<std::vector<unsigned char>, arith_uint288>::value_type &p ){
+            return v + p.second;
+        }) != _share_data.subsidy)
+            throw std::invalid_argument("Invalid subsidy!");
 
         return std::make_tuple(amounts);
     }
 
-    coind::data::tx_type GenerateShareTransaction::gentx_generate(bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
+    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
         coind::data::tx_type gentx;
 
@@ -392,7 +394,7 @@ namespace shares
             LOG_TRACE.stream() << "\t\t" << k << "; " << v.GetHex();
         }
 
-        for (auto v: amounts)
+        for (const auto& v: amounts)
             dests.push_back(v.first);
         LOG_TRACE.stream() << "dests: " << dests;
 
