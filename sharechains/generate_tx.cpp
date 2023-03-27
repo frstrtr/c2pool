@@ -55,18 +55,15 @@ namespace shares
         int32_t removed_fee_sum = 0;
         int32_t definite_fees = 0;
         bool fees_none_contains = false;
-        for (auto item: _desired_other_transaction_hashes_and_fees)
+        for (auto [tx_hash, fee]: _desired_other_transaction_hashes_and_fees)
         {
-            auto tx_hash = std::get<0>(item);
-            auto fee = std::get<1>(item);
-            if (!fee.has_value())
-                fees_none_contains = true;
-
             if (included_transactions.find(tx_hash) == included_transactions.end())
             {
                 removed_fee.push_back(fee);
                 if (fee.has_value())
                     removed_fee_sum += *fee;
+                else
+                    fees_none_contains = true;
             } else
             {
                 if (fee.has_value())
@@ -93,15 +90,13 @@ namespace shares
             segwit_activated = false;
         }
 
-        bool segwit_tx = false;
-        for (auto _tx_hash: other_transaction_hashes)
+        if (!(segwit_activated || !_known_txs.has_value()))
         {
-            if (coind::data::is_segwit_tx(_known_txs.value()[_tx_hash]))
-                segwit_tx = true;
-        }
-        if (!(segwit_activated || !_known_txs.has_value()) && segwit_tx)
-        {
-            throw std::runtime_error("segwit transaction included before activation");
+            for (auto _tx_hash: other_transaction_hashes)
+            {
+                if (coind::data::is_segwit_tx(_known_txs.value()[_tx_hash]))
+                    throw std::runtime_error("segwit transaction included before activation");
+            }
         }
 
         if (segwit_activated && _known_txs.has_value())
@@ -228,16 +223,12 @@ namespace shares
         }
 
         //t2
-        //TODO: test
-        for (auto item: _desired_other_transaction_hashes_and_fees)
+        for (auto [tx_hash, fee]: _desired_other_transaction_hashes_and_fees)
         {
-            auto tx_hash = std::get<0>(item);
-            auto fee = std::get<1>(item);
-
             int32_t this_stripped_size = 0;
             int32_t this_real_size = 0;
             int32_t this_weight = 0;
-            if (_known_txs.has_value())
+            if (_known_txs.has_value() && !_known_txs.value().empty())
             {
                 for (auto _vs : _known_txs.value())
                     LOG_TRACE << _vs.first;
@@ -268,16 +259,22 @@ namespace shares
                 break;
 
             tuple<int, int> _this;
-            all_transaction_stripped_size += this_stripped_size;
-            //all_transaction_real_size += this_real_size;
-            all_transaction_weight += this_weight;
+            if (_known_txs.has_value())
+            {
+                all_transaction_stripped_size += this_stripped_size;
+                //all_transaction_real_size += this_real_size;
+                all_transaction_weight += this_weight;
+            }
             if (tx_hash_to_this.find(tx_hash) != tx_hash_to_this.end())
             {
                 _this = tx_hash_to_this[tx_hash];
             } else
             {
                 //new_transaction_size += this_real_size;
-                new_transaction_weight += this_weight;
+                if (_known_txs.has_value())
+                {
+                    new_transaction_weight += this_weight;
+                }
 
                 new_transaction_hashes.push_back(tx_hash);
                 _this = std::make_tuple(0, new_transaction_hashes.size() - 1);
