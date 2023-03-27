@@ -133,7 +133,7 @@ void Share::init()
 }
 #undef CheckShareRequirement
 
-void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint256, coind::data::tx_type> other_txs)
+void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<std::map<uint256, coind::data::tx_type>> other_txs)
 {
     if (*timestamp > (c2pool::dev::timestamp() + 600))
     {
@@ -169,17 +169,12 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint25
     }
 
     std::vector<uint256> other_tx_hashes;
-    for (auto v: (*share_info)->transaction_hash_refs)
+    for (auto [share_count, tx_count]: (*share_info)->transaction_hash_refs)
     {
-        auto share_count = std::get<0>(v);
-        auto tx_count = std::get<1>(v);
-
-        other_tx_hashes.push_back(_tracker->get(_tracker->get_nth_parent_key(hash,
-                                                                              share_count))->share_info->get()->new_transaction_hashes[tx_count]);
+        other_tx_hashes.push_back(
+                _tracker->get(_tracker->get_nth_parent_key(hash, share_count))->share_info->get()->new_transaction_hashes[tx_count]);
     }
 
-    // TODO: Check type in python???
-    //if other_txs is not None and not isinstance(other_txs, dict): other_txs = dict((bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx)), tx) for tx in other_txs)
 
     auto gentx_F = std::make_shared<shares::GenerateShareTransaction>(_tracker);
     gentx_F->
@@ -188,8 +183,11 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint25
             set_desired_timestamp(*timestamp).
             set_desired_target(FloatingInteger((*share_info)->bits).target()).
             set_ref_merkle_link(*ref_merkle_link->get()).
-            set_known_txs(other_txs).
             set_last_txout_nonce(last_txout_nonce);
+
+    // set known txs
+    if (other_txs.has_value())
+        gentx_F->set_known_txs(other_txs.value());
 
     // set_segwit_data
     if (segwit_data)
@@ -213,7 +211,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint25
     if (*share_info->get() != *gentx->share_info)
         throw std::invalid_argument("share_info invalid");
     if (coind::data::get_txid(gentx->gentx) != gentx_hash)
-        throw std::invalid_argument("gentx doesn't match hash_link");
+        throw std::invalid_argument((boost::format("gentx doesn't match hash_link: txid = %1%, gentx_hash = %2%") % coind::data::get_txid(gentx->gentx).GetHex() % gentx_hash).str());
 
     // Check merkle link
     {
