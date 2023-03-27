@@ -499,7 +499,7 @@ public:
             return false;
 
         auto height_up = child_height - height;
-        return height_up != 0 && get_nth_parent_key(possible_child, height_up) == item;
+        return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
     // last------[ancestor------item]--->best
