@@ -78,10 +78,11 @@ namespace shares
 
         if (!fees_none_contains)
         {
-            _share_data.subsidy += removed_fee_sum;
+            _share_data.subsidy -= removed_fee_sum;
         } else
         {
-            _share_data.subsidy = _base_subsidy + definite_fees;
+            assert(_base_subsidy.has_value());
+            _share_data.subsidy = _base_subsidy.value() + definite_fees;
         }
 
         auto [amounts] = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height);
