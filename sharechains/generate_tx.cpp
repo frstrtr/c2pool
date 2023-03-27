@@ -126,7 +126,7 @@ namespace shares
 
         std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs, segwit_activated);
 
-        auto gentx = gentx_generate(segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
+        auto gentx = gentx_generate(version, segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
 
         get_share_method get_share_F = get_share_func(version, gentx, other_transaction_hashes, share_info);
 
@@ -438,7 +438,7 @@ namespace shares
             // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)
             auto script = std::vector<unsigned char>{0x6a, 0x28};
 
-            auto _get_ref_hash = get_ref_hash(net, _share_data, *share_info, _ref_merkle_link, _segwit_data);
+            auto _get_ref_hash = get_ref_hash(version, net, _share_data, *share_info, _ref_merkle_link, _segwit_data);
             script.insert(script.end(), _get_ref_hash.data.begin(), _get_ref_hash.data.end());
 
             std::vector<unsigned char> packed_last_txout_nonce = pack<IntType(64)>(_last_txout_nonce);

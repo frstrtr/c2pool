@@ -84,9 +84,9 @@ namespace shares
         return result;
     }
 
-    PackStream get_ref_hash(std::shared_ptr<c2pool::Network> net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data)
+    PackStream get_ref_hash(uint64_t version, std::shared_ptr<c2pool::Network> net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data)
     {
-        RefType ref_type(std::vector<unsigned char>(net->IDENTIFIER, net->IDENTIFIER+net->IDENTIFIER_LENGTH), share_data, share_info, segwit_data);
+        RefType ref_type(is_segwit_activated(version, net), std::vector<unsigned char>(net->IDENTIFIER, net->IDENTIFIER+net->IDENTIFIER_LENGTH), share_data, share_info, segwit_data);
 
         PackStream ref_type_packed;
         ref_type_packed << ref_type;

@@ -74,7 +74,7 @@ namespace shares::stream
 
         SegwitData_stream() : txid_merkle_link(), wtxid_merkle_root()
         {
-
+            wtxid_merkle_root.set(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
         }
 
 		SegwitData_stream(const types::SegwitData &val)
@@ -249,20 +249,19 @@ namespace shares::stream
 
     struct RefType
     {
-        bool __segwit_activated__;
+        bool segwit_activated;
 
         FixedStrType<8> identifier;
         ShareData_stream share_data;
         ShareInfo_stream share_info;
         PossibleNoneType<SegwitData_stream> segwit_data;
-//        std::shared_ptr<SegwitData_stream> segwit_data;
 
 		RefType(bool _segwit_activated = true) : segwit_data({})
         {
-            __segwit_activated__ = _segwit_activated;
+            segwit_activated = _segwit_activated;
         }
 
-		RefType(std::vector<unsigned char> _ident, shares::types::ShareData &_share_data, shares::types::ShareInfo &_share_info, std::optional<shares::types::SegwitData> _segwit_data) : segwit_data({})
+		RefType(bool _segwit_activated, std::vector<unsigned char> _ident, shares::types::ShareData &_share_data, shares::types::ShareInfo &_share_info, std::optional<shares::types::SegwitData> _segwit_data) : segwit_activated(_segwit_activated), segwit_data({})
 		{
 			identifier = FixedStrType<8>(_ident);
             share_data = ShareData_stream(_share_data);
@@ -275,7 +274,8 @@ namespace shares::stream
         PackStream &write(PackStream &stream)
         {
             stream << identifier << share_data;
-            stream << segwit_data;
+            if (segwit_activated)
+                stream << segwit_data;
             stream << share_info;
             return stream;
         }
@@ -283,7 +283,7 @@ namespace shares::stream
         PackStream &read(PackStream &stream)
         {
             stream >> identifier >> share_info;
-            if (__segwit_activated__)
+            if (segwit_activated)
                 stream >> segwit_data;
             stream >> share_info;
             return stream;
