@@ -69,7 +69,6 @@ namespace shares
         }
 
         std::optional<type_known_txs> _known_txs;
-
         GenerateShareTransaction &set_known_txs(const type_known_txs &_value)
         {
             _known_txs = _value;
@@ -77,7 +76,6 @@ namespace shares
         }
 
         std::optional<shares::types::SegwitData> _segwit_data;
-
         GenerateShareTransaction &set_segwit_data(const shares::types::SegwitData &_value)
         {
             _segwit_data = _value;
