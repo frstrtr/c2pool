@@ -106,6 +106,44 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
         *_l -= *_r;
     });
 
+    _tracker->verified.rules.add("doa", [&](const ShareType &share)
+    {
+        if (!share)
+        {
+            LOG_WARNING << "NULLPTR SHARE IN DOAElement MAKE!";
+            return DOAElement{};
+        }
+        int32_t my_count = 0;
+        if (my_share_hashes.count(share->hash))
+            my_count = 1;
+
+        int32_t my_doa_count = 0;
+        if (my_doa_share_hashes.count(share->hash))
+            my_doa_count = 1;
+
+        int32_t my_orphan_announce_count = 0;
+        if (my_share_hashes.count(share->hash) && (*share->share_data)->stale_info == orphan)
+            my_orphan_announce_count = 1;
+
+
+        int32_t my_dead_announce_count = 0;
+        if (my_share_hashes.count(share->hash) && (*share->share_data)->stale_info == doa)
+            my_dead_announce_count = 1;
+
+        return DOAElement{my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count};
+    }, [](Rule& l, const Rule& r)
+                        {
+                            auto _l = std::any_cast<DOAElement>(&l.value);
+                            auto _r = std::any_cast<DOAElement>(&r.value);
+                            *_l += *_r;
+                        }, [](Rule& l, const Rule& r)
+                        {
+                            auto _l = std::any_cast<DOAElement>(&l.value);
+                            auto _r = std::any_cast<DOAElement>(&l.value);
+                            *_l -= *_r;
+                        });
+
+
     // sub for removed_unstales Variable's
     _tracker->removed.subscribe([&](ShareType share)
                                 {
