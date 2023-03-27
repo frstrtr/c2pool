@@ -59,7 +59,14 @@ namespace shares
         SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
 //        SetProperty(type_known_txs, known_txs);
         SetProperty(unsigned long long, last_txout_nonce);
-        SetProperty(unsigned long long, base_subsidy);
+//        SetProperty(, base_subsidy);
+
+        std::optional<unsigned long long> _base_subsidy;
+        GenerateShareTransaction &set_base_subsidy(const unsigned long long &_value)
+        {
+            _base_subsidy = _value;
+            return *this;
+        }
 
         std::optional<type_known_txs> _known_txs;
 
