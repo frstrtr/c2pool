@@ -165,3 +165,10 @@ TEST(stream_types_test, from_target_upper_bound_test)
     ASSERT_EQ(from_target1.get(), from_target2.get());
     ASSERT_EQ(from_target1.target(), from_target2.target());
 }
+
+TEST(stream_types_test, floating_int_test)
+{
+    FloatingInteger v(504365055);
+    std::cout << "target: " << v.target().GetHex() << std::endl;
+//    pack.FloatingInteger.from_target_upper_bound(p2pool_math.clip(desired_share_target, (pre_target3//30, pre_target3)))
+}

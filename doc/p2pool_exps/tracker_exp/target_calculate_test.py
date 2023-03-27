@@ -39,6 +39,7 @@ else:
     pre_target = 2**256//(net.SHARE_PERIOD*attempts_per_second) - 1 if attempts_per_second else 2**256-1
     pre_target2 = math.clip(pre_target, (previous_share.max_target*9//10, previous_share.max_target*11//10))
     pre_target3 = math.clip(pre_target2, (net.MIN_TARGET, net.MAX_TARGET))
+print('pre_target3 = {0}'.format(hex(pre_target3)))
 max_bits = pack.FloatingInteger.from_target_upper_bound(pre_target3)
 bits = pack.FloatingInteger.from_target_upper_bound(p2pool_math.clip(desired_share_target, (pre_target3//30, pre_target3)))
 
@@ -67,8 +68,13 @@ target = p2pool_math.clip(target, net.PARENT.SANE_TARGET_RANGE)
 
 
 pow_hash = int('0000021af02bba79f0619927450b9a2e942be752b7cfce29e00178b7db7904c7', 16)
+if pow_hash < share_info['bits'].target:
+    print("GOT SHARE!")
 print('target = {0}'.format(hex(target)))
 if pow_hash > target:
     print('Submited')
 else:
     print('Pseudoshare')
+
+
+print('rpc_diffuculty = {0}'.format(coind_data.target_to_difficulty(target)*net.PARENT.DUMB_SCRYPT_DIFF))
