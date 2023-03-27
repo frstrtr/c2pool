@@ -84,7 +84,8 @@ void Share::init()
 
     std::vector<unsigned char> hash_link_data;
     {
-        auto ref_hash = shares::get_ref_hash(net, *share_data->get(), *share_info->get(), *ref_merkle_link->get(), segwit_data ? std::make_optional(*segwit_data->get()) : nullopt);
+        auto ref_hash = shares::get_ref_hash(VERSION, net, *share_data->get(), *share_info->get(), *ref_merkle_link->get(), segwit_data ? std::make_optional(*segwit_data->get()) : nullopt);
+        LOG_TRACE.stream() << "INIT hash_link_data(ref_hash): " << ref_hash;
         hash_link_data = ref_hash.data;
 
         IntType(64) _last_txout_nonce(last_txout_nonce);
