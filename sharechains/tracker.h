@@ -184,7 +184,14 @@ public:
             }
 
             prev = cur;
-            cur = cur.prev->second;
+
+            if (cur.prev != sum.end())
+            {
+                cur = cur.prev->second;
+            } else
+            {
+                break;
+            }
         }
 
         if (extra_ending.has_value())
