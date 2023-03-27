@@ -363,6 +363,7 @@ namespace shares
         //all that's left over is the donation weight and some extra satoshis due to rounding
         {
             auto _donation_amount = amounts.find(net->DONATION_SCRIPT);
+            LOG_TRACE.stream() << "DONATION_SCRIPT: " << net->DONATION_SCRIPT;
             if (_donation_amount == amounts.end())
                 amounts[net->DONATION_SCRIPT] = 0;
 
@@ -387,10 +388,15 @@ namespace shares
         coind::data::tx_type gentx;
 
         std::vector<std::vector<unsigned char>> dests;
-        dests.reserve(amounts.size());
+        LOG_TRACE.stream() << "amounts: ";
+        for (auto [k, v] : amounts)
+        {
+            LOG_TRACE.stream() << "\t\t" << k << "; " << v.GetHex();
+        }
 
         for (auto v: amounts)
             dests.push_back(v.first);
+        LOG_TRACE.stream() << "dests: " << dests;
 
         std::sort(dests.begin(), dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
         {
@@ -399,6 +405,7 @@ namespace shares
 
             return amounts[a] != amounts[b] ? amounts[a] < amounts[b] : a < b;
         });
+        LOG_TRACE.stream() << "dests_sorted: " << dests;
 
 
         //TX_IN
@@ -537,6 +544,7 @@ namespace shares
 
     get_share_method GenerateShareTransaction::get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info)
     {
+        LOG_TRACE.stream() << "generate_tx: pref_to_hash_link(gentx_before_copy): " << *gentx;
         return [=, gentx_data = shared_from_this()](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
@@ -545,13 +553,17 @@ namespace shares
             shared_ptr<::HashLinkType> pref_to_hash_link;
             {
                 coind::data::stream::TxIDType_stream txid(gentx->version,gentx->tx_ins, gentx->tx_outs, gentx->lock_time);
+                LOG_TRACE.stream() << "generate_tx: pref_to_hash_link(gentx): " << *gentx;
                 PackStream txid_packed;
                 txid_packed << txid;
+                LOG_TRACE.stream() << "\tgenerate_tx: pref_to_hash_link(txid_packed): " << txid_packed;
 
                 std::vector<unsigned char> prefix;
                 prefix.insert(prefix.begin(), txid_packed.begin(), txid_packed.end()-32-8-4);
+                LOG_TRACE.stream() << "generate_tx: pref_to_hash_link(prefix): " << prefix;
 
                 pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
+                LOG_TRACE.stream() << "generate_tx: pref_to_hash_link(result): " << (*pref_to_hash_link->get());
             }
 
             auto tx_hashes = other_transaction_hashes;

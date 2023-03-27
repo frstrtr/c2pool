@@ -34,6 +34,7 @@ share_type = pack.ComposedType([
 
 def load_share(share, net, peer_addr):
     assert peer_addr is None or isinstance(peer_addr, tuple)
+    print(share)
     if share['type'] in p2pool_share.share_versions:
         return p2pool_share.share_versions[share['type']](net, peer_addr, p2pool_share.share_versions[share['type']].get_dynamic_types(net)['share_type'].unpack(share['contents']))
 
