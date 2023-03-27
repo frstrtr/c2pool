@@ -110,13 +110,17 @@ bool ShareTracker::attempt_verify(ShareType share)
 		return true;
 	}
 
+    auto [height, last] = get_height_and_last(share->hash);
+    if (height < net->CHAIN_LENGTH + 1 && !last.IsNull())
+        throw std::invalid_argument("");
+
 	try
 	{
 		share->check(shared_from_this());
 	}
 	catch (const std::invalid_argument &e)
 	{
-		LOG_WARNING << e.what() << '\n';
+		LOG_WARNING << "Share check failed (" << e.what() << "): " << share->hash << " -> " << (share->previous_hash->IsNull() ? uint256::ZERO.GetHex() : share->previous_hash->GetHex());
 		return false;
 	}
 
