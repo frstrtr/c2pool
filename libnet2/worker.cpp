@@ -222,8 +222,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     }
 
     LOG_DEBUG_STRATUM << "best_share in get_work: " << _pool_node->best_share.value().GetHex();
-    LOG_TRACE << "besh share is null? = " << _pool_node->best_share.isNull() << "; PERSIST = " << _net->PERSIST;
-    if (_pool_node->best_share.isNull() && _net->PERSIST)
+    LOG_TRACE << "best share is null? = " << _pool_node->best_share.value().IsNull() << "; PERSIST = " << _net->PERSIST;
+    if (_pool_node->best_share.value().IsNull() && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is downloading shares"); //TODO: to jsonrpc_error
     }
@@ -280,7 +280,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     uint64_t share_version;
 
     ShareType prev_share;
-    if (!_pool_node->best_share.isNull())
+    if (!_pool_node->best_share.value().IsNull())
     {
         prev_share = _tracker->get(_pool_node->best_share.value());
     }

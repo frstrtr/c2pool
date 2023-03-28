@@ -24,6 +24,8 @@ void CoindNodeData::set_best_share()
 
 	best_share.set(_best);
     LOG_DEBUG_COIND << "new best_share: " << best_share.value().GetHex();
+    if (!best_share.value().IsNull())
+        LOG_DEBUG_COIND << "REAL NEW BEST SHARE: " << best_share.value().GetHex();
 	desired.set(_desired);
 
 	if (pool_node)
