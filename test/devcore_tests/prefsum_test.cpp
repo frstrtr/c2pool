@@ -37,6 +37,11 @@ public:
         return i == 0;
     }
 
+    bool is_none_tail() override
+    {
+        return tail == 0;
+    }
+
     void set_value(value_type value) override
     {
         head = value.head;
@@ -159,7 +164,7 @@ TEST(Prefsum_test, main_test)
     print_get_height_and_last(prefsum, 3);
 
     ASSERT_TRUE(prefsum.is_child_of(1, 44));
-    ASSERT_ANY_THROW(prefsum.is_child_of(44,1));
+    ASSERT_FALSE(prefsum.is_child_of(44,1));
     ASSERT_TRUE(prefsum.is_child_of(33, 44));
     ASSERT_TRUE(prefsum.is_child_of(1, 3));
     ASSERT_FALSE(prefsum.is_child_of(22, 1));
@@ -359,4 +364,114 @@ TEST(Prefsum_test, rules_test)
     }
 
     ASSERT_EQ(*prefsum.get_sum_to_last(44).rules.get<int>("test_rule"), 2);
+
+    // Test for solo element
+//    prefsum.get_height_and_last()
+    {
+        auto _v = prefsum.get_sum_to_last(3);
+        std::cout << _v.tail;
+    }
+}
+
+TEST(Prefsum_test, none_tail_test)
+{
+    TestPrefsum prefsum;
+    TestData first{2, 0, 100};
+    TestData second{3, 2, 200};
+    TestData second2{33, 2, 233};
+    TestData second22{44, 33, 67};
+    // (1->2->33->44]; (1->2->3]; (9->10]
+    TestData first2{10, 9, 900};
+
+    std::vector<int> check_rules_value {100, 233, 900, 300};
+
+    // (0->2->33->44]; (0->2->3->4]; (9->10]
+    TestData third{4, 3, 300};
+
+    prefsum.add(first);
+    prefsum.add(second);
+    prefsum.add(second2);
+    prefsum.add(first2);
+    prefsum.add(second22);
+    prefsum.add(third);
+
+    prefsum.rules.add("test_rule", [&](const TestData& v)
+    {
+        std::cout << "MAKE: " << v.head << std::endl;
+        if (std::count(check_rules_value.begin(), check_rules_value.end(), v.value))
+            return 1;
+        return 0;
+    }, [](Rule& l, const Rule& r)
+                      {
+                          auto _l = std::any_cast<int>(&l.value);
+                          auto _r = std::any_cast<int>(&r.value);
+                          std::cout << "ADD: " << *_l << "+" << *_r << std::endl;
+                          *_l += *_r;
+                      }, [](Rule& l, const Rule& r)
+                      {
+                          auto _l = std::any_cast<int>(&l.value);
+                          auto _r = std::any_cast<int>(&l.value);
+                          std::cout << "REMOVE" << std::endl;
+                          *_l -= *_r;
+                      });
+
+    write_head_n_tails(prefsum);
+
+
+    // 1
+    std::cout << "is_child_of: " << (prefsum.is_child_of(2, 2) ? "true" : "false") << std::endl;
+    ASSERT_EQ(prefsum.is_child_of(2, 2), true);
+    // 2
+    std::cout << "get_nth_parent_hash: " << prefsum.get_nth_parent_key(2, 0) << std::endl;
+    ASSERT_EQ(prefsum.get_nth_parent_key(2, 0), 2);
+    // 3.1
+    {
+        auto get_chain_f = prefsum.get_chain(2, 0);
+        std::cout << "get_chain: [";
+        std::vector<int> chain;
+        int i;
+        while(get_chain_f(i))
+        {
+            std::cout << i << ", ";
+            chain.push_back(i);
+        }
+        std::cout << "]" << std::endl;
+        ASSERT_EQ(chain, std::vector<int>());
+    }
+    // 3.2
+    {
+        auto get_chain_f = prefsum.get_chain(33, 0);
+        std::cout << "get_chain: [";
+        std::vector<int> chain;
+        int i;
+        while(get_chain_f(i))
+        {
+            std::cout << i << ", ";
+            chain.push_back(i);
+        }
+        std::cout << "]" << std::endl;
+        ASSERT_EQ(chain, std::vector<int>());
+    }
+    // 4.1
+    {
+        auto res = prefsum.get_sum(2, 2);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+        ASSERT_EQ(res.head, 0);
+        ASSERT_EQ(res.tail, 0);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 0);
+        ASSERT_EQ(res.height, 0);
+        ASSERT_EQ(res.i, 0);
+    }
+    // 4.2
+    {
+        auto res = prefsum.get_sum(10, 10);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+        ASSERT_EQ(res.head, 9);
+        ASSERT_EQ(res.tail, 9);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 0);
+        ASSERT_EQ(res.height, 0);
+        ASSERT_EQ(res.i, 0);
+    }
+    // 5
+//    std::cout << prefsum.ge
 }

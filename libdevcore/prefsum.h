@@ -338,8 +338,7 @@ public:
         value.pvalue = items.find(value.head);
 
         //--Add to reverse
-        if (!value.is_none_tail())
-            reverse[value.tail].push_back(items.find(value.head));
+        reverse[value.tail].push_back(items.find(value.head));
 
         //--Add value to sum
         auto &it = sum[value.head];
