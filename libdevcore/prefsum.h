@@ -178,6 +178,8 @@ public:
 public:
     virtual bool is_none() = 0;
 
+    virtual bool is_none_tail() = 0;
+
     virtual void set_value(value_type value) = 0;
     // return head value
     virtual value_type get_value()
@@ -336,7 +338,8 @@ public:
         value.pvalue = items.find(value.head);
 
         //--Add to reverse
-        reverse[value.tail].push_back(items.find(value.head));
+        if (!value.is_none_tail())
+            reverse[value.tail].push_back(items.find(value.head));
 
         //--Add value to sum
         auto &it = sum[value.head];
