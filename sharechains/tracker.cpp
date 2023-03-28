@@ -135,15 +135,14 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     std::vector<uint256> bads;
 
-    int i1 = 0;
     for (auto [head, tail] : heads)
     {
         // only unverified heads
         if (verified.heads.find(head) != verified.heads.end())
             continue;
-        i1++;
 
         auto [head_height, last] = get_height_and_last(head);
+        LOG_TRACE << "head_height = " << head_height << ", last = " << last.GetHex();
 
         auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height -
                                                                                                  net->CHAIN_LENGTH)));
@@ -152,6 +151,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         bool _verified = false;
         while (get_chain_f(_hash))
         {
+            LOG_TRACE << "GET_CHAIN hash = " << _hash.GetHex();
             if (attempt_verify(get(_hash)))
             {
                 _verified = true;
