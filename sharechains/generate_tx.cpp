@@ -228,7 +228,7 @@ namespace shares
             int32_t this_stripped_size = 0;
             int32_t this_real_size = 0;
             int32_t this_weight = 0;
-            if (_known_txs.has_value() && !_known_txs.value().empty())
+            if (_known_txs.has_value())
             {
                 for (auto _vs : _known_txs.value())
                     LOG_TRACE << _vs.first;
