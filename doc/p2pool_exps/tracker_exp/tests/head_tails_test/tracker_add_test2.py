@@ -33,3 +33,9 @@ write_ht(track)
 fork = PresudoShare([-4, 2])
 track.add(fork)
 write_ht(track)
+
+#(0=None)->1->2->3->-2
+#      |
+#      |
+#      ->-4
+

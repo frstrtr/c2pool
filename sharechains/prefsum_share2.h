@@ -45,6 +45,11 @@ namespace shares
                    height == 0;
         }
 
+        bool is_none_tail() override
+        {
+            return tail.IsNull();
+        }
+
         void set_value(value_type value) override
         {
             head = value->hash;
