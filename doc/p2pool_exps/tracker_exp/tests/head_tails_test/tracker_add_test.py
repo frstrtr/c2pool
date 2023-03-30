@@ -44,3 +44,5 @@ print('tails: {0}'.format(tails))
 add([2,1])
 print('heads: {0}'.format(heads))
 print('tails: {0}'.format(tails))
+
+# Tracker = [0->1->2->3

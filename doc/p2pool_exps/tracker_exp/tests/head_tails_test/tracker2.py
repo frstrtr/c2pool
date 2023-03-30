@@ -225,6 +225,8 @@ class Tracker(object):
         self._delta_type = delta_type
         self._default_view = TrackerView(self, delta_type)
 
+        self.get_nth_parent_hash = DistanceSkipList(self)
+
         for item in items:
             self.add(item)
 
@@ -253,12 +255,12 @@ class Tracker(object):
             tail = self.heads.pop(delta.tail)
         else:
             tail = self.get_last(delta.tail)
-        print("_TAIL: {0}".format(tail))
+        # print("_TAIL: {0}".format(tail))
         self.items[delta.head] = item
         self.reverse.setdefault(delta.tail, set()).add(delta.head)
 
         #3
-        print("_HEADS: {0}".format(heads))
+        # print("_HEADS: {0}".format(heads))
         self.tails.setdefault(tail, set()).update(heads)
         #4
         if delta.tail in self.tails[tail]:
