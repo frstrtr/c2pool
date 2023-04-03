@@ -39,7 +39,7 @@ public:
 
     bool is_none_tail() override
     {
-        return tail == 0;
+        return tail == -876;
     }
 
     void set_value(value_type value) override
@@ -375,7 +375,7 @@ TEST(Prefsum_test, rules_test)
 
 TEST(Prefsum_test, none_tail_test)
 {
-    TestPrefsum prefsum;
+    TestPrefsum prefsum; // none_tail = -876
     TestData first{2, 0, 100};
     TestData second{3, 2, 200};
     TestData second2{33, 2, 233};
@@ -385,7 +385,7 @@ TEST(Prefsum_test, none_tail_test)
 
     std::vector<int> check_rules_value {100, 67, 233, 900, 300};
 
-    // (0->2->33->44]; (0->2->3->4]; (9->10]
+    // (0->2->33->44]; (0->2->3->4]; (9->10]; ({None=-876}->678->679]
     TestData third{4, 3, 300};
 
     prefsum.add(first);
@@ -416,6 +416,12 @@ TEST(Prefsum_test, none_tail_test)
                           *_l -= *_r;
                       }
     );
+
+    TestData testNoneTail{678, -876, 1000};
+    prefsum.add(testNoneTail);
+
+    TestData testNoneTail2{679, 678, 1000};
+    prefsum.add(testNoneTail2);
 
     write_head_n_tails(prefsum);
 
@@ -520,9 +526,81 @@ TEST(Prefsum_test, none_tail_test)
         ASSERT_EQ(res.height, 3);
         ASSERT_EQ(res.i, 400);
     }
-    // 5
+    // 4.5.1
     {
+        std::cout << "4.5.1" << std::endl;
+        auto res = prefsum.get_sum(678, -876);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+/*        ASSERT_EQ(res.head, 44);
+        ASSERT_EQ(res.tail, 0);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 3);
+        ASSERT_EQ(res.height, 3);
+        ASSERT_EQ(res.i, 400);*/
+    }
+    // 4.5.2
+    {
+        std::cout << "4.5.2" << std::endl;
+        auto res = prefsum.get_sum(679, -876);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+/*        ASSERT_EQ(res.head, 44);
+        ASSERT_EQ(res.tail, 0);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 3);
+        ASSERT_EQ(res.height, 3);
+        ASSERT_EQ(res.i, 400);*/
+    }
+    // 4.5.3
+    {
+        std::cout << "4.5.3" << std::endl;
+        auto res = prefsum.get_sum(679, 678);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+/*        ASSERT_EQ(res.head, 44);
+        ASSERT_EQ(res.tail, 0);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 3);
+        ASSERT_EQ(res.height, 3);
+        ASSERT_EQ(res.i, 400);*/
+    }
+    // 4.6
+    {
+        std::cout << "4.6" << std::endl;
+        auto res = prefsum.get_sum(10, 9);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+        ASSERT_EQ(res.head, 10);
+        ASSERT_EQ(res.tail, 9);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 1);
+        ASSERT_EQ(res.height, 1);
+        ASSERT_EQ(res.i, 900);
+    }
+    // 5.1
+    {
+        std::cout << "5.1" << std::endl;
         auto res = prefsum.get_sum_to_last(10);
         std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+        ASSERT_EQ(res.head, 10);
+        ASSERT_EQ(res.tail, 9);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 1);
+        ASSERT_EQ(res.height, 1);
+        ASSERT_EQ(res.i, 900);
+    }
+    // 5.2
+    {
+        std::cout << "5.2" << std::endl;
+        auto res = prefsum.get_sum_to_last(44);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", test_rule = " << *res.rules.get<int>("test_rule") << ", i = " << res.i << std::endl;
+        ASSERT_EQ(res.head, 44);
+        ASSERT_EQ(res.tail, 0);
+        ASSERT_EQ(*res.rules.get<int>("test_rule"), 3);
+        ASSERT_EQ(res.height, 3);
+        ASSERT_EQ(res.i, 400);
+    }
+    // 5.3
+    {
+        std::cout << "5.3" << std::endl;
+        auto res = prefsum.get_sum_to_last(678);
+        std::cout << "head = " << res.head << ", tail = " << res.tail << ", height = " << res.height << ", i = " << res.i << std::endl;
+//        ASSERT_EQ(res.head, 44);
+//        ASSERT_EQ(res.tail, 0);
+//        ASSERT_EQ(*res.rules.get<int>("test_rule"), 3);
+//        ASSERT_EQ(res.height, 3);
+//        ASSERT_EQ(res.i, 400);
     }
 }

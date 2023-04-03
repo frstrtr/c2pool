@@ -142,9 +142,12 @@ public:
 	std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
 	        get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint288 desired_weight)
 	{
+        std::cout << "get_cumulative_weights START" << std::endl;
+
         // Если start -- None/Null/0 шара.
         if (start.IsNull())
             return {{},{}, {}};
+        std::cout << "get_cumulative_weights0" << std::endl;
 
         auto [start_height, last] = get_height_and_last(start);
 
@@ -196,6 +199,7 @@ public:
 
         if (extra_ending.has_value())
         {
+            std::cout << "get_cumulative_weights1: " << start << " " << cur.head << std::endl;
             auto result_sum = get_sum(start, prev.head);
             //total weights
             auto total_weights = result_sum.weight.total_weight;
@@ -224,7 +228,8 @@ public:
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
-            auto result_sum = get_sum(start, cur.head);
+            std::cout << "get_cumulative_weights2: " << start << " " << cur.tail << std::endl;
+            auto result_sum = get_sum(start, cur.tail);
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
