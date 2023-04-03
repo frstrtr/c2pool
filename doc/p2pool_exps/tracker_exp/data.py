@@ -48,7 +48,7 @@ class ShareStore(object):
     def __init__(self, net, path_shares, share_cb, verified_hash_cb):
         start = time.time()
 
-        load_tracker = False # false -- empty tracker
+        load_tracker = True # false -- empty tracker
 
         known = {}
         if load_tracker:
