@@ -476,6 +476,13 @@ namespace shares
 
         uint32_t timestamp;
 
+        LOG_TRACE << "Desired Timestamp = " << _desired_timestamp;
+        LOG_TRACE << "PreviousShare = " << (previous_share != nullptr);
+        if (previous_share)
+            LOG_TRACE << "PreviousShare Timestamp = " << *previous_share->timestamp;
+        LOG_TRACE << "SHARE_PERIOD = " << net->SHARE_PERIOD;
+        LOG_TRACE << "version = " << version;
+
         if (previous_share != nullptr)
         {
             if (version < 32)
@@ -533,6 +540,7 @@ namespace shares
                                               "Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
                                 (*previous_share->timestamp - c2pool::dev::timestamp()))
                         .str();
+                LOG_TRACE << "PreviousShare.timestamp = " << *previous_share->timestamp << ", timestamp = " << c2pool::dev::timestamp();
             }
         }
 

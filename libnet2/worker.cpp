@@ -344,6 +344,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             set_base_subsidy(_net->parent->SUBSIDY_FUNC(current_work.value().height)).
             set_known_txs(tx_map);
 
+    LOG_TRACE << "DESIRED TIMESTAMP CALCULATE = " << c2pool::dev::timestamp() << " (" << (uint32_t) c2pool::dev::timestamp() << ") + " << 0.5f << " = " << (c2pool::dev::timestamp() + 0.5f) << " / " << (uint32_t)(c2pool::dev::timestamp() + 0.5f);
+
     {
         std::vector<std::tuple<uint256, std::optional<int32_t>>> desired_other_transaction_hashes_and_fees;
         uint256 _tx_hash;
