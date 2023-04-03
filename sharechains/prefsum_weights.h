@@ -14,6 +14,7 @@ class ShareTracker;
 namespace shares::weight
 {
     // TODO: хранить без умножения на 65535 и лишь в конце вычислений, результат, как сумму, умножать на 65535*n;
+    // TODO: Оптимизировать память для amount.
     class weight_data
     {
     public:
@@ -39,12 +40,31 @@ namespace shares::weight
 
         void operator+=(const weight_data &element)
         {
+/*            for (auto el : element.amount)
+            {
+                if (amount.find(el.first) != amount.end())
+                    amount[el.first] += el.second;
+                else
+                    amount[el.first] = el.second;
+            }*/
+
             total_weight += element.total_weight;
             total_donation_weight += element.total_donation_weight;
         }
 
         void operator-=(const weight_data &element)
         {
+            for (auto el : element.amount)
+            {
+                //TODO: сделать проверку на существование script в словаре?
+                amount[el.first] -= el.second;
+
+                if (amount[el.first].IsNull())
+                {
+                    amount.erase(el.first);
+                }
+            }
+
             total_weight -= element.total_weight;
             total_donation_weight -= element.total_donation_weight;
         }

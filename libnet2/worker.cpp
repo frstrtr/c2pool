@@ -102,7 +102,7 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
     }, [](Rule& l, const Rule& r)
     {
         auto _l = std::any_cast<DOAElement>(&l.value);
-        auto _r = std::any_cast<DOAElement>(&l.value);
+        auto _r = std::any_cast<DOAElement>(&r.value);
         *_l -= *_r;
     });
 
@@ -139,7 +139,7 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
                         }, [](Rule& l, const Rule& r)
                         {
                             auto _l = std::any_cast<DOAElement>(&l.value);
-                            auto _r = std::any_cast<DOAElement>(&l.value);
+                            auto _r = std::any_cast<DOAElement>(&r.value);
                             *_l -= *_r;
                         });
 

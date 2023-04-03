@@ -511,15 +511,9 @@ public:
             throw std::invalid_argument("get_sum item not child for ancestor");
 
         auto result = get_sum_to_last(item);
-        std::cout << "result: " << result.head << " " << result.tail << " " << result.i << " " << *result.rules.template get<int>("test_rule") << std::endl;
         auto ances = get_sum_to_last(ancestor);
-        std::cout << "ances: " << ances.head << " " << ances.tail << " " << ances.i << " " << *ances.rules.template get<int>("test_rule") << std::endl;
 
-        auto &a = result.erase(ances);
-        std::cout << "a: " << a.head << " " << a.tail << " " << a.i  << " " << *a.rules.template get<int>("test_rule") << std::endl;
-        std::cout << "result2: " << result.head << " " << result.tail << " " << result.i << " " << *result.rules.template get<int>("test_rule") << std::endl;
-
-        return a;
+        return result.erase(ances);
     }
 
     std::function<bool(key_type&)> get_chain(key_type key, int32_t n)
