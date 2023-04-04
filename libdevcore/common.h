@@ -25,7 +25,7 @@ namespace c2pool::dev
     }
 
     //int64_t/IntType(64)
-    time_t timestamp();
+    uint32_t timestamp();
 
     std::vector<unsigned char> bytes_from_uint8(std::vector<uint8_t> data);
 

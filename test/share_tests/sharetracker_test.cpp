@@ -495,7 +495,7 @@ TEST_F(SharechainsTest, gentx_test)
     auto generate_transaction = std::make_shared<GenerateShareTransaction>(tracker);
     generate_transaction->
             set_block_target(FloatingInteger(current_work.bits).target()).
-            set_desired_timestamp(c2pool::dev::timestamp() + 0.5f).
+            set_desired_timestamp(c2pool::dev::timestamp()).
             set_desired_target(desired_share_target).
             set_ref_merkle_link(coind::data::MerkleLink({}, 0)).
             set_desired_other_transaction_hashes_and_fees({}).

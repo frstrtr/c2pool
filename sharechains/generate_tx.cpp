@@ -471,6 +471,7 @@ namespace shares
         uint256 far_share_hash;
         if (last.IsNull() && height < 99)
             far_share_hash.SetNull();
+
         else
             far_share_hash = tracker->get_nth_parent_key(_share_data.previous_share_hash, 99);
 
@@ -540,7 +541,7 @@ namespace shares
                                               "Make sure your system clock is accurate.Errors beyond 300 sec result in orphaned shares.") %
                                 (*previous_share->timestamp - c2pool::dev::timestamp()))
                         .str();
-                LOG_TRACE << "PreviousShare.timestamp = " << *previous_share->timestamp << ", timestamp = " << c2pool::dev::timestamp();
+                LOG_TRACE << "PreviousShare.timestamp = " << *previous_share->timestamp << ", timestamp = " << c2pool::dev::timestamp() << "(" << (c2pool::dev::timestamp() + 3) << ")";
             }
         }
 
