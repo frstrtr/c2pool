@@ -34,7 +34,7 @@ namespace c2pool::dev
         return s;
     }
 
-    time_t timestamp()
+    uint32_t timestamp()
     {
         return std::time(nullptr);
     }

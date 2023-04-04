@@ -338,7 +338,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     auto generate_transaction = std::make_shared<shares::GenerateShareTransaction>(_tracker);
     generate_transaction->
             set_block_target(FloatingInteger(current_work.value().bits).target()).
-            set_desired_timestamp(c2pool::dev::timestamp() + 0.5f).
+            set_desired_timestamp(c2pool::dev::timestamp()).
             set_desired_target(desired_share_target).
             set_ref_merkle_link(coind::data::MerkleLink({}, 0)).
             set_base_subsidy(_net->parent->SUBSIDY_FUNC(current_work.value().height)).
