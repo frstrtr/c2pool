@@ -311,21 +311,28 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             // TODO: CHECK
 			// limit to 1.67% of pool shares by modulating share difficulty
 			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
-					local_hash_rate * _net->SHARE_PERIOD / 0.0167));
+					local_hash_rate * _net->SHARE_PERIOD / 60)); // in p2pool:  /0.0167, not /60
             LOG_DEBUG_STRATUM << "desired_share_target[#2] = " << desired_share_target.GetHex();
 		}
 		auto lookbehind = 3600 / _net->SHARE_PERIOD;
         LOG_DEBUG_STRATUM << "lookbehind = " << lookbehind;
 		block_subsidy = _coind_node->coind_work.value().subsidy;
-        LOG_DEBUG_STRATUM << "block_subsidy = " << block_subsidy;
 		if (prev_share && _tracker->get_height(prev_share->hash) > lookbehind)
 		{
 			//TODO (from p2pool): doesn't use global stale rate to compute pool hash
-			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind) * block_subsidy * (1 - donation_percentage/100);
+            LOG_DEBUG_STRATUM << "local_hash_rate = " << local_hash_rate.GetHex();
+            LOG_DEBUG_STRATUM << "get_pool_attempts_per_second = " << _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind).GetHex();
+            LOG_DEBUG_STRATUM << "block_subsidy = " << block_subsidy;
+            LOG_DEBUG_STRATUM << "donation_percentage = " << donation_percentage;
+			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind) * block_subsidy * (100 - donation_percentage) / 100; //(1 - donation_percentage/100);
+            LOG_DEBUG_STRATUM << "expected_payout_per_block = " << expected_payout_per_block.GetHex();
 			if (expected_payout_per_block < _net->parent->DUST_THRESHOLD)
 			{
+                LOG_DEBUG_STRATUM << "_net->parent->DUST_THRESHOLD = " << _net->parent->DUST_THRESHOLD;
 				auto temp1 = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target()) * _net->SPREAD;
+                LOG_DEBUG_STRATUM << "temp1 = " << temp1.GetHex();
 				auto temp2 = temp1 * _net->parent->DUST_THRESHOLD / block_subsidy;
+                LOG_DEBUG_STRATUM << "temp2 = " << temp2.GetHex();
 				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(temp2));
                 LOG_DEBUG_STRATUM << "desired_share_target[#3] = " << desired_share_target.GetHex();
 			}
@@ -576,6 +583,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                 LOG_DEBUG_STRATUM << "header_hash = " << header_hash;
                 LOG_DEBUG_STRATUM << "pow_hash = " << pow_hash;
+                LOG_INFO << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "target = " << target;
 
@@ -667,6 +675,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     }
 
                     _tracker->add(share);
+                    LOG_INFO << "Tracker items count = " << _tracker->items.size();
                     _coind_node->set_best_share();
 
                     try

@@ -85,21 +85,8 @@ namespace coind::data
 
     double target_to_difficulty(uint256 target)
     {
-        uint288 targ;
-        targ.SetHex(target.GetHex());
-
-        auto v = UintToArith288(targ);
-        assert(!target.IsNull());
-
-        uint288 u_s;
-        u_s.SetHex("1000000000000000000000000000000000000000000000000");
-
-        auto s = UintToArith288(u_s);
-        s *= 0xffff0000;
-        s += 1;
-
-        auto r = s/(v+1);
-        return r.getdouble();
+        arith_uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
+        return for_div.getdouble() / (UintToArith256(target).getdouble() + 1);
     }
 
     uint256 difficulty_to_target(uint256 difficulty)
