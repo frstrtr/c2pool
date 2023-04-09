@@ -1,3 +1,5 @@
+from __future__ import division
+
 import pack
 import hashlib
 import math,  p2pool_math

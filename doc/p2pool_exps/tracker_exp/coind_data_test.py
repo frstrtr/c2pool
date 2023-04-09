@@ -67,3 +67,15 @@ print(pack.FloatingInteger(504365055).target)
 print(int('00000fffff000000000000000000000000000000000000000000000000000000', 16))
 
 print(pack.FloatingInteger(504365055).target == int('00000fffff000000000000000000000000000000000000000000000000000000', 16))
+
+###############
+
+
+local_hash_rate = int('000000000000000000000000000000000000000000000000000000000000000000369d03', 16)
+_SHARE_PERIOD = 25
+print(local_hash_rate * _SHARE_PERIOD / 0.0167)
+print(coind_data.average_attempts_to_target(local_hash_rate * _SHARE_PERIOD / 0.0167))
+_target = 53919893334301279589334030174039261347274288845081144962207220498431
+print u'diff = %s' % (coind_data.difficulty_to_target(_target))
+# print(coind_data.target_to_difficulty(53919893334301279589334030174039261347274288845081144962207220498431)*65565)
+print u'%s' % (coind_data.difficulty_to_target(0.499992370605))

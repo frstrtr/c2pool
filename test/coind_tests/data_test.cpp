@@ -266,6 +266,13 @@ TEST(CoindDataTest, AverageAttemptsToTarget)
     std::cout << "\n6:\n";
     auto v6 = Uint256ToArith288(uint256S("3fffffff00000003fffffff00000003fffffff00000003fffffff0000"));
     std::cout << coind::data::average_attempts_to_target(v6).GetHex() << std::endl;
+
+    {
+        auto local_hash_rate = Uint256ToArith288(uint256S("000000000000000000000000000000000000000000000000000000000000000000369d03"));
+        auto SHARE_PERIOD = 25;
+        std::cout << (local_hash_rate * SHARE_PERIOD * 10000 / 167).GetHex() << std::endl;
+        std::cout << coind::data::average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 60) << std::endl;
+    }
 }
 
 TEST(CoindDataTest, RandomTest)
@@ -284,6 +291,86 @@ TEST(CoindDataTest, RandomTest)
 
         ASSERT_EQ(diff, 70307);
     }
+}
+
+TEST(CoindDataTest, DOUBLE_TEST)
+{
+    int32_t DUMB_SCRYPT_DIFF1 = 65536;
+    uint256 DUMB_SCRYPT_DIFF2 = uint256S("10000");
+    uint256 target = uint256S("1ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+    auto diff1 =  coind::data::target_to_difficulty(target) * DUMB_SCRYPT_DIFF1;
+    auto diff2 =  coind::data::target_to_difficulty(target) * DUMB_SCRYPT_DIFF2.GetUint64(0);
+    std::cout << diff1 << " / " << diff2 << std::endl;
+    std::cout << coind::data::target_to_difficulty(target) << std::endl;
+
+
+//    uint256 for_div = uint256S("ffff0000000000000000000000000000000000000000000000000001");
+    arith_uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
+    double for_div_d = for_div.getdouble();
+    double targ_d = UintToArith256(target).getdouble();
+
+    auto diff = for_div.getdouble() / (UintToArith256(target).getdouble() + 1);
+
+    // 0.499992 / 32767.5 / 32767.5
+    std::cout << diff << " / " << diff*DUMB_SCRYPT_DIFF1 << " / " << diff * DUMB_SCRYPT_DIFF2.GetUint64(0) << std::endl;
+    std::cout << coind::data::target_to_difficulty(target) << std::endl;
+    std::cout << (double)1 / DUMB_SCRYPT_DIFF1 << std::endl;
+}
+
+TEST(CoindDataTest, DOUBLE_TEST2_REVERSE)
+{
+////    double ret = 0.0;
+//    double fact = 1.0;
+//    double fact2 = 1.0;
+//
+//    auto WIDTH = 256 / 32;
+////    vector<uint32_t> pn;
+////    pn.resize(WIDTH);
+//
+//    for (int i = 0; i < WIDTH; i++) {
+////        ret += fact * pn[i];
+//        fact *= 4294967296.0;
+//        fact2 *= 4294967296.0;
+//    }
+//
+////    uint256 targ()
+//    std::cout.precision(300);
+//    std::cout << fact << std::endl;
+//
+//    double fact3 = 115792089237316195423570985008687907853269984665640564039457584007913129639936.0;
+//
+//    std::cout << ((fact == fact2) ? "TRUE" : "FALSE") << std::endl;
+//    std::cout << ((fact == fact3) ? "TRUE" : "FALSE") << std::endl;
+
+//    uint256 _target = uint256S("1ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//    double diff = coind::data::target_to_difficulty(_target);
+//
+//    double fact3 = 115792089237316195423570985008687907853269984665640564039457584007913129639936.0;
+//
+//    auto WIDTH = 256 / 32;
+//    vector<uint32_t> pn;
+//    pn.resize(WIDTH);
+//
+//    double ret = 0.0;
+//    double fact = 1.0;
+//    for (int i = WIDTH-1; i > 0; i--) {
+//        pn[i] = ret / fact;
+//        fact /= 4294967296.0;
+//    }
+//
+//    double fact3 = 115792089237316195423570985008687907853269984665640564039457584007913129639936.0;
+//    std::stringstream ss;
+//    ss << hex   << std::setprecision(200) << fact3;
+//    std::string s;
+//    ss >> s;
+//
+//
+//
+//    std::cout << s << std::endl;
+
+    //result -> ret
+
 }
 
 TEST(CoindDataTest, DifficultyToTarget2)
