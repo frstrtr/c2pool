@@ -38,6 +38,9 @@ void StratumProtocol::Read()
             Send(response);
         } else
         {
+            if (ec == boost::system::errc::operation_canceled)
+                return;
+
             disconnect("StratumProtocol::read() error = " + ec.message());
         }
     });
