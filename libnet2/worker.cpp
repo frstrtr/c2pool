@@ -896,7 +896,6 @@ user_details Worker::preprocess_request(std::string username)
 void Worker::compute_work()
 {
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
-    LOG_TRACE << "T: " << t;
     if (!_coind_node->best_block_header.isNull())
     {
         // TODO: test
@@ -926,6 +925,6 @@ void Worker::compute_work()
 //                t = coind::getwork_result()
         }
     }
-    LOG_DEBUG_STRATUM << "New current_work!: " << t;
+//    LOG_DEBUG_STRATUM << "New current_work!: " << t;
     current_work.set(t);
 }

@@ -26,16 +26,16 @@ void Stratum::_send_work()
 {
     worker_get_work_result get_work_result;
 
-//    try
+    try
     {
         auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
         get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
     }
-//    catch (const std::runtime_error &ec)
-//    {
-//        disconnect(ec.what());
-//        return;
-//    }
+    catch (const std::runtime_error &ec) //TODO: to jsonrpc_error
+    {
+        disconnect(ec.what());
+        return;
+    }
 
     auto &[x, got_response] = get_work_result;
     LOG_DEBUG_STRATUM << "X: " << x;

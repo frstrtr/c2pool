@@ -301,7 +301,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 //    }
 
     uint32_t timestamp_cutoff;
-//    arith_uint256 target_cutoff;
+    arith_uint288 target_cutoff;
 
     if (!best.IsNull())
     {
@@ -315,15 +315,31 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
         timestamp_cutoff = std::min((uint32_t)c2pool::dev::timestamp(), *best_share->timestamp) - 3600;
 
-//        target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-//        target_cutoff /= ArithToUint256(std::get<1>(best_tail_score)).IsNull() ? UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) : (std::get<1>(best_tail_score) * net->SHARE_PERIOD + 1) * 2;
+        if (std::get<1>(best_tail_score).IsNull())
+        {
+            target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        } else
+        {
+            target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            target_cutoff /= (std::get<1>(best_tail_score) * net->SHARE_PERIOD + 1) * 2;
+        }
     } else
     {
         timestamp_cutoff = c2pool::dev::timestamp() - 24*60*60;
-//        target_cutoff = UintToArith256(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
+        target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     }
 
-//    auto _target_cutoff = ArithToUint256(target_cutoff);
+    //    if (c2pool.DEBUG))
+//    {
+    LOG_DEBUG_SHARETRACKER << "Desire " << desired.size() << " shares. Cutoff: " << c2pool::dev::timestamp() - timestamp_cutoff << " old diff>" << coind::data::target_to_difficulty(uint256S(target_cutoff.GetHex()));
+    for (const auto &[peer_addr, hash, ts, targ] : desired)
+    {
+        LOG_DEBUG_SHARETRACKER << "\t"
+            << std::get<0>(peer_addr) << ":" << std::get<1>(peer_addr)
+            << " " << hash << " " << (c2pool::dev::timestamp() - ts) << " " << coind::data::target_to_difficulty(targ)
+            << " " << (ts >= timestamp_cutoff) << " " << (Uint256ToArith288(targ) <= target_cutoff);
+    }
+//    }
 
     std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired_result;
     for (auto [peer_addr, hash, ts, targ] : desired)
@@ -331,6 +347,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         if (ts >= timestamp_cutoff)
             desired_result.emplace_back(peer_addr, hash);
     }
+    LOG_TRACE << "desired_result = " << desired_result.size();
     return {best, desired_result, decorated_heads, bad_peer_addresses};
 }
 

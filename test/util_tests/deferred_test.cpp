@@ -249,3 +249,83 @@ TEST(Deferred, FiberDefferedWithVariable)
 
     context->run();
 }
+
+class TestNode : public std::enable_shared_from_this<TestNode>
+{
+public:
+    std::shared_ptr<boost::asio::io_context> context;
+    std::vector<uint64_t> data;
+
+    c2pool::deferred::QueryDeferrer<std::vector<uint64_t>> get_data;
+    boost::asio::steady_timer _get_data_timer;
+
+    Variable<std::vector<uint64_t>> desired;
+public:
+    TestNode(std::shared_ptr<boost::asio::io_context> _context) : context(std::move(_context)), _get_data_timer(*context), get_data([&](uint256 id){
+        std::cout << c2pool::dev::timestamp() << " GET_DATA_CALLED!\n";
+        _get_data_timer.expires_from_now(2s);
+        _get_data_timer.async_wait([&, _id = id](const boost::system::error_code& ec){
+            if (!ec)
+            {
+                auto result = c2pool::random::randomNonce();
+                std::cout << c2pool::dev::timestamp() << " GET_DATA_RESULTED = " << result << "\n";
+                get_data.got_response(_id, std::vector<uint64_t>{result});
+            } else {
+                std::cout << "EC: " << ec.message() << std::endl;
+            }
+        });
+    })
+    {
+
+    }
+
+    void start_download()
+    {
+        Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber){
+            auto node = shared_from_this();
+            std::cout << "Started download!" << std::endl;
+
+            while (true)
+            {
+                std::cout << "WAIT FOR DESIRED" << std::endl;
+                node->desired.get_when_satisfies([](const std::vector<uint64_t> &v)
+                {
+                    std::cout << "SATISFIES!: ";
+                    for (auto _v : v){
+                        std::cout << _v << ", ";
+                    }
+                    std::cout << std::endl;
+                    return v.size() != 0;
+                })->yield(fiber);
+
+                std::cout << c2pool::dev::timestamp() << " " << "DOWNLOAD PREPARE" << std::endl;
+                fiber->sleep(1s);
+                std::cout << c2pool::dev::timestamp() << " " << "DOWNLOAD START" << std::endl;
+                auto _data = node->get_data.yield(fiber);
+                std::cout << c2pool::dev::timestamp() << " " << "DOWNLOAD FINISHED!" << std::endl;
+            }
+        });
+    }
+};
+
+TEST(Deferred, TestDownloadInNode)
+{
+    auto context = std::make_shared<boost::asio::io_context>();
+
+    auto node = std::make_shared<TestNode>(context);
+    node->start_download();
+
+    std::vector<boost::asio::steady_timer> timers;
+
+    for (int i = 0; i < 10; i++)
+    {
+        auto &timer = timers.emplace_back(*context);
+        timer.expires_from_now(3s + 3s*i);
+        timer.async_wait([&](const boost::system::error_code& ec)
+        {
+            std::cout << c2pool::dev::timestamp() << " SET" << std::endl;
+            node->desired.set({c2pool::random::randomNonce()});
+        });
+    }
+    context->run();
+}
