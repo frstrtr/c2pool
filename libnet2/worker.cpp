@@ -829,6 +829,9 @@ user_details Worker::get_user_details(std::string username)
         contents.push_back(t);
     }
 //        boost::split(contents, username, boost::is_any_of("+/"));
+    if (contents.empty())
+        contents.push_back("");
+
     if (contents.size() % 2 != 1)
     {
         throw std::invalid_argument("Worker::get_user_details(std::__cxx11::string): 'contents.size() % 2 == 1' failed.");
@@ -883,10 +886,12 @@ user_details Worker::preprocess_request(std::string username)
 {
     if (!_pool_node || _pool_node->peers.size() == 0)
     {
+        throw std::runtime_error("c2pool is not connected to any peers");
         //TODO: raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
     }
     if (c2pool::dev::timestamp() > current_work.value().last_update + 60)
     {
+        throw std::runtime_error("lost contact with coind");
         //TODO: raise jsonrpc.Error_for_code(-12345)(u'lost contact with bitcoind')
     }
 
