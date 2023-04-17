@@ -177,14 +177,15 @@ public:
         if (!def)
             def = c2pool::deferred::make_deferred<VarType>();
 
+        if (_value && when_f(*_value))
+        {
+            def->result.set_value(*_value);
+            return def;
+        }
+
         changed->subscribe_once([&, when_f = when_f, def = def](VarType _v)
                                 {
-                                    if (when_f(_v)){
-                                        def->result.set_value(_v);
-                                    }
-                                    else{
                                         get_when_satisfies(when_f, def);
-                                    }
                                 });
         return def;
     }
