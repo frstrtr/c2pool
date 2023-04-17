@@ -29,6 +29,7 @@ void NodeManager::run()
     // JSONRPC Coind
     LOG_INFO << "Init Coind...";
     _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, _config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str(), _config->jsonrpc_coind_login.c_str());
+    _coind->check();
 
     // Determining payout address
     // TODO
