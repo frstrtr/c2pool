@@ -78,7 +78,9 @@ class Variable(object):
     def get_when_satisfies(self, func):
         while True:
             if func(self.value):
+                print('return')
                 defer.returnValue(self.value)
+            print('continue')
             yield self.changed.once.get_deferred()
 
     def get_not_none(self):
