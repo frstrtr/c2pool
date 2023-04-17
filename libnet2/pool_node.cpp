@@ -702,6 +702,7 @@ void PoolNode::download_shares()
             }
 
             _node->handle_shares(post_shares, peer->get_addr());
+            fiber->sleep(500ms);
         }
     });
 

@@ -105,6 +105,7 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 	if (shares.size() > 5)
 	{
 		LOG_INFO << "... done processing " << shares.size() << " shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
+//        std::this_thread::sleep_for(0.2s);
 	}
 }
 

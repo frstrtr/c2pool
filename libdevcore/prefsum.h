@@ -8,6 +8,7 @@
 #include <queue>
 #include <any>
 #include <boost/format.hpp>
+#include <iostream>
 
 #include "events.h"
 
@@ -175,6 +176,8 @@ public:
     int32_t height;
     key_type head;
     key_type tail;
+
+    std::shared_ptr<sub_element_type> only_me; // Возвращает только самый первый (верхний) элемент в сумме.
 public:
     virtual bool is_none() = 0;
 
@@ -224,6 +227,7 @@ public:
     BasePrefsumElement() {}
 };
 
+//TODO: More optimize by Fenwick Tree!!!
 //https://en.wikipedia.org/wiki/Prefix_sum
 template <typename PrefsumElementType>
 class Prefsum
@@ -340,6 +344,9 @@ public:
         //--Add to reverse
         reverse[value.tail].push_back(items.find(value.head));
 
+        //--Set only_me for value
+        value.only_me = std::make_shared<element_type>(value);
+
         //--Add value to sum
         auto &it = sum[value.head];
         it = std::move(value);
@@ -368,9 +375,18 @@ public:
             }
 
             // new calculate
-            auto new_value = make_element((v->second.pvalue)->second);
+//            auto new_value2 = make_element((v->second.pvalue)->second);
+//            std::cout << "hash = " << (v->second.pvalue)->second->hash << std::endl;
+//            std::cout << "v->second.only_me = " << v->second.only_me << std::endl;
+//            std::cout << "v->second.only_me.hash = " << v->second.only_me->head << std::endl;
+
+
+            auto new_value = *v->second.only_me;
+            new_value.prev = sum.find(new_value.tail);
             new_value.pvalue = v->second.pvalue;
+            new_value.only_me = v->second.only_me;
             new_value.push(new_value.prev->second);
+//            new_value.push(v->second.prev->second);
             sum[v->first] = new_value;
         }
 
