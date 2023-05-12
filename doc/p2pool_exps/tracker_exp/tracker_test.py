@@ -124,3 +124,22 @@ print('t5.3 = {0}'.format(t53))
 #6
 t6 = track.get_height_and_last(678)
 print(t6)
+
+#Get nth parent
+print('\nGet nth parent:')
+print(track.get_nth_parent_hash(0,0))
+try:
+    print(track.get_nth_parent_hash(33,5))
+except KeyError:
+    print('(33,5) -- exception')
+
+#is child of:
+print('\nIs child of:')
+print(track.is_child_of(0, 0))
+print(track.is_child_of(-23, -23))
+print(track.is_child_of(2, -1))
+print(track.is_child_of(-1, 2))
+print(track.is_child_of(0, 2))
+print(track.is_child_of(2, 0))
+print(track.is_child_of(44, 0))
+print(track.is_child_of(44, 2))
