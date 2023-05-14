@@ -143,3 +143,10 @@ print(track.is_child_of(0, 2))
 print(track.is_child_of(2, 0))
 print(track.is_child_of(44, 0))
 print(track.is_child_of(44, 2))
+
+#get_chain
+# for i in track.get_chain(44, 4):
+#     print(i)
+
+for i in track.get_chain(44, 0):
+    print(i)
