@@ -71,9 +71,8 @@ public:
     typedef Cluster<SumType> cluster_type;
     typedef typename cluster_type::value_type value_type;
     typedef typename cluster_type::sum_element sum_element;
-    typedef int hash_type;
+    typedef uint256 hash_type;
     const int cluster_size = SIZE;
-//  TODO:  const int cluster_size = 8192;
 public:
     std::deque<cluster_type> clusters;
     hash_type head{}, tail{};

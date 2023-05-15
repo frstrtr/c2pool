@@ -152,7 +152,6 @@ public:
     int32_t get_last(hash_type hash)
     {
         auto fork = fork_by_key.find(hash);
-        // TODO: NULL HASH RETURN!
         return fork != fork_by_key.end() ? fork->second->tail : hash;
     }
 
@@ -231,8 +230,35 @@ private:
         return element;
     }
 
+    //TODO: Реализовать, если понадобится создавать новые правила прямо во время работы пулла.
     void new_rules_calculate(std::vector<std::string> k_rules)
     {
-        //TODO:
+        // legacy code:
+        /*for (const auto &tail : tails)
+        {
+            std::queue<it_sums> next_tree;
+            for (auto v: reverse[tail.first])
+                next_tree.push(sum.find(v->first));
+
+            while (!next_tree.empty())
+            {
+                auto v = next_tree.front();
+                next_tree.pop();
+
+                for (auto v_next: v->second.next)
+                {
+                    next_tree.push(v_next);
+                }
+
+                // new calculate
+                for (auto k : k_rules)
+                {
+                    Rule new_rule = rules.make_rule(k, v->second.pvalue->second);
+                    if (v->second.prev != sum.end())
+                        new_rule += v->second.prev->second.rules.get_rule(k);
+                    v->second.rules.add(k, new_rule);
+                }
+            }
+        }*/
     }
 };
