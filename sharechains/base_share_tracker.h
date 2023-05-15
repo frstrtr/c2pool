@@ -1,0 +1,76 @@
+#pragma once
+#include "tree_tracker/tracker.h"
+#include "tree_tracker/rules.h"
+#include "prefsum_weights.h"
+
+class BaseTrackerElement : public BaseSumElement<ShareType, BaseTrackerElement, uint256>
+{
+private:
+    std::optional<hash_type> none_hash;
+public:
+    value_type share;
+
+    shares::PrefsumRulesElement rules;
+    arith_uint288 work;
+    arith_uint288 min_work;
+    shares::weight::weight_data weight;
+    uint64_t height;
+
+public:
+
+    hash_type hash() const override
+    {
+        return share ? share->hash : uint256::ZERO;
+    }
+
+    hash_type prev() const override
+    {
+        return share ? *share->previous_hash : uint256::ZERO;
+    }
+
+    BaseTrackerElement()
+    {
+        height = 0;
+//        work = uint256::ZERO;
+//        min_work = uint256::ZERO;
+//        weight = {};
+    }
+
+    BaseTrackerElement(const value_type& _share) : share(_share)
+    {
+        height = 1;
+        work = coind::data::target_to_average_attempts(_share->target);
+        min_work = coind::data::target_to_average_attempts(_share->max_target);
+        weight = shares::weight::weight_data(_share);
+    }
+
+    BaseTrackerElement(hash_type hash)
+    {
+        height = 0;
+//        work = uint256::ZERO;
+//        min_work = uint256::ZERO;
+//        weight = {};
+        none_hash = std::make_optional(hash);
+    }
+
+    sum_element_type& add(const sum_element_type& value) override
+    {
+        height += value.height;
+        work += value.work;
+        min_work += value.min_work;
+        weight += value.weight;
+        rules += value.rules;
+        return *this;
+    }
+
+    sum_element_type& sub(const sum_element_type& value) override
+    {
+        height -= value.height;
+        work -= value.work;
+        min_work -= value.min_work;
+        weight -= value.weight;
+        rules -= value.rules;
+        return *this;
+    }
+};
+
