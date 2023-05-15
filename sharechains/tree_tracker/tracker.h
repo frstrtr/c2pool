@@ -223,7 +223,13 @@ private:
         return new_fork;
     }
 
-    virtual sum_element make_element(value_type _value) = 0;
+    virtual sum_element make_element(value_type _value)
+    {
+        sum_element element(_value);
+        element.rules = rules.make_rules(_value);
+
+        return element;
+    }
 
     void new_rules_calculate(std::vector<std::string> k_rules)
     {
