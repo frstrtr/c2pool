@@ -5,8 +5,6 @@
 
 class BaseTrackerElement : public BaseSumElement<ShareType, BaseTrackerElement, uint256>
 {
-private:
-    std::optional<hash_type> none_hash;
 public:
     value_type share;
 
@@ -50,7 +48,6 @@ public:
 //        work = uint256::ZERO;
 //        min_work = uint256::ZERO;
 //        weight = {};
-        none_hash = std::make_optional(hash);
     }
 
     sum_element_type& add(const sum_element_type& value) override
@@ -74,3 +71,26 @@ public:
     }
 };
 
+class BaseShareTracker : public Tracker<BaseTrackerElement>
+{
+public:
+    uint256 get_work(uint256 hash)
+    {
+        return ArithToUint256(get_sum_to_last(hash).work);
+    }
+};
+
+class VerifiedShareTracker : public BaseShareTracker
+{
+protected:
+    BaseShareTracker &_share_tracker;
+public:
+    VerifiedShareTracker(BaseShareTracker &share_tracker) : BaseShareTracker(), _share_tracker(share_tracker)
+    {
+    }
+
+    hash_type get_nth_parent_key(hash_type hash, int32_t n) const override
+    {
+        return _share_tracker.get_nth_parent_key(hash, n);
+    }
+};
