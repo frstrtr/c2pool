@@ -49,10 +49,14 @@ testNoneTail2 = PresudoShare([679, 678], 1000)
 track.add(testNoneTail2)
 write_ht(track)
 
-#(0=None)->2->33->44    | (9=None)->10 |    (None)->678->679
-#          |            |              |
-#          |            |              |
-#          ->3->4       |              |
+track.add(PresudoShare([19, 18], 190))
+track.add(PresudoShare([20, 19], 100))
+track.add(PresudoShare([21, 20], 200))
+                                                            # (0  -> 190 -> 290 -> 490]
+#(0=None)->2->33->44    | (9=None)->10 | (None)->678->679   | (18=None)->19->20->21
+#          |            |              |                    |
+#          |            |              |                    |
+#          ->3->4       |              |                    |
 
 #1
 print(track.is_child_of(2,2))
@@ -150,3 +154,7 @@ print(track.is_child_of(44, 2))
 
 for i in track.get_chain(44, 0):
     print(i)
+
+print('\nGet sum')
+print(track.get_delta(21, 20))
+print(track.get_delta(21, 19))
