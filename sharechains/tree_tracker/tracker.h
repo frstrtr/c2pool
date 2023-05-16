@@ -51,7 +51,7 @@ public:
                                        });
     }
 
-    void add(value_type _value)
+    virtual void add(value_type _value)
     {
         if (!_value)
             throw std::invalid_argument("value is none");
@@ -149,7 +149,7 @@ public:
         return get_sum_to_last(hash).height;
     }
 
-    int32_t get_last(hash_type hash)
+    hash_type get_last(hash_type hash)
     {
         auto fork = fork_by_key.find(hash);
         return fork != fork_by_key.end() ? fork->second->tail : hash;
@@ -212,6 +212,18 @@ public:
                 }
             };
         }();
+    }
+
+    // last------(ancestor------item]--->best
+    sum_element get_sum(hash_type item, hash_type ancestor)
+    {
+        if (!is_child_of(ancestor, item))
+            throw std::invalid_argument("get_sum item not child for ancestor");
+
+        auto result = get_sum_to_last(item);
+        auto ances = get_sum_to_last(ancestor);
+
+        return result.sub(ances);
     }
 
 private:
