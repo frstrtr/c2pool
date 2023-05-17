@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include "tracker.h"
+#include "share_tracker.h"
 #include "data.h"
 #include "share_adapters.h"
 #include "share_builder.h"
@@ -40,7 +40,7 @@ namespace shares
         //height, last
         auto [height, last] = tracker->get_height_and_last(_share_data.previous_share_hash);
         LOG_TRACE << "height: " << height << ", last: " << last.IsNull() << "/" << last.GetHex();
-        LOG_TRACE << tracker->exists(last) << " " << tracker->exists(_share_data.previous_share_hash);
+        LOG_TRACE << tracker->exist(last) << " " << tracker->exist(_share_data.previous_share_hash);
         assert((height >= net->REAL_CHAIN_LENGTH) || last.IsNull());//!tracker->exists(last));//last.IsNull());
 
         auto pre_target = pre_target_calculate(previous_share, height);

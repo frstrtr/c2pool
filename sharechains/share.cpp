@@ -9,7 +9,7 @@
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <libdevcore/addr_store.h>
-#include "tracker.h"
+#include "share_tracker.h"
 #include "data.h"
 #include "share_builder.h"
 #include "generate_tx.h"

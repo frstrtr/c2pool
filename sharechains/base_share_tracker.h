@@ -74,6 +74,8 @@ public:
 class BaseShareTracker : public Tracker<BaseTrackerElement>
 {
 public:
+    BaseShareTracker() : Tracker<BaseTrackerElement>() {}
+
     uint256 get_work(uint256 hash)
     {
         return ArithToUint256(get_sum_to_last(hash).work);

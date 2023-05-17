@@ -31,7 +31,6 @@ class ShareTracker : public BaseShareTracker, public std::enable_shared_from_thi
 public:
     ShareStore share_store;
     VerifiedShareTracker verified;
-    Event<ShareType> removed;
 public:
     shared_ptr<c2pool::Network> net;
     shared_ptr<coind::ParentNetwork> parent_net;

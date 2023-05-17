@@ -3,7 +3,7 @@
 #include <memory>
 #include <string>
 
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 #include <sharechains/share_types.h>
 #include <networks/network.h>
 #include <libdevcore/events.h>
