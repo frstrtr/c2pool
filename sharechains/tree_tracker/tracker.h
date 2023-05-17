@@ -180,7 +180,10 @@ public:
     {
         for (int i = 0; i < n; i++)
         {
-            hash = *items.at(hash)->previous_hash;
+            if (items.find(hash) != items.end())
+                hash = *items.at(hash)->previous_hash;
+            else
+                throw std::invalid_argument("get_nth_parent_key: items not exis't hash");
         }
         return hash;
     }

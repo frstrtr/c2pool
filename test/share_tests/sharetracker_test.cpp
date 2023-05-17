@@ -4,7 +4,7 @@
 #include <utility>
 
 #include <libdevcore/common.h>
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 #include <sharechains/share_store.h>
 #include <sharechains/generate_tx.h>
 #include <networks/network.h>

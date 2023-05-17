@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "tracker.h"
+#include "share_tracker.h"
 #include "share_adapters.h"
 #include "share_builder.h"
 #include <networks/network.h>
