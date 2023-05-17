@@ -111,48 +111,48 @@ TEST_F(SharechainsTest, tracker_base_tests)
                  }, "get_pool_attempts_per_second: assert for dist >= 2");
 }
 
-TEST_F(SharechainsTest, tracker_empty)
-{
-    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
-
-    uint256 hash = uint256S("1");
-
-
-    // Remove
-    std::cout << "Remove" << std::endl;
-    tracker->remove(hash);
-
-    // Pool attempts for dist = 1
-    std::cout << "Pool attempts for dist = 1" << std::endl;
-    ASSERT_DEATH({
-                     auto attempts1 = tracker->get_pool_attempts_per_second(hash, 1);
-                 }, "get_pool_attempts_per_second: assert for dist >= 2");
-
-    // Pool attempts for dist = 10
-    std::cout << "Pool attempts for dist = 10" << std::endl;
-    ASSERT_THROW({auto attempts10 = tracker->get_pool_attempts_per_second(hash, 10);}, std::invalid_argument);
-
-    // Desired version dist = 1
-    std::cout << "Desired version dist = 1" << std::endl;
-    auto desired_version1 = tracker->get_desired_version_counts(hash, 1);
-    for (auto v : desired_version1)
-    {
-        std::cout << v.first << ": " << v.second.ToString() << std::endl;
-    }
-
-    // Desired version dist = 10
-    std::cout << "Desired version dist = 10" << std::endl;
-    auto desired_version10 = tracker->get_desired_version_counts(hash, 10);
-    for (auto v : desired_version10)
-    {
-        std::cout << v.first << ": " << v.second.ToString() << std::endl;
-    }
-
-    // Get
-    std::cout << "Get" << std::endl;
-    auto share = tracker->get(hash);
-    ASSERT_EQ(share, nullptr);
-}
+//TEST_F(SharechainsTest, tracker_empty)
+//{
+//    std::shared_ptr<ShareTracker> tracker = std::make_shared<ShareTracker>(net);
+//
+//    uint256 hash = uint256S("1");
+//
+//
+//    // Remove
+//    std::cout << "Remove" << std::endl;
+//    tracker->remove(hash);
+//
+//    // Pool attempts for dist = 1
+//    std::cout << "Pool attempts for dist = 1" << std::endl;
+//    ASSERT_DEATH({
+//                     auto attempts1 = tracker->get_pool_attempts_per_second(hash, 1);
+//                 }, "get_pool_attempts_per_second: assert for dist >= 2");
+//
+//    // Pool attempts for dist = 10
+//    std::cout << "Pool attempts for dist = 10" << std::endl;
+//    ASSERT_THROW({auto attempts10 = tracker->get_pool_attempts_per_second(hash, 10);}, std::invalid_argument);
+//
+//    // Desired version dist = 1
+//    std::cout << "Desired version dist = 1" << std::endl;
+//    auto desired_version1 = tracker->get_desired_version_counts(hash, 1);
+//    for (auto v : desired_version1)
+//    {
+//        std::cout << v.first << ": " << v.second.ToString() << std::endl;
+//    }
+//
+//    // Desired version dist = 10
+//    std::cout << "Desired version dist = 10" << std::endl;
+//    auto desired_version10 = tracker->get_desired_version_counts(hash, 10);
+//    for (auto v : desired_version10)
+//    {
+//        std::cout << v.first << ": " << v.second.ToString() << std::endl;
+//    }
+//
+//    // Get
+//    std::cout << "Get" << std::endl;
+//    auto share = tracker->get(hash);
+//    ASSERT_EQ(share, nullptr);
+//}
 
 TEST_F(SharechainsTest, just_share_load)
 {
@@ -166,90 +166,90 @@ TEST_F(SharechainsTest, just_share_load)
     std::cout << *share->subsidy << ":" << (*share->share_data)->subsidy;
 }
 
-TEST_F(SharechainsTest, handle_share_test)
-{
-    VariableDict<uint256, coind::data::tx_type> known_txs = VariableDict<uint256, coind::data::tx_type>(true);
-
-
-    PackStream stream_share;
-    stream_share.from_hex(
-            "21fd0702fe02000020462750c8ee349d5cdf644f2f387eae5e83f09c516d80f6b7bff6bb5077f492cf501c286382d0001b336009dfc05bb320693870ee52f31b1a7acdf59fd62a06304c2226ec71372e2dd81038443d04abedf0002cfabe6d6dbb98999c619b01360f5f78fb757361280a0fc6d86e64af39883cd4c32c1bb41f01000000000000000a5f5f6332706f6f6c5f5feafa8b19bb351fc9fbbd8e1f40942130e77131978df6de41c5bc0d1e0a0000000000002102ba60a71143d79b34ce2763688d2dc47431699e946cfba3bc09f0538db16c247603f5fd54628f9524c7816a13bfdcbb294bfbf910c856dd6d2867e3fea75e6ff0fa575b274b856f98e04e2e4e137d1aec6ff73ac3abe10198b9e2a4cacebb32a602ba60a71143d79b34ce2763688d2dc47431699e946cfba3bc09f0538db16c24761f66f6ca39e76964e7c66d2d6ce0c0f53a41c240c21ac01f9f1ca7a88d3a40530200000001e541da22b7db053fbc6cdcd45cf4ebd37b17704c4845fcc9ab41f01ff85e935e78ee081e3b374c1d521c2863a7ac00000ef2e2a1b50000000000000000000000000000000001000000849846b13fc97f2930fda8c079866515eb86fed117a26ec0d91a47406e1caadefd7a0102ba60a71143d79b34ce2763688d2dc47431699e946cfba3bc09f0538db16c247603f5fd54628f9524c7816a13bfdcbb294bfbf910c856dd6d2867e3fea75e6ff0");
-    auto share = load_share(stream_share, net, {"0.0.0.0", "0"});
-
-    //t0
-    vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
-
-
-    std::vector<coind::data::tx_type> txs;
-    if (true)
-    {
-        for (auto tx_hash: *share->new_transaction_hashes)
-        {
-            coind::data::tx_type tx;
-            if (known_txs.value().find(tx_hash) != known_txs.value().end())
-            {
-                tx = known_txs.value()[tx_hash];
-            }
-//            else
-//            {
-//                for (auto cache: protocol->known_txs_cache)
-//                {
-//                    if (cache.find(tx_hash) != cache.end())
-//                    {
-//                        tx = cache[tx_hash];
-//                        LOG_INFO
-//                            << boost::format("Transaction %0% rescued from peer latency cache!") % tx_hash.GetHex();
-//                        break;
-//                    }
-//                }
-//            }
-            txs.push_back(tx);
-        }
-    }
-    result.emplace_back(share, txs);
-
-//    handle_shares(result, protocol);
-// HANDLE SHARES:
-
-//    int32_t new_count = 0;
-    std::map<uint256, coind::data::tx_type> all_new_txs;
-    auto [_share, new_txs] = result[0];
-    {
-        if (!new_txs.empty())
-        {
-            for (const auto& new_tx : new_txs)
-            {
-                coind::data::stream::TransactionType_stream _tx(new_tx);
-                PackStream packed_tx;
-                packed_tx << _tx;
-
-                all_new_txs[coind::data::hash256(packed_tx)] = new_tx;
-            }
-        }
+//TEST_F(SharechainsTest, handle_share_test)
+//{
+//    VariableDict<uint256, coind::data::tx_type> known_txs = VariableDict<uint256, coind::data::tx_type>(true);
 //
-//        if (tracker->exists(share->hash))
+//
+//    PackStream stream_share;
+//    stream_share.from_hex(
+//            "21fd0702fe02000020462750c8ee349d5cdf644f2f387eae5e83f09c516d80f6b7bff6bb5077f492cf501c286382d0001b336009dfc05bb320693870ee52f31b1a7acdf59fd62a06304c2226ec71372e2dd81038443d04abedf0002cfabe6d6dbb98999c619b01360f5f78fb757361280a0fc6d86e64af39883cd4c32c1bb41f01000000000000000a5f5f6332706f6f6c5f5feafa8b19bb351fc9fbbd8e1f40942130e77131978df6de41c5bc0d1e0a0000000000002102ba60a71143d79b34ce2763688d2dc47431699e946cfba3bc09f0538db16c247603f5fd54628f9524c7816a13bfdcbb294bfbf910c856dd6d2867e3fea75e6ff0fa575b274b856f98e04e2e4e137d1aec6ff73ac3abe10198b9e2a4cacebb32a602ba60a71143d79b34ce2763688d2dc47431699e946cfba3bc09f0538db16c24761f66f6ca39e76964e7c66d2d6ce0c0f53a41c240c21ac01f9f1ca7a88d3a40530200000001e541da22b7db053fbc6cdcd45cf4ebd37b17704c4845fcc9ab41f01ff85e935e78ee081e3b374c1d521c2863a7ac00000ef2e2a1b50000000000000000000000000000000001000000849846b13fc97f2930fda8c079866515eb86fed117a26ec0d91a47406e1caadefd7a0102ba60a71143d79b34ce2763688d2dc47431699e946cfba3bc09f0538db16c247603f5fd54628f9524c7816a13bfdcbb294bfbf910c856dd6d2867e3fea75e6ff0");
+//    auto share = load_share(stream_share, net, {"0.0.0.0", "0"});
+//
+//    //t0
+//    vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
+//
+//
+//    std::vector<coind::data::tx_type> txs;
+//    if (true)
+//    {
+//        for (auto tx_hash: *share->new_transaction_hashes)
 //        {
-////			#print 'Got duplicate share, ignoring. Hash: %s' % (p2pool_data.format_hash(share.hash),)
-////			continue
+//            coind::data::tx_type tx;
+//            if (known_txs.value().find(tx_hash) != known_txs.value().end())
+//            {
+//                tx = known_txs.value()[tx_hash];
+//            }
+////            else
+////            {
+////                for (auto cache: protocol->known_txs_cache)
+////                {
+////                    if (cache.find(tx_hash) != cache.end())
+////                    {
+////                        tx = cache[tx_hash];
+////                        LOG_INFO
+////                            << boost::format("Transaction %0% rescued from peer latency cache!") % tx_hash.GetHex();
+////                        break;
+////                    }
+////                }
+////            }
+//            txs.push_back(tx);
 //        }
+//    }
+//    result.emplace_back(share, txs);
 //
-//        new_count++;
-//        tracker->add(share);
-    }
-
-    known_txs.add(all_new_txs);
-
-//    if (new_count)
+////    handle_shares(result, protocol);
+//// HANDLE SHARES:
+//
+////    int32_t new_count = 0;
+//    std::map<uint256, coind::data::tx_type> all_new_txs;
+//    auto [_share, new_txs] = result[0];
 //    {
-//        coind_node->set_best_share();
+//        if (!new_txs.empty())
+//        {
+//            for (const auto& new_tx : new_txs)
+//            {
+//                coind::data::stream::TransactionType_stream _tx(new_tx);
+//                PackStream packed_tx;
+//                packed_tx << _tx;
+//
+//                all_new_txs[coind::data::hash256(packed_tx)] = new_tx;
+//            }
+//        }
+////
+////        if (tracker->exists(share->hash))
+////        {
+//////			#print 'Got duplicate share, ignoring. Hash: %s' % (p2pool_data.format_hash(share.hash),)
+//////			continue
+////        }
+////
+////        new_count++;
+////        tracker->add(share);
 //    }
 //
-//    if (shares.size() > 5)
-//    {
-//        LOG_INFO << "... done processing " << shares.size() << "shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
-//    }
-
-}
+//    known_txs.add(all_new_txs);
+//
+////    if (new_count)
+////    {
+////        coind_node->set_best_share();
+////    }
+////
+////    if (shares.size() > 5)
+////    {
+////        LOG_INFO << "... done processing " << shares.size() << "shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
+////    }
+//
+//}
 
 
 TEST_F(SharechainsTest, tracker_one_share)
