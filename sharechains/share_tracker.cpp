@@ -224,12 +224,12 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
         auto max_el = std::max_element(head_hashes.begin(), head_hashes.end(),
-                                       [&](const uint256 &a, const uint256 &b)
+                                       [&](const auto &a, const auto &b)
                                        {
-                                           return UintToArith256(verified.get_work(a)) < UintToArith256(verified.get_work(b));
+                                           return UintToArith256(verified.get_work(a->head)) < UintToArith256(verified.get_work(b->head));
                                        });
 
-        auto _score = std::make_tuple(score(*max_el, block_rel_height_func), UintToArith256(tail_hash));
+        auto _score = std::make_tuple(score((*max_el)->head, block_rel_height_func), UintToArith256(tail_hash));
         decorated_tails.push_back(_score);
     }
     std::sort(decorated_tails.begin(), decorated_tails.end());
@@ -251,11 +251,11 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         {
             auto el = std::make_tuple(
                     UintToArith256(verified.get_work(
-                            verified.get_nth_parent_key(h, std::min(5, verified.get_height(h))))),
-                    -std::get<0>(should_punish_reason(items[h], previous_block, bits, known_txs)),
-                    -items[h]->time_seen
+                            verified.get_nth_parent_key(h->head, std::min(5, verified.get_height(h->head))))),
+                    -std::get<0>(should_punish_reason(items[h->head], previous_block, bits, known_txs)),
+                    -items[h->head]->time_seen
             );
-            decorated_heads.emplace_back(el, UintToArith256(h));
+            decorated_heads.emplace_back(el, UintToArith256(h->head));
         }
         std::sort(decorated_heads.begin(), decorated_heads.end());
     }
