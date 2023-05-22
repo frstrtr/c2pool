@@ -117,6 +117,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             continue;
 
         auto [head_height, last] = get_height_and_last(head);
+        LOG_TRACE << "head1 = " << head << " tail1 = " << tail << std::endl;
         LOG_TRACE << "head_height = " << head_height << ", last = " << last.GetHex();
 
         auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height -
@@ -179,6 +180,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     for (auto [head, tail] : verified.heads)
     {
+        LOG_TRACE << "head2 = " << head << " tail2 = " << tail << std::endl;
         auto [head_height, last_hash] = verified.get_height_and_last(head);
         auto [last_height, last_last_hash] = get_height_and_last(last_hash);
 
@@ -223,6 +225,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     std::vector<std::tuple<std::tuple<int32_t, arith_uint288>, arith_uint256>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
+        LOG_TRACE << "tail_hash = " << tail_hash << " head_hashes = [ "; std::for_each(head_hashes.begin(), head_hashes.end(), [](const auto& v){std::cout << v << " ";}); std::cout << "]" << std::endl;
         auto max_el = std::max_element(head_hashes.begin(), head_hashes.end(),
                                        [&](const auto &a, const auto &b)
                                        {
@@ -249,6 +252,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     {
         for (auto h : verified.tails[best_tail])
         {
+            LOG_TRACE << "h = " << h << std::endl;
             auto el = std::make_tuple(
                     UintToArith256(verified.get_work(
                             verified.get_nth_parent_key(h->head, std::min(5, verified.get_height(h->head))))),
