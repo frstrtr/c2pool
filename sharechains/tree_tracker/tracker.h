@@ -69,49 +69,97 @@ public:
 
         //--Add to forks
 
-        //----forks by head
-        if (heads.find(value.prev()) != heads.end())
-        {
-            auto head_fork = heads.extract(value.prev());
-            head_fork.mapped()->insert(value);
-            head_fork.key() = value.hash();
-            heads.insert(std::move(head_fork));
+        //--Add to forks
 
-            fork_by_key[value.hash()] = heads[value.hash()];
-        }
-        //----forks by tail
-        else if (tails.find(value.hash()) != tails.end())
+        enum fork_state
         {
-            auto tail_forks = tails.find(value.hash());
-            if (tail_forks->second.size() > 1)
+            new_fork = 0,
+            only_heads = 1,
+            only_tails = 1 << 1,
+            both = only_heads | only_tails
+        };
+
+        int state = new_fork;
+        if (heads.count(value.prev()))
+            state |= only_heads;
+        if (tails.count(value.hash()))
+            state |= only_tails;
+
+        switch (state)
+        {
+            case new_fork:
+                //создание нового форка
             {
                 // make new fork
                 auto new_fork = make_fork();
                 new_fork->insert(value);
-
-                // add new fork to head forks
-                for (auto &_fork :tail_forks->second)
-                {
-                    _fork->insert_fork(new_fork);
-                }
+                heads[new_fork->head] = new_fork;
+                tails[new_fork->tail].insert(new_fork);
                 fork_by_key[value.hash()] = new_fork;
-            } else
+            }
+                break;
+            case both:
+                // объединение двух форков на стыке нового элемента
             {
-                // add value in head fork
-                for (auto &_fork :tail_forks->second)
+                auto left_fork = heads.extract(value.prev());
+                auto right_fork = tails.extract(value.hash());
+
+                tails[left_fork.mapped()->get_chain_tail()].clear();
+                for (auto &_fork : right_fork.mapped())
                 {
-                    _fork->insert(value);
-                    fork_by_key[value.hash()] = _fork;
+                    _fork->insert_fork(left_fork.mapped());
+
+                    tails[left_fork.mapped()->get_chain_tail()].insert(_fork);
+
+                }
+                for (int i = 0; i < forks.size(); i++)
+                {
+                    if (forks[i] == left_fork.mapped())
+                    {
+                        forks.erase(forks.begin() + i);
+                    }
+                }
+//                    std::remove(forks.begin(), forks.end(), )
+//                    forks.erase(forks.find(left_fork.mapped()));
+            }
+                break;
+            case only_heads:
+                // продолжение форка спереди
+            {
+                auto head_fork = heads.extract(value.prev());
+                head_fork.mapped()->insert(value);
+                head_fork.key() = value.hash();
+                heads.insert(std::move(head_fork));
+                fork_by_key[value.hash()] = heads[value.hash()];
+            }
+                break;
+            case only_tails:
+                // продолжение форка сзади
+            {
+                auto tail_forks = tails.find(value.hash());
+                if (tail_forks->second.size() > 1)
+                {
+                    // make new fork
+                    auto new_fork = make_fork();
+                    new_fork->insert(value);
+
+                    // add new fork to head forks
+                    for (auto &_fork: tail_forks->second)
+                    {
+                        _fork->insert_fork(new_fork);
+                    }
+                    fork_by_key[value.hash()] = new_fork;
+                } else
+                {
+                    // add value in head fork
+                    for (auto &_fork: tail_forks->second)
+                    {
+                        _fork->insert(value);
+                        fork_by_key[value.hash()] = _fork;
+                    }
                 }
             }
-        } else
-        {
-            // make new fork
-            auto new_fork = make_fork();
-            new_fork->insert(value);
-            heads[new_fork->head] = new_fork;
-            tails[new_fork->tail].insert(new_fork);
-            fork_by_key[value.hash()] = new_fork;
+                break;
         }
 
         //--Call event ADDED

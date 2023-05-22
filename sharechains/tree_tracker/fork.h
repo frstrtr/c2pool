@@ -1,5 +1,6 @@
 #pragma once
 #include <deque>
+#include <memory>
 #include "cluster.h"
 
 //class fake_share
@@ -65,7 +66,7 @@
 
 //template <typename CLUSTER_SUM_ELEMENT>
 template <typename SumType, int SIZE = 8192>
-class Fork
+class Fork : public std::enable_shared_from_this<Fork<SumType, SIZE>>
 {
 public:
     typedef Cluster<SumType> cluster_type;
@@ -155,5 +156,15 @@ public:
     sum_element get_sum_all()
     {
         return get_sum(head);
+    }
+
+    hash_type get_chain_tail() const
+    {
+        auto _fork = this->shared_from_this();
+        while (_fork->prev_fork)
+        {
+            _fork = this->prev_fork;
+        }
+        return _fork->tail;
     }
 };
