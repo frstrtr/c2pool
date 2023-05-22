@@ -11,18 +11,57 @@ ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : BaseShareTracker(
 void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes)
 {
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
-    for (auto& _share : _shares)
+
+    std::cout << "start prepare" << std::endl;
+    PreparedList prepare_shares(_shares);
+
+
+    for (auto& fork : prepare_shares.forks)
     {
-        add(_share);
+        auto share_node = fork->tail;
+        while (share_node)
+        {
+            add(share_node->value);
+            share_node = share_node->next;
+        }
     }
+    std::cout << "finish prepare" << std::endl;
+
+//    for (auto& _share : _shares)
+//    {
+//        add(_share);
+//    }
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares finished: " << c2pool::dev::timestamp();
 
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- known shares started: " << c2pool::dev::timestamp();
-    for (auto& share_hash : known_verified_share_hashes)
+
     {
-        if (exist(share_hash))
-            verified.add(items.at(share_hash));
+        std::vector<ShareType> _verified_shares;
+
+        for (auto &share_hash: known_verified_share_hashes)
+        {
+            if (exist(share_hash))
+                _verified_shares.push_back(items.at(share_hash));
+        }
+
+        PreparedList prepare_verified_shares(_verified_shares);
+
+        for (auto& fork : prepare_verified_shares.forks)
+        {
+            auto share_node = fork->tail;
+            while (share_node)
+            {
+                verified.add(share_node->value);
+                share_node = share_node->next;
+            }
+        }
     }
+
+//    for (auto& share_hash : known_verified_share_hashes)
+//    {
+//        if (exist(share_hash))
+//            verified.add(items.at(share_hash));
+//    }
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- known shares finished: " << c2pool::dev::timestamp();
 
     // Set DOA rule
