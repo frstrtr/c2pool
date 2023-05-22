@@ -280,12 +280,14 @@ public:
             return {{},{}, {}};
 
         auto [start_height, last] = get_height_and_last(start);
+        LOG_TRACE << "start_height = " << start_height << ", last = " << last;
 
         // Ограничиваем цепочку до размера max_shares.
         if (start_height > max_shares)
         {
             last = get_nth_parent_key(start, max_shares);
         }
+        LOG_TRACE << "last = " << last;
 
         // Поиск desired_weight
         std::map<std::vector<unsigned char>, arith_uint288> weights;
@@ -293,6 +295,7 @@ public:
         auto desired_sum_weight = get_sum_to_last(start).weight.total_weight >= desired_weight ? get_sum_to_last(start).weight.total_weight - desired_weight : arith_uint288();
         auto cur = get_sum_to_last(start);
         auto prev = get_sum_to_last(start);
+        LOG_TRACE << "desired_sum_weight = " << desired_weight.GetHex() << ", cur = " << cur.hash() << ", prev = " << prev.hash();
         std::optional<shares::weight::weight_data> extra_ending;
 
         while(cur.hash() != last)
@@ -327,6 +330,7 @@ public:
             {
                 break;
             }
+            LOG_TRACE << "cur = " << cur.hash();
         }
 
         if (extra_ending.has_value())
@@ -359,6 +363,7 @@ public:
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
+            std::cout << "get_sum: " << start << " " << cur.hash() << " " << cur.prev() << std::endl;
             auto result_sum = get_sum(start, cur.prev());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
