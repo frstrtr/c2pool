@@ -5,6 +5,164 @@
 #include "base_share_tracker.h"
 #include "share_store.h"
 
+class PrepareListNode
+{
+public:
+    ShareType value;
+
+    std::shared_ptr<PrepareListNode> prev;
+    std::shared_ptr<PrepareListNode> next;
+
+    PrepareListNode() {};
+    PrepareListNode(ShareType& _value)
+    {
+        value = _value;
+    }
+};
+
+//class TestData
+//{
+//public:
+//    int hash;
+//    int previous_hash;
+//
+//    int value;
+//
+//    TestData() {};
+//    TestData(int _v, int _hash, int _prev)
+//    {
+//        value = _v;
+//        hash = _hash;
+//        previous_hash = _prev;
+//    }
+//};
+
+typedef std::shared_ptr<PrepareListNode> ptr_node;
+
+class PrepareFork
+{
+public:
+    ptr_node head;
+    ptr_node tail;
+
+    PrepareFork(ptr_node _node)
+    {
+        head = _node;
+        tail = _node;
+    }
+};
+
+
+class PreparedList
+{
+private:
+    typedef std::shared_ptr<PrepareFork> ptr_fork;
+private:
+    std::map<uint256, ptr_node> nodes;
+
+    ptr_node make_node(ShareType &value)
+    {
+        auto v = std::make_shared<PrepareListNode>(value);
+        nodes[value->hash] = v;
+
+        return v;
+    }
+
+    // Метод создаёт пару из двух нод
+    void make_pair(ptr_node left, ptr_node right)
+    {
+        left->next = right;
+        right->prev = left;
+    }
+
+    ptr_fork merge_fork(ptr_fork left, ptr_fork right)
+    {
+        make_pair(left->head, right->tail);
+        left->head = right->head;
+        return left;
+    }
+public:
+    std::vector<ptr_fork> forks;
+
+    PreparedList(std::vector<ShareType> data)
+    {
+        // Prepare data
+        // -- map hashes
+        std::map<uint256, ShareType> hashes;
+        for (auto &_share : data)
+        {
+            hashes[_share->hash] = _share;
+        }
+
+        // -- heads/tails
+
+        std::map<uint256, ptr_fork> heads;
+        std::map<uint256, ptr_fork> tails;
+
+        while (!hashes.empty())
+        {
+            auto node = make_node(hashes.begin()->second);
+            hashes.erase(node->value->hash);
+
+            if (!heads.count(*node->value->previous_hash) && !tails.count(node->value->hash))
+            {
+                std::map<uint256, ShareType>::iterator it;
+                // make new fork
+                {
+                    auto new_fork = std::make_shared<PrepareFork>(node);
+                    heads[node->value->hash] = new_fork;
+                    tails[*node->value->previous_hash] = new_fork;
+                }
+
+                while ((it = hashes.find(*node->value->previous_hash)) != hashes.end())
+                {
+                    auto new_node = make_node(it->second);
+                    hashes.erase(it->first);
+                    make_pair(new_node, node);
+
+                    auto _fork = tails.extract(*node->value->previous_hash);
+                    _fork.mapped()->tail = new_node;
+                    _fork.key() = *new_node->value->previous_hash;
+                    tails.insert(std::move(_fork));
+
+                    node = new_node;
+                }
+                continue;
+            }
+
+            // Проверка на продолжение форка спереди
+            if (heads.find(*node->value->previous_hash) != heads.end())
+            {
+                auto _fork = heads.extract(*node->value->previous_hash);
+                make_pair(_fork.mapped()->head, node);
+
+                _fork.mapped()->head = node;
+                _fork.key() = node->value->hash;
+                heads.insert(std::move(_fork));
+
+                hashes.erase(node->value->hash);
+            }
+
+            // Проверка на merge форков.
+            if (tails.find(node->value->hash) != tails.end())
+            {
+                auto left_fork = heads.extract(node->value->hash);
+                auto right_fork = tails.extract(node->value->hash);
+
+                auto new_fork = merge_fork(left_fork.mapped(), right_fork.mapped());
+                heads[new_fork->head->value->hash] = new_fork;
+                tails[*new_fork->tail->value->previous_hash] = new_fork;
+            }
+        }
+
+        // set forks
+        for (auto &_forks : heads)
+        {
+            forks.push_back(_forks.second);
+        }
+    }
+};
+
 struct desired_type
 {
     std::tuple<std::string, std::string> peer_addr;
