@@ -158,3 +158,7 @@ for i in track.get_chain(44, 0):
 print('\nGet sum')
 print(track.get_delta(21, 20))
 print(track.get_delta(21, 19))
+
+
+print('\nGet delta to last:')
+print(track.get_delta_to_last(21))

@@ -20,23 +20,6 @@ public:
     }
 };
 
-//class TestData
-//{
-//public:
-//    int hash;
-//    int previous_hash;
-//
-//    int value;
-//
-//    TestData() {};
-//    TestData(int _v, int _hash, int _prev)
-//    {
-//        value = _v;
-//        hash = _hash;
-//        previous_hash = _prev;
-//    }
-//};
-
 typedef std::shared_ptr<PrepareListNode> ptr_node;
 
 class PrepareFork
@@ -51,7 +34,6 @@ public:
         tail = _node;
     }
 };
-
 
 class PreparedList
 {
@@ -292,17 +274,18 @@ public:
         // Поиск desired_weight
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
-        auto desired_sum_weight = get_sum_to_last(start).weight.total_weight >= desired_weight ? get_sum_to_last(start).weight.total_weight - desired_weight : arith_uint288();
+        auto desired_sum_weight = std::get<0>(get_sum_to_last(start)).weight.total_weight >= desired_weight ? std::get<0>(get_sum_to_last(start)).weight.total_weight - desired_weight : arith_uint288();
+        LOG_TRACE << "start = " << start;
         auto cur = get_sum_to_last(start);
         auto prev = get_sum_to_last(start);
-        LOG_TRACE << "desired_sum_weight = " << desired_weight.GetHex() << ", cur = " << cur.hash() << ", prev = " << prev.hash();
+        LOG_TRACE << "desired_sum_weight = " << desired_weight.GetHex() << ", cur = " << std::get<0>(cur).hash() << ", prev = " << std::get<0>(prev).hash();
         std::optional<shares::weight::weight_data> extra_ending;
 
-        while(cur.hash() != last)
+        while(std::get<0>(cur).hash() != last)
         {
-            if (cur.weight.total_weight >= desired_sum_weight)
+            if (std::get<0>(cur).weight.total_weight >= desired_sum_weight)
             {
-                for (auto [k, v]: cur.weight.amount)
+                for (auto [k, v]: std::get<0>(cur).weight.amount)
                 {
                     if (weights.find(k) != weights.end())
                     {
@@ -315,27 +298,28 @@ public:
             } else
             {
 //                auto [_script, _weight] = *cur.weight.amount.begin();
-                extra_ending = std::make_optional<shares::weight::weight_data>(cur.share); //TODO: check
+                extra_ending = std::make_optional<shares::weight::weight_data>(std::get<0>(cur).share); //TODO: check
                 break;
             }
 
             prev = cur;
 
-            if (items.count(cur.prev()))
+            if (items.count(std::get<0>(cur).prev()))
 //            if (cur.prev != sum.end())
             {
 //                cur = cur.prev->second;
-                cur = items[cur.prev()];
+//                cur = items[cur.prev()];
+                cur = get_sum_to_last(std::get<0>(cur).prev());
             } else
             {
                 break;
             }
-            LOG_TRACE << "cur = " << cur.hash();
+            LOG_TRACE << "cur = " << std::get<0>(cur).hash();
         }
 
         if (extra_ending.has_value())
         {
-            auto result_sum = get_sum(start, prev.hash());
+            auto result_sum = get_sum(start, std::get<0>(prev).hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
@@ -363,8 +347,8 @@ public:
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
-            std::cout << "get_sum: " << start << " " << cur.hash() << " " << cur.prev() << std::endl;
-            auto result_sum = get_sum(start, cur.prev());
+            std::cout << "get_sum: " << start << " " << std::get<1>(cur) << " " << std::get<2>(cur) << std::endl;
+            auto result_sum = get_sum(start, std::get<2>(cur));
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights

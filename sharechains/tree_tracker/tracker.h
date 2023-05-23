@@ -172,13 +172,15 @@ public:
         return (items.find(hash) != items.end());
     }
 
-    sum_element get_sum_to_last(hash_type hash)
+    // sum_element, head, tail
+    std::tuple<sum_element, hash_type, hash_type> get_sum_to_last(hash_type hash)
     {
         sum_element result;
 
         if (items.find(hash) != items.end())
         {
             auto fork = fork_by_key[hash];
+            result.share = items[hash];
             result += fork->get_sum(hash);
             fork = fork->prev_fork;
 
@@ -188,14 +190,14 @@ public:
                 fork = fork->prev_fork;
             }
         } else
-            return sum_element(hash);
+            return std::make_tuple(sum_element(hash), hash, hash);
 
-        return result;
+        return std::make_tuple(result, hash, fork_by_key[hash]->get_chain_tail());
     }
 
     int32_t get_height(hash_type hash)
     {
-        return get_sum_to_last(hash).height;
+        return std::get<0>(get_sum_to_last(hash)).height;
     }
 
     hash_type get_last(hash_type hash)
@@ -272,8 +274,8 @@ public:
         if (!is_child_of(ancestor, item))
             throw std::invalid_argument("get_sum item not child for ancestor");
 
-        auto result = get_sum_to_last(item);
-        auto ances = get_sum_to_last(ancestor);
+        auto [result, _head, _tail] = get_sum_to_last(item);
+        auto [ances, _head2, _tail2] = get_sum_to_last(ancestor);
 
         return result.sub(ances);
     }
