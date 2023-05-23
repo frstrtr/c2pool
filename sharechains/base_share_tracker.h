@@ -78,7 +78,7 @@ public:
 
     uint256 get_work(uint256 hash)
     {
-        return ArithToUint256(get_sum_to_last(hash).work);
+        return ArithToUint256(std::get<0>(get_sum_to_last(hash)).work);
     }
 };
 
