@@ -12,7 +12,7 @@
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
 #include <networks/network.h>
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;

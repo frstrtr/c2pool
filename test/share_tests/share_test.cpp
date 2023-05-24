@@ -3,7 +3,7 @@
 #include <vector>
 #include <string>
 
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 #include <networks/network.h>
 
 #include <sharechains/share.h>

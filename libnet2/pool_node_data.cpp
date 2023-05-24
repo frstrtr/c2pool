@@ -85,7 +85,7 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 			}
 		}
 
-		if (tracker->exists(share->hash))
+		if (tracker->exist(share->hash))
 		{
             LOG_WARNING << "Got duplicate share, ignoring. Hash: " << share->hash.ToString();
 			continue;
@@ -114,7 +114,7 @@ void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_
 	std::vector<uint256> new_hashes;
 	for (auto x : hashes)
 	{
-		if (!tracker->exists(x))
+		if (!tracker->exist(x))
 			new_hashes.push_back(x);
 	}
 

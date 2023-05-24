@@ -10,7 +10,7 @@ using namespace std;
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <networks/network.h>
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/post.hpp>
 using namespace c2pool::dev;
