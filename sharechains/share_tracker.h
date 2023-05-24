@@ -263,6 +263,7 @@ public:
 
         auto [start_height, last] = get_height_and_last(start);
         LOG_TRACE << "start_height = " << start_height << ", last = " << last;
+        LOG_TRACE << "max_shares = " << max_shares;
 
         // Ограничиваем цепочку до размера max_shares.
         if (start_height > max_shares)
@@ -314,7 +315,7 @@ public:
             {
                 break;
             }
-            LOG_TRACE << "cur = " << std::get<0>(cur).hash();
+//            LOG_TRACE << "cur = " << std::get<0>(cur).hash();
         }
 
         if (extra_ending.has_value())
@@ -348,11 +349,17 @@ public:
         } else
         {
             std::cout << "get_sum: " << start << " " << std::get<1>(cur) << " " << std::get<2>(cur) << std::endl;
-            auto result_sum = get_sum(start, std::get<2>(cur));
+            auto result_sum = get_sum(start, std::get<2>(prev)/*std::get<0>(prev).prev()*/);
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
+
+            LOG_TRACE << "height: " << result_sum.height;
+            LOG_TRACE << "result_sum: " << std::accumulate(result_sum.weight.amount.begin(), result_sum.weight.amount.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}).GetHex();
+            LOG_TRACE << "weights: " << std::accumulate(weights.begin(), weights.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}).GetHex();
+            LOG_TRACE << "total_weights: " << total_weights.GetHex();
+            LOG_TRACE << "total_donation_weights: " << total_donation_weights.GetHex();
 
             return std::make_tuple(weights, total_weights, total_donation_weights);
         }

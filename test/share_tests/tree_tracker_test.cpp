@@ -395,6 +395,8 @@ TEST_F(Sharechains2Test, weights_test)
     share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
 
     std::cout << tracker->items.size() << " " << tracker->verified.items.size() << std::endl;
+    std::cout << "shares: " << tracker->heads.size() << "/" << tracker->tails.size() << std::endl;
+    std::cout << "verified: " << tracker->verified.heads.size() << "/" << tracker->verified.tails.size() << std::endl;
 
     boost::function<int32_t(uint256)> test_block_rel_height_func = [&](uint256 hash){return 0;};
 
