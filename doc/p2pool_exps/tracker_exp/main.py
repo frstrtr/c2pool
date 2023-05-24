@@ -84,3 +84,7 @@ weights, total_weight, donation_weight = tracker.get_cumulative_weights(best,
 print('\nweights = {0}'.format(weights))
 print('total_weight = {0}'.format(total_weight))
 print('donation_weight = {0}'.format(donation_weight))
+#==================
+print('{0}-{1}'.format(len(tracker.items), len(tracker.verified.items)))
+print('shares: {0}/{1}'.format(len(tracker.heads), len(tracker.tails)))
+print('verified: {0}/{1}'.format(len(tracker.verified.heads), len(tracker.verified.tails)))

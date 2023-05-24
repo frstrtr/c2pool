@@ -34,27 +34,45 @@ namespace shares::weight
             auto att = coind::data::target_to_average_attempts(share->target);
 
             amount = {{share->new_script.data, att * (65535 - *share->donation)}};
+            std::fstream fs;
+            fs.open("/home/sl33n/c2pool/cmake-build-debug/weights.txt", ios_base::in | ios_base::out | ios_base::app);
+            if (fs.is_open())
+            {
+                fs << "AMOUNT for " << share->hash << " = " << "{ " << share->new_script << ":"
+                   << amount[share->new_script.data].GetHex() << "}, from "
+                   << "[" << share->target << " -> " << att.GetHex() << "]\n";
+                fs.close();
+            } else {
+                LOG_TRACE << "ERROR!";
+            }
             total_weight = att*65535;
             total_donation_weight = att * (*share->donation);
         }
 
         void operator+=(const weight_data &element)
         {
-/*            for (auto el : element.amount)
+            for (const auto& el : element.amount)
             {
                 if (amount.find(el.first) != amount.end())
                     amount[el.first] += el.second;
                 else
                     amount[el.first] = el.second;
-            }*/
+            }
 
             total_weight += element.total_weight;
             total_donation_weight += element.total_donation_weight;
+            if (!total_donation_weight.IsNull())
+                std::cout << "NOT NULL!" << std::endl;
+
+            if (std::accumulate(amount.begin(), amount.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}) != (total_weight + total_donation_weight))
+            {
+                std::cout << "NOT EQUAL!" << std::endl;
+            }
         }
 
         void operator-=(const weight_data &element)
         {
-            for (auto el : element.amount)
+            for (const auto& el : element.amount)
             {
                 //TODO: сделать проверку на существование script в словаре?
                 amount[el.first] -= el.second;
