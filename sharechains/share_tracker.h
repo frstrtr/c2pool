@@ -262,33 +262,25 @@ public:
             return {{},{}, {}};
 
         auto [start_height, last] = get_height_and_last(start);
-        LOG_TRACE << "start_height = " << start_height << ", last = " << last;
-        LOG_TRACE << "max_shares = " << max_shares;
 
         // Ограничиваем цепочку до размера max_shares.
         if (start_height > max_shares)
         {
             last = get_nth_parent_key(start, max_shares);
         }
-        LOG_TRACE << "last = " << last;
 
         // Поиск desired_weight
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
         auto desired_sum_weight = std::get<0>(get_sum_to_last(start)).weight.total_weight >= desired_weight ? std::get<0>(get_sum_to_last(start)).weight.total_weight - desired_weight : arith_uint288();
-        LOG_TRACE << "start = " << start;
         auto cur = get_sum_to_last(start);
         auto prev = get_sum_to_last(start);
-        LOG_TRACE << "desired_sum_weight = " << desired_weight.GetHex() << ", cur = " << std::get<0>(cur).hash() << ", prev = " << std::get<0>(prev).hash();
         std::optional<shares::weight::weight_data> extra_ending;
 
         while(std::get<0>(cur).hash() != last)
         {
             if (std::get<0>(cur).weight.total_weight >= desired_sum_weight)
             {
-                std::fstream f;
-                f.open("/home/sl33n/c2pool/cmake-build-debug/weights2.txt", ios_base::in | ios_base::out | ios_base::app);
-                f << "[";
                 for (auto [k, v]: std::get<0>(cur).weight.amount)
                 {
                     if (weights.find(k) != weights.end())
@@ -298,12 +290,7 @@ public:
                     {
                         weights[k] = v;
                     }
-                    f << " (" << k << " : " << v.GetHex() << "); ";
                 }
-                f << "]\n";
-                std::fstream f2;
-                f2.open("/home/sl33n/c2pool/cmake-build-debug/weights3_c2pool.txt", ios_base::in | ios_base::out | ios_base::app);
-                f2 << (coind::data::target_to_average_attempts(std::get<0>(cur).share->target) * 65535).GetHex() << "\n";//std::get<0>(cur).weight.total_weight.GetHex() << "\n";//std::accumulate(result_sum.weight.amount.begin(), result_sum.weight.amount.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}).GetHex() << "\n";
             } else
             {
 //                auto [_script, _weight] = *cur.weight.amount.begin();
@@ -356,18 +343,11 @@ public:
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
-            std::cout << "get_sum: " << start << " " << std::get<1>(cur) << " " << std::get<2>(cur) << std::endl;
             auto result_sum = get_sum(start, /*std::get<2>(prev)*/std::get<0>(prev).prev());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
-
-            LOG_TRACE << "height: " << result_sum.height;
-            LOG_TRACE << "result_sum: " << std::accumulate(result_sum.weight.amount.begin(), result_sum.weight.amount.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}).GetHex();
-            LOG_TRACE << "weights: " << std::accumulate(weights.begin(), weights.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}).GetHex();
-            LOG_TRACE << "total_weights: " << total_weights.GetHex();
-            LOG_TRACE << "total_donation_weights: " << total_donation_weights.GetHex();
 
             return std::make_tuple(result_sum.weight.amount, total_weights, total_donation_weights);
         }
