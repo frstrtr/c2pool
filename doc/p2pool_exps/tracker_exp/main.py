@@ -76,7 +76,7 @@ print(max(0, min(b_height, net.REAL_CHAIN_LENGTH) - 1))
 print('attempts = {0}'.format(hex(coind_data.target_to_average_attempts(0))))
 print(hex(65535*net.SPREAD*coind_data.target_to_average_attempts(0)))
 
-weights, total_weight, donation_weight = tracker.get_cumulative_weights(best, 
+weights, total_weight, donation_weight = tracker.get_cumulative_weights(tracker.items[best].share_data['previous_share_hash'],
     max(0, min(b_height, net.REAL_CHAIN_LENGTH) - 1),
     65535*net.SPREAD*coind_data.target_to_average_attempts(0)
 )
@@ -88,3 +88,5 @@ print('donation_weight = {0}'.format(donation_weight))
 print('{0}-{1}'.format(len(tracker.items), len(tracker.verified.items)))
 print('shares: {0}/{1}'.format(len(tracker.heads), len(tracker.tails)))
 print('verified: {0}/{1}'.format(len(tracker.verified.heads), len(tracker.verified.tails)))
+#==================
+print('best = {0}'.format(hex(best)))
