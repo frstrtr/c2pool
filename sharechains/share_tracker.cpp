@@ -12,9 +12,7 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
 {
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
 
-    std::cout << "start prepare" << std::endl;
     PreparedList prepare_shares(_shares);
-
 
     for (auto& fork : prepare_shares.forks)
     {
@@ -25,7 +23,6 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
             share_node = share_node->next;
         }
     }
-    std::cout << "finish prepare" << std::endl;
 
 //    for (auto& _share : _shares)
 //    {
