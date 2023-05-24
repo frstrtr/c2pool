@@ -240,10 +240,13 @@ class WeightsSkipList(TrackerSkipList):
         return 0, None, 0, 0
     
     def apply_delta(self, (share_count1, weights_list, total_weight1, total_donation_weight1), (share_count2, weights2, total_weight2, total_donation_weight2), (max_shares, desired_weight)):
+        f = open('/home/sl33n/c2pool/cmake-build-debug/weights3_p2pool.txt', 'a')
+        f.write('{0}\n'.format(hex(total_weight2)))
         if total_weight1 + total_weight2 > desired_weight and share_count2 == 1:
             assert (desired_weight - total_weight1) % 65535 == 0
             script, = weights2.iterkeys()
             new_weights = {script: (desired_weight - total_weight1)//65535*weights2[script]//(total_weight2//65535)}
+            print("ending")
             return share_count1 + share_count2, (weights_list, new_weights), desired_weight, total_donation_weight1 + (desired_weight - total_weight1)//65535*total_donation_weight2//(total_weight2//65535)
         return share_count1 + share_count2, (weights_list, weights2), total_weight1 + total_weight2, total_donation_weight1 + total_donation_weight2
     
@@ -260,8 +263,8 @@ class WeightsSkipList(TrackerSkipList):
         assert share_count == max_shares or total_weight == desired_weight
         print('share_count = {0}'.format(share_count))
         # print('weights_list = {0}'.format(weights_list))
-        print('total_weight = {0}'.format(total_weight))
-        print('total_donation_weight = {0}'.format(total_donation_weight))
+        print('total_weight = {0}'.format(hex(total_weight)))
+        print('total_donation_weight = {0}'.format(hex(total_donation_weight)))
         print('max_shares = {0}'.format(max_shares))
         print('desired_weight = {0}'.format(hex(desired_weight)))
         return p2pool_math.add_dicts(*p2pool_math.flatten_linked_list(weights_list)), total_weight, total_donation_weight

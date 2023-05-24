@@ -286,6 +286,9 @@ public:
         {
             if (std::get<0>(cur).weight.total_weight >= desired_sum_weight)
             {
+                std::fstream f;
+                f.open("/home/sl33n/c2pool/cmake-build-debug/weights2.txt", ios_base::in | ios_base::out | ios_base::app);
+                f << "[";
                 for (auto [k, v]: std::get<0>(cur).weight.amount)
                 {
                     if (weights.find(k) != weights.end())
@@ -295,7 +298,12 @@ public:
                     {
                         weights[k] = v;
                     }
+                    f << " (" << k << " : " << v.GetHex() << "); ";
                 }
+                f << "]\n";
+                std::fstream f2;
+                f2.open("/home/sl33n/c2pool/cmake-build-debug/weights3_c2pool.txt", ios_base::in | ios_base::out | ios_base::app);
+                f2 << (coind::data::target_to_average_attempts(std::get<0>(cur).share->target) * 65535).GetHex() << "\n";//std::get<0>(cur).weight.total_weight.GetHex() << "\n";//std::accumulate(result_sum.weight.amount.begin(), result_sum.weight.amount.end(), arith_uint288{}, [](auto x, const auto &p) {return x + p.second;}).GetHex() << "\n";
             } else
             {
 //                auto [_script, _weight] = *cur.weight.amount.begin();
@@ -349,7 +357,7 @@ public:
         } else
         {
             std::cout << "get_sum: " << start << " " << std::get<1>(cur) << " " << std::get<2>(cur) << std::endl;
-            auto result_sum = get_sum(start, std::get<2>(prev)/*std::get<0>(prev).prev()*/);
+            auto result_sum = get_sum(start, /*std::get<2>(prev)*/std::get<0>(prev).prev());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
@@ -361,7 +369,7 @@ public:
             LOG_TRACE << "total_weights: " << total_weights.GetHex();
             LOG_TRACE << "total_donation_weights: " << total_donation_weights.GetHex();
 
-            return std::make_tuple(weights, total_weights, total_donation_weights);
+            return std::make_tuple(result_sum.weight.amount, total_weights, total_donation_weights);
         }
     }
 
