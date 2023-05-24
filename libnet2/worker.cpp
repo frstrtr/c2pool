@@ -17,6 +17,7 @@
 #include <sharechains/share_adapters.h>
 #include <sharechains/generate_tx.h>
 #include <libcoind/jsonrpc/results.h>
+#include <sharechains/tree_tracker/rules.h>
 
 using std::vector;
 
@@ -94,12 +95,12 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
             my_dead_announce_count = 1;
 
         return DOAElement{my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count};
-    }, [](Rule& l, const Rule& r)
+    }, [](shares::Rule& l, const shares::Rule& r)
     {
         auto _l = std::any_cast<DOAElement>(&l.value);
         auto _r = std::any_cast<DOAElement>(&r.value);
         *_l += *_r;
-    }, [](Rule& l, const Rule& r)
+    }, [](shares::Rule& l, const shares::Rule& r)
     {
         auto _l = std::any_cast<DOAElement>(&l.value);
         auto _r = std::any_cast<DOAElement>(&r.value);
@@ -131,12 +132,12 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
             my_dead_announce_count = 1;
 
         return DOAElement{my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count};
-    }, [](Rule& l, const Rule& r)
+    }, [](shares::Rule& l, const shares::Rule& r)
                         {
                             auto _l = std::any_cast<DOAElement>(&l.value);
                             auto _r = std::any_cast<DOAElement>(&r.value);
                             *_l += *_r;
-                        }, [](Rule& l, const Rule& r)
+                        }, [](shares::Rule& l, const shares::Rule& r)
                         {
                             auto _l = std::any_cast<DOAElement>(&l.value);
                             auto _r = std::any_cast<DOAElement>(&r.value);
@@ -389,7 +390,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 				stale_info = unk;
 		}
 
-        types::ShareData _share_data(
+        shares::types::ShareData _share_data(
                 _pool_node->best_share.value(),
                 coinbase,
                 c2pool::random::randomNonce(),
@@ -798,7 +799,7 @@ stale_counts Worker::get_stale_counts()
     if (_coind_node->best_share.value().IsNull())
         delta = DOAElement{0,0,0,0};
     else
-        delta = *_tracker->get_sum_to_last(_coind_node->best_share.value()).rules.get<DOAElement>("doa");
+        delta = *(std::get<0>(_tracker->get_sum_to_last(_coind_node->best_share.value())).rules.get<DOAElement>("doa"));
 
     auto my_shares_in_chain = delta.my_count + _removed_unstales;
     auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales.value();

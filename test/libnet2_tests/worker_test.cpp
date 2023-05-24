@@ -7,7 +7,7 @@
 #include <libnet2/coind_node_data.h>
 #include <libnet2/worker.h>
 #include <libdevcore/common.h>
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 #include <sharechains/share_store.h>
 #include <networks/network.h>
 

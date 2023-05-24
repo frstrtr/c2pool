@@ -6,7 +6,7 @@
 #include <libcoind/height_tracker.h>
 #include <libcoind/p2p/coind_protocol.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 #include <networks/network.h>
 #include <boost/asio.hpp>
 namespace io = boost::asio;

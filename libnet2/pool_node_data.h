@@ -12,7 +12,7 @@
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>
 #include <sharechains/share.h>
-#include <sharechains/tracker.h>
+#include <sharechains/share_tracker.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
