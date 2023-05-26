@@ -95,7 +95,10 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
             my_dead_announce_count = 1;
 
         return DOAElement{my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count};
-    }, [](shares::Rule& l, const shares::Rule& r)
+    },[]()
+    {
+        return DOAElement{};
+    },[](shares::Rule& l, const shares::Rule& r)
     {
         auto _l = std::any_cast<DOAElement>(&l.value);
         auto _r = std::any_cast<DOAElement>(&r.value);
@@ -132,17 +135,20 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
             my_dead_announce_count = 1;
 
         return DOAElement{my_count, my_doa_count, my_orphan_announce_count, my_dead_announce_count};
+    },[]()
+    {
+        return DOAElement();
     }, [](shares::Rule& l, const shares::Rule& r)
-                        {
-                            auto _l = std::any_cast<DOAElement>(&l.value);
-                            auto _r = std::any_cast<DOAElement>(&r.value);
-                            *_l += *_r;
-                        }, [](shares::Rule& l, const shares::Rule& r)
-                        {
-                            auto _l = std::any_cast<DOAElement>(&l.value);
-                            auto _r = std::any_cast<DOAElement>(&r.value);
-                            *_l -= *_r;
-                        });
+    {
+        auto _l = std::any_cast<DOAElement>(&l.value);
+        auto _r = std::any_cast<DOAElement>(&r.value);
+        *_l += *_r;
+    }, [](shares::Rule& l, const shares::Rule& r)
+    {
+        auto _l = std::any_cast<DOAElement>(&l.value);
+        auto _r = std::any_cast<DOAElement>(&r.value);
+        *_l -= *_r;
+    });
 
 
     // sub for removed_unstales Variable's
