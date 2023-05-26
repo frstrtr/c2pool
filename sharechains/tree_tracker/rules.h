@@ -79,7 +79,7 @@ namespace shares
             return *this;
         }
 
-        Rule make_none()
+        Rule make_none() const
         {
             return Rule{(*_make_none)(), _add, _sub, _make_none};
         }
@@ -127,6 +127,9 @@ namespace shares
         {
             for (const auto &[k, rule]: r.rules)
             {
+                if (!rules.count(k))
+                    rules[k] = rule.make_none();
+
                 rules[k] += rule;
             }
             return *this;
@@ -136,6 +139,9 @@ namespace shares
         {
             for (const auto &[k, rule]: r.rules)
             {
+                if (!rules.count(k))
+                    rules[k] = rule.make_none();
+
                 rules[k] -= rule;
             }
             return *this;
