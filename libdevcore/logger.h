@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <map>
+#include <atomic>
 using std::shared_ptr;
 
 #include <boost/log/core.hpp>
