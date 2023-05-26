@@ -20,13 +20,15 @@ namespace shares
         func_type *_add;
         /// subtraction function
         func_type *_sub;
+        /// make empty Rule obj
+        std::function<std::any()> *_make_none;
     public:
         Rule() : _add(nullptr), _sub(nullptr)
         {
 
         }
 
-        Rule(std::any v, func_type *additionF, func_type *subtractionF) : _add(additionF), _sub(subtractionF)
+        Rule(std::any v, func_type *additionF, func_type *subtractionF, auto *make_noneF) : _add(additionF), _sub(subtractionF), _make_none(make_noneF)
         {
             value = std::move(v);
         }
@@ -34,27 +36,52 @@ namespace shares
         Rule operator+(const Rule &r) const
         {
             auto copy_rule = Rule(*this);
-            (*_add)(copy_rule, r);
+            if (_add)
+                (*_add)(copy_rule, r);
+            else if (r._add)
+                (*r._add)(copy_rule, r);
+            else
+                throw std::runtime_error("Rule::operator+ without add functors");
             return copy_rule;
         }
 
         Rule operator-(const Rule &r) const
         {
             auto copy_rule = Rule(*this);
-            (*_sub)(copy_rule, r);
+            if (_sub)
+                (*_sub)(copy_rule, r);
+            else if (r._sub)
+                (*r._sub)(copy_rule, r);
+            else
+                throw std::runtime_error("Rule::operator- without sub functors");
             return copy_rule;
         }
 
         Rule &operator+=(const Rule &r)
         {
-            (*_add)(*this, r);
+            if (_add)
+                (*_add)(*this, r);
+            else if (r._add)
+                (*r._add)(*this, r);
+            else
+                throw std::runtime_error("Rule::operator+= without add functors");
             return *this;
         }
 
         Rule &operator-=(const Rule &r)
         {
-            (*_sub)(*this, r);
+            if (_sub)
+                (*_sub)(*this, r);
+            else if (r._sub)
+                (*r._sub)(*this, r);
+            else
+                throw std::runtime_error("Rule::operator-= without sub functors");
             return *this;
+        }
+
+        Rule make_none()
+        {
+            return Rule{(*_make_none)(), _add, _sub, _make_none};
         }
     };
 
@@ -123,6 +150,8 @@ namespace shares
             // Словарь с функциями для инициализации (расчёта) новых значений правил.
             std::function<std::any(const ValueType&)> make;
             //
+            std::function<std::any()> make_none;
+            //
             std::function<void(Rule&, const Rule&)> add;
             //
             std::function<void(Rule&, const Rule&)> sub;
@@ -133,9 +162,9 @@ namespace shares
     public:
         Event<std::vector<std::string>> new_rule_event;
 
-        void add(std::string k, std::function<std::any(const ValueType&)> _make, std::function<void(Rule&, const Rule&)> _add, std::function<void(Rule&, const Rule&)> _sub)
+        void add(std::string k, std::function<std::any(const ValueType&)> _make, std::function<std::any()> _make_none, std::function<void(Rule&, const Rule&)> _add, std::function<void(Rule&, const Rule&)> _sub)
         {
-            funcs[k] = {std::move(_make), std::move(_add), std::move(_sub)};
+            funcs[k] = {std::move(_make), std::move(_make_none) , std::move(_add), std::move(_sub)};
 
             std::vector<std::string> new_rule_list{k};
             new_rule_event.happened(new_rule_list);
@@ -147,7 +176,7 @@ namespace shares
                 throw std::invalid_argument((boost::format("%1% not exist in funcs!") % key).str());
 
             auto &f = funcs[key];
-            return {f.make(value), &f.add, &f.sub};
+            return {f.make(value), &f.add, &f.sub, &f.make_none};
         }
 
         PrefsumRulesElement make_rules(const ValueType &value)
