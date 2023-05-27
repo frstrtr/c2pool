@@ -203,7 +203,7 @@ public:
     hash_type get_last(hash_type hash)
     {
         auto fork = fork_by_key.find(hash);
-        return fork != fork_by_key.end() ? fork->second->tail : hash;
+        return fork != fork_by_key.end() ? fork->second->get_chain_tail() : hash;
     }
 
     std::tuple<int32_t, hash_type> get_height_and_last(hash_type item)
