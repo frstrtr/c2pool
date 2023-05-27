@@ -681,7 +681,7 @@ void PoolNode::download_shares()
                     stops = vector<uint256>{_stops.begin(), _stops.end()};
                 }
 
-                LOG_INFO << "Stops: " << stops;
+                LOG_TRACE << "Stops: " << stops;
 
                 shares = peer->get_shares.yield(fiber,
                                                      std::vector<uint256>{share_hash},
@@ -694,18 +694,12 @@ void PoolNode::download_shares()
             if (shares.empty())
             {
                 fiber->sleep(1s);
-                LOG_INFO << "SHARES EMPTY!";
                 continue;
             }
 
             vector<tuple<ShareType, std::vector<coind::data::tx_type>>> post_shares;
-//            for (const auto& _share : shares)
-//            {
-//                post_shares.emplace_back(_share, std::vector<coind::data::tx_type>{});
-//            }
 
             PreparedList prepare_shares(shares);
-
             for (auto& fork : prepare_shares.forks)
             {
                 auto share_node = fork->tail;
