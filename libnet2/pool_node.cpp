@@ -668,12 +668,12 @@ void PoolNode::download_shares()
                 std::vector<uint256> stops;
                 {
                     std::set<uint256> _stops;
-                    for (auto s : _node->tracker->heads)
+                    for (const auto& s : _node->tracker->heads)
                     {
                         _stops.insert(s.first);
                     }
 
-                    for (auto s : _node->tracker->heads)
+                    for (const auto& s : _node->tracker->heads)
                     {
                         uint256 stop_hash = _node->tracker->get_nth_parent_key(s.first, std::min(std::max(0, std::get<0>(_node->tracker->get_height_and_last(s.first)) - 1), 10));
                         _stops.insert(stop_hash);
