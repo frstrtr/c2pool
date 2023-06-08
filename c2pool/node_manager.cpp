@@ -27,7 +27,7 @@ void NodeManager::run()
     //    timer in _addr_store constructor
 
     // JSONRPC Coind
-    LOG_INFO << "Init Coind...";
+    LOG_INFO << "Init Coind (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "])...";
     _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, _config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str(), _config->jsonrpc_coind_login.c_str());
     _coind->check();
 

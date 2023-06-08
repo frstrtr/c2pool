@@ -891,7 +891,7 @@ user_details Worker::get_user_details(std::string username)
 
 user_details Worker::preprocess_request(std::string username)
 {
-    if (!_pool_node || _pool_node->peers.size() == 0)
+    if ((!_pool_node || _pool_node->peers.size() == 0) && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is not connected to any peers");
         //TODO: raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
