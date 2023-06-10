@@ -490,7 +490,7 @@ public:
                 to_value();
             } else
             {
-                LOG_WARNING << "StreamTypeAdapter operator -> error: _value and _stream - nullptr!";
+                LOG_DEBUG_OTHER << "StreamTypeAdapter operator -> warning: _value and _stream - nullptr!";
             }
         }
         return _value;
