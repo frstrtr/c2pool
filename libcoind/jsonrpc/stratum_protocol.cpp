@@ -38,7 +38,7 @@ void StratumProtocol::Read()
             Send(response);
         } else
         {
-            if (ec == boost::system::errc::operation_canceled)
+            if (ec == boost::system::errc::operation_canceled /*|| ec == boost::asio::error::eof*/)
                 return;
 
             disconnect("StratumProtocol::read() error = " + ec.message());

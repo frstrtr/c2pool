@@ -144,4 +144,22 @@ namespace coind::jsonrpc::data
             }
         }
     };
+
+    class SubmitBlockRequest : public TemplateRequest
+    {
+    public:
+        //required
+        std::string hex_data;
+
+    public:
+        SubmitBlockRequest(std::string _hex_data) : TemplateRequest("submitblock")
+        {
+            hex_data = std::move(_hex_data);
+        }
+
+        void set_params() override
+        {
+            params.push_back(hex_data);
+        }
+    };
 } // namespace coind::data

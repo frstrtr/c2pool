@@ -139,3 +139,27 @@ void CoindNodeData::clean_tracker()
 
 	set_best_share();
 }
+
+void CoindNodeData::submit_block(coind::data::types::BlockType &block, bool ignore_failure)
+{
+    // P2P
+
+    if (!is_connected())
+    {
+        //TODO: add net.PARENT.BLOCK_EXPLORER_URL_PREFIX
+        LOG_ERROR << "No bitcoind connection when block submittal attempted!"; //<< /*net.PARENT.BLOCK_EXPLORER_URL_PREFIX <<*/ /*bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header'])))*/
+        // TODO: raise deferral.RetrySilentlyException()
+        throw std::runtime_error("No bitcoind connection in submit_block");
+    }
+    //---send_block
+    send_block(block);
+
+    // RPC
+    bool segwit_activated = false;
+    {
+        segwit_activated += std::any_of(coind_work._value->rules.begin(), coind_work._value->rules.end(), [](const auto &v){ return v == "segwit";});
+        segwit_activated += std::any_of(coind_work._value->rules.begin(), coind_work._value->rules.end(), [](const auto &v){ return v == "!segwit";});
+    }
+
+    coind->submit_block(block, /*coind_work._value->use_getblocktemplate,*/ ignore_failure, segwit_activated);
+}
