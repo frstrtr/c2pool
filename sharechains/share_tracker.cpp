@@ -85,7 +85,8 @@ ShareType ShareTracker::get(uint256 hash)
     }
     catch (const std::out_of_range &e)
     {
-        LOG_WARNING << "ShareTracker.get(" << hash.GetHex() << "): out of range!";
+        if (!hash.IsNull())
+            LOG_WARNING << "ShareTracker.get(" << hash.GetHex() << "): out of range!";
         return nullptr;
     }
 }
