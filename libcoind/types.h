@@ -146,6 +146,7 @@ namespace coind::data::types
         }
     };
 
+    //TODO: maybe remove?
     struct StrippedBlockType
     {
         BlockHeaderType header;
@@ -304,6 +305,7 @@ namespace coind::data::stream
         }
     };
 
+    //TODO: maybe remove?
     struct StrippedBlockType_stream
     {
         BlockHeaderType_stream header;

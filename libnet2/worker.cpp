@@ -205,6 +205,9 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
 
 
     current_work.transitioned->subscribe([&](const auto& before, const auto& after){
+//        LOG_TRACE << "CURRENT WORK.TRANSITIONED:";
+//        LOG_TRACE << "\tBefore: " << before;
+//        LOG_TRACE << "\tafter: " << after;
         //  # trigger LP if version/previous_block/bits changed or transactions changed from nothing
         if ((std::tie(before.version, before.previous_block, before.bits) != std::tie(after.version, after.previous_block, after.bits)) || (before.transactions.empty() && !after.transactions.empty()))
         {
@@ -590,7 +593,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                 LOG_DEBUG_STRATUM << "header_hash = " << header_hash;
                 LOG_DEBUG_STRATUM << "pow_hash = " << pow_hash;
-                LOG_INFO << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
+                LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "target = " << target;
 
@@ -598,8 +601,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 {
                     if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()))
                     {
-                        //TODO: helper.submit_block
-                        LOG_INFO << "GOT BLOCK FROM MINER! Passing to bitcoind!";
+                        coind::data::types::BlockType new_block(header, {new_gentx});
+                        new_block.txs.insert(new_block.txs.end(), other_transactions.begin(), other_transactions.end());
+                        _coind_node->submit_block(new_block, false);
+                        //TODO: add self.node.net.PARENT.BLOCK_EXPLORER_URL_PREFIX
+                        LOG_INFO << "\nGOT BLOCK FROM MINER! Passing to bitcoind! " << header_hash.GetHex() << "\n";
                     }
                 } catch (const std::error_code &ec)
                 {
@@ -907,6 +913,7 @@ user_details Worker::preprocess_request(std::string username)
 
 void Worker::compute_work()
 {
+    LOG_TRACE << "COMPUTE WORK!";
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
     if (!_coind_node->best_block_header.isNull())
     {

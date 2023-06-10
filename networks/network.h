@@ -15,6 +15,7 @@
 
 using std::shared_ptr;
 
+//TODO: legacy remove?
 namespace coind::jsonrpc
 {
     class Coind;

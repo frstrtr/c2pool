@@ -16,6 +16,7 @@ using tcp = io::ip::tcp;
 #include "txidcache.h"
 #include "results.h"
 #include <libcoind/data.h>
+#include <libcoind/types.h>
 using namespace coind::jsonrpc::data;
 
 namespace coind
@@ -121,6 +122,8 @@ namespace coind
 		bool check_block_header(uint256 header);
 
 		getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
+
+        void submit_block(coind::data::types::BlockType &block, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
 	public:
 		UniValue getblockchaininfo(bool full = false)

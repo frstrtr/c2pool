@@ -226,3 +226,49 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 	getwork_result result(work, unpacked_transactions, txhashes, end - start);
     return result;
 }
+
+// p2pool: submit_block_rpc
+void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated)
+{
+    //TODO: @deferral.retry('Error submitting block: (will retry)', 10, 10)
+
+    //TODO: TO OTHER METHOD:
+//    segwit_rules = set(['!segwit', 'segwit'])
+//    segwit_activated = len(segwit_rules - set(bitcoind_work.value['rules'])) < len(segwit_rules)
+
+    UniValue res;
+    bool success = true;
+//    if (use_getblocktemplate) ALWAYS TRUE
+    if (true)
+    {
+        //TODO: yield request
+
+        PackStream packed_block;
+        if (segwit_activated)
+        {
+            packed_block = pack_to_stream<coind::data::stream::BlockType_stream>(block);
+        } else {
+            // TODO: stripped block type?
+//            packed_block = pack_to_stream<coind::data::stream::StrippedBlockType_stream>(coind::data::types::StrippedBlockType(block.header, block.txs));
+
+            packed_block = pack_to_stream<coind::data::stream::BlockType_stream>(block);
+        }
+
+        auto req = std::make_shared<SubmitBlockRequest>(HexStr(packed_block.data));
+
+        res = request("submitblock", req);
+        success = res.isNull();
+    } else
+    {
+        //TODO: ?
+        throw std::runtime_error("c2pool without getmemorypool");
+        res = request("getmemorypool");
+        success = res.isNull();
+    }
+
+    auto block_header_stream = pack_to_stream<coind::data::stream::BlockHeaderType_stream>(block.header);
+    auto success_expected = UintToArith256(parent_net->POW_FUNC(block_header_stream)) <= UintToArith256(FloatingInteger(block.header.bits).target());
+
+    if ((!success && success_expected && !ignore_failure) || (success && !success_expected))
+        LOG_ERROR << "Block submittal result: " << success << "(" << res.write() << ") Expected: " << success_expected;
+}

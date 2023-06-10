@@ -69,6 +69,11 @@ public:
 		SET_POOL_DEFAULT_HANDLER(tx);
 		SET_POOL_DEFAULT_HANDLER(block);
 		SET_POOL_DEFAULT_HANDLER(headers);
+
+        set_send_block([&](const auto &block){
+            auto msg = std::make_shared<coind::messages::message_block>(block);
+            protocol->write(msg);
+        });
     }
 
 	template <typename ConnectorType>
@@ -106,7 +111,5 @@ private:
 	void start();
     void work_poller();
     void poll_header();
-
-
 };
 #undef SET_POOL_DEFAULT_HANDLER

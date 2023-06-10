@@ -23,6 +23,7 @@ public:
 	std::shared_ptr<coind::JSONRPC_Coind> coind;
 	std::shared_ptr<PoolNodeData> pool_node;
 
+    std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
 	HandlerManagerPtr<CoindProtocol> handler_manager;
 public:
 	coind::TXIDCache txidcache;
@@ -76,11 +77,19 @@ public:
 		pool_node = std::move(_pool_node);
 		return this;
 	}
+
+    auto set_send_block(auto _function)
+    {
+        send_block = std::move(_function);
+        return this;
+    }
 public:
 	void set_best_share();
 	void clean_tracker();
 
 	void handle_header(coind::data::BlockHeaderType new_header);
+
+    void submit_block(coind::data::types::BlockType &block, bool ignore_failure);
 
     void set_connection_status(bool value)
     {
