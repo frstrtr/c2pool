@@ -79,3 +79,8 @@ _target = 53919893334301279589334030174039261347274288845081144962207220498431
 print u'diff = %s' % (coind_data.difficulty_to_target(_target))
 # print(coind_data.target_to_difficulty(53919893334301279589334030174039261347274288845081144962207220498431)*65565)
 print u'%s' % (coind_data.difficulty_to_target(0.499992370605))
+
+print("\n\n\n\n\n")
+
+tip_hash = int('9ac4b53e4eb96fe39364cd0ebd8ce3af1b918c99de4be4d05a6db50a057b12ae', 16)
+print(hex(coind_data.check_merkle_link(tip_hash, coind_data.calculate_merkle_link([None], 0))))
