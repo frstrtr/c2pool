@@ -498,13 +498,16 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     coind::data::MerkleLink merkle_link;
     if (!gen_sharetx_res->share_info->segwit_data.has_value())
     {
+        LOG_TRACE << "WITHOUT SEGWIT DATA";
         std::vector<uint256> _copy_for_link{uint256::ZERO};
         _copy_for_link.insert(_copy_for_link.end(), gen_sharetx_res->other_transaction_hashes.begin(),
                               gen_sharetx_res->other_transaction_hashes.end());
 
         merkle_link = coind::data::calculate_merkle_link(_copy_for_link, 0);
+        LOG_TRACE.stream() << "MERKLE_LINK: " << merkle_link << ", for " << _copy_for_link;
     } else
     {
+        LOG_TRACE << "WITH SEGWIT DATA";
         merkle_link = gen_sharetx_res->share_info->segwit_data->txid_merkle_link;
     }
 
@@ -603,6 +606,22 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     {
                         coind::data::types::BlockType new_block(header, {new_gentx});
                         new_block.txs.insert(new_block.txs.end(), other_transactions.begin(), other_transactions.end());
+                        LOG_TRACE << "NEW BLOCK TXS:";
+                        for (auto _tx_ : new_block.txs)
+                        {
+                            LOG_TRACE.stream() << _tx_;
+                        }
+                        {
+                         //for trace
+                         std::vector<uint256> _hashes;
+                         for (auto _tx_:new_block.txs){
+                             auto packed_tx = pack<coind::data::stream::TransactionType_stream>(_tx_);
+                             LOG_TRACE.stream() << "PACKED_TX: " << packed_tx;
+                             _hashes.push_back(coind::data::hash256(packed_tx));
+                             LOG_TRACE << _hashes.back();
+                         }
+                         LOG_TRACE << "MERKLE MANUAL ROOT = " << coind::data::merkle_hash(_hashes).GetHex();
+                        }
                         _coind_node->submit_block(new_block, false);
                         //TODO: add self.node.net.PARENT.BLOCK_EXPLORER_URL_PREFIX
                         LOG_INFO << "\nGOT BLOCK FROM MINER! Passing to bitcoind! " << header_hash.GetHex() << "\n";

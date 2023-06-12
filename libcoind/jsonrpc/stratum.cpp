@@ -26,6 +26,7 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
 
 void Stratum::_send_work()
 {
+    LOG_INFO << "SEND WORK!" << std::endl;
     worker_get_work_result get_work_result;
 
     try
@@ -35,6 +36,7 @@ void Stratum::_send_work()
     }
     catch (const std::runtime_error &ec) //TODO: to jsonrpc_error
     {
+        LOG_INFO << "DISCONNECTED!!!";
         disconnect(ec.what());
         return;
     }
@@ -173,6 +175,7 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
 
     uint32_t _timestamp = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_ntime)));
     uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
+    LOG_TRACE << "coind::data::hash256(new_packed_gentx, true): " << coind::data::hash256(new_packed_gentx, true).GetHex();
     auto merkle_root = coind::data::check_merkle_link(coind::data::hash256(new_packed_gentx, true), x.merkle_link);
 
     coind::data::types::BlockHeaderType header(x.version, x.previous_block, _timestamp, x.bits, nonce, merkle_root);
