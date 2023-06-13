@@ -254,9 +254,9 @@ void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, /*
             packed_block = pack_to_stream<coind::data::stream::BlockType_stream>(block);
         }
 
-        auto req = std::make_shared<SubmitBlockRequest>(HexStr(packed_block.data));
+        auto _req = std::make_shared<SubmitBlockRequest>(HexStr(packed_block.data));
 
-        res = request("submitblock", req);
+        res = request("submitblock", _req);
         success = res.isNull();
     } else
     {
