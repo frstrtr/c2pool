@@ -45,7 +45,7 @@ namespace coind::data
             index = 4294967295;
         }
 
-        PreviousOutput(uint256 _hash, int32_t _index)
+        PreviousOutput(uint256 _hash, uint32_t _index)
         {
             hash = _hash;
             index = _index;
@@ -262,6 +262,12 @@ namespace coind::data::stream
             index = IntType(32)::make_type(val.index);
         }
 
+        PreviousOutput_stream(uint256 _hash, uint32_t _index)
+        {
+            hash = _hash;
+            index = _index;
+        }
+
         PackStream &write(PackStream &stream)
         {
             stream << hash << index;
@@ -280,7 +286,7 @@ namespace coind::data::stream
         StrType script;
         PossibleNoneType<IntType(32)> sequence;
 
-        TxInType_stream() : previous_output(PreviousOutput_stream(PreviousOutput())), sequence(IntType(32)(4294967295)) {
+        TxInType_stream() : previous_output(PreviousOutput_stream(uint256::ZERO, 4294967295)), sequence(IntType(32)(4294967295)) {
 
         }
         TxInType_stream(TxInType val) : TxInType_stream() {

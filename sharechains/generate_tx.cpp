@@ -410,7 +410,7 @@ namespace shares
 
         //TX_IN
         vector<coind::data::TxInType> tx_ins;
-        tx_ins.emplace_back(coind::data::PreviousOutput(uint256::ZERO, 0), _share_data.coinbase, 0);
+        tx_ins.emplace_back(coind::data::PreviousOutput(), _share_data.coinbase, 4294967295);
 
         //TX_OUT
         vector<coind::data::TxOutType> tx_outs;
