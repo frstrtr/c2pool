@@ -231,8 +231,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         throw std::runtime_error("c2pool is not connected to any peers"); //TODO: to jsonrpc_error
     }
 
-    LOG_DEBUG_STRATUM << "best_share in get_work: " << _pool_node->best_share.value().GetHex();
-    LOG_TRACE << "best share is null? = " << _pool_node->best_share.value().IsNull() << "; PERSIST = " << _net->PERSIST;
     if (_pool_node->best_share.value().IsNull() && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is downloading shares"); //TODO: to jsonrpc_error
@@ -309,49 +307,35 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	if (desired_share_target.IsNull())
 	{
         auto local_hash_rates = get_local_addr_rates();
-        LOG_DEBUG_STRATUM << "local_hash_rates = " << local_hash_rates;
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
 		desired_share_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
-        LOG_DEBUG_STRATUM << "desired_share_target[#1] = " << desired_share_target.GetHex();
 
 		auto local_hash_rate = local_hash_rates.count(pubkey_hash) > 0 ? UintToArith288(local_hash_rates[pubkey_hash]) : arith_uint288();
-        LOG_DEBUG_STRATUM << "local_hash_rate = " << local_hash_rate.GetHex();
 		if (local_hash_rate > 0)
 		{
             // TODO: CHECK
 			// limit to 1.67% of pool shares by modulating share difficulty
 			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
 					local_hash_rate * _net->SHARE_PERIOD / 60)); // in p2pool:  /0.0167, not /60
-            LOG_DEBUG_STRATUM << "desired_share_target[#2] = " << desired_share_target.GetHex();
 		}
 		auto lookbehind = 3600 / _net->SHARE_PERIOD;
-        LOG_DEBUG_STRATUM << "lookbehind = " << lookbehind;
 		block_subsidy = _coind_node->coind_work.value().subsidy;
 		if (prev_share && _tracker->get_height(prev_share->hash) > lookbehind)
 		{
 			//TODO (from p2pool): doesn't use global stale rate to compute pool hash
-            LOG_DEBUG_STRATUM << "local_hash_rate = " << local_hash_rate.GetHex();
-            LOG_DEBUG_STRATUM << "get_pool_attempts_per_second = " << _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind).GetHex();
-            LOG_DEBUG_STRATUM << "block_subsidy = " << block_subsidy;
-            LOG_DEBUG_STRATUM << "donation_percentage = " << donation_percentage;
 			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind) * block_subsidy * (100 - donation_percentage) / 100; //(1 - donation_percentage/100);
-            LOG_DEBUG_STRATUM << "expected_payout_per_block = " << expected_payout_per_block.GetHex();
 			if (expected_payout_per_block < _net->parent->DUST_THRESHOLD)
 			{
-                LOG_DEBUG_STRATUM << "_net->parent->DUST_THRESHOLD = " << _net->parent->DUST_THRESHOLD;
 				auto temp1 = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target()) * _net->SPREAD;
-                LOG_DEBUG_STRATUM << "temp1 = " << temp1.GetHex();
 				auto temp2 = temp1 * _net->parent->DUST_THRESHOLD / block_subsidy;
-                LOG_DEBUG_STRATUM << "temp2 = " << temp2.GetHex();
 				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(temp2));
-                LOG_DEBUG_STRATUM << "desired_share_target[#3] = " << desired_share_target.GetHex();
 			}
 		}
 	}
     LOG_DEBUG_STRATUM << "desired_share_target = " << desired_share_target.GetHex();
 
     //6
-    LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
+//    LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
     auto generate_transaction = std::make_shared<shares::GenerateShareTransaction>(_tracker);
     generate_transaction->
             set_block_target(FloatingInteger(current_work.value().bits).target()).
@@ -361,7 +345,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             set_base_subsidy(_net->parent->SUBSIDY_FUNC(current_work.value().height)).
             set_known_txs(tx_map);
 
-    LOG_TRACE << "DESIRED TIMESTAMP CALCULATE = " << c2pool::dev::timestamp() << " (" << (uint32_t) c2pool::dev::timestamp() << ") + " << 0.5f << " = " << (c2pool::dev::timestamp() + 0.5f) << " / " << (uint32_t)(c2pool::dev::timestamp() + 0.5f);
+//    LOG_TRACE << "DESIRED TIMESTAMP CALCULATE = " << c2pool::dev::timestamp() << " (" << (uint32_t) c2pool::dev::timestamp() << ") + " << 0.5f << " = " << (c2pool::dev::timestamp() + 0.5f) << " / " << (uint32_t)(c2pool::dev::timestamp() + 0.5f);
 
     {
         std::vector<std::tuple<uint256, std::optional<int32_t>>> desired_other_transaction_hashes_and_fees;
@@ -437,15 +421,12 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     {
 //		target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
         a_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
-        LOG_DEBUG_STRATUM << "target[#1] = " << a_target.GetHex();
 		auto local_hash_rate = _estimate_local_hash_rate();
-        LOG_DEBUG_STRATUM << "local_hash_rate = " << local_hash_rate.GetHex();
 		if (!local_hash_rate.IsNull())
 		{
 			//in p2pool: target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1)
 			// target 10 share responses every second by modulating pseudoshare difficulty
             a_target = coind::data::average_attempts_to_target(local_hash_rate);
-            LOG_DEBUG_STRATUM << "target[#2.1] = " << a_target.GetHex();
 		} else
         {
             //TODO: TEST
@@ -468,12 +449,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             {
                 a_target = ArithToUint256(target_from_avg);
             }
-            LOG_DEBUG_STRATUM << "target[#2.2] = " << a_target.GetHex();
         }
     } else
     {
         a_target = desired_pseudoshare_target;
-        LOG_DEBUG_STRATUM << "target[#1.alternative] = " << a_target.GetHex();
     }
 
     auto bits_target = UintToArith256(FloatingInteger(gen_sharetx_res->share_info->bits).target());
@@ -481,12 +460,10 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     {
         a_target = bits_target;
     }
-    LOG_DEBUG_STRATUM << "target[#3]" << a_target.GetHex();
 
     // TODO: part for merged mining
 
     a_target = math::clip(a_target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX);
-    LOG_DEBUG_STRATUM << "target[#4] = " << a_target.GetHex();
     auto target = ArithToUint256(a_target);
     LOG_DEBUG_STRATUM << "target =  " << a_target.GetHex();
 
@@ -498,16 +475,13 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     coind::data::MerkleLink merkle_link;
     if (!gen_sharetx_res->share_info->segwit_data.has_value())
     {
-        LOG_TRACE << "WITHOUT SEGWIT DATA";
         std::vector<uint256> _copy_for_link{uint256::ZERO};
         _copy_for_link.insert(_copy_for_link.end(), gen_sharetx_res->other_transaction_hashes.begin(),
                               gen_sharetx_res->other_transaction_hashes.end());
 
         merkle_link = coind::data::calculate_merkle_link(_copy_for_link, 0);
-        LOG_TRACE.stream() << "MERKLE_LINK: " << merkle_link << ", for " << _copy_for_link;
     } else
     {
-        LOG_TRACE << "WITH SEGWIT DATA";
         merkle_link = gen_sharetx_res->share_info->segwit_data->txid_merkle_link;
     }
 
@@ -597,8 +571,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                 LOG_DEBUG_STRATUM << "header_hash = " << header_hash;
                 LOG_DEBUG_STRATUM << "pow_hash = " << pow_hash;
-                LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
-                LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "target = " << target;
 
                 try
@@ -607,23 +579,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     {
                         coind::data::types::BlockType new_block(header, {new_gentx});
                         new_block.txs.insert(new_block.txs.end(), other_transactions.begin(), other_transactions.end());
-                        LOG_TRACE << "NEW BLOCK TXS:";
-                        for (auto _tx_ : new_block.txs)
-                        {
-                            LOG_TRACE.stream() << _tx_;
-                        }
-                        {
-                         //for trace
-                         std::vector<uint256> _hashes;
-                         for (auto _tx_:new_block.txs){
-                             auto packed_tx = pack<coind::data::stream::TransactionType_stream>(_tx_);
-                             LOG_TRACE.stream() << "PACKED_TX: " << packed_tx;
-                             _hashes.push_back(coind::data::hash256(packed_tx));
-                             LOG_TRACE << _hashes.back();
-                         }
-                         LOG_TRACE << "MERKLE MANUAL ROOT = " << coind::data::merkle_hash(_hashes).GetHex();
-                        }
+
                         _coind_node->submit_block(new_block, false);
+
                         //TODO: add self.node.net.PARENT.BLOCK_EXPLORER_URL_PREFIX
                         LOG_INFO << "\nGOT BLOCK FROM MINER! Passing to bitcoind! " << header_hash.GetHex() << "\n";
                     }
@@ -933,7 +891,6 @@ user_details Worker::preprocess_request(std::string username)
 
 void Worker::compute_work()
 {
-    LOG_TRACE << "COMPUTE WORK!";
     Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
     if (!_coind_node->best_block_header.isNull())
     {
