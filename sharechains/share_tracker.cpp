@@ -262,7 +262,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     std::vector<std::tuple<std::tuple<int32_t, arith_uint288>, arith_uint256>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
-        LOG_TRACE << "tail_hash = " << tail_hash << " head_hashes = [ "; std::for_each(head_hashes.begin(), head_hashes.end(), [](const auto& v){std::cout << v << " ";}); std::cout << "]" << std::endl;
+//        LOG_TRACE << "tail_hash = " << tail_hash << " head_hashes = [ "; std::for_each(head_hashes.begin(), head_hashes.end(), [](const auto& v){std::cout << v << " ";}); std::cout << "]" << std::endl;
         auto max_el = std::max_element(head_hashes.begin(), head_hashes.end(),
                                        [&](const auto &a, const auto &b)
                                        {
@@ -289,7 +289,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     {
         for (auto h : verified.tails[best_tail])
         {
-            LOG_TRACE << "h = " << h << std::endl;
             auto el = std::make_tuple(
                     UintToArith256(verified.get_work(
                             verified.get_nth_parent_key(h->head, std::min(5, verified.get_height(h->head))))),
