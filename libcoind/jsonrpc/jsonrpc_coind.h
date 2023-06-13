@@ -39,7 +39,7 @@ namespace coind
 		//TODO: template request params
 		UniValue _request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
-		UniValue request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
+		UniValue request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr, bool ignore_result = false);
 
 		UniValue request_with_error(const char* method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
