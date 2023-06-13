@@ -543,8 +543,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 //                    { return v == '\0'; }))
                     if (coinbase_nonce.value != 0)
                     {
+                        auto new_packed_gentx_copy = new_packed_gentx;
                         coind::data::stream::TransactionType_stream temp;
-                        new_packed_gentx >> temp;
+                        new_packed_gentx_copy >> temp;
                         new_gentx = temp.tx;
                     } else
                     {
@@ -583,7 +584,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                         _coind_node->submit_block(new_block, false);
 
                         //TODO: add self.node.net.PARENT.BLOCK_EXPLORER_URL_PREFIX
-                        LOG_INFO << "\nGOT BLOCK FROM MINER! Passing to bitcoind! " << header_hash.GetHex() << "\n";
+                        LOG_INFO << "GOT BLOCK FROM MINER! Passing to bitcoind! " << header_hash.GetHex() << "\n";
                     }
                 } catch (const std::error_code &ec)
                 {
