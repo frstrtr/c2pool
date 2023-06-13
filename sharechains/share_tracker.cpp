@@ -217,7 +217,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     for (auto [head, tail] : verified.heads)
     {
-        LOG_TRACE << "head2 = " << head << " tail2 = " << tail << std::endl;
         auto [head_height, last_hash] = verified.get_height_and_last(head);
         auto [last_height, last_last_hash] = get_height_and_last(last_hash);
 
