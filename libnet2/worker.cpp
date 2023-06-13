@@ -565,8 +565,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     PackStream nonce_packed;
                     nonce_packed << coinbase_nonce;
 
-                    if (all_of(nonce_packed.data.begin(), nonce_packed.data.end(), [](unsigned char v)
-                    { return v == '\0'; }))
+//                    if (all_of(nonce_packed.data.begin(), nonce_packed.data.end(), [](unsigned char v)
+//                    { return v == '\0'; }))
+                    if (coinbase_nonce.value != 0)
                     {
                         coind::data::stream::TransactionType_stream temp;
                         new_packed_gentx >> temp;
