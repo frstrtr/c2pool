@@ -274,22 +274,33 @@ namespace coind::data::stream
             header = _header;
 
             std::vector<coind::data::stream::TransactionType_stream> _temp_txs;
-            std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
+
+            for (auto _tx : _txs)
             {
-                return coind::data::stream::TransactionType_stream(_tx);
-            });
-            txs = _temp_txs;
+                coind::data::stream::TransactionType_stream tx_stream(_tx);
+                txs.value.push_back(std::move(tx_stream));
+            }
+//            std::transform(_txs.begin(), _txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
+//            {
+//                return coind::data::stream::TransactionType_stream(_tx);
+//            });
+//            txs = _temp_txs;
         }
 
         BlockType_stream (types::BlockType _block)
         {
             header = _block.header;
             std::vector<coind::data::stream::TransactionType_stream> _temp_txs;
-            std::transform(_block.txs.begin(), _block.txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
+            for (auto _tx : _block.txs)
             {
-                return coind::data::stream::TransactionType_stream(_tx);
-            });
-            txs = _temp_txs;
+                coind::data::stream::TransactionType_stream tx_stream(_tx);
+                txs.value.push_back(std::move(tx_stream));
+            }
+//            std::transform(_block.txs.begin(), _block.txs.end(), _temp_txs.begin(), [&](coind::data::tx_type _tx)
+//            {
+//                return coind::data::stream::TransactionType_stream(_tx);
+//            });
+//            txs = _temp_txs;
         }
 
         PackStream &write(PackStream &stream)
