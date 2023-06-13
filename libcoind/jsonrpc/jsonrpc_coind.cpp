@@ -41,7 +41,7 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
 	return result;
 }
 
-UniValue coind::JSONRPC_Coind::request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
+UniValue coind::JSONRPC_Coind::request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params, bool ignore_result)
 {
     LOG_DEBUG_COIND_JSONRPC << "JsonRPC COIND request: " << method_name;
 	auto result =  _request(method_name, req_params);
@@ -49,7 +49,19 @@ UniValue coind::JSONRPC_Coind::request(const char *method_name, std::shared_ptr<
 	{
 		LOG_ERROR << "Error in request JSONRPC_COIND[" << parent_net->net_name << "]: " << result["error"].get_str();
 	}
-	return result["result"].get_obj();
+
+    if (result.exists("result"))
+    {
+        if (result["result"].isNull())
+            return result["result"];
+        else
+            if (ignore_result)
+                return UniValue();
+            else
+                return result["result"].get_obj();
+    } else {
+        throw runtime_error("json result not exist real result");
+    }
 }
 
 UniValue coind::JSONRPC_Coind::request_with_error(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
@@ -256,7 +268,7 @@ void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, /*
 
         auto _req = std::make_shared<SubmitBlockRequest>(HexStr(packed_block.data));
 
-        res = request("submitblock", _req);
+        res = request("submitblock", _req, true);
         success = res.isNull();
     } else
     {
