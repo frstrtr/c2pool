@@ -68,19 +68,19 @@ namespace jsonrpccxx {
       if (valid_id(request)) {
         id = request["id"];
       }
-      try {
+//      try {
         return ProcessSingleRequest(request);
-      } catch (JsonRpcException &e) {
-        json error = {{"code", e.Code()}, {"message", e.Message()}};
-        if (!e.Data().is_null()) {
-          error["data"] = e.Data();
-        }
-        return json{{"id", id}, {"error", error}, {"jsonrpc", "2.0"}};
-      } catch (std::exception &e) {
-        return json{{"id", id}, {"error", {{"code", internal_error}, {"message", std::string("internal server error: ") + e.what()}}}, {"jsonrpc", "2.0"}};
-      } catch (...) {
-        return json{{"id", id}, {"error", {{"code", internal_error}, {"message", std::string("internal server error")}}}, {"jsonrpc", "2.0"}};
-      }
+//      } catch (JsonRpcException &e) {
+//        json error = {{"code", e.Code()}, {"message", e.Message()}};
+//        if (!e.Data().is_null()) {
+//          error["data"] = e.Data();
+//        }
+//        return json{{"id", id}, {"error", error}, {"jsonrpc", "2.0"}};
+//      } catch (std::exception &e) {
+//        return json{{"id", id}, {"error", {{"code", internal_error}, {"message", std::string("internal server error: ") + e.what()}}}, {"jsonrpc", "2.0"}};
+//      } catch (...) {
+//        return json{{"id", id}, {"error", {{"code", internal_error}, {"message", std::string("internal server error")}}}, {"jsonrpc", "2.0"}};
+//      }
     }
 
     json ProcessSingleRequest(json &request) {
