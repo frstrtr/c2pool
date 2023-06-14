@@ -124,7 +124,7 @@ bool ShareTracker::attempt_verify(ShareType share)
 
     auto [height, last] = get_height_and_last(share->hash);
     if (height < net->CHAIN_LENGTH + 1 && !last.IsNull())
-        throw std::invalid_argument("");
+        throw std::invalid_argument("attempt_verify error");
 
     try
     {

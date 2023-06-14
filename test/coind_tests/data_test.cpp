@@ -207,11 +207,53 @@ TEST(CoindDataTest, DifficultyToTarget)
     std::cout << "\n4:\n";
     auto v4 = uint256S("8420842108421084210842108421084210842108421084210842108");
     std::cout << coind::data::difficulty_to_target(v4) << std::endl;
+}
 
-    // difficulty to target_1
-    std::cout << "\n5:\n";
-    auto v5 = uint256S("10000");
-    std::cout << coind::data::difficulty_to_target_1(v5) << std::endl;
+TEST(CoindDataTest, DifficultyToTarget_1_MANUAL)
+{
+    uint256 difficulty = uint256S("100");
+    uint256 result;
+
+    auto v = Uint256ToArith288(difficulty);
+    if (v.IsNull())
+        result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+    uint288 u_s;
+    u_s.SetHex("1000000000000000000000000000000000000000000000000");
+
+    auto s = UintToArith288(u_s);
+    s *= 0xffff0000;
+    s += 1;
+
+    auto r = s*v - 1;
+
+    arith_uint256 r_round;
+    r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
+    r.SetHex(ArithToUint256(r_round).GetHex());
+
+    {
+        arith_uint288 _max_value;
+        _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        if (r > _max_value)
+            result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    }
+
+    result = uint256S(r.GetHex()) ;
+
+    std::cout << "result: " << result;
+}
+
+TEST(CoindDataTest, DifficultyToTarget_1)
+{
+    // 1
+    std::cout << "\n1:\n";
+    auto v1 = uint256S("10000");
+    std::cout << coind::data::difficulty_to_target_1(v1) << std::endl;
+
+    // 2
+    std::cout << "\n2:\n";
+    auto v2 = uint256S("256");
+    std::cout << coind::data::difficulty_to_target_1(v2) << std::endl;
 }
 
 TEST(CoindDataTest, TargetToAverageAttempts)

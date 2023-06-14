@@ -8,7 +8,7 @@ print(coind_data.calculate_merkle_link([None], 0))
 
 print(coind_data.target_to_difficulty(int("00000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)))
 print(hex(coind_data.difficulty_to_target(1)))
-print(hex(coind_data.difficulty_to_target(float(1.0 / 2**16))))
+print('1/DUMB = {0}'.format(hex(coind_data.difficulty_to_target(float(1.0 / 2**16)))))
 
 print(hex(coind_data.hash256('1234')))
 
@@ -84,3 +84,7 @@ print("\n\n\n\n\n")
 
 tip_hash = int('9ac4b53e4eb96fe39364cd0ebd8ce3af1b918c99de4be4d05a6db50a057b12ae', 16)
 print(hex(coind_data.check_merkle_link(tip_hash, coind_data.calculate_merkle_link([None], 0))))
+
+#########
+print(hex(pack.FloatingInteger(503351432).target))
+print(hex(pack.FloatingInteger(504365055).target))

@@ -308,11 +308,15 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	{
         auto local_hash_rates = get_local_addr_rates();
 //		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
+        LOG_DEBUG_STRATUM << "_net->parent->DUMB_SCRYPT_DIFF: " << _net->parent->DUMB_SCRYPT_DIFF.GetHex();
 		desired_share_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
+
+        LOG_DEBUG_STRATUM << "coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF): " << coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
 
 		auto local_hash_rate = local_hash_rates.count(pubkey_hash) > 0 ? UintToArith288(local_hash_rates[pubkey_hash]) : arith_uint288();
 		if (local_hash_rate > 0)
 		{
+            LOG_DEBUG_STRATUM << "LOCAL_HASH_RATE: " << local_hash_rate.GetHex();
             // TODO: CHECK
 			// limit to 1.67% of pool shares by modulating share difficulty
 			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
@@ -571,7 +575,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 auto pow_hash = _net->parent->POW_FUNC(block_header_packed);
 
                 LOG_DEBUG_STRATUM << "header_hash = " << header_hash;
+                LOG_DEBUG_STRATUM << "header.bits = " << header.bits;
+                LOG_DEBUG_STRATUM << "FloatingInteger(header.bits).target() = " << FloatingInteger(header.bits).target();
                 LOG_DEBUG_STRATUM << "pow_hash = " << pow_hash;
+                LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
+                LOG_DEBUG_STRATUM << "FloatingInteger(_gen_sharetx_res->share_info->bits).target() = " << FloatingInteger(_gen_sharetx_res->share_info->bits).target();
                 LOG_DEBUG_STRATUM << "target = " << target;
 
                 try
@@ -723,6 +731,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 }
                 auto t1 = c2pool::dev::timestamp();
 
+                LOG_DEBUG_STRATUM << "END OF GOT RESPONSE";
                 return on_time;
             }
     };
