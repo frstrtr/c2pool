@@ -180,11 +180,18 @@ namespace shares
         FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(ArithToUint256(pre_target));
         FloatingInteger bits;
         {
+            LOG_DEBUG_STRATUM << "DESIRED TARGET: " << _desired_target.GetHex();
+
             arith_uint256 __desired_target = UintToArith256(_desired_target);
             arith_uint256 _pre_target3_div30 = pre_target/30;
             bits = FloatingInteger::from_target_upper_bound(
                     ArithToUint256(math::clip(__desired_target, _pre_target3_div30, pre_target))
             );
+
+            LOG_DEBUG_STRATUM << "_pre_target3_div30: " << _pre_target3_div30.GetHex();
+            LOG_DEBUG_STRATUM << "pre_target: " << pre_target.GetHex();
+            LOG_DEBUG_STRATUM << "math::clip(__desired_target, _pre_target3_div30, pre_target): " << math::clip(__desired_target, _pre_target3_div30, pre_target).GetHex();
+            LOG_DEBUG_STRATUM << "BITS: " << bits.value.value;
         }
 
         return std::make_tuple(max_bits, bits);

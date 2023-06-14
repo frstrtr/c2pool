@@ -150,10 +150,8 @@ namespace coind::data
 	uint256 get_txid(shared_ptr<coind::data::TransactionType> tx)
 	{
 		coind::data::stream::TxIDType_stream txid_stream(tx->version, tx->tx_ins, tx->tx_outs, tx->lock_time);
-        LOG_TRACE.stream() << "GENTX TXID DATA(GENTX): " << *tx;
 		PackStream stream;
 		stream << txid_stream;
-        LOG_TRACE.stream() << "GENTX TXID DATA: " << stream;
 		return hash256(stream, true);
 	}
 
