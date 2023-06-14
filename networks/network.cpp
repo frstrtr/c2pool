@@ -202,7 +202,15 @@ namespace coind
         ADDRESS_VERSION = pt.get<int>("ADDRESS_VERSION");
         RPC_PORT = pt.get<int>("RPC_PORT");
 
-        DUMB_SCRYPT_DIFF = uint256S(pt.get<std::string>("DUMB_SCRYPT_DIFF"));
+//        DUMB_SCRYPT_DIFF = uint256S(pt.get<std::string>("DUMB_SCRYPT_DIFF"));
+        {
+            std::stringstream ss;
+            ss << hex << pt.get<int>("DUMB_SCRYPT_DIFF");
+            std::string hex_dumb_scrypt_diff;
+            ss >> hex_dumb_scrypt_diff;
+            DUMB_SCRYPT_DIFF = uint256S(hex_dumb_scrypt_diff);
+        }
+
         DUST_THRESHOLD = pt.get<int>("DUST_THRESHOLD");
 
         SANE_TARGET_RANGE_MIN = uint256S(pt.get<std::string>("SANE_TARGET_RANGE_MIN"));
