@@ -42,3 +42,17 @@ public:
         return message.c_str();
     }
 };
+
+class WebInitError : public std::exception {
+private:
+    std::string message;
+
+public:
+    explicit WebInitError(std::string msg) : message(std::move(msg)) {}
+    explicit WebInitError(const char* msg) : message(msg) {}
+
+    const char* what() const noexcept override
+    {
+        return message.c_str();
+    }
+};
