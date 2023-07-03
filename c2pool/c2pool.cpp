@@ -45,6 +45,7 @@ int main(int ac, char *av[])
     desc.add_options()("networks", po::value<std::vector<std::string>>()->multitoken(), "");
     desc.add_options()("datadir", po::value<string>()->default_value(""), "store data in this directory (default: <directory with c2pool build>/data)");
     desc.add_options()("give-author", po::value<float>()->default_value(0), "donate this percentage of work towards the development of p2pool (default: 0.0)");
+    desc.add_options()("web_server", po::value<std::string>(), "ip:port for web site");
 
     po::options_description cmd_options;
     cmd_options.add(desc);
@@ -113,12 +114,16 @@ int main(int ac, char *av[])
         auto ioc = std::make_shared<boost::asio::io_context>();
 
         web_server = std::make_shared<WebServer>(ioc, web_endpoint);
+        c2pool::master::init_web(web_server);
+        web_server->run();
+
+        ioc->run();
     });
     web_server_thread.detach();
 
     while (!web_server || (web_server && !web_server->is_running()))
     {
-        LOG_INFO << "/t...wait for web server initialization";
+        LOG_INFO << "\t...wait for web server initialization";
         this_thread::sleep_for(std::chrono::seconds(1));
     }
 
