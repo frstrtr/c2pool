@@ -8,9 +8,9 @@ using boost::asio::ip::tcp;
 using namespace shares::types;
 
 
-NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg) :
+NodeManager::NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg, shared_ptr<WebServer> _web) :
                                                                 _net(_network), _parent_net(_network->parent),
-                                                                _config(_cfg)
+                                                                _config(_cfg), _web_server(_web)
 {
 }
 
@@ -193,6 +193,11 @@ shared_ptr<StratumNode> NodeManager::stratum() const
     return _stratum;
 }
 
+shared_ptr<WebServer> NodeManager::web_server() const
+{
+    return _web_server;
+}
+
 
 #define create_set_method(type, var_name)                      \
     void TestNodeManager::set##var_name(shared_ptr<type> _val) \
@@ -223,5 +228,7 @@ create_set_method(ShareTracker, _tracker);
 create_set_method(Worker, _worker);
 
 create_set_method(StratumNode, _stratum);
+
+create_set_method(WebServer, _web_server)
 
 #undef create_set_method

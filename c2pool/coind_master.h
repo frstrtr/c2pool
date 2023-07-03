@@ -24,7 +24,7 @@ namespace po = boost::program_options;
 namespace c2pool::master
 {
 
-    std::shared_ptr<NodeManager> make_node(boost::asio::thread_pool &thread_pool, const std::string &name)
+    std::shared_ptr<NodeManager> make_node(boost::asio::thread_pool &thread_pool, const std::string &name, const std::shared_ptr<WebServer>& web)
     {
         LOG_INFO << "Starting " << name << " initialization...";
 
@@ -33,10 +33,12 @@ namespace c2pool::master
         auto net = c2pool::load_network_file(name);
         LOG_INFO << name << " config initialization...";
         auto cfg = c2pool::dev::load_config_file(name);//std::make_shared<c2pool::dev::coind_config>(name);
+//        LOG_INFO << "web server initialization...";
+//        auto web = std::make_shared<WebServer>()
 
         //NodeManager
         LOG_INFO << name << " NodeManager initialization...";
-        auto node = std::make_shared<NodeManager>(net, cfg);
+        auto node = std::make_shared<NodeManager>(net, cfg, web);
 
         //run manager in another thread from thread_pool.
         boost::asio::post(thread_pool, [&]() { node->run(); });
@@ -49,7 +51,7 @@ namespace c2pool::master
         return std::move(node);
     }
 
-    std::vector<std::shared_ptr<NodeManager>> make_nodes(boost::asio::thread_pool &thread_pool, po::variables_map &vm)
+    std::vector<std::shared_ptr<NodeManager>> make_nodes(boost::asio::thread_pool &thread_pool, po::variables_map &vm, const std::shared_ptr<WebServer>& web)
     {
         if (vm.count("networks") == 0)
         {
@@ -61,32 +63,23 @@ namespace c2pool::master
         LOG_INFO.stream() << "Starting with networks: " << networks;
 
         std::vector<std::shared_ptr<NodeManager>> nodes;
-        for (const auto& n : networks)
+        for (const auto& net : networks)
         {
-            nodes.push_back(std::move(make_node(thread_pool, n)));
+            nodes.push_back(std::move(make_node(thread_pool, net, web)));
         }
         return std::move(nodes);
     }
 
-//    shared_ptr<NodeManager> Make_DGB(boost::asio::thread_pool &thread_pool, po::variables_map &vm) {
-//        LOG_INFO << "Starting DGB initialization...";
-//        //Networks/Configs
-//        LOG_INFO << "DGB_net initialization...";
-//        auto DGB_net = c2pool::load_network_file("dgb");
-//        LOG_INFO << "DGB_cfg initialization...";
-//        auto DGB_cfg = std::make_shared<c2pool::dev::coind_config>(vm);
-//        //NodeManager
-//        LOG_INFO << "DGB NodeManager initialization...";
-//        auto DGB = std::make_shared<NodeManager>(DGB_net, DGB_cfg);
-//
-//        //run manager in another thread from thread_pool.
-//        boost::asio::post(thread_pool, [&]() { DGB->run(); });
-//
-//        while (!DGB->is_loaded()) {
-//            using namespace chrono_literals;
-//            std::this_thread::sleep_for(100ms);
-//        }
-//        LOG_INFO << "DGB started!";
-//        return DGB;
-//    }
+    void init_web(const std::shared_ptr<WebServer>& web)
+    {
+        auto web_root = std::make_shared<WebRoot>(
+                [](WebInterface::func_type::argument_type& query)
+                {
+                });
+        web->add_web_root(web_root);
+
+        //---> New net
+        auto &web_dgb = web_root->new_net("dgb");
+
+    }
 }
