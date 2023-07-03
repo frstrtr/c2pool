@@ -51,41 +51,6 @@ std::list<std::string> split(const std::string &str, char delimiter)
     return parts;
 }
 
-UrlData parse_url(const std::string &url)
-{
-    UrlData result;
-    result.full_path = split(url, '?').front();
 
-    result.path = split(url, '/');
-    result.path.pop_front();
 
-    if (result.path.empty())
-        return result;
 
-    std::string last(result.path.back());
-
-    auto query_line = split(last, '?');
-    if (!query_line.front().empty())
-    {
-        auto v = query_line.front();
-        result.path.back() = v;
-    }
-    query_line.pop_front();
-
-    if (query_line.empty())
-        return result;
-
-    auto only_query = split(query_line.back(), '&');
-    for (const auto& v: only_query)
-    {
-        auto del_pos = v.find('=');
-        if (del_pos != std::string::npos)
-        {
-            auto key = v.substr(0, del_pos);
-            auto value = v.substr(del_pos + 1);
-            result.query[key] = value;
-        }
-    }
-
-    return result;
-}
