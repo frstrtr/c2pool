@@ -88,3 +88,4 @@ print(hex(coind_data.check_merkle_link(tip_hash, coind_data.calculate_merkle_lin
 #########
 print(hex(pack.FloatingInteger(503351432).target))
 print(hex(pack.FloatingInteger(504365055).target))
+print(hex(coind_data.difficulty_to_target(0.0002441371325370145)))
