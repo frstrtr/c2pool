@@ -2,8 +2,13 @@ add_executable(c2pool_main c2pool.cpp
                         coind_master.h 
                         node_manager.h node_manager.cpp)
 
-target_link_libraries(c2pool_main Boost::program_options libnet2 libdevcore networks sharechains)
+target_link_libraries(c2pool_main Boost::program_options libnet2 libdevcore networks sharechains web_interface)
 
+set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/web)
+file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/web)
+file(COPY ${SOURCE_DIR} DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+
+# tests
 add_executable(coind_worker coind_worker.cpp)
 target_link_libraries(coind_worker libcoind libnet2 libdevcore networks sharechains libp2ppreset)
 
