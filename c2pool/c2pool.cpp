@@ -73,7 +73,7 @@ int main(int ac, char *av[])
 
     if (vm.count("debug"))
     {
-        for (const auto &v: vm["debug"].as < std::vector < std::string >> ())
+        for (const auto &v: vm["debug"].as<std::vector<std::string>> ())
         {
             C2Log::Logger::add_category(v);
         }
@@ -84,9 +84,46 @@ int main(int ac, char *av[])
     // каждый второй поток для coind'a/stratum'a
     //boost::asio::thread_pool coind_threads(thread::hardware_concurrency()/2); //TODO: количество через аргументы запуска.
     boost::asio::thread_pool coind_threads(1);
-    //Creating and initialization coinds network, config and NodeManager
 
-    auto nodes = c2pool::master::make_nodes(coind_threads, vm);
+    //Createing web server
+    LOG_INFO << "web_server initialization in new thread...";
+    std::shared_ptr<WebServer> web_server;
+
+    tcp::endpoint web_endpoint;
+    if (vm.count("web_server"))
+    {
+        std::vector<std::string> _addr;
+        boost::split(_addr, vm["web_server"].as<std::string>(), boost::is_any_of(":"));
+
+        if (_addr.size() == 2)
+        {
+            web_endpoint = tcp::endpoint(net::ip::make_address(_addr[0]), std::stoi(_addr[1]));
+        } else
+        {
+            LOG_ERROR << "Incorrect web_server arg!";
+            return 0;
+        }
+    } else
+    {
+        LOG_ERROR << "Use arg --web_server=ip:port!";
+        return 0;
+    }
+
+    std::thread web_server_thread([&web_server, &web_endpoint](){
+        auto ioc = std::make_shared<boost::asio::io_context>();
+
+        web_server = std::make_shared<WebServer>(ioc, web_endpoint);
+    });
+    web_server_thread.detach();
+
+    while (!web_server || (web_server && !web_server->is_running()))
+    {
+        LOG_INFO << "/t...wait for web server initialization";
+        this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    //Creating and initialization coinds network, config and NodeManager
+    auto nodes = c2pool::master::make_nodes(coind_threads, vm, web_server);
 
     //Init exit handler
     ExitSignalHandler exitSignalHandler;
@@ -99,5 +136,9 @@ int main(int ac, char *av[])
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 //        std::cout << "main thread: " << (DGB == nullptr) << std::endl;
     }
+
+    if (web_server_thread.joinable())
+        web_server_thread.join();
+
     return C2PoolErrors::success;
 }
