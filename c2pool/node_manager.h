@@ -12,6 +12,7 @@
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
 #include <libcoind/p2p/coind_socket.h>
 #include <libcoind/jsonrpc/stratum_node.h>
+#include <web_interface/webserver.h>
 
 
 class NodeManager : public std::enable_shared_from_this<NodeManager>
@@ -21,7 +22,7 @@ protected:
     {}
 
 public:
-    NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg);
+    NodeManager(shared_ptr<c2pool::Network> _network, shared_ptr<c2pool::dev::coind_config> _cfg, shared_ptr<WebServer> _web);
 
     void start()
     {
@@ -56,6 +57,8 @@ public:
 
     shared_ptr<StratumNode> stratum() const;
 
+    shared_ptr<WebServer> web_server() const;
+
 protected:
     shared_ptr<boost::asio::io_context> _context;
     shared_ptr<c2pool::Network> _net;
@@ -68,6 +71,9 @@ protected:
     shared_ptr<ShareTracker> _tracker;
     shared_ptr<Worker> _worker;
     shared_ptr<StratumNode> _stratum;
+
+    // Общий для всех NodeManager
+    shared_ptr<WebServer> _web_server;
 
 private:
     std::atomic<bool> _is_loaded = false;
@@ -105,6 +111,8 @@ public:
     create_set_method(Worker, _worker);
 
     create_set_method(StratumNode, _stratum);
+
+    create_set_method(WebServer, _web_server);
 };
 
 #undef create_set_method
