@@ -148,7 +148,7 @@ public:
 
         //path
         //TODO: remove "." for custom path
-        std::string path = path_cat(".", req.target());
+        std::string path = path_cat("web", req.target());
         // send index.html if target end = ".../.../"
 //        if(req.target().back() == '/')
 //            path.append("index.html");
