@@ -65,7 +65,7 @@ sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6AF7F09730B3F0A4
 sudo apt update
 sudo apt install cmake
 ```
-c2pool
+<!-- c2pool
 ```
 
 sudo apt-get update
@@ -81,4 +81,34 @@ git pull
 mkdir cmake-build-debug
 cmake -DCMAKE_BUILD_TYPE=Debug -S . -B cmake-build-debug
 cmake --build cmake-build-debug --target c2pool_main -j 6
+``` -->
+c2pool
+```
+apt update && apt upgrade
+
+apt install wget
+
+apt install g++-9
+update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 900 --slave /usr/bin/g++ g++ /usr/bin/g++-9
+
+wget -O boost_1_71_0.tar.gz https://boostorg.jfrog.io/artifactory/main/release/1.71.0/source/boost_1_71_0.tar.gz
+tar xzvf boost_1_71_0.tar.gz
+cd boost_1_71_0/
+./bootstrap.sh --prefix=/usr/
+./b2
+./b2 install
+cd ..
+
+apt install git
+git clone https://github.com/frstrtr/c2pool.git
+cd c2pool
+mkdir cmake-build-debug
+cmake -DCMAKE_BUILD_TYPE=Debug -S . -B cmake-build-debug
+cmake --build cmake-build-debug --target c2pool_main -j 6
+```
+
+launch
+```
+cd cmake-build-debug
+./c2pool_main --networks=dgb
 ```
