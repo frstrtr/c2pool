@@ -23,4 +23,14 @@ public:
         std::unique_lock lock(mutex_);
         data[var_name] = value;
     }
+
+    std::vector<std::string> fields()
+    {
+        std::vector<std::string> result;
+        for (const auto& field : data)
+        {
+            result.push_back(field.first);
+        }
+        return result;
+    }
 };
