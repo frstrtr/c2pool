@@ -7,6 +7,7 @@
 
 #include "response_sender.h"
 #include "webexcept.h"
+#include "netdatafield.h"
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -225,67 +226,45 @@ public:
     }
 };
 
+// For dynamic net-json generate
+class WebNetJson : public WebNode
+{
+public:
+    typedef std::shared_ptr<NetDataField> net_field;
+    typedef std::function<net_field(const std::string &net_name)> get_net_func_type;
+    typedef std::function<std::string(net_field, const std::map<std::string, std::string>&)> func_type;
+protected:
+    get_net_func_type get_net_func;
+    func_type func;
 
-//class WebNode : public std::enable_shared_from_this<WebNode>
-//{
-//protected:
-//    std::map<std::string, std::shared_ptr<WebNode>> childs;
-//public:
-//    typedef std::function<bool(std::string_view&)> func_type;
-//
-//    func_type func;
-//public:
-//    explicit WebNode(func_type &&_func) : func(std::move(_func)) {}
-//
-//    std::shared_ptr<WebNode> put_child<>(const std::string& key, func_type &&child_func)
-//    {
-//        childs[key] = std::make_shared<WebNode>(std::move(child_func));
-//        return childs[key];
-//    }
-//
-//    std::shared_ptr<WebNode> get_child(const std::string& key)
-//    {
-//        return childs.count(key) ? childs[key] : nullptr;
-//    }
-//
-//    template <class Send>
-//    void handle(const std::string &root_path, Send&& send)
-//    {
-//        //split
-//        std::vector<std::string_view> roots;
-//        {
-//            std::string_view sv(root_path);
-//            size_t pos = 0;
-//            while (pos < sv.length())
-//            {
-//                auto next_pos = sv.find('/', pos);
-//                if (next_pos == std::string_view::npos)
-//                {
-//                    next_pos = sv.length();
-//                }
-//                roots.push_back(sv.substr(pos, next_pos - pos));
-//                pos = next_pos + 1;
-//            }
-//        }
-//
-//        auto _node = shared_from_this();
-//        for (int i = 0; i < roots.size() - 1; i++)
-//        {
-//            auto next_node = _node->get_child(std::string(roots[i]));
-//            if (next_node)
-//                _node = std::move(next_node);
-//            else
-//                throw std::invalid_argument("Node not exist in roots!");
-//        }
-//
-//        bool success = _node->func(roots.back());
-//
-//        if (!success)
-//        {
-//            ERROR MSG
-//        }
-//    }
-//
-//
-//};
-//
+public:
+
+    explicit WebNetJson(get_net_func_type &_get_net_func, func_type &&_func) : get_net_func(std::move(_get_net_func)), func(std::move(_func)) {}
+
+    void handle(const RequestData& rq, UrlData::path_it path_pos, ResponseSender &sender) override
+    {
+        http::response<http::dynamic_body> response_;
+
+//        http::response<http::file_body> res{
+//                std::piecewise_construct,
+//                std::make_tuple(std::move(body)),
+//                std::make_tuple(http::status::ok, req.version())};
+//        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+//        res.set(http::field::content_type, "application/json");
+//        res.content_length(size);
+//        res.keep_alive(req.keep_alive());
+
+
+        response_.set(http::field::content_type, "application/json");
+        std::string net_name;
+        if (rq.url.query.count("net"))
+            net_name = rq.url.query.at("net");
+        else
+            throw WebBadRequest("In query not exist net field!");
+
+        auto net = get_net_func(net_name);
+
+        beast::ostream(response_.body()) << func(std::move(net), rq.url.query);
+        return sender(std::move(response_));
+    }
+};
