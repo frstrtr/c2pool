@@ -8,6 +8,8 @@
 #include <mutex>
 #include <shared_mutex>
 
+#include <boost/algorithm/string.hpp>
+
 #include "webnode.h"
 
 // Example:
@@ -108,6 +110,43 @@ public:
     {
         web = std::make_shared<WebInterface>(std::move(func));
     }
+
+    template <typename NodeType>
+    std::shared_ptr<NodeType> get(std::string path)
+    {
+        std::vector<std::string> els; // elements of path
+        boost::split(els, path, boost::is_any_of("/"));
+
+        std::shared_ptr<WebInterface> cur_node = get_interface();
+
+        if (els.empty() || els[0].empty())
+        {
+            if (els.size() <= 1)
+                return cur_node;
+            else
+                els.erase(els.begin());
+        }
+
+        for (int i = 0; i < els.size()-1; i++)
+        {
+            auto child_node = cur_node->get_child(els[i]);
+
+            if (child_node)
+                cur_node = std::dynamic_pointer_cast<WebInterface, WebNode>(child_node);
+            else
+                cur_node = nullptr;
+
+            if (!cur_node)
+                throw WebInitError("Error when cast child_node");
+        }
+
+        std::shared_ptr<NodeType> result = std::dynamic_pointer_cast<NodeType, WebNode>(cur_node->get_child(els.back()));
+        if (result)
+            return result;
+        else
+            throw WebInitError("Error when cast to result type");
+    }
+
 
     std::shared_ptr<WebInterface> get_interface(){
         return web;
