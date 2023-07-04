@@ -1,4 +1,5 @@
 set(web_interface_source
+        netdatafield.h
         response_sender.h
         webnode.h
         webroot.h
