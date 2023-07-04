@@ -86,54 +86,94 @@ namespace c2pool::master
         });
 
         //---> Config Status node
+        /*
+        auto dgb = web_root->new_net("dgb");
+        dgb->set("hashrate", "123123");
+        dgb->set("doa_orphan_rate", "22%");
+        dgb->set("difficulty", "0.1231231223213");*/
         //------> Pool Rate
         status->put_child<WebNetJson>("pool_rate",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-            return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                          {"hashrate",        net->get("hashrate")},
+                                                          {"doa_orphan_rate", net->get("doa_orphan_rate")},
+                                                          {"difficulty",      net->get("difficulty")}
+                                                  };
+                                          return j.dump();
                                       });
         //------> NodeUptime
         status->put_child<WebNetJson>("node_uptime",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
         //------> LocalRate
         status->put_child<WebNetJson>("local_rate",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
         //------> Shares
         status->put_child<WebNetJson>("shares",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
 
         //------> Payout
         status->put_child<WebNetJson>("payout",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
         //------> LastBlock
         status->put_child<WebNetJson>("last_block",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
         //------> AddrsAmount
         status->put_child<WebNetJson>("addrs_amount",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
         //------> MinersHasharate
         status->put_child<WebNetJson>("miners_hashrate",
                                       web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query) {
-                                          return "";
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          json j
+                                                  {
+                                                  };
+                                          return j.dump();
                                       });
 
         //---> Finish configure web_root/web_server
