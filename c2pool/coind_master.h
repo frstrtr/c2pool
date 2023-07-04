@@ -4,7 +4,6 @@
 #include <memory>
 #include <thread>
 #include <vector>
-using namespace std;
 
 #include <libdevcore/config.h>
 #include <libdevcore/logger.h>
@@ -86,11 +85,10 @@ namespace c2pool::master
         });
 
         //---> Config Status node
-        /*
         auto dgb = web_root->new_net("dgb");
         dgb->set("hashrate", "123123");
         dgb->set("doa_orphan_rate", "22%");
-        dgb->set("difficulty", "0.1231231223213");*/
+        dgb->set("difficulty", "0.1231231223213");
         //------> Pool Rate
         status->put_child<WebNetJson>("pool_rate",
                                       web_root->net_functor(),
@@ -98,8 +96,8 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
-                                                          {"hashrate",        net->get("hashrate")},
-                                                          {"doa_orphan_rate", net->get("doa_orphan_rate")},
+                                                          {"hashrate",        net->get("pool_hashrate")},
+                                                          {"doa_orphan_rate", net->get("pool_doa_orphan_rate")},
                                                           {"difficulty",      net->get("difficulty")}
                                                   };
                                           return j.dump();
@@ -111,6 +109,12 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
+                                                          {"uptite", net->get("uptime")},
+                                                          {"peers",  {
+                                                                             {"in", net->get("peers_in")},
+                                                                             {"out", net->get("peers_out")}
+                                                                     }
+                                                          }
                                                   };
                                           return j.dump();
                                       });
@@ -121,6 +125,9 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
+                                                          {"hashrate",        net->get("local_hashrate")},
+                                                          {"doa_orphan_rate", net->get("doa_orphan_rate")},
+                                                          {"difficulty",      net->get("difficulty")}
                                                   };
                                           return j.dump();
                                       });
@@ -175,6 +182,17 @@ namespace c2pool::master
                                                   };
                                           return j.dump();
                                       });
+
+        //---> Debug Interface
+        auto debug = index->put_child<WebInterface>("debug", [](const auto &query) {});
+        //------> NetField keys
+        debug->put_child<WebNetJson>("netfield_keys",
+                                     web_root->net_functor(),
+                                     [&](const WebNetJson::net_field &net, const auto &query)
+                                     {
+                                         json j = net->fields();
+                                         return j.dump();
+                                     });
 
         //---> Finish configure web_root/web_server
         web->add_web_root(web_root);
