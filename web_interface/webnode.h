@@ -25,21 +25,8 @@ bool isDirectory(const std::string& path);
 
 class WebNode : public std::enable_shared_from_this<WebNode>
 {
-//protected:
-//    typedef std::function<bool(ResponseSender&)> func_type;
-//
-//    func_type func;
-//public:
-//    explicit WebNode(func_type &&_func) : func(std::move(_func)) {}
-    static std::string_view get_root_from_path(std::list<std::string_view>& root_path)
-    {
-        auto result = root_path.front();
-        root_path.pop_front();
-        return result;
-    }
 public:
     virtual void handle(const RequestData& rq, std::list<std::string>::iterator path_pos, ResponseSender &sender) = 0;
-//    virtual void handle(const std::string &root_path, ResponseSender &_sender) = 0;
 };
 
 // For web tree logic
