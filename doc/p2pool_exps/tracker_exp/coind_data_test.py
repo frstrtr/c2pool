@@ -89,3 +89,9 @@ print(hex(coind_data.check_merkle_link(tip_hash, coind_data.calculate_merkle_lin
 print(hex(pack.FloatingInteger(503351432).target))
 print(hex(pack.FloatingInteger(504365055).target))
 print(hex(coind_data.difficulty_to_target(0.0002441371325370145)))
+
+
+##########
+
+addr_human_type = coind_data.human_address_type.unpack(coind_data.base58_decode("sr2MqR3WzJYvKZv4px1ohqCudcMT8kn2Kg"))
+print(addr_human_type)
