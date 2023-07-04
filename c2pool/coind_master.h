@@ -72,14 +72,77 @@ namespace c2pool::master
 
     void init_web(const std::shared_ptr<WebServer>& web)
     {
+        //---> Create WebRoot
         auto web_root = std::make_shared<WebRoot>(
-                [](WebInterface::func_type::argument_type& query)
+                [](WebInterface::func_type::argument_type &query)
                 {
                 });
+
+        //---> Create Index & sub index nodes
+        auto index = web_root->get_interface();
+        auto status = index->put_child<WebInterface>("status", [](const auto &query)
+        {
+
+        });
+
+        //---> Config Status node
+        //------> Pool Rate
+        status->put_child<WebNetJson>("pool_rate",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+            return "";
+                                      });
+        //------> NodeUptime
+        status->put_child<WebNetJson>("node_uptime",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+        //------> LocalRate
+        status->put_child<WebNetJson>("local_rate",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+        //------> Shares
+        status->put_child<WebNetJson>("shares",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+
+        //------> Payout
+        status->put_child<WebNetJson>("payout",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+        //------> LastBlock
+        status->put_child<WebNetJson>("last_block",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+        //------> AddrsAmount
+        status->put_child<WebNetJson>("addrs_amount",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+        //------> MinersHasharate
+        status->put_child<WebNetJson>("miners_hashrate",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query) {
+                                          return "";
+                                      });
+
+        //---> Finish configure web_root/web_server
         web->add_web_root(web_root);
 
+
+
         //---> New net
-        auto &web_dgb = web_root->new_net("dgb");
+//        auto &web_dgb = web_root->new_net("dgb");
 
     }
 }
