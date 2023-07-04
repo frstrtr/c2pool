@@ -5,44 +5,22 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
-#include <mutex>
-#include <shared_mutex>
 
 #include <boost/algorithm/string.hpp>
 
+#include "netdatafield.h"
 #include "webnode.h"
 
 // Example:
 //      auto& net_root = web_root->new_net("dgb");
 //      new_root->set("shares_count", json);
 
-class NetDataField
-{
-    std::shared_mutex mutex_;
-
-    std::unordered_map<std::string, std::string> data; // key -- variable name; value -- json value
-public:
-
-    std::string get(const std::string& var_name)
-    {
-        std::shared_lock lock(mutex_);
-        //TODO: throw WebNotFound?
-        return data.count(var_name) ? data.at(var_name) : "";
-    }
-
-    void set(const std::string &var_name, const std::string &value)
-    {
-        std::unique_lock lock(mutex_);
-        data[var_name] = value;
-    }
-};
-
 class WebRoot
 {
 protected:
     std::shared_ptr<WebInterface> web;
 
-    std::unordered_map<std::string, std::unique_ptr<NetDataField>> datas; // key -- net_name;
+    std::unordered_map<std::string, std::shared_ptr<NetDataField>> datas; // key -- net_name;
 protected:
     template<class Body, class Allocator>
     auto bad_request(http::request<Body, http::basic_fields<Allocator>>& req, std::string_view why)
@@ -152,14 +130,9 @@ public:
         return web;
     }
 
-    NetDataField& net(const std::string &net_name)
-    {
-        return *datas[net_name];
-    }
-
     NetDataField& new_net(const std::string &net_name)
     {
-        datas[net_name] = std::make_unique<NetDataField>();
+        datas[net_name] = std::make_shared<NetDataField>();
         return *datas[net_name];
     }
 
@@ -168,9 +141,20 @@ public:
         return datas.count(net_name);
     }
 
-    template<
-            class Body, class Allocator,
-            class Send>
+    std::shared_ptr<NetDataField> net(const std::string &net_name)
+    {
+        if (exist_net(net_name))
+            return datas[net_name];
+        else
+            throw WebServerError((boost::format("NetDataField %1% not founded") % net_name).str());
+    }
+
+    std::function<std::shared_ptr<NetDataField>(const std::string &net_name)> net_functor()
+    {
+        return [&](const std::string &net_name){return net(net_name);};
+    }
+
+    template<class Body, class Allocator, class Send>
     void handle_request(http::request<Body, http::basic_fields<Allocator>>&& req,
                         Send&& send)
     {
