@@ -130,10 +130,10 @@ public:
         return web;
     }
 
-    NetDataField& new_net(const std::string &net_name)
+    std::shared_ptr<NetDataField> new_net(const std::string &net_name)
     {
         datas[net_name] = std::make_shared<NetDataField>();
-        return *datas[net_name];
+        return datas[net_name];
     }
 
     bool exist_net(const std::string &net_name)
