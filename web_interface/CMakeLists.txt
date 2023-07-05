@@ -1,14 +1,6 @@
-set(web_interface_source
-        netdatafield.h
-        response_sender.h
-        webnode.h
-        webroot.h
-        webserver.h
-        webexcept.h
-        session_interface.h
-        webroot.cpp
-        webnode.cpp
-        response_sender.cpp)
 
-add_library(web_interface ${web_interface_source})
-#target_link_libraries(web_interface )
+set (METRICS metrics/metric.h metrics/metric_sum.h metrics/metric.h metrics/metric_value.h)
+set (WEBLIB netdatafield.h webroot.cpp webroot.h#[[web_interface.h]] webnode.cpp webnode.h response_sender.h webserver.h webexcept.h session_interface.h response_sender.cpp)
+
+add_library(web_interface ${METRICS} ${WEBLIB})
+target_link_libraries(web_interface PRIVATE nlohmann_json::nlohmann_json)
