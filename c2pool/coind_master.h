@@ -32,8 +32,12 @@ namespace c2pool::master
         auto net = c2pool::load_network_file(name);
         LOG_INFO << name << " config initialization...";
         auto cfg = c2pool::dev::load_config_file(name);//std::make_shared<c2pool::dev::coind_config>(name);
-//        LOG_INFO << "web server initialization...";
-//        auto web = std::make_shared<WebServer>()
+        LOG_INFO << "web server initialization...";
+        auto root = web->get_web_root();
+        //------> new net in web_root
+        auto web_net = root->new_net(name);
+        web_net->set("uptime_begin", std::to_string(c2pool::dev::timestamp()));
+
 
         //NodeManager
         LOG_INFO << name << " NodeManager initialization...";
@@ -85,10 +89,10 @@ namespace c2pool::master
         });
 
         //---> Config Status node
-        auto dgb = web_root->new_net("dgb");
-        dgb->set("hashrate", "123123");
-        dgb->set("doa_orphan_rate", "22%");
-        dgb->set("difficulty", "0.1231231223213");
+//        auto dgb = web_root->new_net("dgb");
+//        dgb->set("hashrate", "123123");
+//        dgb->set("doa_orphan_rate", "22%");
+//        dgb->set("difficulty", "0.1231231223213");
         //------> Pool Rate
         status->put_child<WebNetJson>("pool_rate",
                                       web_root->net_functor(),
@@ -109,7 +113,7 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
-                                                          {"uptite", net->get("uptime")},
+                                                          {"uptime", c2pool::dev::timestamp() - std::stoi(net->get("uptime_begin"))},
                                                           {"peers",  {
                                                                              {"in", net->get("peers_in")},
                                                                              {"out", net->get("peers_out")}
@@ -125,9 +129,9 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
-                                                          {"hashrate",        net->get("local_hashrate")},
-                                                          {"doa_orphan_rate", net->get("doa_orphan_rate")},
-                                                          {"difficulty",      net->get("difficulty")}
+                                                          {"hashrate",   net->get("local_hashrate")},
+                                                          {"doa",        net->get("doa")},
+                                                          {"difficulty", net->get("difficulty")}
                                                   };
                                           return j.dump();
                                       });
@@ -138,6 +142,10 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
+                                                          {"total", net->get("shares_total")},
+                                                          {"orphaned", net->get("shares_orphaned")},
+                                                          {"dead", net->get("shares_dead")},
+                                                          {"efficiency", net->get("shares_efficiency")},
                                                   };
                                           return j.dump();
                                       });
@@ -149,6 +157,7 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
+                                                          {""}
                                                   };
                                           return j.dump();
                                       });
