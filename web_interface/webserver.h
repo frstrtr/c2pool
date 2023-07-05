@@ -161,6 +161,11 @@ public:
         web = std::move(_web);
     }
 
+    std::shared_ptr<WebRoot> get_web_root() const
+    {
+        return web;
+    }
+
     // Start accepting incoming connections
     void run()
     {
