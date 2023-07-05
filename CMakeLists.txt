@@ -49,8 +49,10 @@ include_directories(${Boost_INCLUDE_DIRS})
 
 set (CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-hunter_add_package(nlohmann_json)
-find_package(nlohmann_json CONFIG REQUIRED)
+# If you only include this third party in PRIVATE source files, you do not need to install it
+# when your main project gets installed.
+set(JSON_Install OFF CACHE INTERNAL "")
+add_subdirectory(include/json)
 
 add_subdirectory(libs)
 #---------------
