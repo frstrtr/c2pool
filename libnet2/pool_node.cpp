@@ -718,47 +718,47 @@ void PoolNode::download_shares()
 
 void PoolNode::init_web_metrics()
 {
-    LOG_DEBUG_SHARETRACKER << "ShareTracker::init_web_metrics -- started: " << c2pool::dev::timestamp();
+    LOG_DEBUG_POOL << "PoolNode::init_web_metrics -- started: " << c2pool::dev::timestamp();
 
     //---> add metrics
     stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
     stale_rate_metric = net->web->add<stale_rate_metric_type>("stale_rate");
 
     //---> subs for metrics
-    best_share.changed->subscribe([&](const uint256& hash){
-        auto share = tracker->get(hash);
-        if (!share)
-        {
-            LOG_ERROR << hash << " not found in tracker";
-            return;
-        }
+//    best_share.changed->subscribe([&](const uint256& hash){
+//        auto share = tracker->get(hash);
+//        if (!share)
+//        {
+//            LOG_ERROR << hash << " not found in tracker";
+//            return;
+//        }
+//
+//        shares_stale_count el;
+//        auto avg_attempts = coind::data::target_to_average_attempts(share->target);
+//
+//        el.good = avg_attempts;
+//        if (*share->stale_info != unk)
+//        {
+//            switch (*share->stale_info)
+//            {
+//                case orphan:
+//                    el.orphan = avg_attempts;
+//                    break;
+//                case doa:
+//                    el.doa = avg_attempts;
+//                    break;
+//                default:
+//                    break;
+//            }
+//        }
+//
+//        //------> stale_count
+//        stale_counts_metric->add(el);
+//        //------> stale_rate
+//        stale_rate_metric->add(el, *share->timestamp);
+//
+//    });
 
-        shares_stale_count el;
-        auto avg_attempts = coind::data::target_to_average_attempts(share->target);
 
-        el.good = avg_attempts;
-        if (*share->stale_info != unk)
-        {
-            switch (*share->stale_info)
-            {
-                case orphan:
-                    el.orphan = avg_attempts;
-                    break;
-                case doa:
-                    el.doa = avg_attempts;
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        //------> stale_count
-        stale_counts_metric->add(el);
-        //------> stale_rate
-        stale_rate_metric->add(el, *share->timestamp);
-
-    });
-
-
-    LOG_DEBUG_SHARETRACKER << "ShareTracker::init_web_metrics -- finished: " << c2pool::dev::timestamp();
+    LOG_DEBUG_POOL << "PoolNode::init_web_metrics -- finished: " << c2pool::dev::timestamp();
 }
