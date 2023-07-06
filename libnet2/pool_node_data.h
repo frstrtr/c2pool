@@ -13,12 +13,26 @@
 #include <libdevcore/addr_store.h>
 #include <sharechains/share.h>
 #include <sharechains/share_tracker.h>
+#include <web_interface/metrics/metric_rate.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
 namespace ip = io::ip;
 
 class CoindNodeData;
+
+class WebPoolNode
+{
+protected:
+//    typedef MetricSum<shares_stale_count, 120> stale_counts_metric_type;
+//    typedef MetricRateTime<shares_stale_count, 120> stale_rate_metric_type;
+protected:
+    // Metrics
+//    stale_counts_metric_type* stale_counts_metric{};
+//    stale_rate_metric_type* stale_rate_metric{};
+public:
+    virtual void init_web_metrics() = 0;
+};
 
 class PoolNodeData
 {

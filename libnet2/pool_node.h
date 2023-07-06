@@ -137,7 +137,7 @@ public:
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, public enable_shared_from_this<PoolNode>
+class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, protected WebPoolNode, public enable_shared_from_this<PoolNode>
 {
 private:
     uint64_t nonce; // node_id
@@ -216,5 +216,7 @@ private:
     void start();
 
     void download_shares();
+
+    void init_web_metrics() override;
 };
 #undef SET_POOL_DEFAULT_HANDLER
