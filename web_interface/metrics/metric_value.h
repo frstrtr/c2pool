@@ -31,7 +31,7 @@ class MetricValues : public Metric
 public:
     MetricValues() = default;
 
-    explicit MetricValues(nlohmann::json&& json)
+    explicit MetricValues(const nlohmann::json& json)
     {
         std::unique_lock lock(mutex_);
         j = json;
