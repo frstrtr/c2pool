@@ -10,6 +10,8 @@ ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : BaseShareTracker(
 
 void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes)
 {
+    init_web_metrics();
+
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
 
     PreparedList prepare_shares(_shares);
@@ -74,6 +76,43 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
 //
 //        return std::make_tuple<int32_t, int32_t, int32_t, int32_t>(0, 0, 0, 0);
 //    });
+}
+
+void ShareTracker::init_web_metrics()
+{
+    LOG_DEBUG_SHARETRACKER << "ShareTracker::init_web_metrics -- started: " << c2pool::dev::timestamp();
+
+    //---> add metrics
+    stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
+
+    //---> subs for metrics
+    added.subscribe([&](const ShareType& share){
+        shares_stale_count el;
+
+        el.good = coind::data::target_to_average_attempts(share->target);
+        if (*share->stale_info != unk)
+        {
+            switch (*share->stale_info)
+            {
+                case orphan:
+                    el.orphan = coind::data::target_to_average_attempts(share->target);
+                    break;
+                case doa:
+                    el.doa = coind::data::target_to_average_attempts(share->target);
+                    break;
+                default:
+                    break;
+            }
+        }
+        stale_counts_metric->add(el);
+    });
+
+//    added.subscribe([&](const ShareType& share){
+//        auto lookbehind = std::min(120, get_height( node.best_share_var.value));
+//    });
+
+
+    LOG_DEBUG_SHARETRACKER << "ShareTracker::init_web_metrics -- finished: " << c2pool::dev::timestamp();
 }
 
 ShareType ShareTracker::get(uint256 hash)
