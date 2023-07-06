@@ -60,6 +60,7 @@ include_directories(libs/jsonrpccxx)
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_subdirectory(btclibs)
+add_subdirectory(web_interface)
 add_subdirectory(networks)
 add_subdirectory(libcoind)
 add_subdirectory(sharechains) #ver. 2
@@ -67,7 +68,6 @@ add_subdirectory(libdevcore)
 #add_subdirectory(libnet)
 add_subdirectory(libnet2)
 add_subdirectory(libp2p)
-add_subdirectory(web_interface)
 
 add_subdirectory(c2pool)
 

@@ -4,7 +4,7 @@
 #include <list>
 
 
-template <unsigned int Size, typename T>
+template <typename T, unsigned int Size = 0>
 class MetricRateTime : public Metric
 {
     static constexpr int max_size = Size;
@@ -19,10 +19,15 @@ class MetricRateTime : public Metric
     T sum{};
 
 public:
+    inline auto size_check() const
+    {
+        return (max_size != 0) && (datas.size() == max_size);
+    }
+
     void add(const T& value, int timestamp)
     {
         std::unique_lock lock(mutex_);
-        if (datas.size() == max_size)
+        if (size_check())
         {
             sum -= datas.front().data;
             datas.pop_front();
