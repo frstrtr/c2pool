@@ -10,6 +10,13 @@
 
 #include "message.h"
 
+enum connection_type
+{
+    unknown,
+    incoming,
+    outgoing
+};
+
 class Socket
 {
 public:
@@ -21,6 +28,7 @@ protected:
     std::tuple<std::string, std::string> addr;
     std::tuple<std::string, std::string> addr_local;
 
+    connection_type conn_type_; // unk, in, out
     std::string last_message_sent; // last message sent by me and received by peer.
     std::string last_message_received; // last message sent by peer and received by me.
     std::map<std::string, int32_t> not_received; // messages sent by me and not yet received by peer
@@ -41,14 +49,15 @@ protected:
             not_received.erase(key);
     }
 public:
-    Socket() {}
-
-    Socket(handler_type message_handler) : handler(std::move(message_handler)) {}
+    explicit Socket(connection_type conn_type = connection_type::unknown) : conn_type_(conn_type) {}
+    Socket(handler_type message_handler, connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), handler(std::move(message_handler)){}
 
     void set_message_handler(handler_type message_handler)
     {
         handler = std::move(message_handler);
     }
+
+    connection_type get_type() const { return conn_type_; }
 
     virtual void write(std::shared_ptr<Message> msg) = 0;
     virtual void read() = 0;
