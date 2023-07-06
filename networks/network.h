@@ -9,6 +9,7 @@
 #include "btclibs/uint256.h"
 #include "btclibs/arith_uint256.h"
 #include <libdevcore/stream.h>
+#include <web_interface/netdatafield.h>
 
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/ini_parser.hpp>
@@ -39,8 +40,14 @@ namespace c2pool
         const std::string net_name;
     public:
         std::shared_ptr<coind::ParentNetwork> parent;
+        std::shared_ptr<NetDataField> web;
 
         static boost::property_tree::ptree make_default_network();
+        void set_web(std::shared_ptr<NetDataField> _web_data)
+        {
+            web = _web_data;
+        }
+
     public:
 		std::set<std::string> SOFTFORKS_REQUIRED;
         //std::tuple<std::string, std::string> = addr
