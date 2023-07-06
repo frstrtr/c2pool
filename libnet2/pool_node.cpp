@@ -721,8 +721,28 @@ void PoolNode::init_web_metrics()
     LOG_DEBUG_POOL << "PoolNode::init_web_metrics -- started: " << c2pool::dev::timestamp();
 
     //---> add metrics
-    stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
-    stale_rate_metric = net->web->add<stale_rate_metric_type>("stale_rate");
+//    peers_metric = net->web->add<peers_metric_type>("peers", nlohmann::json{{"in", 0}, {"out", 0}});
+    peers_metric = net->web->add<peers_metric_type>("peers", [&](auto& j){
+        int in = 0, out = 0;
+        for (const auto&[k, v]:peers)
+        {
+            switch (v->get_socket()->get_type())
+            {
+                case connection_type::incoming:
+                    ++in;
+                    break;
+                case connection_type::outgoing:
+                    ++out;
+                    break;
+                default:
+                    break;
+            }
+        }
+        j["in"] = in;
+        j["out"] = out;
+    });
+//    stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
+//    stale_rate_metric = net->web->add<stale_rate_metric_type>("stale_rate");
 
     //---> subs for metrics
 //    best_share.changed->subscribe([&](const uint256& hash){
