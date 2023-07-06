@@ -15,7 +15,7 @@ protected:
     nlohmann::json j{};
 
 public:
-    virtual nlohmann::json get() const
+    virtual nlohmann::json get()
     {
         std::shared_lock lock(mutex_);
         return j;
