@@ -4,6 +4,7 @@
 
 #include "base_share_tracker.h"
 #include "share_store.h"
+#include <web_interface/metrics/metric_macro_scope.h>
 
 class PrepareListNode
 {
@@ -166,7 +167,37 @@ struct TrackerThinkResult
     std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
 };
 
-class ShareTracker : public BaseShareTracker, public std::enable_shared_from_this<ShareTracker>
+//---> Web Share Tracker
+
+struct shares_stale_count
+{
+    arith_uint288 good;
+    arith_uint288 doa;
+    arith_uint288 orphan;
+
+    shares_stale_count operator/(const int& t) const
+    {
+        return shares_stale_count{good/t, doa/t, orphan/t};
+    }
+
+    CUSTOM_METRIC_DEFINE_TYPE_INTRUSIVE(shares_stale_count, good, doa, orphan);
+};
+
+class WebShareTracker
+{
+protected:
+    //typedef MetricSum<shares_stale_count, 120> stale_counts_metric_type;
+
+protected:
+    // Metrics
+    //stale_counts_metric_type* stale_counts_metric{};
+protected:
+    virtual void init_web_metrics() = 0;
+};
+
+//---> Share Tracker
+
+class ShareTracker : public BaseShareTracker, protected WebShareTracker, public std::enable_shared_from_this<ShareTracker>
 {
 public:
     ShareStore share_store;
@@ -178,6 +209,7 @@ public:
     ShareTracker(shared_ptr<c2pool::Network> _net);
 
     void init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes);
+    void init_web_metrics() override;
 
     ShareType get(uint256 hash);
 
