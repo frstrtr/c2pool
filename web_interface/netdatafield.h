@@ -51,6 +51,17 @@ public:
         }
         return metric;
     }
+//
+//    template <typename MetricType, typename... Args>
+//    MetricType* add(const std::string &metric_name, Args&&... args)
+//    {
+//        auto* metric = new MetricType(std::forward<Args>(args)...);
+//        {
+//            std::unique_lock lock(mutex_);
+//            data[metric_name] = metric;
+//        }
+//        return metric;
+//    }
 
     template <typename T>
     MetricValue* add(const std::string &metric_name, T&& value)
