@@ -1,6 +1,6 @@
 1. [ ] Node Uptime
    - [x] Uptime -- время записывается в поле __uptime_begin__ при создании ноды.
-   - [ ] Peers in/out -- записывается в поле __peers__ при подключении/отключении к нодам из p2p_node
+   - [x] Peers in/out -- записывается в поле __peers__ при подключении/отключении к нодам из p2p_node
 2. [ ] Shares -- Один json из MetricValue = __shares__; Объявляется в Worker'e. Обновляется каждый раз, как на нашей ноде создаётся новая шара (worker.get_stale_counts)
    - [ ] Total/Orphaned/Dead -- поле __total__, __orphan__, __dead__ 
    - [ ] Efficiency -- поле __efficiency__
