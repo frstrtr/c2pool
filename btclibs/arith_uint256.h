@@ -337,22 +337,22 @@ arith_uint256 operator+(const arith_uint256 &a, const uint256 &b);
 
 arith_uint256 operator-(const arith_uint256 &a, const uint256 &b);
 
-void to_json(nlohmann::json& j, const arith_uint256& p)
+inline void to_json(nlohmann::json& j, const arith_uint256& p)
 {
     j = p.GetHex();
 }
 
-void from_json(const nlohmann::json& j, arith_uint256& p)
+inline void from_json(const nlohmann::json& j, arith_uint256& p)
 {
     p.SetHex(j.get<std::string>());
 }
 
-void to_json(nlohmann::json& j, const arith_uint288& p)
+inline void to_json(nlohmann::json& j, const arith_uint288& p)
 {
     j = p.GetHex();
 }
 
-void from_json(const nlohmann::json& j, arith_uint288& p)
+inline void from_json(const nlohmann::json& j, arith_uint288& p)
 {
     p.SetHex(j.get<std::string>());
 }
