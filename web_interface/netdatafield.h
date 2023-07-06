@@ -6,6 +6,7 @@
 
 #include "webexcept.h"
 #include "metrics/metric.h"
+#include "metrics/metric_sum.h"
 #include "metrics/metric_value.h"
 
 #include <boost/format.hpp>
