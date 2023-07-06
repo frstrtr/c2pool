@@ -1,0 +1,5 @@
+#include "metrics/metric_macro_scope.h"
+#include "metrics/metric_value.h"
+#include "metrics/metric_getter.h"
+#include "metrics/metric_sum.h"
+#include "metrics/metric_rate.h"
