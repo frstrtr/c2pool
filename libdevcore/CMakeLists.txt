@@ -15,5 +15,6 @@ find_library(dl NAMES dl)
 add_library(libdevcore ${devcore_sources})
 target_link_libraries(libdevcore Boost::coroutine Boost::log Boost::log_setup univalue ${dl})
 target_link_libraries(libdevcore btclibs Threads::Threads leveldb)
+target_link_libraries(libdevcore nlohmann_json::nlohmann_json)
 
 target_compile_definitions(libdevcore PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
