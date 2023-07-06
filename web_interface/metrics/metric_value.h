@@ -31,16 +31,10 @@ class MetricValues : public Metric
 public:
     MetricValues() = default;
 
-    template <typename T>
-    explicit MetricValues(const std::string& field_name, const T& value)
+    explicit MetricValues(nlohmann::json&& json)
     {
-        set(field_name, value);
-    }
-
-    template <typename T>
-    explicit MetricValues(const std::string& field_name, T&& value)
-    {
-        set(field_name, value);
+        std::unique_lock lock(mutex_);
+        j = json;
     }
 
     template<typename T>
