@@ -2,7 +2,7 @@
 
 #include "metric.h"
 
-template <unsigned int Size, typename T>
+template <typename T, unsigned int Size = 0>
 class MetricSum : public Metric
 {
     static constexpr int max_size = Size;
@@ -17,11 +17,15 @@ public:
     {
     }
 
+    inline auto size_check() const
+    {
+        return (max_size != 0) && (array.size() == max_size);
+    }
 
     void add(const T& value)
     {
         std::unique_lock lock(mutex_);
-        if (array.size() == max_size)
+        if (size_check())
         {
             sum_value -= array.begin()->template get<T>();
             array.erase(array.begin());
@@ -35,7 +39,7 @@ public:
     void add(T&& value)
     {
         std::unique_lock lock(mutex_);
-        if (array.size() == max_size)
+        if (size_check())
         {
             sum_value -= array.begin()->template get<T>();
             array.erase(array.begin());
