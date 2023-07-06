@@ -43,7 +43,7 @@ public:
 								  {
 									  auto boost_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
 									  auto socket = std::make_shared<SocketType>(
-											  boost_socket, net
+											  boost_socket, net, connection_type::incoming
 									  );
 									  handle(socket);
 									  socket->read();
@@ -86,7 +86,7 @@ public:
 									}
 								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
 								   auto socket = std::make_shared<SocketType>(
-										   _socket, net
+										   _socket, net, connection_type::outgoing
 								   );
 
 

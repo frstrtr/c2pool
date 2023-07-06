@@ -27,12 +27,12 @@ private:
     }
 public:
 
-	PoolSocket(auto _socket, auto _net) : socket(std::move(_socket)), net(std::move(_net))
+	PoolSocket(auto _socket, auto _net, auto conn_type) : Socket(conn_type), socket(std::move(_socket)), net(std::move(_net))
 	{
 		LOG_DEBUG_POOL << "PoolSocket created";
 	}
 
-	PoolSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
+	PoolSocket(auto _socket, auto _net, handler_type message_handler, auto conn_type) : Socket(std::move(message_handler), conn_type), socket(std::move(_socket)), net(std::move(_net))
 	{
         LOG_DEBUG_POOL << "PoolSocket created2";
 	}
