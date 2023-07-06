@@ -4,13 +4,13 @@
 
 #include <functional>
 
-class MetricGetter : Metric
+class MetricGetter : public Metric
 {
     typedef std::function<void(nlohmann::json& j)> func_type;
 private:
     func_type func_;
 public:
-    explicit MetricGetter(func_type&& func) : func_(std::move(func)){}
+    explicit MetricGetter(func_type func) : func_(std::move(func)){}
 
     nlohmann::json get() override
     {
