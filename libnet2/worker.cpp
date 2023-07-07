@@ -220,6 +220,7 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
        new_work.happened();
     });
 
+    init_web_metrics();
 }
 
 worker_get_work_result
@@ -689,8 +690,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                         LOG_ERROR << "Error forwarding block solution: " << ec.message();
                     }
 
-                    //TODO: for web_static
+                    //for web_static
                     //self.share_received.happened(bitcoin_data.target_to_average_attempts(share.target), not on_time, share.hash)
+                    share_received.happened();
                 }
 
                 if (pow_hash > target)
@@ -741,29 +743,28 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
 local_rates Worker::get_local_rates()
 {
-    std::map<std::string, uint256> miner_hash_rates;
-    std::map<std::string, uint256> miner_dead_hash_rates;
+    std::map<std::string, arith_uint288> miner_hash_rates;
+    std::map<std::string, arith_uint288> miner_dead_hash_rates;
 
     auto [datums, dt] = local_rate_monitor.get_datums_in_last();
-    for (auto datum: datums)
+    for (const auto& datum: datums)
     {
         {
-            arith_uint256 temp;
-            temp = ((miner_hash_rates.find(datum.user) != miner_hash_rates.end()) ? miner_hash_rates[datum.user]
-                                                                                  : uint256::ZERO);
-//            temp += UintToArith256(datum.work) / dt; //TODO:
-
-            miner_hash_rates[datum.user] = ArithToUint256(temp);
+//            arith_uint288 temp;
+//            temp = (miner_hash_rates.count(datum.user) ? miner_hash_rates[datum.user] : arith_uint288{});
+            miner_hash_rates[datum.user] += datum.work / dt;
         }
 
         if (datum.dead)
         {
-            arith_uint256 temp;
-            temp = ((miner_dead_hash_rates.find(datum.user) != miner_dead_hash_rates.end())
-                    ? miner_dead_hash_rates[datum.user]
-                    : uint256::ZERO);
+//            arith_uint256 temp;
+//            temp = ((miner_dead_hash_rates.find(datum.user) != miner_dead_hash_rates.end())
+//                    ? miner_dead_hash_rates[datum.user]
+//                    : uint256::ZERO);
 //            temp += UintToArith256(datum.work) / dt; //TODO:
-            miner_dead_hash_rates[datum.user] = ArithToUint256(temp);
+//            miner_dead_hash_rates[datum.user] = ArithToUint256(temp);
+
+            miner_dead_hash_rates[datum.user] += datum.work / dt;
         }
     }
 
