@@ -183,6 +183,7 @@ public:
 			auto_connect();
 		}
         start();
+        init_web_metrics();
 	}
 
 	// Handshake handlers
