@@ -36,7 +36,8 @@ namespace c2pool::master
         auto root = web->get_web_root();
         //------> new net in web_root
         auto web_net = root->new_net(name);
-        web_net->set("uptime_begin", std::to_string(c2pool::dev::timestamp()));
+        net->set_web(web_net);
+        web_net->add("uptime_begin", c2pool::dev::timestamp());
 
 
         //NodeManager
@@ -113,12 +114,8 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
-                                                          {"uptime", c2pool::dev::timestamp() - std::stoi(net->get("uptime_begin"))},
-                                                          {"peers",  {
-                                                                             {"in", net->get("peers_in")},
-                                                                             {"out", net->get("peers_out")}
-                                                                     }
-                                                          }
+                                                          {"uptime", c2pool::dev::timestamp() - net->get<int>("uptime_begin")},
+                                                          {"peers",  net->get("peers")}
                                                   };
                                           return j.dump();
                                       });
@@ -129,9 +126,9 @@ namespace c2pool::master
                                       {
                                           json j
                                                   {
-                                                          {"hashrate",   net->get("local_hashrate")},
-                                                          {"doa",        net->get("doa")},
-                                                          {"difficulty", net->get("difficulty")}
+                                                          {"hashrate",   net->get("local_rate")["miner_hash_rates"]},
+                                                          {"doa",        net->get("local_rate")["miner_hash_rates"]/*/net->get("local_rate")["miner_dead_hash_rates"]*/},
+                                                          {"difficulty", net->get("time_to_share")}
                                                   };
                                           return j.dump();
                                       });
