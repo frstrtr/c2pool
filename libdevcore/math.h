@@ -6,6 +6,8 @@
 #include <string>
 #include <initializer_list>
 #include <btclibs/uint256.h>
+#include <shared_mutex>
+#include <mutex>
 
 #include "common.h"
 
@@ -110,6 +112,7 @@ namespace math
     template <typename T>
     class RateMonitor
     {
+        shared_mutex mutex_{};
     private:
         int32_t max_lookback_time;
         std::vector<std::pair<int32_t, T>> datums;
@@ -125,6 +128,7 @@ namespace math
             {
                 if (ts > start_time)
                 {
+                    std::unique_lock lock(mutex_);
                     datums.erase(datums.begin(), datums.begin() + i);
                 }
             }
@@ -139,6 +143,9 @@ namespace math
             prune();
 
             int32_t t = c2pool::dev::timestamp();
+
+            std::unique_lock lock(mutex_);
+
             if (first_timestamp == 0)
                 first_timestamp = t;
             else
@@ -147,6 +154,8 @@ namespace math
 
         std::tuple<std::vector<T>, int32_t> get_datums_in_last(int32_t dt = 0)
         {
+            std::shared_lock lock(mutex_);
+
             if (dt == 0)
                 dt = max_lookback_time;
 
