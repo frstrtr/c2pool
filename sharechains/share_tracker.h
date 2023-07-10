@@ -391,5 +391,7 @@ public:
     std::vector<coind::data::tx_type> _get_other_txs(ShareType share, const std::map<uint256, coind::data::tx_type> &known_txs);
 
     std::tuple<bool, std::string> should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits, const std::map<uint256, coind::data::tx_type> &known_txs);
+
+    float get_average_stale_prop(uint256 share_hash, uint64_t lookbehind);
 };
 

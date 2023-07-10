@@ -717,7 +717,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     }
                     local_rate_monitor.add_datum(
                             {
-                                    ArithToUint288(coind::data::target_to_average_attempts(target)),
+                                    coind::data::target_to_average_attempts(target),
                                     !on_time,
                                     user,
                                     FloatingInteger(_gen_sharetx_res->share_info->bits).target()
@@ -750,20 +750,11 @@ local_rates Worker::get_local_rates()
     for (const auto& datum: datums)
     {
         {
-//            arith_uint288 temp;
-//            temp = (miner_hash_rates.count(datum.user) ? miner_hash_rates[datum.user] : arith_uint288{});
             miner_hash_rates[datum.user] += datum.work / dt;
         }
 
         if (datum.dead)
         {
-//            arith_uint256 temp;
-//            temp = ((miner_dead_hash_rates.find(datum.user) != miner_dead_hash_rates.end())
-//                    ? miner_dead_hash_rates[datum.user]
-//                    : uint256::ZERO);
-//            temp += UintToArith256(datum.work) / dt; //TODO:
-//            miner_dead_hash_rates[datum.user] = ArithToUint256(temp);
-
             miner_dead_hash_rates[datum.user] += datum.work / dt;
         }
     }
@@ -934,4 +925,48 @@ void Worker::compute_work()
     }
 //    LOG_DEBUG_STRATUM << "New current_work!: " << t;
     current_work.set(t);
+}
+
+void Worker::init_web_metrics()
+{
+    //---> add metrics
+    //------> shares
+    shares_metric = _net->web->add<shares_metric_type>("shares", [&](nlohmann::json& j){
+        auto _stale = get_stale_counts();
+
+        //---------> total/orphan/doa
+        j["total"] = _stale.total;
+        j["orphan"] = std::get<0>(_stale.orph_doa);
+        j["doa"] = std::get<1>(_stale.orph_doa);
+
+        //---------> efficiency
+        if (_stale.total)
+        {
+            auto lookbehind = min(_tracker->get_height(_pool_node->best_share.value()), 3600/_net->SHARE_PERIOD);
+            //TODO: test
+            float efficiency = (1 - (std::get<0>(_stale.orph_doa) + std::get<1>(_stale.orph_doa))/_stale.total) / (1 - _tracker->get_average_stale_prop(_pool_node->best_share.value(), lookbehind));
+            j["efficiency"] = efficiency;
+        } else{
+            j["efficiency"] = nullptr;
+        }
+    });
+
+    //------> local_rate
+    local_rate_metric = _net->web->add<local_rate_metric_type>("local", [&](nlohmann::json& j){
+        auto [miner_hash_rates, miner_dead_hash_rates] = get_local_rates();
+
+        arith_uint288 local;
+        for (const auto& v : miner_hash_rates)
+            local += v.second;
+
+        arith_uint288 local_dead;
+        for (const auto& v : miner_dead_hash_rates)
+            local_dead += v.second;
+
+        j["miner_hash_rates"] = miner_hash_rates;
+        j["miner_dead_hash_rates"] = miner_dead_hash_rates;
+        j["rate"] = local;
+        j["doa"] = local_dead/local;
+        j["time_to_share"] = coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share.value())->max_target) / local;
+    });
 }

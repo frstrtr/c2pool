@@ -197,7 +197,7 @@ public:
 class WebWorker
 {
 protected:
-    typedef MetricValues shares_metric_type;
+    typedef MetricGetter shares_metric_type;
     typedef MetricGetter local_rate_metric_type;
 protected:
     shares_metric_type* shares_metric;
@@ -245,32 +245,7 @@ private:
 		return arith_uint288();
 	}
 protected:
-    void init_web_metrics() override
-    {
-        //---> add metrics
-        shares_metric = _net->web->add<shares_metric_type>("shares");
-        local_rate_metric = _net->web->add<local_rate_metric_type>("local_rate", [&](nlohmann::json& j){
-            auto [miner_hash_rates, miner_dead_hash_rates] = get_local_rates();
-
-            j["miner_hash_rate"] = miner_hash_rates;
-            j["miner_dead_hash_rates"] = miner_hash_rates;
-            j["time_to_share"] = coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share.))
-        });
-
-        //---> sub for metrics
-        share_received.subscribe([&](){
-            auto _stale = get_stale_counts();
-
-            //------> total/orphan/doa
-            shares_metric->set("total", _stale.total);
-            shares_metric->set("orphan", std::get<0>(_stale.orph_doa));
-            shares_metric->set("doa", std::get<0>(_stale.orph_doa));
-
-            //------> efficiency
-//            shares_metric->
-
-        });
-    }
+    void init_web_metrics() override;
 public:
     std::shared_ptr<c2pool::Network> _net;
     std::shared_ptr<PoolNodeData> _pool_node;
