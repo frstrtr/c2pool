@@ -62,20 +62,6 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
 //            verified.add(items.at(share_hash));
 //    }
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- known shares finished: " << c2pool::dev::timestamp();
-
-    // Set DOA rule
-    //TODO
-//    doa_element_type::set_rules([&](ShareType share){
-////        my_count=lambda share: 1 if share.hash in self.my_share_hashes else 0,
-////            my_doa_count=lambda share: 1 if share.hash in self.my_doa_share_hashes else 0,
-////            my_orphan_announce_count=lambda share: 1 if share.hash in self.my_share_hashes and share.share_data['stale_info'] == 'orphan' else 0,
-////            my_dead_announce_count=lambda share: 1 if share.hash in self.my_share_hashes and share.share_data['stale_info'] == 'doa' else 0,
-////        auto result = std::make_tuple(
-////                my_sh
-////                );
-//
-//        return std::make_tuple<int32_t, int32_t, int32_t, int32_t>(0, 0, 0, 0);
-//    });
 }
 
 void ShareTracker::init_web_metrics()
@@ -514,4 +500,20 @@ std::tuple<bool, std::string> ShareTracker::should_punish_reason(ShareType share
             return {true, "txs over block size limit"};
     }
     return {false, ""};
+}
+
+float ShareTracker::get_average_stale_prop(uint256 share_hash, uint64_t lookbehind)
+{
+    float res = 0;
+
+    auto chain_f = get_chain(share_hash, lookbehind);
+
+    uint256 hash;
+    while (chain_f(hash))
+    {
+        if (*get_item(hash)->stale_info != unk)
+            res += 1;
+    }
+
+    return res/(res + lookbehind);
 }
