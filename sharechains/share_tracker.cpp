@@ -105,7 +105,7 @@ ShareType ShareTracker::get(uint256 hash)
 {
     try
     {
-        auto share = items.at(hash);
+        auto share = get_item(hash);
         return share;
     }
     catch (const std::out_of_range &e)
