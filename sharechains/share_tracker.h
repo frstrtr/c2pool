@@ -240,7 +240,7 @@ public:
         uint256 hash;
         while (gen_verif_chain(hash))
         {
-            auto share = verified.items[hash];
+            auto share = verified.get_item(hash);
 
             auto block_height_temp = block_rel_height_func(share->header->previous_block);
             if (!block_height.has_value())
@@ -279,7 +279,7 @@ public:
         }
 
         std::map<uint64_t, uint256> result;
-        for (auto v : _result)
+        for (const auto& v : _result)
         {
             result[v.first] = ArithToUint256(v.second);
         }
@@ -287,7 +287,7 @@ public:
     }
 
     std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
-    get_cumulative_weights(uint256 start, int32_t max_shares, arith_uint288 desired_weight)
+    get_cumulative_weights(uint256 start, int32_t max_shares, const arith_uint288& desired_weight)
     {
         // Если start -- None/Null/0 шара.
         if (start.IsNull())
@@ -325,24 +325,19 @@ public:
                 }
             } else
             {
-//                auto [_script, _weight] = *cur.weight.amount.begin();
-                extra_ending = std::make_optional<shares::weight::weight_data>(std::get<0>(cur).share); //TODO: check
+                extra_ending = std::make_optional<shares::weight::weight_data>(std::get<0>(cur).share);
                 break;
             }
 
             prev = cur;
 
-            if (items.count(std::get<0>(cur).prev()))
-//            if (cur.prev != sum.end())
+            if (exist(std::get<0>(cur).prev()))
             {
-//                cur = cur.prev->second;
-//                cur = items[cur.prev()];
                 cur = get_sum_to_last(std::get<0>(cur).prev());
             } else
             {
                 break;
             }
-//            LOG_TRACE << "cur = " << std::get<0>(cur).hash();
         }
 
         if (extra_ending.has_value())

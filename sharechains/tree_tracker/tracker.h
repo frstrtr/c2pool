@@ -2,6 +2,7 @@
 #include <set>
 #include <functional>
 #include <optional>
+#include <shared_mutex>
 
 #include <btclibs/uint256.h>
 
@@ -11,10 +12,11 @@
 #include <libdevcore/events.h>
 
 
-
 template <typename TrackerElement>
 class Tracker
 {
+protected:
+    mutable shared_mutex mutex_;
 public:
     typedef uint256 hash_type;
     typedef ShareType item_type;
@@ -57,6 +59,10 @@ public:
         if (!_value)
             throw std::invalid_argument("value is none");
 
+        // Unique lock for thread
+        std::unique_lock lock(mutex_);
+
+        // Make new tracker element
         auto value = make_element(_value);
 
         if (items.find(value.hash()) != items.end())
@@ -67,8 +73,6 @@ public:
 
         //--Add to reverse
         reverse[value.prev()].push_back(items.find(value.hash()));
-
-        //--Add to forks
 
         //--Add to forks
 
@@ -167,8 +171,15 @@ public:
         added.happened(_value);
     }
 
+    auto get_item(hash_type hash) const
+    {
+        shared_lock lock(mutex_);
+        return items.at(hash);
+    }
+
     bool exist(hash_type hash)
     {
+        shared_lock lock(mutex_);
         return (items.find(hash) != items.end());
     }
 
@@ -177,6 +188,7 @@ public:
     {
         sum_element result;
 
+        shared_lock lock(mutex_);
         if (items.find(hash) != items.end())
         {
             auto fork = fork_by_key[hash];
@@ -202,6 +214,8 @@ public:
 
     hash_type get_last(hash_type hash)
     {
+        shared_lock lock(mutex_);
+
         auto fork = fork_by_key.find(hash);
         return fork != fork_by_key.end() ? fork->second->get_chain_tail() : hash;
     }
@@ -217,6 +231,7 @@ public:
         if (item == possible_child)
             return true;
 
+
         auto [height, last] = get_height_and_last(item);
         auto [child_height, child_last] = get_height_and_last(possible_child);
 
@@ -229,6 +244,7 @@ public:
 
     virtual hash_type get_nth_parent_key(hash_type hash, int32_t n) const
     {
+        shared_lock lock(mutex_);
         for (int i = 0; i < n; i++)
         {
             if (items.find(hash) != items.end())
@@ -239,7 +255,7 @@ public:
         return hash;
     }
 
-    std::function<bool(hash_type&)> get_chain(hash_type hash, int32_t n)
+    std::function<bool(hash_type&)> get_chain(hash_type hash, uint64_t n)
     {
         if (n > get_height(hash))
         {
@@ -248,12 +264,16 @@ public:
 
         return [&, this]()
         {
+            shared_lock lock(mutex_);
+
             auto cur_it = items.find(hash);
             auto cur_pos = n; //exclusive 0
             auto &_items = this->items;
+            auto &mutex__ = mutex_;
 
-            return [=, &_items](hash_type &ref_key) mutable
+            return [=, &_items, &mutex__](hash_type &ref_key) mutable
             {
+                shared_lock lock(mutex__);
                 if (cur_it != _items.end() && (cur_pos > 0))
                 {
                     ref_key = cur_it->first;
@@ -283,6 +303,8 @@ public:
 private:
     fork_ptr make_fork()
     {
+        unique_lock lock(mutex_);
+
         auto new_fork = std::make_shared<fork_type>();
         forks.push_back(new_fork);
         return new_fork;
