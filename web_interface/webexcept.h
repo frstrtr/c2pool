@@ -21,7 +21,7 @@ private:
 
 public:
     explicit WebServerError(std::string msg) : message(std::move(msg)) {}
-    explicit WebServerError(char* msg) : message(msg) {}
+    explicit WebServerError(const char* msg) : message(msg) {}
 
     const char* what() const noexcept override
     {
@@ -35,7 +35,7 @@ private:
 
 public:
     explicit WebBadRequest(std::string msg) : message(std::move(msg)) {}
-    explicit WebBadRequest(char* msg) : message(msg) {}
+    explicit WebBadRequest(const char* msg) : message(msg) {}
 
     const char* what() const noexcept override
     {
