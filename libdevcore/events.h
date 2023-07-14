@@ -19,31 +19,31 @@
 template<typename... Args>
 class Event
 {
-    std::shared_ptr<boost::signals2::signal<void(Args...)>> sig;
-    std::shared_ptr<boost::signals2::signal<void()>> sig_anon; //For subs without arguments;
-    std::shared_ptr<int> times;
+    boost::signals2::signal<void(Args...)> sig;
+    boost::signals2::signal<void()> sig_anon; //For subs without arguments;
+    int times;
 
-    std::shared_ptr<boost::signals2::signal<void(Args...)>> once;
+    boost::signals2::signal<void(Args...)> once;
 
-    //TODO: to shared_ptr
     std::function<int()> get_id;
     std::map<int, boost::signals2::connection> unsub_by_id;
 
-public:
+private:
     Event()
     {
         get_id = c2pool::dev::count_generator();
-        sig = std::make_shared<boost::signals2::signal<void(Args...)>>();
-        sig_anon = std::make_shared<boost::signals2::signal<void()>>();
-        once = std::make_shared<boost::signals2::signal<void(Args...)>>();
-        times = std::make_shared<int>(0);
+        sig = boost::signals2::signal<void(Args...)>();
+        sig_anon = boost::signals2::signal<void()>();
+        once = boost::signals2::signal<void(Args...)>();
+        times = 0;
     }
 
+public:
     //for std::function/lambda
     template<typename Lambda>
     int subscribe(Lambda _f)
     {
-        boost::signals2::connection bc = sig->connect(_f);
+        boost::signals2::connection bc = sig.connect(_f);
 
         auto id = get_id();
         unsub_by_id[id] = std::move(bc);
@@ -51,9 +51,9 @@ public:
         return id;
     }
 
-    int subscribe(std::function<void()> _f)
+    int subscribe(const std::function<void()>& _f)
     {
-        boost::signals2::connection bc = sig_anon->connect(_f);
+        boost::signals2::connection bc = sig_anon.connect(_f);
 
         auto id = get_id();
         unsub_by_id[id] = std::move(bc);
@@ -64,7 +64,7 @@ public:
     template<typename Lambda>
     void subscribe_once(Lambda _f)
     {
-        once->connect(_f);
+        once.connect(_f);
     }
 
     int run_and_subscribe(std::function<void()> _f)
@@ -87,61 +87,70 @@ public:
 
     void happened(Args & ... args)
     {
-        *times += 1;
+        times += 1;
 
-        if (!sig->empty())
-            (*sig)(args...);
-        if (!sig_anon->empty())
-            (*sig_anon)();
-        if(!once->empty())
+        if (!sig.empty())
+            sig(args...);
+        if (!sig_anon.empty())
+            sig_anon();
+        if(!once.empty())
         {
-            (*once)(args...);
-            once->disconnect_all_slots();
+            once(args...);
+            once.disconnect_all_slots();
         }
     }
 
     int get_times() const
     {
-        if (times)
-            return *times;
-        else
-            return 0;
+        return times;
     }
+
+    template<typename... Args2>
+    friend Event<Args2...>* make_event();
 };
 
+template<typename... Args2>
+inline Event<Args2...>* make_event()
+{
+    return new Event<Args2...>();
+}
 
 template<typename VarType>
 class Variable
 {
+protected:
+    VarType* _value;
 public:
-    std::shared_ptr<VarType> _value;
-public:
-    std::shared_ptr<Event<VarType>> changed;
-    std::shared_ptr<Event<VarType, VarType>> transitioned;
+    Event<VarType>* changed;
+    Event<VarType, VarType>* transitioned;
 
-public:
+protected:
     Variable(bool default_init = false)
     {
         if (default_init)
-            _value = std::make_shared<VarType>();
-        changed = std::make_shared<Event<VarType>>();
-        transitioned = std::make_shared<Event<VarType, VarType>>();
+            _value = new VarType();
+
+        changed = make_event<VarType>();
+        transitioned = make_event<VarType, VarType>();
     }
 
-    Variable(const VarType &init_value)
+    explicit Variable(const VarType& data)
     {
-        _value = std::make_shared<VarType>();
-        changed = std::make_shared<Event<VarType>>();
-        transitioned = std::make_shared<Event<VarType, VarType>>();
-        *_value = init_value;
+        _value = new VarType(data);
+
+        changed = make_event<VarType>();
+        transitioned = make_event<VarType, VarType>();
     }
 
-    std::shared_ptr<VarType> pvalue()
+    explicit Variable(VarType&& data)
     {
-        return _value;
-    }
+        _value = new VarType(data);
 
-    VarType value() const
+        changed = make_event<VarType>();
+        transitioned = make_event<VarType, VarType>();
+    }
+public:
+    VarType& value()
     {
         return *_value;
     }
@@ -151,15 +160,15 @@ public:
         return _value == nullptr;
     }
 
-    Variable<VarType> &set(VarType __value)
+    Variable<VarType> &set(VarType value)
     {
         if (!_value)
-            _value = std::make_shared<VarType>();
+            _value = new VarType();
 
-        if (*_value != __value)
+        if (*_value != value)
         {
             auto oldvalue = *_value;
-            *_value = __value;
+            *_value = value;
             changed->happened(*_value);
             transitioned->happened(oldvalue, *_value);
         }
@@ -183,6 +192,15 @@ public:
                                 });
         return def;
     }
+
+    template<typename T>
+    friend Variable<T>* make_variable();
+
+    template<typename T>
+    friend Variable<T>* make_variable(T&& data);
+
+    template<typename T>
+    friend Variable<T>* make_variable(const T& data);
 };
 
 template<typename KeyType, typename VarType>
@@ -280,3 +298,21 @@ public:
 		return false;
 	}
 };
+
+template<typename T>
+inline Variable<T>* make_variable()
+{
+    return new Variable<T>();
+}
+
+template<typename T>
+inline Variable<T>* make_variable(T&& data)
+{
+    return new Variable<T>(std::forward<T>(data));
+}
+
+template<typename T>
+inline Variable<T>* make_variable(const T& data)
+{
+    return new Variable<T>(data);
+}
