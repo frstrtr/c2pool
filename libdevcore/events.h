@@ -166,12 +166,6 @@ public:
         return *this;
     }
 
-    Variable<VarType> &operator=(VarType __value)
-    {
-        this->set(__value);
-        return *this;
-    }
-
     c2pool::deferred::shared_deferred<VarType> get_when_satisfies(std::function<bool(VarType)> when_f, c2pool::deferred::shared_deferred<VarType> def = nullptr)
     {
         if (!def)
@@ -274,28 +268,6 @@ public:
     {
         std::vector<KeyType> keys = {_key};
         remove(keys);
-    }
-
-    VariableDict<KeyType, VarType> &operator=(const MapType &__value)
-    {
-        if (this->isNull())
-            return *this;
-
-        if (*this->_value != __value)
-        {
-            auto oldvalue = *this->_value;
-
-            this->_value->clear();
-            for (auto [k, v] : __value)
-            {
-                (*this->_value)[k] = v;
-            }
-//            *this->_value = __value;
-
-            this->changed->happened(*this->_value);
-            this->transitioned->happened(oldvalue, *this->_value);
-        }
-        return *this;
     }
 
 	bool exist(KeyType key)
