@@ -23,7 +23,7 @@ TEST(DevcoreEvents, event_run_and_subscribe)
 {
     int res = 0;
 
-    Event<int>* event = make_event<int>();
+    Event<int> event = make_event<int>();
     event->run_and_subscribe([&res](){
         res = 99;
     });
@@ -53,7 +53,7 @@ TEST(DevcoreEvents, event_run_and_subscribe)
 TEST(DevcoreEvents, event_copy)
 {
     int res = 0;
-    Event<int>* event = make_event<int>();
+    Event<int> event = make_event<int>();
     event->subscribe([&res](const int &value){
         res = value;
     });
@@ -64,7 +64,7 @@ TEST(DevcoreEvents, event_copy)
 
     int res2 = res;
 
-    Event<int>* event_copy;
+    Event<int> event_copy;
     event_copy = event;
     event_copy->subscribe([&res2] (const int &value){
         res2 += 127;
@@ -81,7 +81,7 @@ TEST(DevcoreEvents, event_copy)
 
 TEST(DevcoreEvents, event_void)
 {
-    Event<>* event = make_event();
+    Event<> event = make_event();
     event->happened();
 
     bool result = false;
@@ -106,7 +106,7 @@ public:
 
 TEST(DevcoreEvents, event_class_method)
 {
-	Event<int>* event = make_event<int>();
+	Event<int> event = make_event<int>();
 	TestEvent *obj = new TestEvent();
 	//event.subscribe(&TestEvent::testF, obj);
 	event->subscribe([&](int value)
@@ -124,7 +124,7 @@ TEST(DevcoreEvents, event_many_args)
 	int res = 0;
 	double res2 = 0;
 
-	Event<int, double>* event = make_event<int, double>();
+	Event<int, double> event = make_event<int, double>();
 	event->subscribe([&res, &res2](int value, double value2)
 					{
 						std::cout << value << std::endl;
@@ -144,7 +144,7 @@ TEST(DevcoreEvents, event_many_args)
 
 TEST(DevcoreEvents, variable_lambda)
 {
-	Variable<int>* var = make_variable<int>(10);
+	Variable<int> var = make_variable<int>(10);
 	var->changed->subscribe([](int val)
 						  {
 							  std::cout << "changed to: " << val << std::endl;
@@ -171,13 +171,13 @@ TEST(DevcoreEvents, variable_lambda)
 
 TEST(DevcoreEvents, variabledict_lambda)
 {
-	VariableDict<int, std::shared_ptr<int>>* var = make_vardict<int, std::shared_ptr<int>>();
-	var->added->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType new_items){
+	VariableDict<int, std::shared_ptr<int>> var = make_vardict<int, std::shared_ptr<int>>();
+	var->added->subscribe([](_VariableDict<int, std::shared_ptr<int>>::MapType new_items){
         for (auto it : new_items){
 			std::cout << "added: " << it.first << ":" << *it.second << std::endl;
 		}
 	});
-    var->removed->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
+    var->removed->subscribe([](_VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
         for (auto it : gone_items){
             std::cout << "removed: " <<it.first << ":" << *it.second << std::endl;
         }
@@ -186,7 +186,8 @@ TEST(DevcoreEvents, variabledict_lambda)
     var->add(0, std::make_shared<int>(0));
 
 
-    VariableDict<int, std::shared_ptr<int>>::MapType newVals = {{1, std::make_shared<int>(112)}, {2, std::make_shared<int>(222)}, {3, std::make_shared<int>(333)}};
+
+    _VariableDict<int, std::shared_ptr<int>>::MapType newVals = {{1, std::make_shared<int>(112)}, {2, std::make_shared<int>(222)}, {3, std::make_shared<int>(333)}};
 	var->add(newVals);
 
     std::cout << "Check duplicate (wanna be empty):" << std::endl;
@@ -208,7 +209,7 @@ TEST(DevcoreEvents, variabledict_lambda)
 TEST(DevcoreEvents, variabledict_varinheritance)
 {
     std::map<int, int> m{{1,2},{2,3}, {5,6}};
-    VariableDict<int, int>* var = make_vardict<int, int>(m);
+    VariableDict<int, int> var = make_vardict<int, int>(m);
 
     var->changed->subscribe([](std::map<int,int> _new){
         std::cout << "changed:" << std::endl;
@@ -245,7 +246,7 @@ TEST(DevcoreEvents, variabledict_varinheritance)
 
 TEST(DevcoreEvents, variabledict_set)
 {
-    VariableDict<int, int>* var = make_vardict<int, int>({{1,2}, {3,5}});
+    VariableDict<int, int> var = make_vardict<int, int>({{1,2}, {3,5}});
 
     var->changed->subscribe([](const std::map<int,int>& val){
         std::cout << "changed" << std::endl;
@@ -261,7 +262,7 @@ TEST(DevcoreEvents, variabledict_set)
 
 TEST(DevcoreEvents, variabledict2_set)
 {
-	VariableDict<int, std::shared_ptr<int>>* var = make_vardict<int, std::shared_ptr<int>>({{1, std::make_shared<int>(2)}, {3,std::make_shared<int>(5)}});
+	VariableDict<int, std::shared_ptr<int>> var = make_vardict<int, std::shared_ptr<int>>({{1, std::make_shared<int>(2)}, {3,std::make_shared<int>(5)}});
 
 	var->changed->subscribe([](const std::map<int, std::shared_ptr<int>>& val){
 		std::cout << "changed" << std::endl;
