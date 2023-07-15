@@ -109,10 +109,10 @@ public:
     friend Event<Args2...>* make_event();
 };
 
-template<typename... Args2>
-inline Event<Args2...>* make_event()
+template<typename... Args>
+inline Event<Args...>* make_event()
 {
-    return new Event<Args2...>();
+    return new Event<Args...>();
 }
 
 template<typename VarType>
@@ -125,11 +125,8 @@ public:
     Event<VarType, VarType>* transitioned;
 
 protected:
-    Variable(bool default_init = false)
+    Variable()
     {
-        if (default_init)
-            _value = new VarType();
-
         changed = make_event<VarType>();
         transitioned = make_event<VarType, VarType>();
     }
@@ -203,6 +200,24 @@ public:
     friend Variable<T>* make_variable(const T& data);
 };
 
+template<typename T>
+inline Variable<T>* make_variable()
+{
+    return new Variable<T>();
+}
+
+template<typename T>
+inline Variable<T>* make_variable(T&& data)
+{
+    return new Variable<T>(std::forward<T>(data));
+}
+
+template<typename T>
+inline Variable<T>* make_variable(const T& data)
+{
+    return new Variable<T>(data);
+}
+
 template<typename KeyType, typename VarType>
 class VariableDict : public Variable<std::map<KeyType, VarType>>
 {
@@ -210,25 +225,36 @@ public:
     typedef std::map<KeyType, VarType> MapType;
 
 public:
-    std::shared_ptr<Event<MapType>> added;
-    std::shared_ptr<Event<MapType>> removed;
+    Event<MapType>* added;
+    Event<MapType>* removed;
+private:
 
-    VariableDict(bool default_init = false) : Variable<std::map<KeyType, VarType>>(default_init)
+    VariableDict() : Variable<std::map<KeyType, VarType>>()
     {
-        added = std::make_shared<Event<MapType>>();
-        removed = std::make_shared<Event<MapType>>();
+        added = make_event<MapType>();
+        removed = make_event<MapType>();
     }
 
-    VariableDict(const MapType &_value) : Variable<std::map<KeyType, VarType>>(_value)
+    explicit VariableDict(const MapType& data) : Variable<MapType>(data)
     {
-        added = std::make_shared<Event<MapType>>();
-        removed = std::make_shared<Event<MapType>>();
+        added = make_event<MapType>();
+        removed = make_event<MapType>();
     }
 
+    explicit VariableDict(MapType&& data) : Variable<MapType>(std::forward(data))
+    {
+        added = make_event<MapType>();
+        removed = make_event<MapType>();
+    }
+
+public:
     void add(const MapType &_values)
     {
         if (_values.empty())
             return;
+
+        if (!this->_value)
+            this->_value = new MapType();
 
         MapType old_value = *this->_value;
 
@@ -297,22 +323,31 @@ public:
 		}
 		return false;
 	}
+
+    template<typename K, typename T>
+    friend VariableDict<K, T>* make_vardict();
+
+    template<typename K, typename T>
+    friend VariableDict<K, T>* make_vardict(std::map<K, T>&& data);
+
+    template<typename K, typename T>
+    friend VariableDict<K, T>* make_vardict(const std::map<K, T>& data);
 };
 
-template<typename T>
-inline Variable<T>* make_variable()
+template<typename K, typename T>
+inline VariableDict<K, T>* make_vardict()
 {
-    return new Variable<T>();
+    return new VariableDict<K, T>();
 }
 
-template<typename T>
-inline Variable<T>* make_variable(T&& data)
+template<typename K, typename T>
+inline VariableDict<K, T>* make_vardict(std::map<K, T>&& data)
 {
-    return new Variable<T>(std::forward<T>(data));
+    return new VariableDict<K, T>(data);
 }
 
-template<typename T>
-inline Variable<T>* make_variable(const T& data)
+template<typename K, typename T>
+inline VariableDict<K, T>* make_vardict(const std::map<K, T>& data)
 {
-    return new Variable<T>(data);
+    return new VariableDict<K, T>(data);
 }
