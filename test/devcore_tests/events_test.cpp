@@ -15,6 +15,8 @@ TEST(DevcoreEvents, event_lambda)
 	int v = 500;
 	event->happened(v);
 	ASSERT_EQ(500, res);
+
+    delete event;
 }
 
 TEST(DevcoreEvents, event_run_and_subscribe)
@@ -45,6 +47,7 @@ TEST(DevcoreEvents, event_run_and_subscribe)
     ASSERT_EQ(res, 99);
     ASSERT_EQ(res2, 511);
 
+    delete event;
 }
 
 TEST(DevcoreEvents, event_copy)
@@ -72,6 +75,8 @@ TEST(DevcoreEvents, event_copy)
 
     ASSERT_EQ(res, 50);
     ASSERT_EQ(res2, 250);
+
+    delete event;
 }
 
 TEST(DevcoreEvents, event_void)
@@ -83,6 +88,8 @@ TEST(DevcoreEvents, event_void)
     event->subscribe([&result](){result = true;});
     event->happened();
     ASSERT_TRUE(result);
+
+    delete event;
 }
 
 class TestEvent
@@ -109,6 +116,7 @@ TEST(DevcoreEvents, event_class_method)
 
 	ASSERT_EQ(1337, obj->res);
 	delete obj;
+    delete event;
 }
 
 TEST(DevcoreEvents, event_many_args)
@@ -130,6 +138,8 @@ TEST(DevcoreEvents, event_many_args)
 	event->happened(v, v2);
 	ASSERT_EQ(500, res);
 	ASSERT_EQ(10.5, res2);
+
+    delete event;
 }
 
 TEST(DevcoreEvents, variable_lambda)
@@ -155,101 +165,119 @@ TEST(DevcoreEvents, variable_lambda)
 							   });
 	var->set(100);
 	ASSERT_EQ(100, var->value());
+
+    delete var;
 }
 
-//TEST(DevcoreEvents, variabledict_lambda)
-//{
-//	VariableDict<int, std::shared_ptr<int>> var;
-//	var.added->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType new_items){
-//        for (auto it : new_items){
-//			std::cout << "added: " << it.first << ":" << *it.second << std::endl;
-//		}
-//	});
-//    var.removed->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
-//        for (auto it : gone_items){
-//            std::cout << "removed: " <<it.first << ":" << *it.second << std::endl;
-//        }
-//    });
-//
-//    var.add(0, std::make_shared<int>(0));
-//
-//
-//    VariableDict<int, std::shared_ptr<int>>::MapType newVals = {{1, std::make_shared<int>(112)}, {2, std::make_shared<int>(222)}, {3, std::make_shared<int>(333)}};
-//	var.add(newVals);
-//
-//    std::cout << "Check duplicate (wanna be empty):" << std::endl;
-//    var.add(newVals);
-//    std::cout << "Check finished." << std::endl;
-//
-//    std::cout << "Check change in duplicate (wanna be not empty):" << std::endl;
-//    newVals[1] = std::make_shared<int>(111);
-//    var.add(newVals);
-//    std::cout << "Check finished." << std::endl;
-//
-//    auto var_copy = var;
-//
-//    var_copy.remove(1);
-//}
-//
-//TEST(DevcoreEvents, variabledict_varinheritance)
-//{
-//    VariableDict<int, int> var({{1,2},{2,3}, {5,6}});
-//
-//    var.changed->subscribe([](std::map<int,int> _new){
-//        std::cout << "changed:" << std::endl;
-//        for (auto item : _new)
-//        {
-//            std::cout << item.first << ":" << item.second << std::endl;
-//        }
-//
-//        std::map<int,int> true_result = {{1,2}, {5,6}};
-//        ASSERT_EQ(true_result, _new);
-//    });
-//
-//    var.transitioned->subscribe([](std::map<int,int> _old, std::map<int,int> _new){
-//        std::map<int,int> true_old = {{1,2},{2,3}, {5,6}};
-//        std::map<int,int> true_result = {{1,2}, {5,6}};
-//
-//        ASSERT_EQ(true_old, _old);
-//        ASSERT_EQ(true_result, _new);
-//
-//    });
-//
-//    var.remove(2);
-//
-//    std::map<int, int> empty_map;
-//    var.add(empty_map);
-//
-//    std::vector<int> empty_keys;
-//    var.remove(empty_keys);
-//
-//    var.add(5,6);
-//}
-//
-//TEST(DevcoreEvents, variabledict_set)
-//{
-//    VariableDict<int, int> var({{1,2}, {3,5}});
-//
-//    var.changed->subscribe([](std::map<int,int> val){
-//        std::cout << "changed" << std::endl;
-//        std::map<int, int> new_var_value = {{0,1}, {2,3}};
-//        ASSERT_EQ(val, new_var_value);
-//    });
-//
-//    std::map<int, int> new_var_value = {{0,1}, {2,3}};
-//    var = new_var_value;
-//}
-//
-//TEST(DevcoreEvents, variabledict2_set)
-//{
-//	VariableDict<int, std::shared_ptr<int>> var({{1, std::make_shared<int>(2)}, {3,std::make_shared<int>(5)}});
-//
-//	var.changed->subscribe([](std::map<int, std::shared_ptr<int>> val){
-//		std::cout << "changed" << std::endl;
-//		std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
+TEST(DevcoreEvents, variabledict_lambda)
+{
+	VariableDict<int, std::shared_ptr<int>>* var = make_vardict<int, std::shared_ptr<int>>();
+	var->added->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType new_items){
+        for (auto it : new_items){
+			std::cout << "added: " << it.first << ":" << *it.second << std::endl;
+		}
+	});
+    var->removed->subscribe([](VariableDict<int, std::shared_ptr<int>>::MapType gone_items){
+        for (auto it : gone_items){
+            std::cout << "removed: " <<it.first << ":" << *it.second << std::endl;
+        }
+    });
+
+    var->add(0, std::make_shared<int>(0));
+
+
+    VariableDict<int, std::shared_ptr<int>>::MapType newVals = {{1, std::make_shared<int>(112)}, {2, std::make_shared<int>(222)}, {3, std::make_shared<int>(333)}};
+	var->add(newVals);
+
+    std::cout << "Check duplicate (wanna be empty):" << std::endl;
+    var->add(newVals);
+    std::cout << "Check finished." << std::endl;
+
+    std::cout << "Check change in duplicate (wanna be not empty):" << std::endl;
+    newVals[1] = std::make_shared<int>(111);
+    var->add(newVals);
+    std::cout << "Check finished." << std::endl;
+
+    auto var_copy = var;
+
+    var_copy->remove(1);
+
+    delete var;
+}
+
+TEST(DevcoreEvents, variabledict_varinheritance)
+{
+    std::map<int, int> m{{1,2},{2,3}, {5,6}};
+    VariableDict<int, int>* var = make_vardict<int, int>(m);
+
+    var->changed->subscribe([](std::map<int,int> _new){
+        std::cout << "changed:" << std::endl;
+        for (auto item : _new)
+        {
+            std::cout << item.first << ":" << item.second << std::endl;
+        }
+
+        std::map<int,int> true_result = {{1,2}, {5,6}};
+        ASSERT_EQ(true_result, _new);
+    });
+
+    var->transitioned->subscribe([](std::map<int,int> _old, std::map<int,int> _new){
+        std::map<int,int> true_old = {{1,2},{2,3}, {5,6}};
+        std::map<int,int> true_result = {{1,2}, {5,6}};
+
+        ASSERT_EQ(true_old, _old);
+        ASSERT_EQ(true_result, _new);
+
+    });
+
+    var->remove(2);
+
+    std::map<int, int> empty_map;
+    var->add(empty_map);
+
+    std::vector<int> empty_keys;
+    var->remove(empty_keys);
+
+    var->add(5,6);
+
+    delete var;
+}
+
+TEST(DevcoreEvents, variabledict_set)
+{
+    VariableDict<int, int>* var = make_vardict<int, int>({{1,2}, {3,5}});
+
+    var->changed->subscribe([](const std::map<int,int>& val){
+        std::cout << "changed" << std::endl;
+        std::map<int, int> new_var_value = {{0,1}, {2,3}};
+        ASSERT_EQ(val, new_var_value);
+    });
+
+    std::map<int, int> new_var_value = {{0,1}, {2,3}};
+    var->set(new_var_value);
+
+    delete var;
+}
+
+TEST(DevcoreEvents, variabledict2_set)
+{
+	VariableDict<int, std::shared_ptr<int>>* var = make_vardict<int, std::shared_ptr<int>>({{1, std::make_shared<int>(2)}, {3,std::make_shared<int>(5)}});
+
+	var->changed->subscribe([](const std::map<int, std::shared_ptr<int>>& val){
+		std::cout << "changed" << std::endl;
+		std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
+        for (const auto &[k, v] : val)
+        {
+            if (new_var_value.count(k))
+            {
+                ASSERT_EQ(*v, *new_var_value[k]);
+            } else {
+                ASSERT_TRUE(false);
+            }
+        }
 //		ASSERT_EQ(val, new_var_value);
-//	});
-//
-//	std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
-//	var = new_var_value;
-//}
+	});
+
+	std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
+	var->set(new_var_value);
+}
