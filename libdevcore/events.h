@@ -17,7 +17,7 @@
 //remove_special.happened(item);
 
 template<typename... Args>
-class Event
+class _Event
 {
     boost::signals2::signal<void(Args...)> sig;
     boost::signals2::signal<void()> sig_anon; //For subs without arguments;
@@ -29,7 +29,7 @@ class Event
     std::map<int, boost::signals2::connection> unsub_by_id;
 
 private:
-    Event()
+    _Event()
     {
         get_id = c2pool::dev::count_generator();
         sig = boost::signals2::signal<void(Args...)>();
@@ -106,32 +106,32 @@ public:
     }
 
     template<typename... Args2>
-    friend Event<Args2...>* make_event();
+    friend _Event<Args2...>* make_event();
 };
 
 template<typename... Args>
-inline Event<Args...>* make_event()
+inline _Event<Args...>* make_event()
 {
-    return new Event<Args...>();
+    return new _Event<Args...>();
 }
 
 template<typename VarType>
-class Variable
+class _Variable
 {
 protected:
     VarType* _value;
 public:
-    Event<VarType>* changed;
-    Event<VarType, VarType>* transitioned;
+    _Event<VarType>* changed;
+    _Event<VarType, VarType>* transitioned;
 
 protected:
-    Variable()
+    _Variable()
     {
         changed = make_event<VarType>();
         transitioned = make_event<VarType, VarType>();
     }
 
-    explicit Variable(const VarType& data)
+    explicit _Variable(const VarType& data)
     {
         _value = new VarType(data);
 
@@ -139,7 +139,7 @@ protected:
         transitioned = make_event<VarType, VarType>();
     }
 
-    explicit Variable(VarType&& data)
+    explicit _Variable(VarType&& data)
     {
         _value = new VarType(data);
 
@@ -157,7 +157,7 @@ public:
         return _value == nullptr;
     }
 
-    Variable<VarType> &set(VarType value)
+    _Variable<VarType> &set(VarType value)
     {
         if (!_value)
             _value = new VarType();
@@ -191,57 +191,57 @@ public:
     }
 
     template<typename T>
-    friend Variable<T>* make_variable();
+    friend _Variable<T>* make_variable();
 
     template<typename T>
-    friend Variable<T>* make_variable(T&& data);
+    friend _Variable<T>* make_variable(T&& data);
 
     template<typename T>
-    friend Variable<T>* make_variable(const T& data);
+    friend _Variable<T>* make_variable(const T& data);
 };
 
 template<typename T>
-inline Variable<T>* make_variable()
+inline _Variable<T>* make_variable()
 {
-    return new Variable<T>();
+    return new _Variable<T>();
 }
 
 template<typename T>
-inline Variable<T>* make_variable(T&& data)
+inline _Variable<T>* make_variable(T&& data)
 {
-    return new Variable<T>(std::forward<T>(data));
+    return new _Variable<T>(std::forward<T>(data));
 }
 
 template<typename T>
-inline Variable<T>* make_variable(const T& data)
+inline _Variable<T>* make_variable(const T& data)
 {
-    return new Variable<T>(data);
+    return new _Variable<T>(data);
 }
 
 template<typename KeyType, typename VarType>
-class VariableDict : public Variable<std::map<KeyType, VarType>>
+class _VariableDict : public _Variable<std::map<KeyType, VarType>>
 {
 public:
     typedef std::map<KeyType, VarType> MapType;
 
 public:
-    Event<MapType>* added;
-    Event<MapType>* removed;
+    _Event<MapType>* added;
+    _Event<MapType>* removed;
 private:
 
-    VariableDict() : Variable<std::map<KeyType, VarType>>()
+    _VariableDict() : _Variable<std::map<KeyType, VarType>>()
     {
         added = make_event<MapType>();
         removed = make_event<MapType>();
     }
 
-    explicit VariableDict(const MapType& data) : Variable<MapType>(data)
+    explicit _VariableDict(const MapType& data) : _Variable<MapType>(data)
     {
         added = make_event<MapType>();
         removed = make_event<MapType>();
     }
 
-    explicit VariableDict(MapType&& data) : Variable<MapType>(std::forward(data))
+    explicit _VariableDict(MapType&& data) : _Variable<MapType>(std::forward(data))
     {
         added = make_event<MapType>();
         removed = make_event<MapType>();
@@ -325,29 +325,38 @@ public:
 	}
 
     template<typename K, typename T>
-    friend VariableDict<K, T>* make_vardict();
+    friend _VariableDict<K, T>* make_vardict();
 
     template<typename K, typename T>
-    friend VariableDict<K, T>* make_vardict(std::map<K, T>&& data);
+    friend _VariableDict<K, T>* make_vardict(std::map<K, T>&& data);
 
     template<typename K, typename T>
-    friend VariableDict<K, T>* make_vardict(const std::map<K, T>& data);
+    friend _VariableDict<K, T>* make_vardict(const std::map<K, T>& data);
 };
 
 template<typename K, typename T>
-inline VariableDict<K, T>* make_vardict()
+inline _VariableDict<K, T>* make_vardict()
 {
-    return new VariableDict<K, T>();
+    return new _VariableDict<K, T>();
 }
 
 template<typename K, typename T>
-inline VariableDict<K, T>* make_vardict(std::map<K, T>&& data)
+inline _VariableDict<K, T>* make_vardict(std::map<K, T>&& data)
 {
-    return new VariableDict<K, T>(data);
+    return new _VariableDict<K, T>(data);
 }
 
 template<typename K, typename T>
-inline VariableDict<K, T>* make_vardict(const std::map<K, T>& data)
+inline _VariableDict<K, T>* make_vardict(const std::map<K, T>& data)
 {
-    return new VariableDict<K, T>(data);
+    return new _VariableDict<K, T>(data);
 }
+
+template<typename... Args>
+using Event = _Event<Args...>*;
+
+template <typename T>
+using Variable = _Variable<T>*;
+
+template<typename KeyType, typename VarType>
+using VariableDict = _VariableDict<KeyType, VarType>*;
