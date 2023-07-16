@@ -137,7 +137,7 @@ void ShareTracker::remove(uint256 hash)
 {
     auto res = get(hash);
     //TODO:
-    removed.happened(res);
+    removed->happened(res);
 }
 
 bool ShareTracker::attempt_verify(ShareType share)
