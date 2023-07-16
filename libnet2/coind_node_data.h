@@ -47,10 +47,20 @@ public:
 	{
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
 
-        known_txs = VariableDict<uint256, coind::data::tx_type>(true);
-        mining_txs = VariableDict<uint256, coind::data::tx_type>(true);
-        mining2_txs = VariableDict<uint256, coind::data::tx_type>(true);
-        best_share = Variable<uint256>(true);
+        stop = make_event();
+
+        known_txs = make_vardict<uint256, coind::data::tx_type>({});
+        mining_txs = make_vardict<uint256, coind::data::tx_type>({});
+        mining2_txs = make_vardict<uint256, coind::data::tx_type>({});
+        best_share = make_variable<uint256>(uint256::ZERO);
+//        desired = make_variable({});
+
+        new_block = make_event<uint256>();
+        new_tx = make_event<coind::data::tx_type>();
+        new_headers = make_event<std::vector<coind::data::types::BlockHeaderType>>();
+
+        coind_work = make_variable<coind::getwork_result>();
+        best_block_header = make_variable<coind::data::BlockHeaderType>();
 	}
 
 	auto set_parent_net(std::shared_ptr<coind::ParentNetwork> _net)

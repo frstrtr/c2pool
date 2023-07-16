@@ -10,9 +10,9 @@ void CoindNode::start()
 	LOG_INFO << "... CoindNode<" << parent_net->net_name << "> starting...";
 	connect(std::make_tuple(parent_net->P2P_ADDRESS, std::to_string(parent_net->P2P_PORT)));
 	//COIND:
-	coind_work = Variable<coind::getwork_result>(coind->getwork(txidcache));
-    get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work.pvalue()](){return _coind_work->previous_block; });
-	new_block.subscribe([&](uint256 _value)
+	coind_work->set(coind->getwork(txidcache));
+    get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work->value()](){return _coind_work.previous_block; });
+	new_block->subscribe([&](uint256 _value)
 						{
 							//Если получаем новый блок, то обновляем таймер
 							work_poller_t.expires_from_now(boost::posix_time::seconds(15));
@@ -20,13 +20,13 @@ void CoindNode::start()
 	work_poller();
 
 	//PEER:
-	coind_work.changed->subscribe([&](coind::getwork_result result){
+	coind_work->changed->subscribe([&](coind::getwork_result result){
 		this->poll_header();
 	});
 	poll_header();
 
 	//BEST SHARE
-	coind_work.changed->subscribe([&](coind::getwork_result result){
+	coind_work->changed->subscribe([&](coind::getwork_result result){
 		set_best_share();
 	});
 	set_best_share();
@@ -34,32 +34,32 @@ void CoindNode::start()
 	// p2p logic and join p2pool network
 
 	// update mining_txs according to getwork results
-	coind_work.changed->run_and_subscribe([&](){
+	coind_work->changed->run_and_subscribe([&](){
         std::map<uint256, coind::data::tx_type> new_mining_txs;
         std::map<uint256, coind::data::tx_type> added_known_txs;
 
         uint256 _tx_hash;
 		coind::data::tx_type _tx;
-        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work._value->transaction_hashes,coind_work._value->transactions))
+        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work->value().transaction_hashes,coind_work->value().transactions))
 		{
 			new_mining_txs[_tx_hash] = _tx;
 
-            if (!known_txs.exist(_tx_hash))
+            if (!known_txs->exist(_tx_hash))
                 added_known_txs[_tx_hash] = _tx;
 		}
 
-        mining_txs.set(new_mining_txs);
-        known_txs.add(added_known_txs);
+        mining_txs->set(new_mining_txs);
+        known_txs->add(added_known_txs);
 	});
 
 	// add p2p transactions from bitcoind to known_txs
-	new_tx.subscribe([&](coind::data::tx_type _tx)
+	new_tx->subscribe([&](coind::data::tx_type _tx)
     {
-		known_txs.add(coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)), _tx);
+		known_txs->add(coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)), _tx);
 	});
 
 	// forward transactions seen to bitcoind
-	known_txs.transitioned->subscribe([&](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+	known_txs->transitioned->subscribe([&](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
 //		//TODO: for what???
 //		// yield deferral.sleep(random.expovariate(1/1))
 //
@@ -118,7 +118,7 @@ void CoindNode::start()
 
 void CoindNode::work_poller()
 {
-    coind_work.set(coind->getwork(txidcache, known_txs.value()));
+    coind_work->set(coind->getwork(txidcache, known_txs->value()));
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
     work_poller_t.async_wait([&](const boost::system::error_code &ec){ work_poller(); });
 }
@@ -128,7 +128,7 @@ void CoindNode::poll_header()
     if (!protocol || !is_connected())
         return;
 
-	protocol->get_block_header->yield(coind_work.value().previous_block, [&](coind::data::BlockHeaderType new_header){ handle_header(new_header); }, coind_work.value().previous_block);
+	protocol->get_block_header->yield(coind_work->value().previous_block, [&](coind::data::BlockHeaderType new_header){ handle_header(new_header); }, coind_work->value().previous_block);
 }
 
 void CoindNode::handle_message_version(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol)
@@ -197,7 +197,7 @@ void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv>
                 break;
             case inventory_type::block:
 //                LOG_TRACE << "HANDLED BLOCK, with hash: " << inv.hash.GetHex();
-                new_block.happened(inv.hash);
+                new_block->happened(inv.hash);
                 break;
             default:
                 //when Unkown inv type
@@ -236,7 +236,7 @@ void CoindNode::handle_message_getheaders(std::shared_ptr<coind::messages::messa
 
 void CoindNode::handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, std::shared_ptr<CoindProtocol> protocol)
 {
-    new_tx.happened(msg->tx.tx);
+    new_tx->happened(msg->tx.tx);
 }
 
 void CoindNode::handle_message_block(std::shared_ptr<coind::messages::message_block> msg, std::shared_ptr<CoindProtocol> protocol)
@@ -273,5 +273,5 @@ void CoindNode::handle_message_headers(std::shared_ptr<coind::messages::message_
         _new_headers.push_back(*_header.get());
     }
 
-    new_headers.happened(_new_headers);
+    new_headers->happened(_new_headers);
 }

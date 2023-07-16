@@ -54,7 +54,7 @@ public:
     {
         auto [ip, port] = get_addr();
         LOG_WARNING << "PoolProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
-        event_disconnect.happened();
+        event_disconnect->happened();
         socket->disconnect();
     }
 };
