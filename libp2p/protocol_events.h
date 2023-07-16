@@ -14,6 +14,19 @@ class ProtocolEvents
 public:
     Event<> event_handle_message;   // Вызывается, когда мы получаем любое сообщение.
     Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
+
+    explicit ProtocolEvents()
+    {
+        event_handle_message = make_event();
+        event_disconnect = make_event();
+    }
+
+    ~ProtocolEvents()
+    {
+        delete event_handle_message;
+        delete event_disconnect;
+    }
+
 protected:
     bool is_stopped() const { return stopped;}
 
@@ -80,7 +93,7 @@ public:
 			  send_ping_time(std::move(send_ping_t)), timer_send_ping(*_context), send_pingF(std::move(send_ping_f))
     {
         start_outtime_ping();
-        event_handle_message.subscribe([this] { restart_ping(); });
+        event_handle_message->subscribe([this] { restart_ping(); });
 
 		start_send_ping();
     }
