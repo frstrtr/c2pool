@@ -85,11 +85,11 @@ namespace shares
         }
     };
 
-    class PrefsumRulesElement
+    class TreeRulesElement
     {
         std::map<std::string, Rule> rules;
     public:
-        PrefsumRulesElement() = default;
+        TreeRulesElement() = default;
 
         void add(const std::string &key, Rule &value)
         {
@@ -101,12 +101,12 @@ namespace shares
         {
             if (rules.find(key) == rules.end())
                 throw std::invalid_argument(
-                        (boost::format("PrefsumRulesElement::get[key = [%1%]]: key not exist in PrefsumRulesElement") %
+                        (boost::format("TreeRulesElement::get[key = [%1%]]: key not exist in TreeRulesElement") %
                          key).str());
 
             if (rules.at(key).value.type() != typeid(TypeValue))
                 throw std::invalid_argument(
-                        (boost::format("PrefsumRulesElement::get[key = [%1%]]: %2% != %3%  in PrefsumRulesElement") %
+                        (boost::format("TreeRulesElement::get[key = [%1%]]: %2% != %3%  in TreeRulesElement") %
                          key % typeid(TypeValue).name() % rules.at(key).value.type().name()).str());
 
             TypeValue *result = std::any_cast<TypeValue>(&rules[key].value);
@@ -117,13 +117,13 @@ namespace shares
         {
             if (rules.find(key) == rules.end())
                 throw std::invalid_argument((boost::format(
-                        "PrefsumRulesElement::get_rule[key = [%1%]]: key not exist in PrefsumRulesElement") %
+                        "TreeRulesElement::get_rule[key = [%1%]]: key not exist in TreeRulesElement") %
                                              key).str());
 
             return rules[key];
         }
 
-        PrefsumRulesElement &operator+=(const PrefsumRulesElement &r)
+        TreeRulesElement &operator+=(const TreeRulesElement &r)
         {
             for (const auto &[k, rule]: r.rules)
             {
@@ -135,7 +135,7 @@ namespace shares
             return *this;
         }
 
-        PrefsumRulesElement &operator-=(const PrefsumRulesElement &r)
+        TreeRulesElement &operator-=(const TreeRulesElement &r)
         {
             for (const auto &[k, rule]: r.rules)
             {
@@ -149,7 +149,7 @@ namespace shares
     };
 
     template <typename ValueType>
-    class PrefsumRules
+    class TreeRules
     {
         struct RuleFunc
         {
@@ -168,12 +168,12 @@ namespace shares
     public:
         Event<std::vector<std::string>> new_rule_event;
 
-        explicit PrefsumRules()
+        explicit TreeRules()
         {
             new_rule_event = make_event<std::vector<std::string>>();
         }
 
-        ~PrefsumRules()
+        ~TreeRules()
         {
             delete new_rule_event;
         }
@@ -195,9 +195,9 @@ namespace shares
             return {f.make(value), &f.add, &f.sub, &f.make_none};
         }
 
-        PrefsumRulesElement make_rules(const ValueType &value)
+        TreeRulesElement make_rules(const ValueType &value)
         {
-            PrefsumRulesElement rules;
+            TreeRulesElement rules;
             for (auto kv : funcs)
             {
                 auto _rule = make_rule(kv.first, value);

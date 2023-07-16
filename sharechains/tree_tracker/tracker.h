@@ -41,7 +41,7 @@ public:
     std::map<hash_type, std::set<fork_ptr>> tails;
 
     // manager for rules
-    shares::PrefsumRules<value_type> rules;
+    shares::TreeRules<value_type> rules;
 
     Event<value_type> added;
     Event<value_type> removed;
