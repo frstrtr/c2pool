@@ -18,10 +18,10 @@ Stratum::Stratum(std::shared_ptr<boost::asio::io_context> context, std::shared_p
 
     server.Add("mining.submit", GetHandle(&Stratum::mining_submit, *this));
 
-    auto new_work_id = _worker->new_work.subscribe([&](){
+    auto new_work_id = _worker->new_work->subscribe([&](){
         _send_work();
     });
-    event_disconnect.subscribe([&, _new_work_id = new_work_id](){ _worker->new_work.unsubscribe(_new_work_id); });
+    event_disconnect->subscribe([&, _new_work_id = new_work_id](){ _worker->new_work->unsubscribe(_new_work_id); });
 }
 
 void Stratum::_send_work()
