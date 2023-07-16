@@ -8,7 +8,7 @@ class BaseTrackerElement : public BaseSumElement<ShareType, BaseTrackerElement, 
 public:
     value_type share;
 
-    shares::PrefsumRulesElement rules;
+    shares::TreeRulesElement rules;
     arith_uint288 work;
     arith_uint288 min_work;
     shares::weight::weight_data weight;
