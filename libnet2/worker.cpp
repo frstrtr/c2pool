@@ -60,14 +60,19 @@ bool Work::operator!=(const Work &value) const
 }
 
 Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeData> pool_node,
-               shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(std::move(net)), current_work(true),
+               shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(std::move(net)),
+                                                                                                          current_work(make_variable<Work>(Work{})),
+                                                                                                          new_work(make_event()),
+                                                                                                          share_received(make_event()),
+                                                                                                          pseudoshare_received(make_event()),
+                                                                                                          removed_unstales(make_variable<std::tuple<int32_t, int32_t, int32_t>>(std::make_tuple(0,0,0))),
+                                                                                                          removed_doa_unstales(make_variable<int32_t>(0)),
                                                                                                           _pool_node(std::move(pool_node)),
                                                                                                           _coind_node(std::move(coind_node)),
                                                                                                           _tracker(std::move(tracker)),
                                                                                                           local_rate_monitor(10 * 60),
-                                                                                                          local_addr_rate_monitor(10 * 60),
-                                                                                                          removed_unstales(std::make_tuple(0,0,0)),
-                                                                                                          removed_doa_unstales(0)
+                                                                                                          local_addr_rate_monitor(10 * 60)
+
 {
     // DOA Rule for PrefsumShare
     _tracker->rules.add("doa", [&](const ShareType &share)
@@ -152,23 +157,23 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
 
 
     // sub for removed_unstales Variable's
-    _tracker->removed.subscribe([&](ShareType share)
+    _tracker->removed->subscribe([&](ShareType share)
                                 {
-                                    auto [count, orphan, doa] = removed_unstales.value();
+                                    auto [count, orphan, doa] = removed_unstales->value();
                                     if (my_share_hashes.count(share->hash) &&
-                                        tracker->is_child_of(share->hash, _coind_node->best_share.value()))
+                                        tracker->is_child_of(share->hash, _coind_node->best_share->value()))
                                     {
-                                        removed_unstales = std::make_tuple(
+                                        removed_unstales->set(std::make_tuple(
                                                 count + 1,
                                                 orphan + ((*share->share_data)->stale_info == orphan ? 1 : 0),
                                                 doa + ((*share->share_data)->stale_info == doa ? 1 : 0)
-                                        );
+                                        ));
                                     }
 
                                     if (my_doa_share_hashes.count(share->hash) &&
-                                        _tracker->is_child_of(share->hash, _coind_node->best_share.value()))
+                                        _tracker->is_child_of(share->hash, _coind_node->best_share->value()))
                                     {
-                                        removed_doa_unstales = removed_doa_unstales.value() + 1;
+                                        removed_doa_unstales->value() += 1;
                                     }
                                 });
 
@@ -199,25 +204,25 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
 
     // COMBINE WORK
 
-    _coind_node->coind_work.changed->subscribe([&](const auto &work){ compute_work(); });
-    _coind_node->best_block_header.changed->subscribe([&](const auto &block_header){ compute_work(); });
+    _coind_node->coind_work->changed->subscribe([&](const auto &work){ compute_work(); });
+    _coind_node->best_block_header->changed->subscribe([&](const auto &block_header){ compute_work(); });
     compute_work();
 
 
-    current_work.transitioned->subscribe([&](const auto& before, const auto& after){
+    current_work->transitioned->subscribe([&](const auto& before, const auto& after){
 //        LOG_TRACE << "CURRENT WORK.TRANSITIONED:";
 //        LOG_TRACE << "\tBefore: " << before;
 //        LOG_TRACE << "\tafter: " << after;
         //  # trigger LP if version/previous_block/bits changed or transactions changed from nothing
         if ((std::tie(before.version, before.previous_block, before.bits) != std::tie(after.version, after.previous_block, after.bits)) || (before.transactions.empty() && !after.transactions.empty()))
         {
-            new_work.happened();
+            new_work->happened();
         }
     });
 
-    _coind_node->best_share.changed->subscribe([&](const auto &value)
+    _coind_node->best_share->changed->subscribe([&](const auto &value)
     {
-       new_work.happened();
+       new_work->happened();
     });
 
     init_web_metrics();
@@ -232,7 +237,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         throw std::runtime_error("c2pool is not connected to any peers"); //TODO: to jsonrpc_error
     }
 
-    if (_pool_node->best_share.value().IsNull() && _net->PERSIST)
+    if (_pool_node->best_share->value().IsNull() && _net->PERSIST)
     {
         throw std::runtime_error("c2pool is downloading shares"); //TODO: to jsonrpc_error
     }
@@ -241,7 +246,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	std::set<std::string> unknown_rules;
 	{
 		std::set<std::string> coind_rules;
-		for (auto rule: _coind_node->coind_work.value().rules)
+		for (auto rule: _coind_node->coind_work->value().rules)
 		{
 			if (rule.rfind("!", 0) == 0)
 			{
@@ -263,7 +268,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //3
     std::vector<uint256> tx_hashes;
-    for (auto tx: current_work.pvalue()->transactions)
+    for (const auto& tx: current_work->value().transactions)
     {
         coind::data::stream::TransactionType_stream _tx(tx);
         PackStream packed_tx;
@@ -277,7 +282,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         uint256 _tx_hash;
         coind::data::tx_type _tx;
 
-        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(tx_hashes, current_work.pvalue()->transactions))
+        BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(tx_hashes, current_work->value().transactions))
                     {
                         tx_map[_tx_hash] = _tx;
                     }
@@ -289,9 +294,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     uint64_t share_version;
 
     ShareType prev_share;
-    if (!_pool_node->best_share.value().IsNull())
+    if (!_pool_node->best_share->value().IsNull())
     {
-        prev_share = _tracker->get(_pool_node->best_share.value());
+        prev_share = _tracker->get(_pool_node->best_share->value());
     }
 
     if (!prev_share)
@@ -324,14 +329,14 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 					local_hash_rate * _net->SHARE_PERIOD / 60)); // in p2pool:  /0.0167, not /60
 		}
 		auto lookbehind = 3600 / _net->SHARE_PERIOD;
-		block_subsidy = _coind_node->coind_work.value().subsidy;
+		block_subsidy = _coind_node->coind_work->value().subsidy;
 		if (prev_share && _tracker->get_height(prev_share->hash) > lookbehind)
 		{
 			//TODO (from p2pool): doesn't use global stale rate to compute pool hash
-			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share.value(), lookbehind) * block_subsidy * (100 - donation_percentage) / 100; //(1 - donation_percentage/100);
+			auto expected_payout_per_block = local_hash_rate / _tracker->get_pool_attempts_per_second(_coind_node->best_share->value(), lookbehind) * block_subsidy * (100 - donation_percentage) / 100; //(1 - donation_percentage/100);
 			if (expected_payout_per_block < _net->parent->DUST_THRESHOLD)
 			{
-				auto temp1 = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target()) * _net->SPREAD;
+				auto temp1 = coind::data::target_to_average_attempts(_coind_node->coind_work->value().bits.target()) * _net->SPREAD;
 				auto temp2 = temp1 * _net->parent->DUST_THRESHOLD / block_subsidy;
 				desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(temp2));
 			}
@@ -343,11 +348,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 //    LOG_DEBUG_STRATUM << "Before generate share transaction: " << current_work.value().bits << " " << FloatingInteger(current_work.value().bits).target();
     auto generate_transaction = std::make_shared<shares::GenerateShareTransaction>(_tracker);
     generate_transaction->
-            set_block_target(FloatingInteger(current_work.value().bits).target()).
+            set_block_target(FloatingInteger(current_work->value().bits).target()).
             set_desired_timestamp(c2pool::dev::timestamp()).
             set_desired_target(desired_share_target).
             set_ref_merkle_link(coind::data::MerkleLink({}, 0)).
-            set_base_subsidy(_net->parent->SUBSIDY_FUNC(current_work.value().height)).
+            set_base_subsidy(_net->parent->SUBSIDY_FUNC(current_work->value().height)).
             set_known_txs(tx_map);
 
 //    LOG_TRACE << "DESIRED TIMESTAMP CALCULATE = " << c2pool::dev::timestamp() << " (" << (uint32_t) c2pool::dev::timestamp() << ") + " << 0.5f << " = " << (c2pool::dev::timestamp() + 0.5f) << " / " << (uint32_t)(c2pool::dev::timestamp() + 0.5f);
@@ -357,7 +362,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         uint256 _tx_hash;
         int32_t _fee;
 
-        BOOST_FOREACH(boost::tie(_tx_hash, _fee), boost::combine(tx_hashes, current_work.pvalue()->transaction_fees))
+        BOOST_FOREACH(boost::tie(_tx_hash, _fee), boost::combine(tx_hashes, current_work->value().transaction_fees))
                     {
                         desired_other_transaction_hashes_and_fees.emplace_back(_tx_hash, std::make_optional(_fee));
                     }
@@ -369,9 +374,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
         std::vector<unsigned char> coinbase;
 		{
 			CScript _coinbase;
-			_coinbase << current_work.value().height;
+			_coinbase << current_work->value().height;
 			// _coinbase << mm_data // TODO: FOR MERGED MINING
-			_coinbase << current_work.value().coinbaseflags;
+			_coinbase << current_work->value().coinbaseflags;
 			coinbase = ToByteVector(_coinbase);
             if (coinbase.size() > 100)
                 coinbase.resize(100);
@@ -389,11 +394,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 		}
 
         shares::types::ShareData _share_data(
-                _pool_node->best_share.value(),
+                _pool_node->best_share->value(),
                 coinbase,
                 c2pool::random::randomNonce(),
                 pubkey_hash,
-                current_work.value().subsidy,
+                current_work->value().subsidy,
                 donation,
                 stale_info,
                 share_version
@@ -441,7 +446,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             //# one node has the whole p2pool hashrate, it will still only need to process one pseudoshare
             //# every ~0.01 seconds.
 
-            arith_uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work.value().bits.target());
+            arith_uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work->value().bits.target());
             avg_attempts *= _net->SPREAD;
             avg_attempts *= _net->parent->DUST_THRESHOLD;
             avg_attempts/block_subsidy;
@@ -475,7 +480,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //9
     auto getwork_time = c2pool::dev::timestamp();
-    auto lp_count = new_work.get_times();
+    auto lp_count = new_work->get_times();
 
     coind::data::MerkleLink merkle_link;
     if (!gen_sharetx_res->share_info->segwit_data.has_value())
@@ -510,13 +515,13 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     //10
     NotifyData ba = {
-            std::max(current_work.value().version, (uint64_t) 536870912),
-            current_work.value().previous_block,
+            std::max(current_work->value().version, (uint64_t) 536870912),
+            current_work->value().previous_block,
             merkle_link,
             std::vector<unsigned char>(packed_gentx.data.begin(), packed_gentx.data.end() - COINBASE_NONCE_LENGTH - 4),
 			std::vector<unsigned char>(packed_gentx.data.end()-4, packed_gentx.data.end()),
-            current_work.value().timestamp,
-            current_work.value().bits,
+            current_work->value().timestamp,
+            current_work->value().bits,
             target
     };
 
@@ -607,7 +612,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 assert(header.merkle_root == check_merkle_link1);
                 assert(header.bits == ba.bits);
 
-                bool on_time = _new_work.get_times() == _lp_count;
+                bool on_time = _new_work->get_times() == _lp_count;
                 //TODO: merged mining
 //                    for aux_work, index, hashes in mm_later:
 //                        try:
@@ -653,11 +658,11 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     //# job was assigned. Fortunately, the tx_map is still in in our scope from this job, so we can use that
                     //# to refill it if needed.
 
-                    auto known_txs = _coind_node->known_txs.pvalue();
+                    auto known_txs = _coind_node->known_txs->value();
 
                     std::map<uint256, coind::data::tx_type> missing;
                     for (auto [_hash, _value]: tx_map)
-                        if (known_txs->count(_hash) == 0)
+                        if (known_txs.count(_hash) == 0)
                         {
                             missing[_hash] = _value;
                         }
@@ -666,7 +671,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     {
                         LOG_WARNING << missing.size()
                                     << " transactions were erroneously evicted from known_txs_var. Refilling now.";
-                        _coind_node->known_txs.add(missing);
+                        _coind_node->known_txs->add(missing);
                     }
 
                     my_share_hashes.insert(share->hash);
@@ -692,7 +697,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                     //for web_static
                     //self.share_received.happened(bitcoin_data.target_to_average_attempts(share.target), not on_time, share.hash)
-                    share_received.happened();
+                    share_received->happened();
                 }
 
                 if (pow_hash > target)
@@ -785,16 +790,16 @@ stale_counts Worker::get_stale_counts()
     auto my_shares = my_share_hashes.size();
     auto my_doa_shares = my_doa_share_hashes.size();
 
-    auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales.value();
+    auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales->value();
 
     DOAElement delta;
-    if (_coind_node->best_share.value().IsNull())
+    if (_coind_node->best_share->value().IsNull())
         delta = DOAElement{0,0,0,0};
     else
-        delta = *(std::get<0>(_tracker->get_sum_to_last(_coind_node->best_share.value())).rules.get<DOAElement>("doa"));
+        delta = *(std::get<0>(_tracker->get_sum_to_last(_coind_node->best_share->value())).rules.get<DOAElement>("doa"));
 
     auto my_shares_in_chain = delta.my_count + _removed_unstales;
-    auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales.value();
+    auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales->value();
     auto orphans_recorded_in_chain = delta.my_orphan_announce_count + _removed_unstales_orphans;
     auto doas_recorded_in_chain = delta.my_dead_announce_count + _removed_unstales_doa;
 
@@ -882,7 +887,7 @@ user_details Worker::preprocess_request(std::string username)
         throw std::runtime_error("c2pool is not connected to any peers");
         //TODO: raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
     }
-    if (c2pool::dev::timestamp() > current_work.value().last_update + 60)
+    if (c2pool::dev::timestamp() > current_work->value().last_update + 60)
     {
         throw std::runtime_error("lost contact with coind");
         //TODO: raise jsonrpc.Error_for_code(-12345)(u'lost contact with bitcoind')
@@ -893,11 +898,11 @@ user_details Worker::preprocess_request(std::string username)
 
 void Worker::compute_work()
 {
-    Work t = Work::from_jsonrpc_data(_coind_node->coind_work.value());
-    if (!_coind_node->best_block_header.isNull())
+    Work t = Work::from_jsonrpc_data(_coind_node->coind_work->value());
+    if (!_coind_node->best_block_header->isNull())
     {
         // TODO: test
-        auto bb = _coind_node->best_block_header.value();
+        auto bb = _coind_node->best_block_header->value();
         PackStream packed_block_header = bb.get_pack();
 
         if (bb->previous_block == t.previous_block &&
@@ -917,14 +922,14 @@ void Worker::compute_work()
                     {},
                     {},
                     coind::data::calculate_merkle_link({uint256::ZERO}, 0),
-                    _net->parent->SUBSIDY_FUNC(_coind_node->coind_work.value().height),
-                    (int32_t) _coind_node->coind_work.value().last_update
+                    _net->parent->SUBSIDY_FUNC(_coind_node->coind_work->value().height),
+                    (int32_t) _coind_node->coind_work->value().last_update
             };
 //                t = coind::getwork_result()
         }
     }
 //    LOG_DEBUG_STRATUM << "New current_work!: " << t;
-    current_work.set(t);
+    current_work->set(t);
 }
 
 void Worker::init_web_metrics()
@@ -942,9 +947,9 @@ void Worker::init_web_metrics()
         //---------> efficiency
         if (_stale.total)
         {
-            auto lookbehind = min(_tracker->get_height(_pool_node->best_share.value()), 3600/_net->SHARE_PERIOD);
+            auto lookbehind = min(_tracker->get_height(_pool_node->best_share->value()), 3600/_net->SHARE_PERIOD);
             //TODO: test
-            float efficiency = (1 - (std::get<0>(_stale.orph_doa) + std::get<1>(_stale.orph_doa))/_stale.total) / (1 - _tracker->get_average_stale_prop(_pool_node->best_share.value(), lookbehind));
+            float efficiency = (1 - (std::get<0>(_stale.orph_doa) + std::get<1>(_stale.orph_doa))/_stale.total) / (1 - _tracker->get_average_stale_prop(_pool_node->best_share->value(), lookbehind));
             j["efficiency"] = efficiency;
         } else{
             j["efficiency"] = nullptr;
@@ -967,6 +972,6 @@ void Worker::init_web_metrics()
         j["miner_dead_hash_rates"] = miner_dead_hash_rates;
         j["rate"] = local;
         j["doa"] = local_dead/local;
-        j["time_to_share"] = coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share.value())->max_target) / local;
+        j["time_to_share"] = coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share->value())->max_target) / local;
     });
 }

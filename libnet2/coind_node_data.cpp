@@ -5,28 +5,28 @@ void CoindNodeData::handle_header(coind::data::BlockHeaderType new_header)
 	auto packed_new_header = new_header.get_pack();
 	arith_uint256 hash_header = UintToArith256(parent_net->POW_FUNC(packed_new_header));
 	//check that header matches current target
-	if (!(hash_header <= UintToArith256(coind_work.value().bits.target())))
+	if (!(hash_header <= UintToArith256(coind_work->value().bits.target())))
 		return;
 
-	auto coind_best_block = coind_work.value().previous_block;
+	auto coind_best_block = coind_work->value().previous_block;
 
-	if (best_block_header.isNull() ||
+	if (best_block_header->isNull() ||
 		((new_header->previous_block == coind_best_block) && (coind::data::hash256(packed_new_header) == coind_best_block)) ||
-		((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header.value()->previous_block != coind_best_block)))
+		((coind::data::hash256(packed_new_header) == coind_best_block) && (best_block_header->value()->previous_block != coind_best_block)))
 	{
-		best_block_header = new_header;
+		best_block_header->set(new_header);
 	}
 }
 
 void CoindNodeData::set_best_share()
 {
-	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
+	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
 
-	best_share.set(_best);
-    LOG_DEBUG_COIND << "new best_share: " << best_share.value().GetHex();
-    if (!best_share.value().IsNull())
-        LOG_DEBUG_COIND << "REAL NEW BEST SHARE: " << best_share.value().GetHex();
-	desired.set(_desired);
+	best_share->set(_best);
+    LOG_DEBUG_COIND << "new best_share: " << best_share->value().GetHex();
+    if (!best_share->value().IsNull())
+        LOG_DEBUG_COIND << "REAL NEW BEST SHARE: " << best_share->value().GetHex();
+	desired->set(_desired);
 
 	if (pool_node)
 	{
@@ -47,7 +47,7 @@ void CoindNodeData::set_best_share()
 void CoindNodeData::clean_tracker()
 {
 	// TODO?: Подумать, нужно ли это или очистка шар будет проходить по нашему алгоритму?
-	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work.value().previous_block, coind_work.value().bits.get(), known_txs.value());
+	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
 
 	// if (decorated_heads.size() > 0)
 	// {
@@ -157,8 +157,8 @@ void CoindNodeData::submit_block(coind::data::types::BlockType &block, bool igno
     // RPC
     bool segwit_activated = false;
     {
-        segwit_activated += std::any_of(coind_work._value->rules.begin(), coind_work._value->rules.end(), [](const auto &v){ return v == "segwit";});
-        segwit_activated += std::any_of(coind_work._value->rules.begin(), coind_work._value->rules.end(), [](const auto &v){ return v == "!segwit";});
+        segwit_activated += std::any_of(coind_work->value().rules.begin(), coind_work->value().rules.end(), [](const auto &v){ return v == "segwit";});
+        segwit_activated += std::any_of(coind_work->value().rules.begin(), coind_work->value().rules.end(), [](const auto &v){ return v == "!segwit";});
     }
 
     coind->submit_block(block, /*coind_work._value->use_getblocktemplate,*/ ignore_failure, segwit_activated);

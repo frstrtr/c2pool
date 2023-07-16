@@ -95,7 +95,7 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 		tracker->add(share);
 	}
 
-	known_txs.add(all_new_txs);
+	known_txs->add(all_new_txs);
 
 	if (new_count)
 	{
@@ -160,7 +160,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 {
 	auto t0 = c2pool::dev::timestamp();
 	std::set<uint256> tx_hashes;
-	auto _known_txs = known_txs.value();
+	auto _known_txs = known_txs->value();
 
 	// Share list
 	std::vector<ShareType> shares;
@@ -171,7 +171,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 	});
 
 	// Check shares
-	for (auto share : shares)
+	for (const auto& share : shares)
 	{
 		if (share->VERSION >= 13)
 		{
@@ -182,7 +182,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 				{
 					std::set<uint256> newset(share->new_transaction_hashes->begin(), share->new_transaction_hashes->end());
 
-					for (auto _tx : _known_txs)
+					for (const auto& _tx : _known_txs)
 					{
 						if (_known_txs.find(_tx.first) != _known_txs.end())
 							newset.erase(_tx.first);
@@ -218,13 +218,13 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 	uint32_t new_tx_size = 0;
 	for (auto x : tx_hashes)
 	{
-		if (!coind_node->mining_txs.exist(x) && known_txs.exist(x))
+		if (!coind_node->mining_txs->exist(x) && known_txs->exist(x))
 		{
 			// hashes_to_send
 			hashes_to_send.push_back(x);
 
 			// new_tx_size calculate
-			coind::data::stream::TransactionType_stream _tx(known_txs._value->at(x));
+			coind::data::stream::TransactionType_stream _tx(known_txs->value()[x]);
 			PackStream packed_tx;
 			packed_tx << _tx;
 
@@ -252,7 +252,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 			if (peer->remote_tx_hashes.count(x))
 				_tx_hashes.push_back(x);
 			else
-				_txs.push_back(known_txs.value()[x]);
+				_txs.push_back(known_txs->value()[x]);
 		}
 
 		auto msg_remember_tx = std::make_shared<pool::messages::message_remember_tx>(_tx_hashes, _txs);

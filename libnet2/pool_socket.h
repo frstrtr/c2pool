@@ -62,7 +62,7 @@ public:
                                      if (_ec)
                                      {
                                          std::string reason = "[PoolSocket] write error: " + _ec.message();
-                                         bad_peer.happened(reason);
+                                         bad_peer->happened(reason);
                                      } else
                                      {
                                         last_message_sent = cmd;

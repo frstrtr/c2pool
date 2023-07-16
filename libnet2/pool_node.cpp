@@ -103,7 +103,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
 	}
 
     // add_to_remote_view_of_my_known_txs
-    auto id_add_to_remote_view_of_my_known_txs = known_txs.added->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> added){
+    auto id_add_to_remote_view_of_my_known_txs = known_txs->added->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> added){
         if (!added.empty())
         {
             std::vector<uint256> tx_hashes;
@@ -116,10 +116,10 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
             _socket->write(msg_have_tx);
         }
     });
-    handshake->event_disconnect.subscribe([&, _id = id_add_to_remote_view_of_my_known_txs](){ known_txs.added->unsubscribe(_id); });
+    handshake->event_disconnect->subscribe([&, _id = id_add_to_remote_view_of_my_known_txs](){ known_txs->added->unsubscribe(_id); });
 
     // remove_from_remote_view_of_my_known_txs
-    auto id_remove_from_remote_view_of_my_known_txs = known_txs.removed->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> removed)
+    auto id_remove_from_remote_view_of_my_known_txs = known_txs->removed->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> removed)
     {
         if (!removed.empty())
         {
@@ -146,9 +146,9 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
              */
         }
     });
-    handshake->event_disconnect.subscribe([&, _id = id_remove_from_remote_view_of_my_known_txs](){ known_txs.removed->unsubscribe(_id); });
+    handshake->event_disconnect->subscribe([&, _id = id_remove_from_remote_view_of_my_known_txs](){ known_txs->removed->unsubscribe(_id); });
 
-    auto id_update_remote_view_of_my_known_txs = known_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+    auto id_update_remote_view_of_my_known_txs = known_txs->transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
         std::map<uint256, coind::data::tx_type> added;
         std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
 
@@ -202,11 +202,11 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
             // TODO: reactor.callLater(20, self.known_txs_cache.pop, key)
         }
     });
-    handshake->event_disconnect.subscribe([&, _id = id_update_remote_view_of_my_known_txs](){ known_txs.transitioned->unsubscribe(_id); });
+    handshake->event_disconnect->subscribe([&, _id = id_update_remote_view_of_my_known_txs](){ known_txs->transitioned->unsubscribe(_id); });
 
     {
         std::vector<uint256> tx_hashes;
-        for (auto v : known_txs.value())
+        for (auto v : known_txs->value())
         {
             tx_hashes.push_back(v.first);
         }
@@ -215,7 +215,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
         handshake->get_socket()->write(msg_have_tx);
     }
 
-    auto id_update_remote_view_of_my_mining_txs = mining_txs.transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+    auto id_update_remote_view_of_my_mining_txs = mining_txs->transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), socket = handshake->get_socket()] (std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
         std::map<uint256, coind::data::tx_type> added;
         std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(added, added.begin()));
 
@@ -275,9 +275,9 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
             socket->write(msg_remember_tx);
         }
     });
-    handshake->event_disconnect.subscribe([&, _id = id_update_remote_view_of_my_mining_txs](){ mining_txs.transitioned->unsubscribe(_id); });
+    handshake->event_disconnect->subscribe([&, _id = id_update_remote_view_of_my_mining_txs](){ mining_txs->transitioned->unsubscribe(_id); });
 
-    for (auto x : mining_txs.value())
+    for (auto x : mining_txs->value())
     {
         PackStream stream;
         coind::data::stream::TransactionType_stream packed_tx(x.second);
@@ -290,7 +290,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
     std::vector<uint256> _tx_hashes;
     std::vector<coind::data::tx_type> _txs;
 
-    for (auto x : mining_txs.value())
+    for (auto x : mining_txs->value())
     {
         _txs.push_back(x.second);
     }
@@ -390,9 +390,9 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
             for (auto tx_hash: *share->new_transaction_hashes)
             {
                 coind::data::tx_type tx;
-                if (known_txs._value->find(tx_hash) != known_txs._value->end())
+                if (known_txs->value().find(tx_hash) != known_txs->value().end())
                 {
-                    tx = known_txs._value->at(tx_hash);
+                    tx = known_txs->value()[tx_hash];
                 } else
                 {
                     bool flag = true;
@@ -514,9 +514,9 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
         }
 
         coind::data::stream::TransactionType_stream tx;
-        if (known_txs._value->find(tx_hash) != known_txs._value->end())
+        if (known_txs->value().count(tx_hash))
         {
-            tx = known_txs._value->at(tx_hash);
+            tx = known_txs->value()[tx_hash];
         } else
         {
 			bool founded_cache = false;
@@ -561,7 +561,7 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 			return;
 		}
 
-		if (known_txs.exist(tx_hash) && !warned)
+		if (known_txs->exist(tx_hash) && !warned)
 		{
 			LOG_WARNING << "Peer sent entire transaction " << tx_hash.ToString() << " that was already received";
 			warned = true;
@@ -571,7 +571,7 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 		protocol->remembered_txs_size += 100 + _tx_size;
 		added_known_txs[tx_hash] = _tx.get();
 	}
-    known_txs.add(added_known_txs);
+    known_txs->add(added_known_txs);
 
 	if (protocol->remembered_txs_size >= protocol->max_remembered_txs_size)
 	{
@@ -609,7 +609,7 @@ void PoolNode::start()
 
     download_shares();
 
-    coind_node->best_block_header.changed->subscribe([&](coind::data::BlockHeaderType header){
+    coind_node->best_block_header->changed->subscribe([&](coind::data::BlockHeaderType header){
         for (auto _peer : peers)
         {
             auto _msg = std::make_shared<message_bestblock>(*header.get());
@@ -617,7 +617,7 @@ void PoolNode::start()
         }
     });
 
-    coind_node->best_share.changed->subscribe([&](uint256 _best_share){
+    coind_node->best_share->changed->subscribe([&](uint256 _best_share){
         broadcast_share(_best_share);
     });
 
@@ -644,7 +644,7 @@ void PoolNode::download_shares()
         LOG_DEBUG_POOL << "Start download_shares!";
         while (true)
         {
-            auto desired = _node->coind_node->desired.get_when_satisfies([&](const auto &desired)
+            auto desired = _node->coind_node->desired->get_when_satisfies([&](const auto &desired)
                                                                          {
                                                                              LOG_DEBUG_POOL << "SATISFIES!";
                                                                              return desired.size() != 0;

@@ -64,7 +64,6 @@ public:
 
 struct NotifyData
 {
-//    uint64_t version;
     uint64_t version;
     uint256 previous_block;
     coind::data::MerkleLink merkle_link;

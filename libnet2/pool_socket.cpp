@@ -58,13 +58,13 @@ void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
                                         read_command(msg);
                                     } else {
                                         std::string reason = "[PoolSocket] prefix doesn't match: ";
-                                        bad_peer.happened(reason);
+                                        bad_peer->happened(reason);
                                     }
 								}
 								else
 								{
                                     std::string reason = "[PoolSocket] read_prefix: " + ec.message();
-                                    bad_peer.happened(reason);
+                                    bad_peer->happened(reason);
 								}
 							});
 }
@@ -83,7 +83,7 @@ void PoolSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 								else
 								{
                                     std::string reason = "[PoolSocket] read_command: " + ec.message();
-                                    bad_peer.happened(reason);
+                                    bad_peer->happened(reason);
 								}
 							});
 }
@@ -101,7 +101,7 @@ void PoolSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 								else
 								{
                                     std::string reason = "[PoolSocket] read_length: " + ec.message();
-                                    bad_peer.happened(reason);
+                                    bad_peer->happened(reason);
 								}
 							});
 }
@@ -119,7 +119,7 @@ void PoolSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 								else
 								{
                                     std::string reason = "[PoolSocket] read_checksum: " + ec.message();
-                                    bad_peer.happened(reason);
+                                    bad_peer->happened(reason);
 								}
 							});
 }
@@ -146,7 +146,7 @@ void PoolSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 								else
 								{
                                     std::string reason = "[PoolSocket] read_payload: " + ec.message();
-                                    bad_peer.happened(reason);
+                                    bad_peer->happened(reason);
 								}
 							});
 }
@@ -159,7 +159,7 @@ void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
     {
         auto [ip, port] = get_addr();
         std::string reason = "[PoolSocket] final_read_message: Invalid hash for " + ip + ":" + port + ", command = " + msg->command;
-        bad_peer.happened(reason);
+        bad_peer->happened(reason);
         return;
     }
 
