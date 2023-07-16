@@ -49,8 +49,13 @@ protected:
             not_received.erase(key);
     }
 public:
-    explicit Socket(connection_type conn_type = connection_type::unknown) : conn_type_(conn_type) {}
-    Socket(handler_type message_handler, connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), handler(std::move(message_handler)){}
+    explicit Socket(connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), bad_peer(make_event<std::string>()) {}
+    Socket(handler_type message_handler, connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), bad_peer(make_event<std::string>()), handler(std::move(message_handler)){}
+
+    ~Socket()
+    {
+        delete bad_peer;
+    }
 
     void set_message_handler(handler_type message_handler)
     {

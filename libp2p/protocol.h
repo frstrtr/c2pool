@@ -24,9 +24,9 @@ public:
     // Not safe, socket->message_handler = nullptr; wanna for manual setup
     BaseProtocol() = default;
 
-    BaseProtocol (std::shared_ptr<Socket> _socket) : socket(std::move(_socket))
+    explicit BaseProtocol (std::shared_ptr<Socket> _socket) : socket(std::move(_socket))
     {
-        socket->bad_peer.subscribe([&](const std::string &reason){ disconnect(reason); });
+        socket->bad_peer->subscribe([&](const std::string &reason){ disconnect(reason); });
     }
 
 public:
@@ -61,11 +61,11 @@ protected:
 public:
     // Not safe, socket->message_handler = nullptr; handler_manager = nullptr; wanna for manual setup
     Protocol() : BaseProtocol() {}
-    Protocol(std::string _name) : BaseProtocol(), name(_name) {}
+    explicit Protocol(std::string _name) : BaseProtocol(), name(_name) {}
 
-    Protocol (std::string _name, std::shared_ptr<Socket> _socket) : BaseProtocol(_socket), name(_name) {}
+    Protocol (std::string _name, std::shared_ptr<Socket> _socket) : BaseProtocol(_socket), name(std::move(_name)) {}
 
-    Protocol (std::string _name, std::shared_ptr<Socket> _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket), name(_name),
+    Protocol (std::string _name, std::shared_ptr<Socket> _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket), name(std::move(_name)),
                                                                                        handler_manager(_handler_manager)
     {
         _socket->set_message_handler(std::bind(&Protocol::handle, this, std::placeholders::_1));
@@ -73,7 +73,7 @@ public:
 
     virtual void handle(std::shared_ptr<RawMessage> raw_msg) override
     {
-        event_handle_message.happened(); // ProtocolEvents::event_handle_message
+        event_handle_message->happened(); // ProtocolEvents::event_handle_message
 
         auto handler = handler_manager->get_handler(raw_msg->command);
         if (handler)
