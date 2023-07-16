@@ -48,7 +48,10 @@ public:
 public:
     Tracker()
     {
-        rules.new_rule_event.subscribe([&](const std::vector<std::string> &k_rules)
+        added = make_event<value_type>();
+        removed = make_event<value_type>();
+
+        rules.new_rule_event->subscribe([&](const std::vector<std::string> &k_rules)
                                        {
                                            new_rules_calculate(k_rules);
                                        });
@@ -168,7 +171,7 @@ public:
         }
 
         //--Call event ADDED
-        added.happened(_value);
+        added->happened(_value);
     }
 
     auto get_item(hash_type hash) const

@@ -163,17 +163,27 @@ namespace shares
             std::function<void(Rule&, const Rule&)> sub;
         };
 
-        std::map<std::string, RuleFunc> funcs;
+        std::map<std::string, RuleFunc> funcs{};
 
     public:
         Event<std::vector<std::string>> new_rule_event;
+
+        explicit PrefsumRules()
+        {
+            new_rule_event = make_event<std::vector<std::string>>();
+        }
+
+        ~PrefsumRules()
+        {
+            delete new_rule_event;
+        }
 
         void add(std::string k, std::function<std::any(const ValueType&)> _make, std::function<std::any()> _make_none, std::function<void(Rule&, const Rule&)> _add, std::function<void(Rule&, const Rule&)> _sub)
         {
             funcs[k] = {std::move(_make), std::move(_make_none) , std::move(_add), std::move(_sub)};
 
             std::vector<std::string> new_rule_list{k};
-            new_rule_event.happened(new_rule_list);
+            new_rule_event->happened(new_rule_list);
         }
 
         Rule make_rule(const std::string &key, const ValueType &value)
