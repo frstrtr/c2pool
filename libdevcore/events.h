@@ -119,7 +119,7 @@ template<typename VarType>
 class _Variable
 {
 protected:
-    VarType* _value;
+    VarType* _value = nullptr;
 public:
     _Event<VarType>* changed;
     _Event<VarType, VarType>* transitioned;

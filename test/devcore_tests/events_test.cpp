@@ -282,3 +282,9 @@ TEST(DevcoreEvents, variabledict2_set)
 	std::map<int, std::shared_ptr<int>> new_var_value = {{0,std::make_shared<int>(1)}, {2,std::make_shared<int>(3)}};
 	var->set(new_var_value);
 }
+
+TEST(DevcoreEvents, variable_init_value_debug)
+{
+    Variable<int> v = make_variable<int>();
+    std::cout << v->isNull() << std::endl;
+}
