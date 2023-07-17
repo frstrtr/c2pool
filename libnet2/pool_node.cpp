@@ -741,6 +741,14 @@ void PoolNode::init_web_metrics()
         j["in"] = in;
         j["out"] = out;
     });
+
+    current_payouts_metric = net->web->add<current_payouts_metric_type>("current_payouts", [&](nlohmann::json &j){
+        for (const auto &[script, value] : tracker->get_expected_payouts(best_share->value(), FloatingInteger(coind_node->coind_work->value().bits).target(), coind_node->coind_work->value().subsidy))
+        {
+            //TODO: script = bitcoin_data.script2_to_address(script, node.net.PARENT)?
+            j[script] = value/1e8;
+        }
+    });
 //    stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
 //    stale_rate_metric = net->web->add<stale_rate_metric_type>("stale_rate");
 

@@ -27,10 +27,12 @@ protected:
 //    typedef MetricSum<shares_stale_count, 120> stale_counts_metric_type;
 //    typedef MetricRateTime<shares_stale_count, 120> stale_rate_metric_type;
     typedef MetricGetter peers_metric_type;
+    typedef MetricGetter current_payouts_metric_type;
 //    typedef MetricValue attempts_to_share_metric_type;
 protected:
     // Metrics
-    peers_metric_type* peers_metric = nullptr;
+    peers_metric_type* peers_metric{};
+    current_payouts_metric_type* current_payouts_metric{};
 //    attempts_to_share* attempts_to_share_metric = nullptr;
 //    stale_counts_metric_type* stale_counts_metric{};
 //    stale_rate_metric_type* stale_rate_metric{};

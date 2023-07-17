@@ -970,8 +970,33 @@ void Worker::init_web_metrics()
 
         j["miner_hash_rates"] = miner_hash_rates;
         j["miner_dead_hash_rates"] = miner_dead_hash_rates;
+
         j["rate"] = local;
         j["doa"] = local_dead/local;
         j["time_to_share"] = coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share->value())->max_target) / local;
+
+        j["block_value"] = _coind_node->coind_work->value().subsidy * 1e-8;
     });
+
+    //------> pool_rate
+    pool_rate_metric = _net->web->add<pool_rate_metric_type>("pool", [&](nlohmann::json& j){
+        if (_tracker->get_height(_pool_node->best_share->value()) < 10)
+            return j = nullptr;
+
+        auto lookbehind = min(_tracker->get_height(_pool_node->best_share->value()), 3600/_net->SHARE_PERIOD);
+
+        auto nonstale_hash_rate = _tracker->get_pool_attempts_per_second(_pool_node->best_share->value(), lookbehind);
+        auto stale_prop = _tracker->get_average_stale_prop(_pool_node->best_share->value(), lookbehind);
+        auto diff = coind::data::target_to_difficulty(FloatingInteger(current_work->value().bits).target());
+
+        j["rate"] = (nonstale_hash_rate*100)/(100 - 100*stale_prop);
+        j["nonstale_rate"] = nonstale_hash_rate;
+        j["stale_prop"] = stale_prop;
+        j["difficulty"] = coind::data::target_to_difficulty(_tracker->get(_pool_node->best_share->value())->max_target);
+        j["block_difficulty"] = diff;
+        j["network_hashrate"] = (diff * pow(2, 32)) / _net->parent->BLOCK_PERIOD;
+    });
+
+    //------ payout_addr
+    payout_addr_metric = _net->web->add("payout_addr", coind::data::pubkey_hash_to_address(my_pubkey_hash, _net));
 }
