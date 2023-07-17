@@ -2,14 +2,13 @@
 
 #from devcore
 set(devcore_sources addr_store.h addr_store.cpp common.h common.cpp config.h config.cpp converter.cpp
-    filesystem.h filesystem.cpp logger.h logger.cpp random.h random.cpp str.h str.cpp    
-)
+    filesystem.h filesystem.cpp logger.h logger.cpp random.h random.cpp str.h str.cpp)
 
 #from dbshell
 set(devcore_sources ${devcore_sources} db.h)
 
 #from util
-set(devcore_sources ${devcore_sources} types.h events.h #[[prefsum.h]] stream.h stream_types.h math.h deferred.h types.cpp #[[prefsum.cpp]] stream.cpp math.cpp deferred.cpp expiring_dict.h)
+set(devcore_sources ${devcore_sources} types.h events.h stream.h stream_types.h math.h deferred.h types.cpp stream.cpp math.cpp deferred.cpp expiring_dict.h)
 find_library(dl NAMES dl)
 
 add_library(libdevcore ${devcore_sources})
