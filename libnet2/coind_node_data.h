@@ -53,7 +53,7 @@ public:
         mining_txs = make_vardict<uint256, coind::data::tx_type>({});
         mining2_txs = make_vardict<uint256, coind::data::tx_type>({});
         best_share = make_variable<uint256>(uint256::ZERO);
-//        desired = make_variable({});
+        desired = make_variable<std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>>>();
 
         new_block = make_event<uint256>();
         new_tx = make_event<coind::data::tx_type>();
