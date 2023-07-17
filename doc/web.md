@@ -4,17 +4,22 @@
 2. [x] Shares -- Один json из MetricGetter = __shares__;
    - [x] Total/Orphaned/Dead -- поле __total__, __orphan__, __dead__ 
    - [x] Efficiency -- поле __efficiency__
-3. [ ] Pool Rate
-   - [ ] Hashrate -- Поле __pool_hashrate__; 
-   - [ ] % doa + orphaned -- Поле __pool_stale__
-   - [ ] difficulty -- Поле __difficulty__; В p2pool = min_difficulty
+3. [x] Pool Rate -- Поле __pool__
+   - [x] Hashrate -- Поле __pool.hashrate__; 
+   - [x] % doa + orphaned -- Поле __pool.stale__
+   - [x] difficulty -- Поле __pool.difficulty__; В p2pool = min_difficulty
+   - [x] network_block_difficulty -- Поле __pool.block_difficulty__
+   - [x] network_hashrate -- __pool.network_hashrate__
 4. [x] Local Stats ~~Rate~~ -- Поле __local__ 
    - [x] Hashrate -- Поле __local.rate__; состоит из miner_hash_rates и miner_dead_hash_rates.  
    - [x] % doa -- __local.doa__ = __local.miner_dead_hash_rates__/__local.miner_hash_rates__
    - [x] Excepted to share -- Поле __local.time_to_share__
+   - [x] block_value -- __local.block_value__ 
 5. [ ] Payout
-   - [ ] Payout amount --
+   - [ ] Payout amount -- 
    - [ ] Payout addr -- 
-   - [ ] Expected payout amount --
-   - [ ] Block value
-   - [ ] Time to block
+   - [ ] Expected payout amount -- (local/global_stats.pool_hash_rate*local_stats.block_value*(1-local_stats.donation_proportion))
+   - [x] Block value -- __local.block_value__
+   - [ ] Time to block = local_stats.attempts_to_block/global_stats.pool_hash_rate;
+6. [x] Current Payouts -- __current_payouts__;
+7. [ ] Payout Addr -- __payout_addr__;
