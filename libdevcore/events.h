@@ -11,7 +11,7 @@
 
 
 //Example:
-//Event<item_type> remove_special;
+//Event<item_type> remove_special = make_event<item_type>();
 //remove_special.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special, this, _1);
 //void _handle_remove_special(item_type item);
 //remove_special.happened(item);
