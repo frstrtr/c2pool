@@ -1,0 +1,87 @@
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+<head>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.0/jquery.min.js"></script>
+    <script src='https://cdn.plot.ly/plotly-2.20.0.min.js'></script>
+    <script type="text/javascript">
+        function format_dt(dt) {
+            var pairs = [
+                [365.2425*60*60*24, 'years'],
+                [60*60*24, 'days'],
+                [60*60, 'hours'],
+                [60, 'minutes'],
+                [1, 'seconds'],
+            ];
+
+            for(var i in pairs) {
+                var value = pairs[i][0];
+                var name = pairs[i][1];
+
+                if(dt > value) break;
+            }
+
+            return (dt/value) + ' ' + name;
+        }
+
+        $.ajax({
+            url: 'status/pool_rate',
+            data: {
+                net: "dgb"
+            }
+        }).done(function (data){
+            document.getElementById("pool_rate").innerHTML = data["rate"]
+            document.getElementById("pool_stale").innerHTML = data["stale_prop"]
+            document.getElementById("difficulty").innerHTML = data["difficulty"]
+        });
+
+        $.ajax({
+            url: 'status/node_uptime',
+            data: {
+                net: "dgb"
+            }
+        }).done(function (data){
+            document.getElementById("uptime").innerHTML = format_dt(data["uptime"])
+            document.getElementById("peers_out").innerHTML = data["peers"]["out"]
+            document.getElementById("peers_in").innerHTML = data["peers"]["in"]
+        });
+
+        $.ajax({
+            url: 'status/local_rate',
+            data: {
+                net: "dgb"
+            }
+        }).done(function (data){
+            document.getElementById("local_rate").innerHTML = data["rate"]
+            document.getElementById("local_doa").innerHTML = data["doa"]
+            document.getElementById("time_to_share").innerHTML = data["time_to_share"]
+        });
+    </script>
+</head>
+
+<body>
+<table>
+    <h1>C2Pool <span class="symbol"></span></h1>
+<!--    <p><a href="graphs.html">Graphs</a></p>-->
+<!--    <p>Version: <span id="version"></span></p>-->
+    <p>Pool rate: <span id="pool_rate"></span> (<span id="pool_stale"></span> DOA+orphan) Share difficulty: <span
+            id="difficulty"></span></p>
+    <p>Node uptime: <span id="uptime"></span>; Peers: <span id="peers_out"></span> out, <span id="peers_in"></span> in </p>
+    <p>Local rate: <span id="local_rate"></span> (<span id="local_doa"></span> DOA) Expected time to share: <span
+            id="time_to_share"></span></p>
+    <p>Shares: <span id="shares_total"></span> total (<span id="shares_orphan"></span> orphaned, <span
+            id="shares_dead"></span> dead) Efficiency: <span id="efficiency"></span></p>
+    <p>Payout if a block were found NOW: <span id="payout_amount"></span> <span class="symbol"></span> to <a
+            id="payout_addr"></a>. Expected after mining for 24 hours: <span id="expected_payout_amount"></span> <span
+            class="symbol"></span> per block.</p>
+    <p>Current block value: <span id="block_value"></span> <span class="symbol"></span> Expected time to block: <span
+            id="time_to_block"></span></p>
+<!--    <div id="warnings"></div>-->
+    <tr>
+
+        <!--        <td><div id='myDiv'>&lt;!&ndash; Plotly chart will be drawn inside this DIV &ndash;&gt;</div></td>-->
+    </tr>
+</table>
+<!--<div id="other-data-container"></div>-->
+
+<!--<script src="main_script.js"></script>-->
+</body>
+</html>

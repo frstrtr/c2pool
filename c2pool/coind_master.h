@@ -99,13 +99,7 @@ namespace c2pool::master
                                       web_root->net_functor(),
                                       [&](const WebNetJson::net_field &net, const auto &query)
                                       {
-                                          json j
-                                                  {
-                                                          {"hashrate",        net->get("pool_hashrate")},
-                                                          {"doa_orphan_rate", net->get("pool_doa_orphan_rate")},
-                                                          {"difficulty",      net->get("difficulty")}
-                                                  };
-                                          return j.dump();
+                                          return net->get("pool").dump();
                                       });
         //------> NodeUptime
         status->put_child<WebNetJson>("node_uptime",
@@ -124,13 +118,7 @@ namespace c2pool::master
                                       web_root->net_functor(),
                                       [&](const WebNetJson::net_field &net, const auto &query)
                                       {
-                                          json j
-                                                  {
-                                                          {"hashrate",   net->get("local_rate")["miner_hash_rates"]},
-                                                          {"doa",        net->get("local_rate")["miner_hash_rates"]/*/net->get("local_rate")["miner_dead_hash_rates"]*/},
-                                                          {"difficulty", net->get("time_to_share")}
-                                                  };
-                                          return j.dump();
+                                          return net->get("local").dump();
                                       });
         //------> Shares
         status->put_child<WebNetJson>("shares",

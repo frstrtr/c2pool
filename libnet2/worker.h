@@ -245,7 +245,7 @@ private:
 			if (!hash_rate.IsNull())
 				return hash_rate;
 		}
-		return arith_uint288();
+		return {};
 	}
 protected:
     void init_web_metrics() override;
@@ -274,4 +274,5 @@ public:
 
     double donation_percentage; // TODO: init from args
     double worker_fee; //TODO: init from args
+    uint160 my_pubkey_hash; //TODO: init from args
 };
