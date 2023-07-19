@@ -17,10 +17,10 @@
    - [x] block_value -- __local.block_value__ 
 5. [ ] Payout
    - [ ] Payout amount -- 
-   - [ ] Payout addr -- 
+   - [ ] Payout addr -- payout_addr
    - [ ] Expected payout amount -- (local/global_stats.pool_hash_rate*local_stats.block_value*(1-local_stats.donation_proportion))
    - [x] Block value -- __local.block_value__
-   - [ ] Time to block = local_stats.attempts_to_block/global_stats.pool_hash_rate;
+   - [x] Time to block = local_stats.attempts_to_block/global_stats.pool_hash_rate;
 6. [x] Current Payouts -- __current_payouts__;
 7. [x] Payout Addr -- __payout_addr__;
 
@@ -40,11 +40,11 @@ __________
    - [x] local_rate
    - [x] local_doa
    - [x] time_to_share
-4. [ ] Shares
-   - [ ] shares_total
-   - [ ] shares_orphan
-   - [ ] shares_dead
-   - [ ] efficiency
+4. [x] Shares
+   - [x] shares_total
+   - [x] shares_orphan
+   - [x] shares_dead
+   - [x] efficiency
 5. [ ] Payout
    - [ ] payout_amount
    - [ ] symbol

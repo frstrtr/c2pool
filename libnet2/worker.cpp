@@ -792,7 +792,7 @@ stale_counts Worker::get_stale_counts()
 
     auto [_removed_unstales, _removed_unstales_orphans, _removed_unstales_doa] = removed_unstales->value();
 
-    DOAElement delta;
+    DOAElement delta{};
     if (_coind_node->best_share->value().IsNull())
         delta = DOAElement{0,0,0,0};
     else
@@ -973,9 +973,14 @@ void Worker::init_web_metrics()
 
         j["rate"] = local;
         j["doa"] = local.IsNull() ? arith_uint288{} : local_dead/local;
-        j["time_to_share"] = local.IsNull() ? arith_uint288{} : coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share->value())->max_target) / local;
+
+        if (local.IsNull())
+            j["time_to_share"] = nullptr;
+        else
+            j["time_to_share"] = (coind::data::target_to_average_attempts(_tracker->get(_pool_node->best_share->value())->max_target) / local).GetLow64();
 
         j["block_value"] = _coind_node->coind_work->value().subsidy * 1e-8;
+        j["attempts_to_block"] = coind::data::target_to_average_attempts(_coind_node->coind_work->value().bits.target());
     });
 
     //------> pool_rate
