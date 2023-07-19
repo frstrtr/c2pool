@@ -19,7 +19,7 @@
                 if(dt > value) break;
             }
 
-            return (dt/value) + ' ' + name;
+            return (dt/value).toFixed(2) + ' ' + name;
         }
 
         $.ajax({
@@ -52,7 +52,42 @@
         }).done(function (data){
             document.getElementById("local_rate").innerHTML = data["rate"]
             document.getElementById("local_doa").innerHTML = data["doa"]
-            document.getElementById("time_to_share").innerHTML = data["time_to_share"]
+            document.getElementById("time_to_share").innerHTML = data["time_to_share"] ? format_dt(data["time_to_share"]) : "inf"
+            document.getElementById("block_value").innerHTML = data["block_value"]
+        });
+
+        $.ajax({
+            url: 'status/shares',
+            data: {
+                net: "dgb"
+            }
+        }).done(function (data){
+            document.getElementById("shares_total").innerHTML = data["total"]
+            document.getElementById("shares_orphan").innerHTML = data["orphan"]
+            document.getElementById("shares_dead").innerHTML = data["orph_doa"]
+            document.getElementById("efficiency").innerHTML = data["efficiency"]
+        });
+
+        $.ajax({
+            url: 'status/shares',
+            data: {
+                net: "dgb"
+            }
+        }).done(function (data){
+            document.getElementById("shares_total").innerHTML = data["total"]
+            document.getElementById("shares_orphan").innerHTML = data["orphan"]
+            document.getElementById("shares_dead").innerHTML = data["orph_doa"]
+            document.getElementById("efficiency").innerHTML = data["efficiency"]
+        });
+
+        $.ajax({
+            url: 'status/payout',
+            data: {
+                net: "dgb"
+            }
+        }).done(function (data){
+            document.getElementById("block_value").innerHTML = data["block_value"]
+            document.getElementById("time_to_block").innerHTML = data["time_to_block"] ? format_dt(data["time_to_block"]) : "inf"
         });
     </script>
 </head>

@@ -125,14 +125,7 @@ namespace c2pool::master
                                       web_root->net_functor(),
                                       [&](const WebNetJson::net_field &net, const auto &query)
                                       {
-                                          json j
-                                                  {
-                                                          {"total", net->get("shares_total")},
-                                                          {"orphaned", net->get("shares_orphaned")},
-                                                          {"dead", net->get("shares_dead")},
-                                                          {"efficiency", net->get("shares_efficiency")},
-                                                  };
-                                          return j.dump();
+                                          return net->get("shares").dump();
                                       });
 
         //------> Payout
@@ -140,10 +133,21 @@ namespace c2pool::master
                                       web_root->net_functor(),
                                       [&](const WebNetJson::net_field &net, const auto &query)
                                       {
+                                          arith_uint288 attempts_to_block;
+                                          attempts_to_block.SetHex(net->get("local")["attempts_to_block"]);
+
+                                          arith_uint288 pool_hash_rate;
+                                          pool_hash_rate.SetHex(net->get("pool")["rate"]);
+
                                           json j
                                                   {
-                                                          {""}
+                                                          {"time_to_block", nullptr},
+                                                          {"block_value", net->get("local")["block_value"]}
                                                   };
+
+                                          if (!pool_hash_rate.IsNull())
+                                              j["time_to_block"] = (attempts_to_block/pool_hash_rate).GetLow64();
+
                                           return j.dump();
                                       });
         //------> LastBlock
