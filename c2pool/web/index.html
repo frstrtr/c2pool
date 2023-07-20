@@ -2,6 +2,7 @@
 <head>
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.0/jquery.min.js"></script>
     <script src='https://cdn.plot.ly/plotly-2.20.0.min.js'></script>
+    <script type="text/javascript" src="d3.v2.min.js"></script>
     <script type="text/javascript">
         function format_dt(dt) {
             var pairs = [
@@ -21,6 +22,40 @@
 
             return (dt/value).toFixed(2) + ' ' + name;
         }
+
+        d3.json('/status/currency_info?net=' + "dgb", function(currency_info) {
+            // document.getElementById("symbol").innerHTML = currency_info.symbol;
+            d3.selectAll('.symbol').text(currency_info.symbol);
+
+            d3.json('/status/current_payouts?net=' + "dgb", function (pays) {
+                // d3.json('/payout_addr', function(addr) {
+                //     d3.select('#payout_addr').text(addr).attr('href', currency_info.address_explorer_url_prefix + addr);
+                //     d3.select('#payout_amount').text(addr in pays ? pays[addr] : 0);
+                // });
+
+                var arr = [];
+                for (var i in pays) arr.push(i);
+                arr.sort(function (a, b) {
+                    return pays[b] - pays[a]
+                });
+
+                var tr = d3.select('#payouts').selectAll().data(arr).enter().append('tr');
+                tr.append('td').append('a').text(function (addr) {
+                    return addr
+                }).attr('href', function (addr) {
+                    return currency_info.address_explorer_url_prefix + addr
+                });
+                tr.append('td').text(function (addr) {
+                    return pays[addr]
+                });
+
+                var total_tr = d3.select('#payouts').append('tr');
+                total_tr.append('td').append('strong').text('Total');
+                total_tr.append('td').text(d3.sum(arr, function (addr) {
+                    return pays[addr]
+                }).toFixed(8));
+            });
+        });
 
         $.ajax({
             url: 'status/pool_rate',
@@ -114,6 +149,11 @@
 
         <!--        <td><div id='myDiv'>&lt;!&ndash; Plotly chart will be drawn inside this DIV &ndash;&gt;</div></td>-->
     </tr>
+
+    <h2>Payouts if a block were found NOW:</h2>
+    <table border="1" id="payouts">
+        <tr><th>address</th><th>amount in <span class="symbol"></span></th></tr>
+    </table>
 </table>
 <!--<div id="other-data-container"></div>-->
 
