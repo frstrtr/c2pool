@@ -189,6 +189,8 @@ namespace coind
 
     ParentNetwork::ParentNetwork(std::string name, boost::property_tree::ptree &pt) : ParentNetwork(name)
     {
+        SYMBOL = pt.get<std::string>("SYMBOL");
+
         // PREFIX
         auto _prefix_str = pt.get<std::string>("PREFIX");
         auto _prefix = ParseHex(_prefix_str);
@@ -221,12 +223,19 @@ namespace coind
 
         // SUBSIDY_FUNC
         set_subsidy_func(pt.get<std::string>("SUBSIDY_FUNC"));
+
+        // URL PREFIX's
+        BLOCK_EXPLORER_URL_PREFIX = pt.get<std::string>("BLOCK_EXPLORER_URL_PREFIX");
+        ADDRESS_EXPLORER_URL_PREFIX = pt.get<std::string>("ADDRESS_EXPLORER_URL_PREFIX");
+        TX_EXPLORER_URL_PREFIX = pt.get<std::string>("TX_EXPLORER_URL_PREFIX");
     }
 
     boost::property_tree::ptree ParentNetwork::make_default_network()
     {
         using boost::property_tree::ptree;
         ptree network;
+
+        network.put("SYMBOL", "DGB");
 
         network.put("PREFIX", "fac3b6da");
         network.put("P2P_ADDRESS", "217.72.4.157");
@@ -242,6 +251,10 @@ namespace coind
 
         network.put("POW_FUNC", "scrypt");
         network.put("SUBSIDY_FUNC", "dgb");
+
+        network.put("BLOCK_EXPLORER_URL_PREFIX", "https://chainz.cryptoid.info/dgb/block.dws?");
+        network.put("ADDRESS_EXPLORER_URL_PREFIX", "https://chainz.cryptoid.info/dgb/address.dws?");
+        network.put("TX_EXPLORER_URL_PREFIX", "https://chainz.cryptoid.info/dgb/tx.dws?");
 
         return network;
     }
