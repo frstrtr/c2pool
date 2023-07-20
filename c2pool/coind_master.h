@@ -38,6 +38,10 @@ namespace c2pool::master
         auto web_net = root->new_net(name);
         net->set_web(web_net);
         web_net->add("uptime_begin", c2pool::dev::timestamp());
+        web_net->add("symbol", net->parent->SYMBOL);
+        web_net->add("block_explorer_url_prefix", net->parent->BLOCK_EXPLORER_URL_PREFIX);
+        web_net->add("address_explorer_url_prefix", net->parent->ADDRESS_EXPLORER_URL_PREFIX);
+        web_net->add("tx_explorer_url_prefix", net->parent->TX_EXPLORER_URL_PREFIX);
 
 
         //NodeManager
@@ -180,6 +184,32 @@ namespace c2pool::master
                                                   };
                                           return j.dump();
                                       });
+        //------> Current Payouts
+        status->put_child<WebNetJson>("current_payouts",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          return net->get("current_payouts").dump();
+                                      });
+        //------> Payout Addr
+        status->put_child<WebNetJson>("payout_addr",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          return net->get("payout_addr").dump();
+                                      });
+        //------> Currency Info
+        status->put_child<WebNetJson>("currency_info",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query){
+                                            json j {
+                                                    {"symbol", net->get("symbol")},
+                                                    {"block_explorer_url_prefix", net->get("block_explorer_url_prefix")},
+                                                    {"address_explorer_url_prefix", net->get("address_explorer_url_prefix")},
+                                                    {"tx_explorer_url_prefix", net->get("tx_explorer_url_prefix")},
+                                            };
+                                            return j.dump();
+        });
 
         //---> Debug Interface
         auto debug = index->put_child<WebInterface>("debug", [](const auto &query) {});
