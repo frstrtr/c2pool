@@ -128,6 +128,7 @@ namespace coind
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
         const unsigned char *PREFIX;
 
+        std::string SYMBOL;
         int32_t BLOCK_PERIOD;
         std::string P2P_ADDRESS;
         int P2P_PORT;
@@ -138,6 +139,10 @@ namespace coind
         int DUST_THRESHOLD;
         arith_uint256 SANE_TARGET_RANGE_MIN;
         arith_uint256 SANE_TARGET_RANGE_MAX;
+
+        std::string BLOCK_EXPLORER_URL_PREFIX;
+        std::string ADDRESS_EXPLORER_URL_PREFIX;
+        std::string TX_EXPLORER_URL_PREFIX;
     public:
         ParentNetwork(std::string name);
         ParentNetwork(std::string name, boost::property_tree::ptree &pt);
