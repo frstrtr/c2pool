@@ -437,6 +437,16 @@ struct PackStream
         stream << packstream.data;
         return stream;
     }
+
+    friend bool operator==(const PackStream& left, const PackStream& right)
+    {
+        return left.data == right.data;
+    }
+
+    friend bool operator!=(const PackStream& left, const PackStream& right)
+    {
+        return !(left == right);
+    }
 };
 
 template<typename ValueType, typename StreamType>
