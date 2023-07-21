@@ -5,9 +5,7 @@
 #include <unordered_map>
 
 #include "webexcept.h"
-#include "metrics/metric.h"
-#include "metrics/metric_sum.h"
-#include "metrics/metric_value.h"
+#include "metrics.hpp"
 
 #include <boost/format.hpp>
 
@@ -32,6 +30,22 @@ public:
     {
         std::shared_lock lock(mutex_);
         return data.count(metric_name) ? data.at(metric_name)->get() : nullptr;
+    }
+
+    nlohmann::json get(const std::string& metric_name, const nlohmann::json& params)
+    {
+        std::shared_lock lock(mutex_);
+        if (data.count(metric_name))
+        {
+            auto *metric = dynamic_cast<MetricParamGetter *>(data[metric_name]);
+            if (metric)
+                return metric->get(params);
+            else
+                throw WebBadRequest((boost::format("%1% MetricParamGetter is not found!") % metric_name).str());
+        } else
+        {
+            return nullptr;
+        }
     }
 
     Metric* get_metric(const std::string& metric_name)
