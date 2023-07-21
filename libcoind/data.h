@@ -232,7 +232,7 @@ namespace coind::data
 
     auto pubkey_to_address(auto pubkey, shared_ptr<c2pool::Network> _net)
     {
-        return pubkey_to_address(hash160(pubkey), _net);
+        return pubkey_hash_to_address(hash160(pubkey), _net);
     }
 
     auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
@@ -256,4 +256,59 @@ namespace coind::data
     }
 
     PackStream pubkey_hash_to_script2(uint160 pubkey_hash);
+
+    inline auto pubkey_to_script2(PackStream pubkey)
+    {
+        if (pubkey.size() <= 75)
+            throw invalid_argument("pubkey_to_script2: pubkey.size > 75");
+
+        pubkey.data.insert(pubkey.begin(), (unsigned char)pubkey.size());
+        pubkey.data.push_back('\xac');
+
+        return pubkey;
+    }
+
+    inline std::string script2_to_address(PackStream script2, shared_ptr<c2pool::Network> _net)
+    {
+        LOG_INFO << "SCRIPT2 = " << script2;
+        try
+        {
+            auto pubkey = script2;
+
+            pubkey.data.erase(pubkey.begin());
+            pubkey.data.erase(pubkey.end()-1);
+            LOG_INFO << "pubkey = " << pubkey;
+
+            auto script2_test = pubkey_to_script2(pubkey);
+            LOG_INFO << "script2_test = " << script2_test;
+
+            if (script2_test == script2)
+                return pubkey_to_address(pubkey, _net);
+        } catch (...)
+        {
+
+        }
+
+        try
+        {
+            auto pubkey = script2;
+            pubkey.data.erase(pubkey.begin(), pubkey.begin()+3);
+            pubkey.data.erase(pubkey.end()-2, pubkey.end());
+            LOG_INFO << "pubkey = " << pubkey;
+
+            auto pubkey_hash = unpack<IntType(160)>(pubkey.data);
+            LOG_INFO << "pubkey_hash = " << pubkey_hash;
+
+            auto script2_test = pubkey_hash_to_script2(pubkey_hash);
+            LOG_INFO << "script2_test = " << script2_test;
+
+            if (script2_test == script2)
+                return pubkey_hash_to_address(pubkey_hash, _net);
+        } catch (...)
+        {
+
+        }
+
+        return "none";
+    }
 }
