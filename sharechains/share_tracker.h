@@ -390,6 +390,6 @@ public:
 
     float get_average_stale_prop(uint256 share_hash, uint64_t lookbehind);
 
-    std::map<std::string, arith_uint288> get_expected_payouts(uint256 best_share_hash, uint256 block_target, uint64_t subsidy);
+    std::map<std::vector<unsigned char>, arith_uint288> get_expected_payouts(uint256 best_share_hash, uint256 block_target, uint64_t subsidy);
 };
 
