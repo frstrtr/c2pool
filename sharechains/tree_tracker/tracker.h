@@ -306,7 +306,8 @@ public:
 private:
     fork_ptr make_fork()
     {
-        unique_lock lock(mutex_);
+        unique_lock lock(mutex_, std::defer_lock);
+        lock.try_lock();
 
         auto new_fork = std::make_shared<fork_type>();
         forks.push_back(new_fork);
