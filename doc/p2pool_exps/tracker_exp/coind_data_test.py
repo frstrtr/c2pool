@@ -1,6 +1,15 @@
 import coind_data
 import pack
 
+def bytes_to_data(bytes):
+    res = b''
+    for x in bytes:
+        res += chr(x)
+    return res #str(res).replace(', ', ' ')
+
+def data_to_bytes(data):
+    return [ord(x) for x in data]
+
 print(coind_data.calculate_merkle_link([None], 0))
 
 # print(coind_data.calculate_merkle_link([0, int('f57657b1b38a9766c736c9195d1df87f7053fcbbcc7540da12fb6afee7a2c58d', 16)], 0))
@@ -95,3 +104,43 @@ print(hex(coind_data.difficulty_to_target(0.0002441371325370145)))
 
 addr_human_type = coind_data.human_address_type.unpack(coind_data.base58_decode("sr2MqR3WzJYvKZv4px1ohqCudcMT8kn2Kg"))
 print(addr_human_type)
+
+
+# test script2_to_address
+DONATION_SCRIPT = '522102d92234777b63f6dbc0a0382bbcb54e0befb01f6a4b062122fadab044af6c06882103b27bbc5019d3543586482a995e8f57c6ad506a4dafa6bf7cc89533b8dcb2df1b2102911ff87e792ec75b3a30dc115dfd06ec27c93b27034aa8e7cefbee6477e5d03453ae'.decode('hex')
+print("DONATION_SCRIPT = {0}".format(data_to_bytes(DONATION_SCRIPT)))
+def test_script2_to_addr(data = None):
+    print("test_script2_to_addr")
+    if data:
+        script2 = bytes_to_data([82, 33, 3, 138, 184, 47, 58, 79, 86, 156, 69, 113, 196, 131, 213, 103, 41, 232, 51, 153, 121, 91, 173, 179, 40, 33, 202, 182, 77, 4, 231, 181, 209, 6, 134, 65, 4, 255, 208, 61, 228, 74, 110, 17, 185, 145, 127, 58, 41, 249, 68, 50, 131, 217, 135, 28, 157, 116, 62, 243, 13, 94, 221, 205, 55, 9, 75, 100, 209, 179, 216, 9, 4, 150, 181, 50, 86, 120, 107, 245, 200, 41, 50, 236, 35, 195, 183, 77, 159, 5, 166, 249, 90, 139, 85, 41, 53, 38, 86, 102, 75, 65, 4, 87, 163, 55, 184, 101, 87, 245, 177, 92, 148, 84, 74, 210, 103, 249, 106, 88, 45, 194, 185, 30, 104, 115, 150, 143, 247, 186, 23, 79, 218, 104, 116, 175, 151, 156, 217, 175, 65, 236, 32, 50, 223, 223, 214, 88, 123, 229, 177, 74, 67, 85, 84, 109, 84, 19, 136, 195, 241, 85, 90, 103, 209, 28, 45, 83, 174])
+    else:
+        script2 = DONATION_SCRIPT
+
+    try:
+        pubkey = script2[1:-1]
+        print("pubkey = {0}".format(data_to_bytes(pubkey)))
+        script2_test = coind_data.pubkey_to_script2(pubkey)
+        print("script2_test = {0}".format(data_to_bytes(script2_test)))
+    except:
+        pass
+    else:
+        if script2_test == script2:
+            print("first: {0}".format(script2_test == script2))
+            return
+
+    try:
+        print("second")
+        pubkey_hash = pack.IntType(160).unpack(script2[3:-2])
+        print("pubkey_hash = {0}".format(pubkey_hash))
+        script2_test2 = coind_data.pubkey_hash_to_script2(pubkey_hash)
+        print("script2_test2 = {0}".format(data_to_bytes(script2_test2)))
+    except:
+        pass
+    else:
+        if script2_test2 == script2:
+            print("second: {0}".format(script2_test2 == script2))
+            return
+
+# test_script2_to_addr(DONATION_SCRIPT)
+fake_net = dict(ADDRESS_VERSION=30)
+print(coind_data.script2_to_human(DONATION_SCRIPT, fake_net))
