@@ -110,6 +110,8 @@ public:
 
     /// check for verify share.
     void check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<std::map<uint256, coind::data::tx_type>> other_txs = nullopt);
+
+    nlohmann::json json();
 };
 
 typedef std::shared_ptr<Share> ShareType;

@@ -682,6 +682,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                     _tracker->add(share);
                     LOG_INFO << "Tracker items count = " << _tracker->items.size();
+
                     _coind_node->set_best_share();
 
                     try

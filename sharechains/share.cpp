@@ -247,6 +247,12 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
 // return gentx # only used by as_block
 }
 
+nlohmann::json Share::json()
+{
+//TODO
+    return nlohmann::json();
+}
+
 std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const addr_type& peer_addr)
 {
     PackedShareData packed_share;

@@ -268,7 +268,7 @@ namespace coind::data
         return pubkey;
     }
 
-    inline std::string script2_to_address(PackStream script2, shared_ptr<c2pool::Network> _net)
+    inline std::string script2_to_address(const PackStream& script2, const shared_ptr<c2pool::Network>& _net)
     {
         try
         {

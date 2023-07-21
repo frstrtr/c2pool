@@ -70,6 +70,19 @@ void ShareTracker::init_web_metrics()
 
     //---> add metrics
 //    stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
+    share_param_metric = net->web->add<share_param_metric_type>("share", [&](nlohmann::json& j, const nlohmann::json& param)
+    {
+        if (param.empty())
+            return nlohmann::json{};
+
+        auto hash = param.get<std::string>();
+        auto share = get(uint256S(hash));
+
+        if (share)
+            return share->json();
+        else
+            return nlohmann::json{};
+    });
 
     //---> subs for metrics
 /*    added.subscribe([&](const ShareType& share){

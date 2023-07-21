@@ -34,6 +34,7 @@ namespace c2pool::master
         auto cfg = c2pool::dev::load_config_file(name);//std::make_shared<c2pool::dev::coind_config>(name);
         LOG_INFO << "web server initialization...";
         auto root = web->get_web_root();
+
         //------> new net in web_root
         auto web_net = root->new_net(name);
         net->set_web(web_net);
@@ -210,6 +211,16 @@ namespace c2pool::master
                                             };
                                             return j.dump();
         });
+        //------> Share data
+        status->put_child<WebNetJson>("share",
+                                      web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto &query)
+                                      {
+                                          if (query.count("hash"))
+                                              return net->get("share", query.at("hash")).dump();
+                                          else
+                                              return json{"Empty hash query param"}.dump();
+                                      });
 
         //---> Debug Interface
         auto debug = index->put_child<WebInterface>("debug", [](const auto &query) {});
