@@ -188,10 +188,11 @@ class WebShareTracker
 {
 protected:
     //typedef MetricSum<shares_stale_count, 120> stale_counts_metric_type;
-
+    typedef MetricParamGetter share_param_metric_type;
 protected:
     // Metrics
     //stale_counts_metric_type* stale_counts_metric{};
+    share_param_metric_type* share_param_metric{};
 protected:
     virtual void init_web_metrics() = 0;
 };
