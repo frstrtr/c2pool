@@ -73,15 +73,16 @@ void ShareTracker::init_web_metrics()
     share_param_metric = net->web->add<share_param_metric_type>("share", [&](nlohmann::json& j, const nlohmann::json& param)
     {
         if (param.empty())
-            return nlohmann::json{};
+            return j = nullptr;
 
         auto hash = param.get<std::string>();
-        auto share = get(uint256S(hash));
+        auto result = get_json(uint256S(hash));;
+        LOG_INFO << result.dump();
+        j = result;
+    });
 
-        if (share)
-            return share->json();
-        else
-            return nlohmann::json{};
+    tracker_info_metric = net->web->add<tracker_info_metric_type>("tracker_info", [&](nlohmann::json& j){
+//        j["verified_heads"] = verified.heads
     });
 
     //---> subs for metrics
@@ -127,6 +128,23 @@ ShareType ShareTracker::get(uint256 hash)
             LOG_WARNING << "ShareTracker.get(" << hash.GetHex() << "): out of range!";
         return nullptr;
     }
+}
+
+nlohmann::json ShareTracker::get_json(uint256 hash)
+{
+    auto share = get(hash);
+    nlohmann::json j;
+
+    if (share)
+        j = share->json();
+    else
+        return nullptr;
+
+//    result["children"] = reverse[share->hash];
+    j["local"]["verified"] = verified.exist(share->hash);
+    j["block"]["other_transaction_hashes"] = get_other_tx_hashes(share);
+
+    return j;
 }
 
 void ShareTracker::add(ShareType share)

@@ -189,10 +189,12 @@ class WebShareTracker
 protected:
     //typedef MetricSum<shares_stale_count, 120> stale_counts_metric_type;
     typedef MetricParamGetter share_param_metric_type;
+    typedef MetricGetter tracker_info_metric_type;
 protected:
     // Metrics
     //stale_counts_metric_type* stale_counts_metric{};
     share_param_metric_type* share_param_metric{};
+    tracker_info_metric_type* tracker_info_metric{};
 protected:
     virtual void init_web_metrics() = 0;
 };
@@ -214,6 +216,7 @@ public:
     void init_web_metrics() override;
 
     ShareType get(uint256 hash);
+    nlohmann::json get_json(uint256 hash);
 
     void add(ShareType share) override;
     void remove(uint256 hash);
