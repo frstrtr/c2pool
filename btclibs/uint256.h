@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 #ifdef DEBUG
     #define UPDATE_HEX_STR()      \
@@ -217,6 +218,44 @@ inline uint256 uint256S(const std::string &str)
 
 uint256 &UINT256_ONE();
 
+inline void to_json(nlohmann::json& j, const uint256& p)
+{
+    j = p.GetHex();
+}
 
+inline void from_json(const nlohmann::json& j, uint256& p)
+{
+    p.SetHex(j.get<std::string>());
+}
+
+inline void to_json(nlohmann::json& j, const uint288& p)
+{
+    j = p.GetHex();
+}
+
+inline void from_json(const nlohmann::json& j, uint288& p)
+{
+    p.SetHex(j.get<std::string>());
+}
+
+inline void to_json(nlohmann::json& j, const uint160& p)
+{
+    j = p.GetHex();
+}
+
+inline void from_json(const nlohmann::json& j, uint160& p)
+{
+    p.SetHex(j.get<std::string>());
+}
+
+inline void to_json(nlohmann::json& j, const uint128& p)
+{
+    j = p.GetHex();
+}
+
+inline void from_json(const nlohmann::json& j, uint128& p)
+{
+    p.SetHex(j.get<std::string>());
+}
 
 #endif // BITCOIN_UINT256_H
