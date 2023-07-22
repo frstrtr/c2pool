@@ -94,6 +94,11 @@ namespace c2pool::master
 
         });
 
+        auto share = index->put_child<WebInterface>("share", [](const auto &query)
+        {
+
+        });
+
         //---> Config Status node
 //        auto dgb = web_root->new_net("dgb");
 //        dgb->set("hashrate", "123123");
@@ -211,16 +216,33 @@ namespace c2pool::master
                                             };
                                             return j.dump();
         });
-        //------> Share data
-        status->put_child<WebNetJson>("share",
-                                      web_root->net_functor(),
-                                      [&](const WebNetJson::net_field &net, const auto &query)
+        //------> Tracker info
+        status->put_child<WebNetJson>("tracker_info", web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto& query)
                                       {
-                                          if (query.count("hash"))
-                                              return net->get("share", query.at("hash")).dump();
-                                          else
-                                              return json{"Empty hash query param"}.dump();
+                                          return net->get("tracker_info").dump();
                                       });
+        //------> My share hashes
+        status->put_child<WebNetJson>("my_share_hashes", web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto& query)
+                                      {
+                                          return net->get("my_share_hashes").dump();
+                                      });
+
+        //---> Config Share node
+        //------> data
+        share->put_child<WebNetJson>("data", web_root->net_functor(),
+                                     [&](const WebNetJson::net_field &net, const auto &query)
+                                     {
+                                         if (query.count("hash"))
+                                         {
+                                             auto res = net->get("share", query.at("hash"));
+                                             return res.dump();
+                                         }
+                                         else
+                                             return json{"Empty hash query param"}.dump();
+                                     });
+
 
         //---> Debug Interface
         auto debug = index->put_child<WebInterface>("debug", [](const auto &query) {});
