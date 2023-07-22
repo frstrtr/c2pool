@@ -675,6 +675,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                     }
 
                     my_share_hashes.insert(share->hash);
+                    my_share_hashes_metric->set(my_share_hashes); //TODO: can be optimize, make: metric array
+
                     if (!on_time)
                     {
                         my_doa_share_hashes.insert(share->hash);
@@ -1012,4 +1014,6 @@ void Worker::init_web_metrics()
 
     //------> payout_addr
     payout_addr_metric = _net->web->add("payout_addr", coind::data::pubkey_hash_to_address(my_pubkey_hash, _net));
+    //------> my_share_hashes
+    my_share_hashes_metric = _net->web->add("my_share_hashes", my_share_hashes);
 }
