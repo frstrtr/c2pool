@@ -249,8 +249,49 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
 
 nlohmann::json Share::json()
 {
-//TODO
-    return nlohmann::json();
+    nlohmann::json result{
+            {"parent", previous_hash ? previous_hash->GetHex() : ""},
+            {"far_parent", (*share_info)->far_share_hash},
+//            {"children", tracker->}
+            {"type_name", "share"},
+            {"local", {
+                    // TODO: verified
+                    {"time_first_seen", time_seen == 0 ? c2pool::dev::timestamp() : time_seen},
+                    {"peer_first_received_from", peer_addr} //TODO: check
+            }},
+            {"share_data", {
+                    {"timestamp", *timestamp},
+                    {"target", target},
+                    {"max_target", max_target},
+                    {"payout_address", coind::data::script2_to_address(new_script, net)},
+                    {"donation", *donation/65535},
+                    {"stale_info", *stale_info},
+                    {"nonce", *nonce},
+                    {"desired_version", *desired_version},
+                    {"absheight", *absheight},
+                    {"abswork", *abswork}
+            }},
+            {"block", {
+                    {"hash", hash},
+                    {"header", {
+                            {"version", header.get()->version},
+                            {"previous_block", header.get()->previous_block},
+                            {"merkle_root", header.get()->merkle_root},
+                            {"timestamp", header.get()->timestamp},
+                            {"target", FloatingInteger(header.get()->bits).target()},
+                            {"nonce", header.get()->nonce}
+                    }},
+                    {"gentx", {
+                            {"hash", gentx_hash},
+                            {"coinbase", HexStr(*coinbase)},
+                            {"value", *subsidy * 1e-8},
+                            {"last_txout_nonce", last_txout_nonce}
+                    }}
+            }}
+
+    };
+
+    return result;
 }
 
 std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const addr_type& peer_addr)
