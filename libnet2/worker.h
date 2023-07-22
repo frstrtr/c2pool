@@ -200,11 +200,13 @@ protected:
     typedef MetricGetter local_rate_metric_type;
     typedef MetricGetter pool_rate_metric_type;
     typedef MetricValue payout_addr_metric_type;
+    typedef MetricValue my_share_hashes_metric_type;
 protected:
     shares_metric_type* shares_metric;
     local_rate_metric_type* local_rate_metric;
     pool_rate_metric_type* pool_rate_metric;
     payout_addr_metric_type* payout_addr_metric;
+    my_share_hashes_metric_type* my_share_hashes_metric;
 protected:
     virtual void init_web_metrics() = 0;
 };
