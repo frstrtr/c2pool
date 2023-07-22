@@ -4,6 +4,8 @@
     <script src='https://cdn.plot.ly/plotly-2.20.0.min.js'></script>
     <script type="text/javascript" src="d3.v2.min.js"></script>
     <script type="text/javascript">
+        net = "dgb" //TODO
+
         function format_dt(dt) {
             var pairs = [
                 [365.2425*60*60*24, 'years'],
@@ -124,6 +126,19 @@
             document.getElementById("block_value").innerHTML = data["block_value"]
             document.getElementById("time_to_block").innerHTML = data["time_to_block"] ? format_dt(data["time_to_block"]) : "inf"
         });
+
+        function fill(url, id) {
+            d3.json(url, function(d) {
+                d.sort()
+                d3.select(id).selectAll().data(d).enter().append('span').text(' ').append('a').attr('href', function(c){return 'share?net=' + net + '#' + c}).text(function(c){return String(c).substr(-8)});
+            });
+        }
+        //TODO:
+        // fill('/status/verified_heads?net=' + net, '#verified_heads');
+        // fill('/status/heads?net=' + net, '#heads');
+        // fill('/status/verified_tails?net=' + net, '#verified_tails');
+        // fill('/status/tails?net=' + net, '#tails');
+        fill('/status/my_share_hashes?net=' + net, '#my_share_hashes');
     </script>
 </head>
 
@@ -149,6 +164,15 @@
 
         <!--        <td><div id='myDiv'>&lt;!&ndash; Plotly chart will be drawn inside this DIV &ndash;&gt;</div></td>-->
     </tr>
+
+    <h2>Share explorer</h2>
+    <p>Best share: <span id="best_share"></span></p>
+    <p>Verified heads: <span id="verified_heads"></span></p>
+    <p>Heads: <span id="heads"></span></p>
+    <p>Verified tails: <span id="verified_tails"></span></p>
+    <p>Tails: <span id="tails"></span></p>
+    <p>My shares: <span id="my_share_hashes"></span></p>
+
 
     <h2>Payouts if a block were found NOW:</h2>
     <table border="1" id="payouts">
