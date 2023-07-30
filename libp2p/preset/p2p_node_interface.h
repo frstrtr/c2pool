@@ -135,7 +135,8 @@ public:
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
 							   {
 								   if (er) {
-									   LOG_WARNING << "P2PConnector[resolve]: " << er.message();
+									   LOG_WARNING << "P2PConnector[resolve](" << _ip << ":" << _port << "): " << er.message();
+									   return;
 								   }
 								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
 								   auto socket = std::make_shared<SocketType>(
