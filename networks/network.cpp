@@ -291,6 +291,15 @@ namespace coind
             };
             return;
         }
+        if (name == "ltc")
+        {
+            SUBSIDY_FUNC = [](int32_t height)
+            {
+                unsigned long long result = 5000000000;//50 * 100000000;
+                return result >> (height + 1)/840000;
+            };
+            return;
+        }
 
 
         // default:
