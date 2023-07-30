@@ -164,8 +164,10 @@ namespace coind
             return true;
         }
 
+        //TODO: сделать универсальным, llvm
         virtual bool version_check(int version)
         {
+            return true;
             //lambda v: None if 7170200 <= v else 'DigiByte version too old. Upgrade to 7.17.2 or newer!'
             if (7170200 <= version)
             {
