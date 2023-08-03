@@ -312,23 +312,25 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 	int64_t block_subsidy;
 	if (desired_share_target.IsNull())
 	{
-        auto local_hash_rates = get_local_addr_rates();
-//		desired_share_target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
-        LOG_DEBUG_STRATUM << "_net->parent->DUMB_SCRYPT_DIFF: " << _net->parent->DUMB_SCRYPT_DIFF.GetHex();
-		desired_share_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
-
-        LOG_DEBUG_STRATUM << "coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF): " << coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
-
-		auto local_hash_rate = local_hash_rates.count(pubkey_hash) > 0 ? UintToArith288(local_hash_rates[pubkey_hash]) : arith_uint288();
-		if (local_hash_rate > 0)
-		{
+        desired_share_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        auto local_hash_rate = _estimate_local_hash_rate();
+        if (local_hash_rate > 0)
+        {
             LOG_DEBUG_STRATUM << "LOCAL_HASH_RATE: " << local_hash_rate.GetHex();
             // TODO: CHECK
-			// limit to 1.67% of pool shares by modulating share difficulty
-			desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
-					local_hash_rate * _net->SHARE_PERIOD / 60)); // in p2pool:  /0.0167, not /60
-		}
-		auto lookbehind = 3600 / _net->SHARE_PERIOD;
+            // limit to 1.67% of pool shares by modulating share difficulty
+            desired_share_target = std::min(desired_share_target, coind::data::average_attempts_to_target(
+                    local_hash_rate * _net->SHARE_PERIOD / 60)); // in p2pool:  /0.0167, not /60
+        }
+
+
+        //TODO:
+        /*if self.node.punish:
+        print "trying to punish a share by mining a low-diff share"
+        desired_share_target = bitcoin_data.difficulty_to_target(1.)*/
+
+        auto local_addr_rates = get_local_addr_rates();
+		int lookbehind = 3600 / _net->SHARE_PERIOD;
 		block_subsidy = _coind_node->coind_work->value().subsidy;
 		if (prev_share && _tracker->get_height(prev_share->hash) > lookbehind)
 		{
@@ -429,14 +431,15 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     arith_uint256 a_target;
     if (desired_pseudoshare_target.IsNull())
     {
-//		target = bitcoin_data.difficulty_to_target(float(1.0 / self.node.net.PARENT.DUMB_SCRYPT_DIFF))
-        a_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
+        a_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//        a_target = coind::data::difficulty_to_target_1(_net->parent->DUMB_SCRYPT_DIFF);
 		auto local_hash_rate = _estimate_local_hash_rate();
 		if (!local_hash_rate.IsNull())
 		{
 			//in p2pool: target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1)
 			// target 10 share responses every second by modulating pseudoshare difficulty
-            a_target = coind::data::average_attempts_to_target(local_hash_rate);
+//            target no more than 10 share responses every second node-wide by modulating min pseudoshare difficulty
+            a_target = std::min(a_target, UintToArith256(coind::data::average_attempts_to_target(local_hash_rate/10)));
 		} else
         {
             //TODO: TEST
