@@ -529,20 +529,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     };
 
     // TODO: received_header_hashes = set()
-    uint256 test_num = uint256S("1337");
-    std::vector<unsigned char> fake_data = pack<IntType(256)>(test_num);
-
-    PackStream block_header_packed;
-    {
-        coind::data::types::BlockHeaderType header(37, uint256S("7b"), 50000, FloatingInteger::from_target_upper_bound(uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffff")).get(),555, uint256S("141"));
-        coind::data::stream::BlockHeaderType_stream _block_header_value(header);
-        block_header_packed << _block_header_value;
-        LOG_INFO << "FAKE_HEADER POW: " << _net->parent->POW_FUNC(block_header_packed);
-    }
-
-
-    PackStream fake_packed_data(fake_data);
-    LOG_INFO << "CHECK: " << _net->parent->POW_FUNC(fake_packed_data);
 
     worker_get_work_result res = {
             ba,
