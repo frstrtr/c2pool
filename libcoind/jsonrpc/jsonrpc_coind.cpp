@@ -80,7 +80,7 @@ bool coind::JSONRPC_Coind::check()
 	bool version_check_result = parent_net->version_check(getnetworkinfo()["version"].get_int());
 	if (!version_check_result)
 	{
-		LOG_ERROR << "Coin daemon too old! Upgrade!";
+		LOG_ERROR << "Coind daemon too old! Upgrade!";
 		return false;
 	}
 
@@ -142,7 +142,9 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 
 	auto _req = std::make_shared<GetBlockTemplateRequest>();
 	_req->mode = "template";
-	_req->rules.push_back("segwit");
+	_req->rules.emplace_back("segwit");
+	_req->rules.emplace_back("mweb"); // for ltc
+	LOG_DEBUG_COIND_JSONRPC << "REQ: " << _req->get_params();
 	getblocktemplate_result = getblocktemplate(_req, true);
     LOG_DEBUG_COIND_JSONRPC << "GETBLOCK: " << getblocktemplate_result.write();
 

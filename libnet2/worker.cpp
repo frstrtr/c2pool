@@ -528,6 +528,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             target
     };
 
+    LOG_INFO << "NotifyData: " << ba;
     // TODO: received_header_hashes = set()
 
     worker_get_work_result res = {
@@ -590,6 +591,8 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
                 LOG_DEBUG_STRATUM << "_gen_sharetx_res->share_info->bits = " << _gen_sharetx_res->share_info->bits;
                 LOG_DEBUG_STRATUM << "FloatingInteger(_gen_sharetx_res->share_info->bits).target() = " << FloatingInteger(_gen_sharetx_res->share_info->bits).target();
                 LOG_DEBUG_STRATUM << "target = " << target;
+
+                LOG_DEBUG_STRATUM << "BLOCK_HEADER_PACKED: " << block_header_packed;
 
                 try
                 {
