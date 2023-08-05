@@ -171,6 +171,11 @@ json Stratum::mining_submit(const std::string &_worker_name, const std::string &
     new_packed_gentx.insert(new_packed_gentx.end(), coinb_nonce.begin(), coinb_nonce.end());
     new_packed_gentx.insert(new_packed_gentx.end(), x.coinb2.begin(), x.coinb2.end());
 
+    LOG_INFO.stream() << "[worker.d]: x.coinb1" << x.coinb1;
+    LOG_INFO.stream() << "[worker.d2]: coinb_nonce" << coinb_nonce;
+    LOG_INFO.stream() << "[worker.d3]: x.coinb2" << x.coinb2;
+
+
     uint32_t _timestamp = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_ntime)));
     uint32_t nonce = unpack<IntType(32)>(c2pool::dev::swap4(ParseHex(_nonce)));
 
