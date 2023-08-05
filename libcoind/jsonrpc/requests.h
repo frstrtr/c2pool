@@ -126,8 +126,8 @@ namespace coind::jsonrpc::data
 
             if (!mode.empty())
             {
-                params.push_back(mode);
-                //params.pushKV("mode", mode);
+//                params.push_back(mode);
+                params.pushKV("mode", mode);
             }
 
             if (!capabilities.empty())
