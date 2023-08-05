@@ -452,6 +452,17 @@ namespace shares
             tx_outs.emplace_back(0, script);
         }
 
+        // DEBUG tx_outs
+        int _i = 0;
+        LOG_INFO << "DEBUG_TX_OUTS";
+        for (const auto& _tx : tx_outs)
+        {
+            coind::data::stream::TxOutType_stream packed_tx_out(_tx);
+            auto data = pack<coind::data::stream::TxOutType_stream>(packed_tx_out);
+            LOG_INFO.stream() << _i << ": [" << data << "].";
+            _i += 1;
+        }
+
         // MAKE GENTX
         gentx = std::make_shared<coind::data::TransactionType>(1, tx_ins, tx_outs, 0);
 
@@ -569,7 +580,8 @@ namespace shares
 //                LOG_TRACE.stream() << "generate_tx: pref_to_hash_link(prefix): " << prefix;
 
                 pref_to_hash_link = prefix_to_hash_link(prefix, net->gentx_before_refhash);
-//                LOG_TRACE.stream() << "generate_tx: pref_to_hash_link(result): " << (*pref_to_hash_link->get());
+                LOG_INFO.stream() << "[Share.d] generate_tx: prefix: " << prefix;
+                LOG_INFO.stream() << "[Share.x] generate_tx: pref_to_hash_link(result): " << (*pref_to_hash_link->get());
             }
 
             auto tx_hashes = other_transaction_hashes;

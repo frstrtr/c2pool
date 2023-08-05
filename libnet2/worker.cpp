@@ -416,6 +416,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     {
         coind::data::stream::TxIDType_stream _gentx(gen_sharetx_res->gentx->version, gen_sharetx_res->gentx->tx_ins, gen_sharetx_res->gentx->tx_outs, gen_sharetx_res->gentx->lock_time);
         packed_gentx << _gentx;
+        LOG_INFO << "PACKEG_GENTX"
     }
 
     std::vector<coind::data::tx_type> other_transactions;
