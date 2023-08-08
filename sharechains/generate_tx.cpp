@@ -82,7 +82,7 @@ namespace shares
             _share_data.subsidy = _base_subsidy.value() + definite_fees;
         }
 
-        auto [amounts] = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height);
+        auto amounts = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height);
 
         bool segwit_activated = is_segwit_activated(version, net);
         if (!_segwit_data.has_value() && !_known_txs.has_value())
@@ -318,7 +318,7 @@ namespace shares
         return std::make_tuple(new_transaction_hashes, transaction_hash_refs, other_transaction_hashes);
     }
 
-    std::tuple<std::map<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height)
+    std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height)
     {
         std::map<std::vector<unsigned char>, arith_uint288> weights;
         arith_uint288 total_weight;
@@ -350,51 +350,72 @@ namespace shares
         }
 
         // 99.5% goes according to weights prior to this share
-        std::map<std::vector<unsigned char>, arith_uint288> amounts;
-        for (auto v : weights)
+        std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts;
+        for (const auto& v : weights)
         {
-            amounts[v.first] = v.second*199*_share_data.subsidy/(200*total_weight);
+            amounts.emplace_back(v.first, v.second*199*_share_data.subsidy/(200*total_weight));
         }
 
         //this script reward; 0.5% goes to block finder
         {
             std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash).data;
-            auto _this_amount = amounts.find(this_script);
+
+            auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_script](const auto& value){
+                return std::get<0>(value) == this_script;
+            });
+
+//            auto _this_amount = amounts.find(this_script);
             if (_this_amount == amounts.end())
-                amounts[this_script] = 0;
-            amounts[this_script] += _share_data.subsidy/200;
+                amounts.emplace_back(this_script, _share_data.subsidy/200);
+            else
+                std::get<1>(*_this_amount) += _share_data.subsidy/200;
+                //amounts[this_script] = 0;
+//            amounts[this_script] += _share_data.subsidy/200;
+
         }
 
         //all that's left over is the donation weight and some extra satoshis due to rounding
         {
-            auto _donation_amount = amounts.find(net->DONATION_SCRIPT);
+            auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const auto& value){
+                return std::get<0>(value) == net->DONATION_SCRIPT;
+            });
+
+//            auto _donation_amount = amounts.find(net->DONATION_SCRIPT);
 //            LOG_TRACE.stream() << "DONATION_SCRIPT: " << net->DONATION_SCRIPT;
-            if (_donation_amount == amounts.end())
-                amounts[net->DONATION_SCRIPT] = 0;
+//            if (_donation_amount == amounts.end())
+//                amounts.emplace_back(std::get<0>(*_this_amount), _share_data.subsidy/200);
+//                amounts[net->DONATION_SCRIPT] = 0;
 
-            arith_uint288 sum_amounts;
-            sum_amounts.SetHex("0");
+            arith_uint288 sum_amounts{};
             for (const auto& v: amounts)
-            {
-                sum_amounts += v.second;
-            }
+                sum_amounts += std::get<1>(v);
 
-            amounts[net->DONATION_SCRIPT] += _share_data.subsidy - sum_amounts;
+            if (_donation_amount == amounts.end())
+                amounts.emplace_back(net->DONATION_SCRIPT, _share_data.subsidy - sum_amounts);
+            else
+                std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
         }
 
-        if (std::accumulate(amounts.begin(), amounts.end(), arith_uint288{}, [&](arith_uint288 v, const std::map<std::vector<unsigned char>, arith_uint288>::value_type &p ){
-            return v + p.second;
+        if (std::accumulate(amounts.begin(), amounts.end(), arith_uint288{}, [&](arith_uint288 v, const std::tuple<std::vector<unsigned char>, arith_uint288> &p ){
+            return v + std::get<1>(p);
         }) != _share_data.subsidy)
             throw std::invalid_argument("Invalid subsidy!");
 
-        return std::make_tuple(amounts);
+        return amounts;
     }
 
-    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::map<std::vector<unsigned char>, arith_uint288> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
+    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
         coind::data::tx_type gentx;
 
+        std::map<std::vector<unsigned char>, arith_uint288> _amounts;
+        for (auto v : amounts)
+        {
+            _amounts[std::get<0>(v)] = std::get<1>(v);
+        }
+
         std::vector<std::vector<unsigned char>> dests;
+        std::unordered_map<int, int> s;
 //        LOG_TRACE.stream() << "amounts: ";
 //        for (auto [k, v] : amounts)
 //        {
@@ -402,14 +423,18 @@ namespace shares
 //        }
 
         for (const auto& v: amounts)
-            dests.push_back(v.first);
+            dests.push_back(std::get<0>(v));
 
-        std::partial_sort(dests.begin(), dests.end()-1, dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
+        auto dests_pre_end = std::partition(dests.begin(), dests.end() - 1, [&](auto elem) {
+            return elem < dests.back();
+        });
+
+        std::sort(dests.begin(), dests_pre_end, [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
         {
 //            if (a == net->DONATION_SCRIPT)
 //                return false;
 
-            return amounts[a] != amounts[b] ? amounts[a] < amounts[b] : a < b;
+            return _amounts[a] != _amounts[b] ? _amounts[a] < _amounts[b] : a < b;
         });
 
 
@@ -433,9 +458,9 @@ namespace shares
         // tx2 [+]
         for (const auto& script: dests)
         {
-            if (!ArithToUint256(amounts[script]).IsNull() || script == net->DONATION_SCRIPT)
+            if (!ArithToUint256(_amounts[script]).IsNull() || script == net->DONATION_SCRIPT)
             {
-                tx_outs.emplace_back(amounts[script].GetLow64(), script); //value, script
+                tx_outs.emplace_back(_amounts[script].GetLow64(), script); //value, script
             }
         }
         // tx3 [+]
