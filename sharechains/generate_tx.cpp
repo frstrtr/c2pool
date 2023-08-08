@@ -459,7 +459,7 @@ namespace shares
         {
             coind::data::stream::TxOutType_stream packed_tx_out(_tx);
             auto data = pack<coind::data::stream::TxOutType_stream>(packed_tx_out);
-            LOG_INFO.stream() << _i << ": [" << data << "].";
+            LOG_INFO.stream() << _i << "(" << _tx.value << "/" << coind::data::script2_to_address(PackStream(_tx.script), net) << "): [" << data << "].";
             _i += 1;
         }
 
