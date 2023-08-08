@@ -404,10 +404,10 @@ namespace shares
         for (const auto& v: amounts)
             dests.push_back(v.first);
 
-        std::sort(dests.begin(), dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
+        std::partial_sort(dests.begin(), dests.end()-1, dests.end(), [&](std::vector<unsigned char> a, std::vector<unsigned char> b)
         {
-            if (a == net->DONATION_SCRIPT)
-                return false;
+//            if (a == net->DONATION_SCRIPT)
+//                return false;
 
             return amounts[a] != amounts[b] ? amounts[a] < amounts[b] : a < b;
         });
