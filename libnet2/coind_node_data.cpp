@@ -161,5 +161,5 @@ void CoindNodeData::submit_block(coind::data::types::BlockType &block, bool igno
         segwit_activated += std::any_of(coind_work->value().rules.begin(), coind_work->value().rules.end(), [](const auto &v){ return v == "!segwit";});
     }
 
-    coind->submit_block(block, /*coind_work._value->use_getblocktemplate,*/ ignore_failure, segwit_activated);
+    coind->submit_block(block, coind_work->value().mweb, /*coind_work._value->use_getblocktemplate,*/ ignore_failure, segwit_activated);
 }

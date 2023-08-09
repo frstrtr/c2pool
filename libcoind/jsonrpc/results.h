@@ -32,6 +32,7 @@ namespace coind
         vector<string> rules;
         time_t last_update;
         time_t latency;
+        std::string mweb;
 		//use_getblocktemplate = true always
 
         getwork_result() {}
@@ -95,7 +96,6 @@ namespace coind
                 }
             }
 
-            //TODO: test
             if (work["bits"].isStr())
             {
                 auto _bits_v = ParseHex(work["bits"].get_str());
@@ -115,12 +115,14 @@ namespace coind
 
             last_update = c2pool::dev::timestamp();
             latency = _latency;
+
+            mweb = "01" + (work.exists("mweb") ? work["mweb"].get_str() : "");
         }
 
         bool operator==(getwork_result const &val) const
         {
             return
-                    std::make_tuple(version, previous_block.GetHex(), transactions, transaction_hashes, subsidy, time, bits.get(), coinbaseflags.data, height, rules, last_update, latency) == std::make_tuple(val.version, val.previous_block.GetHex(), val.transactions, val.transaction_hashes, val.subsidy, val.time, val.bits.get(), val.coinbaseflags.data, val.height, val.rules, val.last_update, val.latency);
+                    std::make_tuple(version, previous_block.GetHex(), transactions, transaction_hashes, subsidy, time, bits.get(), coinbaseflags.data, height, rules, last_update, latency, mweb) == std::make_tuple(val.version, val.previous_block.GetHex(), val.transactions, val.transaction_hashes, val.subsidy, val.time, val.bits.get(), val.coinbaseflags.data, val.height, val.rules, val.last_update, val.latency, val.mweb);
         }
         bool operator!=(getwork_result const &val) const
         {
@@ -143,6 +145,7 @@ namespace coind
             stream << ", rules = " << val.rules;
             stream << ", last_update = " << val.last_update;
             stream << ", latency = " << val.latency;
+            stream << ", mweb = " << val.mweb;
             stream << " )";
 
             return stream;
