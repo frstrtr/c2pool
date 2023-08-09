@@ -242,7 +242,7 @@ coind::getwork_result coind::JSONRPC_Coind::getwork(TXIDCache &txidcache, const 
 }
 
 // p2pool: submit_block_rpc
-void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated)
+void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated)
 {
     //TODO: @deferral.retry('Error submitting block: (will retry)', 10, 10)
 
@@ -268,7 +268,7 @@ void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, /*
             packed_block = pack_to_stream<coind::data::stream::BlockType_stream>(block);
         }
 
-        auto _req = std::make_shared<SubmitBlockRequest>(HexStr(packed_block.data));
+        auto _req = std::make_shared<SubmitBlockRequest>(HexStr(packed_block.data) + mweb);
 
         res = request("submitblock", _req, true);
         success = res.isNull();

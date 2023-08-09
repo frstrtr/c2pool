@@ -123,7 +123,7 @@ namespace coind
 
 		getwork_result getwork(TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
 
-        void submit_block(coind::data::types::BlockType &block, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
+        void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
 	public:
 		UniValue getblockchaininfo(bool full = false)
