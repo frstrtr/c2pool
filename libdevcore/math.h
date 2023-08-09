@@ -124,11 +124,11 @@ namespace math
             auto start_time = c2pool::dev::timestamp() - max_lookback_time;
 
             int i = 0;
+            std::unique_lock lock(mutex_);
             for (auto [ts, datum]: datums)
             {
                 if (ts > start_time)
                 {
-                    std::unique_lock lock(mutex_);
                     datums.erase(datums.begin(), datums.begin() + i);
                 }
             }
@@ -145,7 +145,6 @@ namespace math
             int32_t t = c2pool::dev::timestamp();
 
             std::unique_lock lock(mutex_);
-
             if (first_timestamp == 0)
                 first_timestamp = t;
             else
@@ -154,14 +153,14 @@ namespace math
 
         std::tuple<std::vector<T>, int32_t> get_datums_in_last(int32_t dt = 0)
         {
-            std::shared_lock lock(mutex_);
-
             if (dt == 0)
                 dt = max_lookback_time;
 
             assert(dt <= max_lookback_time);
 
             prune();
+
+            std::shared_lock lock(mutex_);
             int32_t now = c2pool::dev::timestamp();
             std::vector<T> res;
             for (auto [ts, datum]: datums)
