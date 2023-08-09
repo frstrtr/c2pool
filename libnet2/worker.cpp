@@ -538,6 +538,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             {
                 auto t0 = c2pool::dev::timestamp();
                 LOG_DEBUG_STRATUM << "HEADER get_work_result: " << header;
+                LOG_INFO << "known_txs len: " << _coind_node->known_txs->value().size();
                 PackStream new_packed_gentx;
                 if (coinbase_nonce.value != 0)
                 {

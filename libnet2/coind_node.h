@@ -51,7 +51,7 @@ private:
 	bool isRunning = false;
 public:
     CoindNode(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)), CoindNodeClient(context),
-                                                          work_poller_t(*context)
+                                                          work_poller_t(*context), forget_old_txs_t(*context)
     {
 		SET_POOL_DEFAULT_HANDLER(version);
 		SET_POOL_DEFAULT_HANDLER(verack);
@@ -107,9 +107,11 @@ public:
     void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, std::shared_ptr<CoindProtocol> protocol);
 private:
     boost::asio::deadline_timer work_poller_t;
+	boost::asio::deadline_timer forget_old_txs_t;
 
 	void start();
     void work_poller();
     void poll_header();
+	void forget_old_txs();
 };
 #undef SET_POOL_DEFAULT_HANDLER
