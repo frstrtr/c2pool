@@ -110,6 +110,13 @@ public:
 
     /// check for verify share.
     void check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<std::map<uint256, coind::data::tx_type>> other_txs = nullopt);
+/* TODO:
+	/// share -> block
+	coind::data::stream::BlockType_stream as_block(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint256, coind::data::tx_type> known_txs);
+
+	std::vector<uint256> get_other_tx_hashes(const std::shared_ptr<ShareTracker>& _tracker);
+	std::vector<coind::data::tx_type> _get_other_txs(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint256, coind::data::tx_type> known_txs);
+*/
 
     nlohmann::json json();
 };

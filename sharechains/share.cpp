@@ -258,6 +258,35 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
 // return gentx # only used by as_block
 }
 
+/*TODO:
+coind::data::stream::BlockType_stream
+Share::as_block(const shared_ptr<ShareTracker> &_tracker, std::map<uint256, coind::data::tx_type> known_txs)
+{
+    auto other_txs = _get_other_txs(_tracker, known_txs);
+    //TODO:
+    return coind::data::stream::BlockType_stream();
+}
+
+std::vector<uint256> Share::get_other_tx_hashes(const shared_ptr<ShareTracker> &_tracker)
+{
+    int32_t parents_needed = 0;
+    if (!(*share_info)->transaction_hash_refs.empty())
+        parents_needed = max((*share_info)->transaction_hash_refs, [](const auto l, const auto r){
+            return true;
+        });
+
+    return std::vector<uint256>();
+}
+
+std::vector<coind::data::tx_type>
+Share::_get_other_txs(const shared_ptr<ShareTracker> &_tracker, std::map<uint256, coind::data::tx_type> known_txs)
+{
+    other_tx_hashes
+
+    return std::vector<coind::data::tx_type>();
+}
+*/
+
 nlohmann::json Share::json()
 {
     nlohmann::json result{

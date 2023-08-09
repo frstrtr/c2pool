@@ -49,6 +49,7 @@ void CoindNode::start()
 		}
 
         mining_txs->set(new_mining_txs);
+        LOG_INFO.stream() << "Added known txs#1: " << added_known_txs;
         known_txs->add(added_known_txs);
 	});
 
@@ -56,6 +57,7 @@ void CoindNode::start()
 	new_tx->subscribe([&](coind::data::tx_type _tx)
     {
 		known_txs->add(coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)), _tx);
+        LOG_INFO.stream() << "Added known txs#2: " << coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)) << ": " << _tx;
 	});
 
 	// forward transactions seen to bitcoind
@@ -72,45 +74,26 @@ void CoindNode::start()
         for (auto [tx_hash, tx] : diff)
         {
             auto msg = std::make_shared<coind::messages::message_tx>(after[tx_hash]);
+            LOG_INFO << "Protocol write message_tx with: " << tx_hash << ": " << *tx;
             protocol->write(msg);
         }
 	});
 
+    /* TODO: GOT BLOCK FROM PEER! Passing to bitcoind!
+    tracker->verified.added->subscribe([&](const ShareType& share){
+        if (UintToArith256(share->pow_hash) > UintToArith256(FloatingInteger(share->header->bits).target()))
+            return;
+
+        block = share->as_b
+    });
+    */
+
+    forget_old_txs();
+
 	/* TODO:
-
-	@self.tracker.verified.added.watch
-	def _(share):
-		if not (share.pow_hash <= share.header['bits'].target):
-			return
-
-		block = share.as_block(self.tracker, self.known_txs_var.value)
-		if block is None:
-			print >>sys.stderr, 'GOT INCOMPLETE BLOCK FROM PEER! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
-			return
-		helper.submit_block(block, True, self.factory, self.bitcoind, self.bitcoind_work, self.net)
-		print
-		print 'GOT BLOCK FROM PEER! Passing to bitcoind! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
-		print
-
-	def forget_old_txs():
-		new_known_txs = {}
-		if self.p2p_node is not None:
-			for peer in self.p2p_node.peers.itervalues():
-				new_known_txs.update(peer.remembered_txs)
-		new_known_txs.update(self.mining_txs_var.value)
-		for share in self.tracker.get_chain(self.best_share_var.value, min(120, self.tracker.get_height(self.best_share_var.value))):
-			for tx_hash in share.new_transaction_hashes:
-				if tx_hash in self.known_txs_var.value:
-					new_known_txs[tx_hash] = self.known_txs_var.value[tx_hash]
-		self.known_txs_var.set(new_known_txs)
-	t = deferral.RobustLoopingCall(forget_old_txs)
-	t.start(10)
-	stop_signal.watch(t.stop)
-
 	t = deferral.RobustLoopingCall(self.clean_tracker)
 	t.start(5)
 	stop_signal.watch(t.stop)
-
 	 */
 
 	LOG_INFO << "... CoindNode[" << parent_net->net_name << "] " << "started!";
@@ -130,6 +113,43 @@ void CoindNode::poll_header()
 
 	protocol->get_block_header->yield(coind_work->value().previous_block, [&](coind::data::BlockHeaderType new_header){ handle_header(new_header); }, coind_work->value().previous_block);
 }
+
+void CoindNode::forget_old_txs()
+{
+    std::map<uint256, coind::data::tx_type> new_known_txs;
+
+    if (pool_node)
+    {
+        for (const auto& peer : pool_node->peers)
+        {
+            for (auto [hash, tx] : peer.second->remembered_txs)
+                new_known_txs[hash] = tx.get();
+        }
+    }
+
+    for (auto [hash, tx]: mining_txs->value())
+        new_known_txs[hash] = tx;
+
+    for (auto [hash, tx]: mining2_txs->value())
+        new_known_txs[hash] = tx;
+
+    auto chainf = tracker->get_chain(best_share->value(), min(120, tracker->get_height(best_share->value())));
+
+    uint256 hash;
+    while (chainf(hash))
+    {
+        for (auto tx_hash : *tracker->get(hash)->new_transaction_hashes)
+        {
+            if (known_txs->exist(tx_hash))
+                new_known_txs[tx_hash] = known_txs->value()[tx_hash];
+        }
+    }
+    known_txs->set(new_known_txs);
+
+    forget_old_txs_t.expires_from_now(boost::posix_time::seconds(10));
+    forget_old_txs_t.async_wait([&](const boost::system::error_code &ec){ forget_old_txs(); });
+}
+
 
 void CoindNode::handle_message_version(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol)
 {
