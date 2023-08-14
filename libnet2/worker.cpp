@@ -416,7 +416,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
     {
         coind::data::stream::TxIDType_stream _gentx(gen_sharetx_res->gentx->version, gen_sharetx_res->gentx->tx_ins, gen_sharetx_res->gentx->tx_outs, gen_sharetx_res->gentx->lock_time);
         packed_gentx << _gentx;
-        LOG_INFO << "PACKEG_GENTX: " << packed_gentx;
     }
 
     std::vector<coind::data::tx_type> other_transactions;
@@ -529,7 +528,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             target
     };
 
-    LOG_INFO << "NotifyData: " << ba;
     // TODO: received_header_hashes = set()
 
     worker_get_work_result res = {
@@ -538,7 +536,6 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
             {
                 auto t0 = c2pool::dev::timestamp();
                 LOG_DEBUG_STRATUM << "HEADER get_work_result: " << header;
-                LOG_INFO << "known_txs len: " << _coind_node->known_txs->value().size();
                 PackStream new_packed_gentx;
                 if (coinbase_nonce.value != 0)
                 {

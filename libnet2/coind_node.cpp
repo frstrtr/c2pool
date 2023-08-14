@@ -40,8 +40,6 @@ void CoindNode::start()
 
         uint256 _tx_hash;
 		coind::data::tx_type _tx;
-        LOG_INFO << "coind_work->changed: transaction_hashes =  " << coind_work->value().transaction_hashes;
-        LOG_INFO << "known_txs: " << known_txs->value();
 
         BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work->value().transaction_hashes,coind_work->value().transactions))
 		{
@@ -52,7 +50,6 @@ void CoindNode::start()
 		}
 
         mining_txs->set(new_mining_txs);
-        LOG_INFO.stream() << "Added known txs#1: " << added_known_txs;
         known_txs->add(added_known_txs);
 	});
 
@@ -60,7 +57,6 @@ void CoindNode::start()
 	new_tx->subscribe([&](coind::data::tx_type _tx)
     {
 		known_txs->add(coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)), _tx);
-        LOG_INFO.stream() << "Added known txs#2: " << coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)) << ": " << _tx;
 	});
 
 	// forward transactions seen to bitcoind
@@ -77,7 +73,7 @@ void CoindNode::start()
         for (auto [tx_hash, tx] : diff)
         {
             auto msg = std::make_shared<coind::messages::message_tx>(after[tx_hash]);
-            LOG_INFO << "Protocol write message_tx with: " << tx_hash << ": " << *tx;
+            LOG_DEBUG_COIND << "Protocol write message_tx with: " << tx_hash << ": " << *tx;
             protocol->write(msg);
         }
 	});
