@@ -4,7 +4,7 @@
     <script src='https://cdn.plot.ly/plotly-2.20.0.min.js'></script>
     <script type="text/javascript" src="d3.v2.min.js"></script>
     <script type="text/javascript">
-        net = "dgb" //TODO
+        net = "ltc" //TODO
 
         function format_dt(dt) {
             var pairs = [
@@ -25,11 +25,11 @@
             return (dt/value).toFixed(2) + ' ' + name;
         }
 
-        d3.json('/status/currency_info?net=' + "dgb", function(currency_info) {
+        d3.json('/status/currency_info?net=' + net, function(currency_info) {
             // document.getElementById("symbol").innerHTML = currency_info.symbol;
             d3.selectAll('.symbol').text(currency_info.symbol);
 
-            d3.json('/status/current_payouts?net=' + "dgb", function (pays) {
+            d3.json('/status/current_payouts?net=' + net, function (pays) {
                 // d3.json('/payout_addr', function(addr) {
                 //     d3.select('#payout_addr').text(addr).attr('href', currency_info.address_explorer_url_prefix + addr);
                 //     d3.select('#payout_amount').text(addr in pays ? pays[addr] : 0);
@@ -62,7 +62,7 @@
         $.ajax({
             url: 'status/pool_rate',
             data: {
-                net: "dgb"
+                net: net
             }
         }).done(function (data){
             document.getElementById("pool_rate").innerHTML = data["rate"]
@@ -73,7 +73,7 @@
         $.ajax({
             url: 'status/node_uptime',
             data: {
-                net: "dgb"
+                net: net
             }
         }).done(function (data){
             document.getElementById("uptime").innerHTML = format_dt(data["uptime"])
@@ -84,7 +84,7 @@
         $.ajax({
             url: 'status/local_rate',
             data: {
-                net: "dgb"
+                net: net
             }
         }).done(function (data){
             document.getElementById("local_rate").innerHTML = data["rate"]
@@ -96,7 +96,7 @@
         $.ajax({
             url: 'status/shares',
             data: {
-                net: "dgb"
+                net: net
             }
         }).done(function (data){
             document.getElementById("shares_total").innerHTML = data["total"]
@@ -108,7 +108,7 @@
         $.ajax({
             url: 'status/shares',
             data: {
-                net: "dgb"
+                net: net
             }
         }).done(function (data){
             document.getElementById("shares_total").innerHTML = data["total"]
@@ -120,7 +120,7 @@
         $.ajax({
             url: 'status/payout',
             data: {
-                net: "dgb"
+                net: net
             }
         }).done(function (data){
             document.getElementById("block_value").innerHTML = data["block_value"]

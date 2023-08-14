@@ -40,6 +40,9 @@ void CoindNode::start()
 
         uint256 _tx_hash;
 		coind::data::tx_type _tx;
+        LOG_INFO << "coind_work->changed: transaction_hashes =  " << coind_work->value().transaction_hashes;
+        LOG_INFO << "known_txs: " << known_txs->value();
+
         BOOST_FOREACH(boost::tie(_tx_hash, _tx), boost::combine(coind_work->value().transaction_hashes,coind_work->value().transactions))
 		{
 			new_mining_txs[_tx_hash] = _tx;
