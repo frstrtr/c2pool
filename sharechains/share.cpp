@@ -38,15 +38,6 @@ void Share::init()
     if (segwit_activated && !segwit_data)
         throw std::invalid_argument("Segwit activated, but segwit_data == nullptr!");
 
-
-//    LOG_TRACE << "min_header = " << *min_header->get();
-//    LOG_TRACE << "share_data = " << *share_data->get();
-//    LOG_TRACE << "share_info = " << *share_info->get();
-//    LOG_TRACE << "hash_link = " << *hash_link->get();
-//    LOG_TRACE << "ref_merkle_link = " << *ref_merkle_link->get();
-//    LOG_TRACE << "last_txout_nonce = " << last_txout_nonce;
-
-
     if (!(coinbase->size() >= 2 && coinbase->size() <= 100))
     {
         throw std::invalid_argument((boost::format("bad coinbase size! %1% bytes.") % coinbase->size()).str());
@@ -101,29 +92,16 @@ void Share::init()
         hash_link_data.insert(hash_link_data.end(), packed_z.data.begin(), packed_z.data.end());
     }
 
-//    LOG_TRACE.stream() << "GENTX IN INIT(hash_link): " << *hash_link->get();
-//    LOG_TRACE.stream() << "GENTX IN INIT(hash_link_data): " << hash_link_data;
-//    LOG_TRACE.stream() << "GENTX IN INIT(net->gentx_before_refhash): " << net->gentx_before_refhash;
     gentx_hash = shares::check_hash_link(hash_link, hash_link_data, net->gentx_before_refhash);
-
-    LOG_INFO << "SHARE_DATA: " << *(share_data->get());
-    LOG_INFO << "SHARE_INFO: " << *(share_info->get());
-    LOG_INFO << "GENTX_HASH: " << gentx_hash;
-    LOG_INFO << "[Share.x] HASH_LINK: " <<*(hash_link->get());
-    LOG_INFO.stream() << "[Share.d3] hash_link_data: " << hash_link_data;
-    LOG_INFO.stream() << "[Share.d2] gentx_before_refhash: " << net->gentx_before_refhash;
 
     auto merkle_root = coind::data::check_merkle_link(gentx_hash, segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
     header.set_value(coind::data::types::BlockHeaderType(*min_header->get(), merkle_root));
-
-    LOG_INFO << "segwit_activated = " << segwit_activated << "; merkle_link = " << (segwit_activated ? (*segwit_data)->txid_merkle_link : *merkle_link->get());
 
     coind::data::stream::BlockHeaderType_stream header_stream(*header.get());
 
     PackStream packed_block_header;
     packed_block_header << header_stream;
 
-    LOG_INFO << "packed block_header: " << packed_block_header;
 
     pow_hash = net->parent->POW_FUNC(packed_block_header);
 

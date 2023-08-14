@@ -78,7 +78,7 @@ public:
         auto handler = handler_manager->get_handler(raw_msg->command);
         if (handler)
         {
-			LOG_INFO << name << " protocol call handler for " << raw_msg->command;
+            LOG_DEBUG_P2P << name << " protocol call handler for " << raw_msg->command;
             handler->invoke(raw_msg->value, this->shared_from_this());
         } else
         {
