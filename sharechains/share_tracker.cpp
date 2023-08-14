@@ -499,7 +499,7 @@ std::vector<coind::data::tx_type> ShareTracker::_get_other_txs(ShareType share, 
     return result;
 }
 
-std::tuple<bool, std::string> ShareTracker::should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits,
+std::tuple<int, std::string> ShareTracker::should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits,
                                                                  const std::map<uint256, coind::data::tx_type> &known_txs)
 {
     if (UintToArith256(share->pow_hash) <= UintToArith256(share->header.stream()->bits.bits.target()))
