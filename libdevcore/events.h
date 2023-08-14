@@ -271,8 +271,9 @@ public:
         if (!new_items.empty())
         {
             added->happened(new_items);
-            this->changed->happened(*this->_value);
-            this->transitioned->happened(old_value, *this->_value);
+            //TODO: because todo in p2pool
+//            this->changed->happened(*this->_value);
+//            this->transitioned->happened(old_value, *this->_value);
         }
     }
 
@@ -303,8 +304,9 @@ public:
         if (!gone_items.empty())
         {
             removed->happened(gone_items);
-            this->changed->happened(*this->_value);
-            this->transitioned->happened(old_value, *this->_value);
+            //TODO: because todo in p2pool
+//            this->changed->happened(*this->_value);
+//            this->transitioned->happened(old_value, *this->_value);
         }
     }
 
