@@ -294,15 +294,23 @@ public:
     std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
     get_cumulative_weights(uint256 start, int32_t max_shares, const arith_uint288& desired_weight)
     {
+        std::string algh_steps = "gcw debug: "; // FOR DEBUG
         // Если start -- None/Null/0 шара.
         if (start.IsNull())
-            return {{},{}, {}};
+        {
+            // 0
+            LOG_INFO << algh_steps << "01";
+            return {{},
+                    {},
+                    {}};
+        }
 
         auto [start_height, last] = get_height_and_last(start);
 
         // Ограничиваем цепочку до размера max_shares.
         if (start_height > max_shares)
         {
+            algh_steps += "1->";
             last = get_nth_parent_key(start, max_shares);
         }
 
@@ -316,20 +324,25 @@ public:
 
         while(std::get<0>(cur).hash() != last)
         {
+            algh_steps += "2->";
             if (std::get<0>(cur).weight.total_weight >= desired_sum_weight)
             {
+                algh_steps += "2.1->";
                 for (auto [k, v]: std::get<0>(cur).weight.amount)
                 {
                     if (weights.find(k) != weights.end())
                     {
+                        algh_steps += "2.11->";
                         weights[k] += v;
                     } else
                     {
+                        algh_steps += "2.12->";
                         weights[k] = v;
                     }
                 }
             } else
             {
+                algh_steps += "2.2->";
                 extra_ending = std::make_optional<shares::weight::weight_data>(std::get<0>(cur).share);
                 break;
             }
@@ -338,15 +351,18 @@ public:
 
             if (exist(std::get<0>(cur).prev()))
             {
+                algh_steps += "2.31->";
                 cur = get_sum_to_last(std::get<0>(cur).prev());
             } else
             {
+                algh_steps += "2.32->";
                 break;
             }
         }
 
         if (extra_ending.has_value())
         {
+            algh_steps += "3->";
             auto result_sum = get_sum(start, std::get<0>(prev).hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
@@ -363,15 +379,18 @@ public:
 
             if (weights.find(new_weight.first) != weights.end())
             {
+                algh_steps += "3.1->";
                 weights[new_weight.first] += new_weight.second;
             } else
             {
+                algh_steps += "3.2->";
                 weights[new_weight.first] = new_weight.second;
             }
 
             total_donation_weights += (desired_weight - total_weights)/65535*extra_ending->total_donation_weight/(extra_ending->total_weight/65535);
             total_weights = desired_weight;
 
+            LOG_INFO << algh_steps << "02";
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
@@ -381,6 +400,7 @@ public:
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
+            LOG_INFO << algh_steps << "03";
             return std::make_tuple(result_sum.weight.amount, total_weights, total_donation_weights);
         }
     }
