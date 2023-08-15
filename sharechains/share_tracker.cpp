@@ -552,20 +552,14 @@ float ShareTracker::get_average_stale_prop(uint256 share_hash, uint64_t lookbehi
 std::map<std::vector<unsigned char>, double>
 ShareTracker::get_expected_payouts(uint256 best_share_hash, uint256 block_target, uint64_t subsidy)
 {
-    LOG_INFO << "===================get_expected_payouts===================";
     std::map<std::vector<unsigned char>, double> res;
     double sum = 0;
 
-    LOG_INFO << "subsidy: " << subsidy;
-
     auto [weights, total_weight, donation_weight] = get_cumulative_weights(best_share_hash, min(get_height(best_share_hash), net->REAL_CHAIN_LENGTH), coind::data::target_to_average_attempts(block_target) * net->SPREAD * 65535);
-    LOG_INFO << "total_weight = " << total_weight.GetHex();
     for (const auto &[script, weight] : weights)
     {
         //TODO: optimize .getdouble()?
         auto payout = subsidy * (weight.getdouble()/total_weight.getdouble());
-
-        LOG_INFO.stream() << "script = " << script << "; weight = " << weight.GetHex() << "; payout = " << payout;
 
         res[script] = payout;
         sum += payout;
@@ -573,8 +567,6 @@ ShareTracker::get_expected_payouts(uint256 best_share_hash, uint256 block_target
 
     auto donation_script = net->DONATION_SCRIPT;
     res[donation_script] = (res.count(donation_script) ? res[donation_script] : 0) + subsidy - sum;
-    LOG_INFO << "sum = " << sum;
-    LOG_INFO.stream() << "donation_script = " << donation_script << "; payout = " << res[donation_script];
 
     return res;
 }
