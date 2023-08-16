@@ -69,7 +69,6 @@ namespace c2pool
         REAL_CHAIN_LENGTH = pt.get<int>("REAL_CHAIN_LENGTH");
         CHAIN_LENGTH = pt.get<int>("CHAIN_LENGTH");
         SPREAD = pt.get<int>("SPREAD");
-        ADDRESS_VERSION = pt.get<int>("ADDRESS_VERSION");
         PERSIST = pt.get<bool>("PERSIST");
 
         MIN_TARGET = uint256S(pt.get<std::string>("MIN_TARGET"));
@@ -203,6 +202,7 @@ namespace coind
         P2P_ADDRESS = pt.get<std::string>("P2P_ADDRESS");
         P2P_PORT = pt.get<int>("P2P_PORT");
         ADDRESS_VERSION = pt.get<int>("ADDRESS_VERSION");
+        ADDRESS_P2SH_VERSION = pt.get<int>("ADDRESS_P2SH_VERSION");
         RPC_PORT = pt.get<int>("RPC_PORT");
 
 //        DUMB_SCRYPT_DIFF = uint256S(pt.get<std::string>("DUMB_SCRYPT_DIFF"));
@@ -242,6 +242,7 @@ namespace coind
         network.put("P2P_ADDRESS", "217.72.4.157");
         network.put("P2P_PORT", 12024);
         network.put("ADDRESS_VERSION", 30);
+        network.put("ADDRESS_P2SH_VERSION", 58);
         network.put("RPC_PORT", 14024);
         network.put("BLOCK_PERIOD", 150);
         network.put("DUMB_SCRYPT_DIFF", "10000");

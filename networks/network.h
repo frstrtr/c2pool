@@ -68,7 +68,6 @@ namespace c2pool
         int REAL_CHAIN_LENGTH;
         int CHAIN_LENGTH;
         int SPREAD;
-        int ADDRESS_VERSION;
         bool PERSIST;
 
         uint256 MIN_TARGET;
@@ -133,6 +132,7 @@ namespace coind
         std::string P2P_ADDRESS;
         int P2P_PORT;
         int ADDRESS_VERSION;
+        int ADDRESS_P2SH_VERSION;
         int RPC_PORT;
 
 		uint256 DUMB_SCRYPT_DIFF;
