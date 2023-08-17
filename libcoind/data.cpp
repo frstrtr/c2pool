@@ -279,13 +279,47 @@ namespace coind::data
         return result;
     }
 
-    PackStream pubkey_hash_to_script2(uint160 pubkey_hash)
+    PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
     {
-        auto packed_pubkey_hash = IntType(160)(pubkey_hash);
+        if (version == -1 && bech32_ver >= 0)
+        {
+            /* TODO:
+        if hasattr(net, 'padding_bugfix') and net.padding_bugfix:
+            decoded = '{:040x}'.format(pubkey_hash)
+        else:
+            decoded = '{:x}'.format(pubkey_hash)
+        ehash = binascii.unhexlify(decoded)
+        size = '{:x}'.format(len(decoded) // 2)
+        if len(size) % 2 == 1:
+            size = '0%s' % size
+        hsize = binascii.unhexlify(size)
+        if net.SYMBOL.lower() in ['bch', 'tbch', 'bsv', 'tbsv']:
+            # CashAddrs can be longer than 20 bytes
+            # TODO: Check the version and restrict the bytes.
+            if bech32_version == 0:
+                # P2KH
+                return '\x76\xa9%s%s\x88\xac' % (hsize, ehash)
+            elif bech32_version == 1:
+                # P2SH
+                return '\xa9%s%s\x87' % (hsize, ehash)
+            else:
+                raise NotImplementedError("Invalid cashaddr type %d" % bech32_version)
+        else:
+            return '\x00%s%s' % (hsize, ehash)
+             */
+            LOG_WARNING << "pubkey_hash_to_script2 TODO";
+        }
 
         PackStream result;
-        result << vector<unsigned char>({0x76, 0xa9, 0x14}) << packed_pubkey_hash << vector<unsigned char>({0x88, 0xac});
+        auto packed_pubkey_hash = IntType(160)(pubkey_hash);
 
+        if (version == _net->parent->ADDRESS_P2SH_VERSION)
+        {
+            result << vector<unsigned char>({0xa9, 0x14}) << packed_pubkey_hash << vector<unsigned char>({0x87});
+            return result;
+        }
+
+        result << vector<unsigned char>({0x76, 0xa9, 0x14}) << packed_pubkey_hash << vector<unsigned char>({0x88, 0xac});
         return result;
     }
 }
