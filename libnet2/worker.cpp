@@ -1018,7 +1018,7 @@ void Worker::init_web_metrics()
     });
 
     //------> payout_addr
-    payout_addr_metric = _net->web->add("payout_addr", coind::data::pubkey_hash_to_address(my_pubkey_hash, _net));
+    payout_addr_metric = _net->web->add("payout_addr", coind::data::pubkey_hash_to_address(my_pubkey_hash, _net->parent->ADDRESS_VERSION, -1, _net));
     //------> my_share_hashes
     my_share_hashes_metric = _net->web->add("my_share_hashes", my_share_hashes);
 }
