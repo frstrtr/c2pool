@@ -220,9 +220,26 @@ namespace coind::data
         }
     };
 
-    std::string pubkey_hash_to_address(auto pubkey_hash, shared_ptr<c2pool::Network> _net)
+    std::string pubkey_hash_to_address(auto pubkey_hash, int32_t addr_ver, int32_t bech32_ver, shared_ptr<c2pool::Network> _net)
     {
-        HumanAddressType human_addr{IntType(8)(_net->ADDRESS_VERSION), IntType(160)(pubkey_hash)};
+        if (addr_ver == -1)
+        {
+            /*if hasattr(net, 'padding_bugfix') and net.padding_bugfix:
+                thash = '{:040x}'.format(pubkey_hash)
+            else:
+                thash = '{:x}'.format(pubkey_hash)
+                if len(thash) % 2 == 1:
+                    thash = '0%s' % thash
+            data = [int(x) for x in bytearray.fromhex(thash)]
+            if net.SYMBOL.lower() in ['bch', 'tbch', 'bsv', 'tbsv']:
+                return cash_addr.encode(net.HUMAN_READABLE_PART, bech32_ver, data)
+            else:
+                return segwit_addr.encode(net.HUMAN_READABLE_PART, bech32_ver, data)*/
+            LOG_WARNING << "pubkey_hash_to_address TODO";
+        }
+
+
+        HumanAddressType human_addr{IntType(8)(addr_ver), IntType(160)(pubkey_hash)};
         PackStream stream;
         stream << human_addr;
         Span<unsigned char> _span(stream.data);
@@ -232,7 +249,7 @@ namespace coind::data
 
     auto pubkey_to_address(auto pubkey, shared_ptr<c2pool::Network> _net)
     {
-        return pubkey_hash_to_address(hash160(pubkey), _net);
+        return pubkey_hash_to_address(hash160(pubkey), _net->parent->ADDRESS_VERSION, -1, _net);
     }
 
     auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
@@ -247,7 +264,7 @@ namespace coind::data
         HumanAddressType human_addr;
         stream >> human_addr;
 
-        if (human_addr.version.value != _net->ADDRESS_VERSION)
+        if (human_addr.version.value != _net->parent->ADDRESS_VERSION)
         {
             throw("address not for this net!");
         }
@@ -255,11 +272,11 @@ namespace coind::data
         return human_addr.pubkey_hash.value;
     }
 
-    PackStream pubkey_hash_to_script2(uint160 pubkey_hash);
+    PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net);
 
     inline auto pubkey_to_script2(PackStream pubkey)
     {
-        if (pubkey.size() <= 75)
+        if (pubkey.size() > 75)
             throw invalid_argument("pubkey_to_script2: pubkey.size > 75");
 
         pubkey.data.insert(pubkey.begin(), (unsigned char)pubkey.size());
@@ -268,41 +285,163 @@ namespace coind::data
         return pubkey;
     }
 
-    inline std::string script2_to_address(const PackStream& script2, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_pubkey_address(const PackStream& script2, const shared_ptr<c2pool::Network>& _net)
     {
+        PackStream pubkey;
+
         try
         {
-            auto pubkey = script2;
-
+            pubkey = script2;
             pubkey.data.erase(pubkey.begin());
             pubkey.data.erase(pubkey.end()-1);
 
             auto script2_test = pubkey_to_script2(pubkey);
-
-            if (script2_test == script2)
-                return pubkey_to_address(pubkey, _net);
+            if (script2_test != script2)
+                throw std::invalid_argument("ValueError");
         } catch (...)
         {
-
+            throw std::invalid_argument("AddrError");
         }
+
+        return pubkey_to_address(pubkey, _net);
+    }
+
+    inline std::string script2_to_pubkey_hash_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    {
+        //TODO: Check for BCH and BSV length, could be longer than 20 bytes
+        uint160 pubkey_hash;
 
         try
         {
-            auto pubkey = script2;
+            PackStream pubkey = script2;
             pubkey.data.erase(pubkey.begin(), pubkey.begin()+3);
             pubkey.data.erase(pubkey.end()-2, pubkey.end());
 
-            auto pubkey_hash = unpack<IntType(160)>(pubkey.data);
+            pubkey_hash = unpack<IntType(160)>(pubkey.data);
+            auto script2_test = pubkey_hash_to_script2(pubkey_hash, addr_ver, bech32_ver, _net);
 
-            auto script2_test = pubkey_hash_to_script2(pubkey_hash);
-
-            if (script2_test == script2)
-                return pubkey_hash_to_address(pubkey_hash, _net);
+            if (script2_test != script2)
+                throw std::invalid_argument("ValueError");
         } catch (...)
         {
-
+            throw std::invalid_argument("AddrError");
         }
 
-        return "none";
+        return pubkey_hash_to_address(pubkey_hash, addr_ver, bech32_ver, _net);
+    }
+
+    inline std::string script2_to_cashaddress(const PackStream& script2, int32_t addr_ver, int32_t ca_ver, const shared_ptr<c2pool::Network>& _net)
+    {
+        //TODO: Check for BCH and BSV length, could be longer than 20 bytes
+        uint160 pubkey_hash;
+
+        try
+        {
+            PackStream sub_hash = script2;
+            if (ca_ver == 0)
+            {
+                sub_hash.data.erase(sub_hash.begin(), sub_hash.begin() + 3);
+                sub_hash.data.erase(sub_hash.end() - 2, sub_hash.end());
+            } else if (ca_ver == 1)
+            {
+                sub_hash.data.erase(sub_hash.begin(), sub_hash.begin() + 2);
+                sub_hash.data.erase(sub_hash.end() - 1, sub_hash.end());
+            } else {
+                throw std::invalid_argument("ValueError");
+            }
+
+            pubkey_hash = unpack<IntType(160)>(sub_hash.data);
+            auto script2_test = pubkey_hash_to_script2(pubkey_hash, addr_ver, ca_ver, _net);
+
+            if (script2_test != script2)
+                throw std::invalid_argument("ValueError");
+        } catch (...)
+        {
+            throw std::invalid_argument("AddrError");
+        }
+
+        return pubkey_hash_to_address(pubkey_hash, addr_ver, ca_ver, _net);
+    }
+
+    inline std::string script2_to_bech32_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    {
+        //TODO: Check for BCH and BSV length, could be longer than 20 bytes
+        uint160 pubkey_hash;
+
+        try
+        {
+            PackStream pubkey = script2;
+            pubkey.data.erase(pubkey.begin(), pubkey.begin()+2);
+
+            pubkey_hash = unpack<IntType(160)>(pubkey.data);
+            auto script2_test = pubkey_hash_to_script2(pubkey_hash, addr_ver, bech32_ver, _net);
+
+            if (script2_test != script2)
+                throw std::invalid_argument("ValueError");
+        } catch (...)
+        {
+            throw std::invalid_argument("AddrError");
+        }
+        return pubkey_hash_to_address(pubkey_hash, addr_ver, bech32_ver, _net);
+    }
+
+    inline std::string script2_to_p2sh_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    {
+        //TODO: Check for BCH and BSV length, could be longer than 20 bytes
+        uint160 pubkey_hash;
+
+        try
+        {
+            PackStream pubkey = script2;
+            pubkey.data.erase(pubkey.begin(), pubkey.begin()+2);
+            pubkey.data.erase(pubkey.end()-1, pubkey.end());
+
+            pubkey_hash = unpack<IntType(160)>(pubkey.data);
+            auto script2_test = pubkey_hash_to_script2(pubkey_hash, addr_ver, bech32_ver, _net);
+
+            if (script2_test != script2)
+                throw std::invalid_argument("ValueError");
+        } catch (...)
+        {
+            throw std::invalid_argument("AddrError");
+        }
+
+        return pubkey_hash_to_address(pubkey_hash, addr_ver, bech32_ver, _net);
+    }
+
+    inline std::string script2_to_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    {
+        //TODO: optimize (избавиться от перебора всех методов)
+        try
+        {
+            return script2_to_pubkey_address(script2, _net);
+        } catch (const std::invalid_argument& ec) {}
+
+
+        // pubkey_hash_address
+        try
+        {
+            return script2_to_pubkey_hash_address(script2, addr_ver, bech32_ver, _net);
+        } catch (const std::invalid_argument& ec) {}
+
+        // bech32_address
+        try
+        {
+            return script2_to_bech32_address(script2, addr_ver, bech32_ver, _net);
+        } catch (const std::invalid_argument& ec) {}
+
+        // p2sh_address
+        try
+        {
+            return script2_to_p2sh_address(script2, addr_ver, bech32_ver, _net);
+        } catch (const std::invalid_argument& ec) {}
+
+        // cashaddress
+        try
+        {
+            return script2_to_cashaddress(script2, addr_ver, bech32_ver, _net);
+        } catch (const std::invalid_argument& ec) {}
+
+        throw std::invalid_argument((boost::format("Invalid script2 hash: %1%") % HexStr(script2.data)).str());
     }
 }
