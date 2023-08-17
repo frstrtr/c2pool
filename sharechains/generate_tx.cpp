@@ -358,7 +358,7 @@ namespace shares
 
         //this script reward; 0.5% goes to block finder
         {
-            std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash).data;
+            std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net).data;
 
             auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_script](const auto& value){
                 return std::get<0>(value) == this_script;
@@ -484,7 +484,7 @@ namespace shares
         {
             coind::data::stream::TxOutType_stream packed_tx_out(_tx);
             auto data = pack<coind::data::stream::TxOutType_stream>(packed_tx_out);
-            LOG_DEBUG_SHARETRACKER << _i << "(" << _tx.value << "/" << coind::data::script2_to_address(PackStream(_tx.script), net) << "): [" << data << "].";
+            LOG_DEBUG_SHARETRACKER << _i << "(" << _tx.value << "/" << coind::data::script2_to_address(PackStream(_tx.script), net->parent->ADDRESS_VERSION, -1, net) << "): [" << data << "].";
             _i += 1;
         }
 

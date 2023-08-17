@@ -54,7 +54,7 @@ void Share::init()
 
     assert(hash_link->get()->extra_data.empty());
 
-    new_script = coind::data::pubkey_hash_to_script2((*share_data)->pubkey_hash);
+    new_script = coind::data::pubkey_hash_to_script2((*share_data)->pubkey_hash, net->parent->ADDRESS_VERSION, -1, net);
 
     if (net->net_name == "bitcoin" && *absheight > 3927800 && *desired_version == 16)
     {
@@ -281,7 +281,7 @@ nlohmann::json Share::json()
                     {"timestamp", *timestamp},
                     {"target", target},
                     {"max_target", max_target},
-                    {"payout_address", coind::data::script2_to_address(new_script, net)},
+                    {"payout_address", coind::data::script2_to_address(new_script, net->parent->ADDRESS_VERSION, -1, net)},
                     {"donation", *donation/65535},
                     {"stale_info", *stale_info},
                     {"nonce", *nonce},
