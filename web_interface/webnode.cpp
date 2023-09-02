@@ -3,12 +3,14 @@
 //
 
 #include "webnode.h"
+#include <filesystem>
 
 bool isDirectory(const std::string &path)
 {
-    struct stat info;
-    if (stat(path.c_str(), &info) != 0) {
+    const std::filesystem::path _path(path); // Constructing the path from a string is possible.
+    std::error_code ec; // For using the non-throwing overloads of functions below.
+    if (std::filesystem::is_directory(path, ec))
+        return true;
+    else
         return false;
-    }
-    return (info.st_mode & S_IFDIR) != 0;
 }

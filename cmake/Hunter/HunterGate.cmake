@@ -41,7 +41,6 @@
 # Projects:
 #     * https://github.com/hunter-packages/gate/
 #     * https://github.com/ruslo/hunter
-
 option(HUNTER_ENABLED "Enable Hunter package manager support" ON)
 
 if(HUNTER_ENABLED)

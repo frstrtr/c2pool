@@ -7,6 +7,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <utility>
+#include <map>
 
 #include "session_interface.h"
 
