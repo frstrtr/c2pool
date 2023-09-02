@@ -653,7 +653,7 @@ void PoolNode::download_shares()
 
             if (_node->peers.size() == 0)
             {
-                LOG_WARNING << "download_shares: peers.size() == 0";
+//                LOG_WARNING << "download_shares: peers.size() == 0";
                 fiber->sleep(1s);
                 continue;
             }
