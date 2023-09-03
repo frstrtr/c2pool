@@ -68,9 +68,9 @@ namespace jsonrpccxx {
       if (valid_id(request)) {
         id = request["id"];
       }
-//      try {
+      try {
         return ProcessSingleRequest(request);
-    /*  } catch (JsonRpcException &e) {
+      } catch (JsonRpcException &e) {
         json error = {{"code", e.Code()}, {"message", e.Message()}};
         if (!e.Data().is_null()) {
           error["data"] = e.Data();
@@ -80,7 +80,7 @@ namespace jsonrpccxx {
         return json{{"id", id}, {"error", {{"code", internal_error}, {"message", std::string("internal server error: ") + e.what()}}}, {"jsonrpc", "2.0"}};
       } catch (...) {
         return json{{"id", id}, {"error", {{"code", internal_error}, {"message", std::string("internal server error")}}}, {"jsonrpc", "2.0"}};
-      }*/
+      }
     }
 
     json ProcessSingleRequest(json &request) {
