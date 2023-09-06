@@ -3,6 +3,7 @@
 //#include <string>
 
 #include <list>
+#include <map>
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
