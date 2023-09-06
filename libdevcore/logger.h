@@ -4,6 +4,7 @@
 #include <memory>
 #include <map>
 #include <atomic>
+#include <optional>
 using std::shared_ptr;
 
 #include <boost/log/core.hpp>

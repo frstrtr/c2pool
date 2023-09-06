@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -36,7 +37,7 @@ struct BaseMaker //TIP, HACK, КОСТЫЛЬ
 };
 
 template <typename T>
-concept bool MakerType = std::is_base_of_v<BaseMaker, T>;
+concept MakerType = std::is_base_of_v<BaseMaker, T>;
 
 template <typename T, typename SUB_T>
 struct Maker : BaseMaker
@@ -110,7 +111,7 @@ struct MakerListType<LIST_TYPE> : BaseMaker
 struct BaseGetter{};
 
 template <typename T>
-concept bool GetterType = std::is_base_of_v<BaseGetter, T>;
+concept GetterType = std::is_base_of_v<BaseGetter, T>;
 
 template <typename GET_TYPE>
 struct Getter : BaseGetter
