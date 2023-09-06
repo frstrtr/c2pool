@@ -2,16 +2,16 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fconcepts")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -D_WIN32_WINNT=0x0601")
 #add_compile_definitions(PUBLIC DEBUG=0)
 
-include("cmake/HunterGate.cmake")
-HunterGate(
-        URL "https://github.com/cpp-pm/hunter/archive/v0.24.18.tar.gz"
-        SHA1 "1292e4d661e1770d6d6ca08c12c07cf34a0bf718"
-#        LOCAL
-)
-SET(HUNTER_STATUS_DEBUG ON)
+#include("cmake/HunterGate.cmake")
+#HunterGate(
+#        URL "https://github.com/cpp-pm/hunter/archive/v0.24.18.tar.gz"
+#        SHA1 "1292e4d661e1770d6d6ca08c12c07cf34a0bf718"
+##        LOCAL
+#)
+#SET(HUNTER_STATUS_DEBUG ON)
 
 project(c2pool)
 
@@ -37,9 +37,10 @@ endif()
 
 
 #init packages
+set(Boost_DEBUG on)
 set(Boost_USE_STATIC_LIBS ON)
 
-find_package(Boost 1.71.0 COMPONENTS program_options log log_setup coroutine REQUIRED)
+find_package(Boost 1.78.0 COMPONENTS program_options log log_setup coroutine REQUIRED)
 if(Boost_FOUND)
 	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
     MESSAGE( STATUS "Boost_LIBRARIES = ${BOOST_LIBRARYDIR}.")
