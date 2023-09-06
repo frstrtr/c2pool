@@ -9,7 +9,7 @@ set(devcore_sources ${devcore_sources} db.h)
 
 #from util
 set(devcore_sources ${devcore_sources} types.h events.h stream.h stream_types.h math.h deferred.h types.cpp stream.cpp math.cpp deferred.cpp expiring_dict.h)
-find_library(dl NAMES dl)
+find_library(dl NAMES dl) # for not windows
 
 add_library(libdevcore ${devcore_sources})
 target_link_libraries(libdevcore Boost::coroutine Boost::log Boost::log_setup univalue ${dl})
