@@ -43,7 +43,7 @@ namespace c2pool::deferred
     public:
         //Таймер, который не блокирует yield_context
         void external_timer(std::function<void(const boost::system::error_code &ec)> __handler,
-                            const std::chrono::_V2::steady_clock::duration &expiry_time)
+                            const std::chrono::steady_clock::duration &expiry_time)
         {
             auto __timer = std::make_shared<boost::asio::steady_timer>(*io);
             unsigned long long _id = external_timers.size();
@@ -58,7 +58,7 @@ namespace c2pool::deferred
                                 });
         }
 
-        void sleep(const std::chrono::_V2::steady_clock::duration &expiry_time)
+        void sleep(const std::chrono::steady_clock::duration &expiry_time)
         {
             boost::asio::steady_timer timer(*io, expiry_time);
             timer.async_wait(yield);

@@ -363,15 +363,15 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
 	}
 };
 
-#define INT8 IntType<uint8_t>
-#define INT16 IntType<uint16_t>
-#define INT32 IntType<uint32_t>
-#define INT64 IntType<uint64_t>
-#define INT160 ULongIntType<uint160>
-#define INT128 ULongIntType<uint128>
-#define INT256 ULongIntType<uint256>
+#define _INT8 IntType<uint8_t>
+#define _INT16 IntType<uint16_t>
+#define _INT32 IntType<uint32_t>
+#define _INT64 IntType<uint64_t>
+#define _INT160 ULongIntType<uint160>
+#define _INT128 ULongIntType<uint128>
+#define _INT256 ULongIntType<uint256>
 
-#define IntType(bytes) INT##bytes
+#define IntType(bytes) _INT##bytes
 
 //PACK_TYPE = StreamObjType
 template <StreamEnumType ENUM_T, typename PACK_TYPE = IntType(32)>
