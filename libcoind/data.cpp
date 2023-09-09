@@ -25,14 +25,14 @@ namespace coind::data
         return false;
     }
 
-    bool is_segwit_tx(std::shared_ptr<TransactionType> tx)
-    {
-        if (tx)
-        {
-            return tx->wdata.has_value() && tx->wdata->marker == 0 && tx->wdata->flag >= 1;
-        }
-        return false;
-    }
+//    bool is_segwit_tx(std::shared_ptr<coind::data::TransactionType> tx)
+//    {
+//        if (tx)
+//        {
+//            return tx->wdata.has_value() && tx->wdata->marker == 0 && tx->wdata->flag >= 1;
+//        }
+//        return false;
+//    }
 
     arith_uint288 target_to_average_attempts(uint256 target)
     {
