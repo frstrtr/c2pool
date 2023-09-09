@@ -11,7 +11,7 @@ set(devcore_sources ${devcore_sources} db.h)
 set(devcore_sources ${devcore_sources} types.h events.h stream.h stream_types.h math.h deferred.h types.cpp stream.cpp math.cpp deferred.cpp expiring_dict.h)
 
 
-add_library(libdevcore ${devcore_sources})
+add_library(libdevcore STATIC ${devcore_sources})
 target_link_libraries(libdevcore Boost::coroutine Boost::log Boost::log_setup univalue)
 if (NOT WIN32) # for not windows
     find_library(dl NAMES dl)

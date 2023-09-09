@@ -21,6 +21,9 @@ endif ()
 
 project(c2pool)
 
+include_directories (${PROJECT_SOURCE_DIR})
+include_directories (${PROJECT_BINARY_DIR})
+
 #check lib's
 find_package(Git QUIET)
 if(GIT_FOUND) #AND EXISTS "${PROJECT_SOURCE_DIR}/.git/modules")

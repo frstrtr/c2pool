@@ -12,7 +12,7 @@ set(libnet2_sources
         coind_node_data.h coind_node_data.cpp
         )
 
-add_library(libnet2 ${libnet2_sources})
+add_library(libnet2 STATIC ${libnet2_sources})
 
-target_link_libraries(libnet2 libp2p libp2ppreset libcoind sharechains)
+target_link_libraries(libnet2 libp2p libcoind sharechains)
 #target_link_libraries(libnet2 univalue networks libdevcore sharechains libcoind)

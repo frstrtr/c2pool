@@ -83,7 +83,7 @@ namespace c2pool::master
     {
         //---> Create WebRoot
         auto web_root = std::make_shared<WebRoot>(
-                [](WebInterface::func_type::argument_type &query)
+                [](/*WebInterface::func_type::argument_type*/ auto &query)
                 {
                 });
 

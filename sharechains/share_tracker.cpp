@@ -424,11 +424,11 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
 {
     assert(("get_pool_attempts_per_second: assert for dist >= 2", dist >= 2));
-    auto near = get(previous_share_hash);
-    auto far = get(get_nth_parent_key(previous_share_hash,dist - 1));
-    auto attempts_delta = get_sum(near->hash, far->hash);
+    auto _near = get(previous_share_hash);
+    auto _far = get(get_nth_parent_key(previous_share_hash,dist - 1));
+    auto attempts_delta = get_sum(_near->hash, _far->hash);
 
-    auto time = *near->timestamp - *far->timestamp;
+    auto time = *_near->timestamp - *_far->timestamp;
     if (time <= 0)
     {
         time = 1;
