@@ -34,7 +34,11 @@ inline UrlData parse_url(const std::string &url)
     UrlData result;
     result.full_path = split(url, '?').front();
 
+#ifdef _WIN32
+    result.path = split(url, '\\');
+#else
     result.path = split(url, '/');
+#endif
     result.path.pop_front();
 
     if (result.path.empty())
