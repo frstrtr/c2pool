@@ -1,5 +1,6 @@
 #include "worker.h"
 
+#include <ranges>
 #include <utility>
 #include <vector>
 #include <tuple>
@@ -604,6 +605,9 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
                         //TODO: add self.node.net.PARENT.BLOCK_EXPLORER_URL_PREFIX
                         LOG_INFO << "GOT BLOCK FROM MINER! Passing to bitcoind! " << header_hash.GetHex() << "\n";
+
+                        // add block to web-statistic
+                        founded_blocks.push_back({{"ts", header.timestamp}, {"hash", header_hash.GetHex()}});
                     }
                 } catch (const std::error_code &ec)
                 {
@@ -961,6 +965,16 @@ void Worker::init_web_metrics()
             j["efficiency"] = efficiency;
         } else{
             j["efficiency"] = nullptr;
+        }
+    });
+
+    //------> founded_blocks
+    founded_blocks_metric = _net->web->add<founded_blocks_metric_type>("founded_blocks", [&](nlohmann::json& j){
+        j.clear();
+        //TODO: can be optimized; hash of the new block is immediately added to the metric
+        for (auto &founded_block : std::ranges::reverse_view(founded_blocks))
+        {
+            j.push_back(founded_block);
         }
     });
 

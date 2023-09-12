@@ -57,6 +57,14 @@
                     return pays[addr]
                 }).toFixed(8));
             });
+
+            d3.json('/status/founded_blocks?net=' + net, function (blocks)  {
+                var tr = d3.select('#blocks').selectAll().data(blocks).enter().append('tr');
+                tr.append('td').text(function(block){return new Date(1000*block.ts).toString()});
+                // tr.append('td').text(function(block){return block.number});
+                tr.append('td').append('a').text(function(block){return block.hash}).attr('href', function(block){return currency_info.block_explorer_url_prefix + block.hash});
+                tr.append('td').append('a').text('→').attr('href', function(block){return 'share?net=' + net + '#' + block.hash});
+            });
         });
 
         $.ajax({
@@ -173,6 +181,11 @@
     <p>Tails: <span id="tails"></span></p>
     <p>My shares: <span id="my_share_hashes"></span></p>
 
+    <h2>Blocks found in last day:</h2>
+<!--    <p>Note that blocks may have been orphaned from the P2Pool chain and so not be here.</p>-->
+    <table border="1" id="blocks">
+        <tr><th>time</th><th>hash/explorer link</th><th>share</th></tr>
+    </table>
 
     <h2>Payouts if a block were found NOW:</h2>
     <table border="1" id="payouts">

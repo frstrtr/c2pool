@@ -197,12 +197,14 @@ class WebWorker
 {
 protected:
     typedef MetricGetter shares_metric_type;
+    typedef MetricGetter founded_blocks_metric_type;
     typedef MetricGetter local_rate_metric_type;
     typedef MetricGetter pool_rate_metric_type;
     typedef MetricValue payout_addr_metric_type;
     typedef MetricValue my_share_hashes_metric_type;
 protected:
     shares_metric_type* shares_metric;
+    founded_blocks_metric_type* founded_blocks_metric; //TODO: can be optimized; hash of the new block is immediately added to the metric.
     local_rate_metric_type* local_rate_metric;
     pool_rate_metric_type* pool_rate_metric;
     payout_addr_metric_type* payout_addr_metric;
@@ -268,6 +270,7 @@ public:
     Event<> pseudoshare_received;
 
     std::set<uint256> my_share_hashes;
+    std::vector<nlohmann::json> founded_blocks;
     std::set<uint256> my_doa_share_hashes;
     std::vector<std::tuple<int32_t, uint288>> recent_shares_ts_work;
 
