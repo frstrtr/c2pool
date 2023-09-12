@@ -229,6 +229,13 @@ namespace c2pool::master
                                           return net->get("my_share_hashes").dump();
                                       });
 
+        //------> Founded blocks
+        status->put_child<WebNetJson>("founded_blocks", web_root->net_functor(),
+                                      [&](const WebNetJson::net_field &net, const auto& query)
+                                      {
+                                          return net->get("founded_blocks").dump();
+                                      });
+
         //---> Config Share node
         //------> data
         share->put_child<WebNetJson>("data", web_root->net_functor(),
