@@ -1,6 +1,5 @@
 #include "worker.h"
 
-#include <ranges>
 #include <utility>
 #include <vector>
 #include <tuple>
@@ -972,9 +971,9 @@ void Worker::init_web_metrics()
     founded_blocks_metric = _net->web->add<founded_blocks_metric_type>("founded_blocks", [&](nlohmann::json& j){
         j.clear();
         //TODO: can be optimized; hash of the new block is immediately added to the metric
-        for (auto &founded_block : std::ranges::reverse_view(founded_blocks))
+        for (auto founded_block = founded_blocks.rbegin(); founded_block != founded_blocks.rend(); founded_block++)
         {
-            j.push_back(founded_block);
+            j.push_back(*founded_block);
         }
     });
 
@@ -1029,6 +1028,7 @@ void Worker::init_web_metrics()
         j["difficulty"] = coind::data::target_to_difficulty(_tracker->get(_pool_node->best_share->value())->max_target);
         j["block_difficulty"] = diff;
         j["network_hashrate"] = (diff * pow(2, 32)) / _net->parent->BLOCK_PERIOD;
+        return j;
     });
 
     //------> payout_addr
