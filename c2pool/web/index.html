@@ -63,7 +63,7 @@
                 tr.append('td').text(function(block){return new Date(1000*block.ts).toString()});
                 // tr.append('td').text(function(block){return block.number});
                 tr.append('td').append('a').text(function(block){return block.hash}).attr('href', function(block){return currency_info.block_explorer_url_prefix + block.hash});
-                tr.append('td').append('a').text('→').attr('href', function(block){return 'share?net=' + net + '#' + block.hash});
+                tr.append('td').append('a').text(decodeURI('%E2%86%92')).attr('href', function(block){return 'share?net=' + net + '#' + block.hash});
             });
         });
 
