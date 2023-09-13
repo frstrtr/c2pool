@@ -103,8 +103,7 @@ public:
 																	  sock->read();
 																  } else
 																  {
-																	  LOG_ERROR << "async_connect: " << ec << " "
-																				<< ec.message();
+																	  LOG_ERROR << "async_connect: " << ec.to_string();
 																  }
 															  });
 							   });
@@ -157,8 +156,7 @@ public:
 																	  sock->read();
 																  } else
 																  {
-																	  LOG_ERROR << "async_connect: " << ec << " "
-																				<< ec.message();
+																	  LOG_ERROR << "async_connect: " << ec.to_string();
 																  }
 															  });
 							   });
