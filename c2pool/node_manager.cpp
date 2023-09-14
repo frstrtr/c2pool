@@ -69,8 +69,6 @@ void NodeManager::run()
     _stratum = std::make_shared<StratumNode>(_context, _worker);
     _stratum->listen();
 
-    // TODO: WebRoot
-
     //...success!
     _is_loaded = true;
     _context->run();
