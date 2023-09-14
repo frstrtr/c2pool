@@ -76,6 +76,7 @@ public:
 					std::tuple<std::string, std::string> _addr) override
 	{
 		auto [ip, port] = _addr;
+        LOG_DEBUG_P2P << "P2PConnector try to resolve " << ip << ":" << port;
 		resolver.async_resolve(ip, port,
 							   [&, _ip = ip, _port = port, _handler = socket_handle](
 									   const boost::system::error_code &er,
@@ -95,7 +96,7 @@ public:
 																	  const boost::system::error_code &ec,
 																	  const boost::asio::ip::tcp::endpoint& ep)
 															  {
-                                                                  LOG_INFO << "Socket try handshake with " << ep.address() << ":"
+                                                                  LOG_INFO << "P2PConnector.Socket try handshake with " << ep.address() << ":"
                                                                            << ep.port();
 																  if (!ec)
 																  {
@@ -148,7 +149,7 @@ public:
 																	  const boost::system::error_code &ec,
 																	  boost::asio::ip::tcp::endpoint ep)
 															  {
-                                                                  LOG_INFO << "Socket try handshake with " << ep.address() << ":"
+                                                                  LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":"
                                                                            << ep.port();
 																  if (!ec)
 																  {

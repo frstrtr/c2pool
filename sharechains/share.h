@@ -125,4 +125,4 @@ typedef std::shared_ptr<Share> ShareType;
 
 ShareType load_share(PackStream &stream, shared_ptr<c2pool::Network> net, const addr_type& peer_addr);
 
-PackedShareData pack_share(ShareType share);
+PackedShareData pack_share(const ShareType& share);

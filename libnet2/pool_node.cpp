@@ -646,7 +646,6 @@ void PoolNode::download_shares()
         {
             auto desired = _node->coind_node->desired->get_when_satisfies([&](const auto &desired)
                                                                          {
-                                                                             LOG_DEBUG_POOL << "SATISFIES!";
                                                                              return desired.size() != 0;
                                                                          })->yield(fiber);
             auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);

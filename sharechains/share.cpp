@@ -341,7 +341,7 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 	}
 }
 
-PackedShareData pack_share(ShareType share)
+PackedShareData pack_share(const ShareType& share)
 {
 	// Pack share to t['share_type'] from p2pool
 	PackStream contents;

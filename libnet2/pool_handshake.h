@@ -34,7 +34,7 @@ protected:
 
 public:
     PoolHandshake(auto socket, msg_version_handler_type _handler)
-            : Handshake(socket), PoolProtocolData(3301, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
+            : Handshake(socket), PoolProtocolData(3501, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
                         LOG_DEBUG_POOL << "ID: " << _id.GetHex();
