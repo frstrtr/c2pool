@@ -4,6 +4,7 @@
 #include "share.h"
 
 #include <memory>
+#include <utility>
 #include <networks/network.h>
 
 class BaseShareBuilder
@@ -12,7 +13,7 @@ protected:
 	ShareType share;
 	std::shared_ptr<c2pool::Network> net;
 public:
-	BaseShareBuilder(std::shared_ptr<c2pool::Network> _net) : net(_net)
+	BaseShareBuilder(std::shared_ptr<c2pool::Network> _net) : net(std::move(_net))
 	{
 		Reset();
 	}
@@ -93,6 +94,7 @@ protected:
     }
 };
 
+// Build Share from shares::types
 class ShareObjectBuilder : public BaseShareBuilder, public enable_shared_from_this<ShareObjectBuilder>
 {
 public:
@@ -106,14 +108,16 @@ public:
         return shared_from_this();
     }
 
-    auto share_data(const shares::types::ShareData &data){
-        auto value = std::make_shared<ShareData>();
+    auto share_data(const shares::types::ShareData &data, bool is_pubkey_hash)
+    {
+        auto value = std::make_shared<ShareData>(is_pubkey_hash);
         value->set_value(data);
         _share_data(value);
         return shared_from_this();
     }
 
-    auto segwit_data(const shares::types::SegwitData &data){
+    auto segwit_data(const shares::types::SegwitData &data)
+    {
         auto value = std::make_shared<SegwitData>();
         value->set_value(data);
         _segwit_data(value);
@@ -159,6 +163,7 @@ public:
     }
 };
 
+// Build share from PackStream
 class ShareStreamBuilder : public BaseShareBuilder, public enable_shared_from_this<ShareStreamBuilder>
 {
 public:
@@ -172,14 +177,17 @@ public:
 		return shared_from_this();
 	}
 
-	auto share_data(PackStream &stream){
-        auto value = std::make_shared<ShareData>();
+    // is_pubkey_hash: true -- pubkey_hash; false -- address.
+	auto share_data(PackStream &stream, bool is_pubkey_hash)
+    {
+        auto value = std::make_shared<ShareData>(is_pubkey_hash);
         stream >> *value;
         _share_data(value);
 		return shared_from_this();
 	}
 
-	auto segwit_data(PackStream &stream){
+	auto segwit_data(PackStream &stream)
+    {
         auto value = std::make_shared<SegwitData>();
         stream >> *value;
         _segwit_data(value);
@@ -241,7 +249,7 @@ public:
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
-				->share_data(stream)
+				->share_data(stream, true)
 				->share_info(stream)
 				->ref_merkle_link(stream)
 				->last_txout_nonce(stream)
@@ -254,7 +262,7 @@ public:
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
-				->share_data(stream)
+				->share_data(stream, true)
 				->segwit_data(stream)
 				->share_info(stream)
 				->ref_merkle_link(stream)
@@ -263,6 +271,11 @@ public:
 				->merkle_link(stream);
         return builder->GetShare();
 	}
+
+    ShareType make_segwitMiningShare(uint64_t version, const addr_type &addr, PackStream& stream)
+    {
+
+    }
 };
 
 #endif //C2POOL_SHARE_BUILDER_H
