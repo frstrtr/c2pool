@@ -165,7 +165,54 @@ namespace shares::types
 //        }
     };
 
+    struct ShareAddrType
+    {
+        std::vector<unsigned char>* address;
+        uint160* pubkey_hash;
 
+        ShareAddrType() = default;
+
+        ~ShareAddrType()
+        {
+            delete address;
+            delete pubkey_hash;
+        }
+
+        bool operator==(const ShareAddrType &value) const
+        {
+            return ((address && value.address) && (*address == *value.address)) || ((pubkey_hash && value.pubkey_hash) && (*pubkey_hash == *value.pubkey_hash));
+        }
+
+        friend std::ostream &operator<<(std::ostream& stream, const ShareAddrType& v)
+        {
+            stream << "(ShareAddrType: ";
+            stream << "address: ";
+            if (v.address)
+                stream << *v.address;
+            else
+                stream << "null";
+
+            stream << ", pubkey_hash: ";
+            if (v.pubkey_hash)
+                stream << v.pubkey_hash->GetHex();
+            else
+                stream << "null";
+            stream << ")";
+            return stream;
+        }
+
+
+    };
+
+    struct ShareAddress : ShareAddrType
+    {
+
+    };
+
+    struct SharePubkeyHash : ShareAddrType
+    {
+
+    };
 
     struct ShareData
     {
@@ -173,7 +220,8 @@ namespace shares::types
         uint256 previous_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
 		std::vector<unsigned char> coinbase;
         uint32_t nonce;         //pack.IntType(32)
-        uint160 pubkey_hash;        //pack.IntType(160)
+        ShareAddrType* addr;
+//        uint160 pubkey_hash;        //pack.IntType(160)
         uint64_t subsidy; //pack.IntType(64)
         uint16_t donation;    //pack.IntType(16)
         StaleInfo stale_info;
@@ -184,13 +232,14 @@ namespace shares::types
 			previous_share_hash.SetHex("0");
 		}
 
-		ShareData(uint256 _prev_share_hash, std::vector<unsigned char> _coinbase, uint32_t _nonce, uint160 _pubkey_hash,
+        template<typename ADDRESS_TYPE>
+		ShareData(uint256 _prev_share_hash, std::vector<unsigned char> _coinbase, uint32_t _nonce, ADDRESS_TYPE _addr,
 					unsigned long long _subsidy, unsigned short _donation, StaleInfo _stale_info, unsigned long long _desired_version)
 		{
 			previous_share_hash = _prev_share_hash;
-			coinbase = _coinbase;
+			coinbase = std::move(_coinbase);
 			nonce = _nonce;
-			pubkey_hash = _pubkey_hash;
+			addr = new ADDRESS_TYPE(_addr);
 			subsidy = _subsidy;
 			donation = _donation;
 			stale_info = _stale_info;
@@ -199,8 +248,9 @@ namespace shares::types
 
         bool operator==(const ShareData &value) const
         {
+            assert(addr);
             return previous_share_hash == value.previous_share_hash && coinbase == value.coinbase && nonce == value.nonce &&
-                   pubkey_hash == value.pubkey_hash && subsidy == value.subsidy && donation == value.donation &&
+            *addr == *value.addr && subsidy == value.subsidy && donation == value.donation &&
                    stale_info == value.stale_info && desired_version == value.desired_version;
         }
 
@@ -215,7 +265,7 @@ namespace shares::types
             stream << "previous_share_hash = " << v.previous_share_hash;
             stream << ", coinbase = " << v.coinbase;
             stream << ", nonce = " << v.nonce;
-            stream << ", pubkey_hash = " << v.pubkey_hash;
+            stream << ", pubkey_hash = " << *v.addr;
             stream << ", subsidy = " << v.subsidy;
             stream << ", donation = " << v.donation;
             stream << ", stale_info = " << v.stale_info;

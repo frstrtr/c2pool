@@ -4,6 +4,8 @@
 #include <libdevcore/stream.h>
 #include <libcoind/types.h>
 
+#include <utility>
+
 #include "share_types.h"
 
 namespace shares::stream
@@ -96,12 +98,96 @@ namespace shares::stream
         }
     };
 
+    struct ShareAddrType_stream
+    {
+        StrType* address;
+        IntType(160)* pubkey_hash;
+
+        auto &operator=(const shares::types::ShareAddrType &_addr)
+        {
+            if (_addr.address)
+                address = new StrType(*_addr.address);
+            if (_addr.pubkey_hash)
+                pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
+            return *this;
+        }
+
+        virtual PackStream &write(PackStream &stream) = 0;
+        virtual PackStream &read(PackStream &stream) = 0;
+    };
+
+    struct ShareAddress_stream : ShareAddrType_stream
+    {
+        ShareAddress_stream()
+        {
+            address = new StrType();
+        }
+
+        explicit ShareAddress_stream(const shares::types::ShareAddrType &_addr)
+        {
+            if (_addr.address)
+                address = new StrType(*_addr.address);
+            if (_addr.pubkey_hash)
+                pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
+        }
+
+        explicit ShareAddress_stream(std::vector<unsigned char> addr)
+        {
+            address = new StrType(std::move(addr));
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << *address;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> *address;
+            return stream;
+        }
+    };
+
+    struct SharePubkeyHash_stream : ShareAddrType_stream
+    {
+        SharePubkeyHash_stream()
+        {
+            pubkey_hash = new IntType(160)();
+        }
+
+        explicit SharePubkeyHash_stream(const shares::types::ShareAddrType &_addr)
+        {
+            if (_addr.address)
+                address = new StrType(*_addr.address);
+            if (_addr.pubkey_hash)
+                pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
+        }
+
+        explicit SharePubkeyHash_stream(uint160 pubkey)
+        {
+            pubkey_hash = new IntType(160)(pubkey);
+        }
+
+        PackStream &write(PackStream &stream) override
+        {
+            stream << *pubkey_hash;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream) override
+        {
+            stream >> *pubkey_hash;
+            return stream;
+        }
+    };
+
     struct ShareData_stream
     {
         PossibleNoneType<IntType(256)> previous_share_hash;
         StrType coinbase;
         IntType(32) nonce;
-        IntType(160) pubkey_hash;
+        ShareAddrType_stream* addr;
         IntType(64) subsidy;
         IntType(16) donation;
         EnumType<StaleInfo, IntType(8)> stale_info;
@@ -112,12 +198,13 @@ namespace shares::stream
 
         }
 
-		ShareData_stream(const types::ShareData &val) : ShareData_stream()
+        template <typename ADDRESS_TYPE>
+		explicit ShareData_stream(const types::ShareData &val) : ShareData_stream()
 		{
 			previous_share_hash = val.previous_share_hash;
 			coinbase = val.coinbase;
 			nonce = val.nonce;
-			pubkey_hash = val.pubkey_hash;
+			*addr = new ADDRESS_TYPE(*val.addr);
 			subsidy = val.subsidy;
 			donation = val.donation;
 			stale_info = val.stale_info;
@@ -126,14 +213,14 @@ namespace shares::stream
 
         PackStream &write(PackStream &stream)
         {
-            stream << previous_share_hash << coinbase << nonce << pubkey_hash << subsidy << donation << stale_info
+            stream << previous_share_hash << coinbase << nonce << *addr << subsidy << donation << stale_info
                    << desired_version;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
-            stream >> previous_share_hash >> coinbase >> nonce >> pubkey_hash >> subsidy >> donation >> stale_info
+            stream >> previous_share_hash >> coinbase >> nonce >> *addr >> subsidy >> donation >> stale_info
                    >> desired_version;
             return stream;
         }

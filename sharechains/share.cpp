@@ -332,6 +332,9 @@ std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Ne
 //			return director.make_share(packed_share.type.value, peer_addr, _stream);
 		case 33:
 			return director.make_preSegwitShare(packed_share.type.value, peer_addr, _stream);
+        case 34:
+        case 35:
+            return director.make_segwitMiningShare(packed_share.type.value, peer_addr, _stream);
 		default:
 			if (packed_share.type.value < 17)
 				throw std::runtime_error("sent an obsolete share");

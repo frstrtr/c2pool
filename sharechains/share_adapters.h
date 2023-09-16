@@ -62,9 +62,12 @@ struct SegwitData :
 struct ShareData :
         StreamTypeAdapter<shares::types::ShareData, shares::stream::ShareData_stream>
 {
+    bool is_pubkey_hash;
+    ShareData(bool _is_pubkey_hash) : is_pubkey_hash(_is_pubkey_hash) {}
+
     void _to_stream() override
     {
-		make_stream(*_value);
+        _stream = std::make_shared<stream_type>();
     }
 
     void _to_value() override
