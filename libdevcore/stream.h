@@ -466,6 +466,12 @@ protected:
 public:
     StreamTypeAdapter() = default;
 
+    virtual std::shared_ptr<value_type> make_empty_value()
+    {
+        auto result = std::make_shared<ValueType>();
+        return result;
+    }
+
     std::shared_ptr<ValueType> operator->()
     {
         if (!_value)
@@ -475,7 +481,7 @@ public:
                 to_value();
             } else
             {
-                _value = std::make_shared<ValueType>();
+                _value = make_empty_value();
             }
         }
         return _value;
