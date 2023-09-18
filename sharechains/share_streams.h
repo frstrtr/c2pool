@@ -187,7 +187,7 @@ namespace shares::stream
         PossibleNoneType<IntType(256)> previous_share_hash;
         StrType coinbase;
         IntType(32) nonce;
-        ShareAddrType_stream* addr;
+        ShareAddrType_stream addr;
         IntType(64) subsidy;
         IntType(16) donation;
         EnumType<StaleInfo, IntType(8)> stale_info;
@@ -198,13 +198,12 @@ namespace shares::stream
 
         }
 
-        template <typename ADDRESS_TYPE>
 		explicit ShareData_stream(const types::ShareData &val) : ShareData_stream()
 		{
 			previous_share_hash = val.previous_share_hash;
 			coinbase = val.coinbase;
 			nonce = val.nonce;
-			*addr = new ADDRESS_TYPE(*val.addr);
+			addr = val.addr;
 			subsidy = val.subsidy;
 			donation = val.donation;
 			stale_info = val.stale_info;
@@ -213,14 +212,14 @@ namespace shares::stream
 
         PackStream &write(PackStream &stream)
         {
-            stream << previous_share_hash << coinbase << nonce << *addr << subsidy << donation << stale_info
+            stream << previous_share_hash << coinbase << nonce << addr << subsidy << donation << stale_info
                    << desired_version;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
-            stream >> previous_share_hash >> coinbase >> nonce >> *addr >> subsidy >> donation >> stale_info
+            stream >> previous_share_hash >> coinbase >> nonce >> addr >> subsidy >> donation >> stale_info
                    >> desired_version;
             return stream;
         }
