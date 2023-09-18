@@ -167,10 +167,20 @@ namespace shares::types
 
     struct ShareAddrType
     {
-        std::vector<unsigned char>* address;
-        uint160* pubkey_hash;
+        std::vector<unsigned char>* address{};
+        uint160* pubkey_hash{};
 
         ShareAddrType() = default;
+
+        explicit ShareAddrType(const std::vector<unsigned char> &addr)
+        {
+            address = new std::vector<unsigned char>(addr);
+        }
+
+        explicit ShareAddrType(const uint160& pubkey)
+        {
+            pubkey_hash = new uint160(pubkey);
+        }
 
         ~ShareAddrType()
         {
@@ -200,18 +210,6 @@ namespace shares::types
             stream << ")";
             return stream;
         }
-
-
-    };
-
-    struct ShareAddress : ShareAddrType
-    {
-
-    };
-
-    struct SharePubkeyHash : ShareAddrType
-    {
-
     };
 
     struct ShareData
@@ -220,8 +218,7 @@ namespace shares::types
         uint256 previous_share_hash; //none — pack.PossiblyNoneType(0, pack.IntType(256))
 		std::vector<unsigned char> coinbase;
         uint32_t nonce;         //pack.IntType(32)
-        ShareAddrType* addr;
-//        uint160 pubkey_hash;        //pack.IntType(160)
+        ShareAddrType addr;
         uint64_t subsidy; //pack.IntType(64)
         uint16_t donation;    //pack.IntType(16)
         StaleInfo stale_info;
@@ -239,7 +236,7 @@ namespace shares::types
 			previous_share_hash = _prev_share_hash;
 			coinbase = std::move(_coinbase);
 			nonce = _nonce;
-			addr = new ADDRESS_TYPE(_addr);
+			addr = ShareAddrType(_addr);
 			subsidy = _subsidy;
 			donation = _donation;
 			stale_info = _stale_info;
@@ -248,9 +245,8 @@ namespace shares::types
 
         bool operator==(const ShareData &value) const
         {
-            assert(addr);
             return previous_share_hash == value.previous_share_hash && coinbase == value.coinbase && nonce == value.nonce &&
-            *addr == *value.addr && subsidy == value.subsidy && donation == value.donation &&
+            addr == value.addr && subsidy == value.subsidy && donation == value.donation &&
                    stale_info == value.stale_info && desired_version == value.desired_version;
         }
 
