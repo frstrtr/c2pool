@@ -53,7 +53,7 @@ public:
 	std::unique_ptr<uint256> previous_hash;
     std::unique_ptr<std::vector<unsigned char>> coinbase;
     std::unique_ptr<uint32_t> nonce;
-    std::unique_ptr<uint160> pubkey_hash;
+    std::unique_ptr<shares::types::ShareAddrType> addr;
     std::unique_ptr<uint64_t> subsidy;
     std::unique_ptr<uint16_t> donation;
     std::unique_ptr<StaleInfo> stale_info;
@@ -92,7 +92,7 @@ public:
 		previous_hash.release();
 		coinbase.release();
 		nonce.release();
-		pubkey_hash.release();
+		addr.release();
 		subsidy.release();
 		donation.release();
 		stale_info.release();
