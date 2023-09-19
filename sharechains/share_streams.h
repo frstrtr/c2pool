@@ -100,85 +100,101 @@ namespace shares::stream
 
     struct ShareAddrType_stream
     {
-        StrType* address;
-        IntType(160)* pubkey_hash;
+        StrType* address{};
+        IntType(160)* pubkey_hash{};
 
-        auto &operator=(const shares::types::ShareAddrType &_addr)
+        ShareAddrType_stream() = default;
+
+        explicit ShareAddrType_stream(const shares::types::ShareAddrType &_addr)
         {
-            if (_addr.address)
-                address = new StrType(*_addr.address);
-            if (_addr.pubkey_hash)
-                pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
-            return *this;
+            switch (_addr.get_type())
+            {
+                case shares::types::ShareAddrType::Type::address_type:
+                    address = new StrType(*_addr.address);
+                    break;
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                    pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
+                    break;
+                default:
+                    throw std::invalid_argument("ShareAddrType_stream(ShareAddrType): _addr none type!");
+            }
         }
 
-        virtual PackStream &write(PackStream &stream) = 0;
-        virtual PackStream &read(PackStream &stream) = 0;
-    };
-
-    struct ShareAddress_stream : ShareAddrType_stream
-    {
-        ShareAddress_stream()
-        {
-            address = new StrType();
-        }
-
-        explicit ShareAddress_stream(const shares::types::ShareAddrType &_addr)
-        {
-            if (_addr.address)
-                address = new StrType(*_addr.address);
-            if (_addr.pubkey_hash)
-                pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
-        }
-
-        explicit ShareAddress_stream(std::vector<unsigned char> addr)
+        explicit ShareAddrType_stream(std::vector<unsigned char> addr)
         {
             address = new StrType(std::move(addr));
         }
 
-        PackStream &write(PackStream &stream) override
-        {
-            stream << *address;
-            return stream;
-        }
-
-        PackStream &read(PackStream &stream) override
-        {
-            stream >> *address;
-            return stream;
-        }
-    };
-
-    struct SharePubkeyHash_stream : ShareAddrType_stream
-    {
-        SharePubkeyHash_stream()
-        {
-            pubkey_hash = new IntType(160)();
-        }
-
-        explicit SharePubkeyHash_stream(const shares::types::ShareAddrType &_addr)
-        {
-            if (_addr.address)
-                address = new StrType(*_addr.address);
-            if (_addr.pubkey_hash)
-                pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
-        }
-
-        explicit SharePubkeyHash_stream(uint160 pubkey)
+        explicit ShareAddrType_stream(uint160 pubkey)
         {
             pubkey_hash = new IntType(160)(pubkey);
         }
 
-        PackStream &write(PackStream &stream) override
+        shares::types::ShareAddrType::Type get_type() const
         {
-            stream << *pubkey_hash;
-            return stream;
+            if (address)
+                return shares::types::ShareAddrType::Type::address_type;
+            if (pubkey_hash)
+                return shares::types::ShareAddrType::Type::pubkey_hash_type;
+            return shares::types::ShareAddrType::Type::none;
         }
 
-        PackStream &read(PackStream &stream) override
+        auto &operator=(const shares::types::ShareAddrType &_addr)
         {
-            stream >> *pubkey_hash;
-            return stream;
+            switch (_addr.get_type())
+            {
+                case shares::types::ShareAddrType::Type::address_type:
+                    address = new StrType(*_addr.address);
+                    return *this;
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                    pubkey_hash = new IntType(160)(*_addr.pubkey_hash);
+                    return *this;
+                default:
+                    throw std::invalid_argument("_addr none type!");
+            }
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            switch (get_type())
+            {
+                case shares::types::ShareAddrType::Type::address_type:
+                    stream << *address;
+                    return stream;
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                    stream << *pubkey_hash;
+                    return stream;
+                default:
+                    throw std::invalid_argument("Cant by write: ShareAddrType_stream none type!");
+            }
+        }
+
+        virtual PackStream &read(PackStream &stream)
+        {
+            switch (get_type())
+            {
+                case shares::types::ShareAddrType::Type::address_type:
+                    stream >> *address;
+                    return stream;
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                    stream >> *pubkey_hash;
+                    return stream;
+                default:
+                    throw std::invalid_argument("Cant by read: ShareAddrType_stream none type!");
+            }
+        }
+
+        shares::types::ShareAddrType get() const
+        {
+            switch (get_type())
+            {
+                case shares::types::ShareAddrType::Type::address_type:
+                    return shares::types::ShareAddrType(address->value);
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                    return shares::types::ShareAddrType(pubkey_hash->get());
+                default:
+                    throw std::invalid_argument("ShareAddrType_stream(ShareAddrType): _addr none type!");
+            }
         }
     };
 

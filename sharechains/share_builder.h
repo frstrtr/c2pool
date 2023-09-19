@@ -49,7 +49,7 @@ protected:
         share->previous_hash = std::unique_ptr<uint256>(&(*value)->previous_share_hash);
         share->coinbase = std::unique_ptr<std::vector<unsigned char>>(&(*value)->coinbase);
         share->nonce = std::unique_ptr<uint32_t>(&(*value)->nonce);
-        share->pubkey_hash = std::unique_ptr<uint160>(&(*value)->pubkey_hash);
+        share->addr = std::unique_ptr<shares::types::ShareAddrType>(&(*value)->addr);
         share->subsidy = std::unique_ptr<uint64_t>(&(*value)->subsidy);
         share->donation = std::unique_ptr<uint16_t>(&(*value)->donation);
         share->stale_info = std::unique_ptr<StaleInfo>(&(*value)->stale_info);
@@ -108,9 +108,9 @@ public:
         return shared_from_this();
     }
 
-    auto share_data(const shares::types::ShareData &data, bool is_pubkey_hash)
+    auto share_data(const shares::types::ShareData &data)
     {
-        auto value = std::make_shared<ShareData>(is_pubkey_hash);
+        auto value = std::make_shared<ShareData>();
         value->set_value(data);
         _share_data(value);
         return shared_from_this();
@@ -178,9 +178,9 @@ public:
 	}
 
     // is_pubkey_hash: true -- pubkey_hash; false -- address.
-	auto share_data(PackStream &stream, bool is_pubkey_hash)
+	auto share_data(PackStream &stream)
     {
-        auto value = std::make_shared<ShareData>(is_pubkey_hash);
+        auto value = std::make_shared<ShareData>();
         stream >> *value;
         _share_data(value);
 		return shared_from_this();
@@ -249,7 +249,7 @@ public:
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
-				->share_data(stream, true)
+				->share_data(stream)
 				->share_info(stream)
 				->ref_merkle_link(stream)
 				->last_txout_nonce(stream)
@@ -262,7 +262,7 @@ public:
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
-				->share_data(stream, true)
+				->share_data(stream)
 				->segwit_data(stream)
 				->share_info(stream)
 				->ref_merkle_link(stream)
