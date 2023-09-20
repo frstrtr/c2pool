@@ -260,8 +260,9 @@ namespace coind::data
         return pubkey_hash_to_address(hash160(pubkey), _net->parent->ADDRESS_VERSION, -1, _net);
     }
 
-    auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
+    auto get_legacy_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
     {
+        // P2PKH or P2SH address
         vector<unsigned char> decoded_addr;
         if (!DecodeBase58(address, decoded_addr, 64))
         {
@@ -277,10 +278,39 @@ namespace coind::data
             throw("address not for this net!");
         }
 
-        return human_addr.pubkey_hash.value;
+        return std::make_tuple(human_addr.pubkey_hash.value, human_addr.version.get(), -1);
+    }
+
+    auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
+    {
+        //TODO:
+//        try
+//        {
+            return get_legacy_pubkey_hash(address, _net);
+//        }
+
+        /* TODO: for BCH/BSV
+    if net.SYMBOL.lower() not in ['bch', 'tbch', 'bsv', 'tbsv']:
+        try:
+            return get_bech32_pubkey_hash(address, net)
+        except AddrError:
+            pass
+    else:
+        try:
+            return get_cashaddr_pubkey_hash(address, net)
+        except AddrError:
+            pass
+    raise ValueError('invalid addr')
+         */
     }
 
     PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net);
+
+    auto address_to_script2(auto address, shared_ptr<c2pool::Network> _net)
+    {
+        auto res = address_to_pubkey_hash(address, _net);
+        return pubkey_hash_to_script2(std::get<0>(res), std::get<1>(res), std::get<2>(res), _net);
+    }
 
     inline auto pubkey_to_script2(PackStream pubkey)
     {

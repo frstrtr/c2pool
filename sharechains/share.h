@@ -71,6 +71,7 @@ public:
 public:
     ///other
     PackStream new_script; //FROM pubkey_hash;
+    std::vector<unsigned char> address;
 
     uint256 gentx_hash;
     coind::data::BlockHeaderType header;
