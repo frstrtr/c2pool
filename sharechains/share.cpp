@@ -54,7 +54,20 @@ void Share::init()
 
     assert(hash_link->get()->extra_data.empty());
 
-    new_script = coind::data::pubkey_hash_to_script2((*share_data)->pubkey_hash, net->parent->ADDRESS_VERSION, -1, net);
+    if (VERSION >= 34)
+    {
+        assert((*share_data)->addr.address);
+        new_script = coind::data::address_to_script2(std::string{(*share_data)->addr.address->begin(), (*share_data)->addr.address->end()}, net);
+        address = *(*share_data)->addr.address;
+    }
+    else
+    {
+        assert((*share_data)->addr.pubkey_hash);
+        new_script = coind::data::pubkey_hash_to_script2(*(*share_data)->addr.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net);
+        auto _address = coind::data::pubkey_hash_to_address(*(*share_data)->addr.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net);
+        address.insert(address.begin(), _address.begin(), _address.end());
+    }
+
 
     if (net->net_name == "bitcoin" && *absheight > 3927800 && *desired_version == 16)
     {
