@@ -33,7 +33,7 @@ namespace shares::weight
         {
             auto att = coind::data::target_to_average_attempts(share->target);
 
-            amount = {{share->new_script.data, att * (65535 - *share->donation)}};
+            amount = {{share->address, att * (65535 - *share->donation)}};
             total_weight = att*65535;
             total_donation_weight = att * (*share->donation);
         }

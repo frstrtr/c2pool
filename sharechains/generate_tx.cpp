@@ -356,42 +356,54 @@ namespace shares
             amounts.emplace_back(v.first, v.second*199*_share_data.subsidy/(200*total_weight));
         }
 
-        //this script reward; 0.5% goes to block finder
+        // 0.5% goes to block finder
         {
-            std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net).data;
+//            std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net).data;
+            std::vector<unsigned char> this_address;
 
-            auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_script](const auto& value){
-                return std::get<0>(value) == this_script;
+            switch (_share_data.addr.get_type())
+            {
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                {
+                    auto _this_address = coind::data::pubkey_hash_to_address(*_share_data.addr.pubkey_hash,
+                                                                             net->parent->ADDRESS_VERSION, -1, net);
+                    this_address = std::vector<unsigned char>{_this_address.begin(), _this_address.end()};
+                    break;
+                }
+                case shares::types::ShareAddrType::Type::address_type:
+                {
+                    this_address = *_share_data.addr.address;
+                    break;
+                }
+                case shares::types::ShareAddrType::Type::none:
+                    throw std::runtime_error("Empty ShareAddrType for this_address");
+            }
+
+            auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_address](const auto& value){
+                return std::get<0>(value) == this_address;
             });
 
-//            auto _this_amount = amounts.find(this_script);
             if (_this_amount == amounts.end())
-                amounts.emplace_back(this_script, _share_data.subsidy/200);
+                amounts.emplace_back(this_address, _share_data.subsidy/200);
             else
                 std::get<1>(*_this_amount) += _share_data.subsidy/200;
-                //amounts[this_script] = 0;
-//            amounts[this_script] += _share_data.subsidy/200;
-
         }
 
         //all that's left over is the donation weight and some extra satoshis due to rounding
         {
-            auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const auto& value){
-                return std::get<0>(value) == net->DONATION_SCRIPT;
-            });
+            auto _donation_script = coind::data::donation_script_to_address(net);
+            std::vector<unsigned char> donation_script{_donation_script.begin(), _donation_script.end()};
 
-//            auto _donation_amount = amounts.find(net->DONATION_SCRIPT);
-//            LOG_TRACE.stream() << "DONATION_SCRIPT: " << net->DONATION_SCRIPT;
-//            if (_donation_amount == amounts.end())
-//                amounts.emplace_back(std::get<0>(*_this_amount), _share_data.subsidy/200);
-//                amounts[net->DONATION_SCRIPT] = 0;
+            auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const auto& value){
+                return std::get<0>(value) == donation_script;
+            });
 
             arith_uint288 sum_amounts{};
             for (const auto& v: amounts)
                 sum_amounts += std::get<1>(v);
 
             if (_donation_amount == amounts.end())
-                amounts.emplace_back(net->DONATION_SCRIPT, _share_data.subsidy - sum_amounts);
+                amounts.emplace_back(donation_script, _share_data.subsidy - sum_amounts);
             else
                 std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
         }
