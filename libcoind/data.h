@@ -482,4 +482,15 @@ namespace coind::data
 
         throw std::invalid_argument((boost::format("Invalid script2 hash: %1%") % HexStr(script2.data)).str());
     }
+
+    auto donation_script_to_address(shared_ptr<c2pool::Network> _net)
+    {
+        try
+        {
+            return script2_to_address(PackStream{_net->DONATION_SCRIPT}, _net->parent->ADDRESS_VERSION, -1, _net);
+        } catch (const invalid_argument &ec)
+        {
+            return script2_to_address(PackStream{_net->DONATION_SCRIPT}, _net->parent->ADDRESS_P2SH_VERSION, -1, _net);
+        }
+    }
 }
