@@ -21,3 +21,7 @@ target_link_libraries(tx_test libdevcore networks libcoind btclibs util)
 
 add_executable(stratum_test_exec stratum_test_exec.cpp)
 target_link_libraries(stratum_test_exec devcore networks libcoind)
+
+add_executable(addr_convert_test addr_convert_test.cpp)
+target_link_libraries(addr_convert_test gtest gtest_main)
+target_link_libraries(addr_convert_test libdevcore networks libcoind)
