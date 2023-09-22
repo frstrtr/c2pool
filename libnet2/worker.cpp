@@ -532,7 +532,7 @@ Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desi
 
     worker_get_work_result res = {
             ba,
-            [=, _gen_sharetx_res = std::move(gen_sharetx_res), _new_work = new_work, _lp_count = lp_count](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
+            [=, this, _gen_sharetx_res = std::move(gen_sharetx_res), _new_work = new_work, _lp_count = lp_count](const coind::data::types::BlockHeaderType& header, std::string user, IntType(64) coinbase_nonce)
             {
                 auto t0 = c2pool::dev::timestamp();
                 LOG_DEBUG_STRATUM << "HEADER get_work_result: " << header;
@@ -878,7 +878,7 @@ user_details Worker::get_user_details(std::string username)
  */
     try
     {
-        result.pubkey_hash = coind::data::address_to_pubkey_hash(result.user, _net);
+        result.pubkey_hash = std::get<0>(coind::data::address_to_pubkey_hash(result.user, _net));
     } catch (...)
     {
         /* TODO:
