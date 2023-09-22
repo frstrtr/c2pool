@@ -228,7 +228,7 @@ namespace coind::data
         }
     };
 
-    std::string pubkey_hash_to_address(auto pubkey_hash, int32_t addr_ver, int32_t bech32_ver, shared_ptr<c2pool::Network> _net)
+    inline std::string pubkey_hash_to_address(auto pubkey_hash, int32_t addr_ver, int32_t bech32_ver, shared_ptr<c2pool::Network> _net)
     {
         if (addr_ver == -1)
         {
@@ -255,12 +255,12 @@ namespace coind::data
         return result;
     }
 
-    auto pubkey_to_address(auto pubkey, shared_ptr<c2pool::Network> _net)
+    inline auto pubkey_to_address(auto pubkey, shared_ptr<c2pool::Network> _net)
     {
         return pubkey_hash_to_address(hash160(pubkey), _net->parent->ADDRESS_VERSION, -1, _net);
     }
 
-    auto get_legacy_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
+    inline auto get_legacy_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
     {
         // P2PKH or P2SH address
         vector<unsigned char> decoded_addr;
@@ -281,7 +281,7 @@ namespace coind::data
         return std::make_tuple(human_addr.pubkey_hash.value, human_addr.version.get(), -1);
     }
 
-    auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
+    inline auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
     {
         //TODO:
 //        try
@@ -483,7 +483,7 @@ namespace coind::data
         throw std::invalid_argument((boost::format("Invalid script2 hash: %1%") % HexStr(script2.data)).str());
     }
 
-    auto donation_script_to_address(shared_ptr<c2pool::Network> _net)
+    inline auto donation_script_to_address(shared_ptr<c2pool::Network> _net)
     {
         try
         {
