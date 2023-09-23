@@ -391,11 +391,11 @@ namespace shares
 
         //all that's left over is the donation weight and some extra satoshis due to rounding
         {
-            auto _donation_script = coind::data::donation_script_to_address(net);
-            std::vector<unsigned char> donation_script{_donation_script.begin(), _donation_script.end()};
+            auto _donation_address = coind::data::donation_script_to_address(net);
+            std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
 
             auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const auto& value){
-                return std::get<0>(value) == donation_script;
+                return std::get<0>(value) == donation_address;
             });
 
             arith_uint288 sum_amounts{};
@@ -403,7 +403,7 @@ namespace shares
                 sum_amounts += std::get<1>(v);
 
             if (_donation_amount == amounts.end())
-                amounts.emplace_back(donation_script, _share_data.subsidy - sum_amounts);
+                amounts.emplace_back(donation_address, _share_data.subsidy - sum_amounts);
             else
                 std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
         }
@@ -421,13 +421,12 @@ namespace shares
         coind::data::tx_type gentx;
 
         std::map<std::vector<unsigned char>, arith_uint288> _amounts;
-        for (auto v : amounts)
+        for (const auto& v : amounts)
         {
             _amounts[std::get<0>(v)] = std::get<1>(v);
         }
 
         std::vector<std::vector<unsigned char>> dests;
-        std::unordered_map<int, int> s;
 //        LOG_TRACE.stream() << "amounts: ";
 //        for (auto [k, v] : amounts)
 //        {
@@ -468,13 +467,24 @@ namespace shares
             }
         }
         // tx2 [+]
-        for (const auto& script: dests)
+        auto _donation_address = coind::data::donation_script_to_address(net);
+        std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
+        for (const auto& addr: dests)
         {
-            if (!ArithToUint256(_amounts[script]).IsNull() || script == net->DONATION_SCRIPT)
+            if (!ArithToUint256(_amounts[addr]).IsNull() || addr == donation_address)
             {
-                tx_outs.emplace_back(_amounts[script].GetLow64(), script); //value, script
+                tx_outs.emplace_back(_amounts[addr].GetLow64(), coind::data::address_to_script2(std::string{addr.begin(), addr.end()}, net).data); //value, script
             }
         }
+        tx_outs.emplace_back(_amounts[donation_address].GetLow64(), net->DONATION_SCRIPT);
+
+//        for (const auto& script: dests)
+//        {
+//            if (!ArithToUint256(_amounts[script]).IsNull() || script == net->DONATION_SCRIPT)
+//            {
+//                tx_outs.emplace_back(_amounts[script].GetLow64(), script); //value, script
+//            }
+//        }
         // tx3 [+]
         {
             // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)

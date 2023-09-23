@@ -187,13 +187,25 @@ namespace shares::types
         }
 
         ShareAddrType() = default;
+        ShareAddrType(const ShareAddrType& other)
+        {
+            if (other.address){
+                address = new std::vector<unsigned char>();
+                *address = *other.address;
+            }
 
-        explicit ShareAddrType(const std::vector<unsigned char> &addr)
+            if (other.pubkey_hash){
+                pubkey_hash = new uint160();
+                *pubkey_hash = *other.pubkey_hash;
+            }
+        }
+
+        explicit ShareAddrType(const std::vector<unsigned char> &addr) : pubkey_hash(nullptr)
         {
             address = new std::vector<unsigned char>(addr);
         }
 
-        explicit ShareAddrType(const uint160& pubkey)
+        explicit ShareAddrType(const uint160& pubkey) : address(nullptr)
         {
             pubkey_hash = new uint160(pubkey);
         }
@@ -201,7 +213,9 @@ namespace shares::types
         ~ShareAddrType()
         {
             delete address;
+            address = nullptr;
             delete pubkey_hash;
+            pubkey_hash = nullptr;
         }
 
         bool operator==(const ShareAddrType &value) const

@@ -109,6 +109,7 @@ TEST_F(AddrConvertTest, pubkey_hash_to_address)
 
     auto addr = coind::data::pubkey_hash_to_address(pubkey_hash, net->parent->ADDRESS_VERSION, -1, net);
     std::cout << "pubkey_hash_to_address: " << addr << std::endl;
+    ASSERT_EQ("mzW2hdZN2um7WBvTDerdahKqRgj3md9C29", addr);
 }
 
 TEST_F(AddrConvertTest, donation_script_to_address)

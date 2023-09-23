@@ -50,7 +50,7 @@ void Share::init()
 
     if (segwit_activated)
         if ((*segwit_data)->txid_merkle_link.branch.size() > 16)
-            throw std::invalid_argument("Merkle branch too long#1!");
+            throw std::invalid_argument("Merkle branch too long#2!");
 
     assert(hash_link->get()->extra_data.empty());
 
@@ -67,7 +67,6 @@ void Share::init()
         auto _address = coind::data::pubkey_hash_to_address(*(*share_data)->addr.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net);
         address.insert(address.begin(), _address.begin(), _address.end());
     }
-
 
     if (net->net_name == "bitcoin" && *absheight > 3927800 && *desired_version == 16)
     {
