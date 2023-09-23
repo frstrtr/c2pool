@@ -384,7 +384,7 @@ namespace shares::stream
 
         PackStream &read(PackStream &stream)
         {
-            stream >> identifier >> share_info;
+            stream >> identifier >> share_data;
             if (segwit_activated)
                 stream >> segwit_data;
             stream >> share_info;
