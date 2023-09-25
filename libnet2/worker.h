@@ -125,7 +125,7 @@ struct stale_counts
 struct user_details
 {
     std::string user;
-    uint160 pubkey_hash;
+    std::vector<unsigned char> address;
     uint256 desired_share_target;
     uint256 desired_pseudoshare_target;
 };

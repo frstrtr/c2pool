@@ -229,7 +229,7 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
 }
 
 worker_get_work_result
-Worker::get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target)
+Worker::get_work(std::vector<unsigned char> address, uint256 desired_share_target, uint256 desired_pseudoshare_target)
 {
     //1
     if ((!_pool_node || !_pool_node->is_connected()) && _net->PERSIST)
@@ -831,7 +831,7 @@ user_details Worker::get_user_details(std::string username)
     result.desired_share_target = uint256::ZERO;
 
     std::vector<std::string> contents;
-    boost::char_separator<char> sep("+", "/");
+    boost::char_separator<char> sep("", "+/");
     boost::tokenizer<boost::char_separator<char>> tokens(username, sep);
     for (std::string t: tokens)
     {
@@ -848,6 +848,24 @@ user_details Worker::get_user_details(std::string username)
 
     result.user = boost::trim_copy(contents[0]);
     contents.erase(contents.begin(), contents.begin() + 1);
+
+    std::string worker = "";
+
+    if (result.user.find('_') != std::string::npos)
+    {
+        std::vector<std::string> splited_user;
+        boost::split(splited_user, result.user, boost::is_any_of("_"));
+
+        result.user = splited_user[0];
+        worker = splited_user[1];
+    } else if (result.user.find('.') != std::string::npos)
+    {
+        std::vector<std::string> splited_user;
+        boost::split(splited_user, result.user, boost::is_any_of("."));
+
+        result.user = splited_user[0];
+        worker = splited_user[1];
+    }
 
     for (int i = 0; i < (contents.size() - contents.size() % 2); i += 2)
     {
@@ -866,26 +884,43 @@ user_details Worker::get_user_details(std::string username)
     //TODO: parse args
 //        if self.args.address == 'dynamic':
 //            i = self.pubkeys.weighted()
-//            pubkey_hash = self.pubkeys.keys[i]
+//            address = self.pubkeys.keys[i]['address']
 //
 //            c = time.time()
 //            if (c - self.pubkeys.stamp) > self.args.timeaddresses:
 //                self.freshen_addresses(c)
 
 /*TODO:    if (c2pool::random::RandomFloat(0, 100) < worker_fee)
- *              pubkey_hash = self.my_pubkey_hash
+ *              address = self.address
  *         else :
  */
     try
     {
-        result.pubkey_hash = std::get<0>(coind::data::address_to_pubkey_hash(result.user, _net));
+        uint64_t share_version = SHARE_VERSION;
+        if (!_coind_node->best_share->isNull())
+        {
+            share_version = _tracker->get(_coind_node->best_share->value())->VERSION;
+        }
+
+        auto ret = coind::data::address_to_pubkey_hash(result.user, _net);
+        if (share_version < 34 && std::get<1>(ret) != _net->parent->ADDRESS_VERSION)
+        {
+            LOG_WARNING << "Not supporting " << result.user << " yet, share version needs to be 34, but is " << share_version << ".";
+            throw std::invalid_argument("Not supporting share version");
+        }
     } catch (...)
     {
         /* TODO:
-         * if self.args.address != 'dynamic':
-         *      pubkey_hash = self.my_pubkey_hash
+         if self.args.address != 'dynamic':
+                    address = self.address
         */
-        result.pubkey_hash.SetHex("78ecd67a8695aa4adc55b70f87c2fa3279cee6d0");
+        std::string addr = "mrcG6giQPy1kajmTT5j4F7eHjRSZHBZvxb";
+        result.address = std::vector<unsigned char>{addr.begin(), addr.end()};
+    }
+
+    if (!worker.empty())
+    {
+        result.user = result.user + "." + worker;
     }
 
     return result;

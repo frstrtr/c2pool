@@ -30,8 +30,8 @@ void Stratum::_send_work()
 
     try
     {
-        auto [user, pubkey_hash, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
-        get_work_result = _worker->get_work(pubkey_hash, desired_share_target, desired_pseudoshare_target);
+        auto [user, address, desired_share_target, desired_pseudoshare_target] = _worker->preprocess_request(username);
+        get_work_result = _worker->get_work(address, desired_share_target, desired_pseudoshare_target);
     }
     catch (const std::runtime_error &ec) //TODO: to jsonrpc_error
     {
