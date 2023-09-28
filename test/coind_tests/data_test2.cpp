@@ -184,3 +184,42 @@ TEST(CoindaData, merkle_hash2)
 
     ASSERT_EQ(merkle_hash, uint256S("6aef4ad75d13e3b7daab2f36995660a7c3df3e1bf9f8fcddc39993d97b814743"));
 }
+
+TEST(CoindData, calculate_merkle_link_test_perfomance)
+{
+    std::vector<uint256> hashes;
+    hashes.push_back(uint256::ZERO);
+
+    std::fstream file("merkle_link_hashes.txt", std::ios::in);
+
+    std::string str;
+    while (file >> str)
+    {
+        hashes.push_back(uint256S(str));
+    }
+
+    auto t1 = clock();
+    auto merkle_link = coind::data::calculate_merkle_link(hashes, 0);
+    auto t2 = clock();
+    const double work_time = ((t2 - t1) / double(CLOCKS_PER_SEC)) * 1000;
+    std::cout << merkle_link << std::endl;
+    std::cout << "TIME: " << work_time << "ms"<< std::endl;
+
+    std::vector<uint256> res_branch{
+        uint256S("f7a71d7aac33994cf19eb2f45cc19f1e90a58b1ddeea712f119addc14d606bf5"),
+        uint256S("89960601d0f6a4abc20018acc3276404d3ebaba63f55605ccad3fadd356d5ef2"),
+        uint256S("93c95e0483c4e293659ceb14dc8b8418ad32c06e0ed3e5a1e2191df19be74bb7"),
+        uint256S("4e4b23f71f4c9e49956d0ea816fb501f4dfc42cee469642d915773eece02ad2a"),
+        uint256S("53af3e3a2f03a4138acd485e780d21558023ffaddeca6588eaa0fd464fb1dc4b"),
+        uint256S("3f95318e882aae1e15b8d75ee25c8f65b55fbc8d31e6875566ec169561a4caed"),
+        uint256S("d781dc348e134203635b7e263c9117dee86e75641cf3a594fe3324706845d4da"),
+        uint256S("97e803db96b6184557c4ec20ba15707a94d8607b48ce2e6f6ab6cc4023786c40"),
+        uint256S("c7fa553133d24aade53aa134f73d5eec4905112c6e86753e43dc3271ce7d50b8"),
+        uint256S("3e4fe8ca4a22273a84c43d0bc377a6d2229b58fb8491bfea4f3bc584779ad88f"),
+        uint256S("bcbf46fcc81b3f21b63c1346feaa1439e663c045e1fd317932eee010a8010ce0"),
+        uint256S("53cf4bdbfeca32c146c254be797996a2b4cff90dc4f92bf804b986b225479c78"),
+    };
+    coind::data::MerkleLink merkle_result(res_branch, 0);
+
+    ASSERT_EQ(merkle_result, merkle_link);
+}
