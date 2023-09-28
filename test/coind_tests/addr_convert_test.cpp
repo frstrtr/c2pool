@@ -102,6 +102,19 @@ protected:
     }
 };
 
+TEST(AddrConvertTestSimple, string_vector)
+{
+    std::string s = "mzW2hdZN2um7WBvTDerdahKqRgj3md9C29";
+    std::vector<unsigned char> s_vec{s.begin(), s.end()};
+
+    std::cout << "s: " << s << "; s_vec: " << s_vec << std::endl;
+
+    std::string s_copy{s_vec.begin(), s_vec.end()};
+    std::cout << "s_copy: " << s_copy << std::endl;
+
+    ASSERT_EQ(s, s_copy);
+}
+
 TEST_F(AddrConvertTest, pubkey_hash_to_address)
 {
     auto pubkey_hash = uint160();

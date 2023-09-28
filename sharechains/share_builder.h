@@ -274,7 +274,16 @@ public:
 
     ShareType make_segwitMiningShare(uint64_t version, const addr_type &addr, PackStream& stream)
     {
-
+        builder->create(version, addr);
+        builder->min_header(stream)
+                ->share_data(stream)
+                ->segwit_data(stream)
+                ->share_info(stream)
+                ->ref_merkle_link(stream)
+                ->last_txout_nonce(stream)
+                ->hash_link(stream)
+                ->merkle_link(stream);
+        return builder->GetShare();
     }
 };
 
