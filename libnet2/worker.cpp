@@ -229,7 +229,7 @@ Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeDat
 }
 
 worker_get_work_result
-Worker::get_work(std::vector<unsigned char> address, uint256 desired_share_target, uint256 desired_pseudoshare_target)
+Worker::get_work(std::string address, uint256 desired_share_target, uint256 desired_pseudoshare_target)
 {
     //1
     if ((!_pool_node || !_pool_node->is_connected()) && _net->PERSIST)
@@ -399,7 +399,7 @@ Worker::get_work(std::vector<unsigned char> address, uint256 desired_share_targe
                 _pool_node->best_share->value(),
                 coinbase,
                 c2pool::random::randomNonce(),
-                pubkey_hash,
+                address,
                 current_work->value().subsidy,
                 donation,
                 stale_info,
@@ -743,7 +743,7 @@ Worker::get_work(std::vector<unsigned char> address, uint256 desired_share_targe
                     local_addr_rate_monitor.add_datum(
                             {
                                     ArithToUint288(coind::data::target_to_average_attempts(target)),
-                                    pubkey_hash
+                                    address
                             }
                     );
                 }
@@ -778,19 +778,19 @@ local_rates Worker::get_local_rates()
     return {miner_hash_rates, miner_dead_hash_rates};
 }
 
-std::map<uint160, uint288> Worker::get_local_addr_rates()
+std::map<std::string, uint288> Worker::get_local_addr_rates()
 {
-    std::map<uint160, uint288> addr_hash_rates;
+    std::map<std::string, uint288> addr_hash_rates;
     auto [datums, dt] = local_addr_rate_monitor.get_datums_in_last();
 
-    for (auto datum: datums)
+    for (const auto& datum: datums)
     {
         arith_uint288 temp;
-        temp = ((addr_hash_rates.find(datum.pubkey_hash) != addr_hash_rates.end()) ? UintToArith288(addr_hash_rates[datum.pubkey_hash])
+        temp = ((addr_hash_rates.find(datum.address) != addr_hash_rates.end()) ? UintToArith288(addr_hash_rates[datum.address])
                                                                                    : UintToArith288(uint288()));
         temp += UintToArith288(datum.work) / dt;
 
-        addr_hash_rates[datum.pubkey_hash] = ArithToUint288(temp);
+        addr_hash_rates[datum.address] = ArithToUint288(temp);
     }
 
     return addr_hash_rates;
@@ -897,7 +897,7 @@ user_details Worker::get_user_details(std::string username)
     try
     {
         uint64_t share_version = SHARE_VERSION;
-        if (!_coind_node->best_share->isNull())
+        if (!_coind_node->best_share->isNull() && !_coind_node->best_share->value().IsNull())
         {
             share_version = _tracker->get(_coind_node->best_share->value())->VERSION;
         }
@@ -908,6 +908,7 @@ user_details Worker::get_user_details(std::string username)
             LOG_WARNING << "Not supporting " << result.user << " yet, share version needs to be 34, but is " << share_version << ".";
             throw std::invalid_argument("Not supporting share version");
         }
+        result.address = result.user;
     } catch (...)
     {
         /* TODO:
@@ -915,7 +916,7 @@ user_details Worker::get_user_details(std::string username)
                     address = self.address
         */
         std::string addr = "mrcG6giQPy1kajmTT5j4F7eHjRSZHBZvxb";
-        result.address = std::vector<unsigned char>{addr.begin(), addr.end()};
+        result.address = addr;
     }
 
     if (!worker.empty())

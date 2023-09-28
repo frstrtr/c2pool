@@ -106,7 +106,7 @@ struct local_rate_datum
 struct local_addr_rate_datum
 {
     uint288 work;
-    uint160 pubkey_hash;
+    std::string address;
 };
 
 struct local_rates
@@ -125,7 +125,7 @@ struct stale_counts
 struct user_details
 {
     std::string user;
-    std::vector<unsigned char> address;
+    std::string address;
     uint256 desired_share_target;
     uint256 desired_pseudoshare_target;
 };
@@ -222,11 +222,11 @@ public:
            std::shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker);
 
     worker_get_work_result
-    get_work(uint160 pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
+    get_work(std::string pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
 
     local_rates get_local_rates();
 
-    std::map<uint160, uint288> get_local_addr_rates();
+    std::map<std::string, uint288> get_local_addr_rates();
 
     stale_counts get_stale_counts();
 

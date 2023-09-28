@@ -167,7 +167,7 @@ namespace shares::types
 
     struct ShareAddrType
     {
-        std::vector<unsigned char>* address{};
+        std::string* address{};
         uint160* pubkey_hash{};
 
         enum Type
@@ -189,20 +189,78 @@ namespace shares::types
         ShareAddrType() = default;
         ShareAddrType(const ShareAddrType& other)
         {
-            if (other.address){
-                address = new std::vector<unsigned char>();
+            if (other.address)
+            {
+                address = new std::string();
                 *address = *other.address;
             }
 
-            if (other.pubkey_hash){
+            if (other.pubkey_hash)
+            {
                 pubkey_hash = new uint160();
                 *pubkey_hash = *other.pubkey_hash;
             }
         }
 
-        explicit ShareAddrType(const std::vector<unsigned char> &addr) : pubkey_hash(nullptr)
+        // Конструктор перемещения, noexcept - для оптимизации при использовании стандартных контейнеров
+        ShareAddrType(ShareAddrType&& other) noexcept
         {
-            address = new std::vector<unsigned char>(addr);
+            if (other.address)
+            {
+                address = other.address;
+                other.address = nullptr;
+            }
+
+            if (other.pubkey_hash)
+            {
+                pubkey_hash = other.pubkey_hash;
+                other.pubkey_hash = nullptr;
+            }
+        }
+
+        ShareAddrType& operator=(const ShareAddrType& other)
+        {
+            if (this == &other)
+                return *this;
+
+            if (other.address)
+            {
+                address = new std::string();
+                *address = *other.address;
+            }
+
+            if (other.pubkey_hash)
+            {
+                pubkey_hash = new uint160();
+                *pubkey_hash = *other.pubkey_hash;
+            }
+
+            return *this;
+        }
+
+        ShareAddrType& operator=(ShareAddrType&& other) noexcept
+        {
+            if (this == &other)
+                return *this;
+
+            if (other.address)
+            {
+                address = other.address;
+                other.address = nullptr;
+            }
+
+            if (other.pubkey_hash)
+            {
+                pubkey_hash = other.pubkey_hash;
+                other.pubkey_hash = nullptr;
+            }
+
+            return *this;
+        }
+
+        explicit ShareAddrType(const std::string &addr) : pubkey_hash(nullptr)
+        {
+            address = new std::string(addr);
         }
 
         explicit ShareAddrType(const uint160& pubkey) : address(nullptr)
@@ -279,7 +337,7 @@ namespace shares::types
             previous_share_hash = _prev_share_hash;
             coinbase = std::move(_coinbase);
             nonce = _nonce;
-            addr = _addr;
+            addr = std::move(_addr);
             subsidy = _subsidy;
             donation = _donation;
             stale_info = _stale_info;

@@ -120,7 +120,7 @@ namespace shares::stream
             }
         }
 
-        explicit ShareAddrType_stream(std::vector<unsigned char> addr)
+        explicit ShareAddrType_stream(std::string addr)
         {
             address = new StrType(std::move(addr));
         }
@@ -189,7 +189,7 @@ namespace shares::stream
             switch (get_type())
             {
                 case shares::types::ShareAddrType::Type::address_type:
-                    return shares::types::ShareAddrType(address->value);
+                    return shares::types::ShareAddrType(address->get());
                 case shares::types::ShareAddrType::Type::pubkey_hash_type:
                     return shares::types::ShareAddrType(pubkey_hash->get());
                 default:
