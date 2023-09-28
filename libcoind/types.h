@@ -98,18 +98,18 @@ namespace coind::data::types
         bool operator==(const BlockHeaderType &value) const
         {
             // FOR TESTS! comment in prod
-            if (version != value.version)
-                assert(false);
-            if (previous_block.Compare(value.previous_block) != 0)
-                assert(false);
-            if (timestamp != value.timestamp)
-                assert(false);
-            if (bits != value.bits)
-                assert(false);
-            if (nonce != value.nonce)
-                assert(false);
-            if (merkle_root.Compare(value.merkle_root) != 0)
-                assert(false);
+//            if (version != value.version)
+//                assert(false);
+//            if (previous_block.Compare(value.previous_block) != 0)
+//                assert(false);
+//            if (timestamp != value.timestamp)
+//                assert(false);
+//            if (bits != value.bits)
+//                assert(false);
+//            if (nonce != value.nonce)
+//                assert(false);
+//            if (merkle_root.Compare(value.merkle_root) != 0)
+//                assert(false);
 
             return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
                    timestamp == value.timestamp && bits == value.bits && nonce == value.nonce &&

@@ -82,7 +82,34 @@ namespace shares
             _share_data.subsidy = _base_subsidy.value() + definite_fees;
         }
 
-        auto amounts = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height);
+        // This address calculate
+        std::string this_address;
+        switch (_share_data.addr.get_type())
+        {
+            case shares::types::ShareAddrType::Type::pubkey_hash_type:
+            {
+                this_address = coind::data::pubkey_hash_to_address(*_share_data.addr.pubkey_hash,
+                                                                         net->parent->ADDRESS_VERSION, -1, net);
+                break;
+            }
+            case shares::types::ShareAddrType::Type::address_type:
+            {
+                this_address = *_share_data.addr.address;
+                break;
+            }
+            case shares::types::ShareAddrType::Type::none:
+                throw std::runtime_error("Empty ShareAddrType for this_address");
+        }
+        if (version < 34 && !_share_data.addr.pubkey_hash)
+        {
+            auto _pubkey = coind::data::address_to_pubkey_hash(this_address, net);
+            _share_data.addr.pubkey_hash = new uint160(std::get<0>(_pubkey));
+            delete _share_data.addr.address;
+            _share_data.addr.address = nullptr;
+        }
+
+        // Weight Amount Calculate
+        auto amounts = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height, this_address);
 
         bool segwit_activated = is_segwit_activated(version, net);
         if (!_segwit_data.has_value() && !_known_txs.has_value())
@@ -318,7 +345,7 @@ namespace shares
         return std::make_tuple(new_transaction_hashes, transaction_hash_refs, other_transaction_hashes);
     }
 
-    std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height)
+    std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
     {
         std::map<std::vector<unsigned char>, arith_uint288> weights;
         arith_uint288 total_weight;
@@ -359,25 +386,7 @@ namespace shares
         // 0.5% goes to block finder
         {
 //            std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net).data;
-            std::vector<unsigned char> this_address;
-
-            switch (_share_data.addr.get_type())
-            {
-                case shares::types::ShareAddrType::Type::pubkey_hash_type:
-                {
-                    auto _this_address = coind::data::pubkey_hash_to_address(*_share_data.addr.pubkey_hash,
-                                                                             net->parent->ADDRESS_VERSION, -1, net);
-                    this_address = std::vector<unsigned char>{_this_address.begin(), _this_address.end()};
-                    break;
-                }
-                case shares::types::ShareAddrType::Type::address_type:
-                {
-                    this_address = *_share_data.addr.address;
-                    break;
-                }
-                case shares::types::ShareAddrType::Type::none:
-                    throw std::runtime_error("Empty ShareAddrType for this_address");
-            }
+            std::vector<unsigned char> this_address{_this_address.begin(), _this_address.end()};
 
             auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_address](const auto& value){
                 return std::get<0>(value) == this_address;
