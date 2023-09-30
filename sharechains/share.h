@@ -42,6 +42,7 @@ public:
 	std::shared_ptr<coind::data::SmallBlockHeaderType> min_header;
     std::shared_ptr<ShareData> share_data;
     std::shared_ptr<SegwitData> segwit_data;
+    std::shared_ptr<ShareTxInfo> share_tx_info;
     std::shared_ptr<ShareInfo> share_info;
     std::shared_ptr<MerkleLink> ref_merkle_link;
 	uint64_t last_txout_nonce;
@@ -81,7 +82,7 @@ public:
 
     int32_t gentx_weight;
 public:
-	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, addr_type _addr) : VERSION(version)
+	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, const addr_type& _addr) : VERSION(version)
 	{
         net = _net;
         peer_addr = _addr;
