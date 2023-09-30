@@ -82,6 +82,13 @@ namespace shares
             return *this;
         }
 
+        std::optional<shares::types::ShareTxInfo> _share_tx_info;
+        GenerateShareTransaction &set_share_tx_info(const shares::types::ShareTxInfo &_value)
+        {
+            _share_tx_info = _value;
+            return *this;
+        }
+
     public:
         std::shared_ptr<GeneratedShareTransactionResult> operator()(uint64_t version);
 

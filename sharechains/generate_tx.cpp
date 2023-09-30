@@ -655,6 +655,9 @@ namespace shares
             if (_segwit_data.has_value())
                 builder->segwit_data(_segwit_data.value());
 
+            if (_share_tx_info.has_value())
+                builder->share_tx_info(_share_tx_info.value());
+
             ShareType share = builder->GetShare();
             assert(*share->header.get() == header);
             return share;
