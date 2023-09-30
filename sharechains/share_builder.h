@@ -18,7 +18,7 @@ public:
 		Reset();
 	}
 
-	void create(uint64_t version, addr_type addr)
+	void create(uint64_t version, const addr_type& addr)
 	{
 		share = std::make_shared<Share>(version, net, addr);
 	}
@@ -58,10 +58,16 @@ protected:
 
     void _segwit_data(std::shared_ptr<SegwitData> value)
     {
-        share->segwit_data = value;
+        share->segwit_data = std::move(value);
     }
 
-    void _share_info(std::shared_ptr<ShareInfo> value)
+    void _share_tx_info(const std::shared_ptr<ShareTxInfo>& value)
+    {
+        share->share_tx_info = value;
+        share->new_transaction_hashes = std::unique_ptr<vector<uint256>>(&(*value)->new_transaction_hashes);
+    }
+
+    void _share_info(const std::shared_ptr<ShareInfo>& value)
     {
         share->share_info = value;
 
@@ -70,7 +76,7 @@ protected:
         share->timestamp = std::unique_ptr<uint32_t>(&(*value)->timestamp);
         share->absheight = std::unique_ptr<uint32_t>(&(*value)->absheight);
         share->abswork = std::unique_ptr<uint128>(&(*value)->abswork);
-        share->new_transaction_hashes = std::unique_ptr<vector<uint256>>(&(*value)->new_transaction_hashes);
+
     }
 
     void _ref_merkle_link(std::shared_ptr<MerkleLink> value)
@@ -121,6 +127,14 @@ public:
         auto value = std::make_shared<SegwitData>();
         value->set_value(data);
         _segwit_data(value);
+        return shared_from_this();
+    }
+
+    auto share_tx_info(const shares::types::ShareTxInfo &data)
+    {
+        auto value = std::make_shared<ShareTxInfo>();
+        value->set_value(data);
+        _share_tx_info(value);
         return shared_from_this();
     }
 
@@ -194,6 +208,14 @@ public:
 		return shared_from_this();
 	}
 
+    auto share_tx_info(PackStream &stream)
+    {
+        auto value = std::make_shared<ShareTxInfo>();
+        stream >> *value;
+        _share_tx_info(value);
+        return shared_from_this();
+    }
+
 	auto share_info(PackStream &stream)
 	{
         auto value = std::make_shared<ShareInfo>();
@@ -250,6 +272,7 @@ public:
 		builder->create(version, addr);
 		builder->min_header(stream)
 				->share_data(stream)
+                ->share_tx_info(stream)
 				->share_info(stream)
 				->ref_merkle_link(stream)
 				->last_txout_nonce(stream)
@@ -264,6 +287,7 @@ public:
 		builder->min_header(stream)
 				->share_data(stream)
 				->segwit_data(stream)
+                ->share_tx_info(stream)
 				->share_info(stream)
 				->ref_merkle_link(stream)
 				->last_txout_nonce(stream)
