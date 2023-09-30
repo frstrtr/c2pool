@@ -194,6 +194,9 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
     if (segwit_data)
         gentx_F->set_segwit_data(*segwit_data->get());
 
+    if (share_tx_info)
+        gentx_F->set_share_tx_info(*share_tx_info->get());
+
     // set_desired_other_transaction_hashes_and_fees
     {
         std::vector<std::tuple<uint256, std::optional<int32_t>>> desired_other_transaction_hashes_and_fees;
