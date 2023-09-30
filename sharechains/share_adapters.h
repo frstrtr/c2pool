@@ -59,6 +59,20 @@ struct SegwitData :
     }
 };
 
+struct ShareTxInfo :
+        StreamTypeAdapter<shares::types::ShareTxInfo, shares::stream::ShareTxInfo_stream>
+{
+    void _to_stream() override
+    {
+        make_stream(*_value);
+    }
+
+    void _to_value() override
+    {
+        make_value(_stream->new_transaction_hashes.get(), _stream->transaction_hash_refs.get());
+    }
+};
+
 struct ShareData :
         StreamTypeAdapter<shares::types::ShareData, shares::stream::ShareData_stream>
 {
@@ -86,7 +100,6 @@ struct ShareInfo :
     void _to_value() override
     {
 		make_value(_stream->far_share_hash.get(), _stream->max_bits.get(), _stream->bits.get(),
-				   _stream->timestamp.get(), _stream->new_transaction_hashes.get(), _stream->transaction_hash_refs.get(),
-				   _stream->absheight.get(), _stream->abswork.get());
+				   _stream->timestamp.get(), _stream->absheight.get(), _stream->abswork.get());
     }
 };

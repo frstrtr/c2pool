@@ -403,16 +403,41 @@ namespace shares::types
 //        }
     };
 
+    struct ShareTxInfo
+    {
+        std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
+        std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
+
+        ShareTxInfo() = default;
+
+        ShareTxInfo(const std::vector<uint256>& _new_transaction_hashes, const std::vector<tuple<uint64_t, uint64_t>>& _transaction_hash_refs)
+        {
+            new_transaction_hashes = _new_transaction_hashes;
+            transaction_hash_refs = _transaction_hash_refs;
+        }
+
+        friend std::ostream &operator<<(std::ostream& stream, const ShareTxInfo& v)
+        {
+            stream << "(ShareTxInfo: ";
+            stream << ", new_transaction_hashes = " << v.new_transaction_hashes;
+            stream << ", transaction_hash_refs = [";
+            for (auto &[x1,x2] : v.transaction_hash_refs)
+            {
+                stream << "(" << x1 << "; " << x2 << "), ";
+            }
+            stream << ")";
+            return stream;
+        }
+    };
+
     struct ShareInfo
     {
     public:
         uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
-        uint32_t max_bits;                                   //bitcoin_data.FloatingIntegerType() max_bits;
-        uint32_t bits;                                       //bitcoin_data.FloatingIntegerType() bits;
-        uint32_t timestamp;                                  //pack.IntType(32)
-        std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
-        std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
-        uint32_t absheight;                                 //pack.IntType(32)
+        uint32_t max_bits{};                                   //bitcoin_data.FloatingIntegerType() max_bits;
+        uint32_t bits{};                                       //bitcoin_data.FloatingIntegerType() bits;
+        uint32_t timestamp{};                                  //pack.IntType(32)
+        uint32_t absheight{};                                 //pack.IntType(32)
         uint128 abswork;                                         //pack.IntType(128)
         std::optional<SegwitData> segwit_data;
     public:
@@ -422,27 +447,21 @@ namespace shares::types
 		}
 
         ShareInfo(uint256 _far_share_hash, unsigned int _max_bits, unsigned int _bits,
-				  unsigned int _timestamp, std::vector<uint256> _new_transaction_hashes,
-				  vector<tuple<uint64_t, uint64_t>> _transaction_hash_refs, unsigned long _absheight,
-				  uint128 _abswork)
+				  unsigned int _timestamp, unsigned long _absheight, uint128 _abswork)
 		{
 			far_share_hash = _far_share_hash;
 			max_bits = _max_bits;
 			bits = _bits;
 			timestamp = _timestamp;
-			new_transaction_hashes = _new_transaction_hashes;
-			transaction_hash_refs = _transaction_hash_refs;
             absheight = _absheight;
 			abswork = _abswork;
 		}
 
         bool operator==(const ShareInfo &value)
         {
-            return far_share_hash == value.far_share_hash && max_bits == value.max_bits &&
-                   bits == value.bits && timestamp == value.timestamp &&
-                   new_transaction_hashes == value.new_transaction_hashes &&
-                   transaction_hash_refs == value.transaction_hash_refs && absheight == value.absheight &&
-                   abswork == value.abswork;
+            //TODO: segwit_data -- wanna for check equal?
+            return far_share_hash == value.far_share_hash && max_bits == value.max_bits && bits == value.bits
+                   && timestamp == value.timestamp && absheight == value.absheight && abswork == value.abswork;
         }
 
         bool operator!=(const ShareInfo &value)
@@ -453,46 +472,16 @@ namespace shares::types
         friend std::ostream &operator<<(std::ostream& stream, const ShareInfo& v)
         {
             stream << "(ShareInfo: ";
-            stream << " far_share_hash = " << v.far_share_hash;
+            stream << "far_share_hash = " << v.far_share_hash;
             stream << ", max_bits = " << v.max_bits;
             stream << ", bits = " << v.bits;
             stream << ", timestamp = " << v.timestamp;
-            stream << ", new_transaction_hashes = " << v.new_transaction_hashes;
-            stream << ", transaction_hash_refs = [";
-            for (auto &[x1,x2] : v.transaction_hash_refs)
-            {
-                stream << "(" << x1 << "; " << x2 << "), ";
-            }
-            stream << "], absheight = " << v.absheight;
+//            stream << ", share_tx_info = " << v.share_tx_info;
+            stream << ", absheight = " << v.absheight;
             stream << ", abswork = " << v.abswork;
             stream << ", segwit_data = " << v.segwit_data;
             stream << ")";
             return stream;
         }
     };
-
-	//t['share_type']
-//	struct ShareTypeData
-//	{
-//		coind::data::types::SmallBlockHeaderType min_header;
-//		ShareInfo share_info;
-//		coind::data::MerkleLink ref_merkle_link;
-//		uint64_t last_txout_nonce;
-//		HashLinkType hash_link;
-//		coind::data::MerkleLink merkle_link;
-//
-//		ShareTypeData() = default;
-//
-//		ShareTypeData(coind::data::types::SmallBlockHeaderType _min_header, ShareInfo _share_info,
-//					  coind::data::MerkleLink _ref_merkle_link, uint64_t _last_txout_nonce,
-//					  HashLinkType _hash_link, coind::data::MerkleLink _merkle_link)
-//		{
-//			min_header = _min_header;
-//			share_info = _share_info;
-//			ref_merkle_link = _ref_merkle_link;
-//			last_txout_nonce = _last_txout_nonce;
-//			hash_link = _hash_link;
-//			merkle_link = _merkle_link;
-//		}
-//	};
 }
