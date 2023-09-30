@@ -248,7 +248,7 @@ namespace shares::stream
 
         transaction_hash_refs_stream() = default;
 
-		transaction_hash_refs_stream(const std::tuple<uint64_t, uint64_t> &val)
+		explicit transaction_hash_refs_stream(const std::tuple<uint64_t, uint64_t> &val)
 		{
 			share_count = std::get<0>(val);
 			tx_count = std::get<1>(val);
@@ -272,10 +272,37 @@ namespace shares::stream
 		}
     };
 
-    struct ShareInfo_stream
+    struct ShareTxInfo_stream
     {
         ListType<IntType(256)> new_transaction_hashes;
         ListType<transaction_hash_refs_stream> transaction_hash_refs;
+
+        ShareTxInfo_stream() = default;
+
+        explicit ShareTxInfo_stream(const types::ShareTxInfo &value)
+        {
+            new_transaction_hashes = ListType<IntType(256)>::make_type(value.new_transaction_hashes);
+			for (auto tx_hash_ref : value.transaction_hash_refs)
+			{
+				transaction_hash_refs.value.push_back(transaction_hash_refs_stream(tx_hash_ref));
+			}
+        }
+
+        PackStream &write(PackStream &stream)
+        {
+            stream << new_transaction_hashes << transaction_hash_refs;
+            return stream;
+        }
+
+        PackStream &read(PackStream &stream)
+        {
+            stream >> new_transaction_hashes >> transaction_hash_refs;
+            return stream;
+        }
+    };
+
+    struct ShareInfo_stream
+    {
         PossibleNoneType<IntType(256)> far_share_hash;
         FloatingIntegerType max_bits;
         FloatingIntegerType bits;
@@ -288,13 +315,13 @@ namespace shares::stream
 
         }
 
-        ShareInfo_stream(const types::ShareInfo &val) : ShareInfo_stream()
+        explicit ShareInfo_stream(const types::ShareInfo &val) : ShareInfo_stream()
 		{
-			new_transaction_hashes = new_transaction_hashes.make_type(val.new_transaction_hashes);
-			for (auto tx_hash_ref : val.transaction_hash_refs)
-			{
-				transaction_hash_refs.value.push_back(transaction_hash_refs_stream(tx_hash_ref));
-			}
+//			new_transaction_hashes = new_transaction_hashes.make_type(val.new_transaction_hashes);
+//			for (auto tx_hash_ref : val.transaction_hash_refs)
+//			{
+//				transaction_hash_refs.value.push_back(transaction_hash_refs_stream(tx_hash_ref));
+//			}
 			far_share_hash = val.far_share_hash;
 			max_bits = val.max_bits;
 			bits = val.bits;
@@ -304,13 +331,13 @@ namespace shares::stream
 		}
 
         virtual PackStream &write(PackStream &stream) {
-            stream << new_transaction_hashes << transaction_hash_refs << far_share_hash << max_bits << bits << timestamp
+            stream << far_share_hash << max_bits << bits << timestamp
                    << absheight << abswork;
             return stream;
         }
 
         virtual PackStream &read(PackStream &stream){
-            stream >> new_transaction_hashes >> transaction_hash_refs >> far_share_hash >> max_bits >> bits >> timestamp
+            stream >> far_share_hash >> max_bits >> bits >> timestamp
                    >> absheight >> abswork;
             return stream;
         }
