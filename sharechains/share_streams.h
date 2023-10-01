@@ -105,6 +105,21 @@ namespace shares::stream
 
         ShareAddrType_stream() = default;
 
+        ShareAddrType_stream(const shares::types::ShareAddrType::Type &type)
+        {
+            switch (type)
+            {
+                case shares::types::ShareAddrType::Type::address_type:
+                    address = new StrType();
+                    break;
+                case shares::types::ShareAddrType::Type::pubkey_hash_type:
+                    pubkey_hash = new IntType(160)();
+                    break;
+                default:
+                    throw std::invalid_argument("ShareAddrType_stream(ShareAddrType::Type): _addr none type!");
+            }
+        }
+
         explicit ShareAddrType_stream(const shares::types::ShareAddrType &_addr)
         {
             switch (_addr.get_type())
@@ -210,6 +225,11 @@ namespace shares::stream
         VarIntType desired_version;
 
         ShareData_stream() : previous_share_hash(uint256())
+        {
+
+        }
+
+        ShareData_stream(shares::types::ShareAddrType::Type type) : addr(type), previous_share_hash(uint256())
         {
 
         }

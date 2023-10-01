@@ -74,12 +74,12 @@ void Share::init()
     }
 
     // check txs
-    std::set<uint64_t> n;
-    for (uint64_t i = 0; i < new_transaction_hashes->size(); i++)
-        n.insert(i);
-
     if (VERSION < 34)
     {
+        std::set<uint64_t> n;
+        for (uint64_t i = 0; i < new_transaction_hashes->size(); i++)
+            n.insert(i);
+
         for (auto [share_count, tx_count]: share_info->get()->share_tx_info->transaction_hash_refs)
         {
             assert(share_count < 110);
@@ -366,6 +366,7 @@ nlohmann::json Share::json()
     return result;
 }
 
+// pack_share<--->load_share
 std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const addr_type& peer_addr)
 {
     PackedShareData packed_share;
