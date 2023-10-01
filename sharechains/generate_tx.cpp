@@ -147,9 +147,11 @@ namespace shares
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
 
-        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, segwit_activated,
-                                                                                   (version < 34 ? std::make_optional<shares::types::ShareTxInfo>(new_transaction_hashes, transaction_hash_refs) : nullopt)
-        );
+
+        if (version < 34)
+            set_share_tx_info(shares::types::ShareTxInfo{new_transaction_hashes, transaction_hash_refs});
+
+        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, segwit_activated);
 
         auto gentx = gentx_generate(version, segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
 
@@ -537,7 +539,7 @@ namespace shares
     std::shared_ptr<shares::types::ShareInfo>
     GenerateShareTransaction::share_info_generate(int32_t height, uint256 last, ShareType previous_share,
                                                   uint64_t version, FloatingInteger max_bits, FloatingInteger bits,
-                                                  bool segwit_activated, std::optional<shares::types::ShareTxInfo> tx_info)
+                                                  bool segwit_activated)
     {
         std::shared_ptr<shares::types::ShareInfo> share_info;
 
@@ -587,8 +589,8 @@ namespace shares
                                                                 bits.get(), timestamp, _absheight, _abswork
         );
 
-        if (tx_info)
-            share_info->share_tx_info = tx_info;
+        if (_share_tx_info.has_value())
+            share_info->share_tx_info = _share_tx_info;
 
         if (previous_share)
         {

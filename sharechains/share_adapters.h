@@ -76,6 +76,12 @@ struct ShareTxInfo :
 struct ShareData :
         StreamTypeAdapter<shares::types::ShareData, shares::stream::ShareData_stream>
 {
+    ShareData() = default;
+    explicit ShareData(shares::types::ShareAddrType::Type addr_type)
+    {
+        _stream = std::make_shared<shares::stream::ShareData_stream>(addr_type);
+    }
+
     void _to_stream() override
     {
         make_stream(*_value);

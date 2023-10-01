@@ -7,6 +7,8 @@
 #include <utility>
 #include <networks/network.h>
 
+// When update Builder -> update pack_share
+
 class BaseShareBuilder
 {
 protected:
@@ -192,9 +194,9 @@ public:
 	}
 
     // is_pubkey_hash: true -- pubkey_hash; false -- address.
-	auto share_data(PackStream &stream)
+	auto share_data(PackStream &stream, shares::types::ShareAddrType::Type addr_type)
     {
-        auto value = std::make_shared<ShareData>();
+        auto value = std::make_shared<ShareData>(addr_type);
         stream >> *value;
         _share_data(value);
 		return shared_from_this();
@@ -271,7 +273,7 @@ public:
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
-				->share_data(stream)
+				->share_data(stream, shares::types::ShareAddrType::Type::pubkey_hash_type)
                 ->share_tx_info(stream)
 				->share_info(stream)
 				->ref_merkle_link(stream)
@@ -285,7 +287,7 @@ public:
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
-				->share_data(stream)
+				->share_data(stream, shares::types::ShareAddrType::Type::pubkey_hash_type)
 				->segwit_data(stream)
                 ->share_tx_info(stream)
 				->share_info(stream)
@@ -300,7 +302,7 @@ public:
     {
         builder->create(version, addr);
         builder->min_header(stream)
-                ->share_data(stream)
+                ->share_data(stream, shares::types::ShareAddrType::Type::address_type)
                 ->segwit_data(stream)
                 ->share_info(stream)
                 ->ref_merkle_link(stream)
