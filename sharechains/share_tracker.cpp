@@ -449,9 +449,9 @@ arith_uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_
 std::vector<uint256> ShareTracker::get_other_tx_hashes(ShareType share)
 {
     uint64_t parents_needed = 0;
-    if (!(*share->share_info)->transaction_hash_refs.empty())
+    if ((*share->share_info)->share_tx_info.has_value())
     {
-        for (auto [share_count, tx_count]: (*share->share_info)->transaction_hash_refs)
+        for (auto [share_count, tx_count]: (*share->share_info)->share_tx_info->transaction_hash_refs)
         {
             parents_needed = std::max(parents_needed, share_count);
         }
@@ -470,9 +470,10 @@ std::vector<uint256> ShareTracker::get_other_tx_hashes(ShareType share)
     }
 
     std::vector<uint256> result;
-    for (auto [share_count, tx_count]: (*share->share_info)->transaction_hash_refs)
+    for (auto [share_count, tx_count]: (*share->share_info)->share_tx_info->transaction_hash_refs)
     {
-        result.push_back(last_shares[share_count]->share_info->get()->new_transaction_hashes[tx_count]);
+        if (last_shares[share_count]->share_info->get()->share_tx_info.has_value())
+            result.push_back(last_shares[share_count]->share_info->get()->share_tx_info->new_transaction_hashes[tx_count]);
     }
     return result;
 }
@@ -505,7 +506,9 @@ std::tuple<int, std::string> ShareTracker::should_punish_reason(ShareType share,
     if (UintToArith256(share->pow_hash) <= UintToArith256(share->header.stream()->bits.bits.target()))
         return {-1, "block_solution"};
 
-    auto other_txs = _get_other_txs(share, known_txs);
+    std::vector<coind::data::tx_type> other_txs;
+    if (share->VERSION < 34)
+        other_txs = _get_other_txs(share, known_txs);
     if (!other_txs.empty())
     {
         // Оптимизация?: два all_txs_size; stripped_txs_size -- за один цикл, а не два.
