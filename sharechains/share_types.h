@@ -433,6 +433,7 @@ namespace shares::types
     struct ShareInfo
     {
     public:
+        std::optional<ShareTxInfo> share_tx_info;
         uint256 far_share_hash;                                  //none — pack.PossiblyNoneType(0, pack.IntType(256))
         uint32_t max_bits{};                                   //bitcoin_data.FloatingIntegerType() max_bits;
         uint32_t bits{};                                       //bitcoin_data.FloatingIntegerType() bits;
@@ -476,7 +477,7 @@ namespace shares::types
             stream << ", max_bits = " << v.max_bits;
             stream << ", bits = " << v.bits;
             stream << ", timestamp = " << v.timestamp;
-//            stream << ", share_tx_info = " << v.share_tx_info;
+            stream << ", share_tx_info = " << v.share_tx_info;
             stream << ", absheight = " << v.absheight;
             stream << ", abswork = " << v.abswork;
             stream << ", segwit_data = " << v.segwit_data;
