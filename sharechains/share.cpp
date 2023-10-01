@@ -77,13 +77,17 @@ void Share::init()
     std::set<uint64_t> n;
     for (uint64_t i = 0; i < new_transaction_hashes->size(); i++)
         n.insert(i);
-    for (auto [share_count, tx_count] : share_info->get()->transaction_hash_refs)
+
+    if (VERSION < 34)
     {
-        assert(share_count < 110);
-        if (share_count == 0)
-            n.erase(tx_count);
+        for (auto [share_count, tx_count]: share_info->get()->share_tx_info->transaction_hash_refs)
+        {
+            assert(share_count < 110);
+            if (share_count == 0)
+                n.erase(tx_count);
+        }
+        assert(n.empty());
     }
-    assert(n.empty());
 
     std::vector<unsigned char> hash_link_data;
     {
@@ -170,10 +174,14 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
     }
 
     std::vector<uint256> other_tx_hashes;
-    for (auto [share_count, tx_count]: (*share_info)->transaction_hash_refs)
+    if (VERSION < 34)
     {
-        other_tx_hashes.push_back(
-                _tracker->get(_tracker->get_nth_parent_key(hash, share_count))->share_info->get()->new_transaction_hashes[tx_count]);
+        for (auto [share_count, tx_count]: (*share_info)->share_tx_info->transaction_hash_refs)
+        {
+            other_tx_hashes.push_back(
+                    _tracker->get(_tracker->get_nth_parent_key(hash,
+                                                               share_count))->share_info->get()->share_tx_info->new_transaction_hashes[tx_count]);
+        }
     }
 
 
@@ -211,6 +219,36 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
 
     auto gentx = (*gentx_F)(VERSION);
 
+    /* TODO:
+     * if self.VERSION < 34:
+            # check for excessive fees
+            if self.share_data['previous_share_hash'] is not None and block_abs_height_func is not None:
+                height = (block_abs_height_func(self.header['previous_block'])+1)
+                base_subsidy = self.net.PARENT.SUBSIDY_FUNC(height)
+                fees = [feecache[x] for x in other_tx_hashes if x in feecache]
+                missing = sum([1 for x in other_tx_hashes if not x in feecache])
+                if missing == 0:
+                    max_subsidy = sum(fees) + base_subsidy
+                    details = "Max allowed = %i, requested subsidy = %i, share hash = %064x, miner = %s" % (
+                            max_subsidy, self.share_data['subsidy'], self.hash,
+                            self.address)
+                    if self.share_data['subsidy'] > max_subsidy:
+                        self.naughty = 1
+                        print "Excessive block reward in share! Naughty. " + details
+                    elif self.share_data['subsidy'] < max_subsidy:
+                        print "Strange, we received a share that did not include as many coins in the block reward as was allowed. "
+                        print "While permitted by the protocol, this causes coins to be lost forever if mined as a block, and costs us money."
+                        print details
+
+        if self.share_data['previous_share_hash'] and tracker.items[self.share_data['previous_share_hash']].naughty:
+            print "naughty ancestor found %i generations ago" % tracker.items[self.share_data['previous_share_hash']].naughty
+            # I am not easily angered ...
+            print "I will not fail to punish children and grandchildren to the third and fourth generation for the sins of their parents."
+            self.naughty = 1 + tracker.items[self.share_data['previous_share_hash']].naughty
+            if self.naughty > 6:
+                self.naughty = 0
+     */
+
     assert(other_tx_hashes == gentx->other_transaction_hashes);
     if (*share_info->get() != *gentx->share_info)
         throw std::invalid_argument("share_info invalid");
@@ -218,6 +256,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
         throw std::invalid_argument((boost::format("gentx doesn't match hash_link: txid = %1%, gentx_hash = %2%") % coind::data::get_txid(gentx->gentx).GetHex() % gentx_hash).str());
 
     // Check merkle link
+    if (VERSION < 34)
     {
         std::vector<uint256> _copy_for_link{uint256::ZERO};
         _copy_for_link.insert(_copy_for_link.end(), gentx->other_transaction_hashes.begin(),
