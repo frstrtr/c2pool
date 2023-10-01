@@ -147,7 +147,9 @@ namespace shares
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
 
-        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, new_transaction_hashes, transaction_hash_refs, segwit_activated);
+        std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, segwit_activated,
+                                                                                   (version < 34 ? std::make_optional<shares::types::ShareTxInfo>(new_transaction_hashes, transaction_hash_refs) : nullopt)
+        );
 
         auto gentx = gentx_generate(version, segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
 
@@ -535,8 +537,7 @@ namespace shares
     std::shared_ptr<shares::types::ShareInfo>
     GenerateShareTransaction::share_info_generate(int32_t height, uint256 last, ShareType previous_share,
                                                   uint64_t version, FloatingInteger max_bits, FloatingInteger bits,
-                                                  vector<uint256> new_transaction_hashes,
-                                                  vector<tuple<uint64_t, uint64_t>> transaction_hash_refs, bool segwit_activated)
+                                                  bool segwit_activated, std::optional<shares::types::ShareTxInfo> tx_info)
     {
         std::shared_ptr<shares::types::ShareInfo> share_info;
 
@@ -583,10 +584,11 @@ namespace shares
         //((previous_share.abswork if previous_share is not None else 0) + bitcoin_data.target_to_average_attempts(bits.target)) % 2**128
 
         share_info = std::make_shared<shares::types::ShareInfo>(far_share_hash, max_bits.get(),
-                                                                bits.get(), timestamp, new_transaction_hashes,
-                                                                transaction_hash_refs,
-                                                                _absheight, _abswork
+                                                                bits.get(), timestamp, _absheight, _abswork
         );
+
+        if (tx_info)
+            share_info->share_tx_info = tx_info;
 
         if (previous_share)
         {
