@@ -26,6 +26,7 @@ public:
     std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
 	HandlerManagerPtr<CoindProtocol> handler_manager;
 public:
+    uint64_t cur_share_version = 0;
 	coind::TXIDCache txidcache;
 	Event<> stop;
 

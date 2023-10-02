@@ -60,25 +60,38 @@ void CoindNode::start()
 	});
 
 	// forward transactions seen to bitcoind
-	known_txs->transitioned->subscribe([&](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
+    if (cur_share_version < 34)
+    {
+        known_txs->transitioned->subscribe(
+                [&](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after)
+                {
 //		//TODO: for what???
 //		// yield deferral.sleep(random.expovariate(1/1))
 //
-		if (!protocol)
-			return;
+                    if (!protocol)
+                        return;
 
-        std::map<uint256, coind::data::tx_type> diff;
-        std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::inserter(diff, diff.begin()));
+                    std::map<uint256, coind::data::tx_type> diff;
+                    std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                                        std::inserter(diff, diff.begin()));
 
-        for (auto [tx_hash, tx] : diff)
-        {
-            auto msg = std::make_shared<coind::messages::message_tx>(after[tx_hash]);
-            LOG_DEBUG_COIND << "Protocol write message_tx with: " << tx_hash << ": " << *tx;
-            protocol->write(msg);
-        }
-	});
+                    for (auto [tx_hash, tx]: diff)
+                    {
+                        auto msg = std::make_shared<coind::messages::message_tx>(after[tx_hash]);
+                        LOG_DEBUG_COIND << "Protocol write message_tx with: " << tx_hash << ": " << *tx;
+                        protocol->write(msg);
+                    }
+                });
+    }
 
     /* TODO: GOT BLOCK FROM PEER! Passing to bitcoind!
+     *
+     * if share.VERSION >= 34:
+                print 'GOT BLOCK FROM PEER! %s %s%064x' % (
+                        p2pool_data.format_hash(share.hash),
+                        self.net.PARENT.BLOCK_EXPLORER_URL_PREFIX,
+                        share.header_hash)
+                return
     tracker->verified.added->subscribe([&](const ShareType& share){
         if (UintToArith256(share->pow_hash) > UintToArith256(FloatingInteger(share->header->bits).target()))
             return;
@@ -87,7 +100,8 @@ void CoindNode::start()
     });
     */
 
-    forget_old_txs();
+    if (cur_share_version < 34)
+        forget_old_txs();
 
 	/* TODO:
 	t = deferral.RobustLoopingCall(self.clean_tracker)
@@ -137,7 +151,12 @@ void CoindNode::forget_old_txs()
     uint256 hash;
     while (chainf(hash))
     {
-        for (auto tx_hash : *tracker->get(hash)->new_transaction_hashes)
+        auto _share = tracker->get(hash);
+        assert(_share);
+
+        if (_share->VERSION >= 34)
+            continue;
+        for (auto tx_hash : *_share->new_transaction_hashes)
         {
             if (known_txs->exist(tx_hash))
                 new_known_txs[tx_hash] = known_txs->value()[tx_hash];

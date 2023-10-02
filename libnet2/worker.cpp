@@ -666,20 +666,23 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
                     //# job was assigned. Fortunately, the tx_map is still in in our scope from this job, so we can use that
                     //# to refill it if needed.
 
-                    auto known_txs = _coind_node->known_txs->value();
-
-                    std::map<uint256, coind::data::tx_type> missing;
-                    for (auto [_hash, _value]: tx_map)
-                        if (known_txs.count(_hash) == 0)
-                        {
-                            missing[_hash] = _value;
-                        }
-
-                    if (!missing.empty())
+                    if (_coind_node->cur_share_version < 34)
                     {
-                        LOG_WARNING << missing.size()
-                                    << " transactions were erroneously evicted from known_txs_var. Refilling now.";
-                        _coind_node->known_txs->add(missing);
+                        auto known_txs = _coind_node->known_txs->value();
+
+                        std::map<uint256, coind::data::tx_type> missing;
+                        for (auto [_hash, _value]: tx_map)
+                            if (known_txs.count(_hash) == 0)
+                            {
+                                missing[_hash] = _value;
+                            }
+
+                        if (!missing.empty())
+                        {
+                            LOG_WARNING << missing.size()
+                                        << " transactions were erroneously evicted from known_txs_var. Refilling now.";
+                            _coind_node->known_txs->add(missing);
+                        }
                     }
 
                     my_share_hashes.insert(share->hash);

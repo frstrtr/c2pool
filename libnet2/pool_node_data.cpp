@@ -173,7 +173,9 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 	// Check shares
 	for (const auto& share : shares)
 	{
-		if (share->VERSION >= 13)
+        if (share->VERSION >= 34)
+            continue;
+		else if (share->VERSION >= 13)
 		{
 			//# send full transaction for every new_transaction_hash that peer does not know
 			for (auto tx_hash : *share->new_transaction_hashes)
@@ -200,7 +202,7 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 		if (std::find(include_txs_with.begin(), include_txs_with.end(), share->hash) != include_txs_with.end())
 		{
 			auto x = tracker->get_other_tx_hashes(share);
-			if (x.size())
+			if (!x.empty())
 				tx_hashes.insert(x.begin(), x.end());
 		}
 
@@ -213,56 +215,58 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 		 */
 	}
 
-	// Calculate tx_size and generate hashes_to_send
-	std::vector<uint256> hashes_to_send;
-	uint32_t new_tx_size = 0;
-	for (auto x : tx_hashes)
-	{
-		if (!coind_node->mining_txs->exist(x) && known_txs->exist(x))
-		{
-			// hashes_to_send
-			hashes_to_send.push_back(x);
+    std::vector<uint256> hashes_to_send;
+    uint32_t new_tx_size = 0;
+    if (!tx_hashes.empty())
+    {
+        // Calculate tx_size and generate hashes_to_send
+        for (auto x: tx_hashes)
+        {
+            if (!coind_node->mining_txs->exist(x) && known_txs->exist(x))
+            {
+                // hashes_to_send
+                hashes_to_send.push_back(x);
 
-			// new_tx_size calculate
-			coind::data::stream::TransactionType_stream _tx(known_txs->value()[x]);
-			PackStream packed_tx;
-			packed_tx << _tx;
+                // new_tx_size calculate
+                coind::data::stream::TransactionType_stream _tx(known_txs->value()[x]);
+                PackStream packed_tx;
+                packed_tx << _tx;
 
-			new_tx_size += 100 + packed_tx.size();
-		}
-	}
+                new_tx_size += 100 + packed_tx.size();
+            }
+        }
 
-	// Remote remembered txs
-	auto new_remote_remembered_txs_size = peer->remote_remembered_txs_size + new_tx_size;
-	if (new_remote_remembered_txs_size > peer->max_remembered_txs_size)
-		throw("share have too many txs");
-    std::cout << "remote_remembered_txs_size(before new_remote_remembered_txs_size): " << peer->remote_remembered_txs_size;
-	peer->remote_remembered_txs_size = new_remote_remembered_txs_size;
-    std::cout << "remote_remembered_txs_size(new_remote_remembered_txs_size): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
+        // Remote remembered txs
+        auto new_remote_remembered_txs_size = peer->remote_remembered_txs_size + new_tx_size;
+        if (new_remote_remembered_txs_size > peer->max_remembered_txs_size)
+            throw ("share have too many txs");
+        peer->remote_remembered_txs_size = new_remote_remembered_txs_size;
 
-	// Send messages
+        // Send messages
 
-	// 		Send remember tx
-	{
-		std::vector<uint256> _tx_hashes;
-		std::vector<coind::data::tx_type> _txs;
+        // Send remember tx
+        {
+            std::vector<uint256> _tx_hashes;
+            std::vector<coind::data::tx_type> _txs;
 
-		for (auto x : hashes_to_send)
-		{
-			if (peer->remote_tx_hashes.count(x))
-				_tx_hashes.push_back(x);
-			else
-				_txs.push_back(known_txs->value()[x]);
-		}
+            for (auto x: hashes_to_send)
+            {
+                if (peer->remote_tx_hashes.count(x))
+                    _tx_hashes.push_back(x);
+                else
+                    _txs.push_back(known_txs->value()[x]);
+            }
 
-		auto msg_remember_tx = std::make_shared<pool::messages::message_remember_tx>(_tx_hashes, _txs);
-        LOG_DEBUG_POOL << "SEND SHARES REMEMBER TX!";
-		peer->write(msg_remember_tx);
-	}
+            auto msg_remember_tx = std::make_shared<pool::messages::message_remember_tx>(_tx_hashes, _txs);
+            LOG_DEBUG_POOL << "SEND SHARES REMEMBER TX!";
+            peer->write(msg_remember_tx);
+        }
+    }
+
 	// 		Send shares
 	{
 		std::vector<PackedShareData> _shares;
-		for (auto share : shares)
+		for (const auto& share : shares)
 		{
 			auto packed_share = pack_share(share);
 			_shares.push_back(std::move(packed_share));
@@ -273,13 +277,12 @@ void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<u
 	}
 
 	//		Send forget tx
-	{
+	if (!hashes_to_send.empty())
+    {
 		auto msg_forget_tx = std::make_shared<pool::messages::message_forget_tx>(hashes_to_send);
 		peer->write(msg_forget_tx);
+        peer->remote_remembered_txs_size -= new_tx_size;
 	}
 
-    std::cout << "remote_remembered_txs_size(before send_shares): " << peer->remote_remembered_txs_size;
-	peer->remote_remembered_txs_size -= new_tx_size;
-    std::cout << "remote_remembered_txs_size(send_shares): " << peer->remote_remembered_txs_size << "/" << peer->max_remembered_txs_size << ".\n";
 	auto t1 = c2pool::dev::timestamp();
 }

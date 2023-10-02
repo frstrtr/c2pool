@@ -28,6 +28,11 @@ void CoindNodeData::set_best_share()
         LOG_DEBUG_COIND << "REAL NEW BEST SHARE: " << best_share->value().GetHex();
 	desired->set(_desired);
 
+    if (tracker->exist(_best))
+        cur_share_version = tracker->get(_best)->VERSION;
+    else
+        cur_share_version = 0; //BaseShare.Version
+
 	if (pool_node)
 	{
 		for (auto bad_peer_address : _bad_peer_addresses)
