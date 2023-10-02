@@ -102,6 +102,9 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
 		handle_share_hashes({best_hash}, handshake, handshake->get_addr());
 	}
 
+    if (coind_node->cur_share_version >= 34)
+        return;
+
     // add_to_remote_view_of_my_known_txs
     auto id_add_to_remote_view_of_my_known_txs = known_txs->added->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> added){
         if (!added.empty())
@@ -385,7 +388,7 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
         auto share = load_share(stream_wrappedshare, net, protocol->get_addr());
 
         std::vector<coind::data::tx_type> txs;
-        if (wrappedshare.type.get() >= 13)
+        if (wrappedshare.type.get() >= 13 && wrappedshare.type.get() < 34)
         {
             for (auto tx_hash: *share->new_transaction_hashes)
             {
