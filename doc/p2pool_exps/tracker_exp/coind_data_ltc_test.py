@@ -58,3 +58,5 @@ print('address_to_pubkey_hash = {0}; value = {1}'.format(addr_to_pubkey_hash, he
 pubkey_hash_to_addr = coind_data_ltc.pubkey_hash_to_address(addr_to_pubkey_hash[0], _net.PARENT.ADDRESS_VERSION, -1, _net)
 print('pubkey_hash_to_address = {0}'.format(pubkey_hash_to_addr))
 
+bits = pack.FloatingInteger(0xe3eb200c)
+print(bits.target)
