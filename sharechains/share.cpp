@@ -407,6 +407,8 @@ PackedShareData pack_share(const ShareType& share)
     contents << *share->share_data->stream();
     if (share->segwit_data)
         contents << *share->segwit_data->stream();
+    if (share->share_tx_info)
+        contents << *share->share_tx_info->stream();
 	contents << *share->share_info->stream();
 	contents << *share->ref_merkle_link->stream();
 	contents << pack<IntType(64)>(share->last_txout_nonce);
