@@ -11,6 +11,7 @@
 #include "../share.h"
 #include <libdevcore/events.h>
 
+#define DEBUG_TRACKER
 
 template <typename TrackerElement>
 class Tracker
@@ -28,6 +29,11 @@ public:
     typedef typename fork_type::sum_element sum_element;
 
 public:
+#ifdef DEBUG_TRACKER
+    std::fstream fork_by_key_log;
+    std::fstream added_items_log;
+#endif //DEBUG_TRACKER
+
     std::map<hash_type, item_type> items;
     std::map<hash_type, std::vector<it_items>> reverse;
 
@@ -55,6 +61,12 @@ public:
                                        {
                                            new_rules_calculate(k_rules);
                                        });
+
+#ifdef DEBUG_TRACKER
+        fork_by_key_log = std::fstream("fork_by_key_log.txt", std::ios_base::out);
+        added_items_log = std::fstream("added_items_log.txt", std::ios_base::out);
+#endif //DEBUG_TRACKER
+
     }
 
     virtual void add(value_type _value)
@@ -103,7 +115,9 @@ public:
                 new_fork->insert(value);
                 heads[new_fork->head] = new_fork;
                 tails[new_fork->tail].insert(new_fork);
-                fork_by_key[value.hash()] = new_fork;
+                fork_by_key_add(value.hash(), new_fork);
+                LOG_INFO << "new_fork: head = " << new_fork->head << ", tail = " << new_fork->tail;
+//                fork_by_key[value.hash()] = new_fork;
             }
                 break;
             case both:
@@ -138,7 +152,8 @@ public:
                 head_fork.mapped()->insert(value);
                 head_fork.key() = value.hash();
                 heads.insert(std::move(head_fork));
-                fork_by_key[value.hash()] = heads[value.hash()];
+                fork_by_key_add(value.hash(), heads[value.hash()]);
+//                fork_by_key[value.hash()] = heads[value.hash()];
             }
                 break;
             case only_tails:
@@ -156,14 +171,16 @@ public:
                     {
                         _fork->insert_fork(new_fork);
                     }
-                    fork_by_key[value.hash()] = new_fork;
+                    fork_by_key_add(value.hash(), new_fork);
+//                    fork_by_key[value.hash()] = new_fork;
                 } else
                 {
                     // add value in head fork
                     for (auto &_fork: tail_forks->second)
                     {
                         _fork->insert(value);
-                        fork_by_key[value.hash()] = _fork;
+                        fork_by_key_add(value.hash(), _fork);
+//                        fork_by_key[value.hash()] = _fork;
                     }
                 }
             }
@@ -194,6 +211,7 @@ public:
         shared_lock lock(mutex_);
         if (items.find(hash) != items.end())
         {
+//            LOG_TRACE << "FORK: " << hash << "; " << (fork_by_key.find(hash) != fork_by_key.end());
             auto fork = fork_by_key[hash];
             result.share = items[hash];
             result += fork->get_sum(hash);
@@ -312,6 +330,14 @@ private:
         auto new_fork = std::make_shared<fork_type>();
         forks.push_back(new_fork);
         return new_fork;
+    }
+
+    void fork_by_key_add(hash_type key, const fork_ptr& fork)
+    {
+        fork_by_key[key] = fork;
+#ifdef DEBUG_TRACKER
+        fork_by_key_log << key.ToString() << "\t" << fork << "\n";
+#endif //DEBUG_TRACKER
     }
 
     virtual sum_element make_element(value_type _value)
