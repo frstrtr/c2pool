@@ -61,9 +61,22 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
         LOG_WARNING << "COIND NODE = NULL IN POOL NODE!";
 }
 
-void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares,
-                                 std::tuple<std::string, std::string> addr)
+void PoolNodeData::handle_shares(HandleSharesData shares_data, std::tuple<std::string, std::string> addr)
 {
+    std::vector<ShareType> shares;
+    PreparedList prepare_shares(shares_data.items);
+    for (auto& fork : prepare_shares.forks)
+    {
+        auto share_node = fork->head;
+        while (share_node)
+        {
+            shares.push_back(share_node->value);
+            share_node = share_node->prev;
+        }
+    }
+
+    LOG_INFO << "shares = " << shares.size() << "; shares_data: " << shares_data.items.size() << "; txs = " << shares_data.txs.size() << "; forks = " << prepare_shares.forks.size();
+
 	if (shares.size() > 5)
 	{
 		LOG_INFO << "Processing " << shares.size() << " shares from " << std::get<0>(addr) << ":" << std::get<1>(addr) << "...";
@@ -71,8 +84,9 @@ void PoolNodeData::handle_shares(vector<tuple<ShareType, std::vector<coind::data
 
 	int32_t new_count = 0;
 	std::map<uint256, coind::data::tx_type> all_new_txs;
-	for (auto [share, new_txs] : shares)
+	for (auto share : shares)
 	{
+        auto new_txs = shares_data.txs[share->hash];
 		if (!new_txs.empty())
 		{
 			for (const auto& new_tx : new_txs)
@@ -123,10 +137,10 @@ void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_
 
 	peer->get_shares.yield(context, [&, _peer = peer, _addr = addr](std::vector<ShareType> shares)
 	{
-		vector<tuple<ShareType, std::vector<coind::data::tx_type>>> _shares;
+		HandleSharesData _shares;
 		for (const auto& _share: shares)
 		{
-			_shares.push_back({_share, {}});
+            _shares.add(_share, {});
 		}
 		handle_shares(_shares, _addr);
 	}, new_hashes, 0, {});

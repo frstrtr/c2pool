@@ -3,6 +3,7 @@
 #include <memory>
 #include <set>
 #include <map>
+#include <utility>
 #include <vector>
 #include <tuple>
 #include <functional>
@@ -39,6 +40,19 @@ protected:
 
 public:
     virtual void init_web_metrics() = 0;
+};
+
+//used in handle_shares
+struct HandleSharesData
+{
+    std::vector<ShareType> items;
+    std::map<uint256, std::vector<coind::data::tx_type>> txs;
+
+    void add(const ShareType& _share, std::vector<coind::data::tx_type> _txs)
+    {
+        items.push_back(_share);
+        txs[_share->hash] = std::move(_txs);
+    }
 };
 
 class PoolNodeData
@@ -110,7 +124,7 @@ public:
 	}
 
 	std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, addr_type peer_addr);
-	void handle_shares(vector<tuple<ShareType, std::vector<coind::data::tx_type>>> shares, std::tuple<std::string, std::string> addr);
+	void handle_shares(HandleSharesData shares, std::tuple<std::string, std::string> addr);
 	void handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, std::tuple<std::string, std::string> addr);
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 	void broadcast_share(uint256 share_hash);

@@ -375,7 +375,7 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
 
 void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    vector<tuple<ShareType, std::vector<coind::data::tx_type>>> result; //share, txs
+    HandleSharesData result; //share, txs
     for (auto wrappedshare: msg->raw_shares.get())
     {
         // TODO: move all supported share version in network setting
@@ -419,7 +419,7 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                 txs.push_back(tx);
             }
         }
-        result.emplace_back(share, txs);
+        result.add(share, txs);
     }
 
     handle_shares(result, protocol->get_addr());
@@ -699,20 +699,24 @@ void PoolNode::download_shares()
                 continue;
             }
 
-            vector<tuple<ShareType, std::vector<coind::data::tx_type>>> post_shares;
-
-            PreparedList prepare_shares(shares);
-            for (auto& fork : prepare_shares.forks)
+            HandleSharesData _shares;
+            for (auto& _share : shares)
             {
-                auto share_node = fork->tail;
-                while (share_node)
-                {
-                    post_shares.emplace_back(share_node->value, std::vector<coind::data::tx_type>{});
-                    share_node = share_node->next;
-                }
+                _shares.add(_share, {});
             }
 
-            _node->handle_shares(post_shares, peer->get_addr());
+//            PreparedList prepare_shares(shares);
+//            for (auto& fork : prepare_shares.forks)
+//            {
+//                auto share_node = fork->tail;
+//                while (share_node)
+//                {
+//                    post_shares.add(share_node->value, {});
+//                    share_node = share_node->next;
+//                }
+//            }
+
+            _node->handle_shares(_shares, peer->get_addr());
             fiber->sleep(500ms);
         }
     });
