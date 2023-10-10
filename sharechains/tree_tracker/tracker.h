@@ -167,15 +167,15 @@ public:
             case only_tails:
                 // продолжение форка сзади
             {
-                auto tail_forks = tails.find(value.hash());
-                if (tail_forks->second.size() > 1)
+                auto tail_forks = tails.extract(value.hash());
+                if (tail_forks.mapped().size() > 1)
                 {
                     // make new fork
                     auto new_fork = make_fork();
                     new_fork->insert(value);
 
                     // add new fork to head forks
-                    for (auto &_fork: tail_forks->second)
+                    for (auto &_fork: tail_forks.mapped())
                     {
                         _fork->insert_fork(new_fork);
                     }
@@ -184,13 +184,15 @@ public:
                 } else
                 {
                     // add value in head fork
-                    for (auto &_fork: tail_forks->second)
+                    for (auto &_fork: tail_forks.mapped())
                     {
                         _fork->insert(value);
                         fork_by_key_add(value.hash(), _fork);
 //                        fork_by_key[value.hash()] = _fork;
                     }
                 }
+                tail_forks.key() = value.prev();
+                tails.insert(std::move(tail_forks));
             }
                 break;
         }
