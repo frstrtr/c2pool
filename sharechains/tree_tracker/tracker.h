@@ -79,6 +79,9 @@ public:
 
         // Make new tracker element
         auto value = make_element(_value);
+        added_items_log << value.hash() << "\n";
+        if (value.hash() == uint256S("80345912fa6e6b94dc5d70df8a453fb94b4c0e4e8d20ae606c3dcd20ca7be553"))
+            std::cout << "HERE";
 
         if (items.find(value.hash()) != items.end())
             throw std::invalid_argument("item already present!");
@@ -104,6 +107,10 @@ public:
             state |= only_heads;
         if (tails.count(value.hash()))
             state |= only_tails;
+
+        LOG_INFO << "hash = " << value.hash() << ", prev = " << value.prev();
+//        LOG_INFO << "heads: " << heads;
+//        LOG_INFO << "tails: " << tails;
 
         switch (state)
         {
@@ -141,6 +148,7 @@ public:
                         forks.erase(forks.begin() + i);
                     }
                 }
+//                fork_by_key_add(value.hash(), heads[value.hash()]);
 //                    std::remove(forks.begin(), forks.end(), )
 //                    forks.erase(forks.find(left_fork.mapped()));
             }

@@ -359,6 +359,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
 //    if (c2pool.DEBUG))
 //    {
+    LOG_DEBUG_SHARETRACKER << "tracker data: heads = " << heads.size() << ", tails = " << tails.size() << "; verified: heads = " << verified.heads.size() << ", tails = " << verified.tails.size();
     LOG_DEBUG_SHARETRACKER << decorated_heads.size() << " heads. Top 10:";
     int i = decorated_heads.size() - 11;
     if (i < 0)
