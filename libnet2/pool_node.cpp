@@ -649,13 +649,15 @@ void PoolNode::download_shares()
         {
             auto desired = _node->coind_node->desired->get_when_satisfies([&](const auto &desired)
                                                                          {
+                                                                             LOG_DEBUG_POOL << "desired.size() != 0: " << (desired.size() != 0);
                                                                              return desired.size() != 0;
                                                                          })->yield(fiber);
+            LOG_DEBUG_POOL << "DOWNLOAD SHARE1";
             auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
 
             if (_node->peers.size() == 0)
             {
-//                LOG_WARNING << "download_shares: peers.size() == 0";
+                LOG_WARNING << "download_shares: peers.size() == 0";
                 fiber->sleep(1s);
                 continue;
             }
