@@ -465,4 +465,50 @@ namespace stream
     };
 }
 
+struct NetAddress
+{
+    std::string ip{};
+    std::string port{};
+
+    NetAddress()
+    {
+
+    }
+
+    NetAddress(const std::string& _ip, const std::string& _port): ip(_ip), port(_port) {}
+
+    //TODO: NetAddress(const std::string& _ip, const int& _port)
+    //TODO: NetAddress(const std::string& full_address)
+
+    std::string to_string() const
+    {
+        return ip + port;
+    }
+
+    int get_port() const
+    {
+        return stoi(port);
+    }
+
+    bool operator<(const NetAddress& value) const
+    {
+        return std::make_tuple(ip, port) < std::make_tuple(value.ip, value.port);
+    }
+
+    bool operator>(const NetAddress& value) const
+    {
+        return std::make_tuple(ip, port) > std::make_tuple(value.ip, value.port);
+    }
+
+    bool operator==(const NetAddress& value) const
+    {
+        return std::make_tuple(ip, port) == std::make_tuple(value.ip, value.port);
+    }
+
+    bool operator!=(const NetAddress& value) const
+    {
+        return !(*this == value);
+    }
+};
+
 typedef std::tuple<std::string, std::string> addr_type; //old name: c2pool::libnet::addr
