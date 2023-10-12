@@ -1,5 +1,6 @@
 #pragma once
 
+#include <utility>
 #include <vector>
 #include <string>
 #include <tuple>
@@ -9,6 +10,7 @@
 #include "btclibs/uint256.h"
 #include "btclibs/arith_uint256.h"
 #include <libdevcore/stream.h>
+#include <libdevcore/types.h>
 #include <web_interface/netdatafield.h>
 
 #include <boost/property_tree/ptree.hpp>
@@ -45,13 +47,13 @@ namespace c2pool
         static boost::property_tree::ptree make_default_network();
         void set_web(std::shared_ptr<NetDataField> _web_data)
         {
-            web = _web_data;
+            web = std::move(_web_data);
         }
 
     public:
 		std::set<std::string> SOFTFORKS_REQUIRED;
         //std::tuple<std::string, std::string> = addr
-        std::vector<std::tuple<std::string, std::string>> BOOTSTRAP_ADDRS; //217.72.6.241
+        std::vector<NetAddress> BOOTSTRAP_ADDRS; //217.72.6.241
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
         const unsigned char *PREFIX;
