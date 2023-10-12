@@ -40,10 +40,10 @@ namespace c2pool
 
             if (_addr.size() == 2)
             {
-                return std::make_tuple(_addr[0], _addr[1]);
+                return NetAddress(_addr[0], _addr[1]);
             } else
             {
-                return std::make_tuple<std::string, std::string>("","");
+                return NetAddress();
             }
         });
 
