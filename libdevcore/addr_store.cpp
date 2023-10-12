@@ -36,7 +36,7 @@ namespace c2pool::dev
         }
 
         //BOOTSTRAP
-        for (auto key : net->BOOTSTRAP_ADDRS)
+        for (const auto& key : net->BOOTSTRAP_ADDRS)
         {
             store[key] = {
                 0,
@@ -45,7 +45,7 @@ namespace c2pool::dev
         }
 
         //SAVE IN FILE
-        if (store.size() > 0)
+        if (!store.empty())
         {
             SaveToFile();
         }
@@ -66,7 +66,7 @@ namespace c2pool::dev
         LOG_DEBUG_OTHER << "Addrs saved in file!";
     }
 
-    bool AddrStore::Check(addr_type key)
+    bool AddrStore::Check(NetAddress key)
     {
         if (store.find(key) != store.end())
             return true;
@@ -74,7 +74,7 @@ namespace c2pool::dev
             return false;
     }
 
-    AddrValue AddrStore::Get(addr_type key)
+    AddrValue AddrStore::Get(NetAddress key)
     {
         if (Check(key))
             return store[key];
@@ -82,9 +82,9 @@ namespace c2pool::dev
             return EMPTY_ADDR_VALUE;
     }
 
-    std::vector<std::pair<addr_type, AddrValue>> AddrStore::GetAll()
+    std::vector<std::pair<NetAddress, AddrValue>> AddrStore::GetAll()
     {
-        std::vector<std::pair<addr_type, AddrValue>> res;
+        std::vector<std::pair<NetAddress, AddrValue>> res;
         for (auto kv : store)
         {
             res.push_back(kv);
@@ -92,16 +92,16 @@ namespace c2pool::dev
         return res;
     }
 
-    bool AddrStore::Add(addr_type key, AddrValue value)
+    bool AddrStore::Add(NetAddress key, AddrValue value)
     {
         if (Check(key))
             return false;
-        store.insert(std::pair<addr_type, AddrValue>(key, value));
+        store.insert(std::pair<NetAddress, AddrValue>(key, value));
         SaveToFile();
         return true;
     }
 
-    bool AddrStore::Remove(addr_type key)
+    bool AddrStore::Remove(NetAddress key)
     {
         if (Check(key))
             return false;
@@ -118,8 +118,8 @@ namespace c2pool::dev
         {
             UniValue value(UniValue::VOBJ);
 
-            value.pushKV("address", std::get<0>(kv.first));
-            value.pushKV("port", std::get<1>(kv.first));
+            value.pushKV("address", kv.first.ip);
+            value.pushKV("port", kv.first.port);
             value.pushKV("services", kv.second.service);
             value.pushKV("first_seen", kv.second.first_seen);
             value.pushKV("last_seen", kv.second.last_seen);
@@ -138,7 +138,7 @@ namespace c2pool::dev
 
         for (int i = 0; i < AddrsValue.size(); i++)
         {
-            addr_type key = std::make_tuple(AddrsValue[i]["address"].get_str(),
+            NetAddress key(AddrsValue[i]["address"].get_str(),
                                        AddrsValue[i]["port"].get_str());
             store[key] = {AddrsValue[i]["services"].get_int(),
                           AddrsValue[i]["first_seen"].get_int64(),
