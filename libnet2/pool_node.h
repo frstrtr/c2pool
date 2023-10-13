@@ -49,7 +49,7 @@ public:
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
 		auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
-		auto ip = std::get<0>(_protocol->get_socket()->get_addr());
+		auto ip = _protocol->get_socket()->get_addr().ip;
         peers[_protocol->nonce] = _protocol;
         server_connections[ip] = std::move(_protocol);
     }
@@ -80,7 +80,7 @@ public:
     {
         socket->set_addr();
         auto addr = socket->get_addr();
-        client_attempts[std::get<0>(addr)] =
+        client_attempts[addr.ip] =
                 std::make_shared<PoolHandshakeClient>(std::move(socket),
                                                       message_version_handle,
                                                       [&](const std::shared_ptr<PoolHandshake>& _handshake){ handshake_handle(_handshake);});
@@ -91,7 +91,7 @@ public:
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
         auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
-        auto ip = std::get<0>(_protocol->get_socket()->get_addr());
+        auto ip = _protocol->get_socket()->get_addr().ip;
         peers[_protocol->nonce] = _protocol;
         client_connections[ip] = std::move(_protocol);
 	    client_attempts.erase(ip);
@@ -115,14 +115,13 @@ public:
 
 										  for (auto addr: get_good_peers(1))
 										  {
-											  if (client_attempts.find(std::get<0>(addr)) != client_attempts.end())
+											  if (client_attempts.find(addr.ip) != client_attempts.end())
 											  {
-												  LOG_WARNING << "Client already connected to " << std::get<0>(addr) << ":" << std::get<1>(addr) << "!";
+												  LOG_WARNING << "Client already connected to " << addr.to_string() << "!";
 												  continue;
 											  }
 
-											  auto [ip, port] = addr;
-											  LOG_TRACE << "try to connect: " << ip << ":" << port;
+											  LOG_TRACE << "try to connect: " << addr.to_string();
 
 											  (*connector)([&](std::shared_ptr<Socket> socket){ socket_handle(socket);}, addr);
 										  }
@@ -131,7 +130,7 @@ public:
 									  });
 	}
 
-	std::vector<addr_type> get_good_peers(int max_count);
+	std::vector<NetAddress> get_good_peers(int max_count);
 };
 
 #define SET_POOL_DEFAULT_HANDLER(msg) \

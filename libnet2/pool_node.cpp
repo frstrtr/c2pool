@@ -12,11 +12,11 @@
 
 using namespace pool::messages;
 
-std::vector<addr_type> PoolNodeClient::get_good_peers(int max_count)
+std::vector<NetAddress> PoolNodeClient::get_good_peers(int max_count)
 {
 	int t = c2pool::dev::timestamp();
 
-	std::vector<std::pair<float, addr_type>> values;
+	std::vector<std::pair<float, NetAddress>> values;
 	for (auto kv : addr_store->GetAll())
 	{
 		values.push_back(
@@ -25,12 +25,12 @@ std::vector<addr_type> PoolNodeClient::get_good_peers(int max_count)
 						kv.first));
 	}
 
-	std::sort(values.begin(), values.end(), [](std::pair<float, addr_type> a, std::pair<float, addr_type> b)
+	std::sort(values.begin(), values.end(), [](const std::pair<float, NetAddress>& a, std::pair<float, NetAddress> b)
 	{ return a.first < b.first; });
 
 	values.resize(min((int)values.size(), max_count));
-	std::vector<addr_type> result;
-	for (auto v : values)
+	std::vector<NetAddress> result;
+	for (const auto& v : values)
 	{
 		result.push_back(v.second);
 	}
@@ -80,9 +80,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
 		auto addr = handshake->get_socket()->get_addr();
 		std::string reason =
 			 "[handle_message_version] Detected duplicate connection, disconnecting from "
-			+ std::get<0>(addr)
-			+ ":"
-			+ std::get<1>(addr);
+			+ addr.to_string();
         handshake->disconnect(reason);
 		return;
 	}
@@ -306,7 +304,7 @@ void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addr
     for (auto addr_record: msg->addrs.get())
     {
         auto addr = addr_record.get();
-        got_addr(std::make_tuple(addr.address.address, std::to_string(addr.address.port)),
+        got_addr(NetAddress(addr.address.address, addr.address.port),
                             addr.address.services, std::min((uint32_t) c2pool::dev::timestamp(), addr.timestamp));
 
         if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
@@ -320,7 +318,7 @@ void PoolNode::handle_message_addrs(std::shared_ptr<pool::messages::message_addr
 
 void PoolNode::handle_message_addrme(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<PoolProtocol> protocol)
 {
-    auto host = std::get<0>(protocol->get_addr());
+    auto host = protocol->get_addr().ip;
 
     if (host.compare("127.0.0.1") == 0)
     {
@@ -331,7 +329,7 @@ void PoolNode::handle_message_addrme(std::shared_ptr<pool::messages::message_add
         }
     } else
     {
-        got_addr(std::make_tuple(host, std::to_string(msg->port.get())), protocol->other_services,
+        got_addr(NetAddress(host, msg->port.get()), protocol->other_services,
                             c2pool::dev::timestamp());
         if ((c2pool::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
         {
@@ -361,8 +359,7 @@ void PoolNode::handle_message_getaddrs(std::shared_ptr<pool::messages::message_g
     {
         auto _addr = addr_store->Get(v);
         _addrs.push_back(
-                addr(_addr.last_seen,
-                                       _addr.service, std::get<0>(v), c2pool::dev::str_to_int<int>(std::get<1>(v)))
+                addr(_addr.last_seen, _addr.service, v.ip, v.get_port())
         );
     }
 

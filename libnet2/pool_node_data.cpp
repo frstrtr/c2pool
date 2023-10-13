@@ -15,7 +15,7 @@ PoolNodeData* PoolNodeData::set_coind_node(std::shared_ptr<CoindNodeData> _coind
 }
 
 std::vector<ShareType> PoolNodeData::handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops,
-													   addr_type peer_addr)
+                                                       NetAddress peer_addr)
 {
 	parents = std::min(parents, (uint64_t)1000/hashes.size());
 	std::vector<ShareType> shares;
@@ -33,9 +33,9 @@ std::vector<ShareType> PoolNodeData::handle_get_shares(std::vector<uint256> hash
 		}
 	}
 
-	if (shares.size() > 0)
+	if (!shares.empty())
 	{
-		LOG_INFO << "Sending " << shares.size() << " shares to " << std::get<0>(peer_addr) << ":" << std::get<1>(peer_addr);
+		LOG_INFO << "Sending " << shares.size() << " shares to " << peer_addr.to_string();
 	}
 	return shares;
 }
@@ -61,7 +61,7 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
         LOG_WARNING << "COIND NODE = NULL IN POOL NODE!";
 }
 
-void PoolNodeData::handle_shares(HandleSharesData shares_data, std::tuple<std::string, std::string> addr)
+void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
 {
     std::vector<ShareType> shares;
     PreparedList prepare_shares(shares_data.items);
@@ -79,7 +79,7 @@ void PoolNodeData::handle_shares(HandleSharesData shares_data, std::tuple<std::s
 
 	if (shares.size() > 5)
 	{
-		LOG_INFO << "Processing " << shares.size() << " shares from " << std::get<0>(addr) << ":" << std::get<1>(addr) << "...";
+		LOG_INFO << "Processing " << shares.size() << " shares from " << addr.to_string() << "...";
 	}
 
 	int32_t new_count = 0;
@@ -123,7 +123,7 @@ void PoolNodeData::handle_shares(HandleSharesData shares_data, std::tuple<std::s
 	}
 }
 
-void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, std::tuple<std::string, std::string> addr)
+void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, NetAddress addr)
 {
 	std::vector<uint256> new_hashes;
 	for (auto x : hashes)
