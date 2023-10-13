@@ -109,7 +109,7 @@ public:
     PoolNodeData* set_coind_node(std::shared_ptr<CoindNodeData> _coind_node);
 
 public:
-	void got_addr(std::tuple<std::string, std::string> _addr, uint64_t services, int64_t timestamp)
+	void got_addr(NetAddress _addr, uint64_t services, int64_t timestamp)
 	{
 		if (addr_store->Check(_addr)) {
 			auto old = addr_store->Get(_addr);
@@ -123,9 +123,9 @@ public:
 		}
 	}
 
-	std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, addr_type peer_addr);
-	void handle_shares(HandleSharesData shares, std::tuple<std::string, std::string> addr);
-	void handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, std::tuple<std::string, std::string> addr);
+	std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetAddress peer_addr);
+	void handle_shares(HandleSharesData shares, NetAddress addr);
+	void handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, NetAddress addr);
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 	void broadcast_share(uint256 share_hash);
 
