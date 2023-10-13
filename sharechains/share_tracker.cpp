@@ -199,7 +199,7 @@ bool ShareTracker::attempt_verify(ShareType share)
 TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs)
 {
     std::set<desired_type> desired;
-    std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
+    std::set<NetAddress> bad_peer_addresses;
 
     std::vector<uint256> bads;
 
@@ -242,7 +242,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                 desired_target = std::min(desired_target, items[temp_hash]->target);
             }
 
-            std::tuple<std::string, std::string> _peer_addr = c2pool::random::RandomChoice(
+            NetAddress _peer_addr = c2pool::random::RandomChoice(
                     reverse[last])->second->peer_addr;
 
             desired.insert({
@@ -302,7 +302,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                 desired_target = std::min(desired_target, items[temp_hash]->target);
             }
 
-            std::tuple<std::string, std::string> _peer_addr = c2pool::random::RandomChoice(
+            NetAddress _peer_addr = c2pool::random::RandomChoice(
                     verified.reverse[last_hash])->second->peer_addr;
 
             desired.insert({
@@ -406,13 +406,13 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     for (const auto &[peer_addr, hash, ts, targ] : desired)
     {
         LOG_DEBUG_SHARETRACKER << "\t"
-                               << std::get<0>(peer_addr) << ":" << std::get<1>(peer_addr)
-                               << " " << hash << " " << (c2pool::dev::timestamp() - ts) << " " << coind::data::target_to_difficulty(targ)
+                               << peer_addr.to_string() << " " << hash << " " << (c2pool::dev::timestamp() - ts)
+                               << " " << coind::data::target_to_difficulty(targ)
                                << " " << (ts >= timestamp_cutoff) << " " << (Uint256ToArith288(targ) <= target_cutoff);
     }
 //    }
 
-    std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired_result;
+    std::vector<std::tuple<NetAddress, uint256>> desired_result;
     for (auto [peer_addr, hash, ts, targ] : desired)
     {
         if (ts >= timestamp_cutoff)
