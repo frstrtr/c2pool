@@ -149,7 +149,7 @@ public:
 
 struct desired_type
 {
-    std::tuple<std::string, std::string> peer_addr;
+    NetAddress peer_addr;
     uint256 hash;
     uint32_t timestamp;
     uint256 target;
@@ -163,9 +163,9 @@ struct desired_type
 struct TrackerThinkResult
 {
     uint256 best;
-    std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>> desired;
+    std::vector<std::tuple<NetAddress, uint256>> desired;
     std::vector<std::tuple<std::tuple<arith_uint256, int32_t, int32_t>, arith_uint256>> decorated_heads;
-    std::set<std::tuple<std::string, std::string>> bad_peer_addresses;
+    std::set<NetAddress> bad_peer_addresses;
 };
 
 //---> Web Share Tracker
