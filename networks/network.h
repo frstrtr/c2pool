@@ -52,7 +52,6 @@ namespace c2pool
 
     public:
 		std::set<std::string> SOFTFORKS_REQUIRED;
-        //std::tuple<std::string, std::string> = addr
         std::vector<NetAddress> BOOTSTRAP_ADDRS; //217.72.6.241
         int PREFIX_LENGTH;
         //prefix: codecs.decode("1bfe01eff5ba4e38", "hex"), where prefix: 1b fe 01 ef f5 ba 4e 38, with 0x
