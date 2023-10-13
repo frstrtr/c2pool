@@ -73,7 +73,7 @@ public:
 	}
 
 	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
-					std::tuple<std::string, std::string> _addr) override
+                    NetAddress _addr) override
 	{
 		auto [ip, port] = _addr;
         LOG_DEBUG_P2P << "P2PConnector try to resolve " << ip << ":" << port;
@@ -126,16 +126,15 @@ public:
 	}
 
 	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
-					std::tuple<std::string, std::string> _addr) override
+                    NetAddress _addr) override
 	{
-		auto [ip, port] = _addr;
-		resolver.async_resolve(ip, port,
-							   [&, _ip = ip, _port = port, _handler = socket_handle](
+		resolver.async_resolve(_addr.ip, _addr.port,
+							   [&, address = _addr, _handler = socket_handle](
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
 							   {
 								   if (er) {
-									   LOG_WARNING << "P2PConnector[resolve](" << _ip << ":" << _port << "): " << er.message();
+									   LOG_WARNING << "P2PConnector[resolve](" << address.to_string() << "): " << er.message();
 									   return;
 								   }
 								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);

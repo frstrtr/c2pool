@@ -7,6 +7,7 @@
 #include <utility>
 
 #include <libdevcore/events.h>
+#include <libdevcore/types.h>
 
 #include "message.h"
 
@@ -25,8 +26,8 @@ protected:
     typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> handler_type;
     handler_type handler;
 
-    std::tuple<std::string, std::string> addr;
-    std::tuple<std::string, std::string> addr_local;
+    NetAddress addr;
+    NetAddress addr_local;
 
     connection_type conn_type_; // unk, in, out
     std::string last_message_sent; // last message sent by me and received by peer.
@@ -71,12 +72,12 @@ public:
     virtual void disconnect() = 0;
 
     virtual void set_addr() = 0;
-    virtual std::tuple<std::string, std::string> get_addr()
+    virtual NetAddress get_addr()
     {
         return addr;
     }
 
-    virtual std::tuple<std::string, std::string> get_addr_local()
+    virtual NetAddress get_addr_local()
     {
         return addr_local;
     }

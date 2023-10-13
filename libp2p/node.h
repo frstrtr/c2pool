@@ -27,7 +27,7 @@ public:
 	}
 
 	virtual void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
-							std::tuple<std::string, std::string> _addr) = 0;
+                            NetAddress _addr) = 0;
 };
 
 enum NodeRunState
