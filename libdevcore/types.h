@@ -477,7 +477,11 @@ struct NetAddress
 
     NetAddress(const std::string& _ip, const std::string& _port): ip(_ip), port(_port) {}
 
-    //TODO: NetAddress(const std::string& _ip, const int& _port)
+    NetAddress(const std::string& _ip, const int& _port) : ip(_ip)
+    {
+        port = std::to_string(_port);
+    }
+
     //TODO: NetAddress(const std::string& full_address)
 
     std::string to_string() const
