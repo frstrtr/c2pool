@@ -35,7 +35,8 @@ private:
 
 	void send_version()
 	{
-		address_type addr_to(1, std::get<0>(socket->get_addr()), std::get<1>(socket->get_addr()));
+        auto addr = socket->get_addr();
+		address_type addr_to(1, addr.ip, addr.port);
 
 		//TODO: get my global ip
 		address_type addr_from(1, "192.168.0.1", 12024);

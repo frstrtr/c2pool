@@ -27,7 +27,7 @@ protected:
 public:
     CoindNodeClient(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)){}
 
-	void connect(std::tuple<std::string, std::string> addr)
+	void connect(NetAddress addr)
 	{
 		(*connector)([&](std::shared_ptr<Socket> socket){ socket_handle(socket); }, addr);
 	}

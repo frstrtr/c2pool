@@ -8,7 +8,7 @@
 void CoindNode::start()
 {
 	LOG_INFO << "... CoindNode<" << parent_net->net_name << "> starting...";
-	connect(std::make_tuple(parent_net->P2P_ADDRESS, std::to_string(parent_net->P2P_PORT)));
+	connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
 	//COIND:
 	coind_work->set(coind->getwork(txidcache));
     get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work->value()](){return _coind_work.previous_block; });
