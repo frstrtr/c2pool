@@ -34,7 +34,7 @@ public:
 	VariableDict<uint256, coind::data::tx_type> mining_txs;
 	VariableDict<uint256, coind::data::tx_type> mining2_txs;
 	Variable<uint256> best_share;
-	Variable<std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>>> desired;
+	Variable<std::vector<std::tuple<NetAddress, uint256>>> desired;
 
 	Event<uint256> new_block;                           //block_hash
 	Event<coind::data::tx_type> new_tx;                 //bitcoin_data.tx_type
@@ -54,7 +54,7 @@ public:
         mining_txs = make_vardict<uint256, coind::data::tx_type>({});
         mining2_txs = make_vardict<uint256, coind::data::tx_type>({});
         best_share = make_variable<uint256>(uint256::ZERO);
-        desired = make_variable<std::vector<std::tuple<std::tuple<std::string, std::string>, uint256>>>();
+        desired = make_variable<std::vector<std::tuple<NetAddress, uint256>>>();
 
         new_block = make_event<uint256>();
         new_tx = make_event<coind::data::tx_type>();
