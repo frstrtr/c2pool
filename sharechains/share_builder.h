@@ -20,7 +20,7 @@ public:
 		Reset();
 	}
 
-	void create(uint64_t version, const addr_type& addr)
+	void create(uint64_t version, const NetAddress& addr)
 	{
 		share = std::make_shared<Share>(version, net, addr);
 	}
@@ -269,7 +269,7 @@ public:
 		builder = std::make_shared<ShareStreamBuilder>(_net);
 	}
 
-	ShareType make_share(uint64_t version, const addr_type &addr, PackStream& stream)
+	ShareType make_share(uint64_t version, const NetAddress &addr, PackStream& stream)
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
@@ -283,7 +283,7 @@ public:
         return builder->GetShare();
 	}
 
-	ShareType make_preSegwitShare(uint64_t version, const addr_type &addr, PackStream& stream)
+	ShareType make_preSegwitShare(uint64_t version, const NetAddress &addr, PackStream& stream)
 	{
 		builder->create(version, addr);
 		builder->min_header(stream)
@@ -298,7 +298,7 @@ public:
         return builder->GetShare();
 	}
 
-    ShareType make_segwitMiningShare(uint64_t version, const addr_type &addr, PackStream& stream)
+    ShareType make_segwitMiningShare(uint64_t version, const NetAddress &addr, PackStream& stream)
     {
         builder->create(version, addr);
         builder->min_header(stream)

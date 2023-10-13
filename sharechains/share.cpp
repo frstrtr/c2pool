@@ -329,7 +329,7 @@ nlohmann::json Share::json()
             {"local", {
                     // TODO: verified
                     {"time_first_seen", time_seen == 0 ? c2pool::dev::timestamp() : time_seen},
-                    {"peer_first_received_from", peer_addr} //TODO: check
+                    {"peer_first_received_from", peer_addr.to_string()}
             }},
             {"share_data", {
                     {"timestamp", *timestamp},
@@ -367,7 +367,7 @@ nlohmann::json Share::json()
 }
 
 // pack_share<--->load_share
-std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const addr_type& peer_addr)
+std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const NetAddress& peer_addr)
 {
     PackedShareData packed_share;
     try
