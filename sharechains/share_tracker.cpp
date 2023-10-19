@@ -14,17 +14,21 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
 
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares started: " << c2pool::dev::timestamp();
 
-    PreparedList prepare_shares(_shares);
+    PreparedList prepare_shares;
+    prepare_shares.add(_shares);
 
-    for (auto& fork : prepare_shares.forks)
-    {
-        auto share_node = fork->tail;
-        while (share_node)
-        {
-            add(share_node->value);
-            share_node = share_node->next;
-        }
-    }
+    for (const auto &share : prepare_shares.build_list())
+        add(share);
+
+//    for (auto& fork : prepare_shares.forks)
+//    {
+//        auto share_node = fork->tail;
+//        while (share_node)
+//        {
+//            add(share_node->value);
+//            share_node = share_node->next;
+//        }
+//    }
 
 //    for (auto& _share : _shares)
 //    {
@@ -43,17 +47,21 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
                 _verified_shares.push_back(items.at(share_hash));
         }
 
-        PreparedList prepare_verified_shares(_verified_shares);
+        PreparedList prepare_verified_shares;
+        prepare_verified_shares.add(_verified_shares);
 
-        for (auto& fork : prepare_verified_shares.forks)
-        {
-            auto share_node = fork->tail;
-            while (share_node)
-            {
-                verified.add(share_node->value);
-                share_node = share_node->next;
-            }
-        }
+        for (const auto &share : prepare_verified_shares.build_list())
+            verified.add(share);
+
+//        for (auto& fork : prepare_verified_shares.forks)
+//        {
+//            auto share_node = fork->tail;
+//            while (share_node)
+//            {
+//                verified.add(share_node->value);
+//                share_node = share_node->next;
+//            }
+//        }
     }
 
 //    for (auto& share_hash : known_verified_share_hashes)

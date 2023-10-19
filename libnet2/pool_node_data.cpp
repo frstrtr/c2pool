@@ -63,19 +63,21 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
 
 void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
 {
-    std::vector<ShareType> shares;
-    PreparedList prepare_shares(shares_data.items);
-    for (auto& fork : prepare_shares.forks)
-    {
-        auto share_node = fork->head;
-        while (share_node)
-        {
-            shares.push_back(share_node->value);
-            share_node = share_node->prev;
-        }
-    }
+    PreparedList prepare_shares;
+    prepare_shares.add(shares_data.items);
 
-    LOG_INFO << "shares = " << shares.size() << "; shares_data: " << shares_data.items.size() << "; txs = " << shares_data.txs.size() << "; forks = " << prepare_shares.forks.size();
+    std::vector<ShareType> shares = prepare_shares.build_list();
+//    for (auto& fork : prepare_shares.forks)
+//    {
+//        auto share_node = fork->head;
+//        while (share_node)
+//        {
+//            shares.push_back(share_node->value);
+//            share_node = share_node->prev;
+//        }
+//    }
+
+//    LOG_INFO << "shares = " << shares.size() << "; shares_data: " << shares_data.items.size() << "; txs = " << shares_data.txs.size() << "; forks = " << prepare_shares.forks.size();
 
 	if (shares.size() > 5)
 	{
