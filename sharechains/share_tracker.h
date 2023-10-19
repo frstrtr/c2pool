@@ -41,18 +41,40 @@ struct PreparedList
 {
     typedef uint256 hash_type;
     typedef ShareType item;
-//last->(prev->value)->best
+
+    //last->(prev->value)->best
     struct PreparedNode
     {
-        item value;
-        PreparedNode *prev_node;
+        item value{};
+        PreparedNode *prev_node{};
         std::set<PreparedNode *> next_nodes;
+
+#ifdef DEBUG_TRACKER
+        std::string _hash;
+        std::string _prev_hash;
+#endif
 
         PreparedNode()
         {}
 
-        PreparedNode(item val) : value(val)
-        {};
+        explicit PreparedNode(item val) : value(val)
+        {
+#ifdef DEBUG_TRACKER
+            _hash = hash().ToString();
+            _prev_hash = prev_hash().ToString();
+#endif
+        };
+
+
+        hash_type hash() const
+        {
+            return value->hash;
+        }
+
+        hash_type prev_hash() const
+        {
+            return *value->previous_hash;
+        }
     };
 
     std::map<hash_type, std::set<PreparedNode *>> branch_tails; // value.previous_hash -> value
@@ -61,19 +83,19 @@ struct PreparedList
     PreparedNode *make_node(const item &val)
     {
         auto node = new PreparedNode(val);
-        nodes[val->hash] = node;
+        nodes[node->hash()] = node;
 
         return node;
     }
 
     static PreparedNode *merge_nodes(PreparedNode *n1, PreparedNode *n2)
     {
-        if (n1->value->hash == *n2->value->previous_hash)
+        if (n1->hash() == n2->prev_hash())
         {
             n1->next_nodes.insert(n2);
             n2->prev_node = n1;
             return n1;
-        } else if (n2->value->hash == *n1->value->previous_hash)
+        } else if (n2->hash() == n1->prev_hash())
         {
             n2->next_nodes.insert(n1);
             n1->prev_node = n2;
@@ -86,8 +108,8 @@ struct PreparedList
     void add(std::vector<item> values)
     {
         // temp-data
-        std::map<hash_type , std::vector<item>::iterator> items; // hash->item;
-        std::map<hash_type , std::vector<std::vector<item>::iterator>> tails; // хэши, которые являются предыдущими существующим item's.
+        std::map<hash_type, std::vector<item>::iterator> items; // hash->item;
+        std::map<hash_type, std::vector<std::vector<item>::iterator>> tails; // хэши, которые являются предыдущими существующим item's.
 
         for (auto it = values.begin(); it != values.end(); it++)
         {
@@ -107,32 +129,30 @@ struct PreparedList
 
             // generate left part of branch
 
-            while (tail && items.count(*tail->value->previous_hash)) //
+            while (tail && items.count(tail->prev_hash()))
             {
-                PreparedNode *new_tail = make_node(*items[*tail->value->previous_hash]);
+                PreparedNode *new_tail = make_node(*items[tail->prev_hash()]);
                 tail = merge_nodes(new_tail, tail);
-                items.erase(*tail->value->previous_hash);
+                items.erase(tail->prev_hash());
             }
 
-
             // generate right part of branch
-            while (tails.count(head->value->hash))
+            while (tails.count(head->hash()))
             {
                 PreparedNode *merged_head = nullptr;
-                for (auto _head: tails[head->value->hash])
+                for (auto _head: tails[head->hash()])
                 {
                     PreparedNode *new_head = make_node(*_head);
 //                    branch_heads[new_head->value.hash].insert(new_head);
                     merged_head = merge_nodes(new_head, head);
-                    items.erase(new_head->value->hash);
+                    items.erase(new_head->hash());
                 }
                 head = merged_head;
             }
 
             if (tail)
             {
-                branch_tails[*tail->value->previous_hash].insert(tail); // update branch_tails for new tail
-
+                branch_tails[tail->prev_hash()].insert(tail); // update branch_tails for new tail
             } else
             {
                 PreparedNode *new_tail = head;
@@ -141,13 +161,13 @@ struct PreparedList
                     new_tail = new_tail->prev_node;
                 }
 
-                branch_tails[*new_tail->value->previous_hash].insert(new_tail);
+                branch_tails[new_tail->prev_hash()].insert(new_tail);
             }
         }
 
         //check for merge branch
         // -- heads
-        std::set<hash_type > keys_remove;
+        std::set<hash_type> keys_remove;
         for (auto &[k, v]: branch_tails)
         {
             if (nodes.count(k))
