@@ -37,115 +37,276 @@ public:
     }
 };
 
-class PreparedList
+struct PreparedList
 {
-private:
-    typedef std::shared_ptr<PrepareFork> ptr_fork;
-private:
-    std::map<uint256, ptr_node> nodes;
-
-    ptr_node make_node(ShareType &value)
+    typedef uint256 hash_type;
+    typedef ShareType item;
+//last->(prev->value)->best
+    struct PreparedNode
     {
-        auto v = std::make_shared<PrepareListNode>(value);
-        nodes[value->hash] = v;
+        item value;
+        PreparedNode *prev_node;
+        std::set<PreparedNode *> next_nodes;
 
-        return v;
+        PreparedNode()
+        {}
+
+        PreparedNode(item val) : value(val)
+        {};
+    };
+
+    std::map<hash_type, std::set<PreparedNode *>> branch_tails; // value.previous_hash -> value
+    std::map<hash_type, PreparedNode *> nodes;
+
+    PreparedNode *make_node(const item &val)
+    {
+        auto node = new PreparedNode(val);
+        nodes[val->hash] = node;
+
+        return node;
     }
 
-    // Метод создаёт пару из двух нод
-    void make_pair(ptr_node left, ptr_node right)
+    static PreparedNode *merge_nodes(PreparedNode *n1, PreparedNode *n2)
     {
-        left->next = right;
-        right->prev = left;
-    }
-
-    ptr_fork merge_fork(ptr_fork left, ptr_fork right)
-    {
-        make_pair(left->head, right->tail);
-        left->head = right->head;
-        return left;
-    }
-public:
-    std::vector<ptr_fork> forks;
-
-    PreparedList(std::vector<ShareType> data)
-    {
-        // Prepare data
-        // -- map hashes
-        std::map<uint256, ShareType> hashes;
-        for (auto &_share : data)
+        if (n1->value->hash == *n2->value->previous_hash)
         {
-            hashes[_share->hash] = _share;
+            n1->next_nodes.insert(n2);
+            n2->prev_node = n1;
+            return n1;
+        } else if (n2->value->hash == *n1->value->previous_hash)
+        {
+            n2->next_nodes.insert(n1);
+            n1->prev_node = n2;
+            return n1;
         }
 
-        // -- heads/tails
+        throw std::invalid_argument("can't merge nodes");
+    }
 
-        std::map<uint256, ptr_fork> heads;
-        std::map<uint256, ptr_fork> tails;
+    void add(std::vector<item> values)
+    {
+        // temp-data
+        std::map<hash_type , std::vector<item>::iterator> items; // hash->item;
+        std::map<hash_type , std::vector<std::vector<item>::iterator>> tails; // хэши, которые являются предыдущими существующим item's.
 
-        while (!hashes.empty())
+        for (auto it = values.begin(); it != values.end(); it++)
         {
-            auto node = make_node(hashes.begin()->second);
-            hashes.erase(node->value->hash);
+            items[(*it)->hash] = it;
+            tails[*(*it)->previous_hash].push_back(it);
+        }
 
-            if (!heads.count(*node->value->previous_hash) && !tails.count(node->value->hash))
+        // generate branches
+        while (!items.empty())
+        {
+            // get element from hashes
+            auto [hash, value] = *items.begin();
+            items.erase(hash);
+
+            PreparedNode *tail = items.count(*(*value)->previous_hash) ? make_node(*items[*(*value)->previous_hash]) : nullptr;
+            PreparedNode *head = make_node(*value);
+
+            // generate left part of branch
+
+            while (tail && items.count(*tail->value->previous_hash)) //
             {
-                std::map<uint256, ShareType>::iterator it;
-                // make new fork
+                PreparedNode *new_tail = make_node(*items[*tail->value->previous_hash]);
+                tail = merge_nodes(new_tail, tail);
+                items.erase(*tail->value->previous_hash);
+            }
+
+
+            // generate right part of branch
+            while (tails.count(head->value->hash))
+            {
+                PreparedNode *merged_head = nullptr;
+                for (auto _head: tails[head->value->hash])
                 {
-                    auto new_fork = std::make_shared<PrepareFork>(node);
-                    heads[node->value->hash] = new_fork;
-                    tails[*node->value->previous_hash] = new_fork;
+                    PreparedNode *new_head = make_node(*_head);
+//                    branch_heads[new_head->value.hash].insert(new_head);
+                    merged_head = merge_nodes(new_head, head);
+                    items.erase(new_head->value->hash);
+                }
+                head = merged_head;
+            }
+
+            if (tail)
+            {
+                branch_tails[*tail->value->previous_hash].insert(tail); // update branch_tails for new tail
+
+            } else
+            {
+                PreparedNode *new_tail = head;
+                while (new_tail->prev_node)
+                {
+                    new_tail = new_tail->prev_node;
                 }
 
-                while ((it = hashes.find(*node->value->previous_hash)) != hashes.end())
-                {
-                    auto new_node = make_node(it->second);
-                    hashes.erase(it->first);
-                    make_pair(new_node, node);
-
-                    auto _fork = tails.extract(*node->value->previous_hash);
-                    _fork.mapped()->tail = new_node;
-                    _fork.key() = *new_node->value->previous_hash;
-                    tails.insert(std::move(_fork));
-
-                    node = new_node;
-                }
-                continue;
-            }
-
-            // Проверка на продолжение форка спереди
-            if (heads.find(*node->value->previous_hash) != heads.end())
-            {
-                auto _fork = heads.extract(*node->value->previous_hash);
-                make_pair(_fork.mapped()->head, node);
-
-                _fork.mapped()->head = node;
-                _fork.key() = node->value->hash;
-                heads.insert(std::move(_fork));
-
-                hashes.erase(node->value->hash);
-            }
-
-            // Проверка на merge форков.
-            if (tails.find(node->value->hash) != tails.end())
-            {
-                auto left_fork = heads.extract(node->value->hash);
-                auto right_fork = tails.extract(node->value->hash);
-
-                auto new_fork = merge_fork(left_fork.mapped(), right_fork.mapped());
-                heads[new_fork->head->value->hash] = new_fork;
-                tails[*new_fork->tail->value->previous_hash] = new_fork;
+                branch_tails[*new_tail->value->previous_hash].insert(new_tail);
             }
         }
 
-        // set forks
-        for (auto &_forks : heads)
+        //check for merge branch
+        // -- heads
+        std::set<hash_type > keys_remove;
+        for (auto &[k, v]: branch_tails)
         {
-            forks.push_back(_forks.second);
+            if (nodes.count(k))
+            {
+                for (auto _tail: v)
+                {
+                    merge_nodes(nodes[k], _tail);
+                }
+                keys_remove.insert(k);
+            }
+        }
+        for (auto k : keys_remove){
+            branch_tails.erase(k);
         }
     }
+
+    void update_stack(PreparedNode* node, std::stack<PreparedNode*>& st)
+    {
+        st.push(node);
+
+        if (!node->next_nodes.empty())
+        {
+            for (const auto &next : node->next_nodes)
+                update_stack(next, st);
+        }
+    }
+
+    auto build_list()
+    {
+        std::stack<PreparedNode*> st;
+        for (const auto &branch : branch_tails)
+        {
+            for (auto node : branch.second)
+            {
+//                st.push(node);
+                update_stack(node, st);
+            }
+        }
+
+        std::vector<item> result;
+        while (!st.empty())
+        {
+            result.push_back(st.top()->value);
+            st.pop();
+        }
+
+        return result;
+    };
 };
+
+//class PreparedList
+//{
+//private:
+//    typedef std::shared_ptr<PrepareFork> ptr_fork;
+//private:
+//    std::map<uint256, ptr_node> nodes;
+//
+//    ptr_node make_node(ShareType &value)
+//    {
+//        auto v = std::make_shared<PrepareListNode>(value);
+//        nodes[value->hash] = v;
+//
+//        return v;
+//    }
+//
+//    // Метод создаёт пару из двух нод
+//    void make_pair(ptr_node left, ptr_node right)
+//    {
+//        left->next = right;
+//        right->prev = left;
+//    }
+//
+//    ptr_fork merge_fork(ptr_fork left, ptr_fork right)
+//    {
+//        make_pair(left->head, right->tail);
+//        left->head = right->head;
+//        return left;
+//    }
+//public:
+//    std::vector<ptr_fork> forks;
+//
+//    PreparedList(std::vector<ShareType> data)
+//    {
+//        // Prepare data
+//        // -- map hashes
+//        std::map<uint256, ShareType> hashes;
+//        for (auto &_share : data)
+//        {
+//            hashes[_share->hash] = _share;
+//        }
+//
+//        // -- heads/tails
+//
+//        std::map<uint256, ptr_fork> heads;
+//        std::map<uint256, ptr_fork> tails;
+//
+//        while (!hashes.empty())
+//        {
+//            auto node = make_node(hashes.begin()->second);
+//            hashes.erase(hashes.begin());
+//
+//            if (!heads.count(*node->value->previous_hash) && !tails.count(node->value->hash))
+//            {
+//                std::map<uint256, ShareType>::iterator it;
+//                // make new fork
+//                {
+//                    auto new_fork = std::make_shared<PrepareFork>(node);
+//                    heads[node->value->hash] = new_fork;
+//                    tails[*node->value->previous_hash] = new_fork;
+//                }
+//
+//                while ((it = hashes.find(*node->value->previous_hash)) != hashes.end())
+//                {
+//                    auto new_node = make_node(it->second);
+//                    hashes.erase(it->first);
+//                    make_pair(new_node, node);
+//
+//                    auto _fork = tails.extract(*node->value->previous_hash);
+//                    _fork.mapped()->tail = new_node;
+//                    _fork.key() = *new_node->value->previous_hash;
+//                    tails.insert(std::move(_fork));
+//
+//                    node = new_node;
+//                }
+//                continue;
+//            }
+//
+//            // Проверка на продолжение форка спереди
+//            if (heads.find(*node->value->previous_hash) != heads.end())
+//            {
+//                auto _fork = heads.extract(*node->value->previous_hash);
+//                make_pair(_fork.mapped()->head, node);
+//
+//                _fork.mapped()->head = node;
+//                _fork.key() = node->value->hash;
+//                heads.insert(std::move(_fork));
+//
+//                hashes.erase(node->value->hash);
+//            }
+//
+//            // Проверка на merge форков.
+//            if (tails.find(node->value->hash) != tails.end())
+//            {
+//                auto left_fork = heads.extract(node->value->hash);
+//                auto right_fork = tails.extract(node->value->hash);
+//
+//                auto new_fork = merge_fork(left_fork.mapped(), right_fork.mapped());
+//                heads[new_fork->head->value->hash] = new_fork;
+//                tails[*new_fork->tail->value->previous_hash] = new_fork;
+//            }
+//        }
+//
+//        // set forks
+//        for (auto &_forks : heads)
+//        {
+//            forks.push_back(_forks.second);
+//        }
+//    }
+//};
 
 struct desired_type
 {
