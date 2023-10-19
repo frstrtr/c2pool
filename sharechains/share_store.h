@@ -1,9 +1,11 @@
 #pragma once
 
 #include <libdevcore/db.h>
-#include "share.h"
 #include <libdevcore/filesystem.h>
 #include <networks/network.h>
+
+#include "share.h"
+#include "data.h"
 
 #include <utility>
 #include <fstream>
