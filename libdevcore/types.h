@@ -486,7 +486,7 @@ struct NetAddress
 
     std::string to_string() const
     {
-        return ip + port;
+        return ip + ":" + port;
     }
 
     int get_port() const

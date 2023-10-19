@@ -86,7 +86,7 @@ void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
 
 	int32_t new_count = 0;
 	std::map<uint256, coind::data::tx_type> all_new_txs;
-	for (auto share : shares)
+	for (const auto& share : shares)
 	{
         auto new_txs = shares_data.txs[share->hash];
 		if (!new_txs.empty())

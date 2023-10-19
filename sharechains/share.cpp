@@ -11,7 +11,6 @@
 #include <libdevcore/addr_store.h>
 #include "share_tracker.h"
 #include "data.h"
-#include "share_builder.h"
 #include "generate_tx.h"
 
 
@@ -366,38 +365,8 @@ nlohmann::json Share::json()
     return result;
 }
 
-// pack_share<--->load_share
-std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const NetAddress& peer_addr)
-{
-    PackedShareData packed_share;
-    try
-    {
-        stream >> packed_share;
-    } catch (packstream_exception &ex)
-    {
-        throw std::invalid_argument((boost::format("Failed unpack PackedShareData in load_share: [%1%]") % ex.what()).str());// << ex.what();
-    }
+//std::shared_ptr<Share> load_share(PackStream &stream, std::shared_ptr<c2pool::Network> net, const NetAddress& peer_addr)
 
-	PackStream _stream(packed_share.contents.value);
-
-	ShareDirector director(std::move(net));
-	switch (packed_share.type.value)
-	{
-		case 17:
-//			return director.make_share(packed_share.type.value, peer_addr, _stream);
-		case 33:
-			return director.make_preSegwitShare(packed_share.type.value, peer_addr, _stream);
-        case 34:
-        case 35:
-            return director.make_segwitMiningShare(packed_share.type.value, peer_addr, _stream);
-		default:
-			if (packed_share.type.value < 17)
-				throw std::runtime_error("sent an obsolete share");
-			else
-				throw std::runtime_error((boost::format("unkown share type: %1%") % packed_share.type.value).str());
-			break;
-	}
-}
 
 PackedShareData pack_share(const ShareType& share)
 {
