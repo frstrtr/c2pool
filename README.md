@@ -21,21 +21,12 @@ BTC:
 
 ### 1C2PooLktmeKwx7Sp7aRoDiyUy3y7TMofw
 
-DGB:
+PayPal donation:
 
-### DJKrhVNZtTggUFHJ4CKCkmyWDSRUewyqm3
+[![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=9DF676HUWAHKY)
 
-Dogecoin:
+![image](https://github.com/frstrtr/c2pool/assets/4164913/51e82162-3d0b-435a-89b7-d8051983b3dc)
 
-### DF4FSgY3f2ThkNK7HpQtHNcSoyrB1bQaMN
-
-Chia (XCH):
-
-### xch120duz2pn97053lrd0ym4vxqe4hlv2awslc9pf4ld5vf7nvagv46s2t0azk
-  
-DASH:
-
-### XcSyqMKS1KWNnQ7nH335oiqrqvMiqXuHRw
 
 </details>
 
