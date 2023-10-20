@@ -39,7 +39,7 @@ public:
 
 struct PreparedList
 {
-    typedef uint256 hash_type;
+    typedef std::string hash_type;
     typedef ShareType item;
 
     //last->(prev->value)->best
@@ -60,20 +60,20 @@ struct PreparedList
         explicit PreparedNode(item val) : value(val)
         {
 #ifdef DEBUG_TRACKER
-            _hash = hash().ToString();
-            _prev_hash = prev_hash().ToString();
+            _hash = hash();//.ToString();
+            _prev_hash = prev_hash();//.ToString();
 #endif
         };
 
 
         hash_type hash() const
         {
-            return value->hash;
+            return value->hash.ToString();
         }
 
         hash_type prev_hash() const
         {
-            return *value->previous_hash;
+            return (*value->previous_hash).ToString();
         }
     };
 
@@ -113,8 +113,8 @@ struct PreparedList
 
         for (auto it = values.begin(); it != values.end(); it++)
         {
-            items[(*it)->hash] = it;
-            tails[*(*it)->previous_hash].push_back(it);
+            items[(*it)->hash.ToString()] = it;
+            tails[(*it)->previous_hash->ToString()].push_back(it);
         }
 
         // generate branches
@@ -124,16 +124,23 @@ struct PreparedList
             auto [hash, value] = *items.begin();
             items.erase(hash);
 
-            PreparedNode *tail = items.count(*(*value)->previous_hash) ? make_node(*items[*(*value)->previous_hash]) : nullptr;
             PreparedNode *head = make_node(*value);
+            PreparedNode *tail = nullptr;
+            if (items.count(head->prev_hash()))
+            {
+                tail = make_node(*items[head->prev_hash()]);
+                merge_nodes(tail, head);
+                items.erase(head->prev_hash());
+            }
+
 
             // generate left part of branch
-
             while (tail && items.count(tail->prev_hash()))
             {
                 PreparedNode *new_tail = make_node(*items[tail->prev_hash()]);
-                tail = merge_nodes(new_tail, tail);
+                merge_nodes(new_tail, tail);
                 items.erase(tail->prev_hash());
+                tail = new_tail;
             }
 
             // generate right part of branch
