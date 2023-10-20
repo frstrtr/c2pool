@@ -46,7 +46,7 @@ namespace shares
         auto pre_target = pre_target_calculate(previous_share, height);
         auto [max_bits, bits] = bits_calculate(pre_target);
 
-        auto [new_transaction_hashes, transaction_hash_refs, other_transaction_hashes] = new_tx_hashes_calculate(prev_share_hash, height);
+        auto [new_transaction_hashes, transaction_hash_refs, other_transaction_hashes] = new_tx_hashes_calculate(version, prev_share_hash, height);
 
         set<uint256> included_transactions = set<uint256>(other_transaction_hashes.begin(),
                                                           other_transaction_hashes.end());
@@ -228,7 +228,7 @@ namespace shares
         return std::make_tuple(max_bits, bits);
     }
 
-    std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> GenerateShareTransaction::new_tx_hashes_calculate(uint256 prev_share_hash, int32_t height)
+    std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> GenerateShareTransaction::new_tx_hashes_calculate(uint64_t version, uint256 prev_share_hash, int32_t height)
     {
         vector<uint256> new_transaction_hashes;
         int32_t all_transaction_stripped_size = 0;
@@ -242,6 +242,7 @@ namespace shares
         auto past_shares_generator = tracker->get_chain(prev_share_hash, std::min(height, 100));
         map<uint256, tuple<int, int>> tx_hash_to_this;
 
+        if (version < 34)
         {
             uint256 _hash;
             int32_t i = 0;
@@ -377,6 +378,7 @@ namespace shares
                 sum_weights += v.second;
             }
 
+            LOG_INFO << "GCW RESULT: total_weight = " << total_weight.ToString() << "; sum_weights = " << sum_weights.ToString() << "; donation_weight = " << donation_weight.ToString() << "; sum = " << (sum_weights + donation_weight).ToString() << "; equal?: " << (total_weight == (sum_weights + donation_weight));
             assert(total_weight == (sum_weights + donation_weight));
         }
 
