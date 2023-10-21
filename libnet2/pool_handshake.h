@@ -43,6 +43,7 @@ public:
                         LOG_DEBUG_POOL << "Stops: " << _stops;
 
                         LOG_DEBUG_POOL << "get_shares called!";
+//                        auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, 10 /*_parents*/, _stops);
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
                         _socket->write(msg);
                     }, 15, [_socket = socket](std::string msg){LOG_WARNING << msg; _socket->disconnect();})), handle_message_version(std::move(_handler))
