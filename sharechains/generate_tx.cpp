@@ -515,15 +515,15 @@ namespace shares
         }
 
         // DEBUG tx_outs
-        int _i = 0;
-        LOG_DEBUG_SHARETRACKER << "DEBUG_TX_OUTS";
-        for (const auto& _tx : tx_outs)
-        {
-            coind::data::stream::TxOutType_stream packed_tx_out(_tx);
-            auto data = pack<coind::data::stream::TxOutType_stream>(packed_tx_out);
-            LOG_DEBUG_SHARETRACKER << _i << "(" << _tx.value << "/" << coind::data::script2_to_address(PackStream(_tx.script), net->parent->ADDRESS_VERSION, -1, net) << "): [" << data << "].";
-            _i += 1;
-        }
+//        int _i = 0;
+//        LOG_DEBUG_SHARETRACKER << "DEBUG_TX_OUTS";
+//        for (const auto& _tx : tx_outs)
+//        {
+//            coind::data::stream::TxOutType_stream packed_tx_out(_tx);
+//            auto data = pack<coind::data::stream::TxOutType_stream>(packed_tx_out);
+//            LOG_DEBUG_SHARETRACKER << _i << "(" << _tx.value << "/" << coind::data::script2_to_address(PackStream(_tx.script), net->parent->ADDRESS_VERSION, -1, net) << "): [" << data << "].";
+//            _i += 1;
+//        }
 
         // MAKE GENTX
         gentx = std::make_shared<coind::data::TransactionType>(1, tx_ins, tx_outs, 0);
