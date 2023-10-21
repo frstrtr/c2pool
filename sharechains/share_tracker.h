@@ -488,9 +488,7 @@ public:
         {
             // 0
             LOG_INFO << algh_steps << "01";
-            return {{},
-                    {},
-                    {}};
+            return {{}, {}, {}};
         }
 
         auto [start_height, last] = get_height_and_last(start);
@@ -551,6 +549,7 @@ public:
         if (extra_ending.has_value())
         {
             algh_steps += "3->";
+            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << std::get<0>(prev).hash();
             auto result_sum = get_sum(start, std::get<0>(prev).hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
@@ -578,10 +577,19 @@ public:
             total_donation_weights += (desired_weight - total_weights)/65535*extra_ending->total_donation_weight/(extra_ending->total_weight/65535);
             total_weights = desired_weight;
 
+            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
+            LOG_INFO << "extra_ending.amount: ";
+            for (auto v : extra_ending->amount)
+            {
+                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
+            }
+            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
+            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
             LOG_INFO << algh_steps << "02";
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
+            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << std::get<0>(prev).prev();
             auto result_sum = get_sum(start, /*std::get<2>(prev)*/std::get<0>(prev).prev());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
