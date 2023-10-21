@@ -270,19 +270,31 @@ public:
             return false;
 
         auto height_up = child_height - height;
+        LOG_INFO << "HEIGHT_UP = " << height_up;
+        LOG_INFO << "child_height = " << child_height;
+        LOG_INFO << "get_nth height = " << std::get<0>(get_height_and_last(get_nth_parent_key(possible_child, height_up)));
+        LOG_INFO << "nth_parent_key = " << get_nth_parent_key(possible_child, height_up).ToString();
+        LOG_INFO << "nth height_up = " << child_height - std::get<0>(get_height_and_last(get_nth_parent_key(possible_child, height_up)));
+
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
     virtual hash_type get_nth_parent_key(hash_type hash, int32_t n) const
     {
         shared_lock lock(mutex_);
+        std::fstream f("tracker_debug/nth_parent_"+hash.ToString()+"_"+to_string(n), std::ios_base::out);
         for (int i = 0; i < n; i++)
         {
             if (items.find(hash) != items.end())
+            {
+                f << hash.ToString() << "(prev:" + items.at(hash)->previous_hash->ToString() + ") -> " << i << "[max=" << n << "];\n";
                 hash = *items.at(hash)->previous_hash;
+            }
             else
                 throw std::invalid_argument("get_nth_parent_key: items not exis't hash");
         }
+        f << hash.ToString() << "(prev:" + items.at(hash)->previous_hash->ToString() + ") -> " << n-1 << "[max=" << n << "];\n";
+        f.close();
         return hash;
     }
 
@@ -323,7 +335,7 @@ public:
     sum_element get_sum(hash_type item, hash_type ancestor)
     {
         if (!is_child_of(ancestor, item))
-            throw std::invalid_argument("get_sum item not child for ancestor");
+            throw std::invalid_argument("get_sum item[" + item.ToString() + "] not child for ancestor[" + ancestor.ToString() + "]");
 
         auto [result, _head, _tail] = get_sum_to_last(item);
         auto [ances, _head2, _tail2] = get_sum_to_last(ancestor);
