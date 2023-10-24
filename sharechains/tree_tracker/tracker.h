@@ -79,9 +79,7 @@ public:
 
         // Make new tracker element
         auto value = make_element(_value);
-        added_items_log << value.hash() << "\n";
-        if (value.hash() == uint256S("80345912fa6e6b94dc5d70df8a453fb94b4c0e4e8d20ae606c3dcd20ca7be553"))
-            std::cout << "HERE";
+        added_items_log << value.hash() << " " << value.prev() << "\n";
 
         if (items.find(value.hash()) != items.end())
             throw std::invalid_argument("item already present!");
