@@ -219,7 +219,7 @@ private:
 
                 if (!node->left)
                     node->left = make_node(node->index_l, (node->index_l+node->index_r)/2, nullptr, nullptr);
-                else if (!node->right)
+                if (!node->right)
                     node->right = make_node((node->index_l+node->index_r)/2 + 1, node->index_r, nullptr, nullptr);
 
                 recalculate_node(node->left, value, index);

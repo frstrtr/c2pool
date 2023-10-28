@@ -152,6 +152,7 @@ namespace coind::data
 		coind::data::stream::TxIDType_stream txid_stream(tx->version, tx->tx_ins, tx->tx_outs, tx->lock_time);
 		PackStream stream;
 		stream << txid_stream;
+        LOG_INFO << "TXID stream: " << stream;
 		return hash256(stream, true);
 	}
 
