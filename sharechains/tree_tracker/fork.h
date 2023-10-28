@@ -102,7 +102,7 @@ public:
         {
             // insert to front
             while (!clusters.front().insert(value))
-                clusters.emplace_back(cluster_size, false); // emplace left orientation
+                clusters.emplace_front(cluster_size, false); // emplace left orientation
 
             tail = value.prev();
             return;
