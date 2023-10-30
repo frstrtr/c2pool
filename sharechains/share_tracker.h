@@ -546,6 +546,7 @@ public:
             }
         }
 
+        // Если мы почти набрали предел и следующая шара переваливает по весу, то каждый воркер, указанный в этой шаре, будет эвивалентно процентно получать соответствующую ему долю.
         if (extra_ending.has_value())
         {
             algh_steps += "3->";
@@ -556,8 +557,10 @@ public:
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
+            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
+
             auto [_script, _weight] = *extra_ending->amount.begin();
-            //TODO: test
+            //TODO: test (если много воркеров, может происходить неправильное округление)
             std::pair<std::vector<unsigned char>, arith_uint288> new_weight = {_script,
                                                                                (desired_weight - total_weights) /
                                                                                65535 * _weight /
