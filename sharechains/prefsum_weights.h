@@ -68,6 +68,21 @@ namespace shares::weight
             total_weight -= element.total_weight;
             total_donation_weight -= element.total_donation_weight;
         }
+
+        friend std::ostream &operator<<(std::ostream &stream, weight_data &v)
+        {
+            stream << "(weight_data: ";
+            stream << "total_weight = " << v.total_weight.GetHex();
+            stream << ", total_donation_weight = " << v.total_donation_weight.GetHex();
+            stream << ", amount = {";
+            for (const auto &am : v.amount)
+            {
+                stream << "(" << am.first << ": " << am.second.GetHex() << "); ";
+            }
+            stream << "})";
+
+            return stream;
+        }
     };
 //	class weight_element;
 //	typedef std::shared_ptr<weight_element> weight_element_ptr;
