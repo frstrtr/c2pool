@@ -29,7 +29,8 @@ track = tracker.Tracker(delta_type=tracker.get_attributedelta_type(dict(tracker.
                                                                         i = lambda share: share.i
                                                                         )))
 
-f = open("added_shares_cut.txt", 'r')
+# f = open("added_shares_cut.txt", 'r')
+f = open("added_shares.txt", 'r')
 for line in f:
     loaded_share = PresudoShare(line.split(' '), 100)
     track.add(loaded_share)
@@ -37,7 +38,8 @@ for line in f:
 write_ht(track)
 
 
-item = num("d44220af7fbb4269d7bdb5d82bc094c60bfb9092ef70dd249e33ea280cc45354")
+# item = num("d44220af7fbb4269d7bdb5d82bc094c60bfb9092ef70dd249e33ea280cc45354")
+item = num("d2c5c02c0353c25607aa5e58bcf47dae875fc485ddb04a1b28676f671d7807cb")
 possible_child = num('88a43ff1490f9dc626cb478b03a6ca6bf572cb6c346a508d9b7d4ff7883344d6')
 
 is_child = track.is_child_of(item, possible_child)
