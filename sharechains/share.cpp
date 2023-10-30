@@ -106,6 +106,8 @@ void Share::init()
 //        LOG_TRACE.stream() << "INIT hash_link_data(packed_z): " << packed_z;
         hash_link_data.insert(hash_link_data.end(), packed_z.data.begin(), packed_z.data.end());
     }
+    LOG_INFO.stream() << "hash_link_data = " << hash_link_data;
+    LOG_INFO.stream() << "gentx_before_refhash = " << net->gentx_before_refhash;
 
     gentx_hash = shares::check_hash_link(hash_link, hash_link_data, net->gentx_before_refhash);
 
@@ -247,6 +249,8 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
             if self.naughty > 6:
                 self.naughty = 0
      */
+
+    LOG_INFO << "GENTX FOR SHARE: " << hash << "; " << *gentx->gentx;
 
     assert(other_tx_hashes == gentx->other_transaction_hashes);
     if (*share_info->get() != *gentx->share_info)
