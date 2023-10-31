@@ -810,7 +810,7 @@ stale_counts Worker::get_stale_counts()
     if (_coind_node->best_share->value().IsNull())
         delta = DOAElement{0,0,0,0};
     else
-        delta = *(std::get<0>(_tracker->get_sum_to_last(_coind_node->best_share->value())).rules.get<DOAElement>("doa"));
+        delta = *(_tracker->get_sum_to_last(_coind_node->best_share->value()).sum.rules.get<DOAElement>("doa"));
 
     auto my_shares_in_chain = delta.my_count + _removed_unstales;
     auto my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales->value();

@@ -211,8 +211,15 @@ public:
         return (items.find(hash) != items.end());
     }
 
+    struct sum_to_last
+    {
+        sum_element sum;
+        hash_type head;
+        hash_type tail;
+    };
+
     // sum_element, head, tail
-    std::tuple<sum_element, hash_type, hash_type> get_sum_to_last(hash_type hash)
+    sum_to_last get_sum_to_last(hash_type hash)
     {
         sum_element result;
 
@@ -231,14 +238,14 @@ public:
                 fork = fork->prev_fork;
             }
         } else
-            return std::make_tuple(sum_element(hash), hash, hash);
+            return {sum_element(hash), hash, hash};
 
-        return std::make_tuple(result, hash, fork_by_key[hash]->get_chain_tail());
+        return {result, hash, fork_by_key[hash]->get_chain_tail()};
     }
 
     int32_t get_height(hash_type hash)
     {
-        return std::get<0>(get_sum_to_last(hash)).height;
+        return get_sum_to_last(hash).sum.height;
     }
 
     hash_type get_last(hash_type hash)
@@ -249,14 +256,20 @@ public:
         return fork != fork_by_key.end() ? fork->second->get_chain_tail() : hash;
     }
 
-    std::tuple<int32_t, hash_type> get_height_and_last(hash_type item)
+    struct height_and_last
+    {
+        int32_t height;
+        hash_type last;
+    };
+
+    height_and_last get_height_and_last(hash_type item)
     {
         return {get_height(item), get_last(item)};
     }
 
     bool is_child_of(hash_type item, hash_type possible_child)
     {
-        // item = possible_child -> объект сам себе дочерний, true.
+        // item = possible_child -> объект сам себе дочерний, true
         if (item == possible_child)
             return true;
 
@@ -270,9 +283,9 @@ public:
         auto height_up = child_height - height;
         LOG_INFO << "HEIGHT_UP = " << height_up;
         LOG_INFO << "child_height = " << child_height;
-        LOG_INFO << "get_nth height = " << std::get<0>(get_height_and_last(get_nth_parent_key(possible_child, height_up)));
+        LOG_INFO << "get_nth height = " << get_height_and_last(get_nth_parent_key(possible_child, height_up)).height;
         LOG_INFO << "nth_parent_key = " << get_nth_parent_key(possible_child, height_up).ToString();
-        LOG_INFO << "nth height_up = " << child_height - std::get<0>(get_height_and_last(get_nth_parent_key(possible_child, height_up)));
+        LOG_INFO << "nth height_up = " << child_height - get_height_and_last(get_nth_parent_key(possible_child, height_up)).height;
 
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }

@@ -503,18 +503,18 @@ public:
         // Поиск desired_weight
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
-        auto desired_sum_weight = std::get<0>(get_sum_to_last(start)).weight.total_weight >= desired_weight ? std::get<0>(get_sum_to_last(start)).weight.total_weight - desired_weight : arith_uint288();
+        auto desired_sum_weight = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : arith_uint288();
         auto cur = get_sum_to_last(start);
         auto prev = get_sum_to_last(start);
         std::optional<shares::weight::weight_data> extra_ending;
 
-        while(std::get<0>(cur).hash() != last)
+        while(cur.sum.hash() != last)
         {
             algh_steps += "2->";
-            if (std::get<0>(cur).weight.total_weight >= desired_sum_weight)
+            if (cur.sum.weight.total_weight >= desired_sum_weight)
             {
                 algh_steps += "2.1->";
-                for (auto [k, v]: std::get<0>(cur).weight.amount)
+                for (auto [k, v]: cur.sum.weight.amount)
                 {
                     if (weights.find(k) != weights.end())
                     {
@@ -529,16 +529,16 @@ public:
             } else
             {
                 algh_steps += "2.2->";
-                extra_ending = std::make_optional<shares::weight::weight_data>(std::get<0>(cur).share);
+                extra_ending = std::make_optional<shares::weight::weight_data>(cur.sum.share);
                 break;
             }
 
             prev = cur;
 
-            if (exist(std::get<0>(cur).prev()))
+            if (exist(cur.sum.prev()))
             {
                 algh_steps += "2.31->";
-                cur = get_sum_to_last(std::get<0>(cur).prev());
+                cur = get_sum_to_last(cur.sum.prev());
             } else
             {
                 algh_steps += "2.32->";
@@ -550,8 +550,8 @@ public:
         if (extra_ending.has_value())
         {
             algh_steps += "3->";
-            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << std::get<0>(prev).hash();
-            auto result_sum = get_sum(start, std::get<0>(prev).hash());
+            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << prev.sum.hash();
+            auto result_sum = get_sum(start, prev.sum.hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
@@ -592,8 +592,8 @@ public:
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
-            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << std::get<0>(prev).prev();
-            auto result_sum = get_sum(start, /*std::get<2>(prev)*/std::get<0>(prev).prev());
+            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << prev.sum.prev();
+            auto result_sum = get_sum(start, /*std::get<2>(prev)*/prev.sum.prev());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
