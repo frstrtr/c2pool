@@ -503,45 +503,49 @@ public:
         // Поиск desired_weight
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
-        auto desired_sum_weight = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : arith_uint288();
+        auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : arith_uint288();
         auto cur = get_sum_to_last(start);
         auto prev = get_sum_to_last(start);
         std::optional<shares::weight::weight_data> extra_ending;
 
-        while(cur.sum.hash() != last)
+        while (cur.sum.hash() != last)
         {
             algh_steps += "2->";
-            if (cur.sum.weight.total_weight >= desired_sum_weight)
+            if (limit == cur.sum.weight.total_weight)
             {
                 algh_steps += "2.1->";
-                for (auto [k, v]: cur.sum.weight.amount)
-                {
-                    if (weights.find(k) != weights.end())
-                    {
-                        algh_steps += "2.11->";
-                        weights[k] += v;
-                    } else
-                    {
-                        algh_steps += "2.12->";
-                        weights[k] = v;
-                    }
-                }
-            } else
-            {
-                algh_steps += "2.2->";
-                extra_ending = std::make_optional<shares::weight::weight_data>(cur.sum.share);
                 break;
             }
 
-            prev = cur;
+            if (limit > cur.sum.weight.total_weight)
+            {
+                algh_steps += "2.2->";
+                extra_ending = std::make_optional<shares::weight::weight_data>(prev.sum.share);
+                break;
+            }
 
+            algh_steps += "2.3->";
+            for (auto [k, v]: cur.sum.weight.amount)
+            {
+                if (weights.find(k) != weights.end())
+                {
+                    algh_steps += "2.31->";
+                    weights[k] += v;
+                } else
+                {
+                    algh_steps += "2.32->";
+                    weights[k] = v;
+                }
+            }
+
+            prev = cur;
             if (exist(cur.sum.prev()))
             {
-                algh_steps += "2.31->";
+                algh_steps += "2.41->";
                 cur = get_sum_to_last(cur.sum.prev());
             } else
             {
-                algh_steps += "2.32->";
+                algh_steps += "2.42->";
                 break;
             }
         }
@@ -615,4 +619,3 @@ public:
 
     std::map<std::vector<unsigned char>, double> get_expected_payouts(uint256 best_share_hash, uint256 block_target, uint64_t subsidy);
 };
-
