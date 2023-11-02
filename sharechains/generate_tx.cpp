@@ -399,7 +399,7 @@ namespace shares
         {
             auto weight = v.second.getdouble();
 
-            amounts.push_back({v.first, weight*199*d_subsidy/(200*d_total_weight)});
+            amounts.push_back({v.first, (weight*d_subsidy*199)/(200*d_total_weight)});
             LOG_INFO.stream() << v.second.GetHex() << " * " << 199 << " * " << _share_data.subsidy << " / (200 * " << total_weight.GetHex() << ").";
             LOG_INFO.stream() << amounts.back().address << "; " << amounts.back().amount;
         }
@@ -436,16 +436,16 @@ namespace shares
                 return value.address == donation_address;
             });
 
-            double sum_amounts = 0;
+            arith_uint288 sum_amounts = 0;
             for (const auto& v: amounts)
-                sum_amounts += v.amount;
+                sum_amounts += arith_uint288((uint64_t)v.amount);
 
             if (_donation_amount == amounts.end())
-                amounts.push_back({donation_address, _share_data.subsidy - sum_amounts});
+                amounts.push_back({donation_address, d_subsidy - sum_amounts.getdouble()});
             else
-               _donation_amount->amount += _share_data.subsidy - sum_amounts;
+               _donation_amount->amount += d_subsidy - sum_amounts.getdouble();
 
-            LOG_INFO << "AMOUNTS3: ";
+            LOG_INFO << "AMOUNTS3:";
             for (const auto& [addr, amount] : amounts)
             {
                 LOG_INFO.stream() << addr << "; " << amount;
