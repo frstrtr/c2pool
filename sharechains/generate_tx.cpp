@@ -134,7 +134,7 @@ namespace shares
 //      witness_reserved_value_str = '[P2Pool]'*4
 //		witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
 //		witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
-        const char* witness_reserved_value_str = "[C2Pool][C2Pool][C2Pool][C2Pool]";
+        const char* witness_reserved_value_str = "[P2Pool][P2Pool][P2Pool][P2Pool]";
         uint256 witness_commitment_hash;
         if (segwit_activated && _segwit_data.has_value())
         {
@@ -486,7 +486,7 @@ namespace shares
         std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
         for (const auto& addr: dests)
         {
-            if (!ArithToUint256(_amounts[addr]).IsNull() || addr == donation_address)
+            if (!ArithToUint256(_amounts[addr]).IsNull() || addr != donation_address)
             {
                 tx_outs.emplace_back(_amounts[addr].GetLow64(), coind::data::address_to_script2(std::string{addr.begin(), addr.end()}, net).data); //value, script
             }

@@ -281,11 +281,11 @@ public:
             return false;
 
         auto height_up = child_height - height;
-        LOG_INFO << "HEIGHT_UP = " << height_up;
-        LOG_INFO << "child_height = " << child_height;
-        LOG_INFO << "get_nth height = " << get_height_and_last(get_nth_parent_key(possible_child, height_up)).height;
-        LOG_INFO << "nth_parent_key = " << get_nth_parent_key(possible_child, height_up).ToString();
-        LOG_INFO << "nth height_up = " << child_height - get_height_and_last(get_nth_parent_key(possible_child, height_up)).height;
+//        LOG_INFO << "HEIGHT_UP = " << height_up;
+//        LOG_INFO << "child_height = " << child_height;
+//        LOG_INFO << "get_nth height = " << get_height_and_last(get_nth_parent_key(possible_child, height_up)).height;
+//        LOG_INFO << "nth_parent_key = " << get_nth_parent_key(possible_child, height_up).ToString();
+//        LOG_INFO << "nth height_up = " << child_height - get_height_and_last(get_nth_parent_key(possible_child, height_up)).height;
 
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
