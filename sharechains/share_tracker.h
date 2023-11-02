@@ -504,6 +504,7 @@ public:
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : arith_uint288();
+        LOG_INFO.stream() << "limit = " << limit.GetHex();
         auto cur = get_sum_to_last(start);
         auto next = get_sum_to_last(cur.sum.prev());
         std::optional<shares::weight::weight_data> extra_ending;
