@@ -352,6 +352,12 @@ namespace shares
 
     std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
     {
+        struct weight_amount
+        {
+            std::vector<unsigned char> address;
+            double amount;
+        };
+
         std::map<std::vector<unsigned char>, arith_uint288> weights;
         arith_uint288 total_weight;
         arith_uint288 donation_weight;
@@ -369,11 +375,15 @@ namespace shares
             donation_weight = std::get<2>(weights_result);
         }
 
+        double d_subsidy = _share_data.subsidy;
+        double d_total_weight = total_weight.getdouble();
+
+
         //assert
         {
             arith_uint288 sum_weights;
             sum_weights.SetHex("0");
-            for (auto v : weights)
+            for (const auto& v : weights)
             {
                 sum_weights += v.second;
             }
@@ -384,12 +394,14 @@ namespace shares
 
         // 99.5% goes according to weights prior to this share
         LOG_INFO << "AMOUNTS1: ";
-        std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts;
+        std::vector<weight_amount> amounts;
         for (const auto& v : weights)
         {
-            amounts.emplace_back(v.first, v.second*199*_share_data.subsidy/(200*total_weight));
+            auto weight = v.second.getdouble();
+
+            amounts.push_back({v.first, weight*199*d_subsidy/(200*d_total_weight)});
             LOG_INFO.stream() << v.second.GetHex() << " * " << 199 << " * " << _share_data.subsidy << " / (200 * " << total_weight.GetHex() << ").";
-            LOG_INFO.stream() << std::get<0>(amounts.back()) << "; " << std::get<1>(amounts.back()).GetHex();
+            LOG_INFO.stream() << amounts.back().address << "; " << amounts.back().amount;
         }
 
         // 0.5% goes to block finder
@@ -398,20 +410,20 @@ namespace shares
             std::vector<unsigned char> this_address{_this_address.begin(), _this_address.end()};
 
             auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_address](const auto& value){
-                return std::get<0>(value) == this_address;
+                return value.address == this_address;
             });
 
             LOG_INFO.stream() << "this_address = " << this_address;
-            LOG_INFO << "subsidy = " << _share_data.subsidy << "; subsidy/200 = " << _share_data.subsidy/200;
+            LOG_INFO << "subsidy = " << _share_data.subsidy << "; subsidy/200 = " << d_subsidy/200;
             if (_this_amount == amounts.end())
-                amounts.emplace_back(this_address, _share_data.subsidy/200);
+                amounts.push_back({this_address, d_subsidy/200});
             else
-                std::get<1>(*_this_amount) += _share_data.subsidy/200;
+                _this_amount->amount += d_subsidy/200;
 
             LOG_INFO << "AMOUNTS2: ";
             for (const auto& [addr, amount] : amounts)
             {
-                LOG_INFO.stream() << addr << "; " << amount.GetHex();
+                LOG_INFO.stream() << addr << "; " << amount;
             }
         }
 
@@ -421,31 +433,37 @@ namespace shares
             std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
 
             auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const auto& value){
-                return std::get<0>(value) == donation_address;
+                return value.address == donation_address;
             });
 
-            arith_uint288 sum_amounts{};
+            double sum_amounts = 0;
             for (const auto& v: amounts)
-                sum_amounts += std::get<1>(v);
+                sum_amounts += v.amount;
 
             if (_donation_amount == amounts.end())
-                amounts.emplace_back(donation_address, _share_data.subsidy - sum_amounts);
+                amounts.push_back({donation_address, _share_data.subsidy - sum_amounts});
             else
-                std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
+               _donation_amount->amount += _share_data.subsidy - sum_amounts;
 
             LOG_INFO << "AMOUNTS3: ";
             for (const auto& [addr, amount] : amounts)
             {
-                LOG_INFO.stream() << addr << "; " << amount.GetHex();
+                LOG_INFO.stream() << addr << "; " << amount;
             }
         }
 
-        if (std::accumulate(amounts.begin(), amounts.end(), arith_uint288{}, [&](arith_uint288 v, const std::tuple<std::vector<unsigned char>, arith_uint288> &p ){
+        std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> result;
+        for (const auto& v : amounts)
+        {
+            result.emplace_back(v.address, arith_uint288{(uint64_t)v.amount});
+        }
+
+        if (std::accumulate(result.begin(), result.end(), arith_uint288{}, [&](arith_uint288 v, const std::tuple<std::vector<unsigned char>, arith_uint288> &p ){
             return v + std::get<1>(p);
         }) != _share_data.subsidy)
             throw std::invalid_argument("Invalid subsidy!");
 
-        return amounts;
+        return result;
     }
 
     coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
