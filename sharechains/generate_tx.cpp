@@ -383,10 +383,13 @@ namespace shares
         }
 
         // 99.5% goes according to weights prior to this share
+        LOG_INFO << "AMOUNTS1: ";
         std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts;
         for (const auto& v : weights)
         {
             amounts.emplace_back(v.first, v.second*199*_share_data.subsidy/(200*total_weight));
+            LOG_INFO.stream() << v.second.GetHex() << " * " << 199 << " * " << _share_data.subsidy << " / (200 * " << total_weight.GetHex() << ").";
+            LOG_INFO.stream() << std::get<0>(amounts.back()) << "; " << std::get<1>(amounts.back()).GetHex();
         }
 
         // 0.5% goes to block finder
@@ -398,10 +401,18 @@ namespace shares
                 return std::get<0>(value) == this_address;
             });
 
+            LOG_INFO.stream() << "this_address = " << this_address;
+            LOG_INFO << "subsidy = " << _share_data.subsidy << "; subsidy/200 = " << _share_data.subsidy/200;
             if (_this_amount == amounts.end())
                 amounts.emplace_back(this_address, _share_data.subsidy/200);
             else
                 std::get<1>(*_this_amount) += _share_data.subsidy/200;
+
+            LOG_INFO << "AMOUNTS2: ";
+            for (const auto& [addr, amount] : amounts)
+            {
+                LOG_INFO.stream() << addr << "; " << amount.GetHex();
+            }
         }
 
         //all that's left over is the donation weight and some extra satoshis due to rounding
@@ -421,6 +432,12 @@ namespace shares
                 amounts.emplace_back(donation_address, _share_data.subsidy - sum_amounts);
             else
                 std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
+
+            LOG_INFO << "AMOUNTS3: ";
+            for (const auto& [addr, amount] : amounts)
+            {
+                LOG_INFO.stream() << addr << "; " << amount.GetHex();
+            }
         }
 
         if (std::accumulate(amounts.begin(), amounts.end(), arith_uint288{}, [&](arith_uint288 v, const std::tuple<std::vector<unsigned char>, arith_uint288> &p ){
@@ -436,9 +453,11 @@ namespace shares
         coind::data::tx_type gentx;
 
         std::map<std::vector<unsigned char>, arith_uint288> _amounts;
+        LOG_INFO << "AMOUNTS: ";
         for (const auto& v : amounts)
         {
             _amounts[std::get<0>(v)] = std::get<1>(v);
+            LOG_INFO.stream() << "\t" << std::get<0>(v) << ": " << std::get<1>(v).GetHex();
         }
 
         std::vector<std::vector<unsigned char>> dests;
