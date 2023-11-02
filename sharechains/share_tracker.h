@@ -598,8 +598,8 @@ public:
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
-            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.prev();
-            auto result_sum = get_sum(start, /*std::get<2>(prev)*/cur.sum.prev());
+            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
+            auto result_sum = get_sum(start, /*std::get<2>(prev)*/cur.sum.hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
