@@ -106,7 +106,7 @@ public:
         if (tails.count(value.hash()))
             state |= only_tails;
 
-        LOG_INFO << "Added share: hash = " << value.hash() << ", prev = " << value.prev();
+        LOG_INFO << "Added share: hash = " << value.hash() << ", prev = " << value.prev() << "; tracker.size = " << items.size();
 //        LOG_INFO << "heads: " << heads;
 //        LOG_INFO << "tails: " << tails;
 
