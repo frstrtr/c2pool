@@ -75,3 +75,25 @@ c2pool
     (TxOutType: value = 1, script = [ 118, 169, 20, 208, 61, 166, 252, 163, 144, 22, 109, 2, 11, 224, 231, 194, 138, 200, 204, 112, 245, 132, 3, 136, 172, ]),
     (TxOutType: value = 1, script = [ 65, 4, 255, 208, 61, 228, 74, 110, 17, 185, 145, 127, 58, 41, 249, 68, 50, 131, 217, 135, 28, 157, 116, 62, 243, 13, 94, 221, 205, 55, 9, 75, 100, 209, 179, 216, 9, 4, 150, 181, 50, 86, 120, 107, 245, 200, 41, 50, 236, 35, 195, 183, 77, 159, 5, 166, 249, 90, 139, 85, 41, 53, 38, 86, 102, 75, 172, ]),
     (TxOutType: value = 0, script = [ 106, 40, 148, 59, 87, 5, 251, 155, 74, 225, 168, 116, 211, 78, 167, 129, 202, 240, 124, 16, 123, 99, 88, 159, 71, 84, 197, 129, 77, 203, 65, 167, 126, 48, 0, 0, 0, 0, 1, 0, 0, 0, ]), ]
+
+
+
+====================
+4 fix
+
+p2pool:
+#SUM AMOUNTS: 625002709
+#AMOUNTS: {'mvR7qRci7meP6aZ1RkyQzasvt2FU2ypRMb': 625002709L, 'mzW2hdZN2um7WBvTDerdahKqRgj3md9C29': 1L}
+
+#{'version': 1, 'tx_ins': [{'previous_output': None, 'sequence': None, 'script': '\x03\xfd .'}], 'tx_outs': [{'value': 0, 'script': 'j$\xaa!\xa9\xed\xbcsa\xdd%\xb8|x\x9dv\xd6\x0e\xe4\x1e\xdc\x08\xbbGI\xfc\r\xea\xc9@\xccuB\x8d9\xe9\xdb9'}, {'value': 625002709L, 'script': 'v\xa9\x14\xa3oZ\xf5\xd8\xdax\xfb\xc9\x00i\xa2L\xba\xb9v8\xaa4\xaf\x88\xac'}, {'script': 'A\x04\xff\xd0=\xe4Jn\x11\xb9\x91\x7f:)\xf9D2\x83\xd9\x87\x1c\x9dt>\xf3\r^\xdd\xcd7\tKd\xd1\xb3\xd8\t\x04\x96\xb52Vxk\xf5\xc8)2\xec#\xc3\xb7M\x9f\x05\xa6\xf9Z\x8bU)5&VfK\xac', 'value': 1L}, {'value': 0, 'script': 'j(\x1a4\xcc\x07\xce\xa0\xe5\xce\xbd\xd6Na\x982X\xf3M\xfc#v\x960\xeb\xca\xb1\x9d\xc0=\xfdn\xe6\x0f\x00\x00\x00\x00\x01\x00\x00\x00'}], 'lock_time': 0, 'marker': 0, 'flag': 1, 'witness': [['[P2Pool][P2Pool][P2Pool][P2Pool]']]}
+
+    {'value': 0, 'script': 'j$\xaa!\xa9\xed\xbcsa\xdd%\xb8|x\x9dv\xd6\x0e\xe4\x1e\xdc\x08\xbbGI\xfc\r\xea\xc9@\xccuB\x8d9\xe9\xdb9'},
+    {'value': 625002709L, 'script': 'v\xa9\x14\xa3oZ\xf5\xd8\xdax\xfb\xc9\x00i\xa2L\xba\xb9v8\xaa4\xaf\x88\xac'},
+    {'value': 1L, 'script': 'A\x04\xff\xd0=\xe4Jn\x11\xb9\x91\x7f:)\xf9D2\x83\xd9\x87\x1c\x9dt>\xf3\r^\xdd\xcd7\tKd\xd1\xb3\xd8\t\x04\x96\xb52Vxk\xf5\xc8)2\xec#\xc3\xb7M\x9f\x05\xa6\xf9Z\x8bU)5&VfK\xac'},
+    {'value': 0, 'script': 'j(\x1a4\xcc\x07\xce\xa0\xe5\xce\xbd\xd6Na\x982X\xf3M\xfc#v\x960\xeb\xca\xb1\x9d\xc0=\xfdn\xe6\x0f\x00\x00\x00\x00\x01\x00\x00\x00'}],
+
+c2pool:
+
+(TxOutType: value = 0, script = [ 106, 36, 170, 33, 169, 237, 188, 115, 97, 221, 37, 184, 124, 120, 157, 118, 214, 14, 228, 30, 220, 8, 187, 71, 73, 252, 13, 234, 201, 64, 204, 117, 66, 141, 57, 233, 219, 57, ]),
+ (TxOutType: value = 0, script = [ 65, 4, 255, 208, 61, 228, 74, 110, 17, 185, 145, 127, 58, 41, 249, 68, 50, 131, 217, 135, 28, 157, 116, 62, 243, 13, 94, 221, 205, 55, 9, 75, 100, 209, 179, 216, 9, 4, 150, 181, 50, 86, 120, 107, 245, 200, 41, 50, 236, 35, 195, 183, 77, 159, 5, 166, 249, 90, 139, 85, 41, 53, 38, 86, 102, 75, 172, ]),
+  (TxOutType: value = 0, script = [ 106, 40, 26, 52, 204, 7, 206, 160, 229, 206, 189, 214, 78, 97, 152, 50, 88, 243, 77, 252, 35, 118, 150, 48, 235, 202, 177, 157, 192, 61, 253, 110, 230, 15, 0, 0, 0, 0, 1, 0, 0, 0, ]), ]

@@ -504,7 +504,7 @@ public:
         std::map<std::vector<unsigned char>, arith_uint288> weights;
 
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : arith_uint288();
-        LOG_INFO.stream() << "limit = " << limit.GetHex();
+//        LOG_INFO.stream() << "limit = " << limit.GetHex();
         auto cur = get_sum_to_last(start);
         auto next = get_sum_to_last(cur.sum.prev());
         std::optional<shares::weight::weight_data> extra_ending;
@@ -512,7 +512,7 @@ public:
         while (cur.sum.hash() != last)
         {
             algh_steps += "2->";
-            LOG_INFO.stream() << "[" << cur.sum.hash() << "->" << cur.sum.prev() << "]: total_weight = " << cur.sum.weight.total_weight.GetHex() << "; donation_weight = " << cur.sum.weight.total_donation_weight.GetHex();
+//            LOG_INFO.stream() << "[" << cur.sum.hash() << "->" << cur.sum.prev() << "]: total_weight = " << cur.sum.weight.total_weight.GetHex() << "; donation_weight = " << cur.sum.weight.total_donation_weight.GetHex();
             if (limit == next.sum.weight.total_weight)
             {
                 algh_steps += "2.1->";
@@ -556,14 +556,14 @@ public:
         if (extra_ending.has_value())
         {
             algh_steps += "3->";
-            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
+//            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
             auto result_sum = get_sum(start, cur.sum.hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
+//            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
 
             auto [_script, _weight] = *extra_ending->amount.begin();
             //TODO: test (если много воркеров, может происходить неправильное округление)
