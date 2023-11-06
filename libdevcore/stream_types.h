@@ -8,7 +8,6 @@
 
 #include <btclibs/util/strencodings.h>
 #include <btclibs/uint256.h>
-#include <btclibs/arith_uint256.h>
 
 #include "stream.h"
 #include "math.h"
@@ -331,9 +330,9 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
     {
         INT_T value2 = Getter<INT_T>::value;
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
-        int32_t len = std::distance(value2.begin(), value2.end());
+//        int32_t len = std::distance(value2.begin(), value2.end());
 
-        PackStream s(packed, len);
+        PackStream s(packed, INT_T::BYTES);
         stream << s;
 
         return stream;
@@ -567,7 +566,7 @@ struct FloatingInteger : public Getter<IntType(32)>
     {
 		auto shift_left = [&](int32_t _n, int32_t _m)
 		{
-			arith_uint256 n(_n);
+			uint256 n(_n);
 			if (_m >= 0)
 			{
 				n <<= _m;
@@ -576,7 +575,7 @@ struct FloatingInteger : public Getter<IntType(32)>
 				_m = -_m;
 				n >>= _m;
 			}
-			return ArithToUint256(n);
+			return n;
 		};
 
 		auto res = shift_left(value.get() & 0x00ffffff, 8 * ((value.get() >> 24) - 3));
