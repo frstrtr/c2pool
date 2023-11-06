@@ -10,7 +10,6 @@
 #include "util/strencodings.h"
 #include <btclibs/crypto/common.h>
 
-// TODO: test
 template <unsigned int BITS>
 base_uint<BITS>::base_uint(const std::string& str)
 {
@@ -20,12 +19,11 @@ base_uint<BITS>::base_uint(const std::string& str)
     DEBUG_UINT_UPDATE();
 }
 
-// TODO: test
 template <unsigned int BITS>
 base_uint<BITS>::base_uint(const std::vector<unsigned char>& vch)
 {
     static_assert(BITS/32 > 0 && BITS%32 == 0, "Template parameter BITS must be a positive multiple of 32.");
-    assert(vch.size() == sizeof(pn)*4);
+    assert(vch.size() == sizeof(pn));
 //    memcpy(m_data, vch.data(), sizeof(m_data));
     for (int x = 0; x < this->WIDTH; ++x)
     {
@@ -165,7 +163,6 @@ double base_uint<BITS>::getdouble() const
     return ret;
 }
 
-//TODO: test
 template <unsigned int BITS>
 std::string base_uint<BITS>::GetHex() const
 {
@@ -177,7 +174,6 @@ std::string base_uint<BITS>::GetHex() const
     return HexStr(m_data_rev);
 }
 
-// TODO: test
 template <unsigned int BITS>
 void base_uint<BITS>::SetHex(const char* psz)
 {
@@ -218,14 +214,12 @@ void base_uint<BITS>::SetHex(const char* psz)
     DEBUG_UINT_UPDATE();
 }
 
-// TODO: test
 template <unsigned int BITS>
 void base_uint<BITS>::SetHex(const std::string& str)
 {
     SetHex(str.c_str());
 }
 
-//TODO: test
 template <unsigned int BITS>
 std::string base_uint<BITS>::ToString() const
 {
@@ -247,7 +241,6 @@ unsigned int base_uint<BITS>::bits() const
     return 0;
 }
 
-//TODO: test
 template <unsigned int BITS>
 std::vector<unsigned char> base_uint<BITS>::GetChars() const
 {
