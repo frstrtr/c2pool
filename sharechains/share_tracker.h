@@ -556,14 +556,14 @@ public:
         if (extra_ending.has_value())
         {
             algh_steps += "3->";
-//            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
+            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
             auto result_sum = get_sum(start, cur.sum.hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-//            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
+            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
 
             auto [_script, _weight] = *extra_ending->amount.begin();
             //TODO: test (если много воркеров, может происходить неправильное округление)
