@@ -21,6 +21,15 @@ class uint_error : public std::runtime_error {
 public:
     explicit uint_error(const std::string& str) : std::runtime_error(str) {}
 };
+#define DEBUG_UINT
+
+#ifdef DEBUG_UINT
+#define DEBUG_UINT_UPDATE() hex_data = GetHex()
+#define DEBUG_UINT_UPDATE_NUM(num) num.hex_data = num.GetHex();
+#else
+#define DEBUG_UINT_UPDATE()
+#define DEBUG_UINT_UPDATE_NUM(num)
+#endif
 
 /** Template base class for unsigned big integers. */
 template<unsigned int BITS>
@@ -29,20 +38,37 @@ class base_uint
 public:
     static_assert(BITS / 32 > 0 && BITS % 32 == 0, "Template parameter BITS must be a positive multiple of 32.");
     static constexpr int WIDTH = BITS / 32;
-    static constexpr int BYTES = BITS / 8; // old uint256.WIDTH
+    static constexpr int WIDTH_BYTES = BITS / 8; // old uint256.WIDTH
     uint32_t pn[WIDTH];
+
+#ifdef DEBUG_UINT
+    std::string hex_data;
+#endif
 public:
 
     base_uint()
     {
         for (int i = 0; i < WIDTH; i++)
             pn[i] = 0;
+
+        DEBUG_UINT_UPDATE();
     }
 
     base_uint(const base_uint& b)
     {
         for (int i = 0; i < WIDTH; i++)
             pn[i] = b.pn[i];
+
+        DEBUG_UINT_UPDATE();
+    }
+
+    base_uint(uint64_t b)
+    {
+        pn[0] = (unsigned int)b;
+        pn[1] = (unsigned int)(b >> 32);
+        for (int i = 2; i < WIDTH; i++)
+            pn[i] = 0;
+        DEBUG_UINT_UPDATE();
     }
 
     explicit base_uint(const std::string& str);
@@ -62,15 +88,8 @@ public:
     {
         for (int i = 0; i < WIDTH; i++)
             pn[i] = b.pn[i];
+        DEBUG_UINT_UPDATE();
         return *this;
-    }
-
-    base_uint(uint64_t b)
-    {
-        pn[0] = (unsigned int)b;
-        pn[1] = (unsigned int)(b >> 32);
-        for (int i = 2; i < WIDTH; i++)
-            pn[i] = 0;
     }
 
     const base_uint operator~() const
@@ -78,6 +97,7 @@ public:
         base_uint ret;
         for (int i = 0; i < WIDTH; i++)
             ret.pn[i] = ~pn[i];
+        DEBUG_UINT_UPDATE_NUM(ret);
         return ret;
     }
 
@@ -87,6 +107,7 @@ public:
         for (int i = 0; i < WIDTH; i++)
             ret.pn[i] = ~pn[i];
         ++ret;
+        DEBUG_UINT_UPDATE_NUM(ret);
         return ret;
     }
 
@@ -98,6 +119,7 @@ public:
         pn[1] = (unsigned int)(b >> 32);
         for (int i = 2; i < WIDTH; i++)
             pn[i] = 0;
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -105,6 +127,7 @@ public:
     {
         for (int i = 0; i < WIDTH; i++)
             pn[i] ^= b.pn[i];
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -112,6 +135,7 @@ public:
     {
         for (int i = 0; i < WIDTH; i++)
             pn[i] &= b.pn[i];
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -119,6 +143,7 @@ public:
     {
         for (int i = 0; i < WIDTH; i++)
             pn[i] |= b.pn[i];
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -126,6 +151,7 @@ public:
     {
         pn[0] ^= (unsigned int)b;
         pn[1] ^= (unsigned int)(b >> 32);
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -133,6 +159,7 @@ public:
     {
         pn[0] |= (unsigned int)b;
         pn[1] |= (unsigned int)(b >> 32);
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -148,12 +175,14 @@ public:
             pn[i] = n & 0xffffffff;
             carry = n >> 32;
         }
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
     base_uint& operator-=(const base_uint& b)
     {
         *this += -b;
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -162,6 +191,7 @@ public:
         base_uint b;
         b = b64;
         *this += b;
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -170,6 +200,7 @@ public:
         base_uint b;
         b = b64;
         *this += -b;
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -183,6 +214,7 @@ public:
         int i = 0;
         while (i < WIDTH && ++pn[i] == 0)
             i++;
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -191,6 +223,7 @@ public:
         // postfix operator
         const base_uint ret = *this;
         ++(*this);
+        DEBUG_UINT_UPDATE();
         return ret;
     }
 
@@ -200,6 +233,7 @@ public:
         int i = 0;
         while (i < WIDTH && --pn[i] == std::numeric_limits<uint32_t>::max())
             i++;
+        DEBUG_UINT_UPDATE();
         return *this;
     }
 
@@ -208,6 +242,7 @@ public:
         // postfix operator
         const base_uint ret = *this;
         --(*this);
+        DEBUG_UINT_UPDATE();
         return ret;
     }
 
@@ -261,6 +296,7 @@ public:
     void SetNull()
     {
         memset(pn, 0, sizeof(pn));
+        DEBUG_UINT_UPDATE();
     }
 
     uint64_t GetLow64() const
@@ -281,6 +317,7 @@ public:
     void Unserialize(Stream& s)
     {
         s.read(MakeWritableByteSpan(pn));
+        DEBUG_UINT_UPDATE();
     }
 };
 
