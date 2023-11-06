@@ -292,7 +292,6 @@ public:
         return true;
     }
 
-    //TODO: test
     void SetNull()
     {
         memset(pn, 0, sizeof(pn));
@@ -414,6 +413,28 @@ extern template class base_uint<128>;
 extern template class base_uint<160>;
 extern template class base_uint<256>;
 extern template class base_uint<288>;
+
+/* uint256 from const char *.
+ * This is a separate function because the constructor uint256(const char*) can result
+ * in dangerously catching uint256(0).
+ */
+inline uint256 uint256S(const char *str)
+{
+    uint256 rv;
+    rv.SetHex(str);
+    return rv;
+}
+/* uint256 from std::string.
+ * This is a separate function because the constructor uint256(const std::string &str) can result
+ * in dangerously catching uint256(0) via std::string(const char*).
+ */
+inline uint256 uint256S(const std::string &str)
+{
+    uint256 rv;
+    rv.SetHex(str);
+    return rv;
+}
+
 
 // json-128
 inline void to_json(nlohmann::json& j, const uint128& p)
