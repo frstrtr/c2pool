@@ -332,7 +332,7 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
         unsigned char *packed = reinterpret_cast<unsigned char *>(&value2);
 //        int32_t len = std::distance(value2.begin(), value2.end());
 
-        PackStream s(packed, INT_T::BYTES);
+        PackStream s(packed, INT_T::WIDTH_BYTES);
         stream << s;
 
         return stream;
@@ -340,19 +340,19 @@ struct ULongIntType : public Maker<ULongIntType<INT_T>, INT_T>, public Getter<IN
 
     virtual PackStream &read(PackStream &stream)
 	{
-        if (stream.size() < value_type::WIDTH)
-            throw packstream_exception("ULongIntType: stream size < value_type::WIDTH");
+        if (stream.size() < value_type::WIDTH_BYTES)
+            throw packstream_exception("ULongIntType: stream size < value_type::WIDTH_BYTES");
 
-		auto *packed = new unsigned char[value_type::WIDTH];
+		auto *packed = new unsigned char[value_type::WIDTH_BYTES];
 		//int32_t len = sizeof(value2) / sizeof(*packed);
 
-		for (int i = 0; i < value_type::WIDTH; i++)
+		for (int i = 0; i < value_type::WIDTH_BYTES; i++)
 		{
 			packed[i] = stream.data[i];
 		}
         std::vector<unsigned char> _packed;
-        _packed.insert(_packed.end(), stream.data.begin(), stream.data.begin() + value_type::WIDTH);
-		stream.data.erase(stream.data.begin(), stream.data.begin() + value_type::WIDTH);
+        _packed.insert(_packed.end(), stream.data.begin(), stream.data.begin() + value_type::WIDTH_BYTES);
+		stream.data.erase(stream.data.begin(), stream.data.begin() + value_type::WIDTH_BYTES);
 
         Getter<INT_T>::value = INT_T(_packed);
 //		auto *_value = reinterpret_cast<INT_T *>(packed);

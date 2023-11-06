@@ -5,6 +5,7 @@
 #include <libdevcore/types.h>
 #include <iostream>
 
+
 //const char* hex_num = "21c9716491c93e9a531f6ea06051bf16311dce9ac8c6d4fb606eedcc0e52106a";
 const char* hex_num = "00032a417a23fcd43a983a44b35da54becf63e847231b8ec8518e25c1fcd31a0";
 
@@ -17,8 +18,9 @@ TEST(Devcore_stream, type_uint256)
 	PackStream stream;
 	stream << packed_num;
 
+    auto vec = num.GetChars();
 	int i = 0;
-	for (auto v = num.begin(); v != num.end(); v++)
+	for (auto v = vec.begin(); v != vec.end(); v++)
 	{
 		ASSERT_EQ(*v, stream.data[i]);
 		i++;
@@ -26,10 +28,12 @@ TEST(Devcore_stream, type_uint256)
 	IntType(256) unpacked_num;
 	stream >> unpacked_num;
 
-	auto v2 = unpacked_num.get().begin();
-	for (auto v = num.begin(); v != num.end(); v++)
+    auto num2 = unpacked_num.get();
+	auto vec2 = num2.GetChars();
+    auto v2 = vec2.begin();
+	for (unsigned char & v : vec)
 	{
-		ASSERT_EQ(*v, *v2);
+		ASSERT_EQ(v, *v2);
 		v2++;
 	}
 
@@ -65,6 +69,15 @@ TEST(Devcore_stream, list_type_uint256)
 	// Unpack stream to unpacked_nums
 	ListType<IntType(256)> unpacked_nums;
 	stream >> unpacked_nums;
+
+    // Check ASSERT
+    int i = 0;
+    for (auto v : unpacked_nums.get())
+    {
+        std::cout << v.GetHex() << std::endl;
+        ASSERT_EQ(v.GetHex(), hexs[i]);
+        i++;
+    }
 }
 
 TEST(Devcore_stream, type_IPV6AddressType){
