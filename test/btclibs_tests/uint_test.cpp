@@ -169,6 +169,14 @@ TEST(Btclibs, UINT256_SET_NULL)
     ASSERT_TRUE(second.IsNull());
 }
 
+TEST(Btclibs, UINT256_PACK_UNPACK)
+{
+    auto s = uint256S("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    uint256 n(s);
+
+
+}
+
 //int COMPARE(const uint256& a, const uint256& b)
 //{
 //    for (int i = a.WIDTH - 1; i >= 0; i--)
