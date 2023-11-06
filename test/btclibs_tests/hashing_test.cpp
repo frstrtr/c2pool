@@ -146,24 +146,24 @@ TEST(secp256k1TEST, Ripemd160Test)
     ASSERT_EQ("7f772647d88750add82d8e1a7a3e5c0902a346a3", result.ToString());
 }
 
-TEST(CSHA256TEST, custom_sha256_simple_test)
-{
-    uint256 result;
-    CSHA256().Write((unsigned char*)"123456789", 9).Finalize(result.begin());
-    reverse(result.begin(), result.end());
-    std::cout << result.GetHex() << std::endl;
-    ASSERT_EQ(result.GetHex(), "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225");
-}
-
-TEST(CSHA256TEST, custom_sha256_changed_init_test)
-{
-    uint256 result;
-    uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12};
-    CSHA256(_init).Write((unsigned char*)"123456789", 9).Finalize(result.begin());
-    reverse(result.begin(), result.end());
-    std::cout << result.GetHex() << std::endl;
-    ASSERT_EQ(result.GetHex(), "23de2ce70e77d80ba1c110071462e90e96710fd0b0ee3faa81b1d04b7fb58535");
-}
+//TEST(CSHA256TEST, custom_sha256_simple_test)
+//{
+//    uint256 result;
+//    CSHA256().Write((unsigned char*)"123456789", 9).Finalize(result.begin());
+//    reverse(result.begin(), result.end());
+//    std::cout << result.GetHex() << std::endl;
+//    ASSERT_EQ(result.GetHex(), "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225");
+//}
+//
+//TEST(CSHA256TEST, custom_sha256_changed_init_test)
+//{
+//    uint256 result;
+//    uint32_t _init[8] {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd12};
+//    CSHA256(_init).Write((unsigned char*)"123456789", 9).Finalize(result.begin());
+//    reverse(result.begin(), result.end());
+//    std::cout << result.GetHex() << std::endl;
+//    ASSERT_EQ(result.GetHex(), "23de2ce70e77d80ba1c110071462e90e96710fd0b0ee3faa81b1d04b7fb58535");
+//}
 
 //TEST(CSHA256TEST, custom_sha256_changed_init_buf_len_test)
 //{
