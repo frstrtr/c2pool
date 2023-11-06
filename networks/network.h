@@ -8,7 +8,6 @@
 #include <set>
 
 #include "btclibs/uint256.h"
-#include "btclibs/arith_uint256.h"
 #include <libdevcore/stream.h>
 #include <libdevcore/types.h>
 #include <web_interface/netdatafield.h>
@@ -138,8 +137,8 @@ namespace coind
 
 		uint256 DUMB_SCRYPT_DIFF;
         int DUST_THRESHOLD;
-        arith_uint256 SANE_TARGET_RANGE_MIN;
-        arith_uint256 SANE_TARGET_RANGE_MAX;
+        uint256 SANE_TARGET_RANGE_MIN;
+        uint256 SANE_TARGET_RANGE_MAX;
 
         std::string BLOCK_EXPLORER_URL_PREFIX;
         std::string ADDRESS_EXPLORER_URL_PREFIX;
