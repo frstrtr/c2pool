@@ -76,7 +76,7 @@ template<typename T>
 inline uint256 Hash(const T& in1)
 {
     uint256 result;
-    std::vector<unsigned char> vec_result(result.begin(), result.end());
+    std::vector<unsigned char> vec_result = result.GetChars();
     auto _span = MakeUCharSpan(vec_result);
     CHash256().Write(MakeUCharSpan(in1)).Finalize(_span);
     std::vector<unsigned char> vec_span(_span.begin(), _span.end());
@@ -124,30 +124,37 @@ public:
      *
      * Invalidates this object.
      */
+     // TODO: test
     uint256 GetHash() {
-        uint256 result;
-        ctx.Finalize(result.begin());
-        ctx.Reset().Write(result.begin(), CSHA256::OUTPUT_SIZE).Finalize(result.begin());
-        return result;
+        std::vector<unsigned char> result;
+        result.resize(CSHA256::OUTPUT_SIZE);
+
+        ctx.Finalize(&result[0]);
+        ctx.Reset().Write(&result[0], CSHA256::OUTPUT_SIZE).Finalize(&result[0]);
+        return uint256(result);
     }
 
     /** Compute the SHA256 hash of all data written to this object.
      *
      * Invalidates this object.
      */
-    uint256 GetSHA256() {
-        uint256 result;
-        ctx.Finalize(result.begin());
-        return result;
-    }
+     //TODO: TEST
+    uint256 GetSHA256()
+     {
+         std::vector<unsigned char> result;
+         result.resize(CSHA256::OUTPUT_SIZE);
 
-    /**
-     * Returns the first 64 bits from the resulting hash.
-     */
-    inline uint64_t GetCheapHash() {
-        uint256 result = GetHash();
-        return ReadLE64(result.begin());
-    }
+         ctx.Finalize(&result[0]);
+         return uint256(result);
+     }
+
+//    /**
+//     * Returns the first 64 bits from the resulting hash.
+//     */
+//    inline uint64_t GetCheapHash() {
+//        uint256 result = GetHash();
+//        return ReadLE64(result.begin());
+//    }
 
     // template<typename T>
     // CHashWriter& operator<<(const T& obj) {
