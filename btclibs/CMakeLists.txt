@@ -5,8 +5,8 @@ set(sources
         uint256.cpp
         tinyformat.h
         attributes.h
-        arith_uint256.h
-        arith_uint256.cpp
+#        arith_uint256.h
+#        arith_uint256.cpp
         hash.h
         hash.cpp
         util/str.h
