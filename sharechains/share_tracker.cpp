@@ -210,7 +210,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     std::set<NetAddress> bad_peer_addresses;
 
     std::vector<uint256> bads;
-
     for (auto [head, tail] : heads)
     {
         // only unverified heads
@@ -218,17 +217,13 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             continue;
 
         auto [head_height, last] = get_height_and_last(head);
-        LOG_TRACE << "head1 = " << head << " tail1 = " << tail << std::endl;
-        LOG_TRACE << "head_height = " << head_height << ", last = " << last.GetHex();
-
         auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height -
                                                                                                  net->CHAIN_LENGTH)));
 
-        uint256 _hash;
         bool _verified = false;
+        uint256 _hash;
         while (get_chain_f(_hash))
         {
-            LOG_TRACE << "GET_CHAIN hash = " << _hash.GetHex();
             if (attempt_verify(get(_hash)))
             {
                 _verified = true;
@@ -240,14 +235,14 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         if (!_verified && !last.IsNull())
         {
             uint32_t desired_timestamp = *items[head]->timestamp;
-            uint256 desired_target = items[head]->target;
+            arith_uint256 desired_target = UintToArith256(items[head]->target);
 
             uint256 temp_hash;
             auto get_chain_f2 = get_chain(head, std::min(head_height, 5));
             while (get_chain_f2(temp_hash))
             {
                 desired_timestamp = std::max(desired_timestamp, *items[temp_hash]->timestamp);
-                desired_target = std::min(desired_target, items[temp_hash]->target);
+                desired_target = std::min(desired_target, UintToArith256(items[temp_hash]->target));
             }
 
             NetAddress _peer_addr = c2pool::random::RandomChoice(
@@ -257,7 +252,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                                    _peer_addr,
                                    last,
                                    desired_timestamp,
-                                   desired_target
+                                   ArithToUint256(desired_target)
                            });
         }
     }
