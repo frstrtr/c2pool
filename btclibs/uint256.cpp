@@ -10,14 +10,17 @@
 #include "util/strencodings.h"
 #include <btclibs/crypto/common.h>
 
+// TODO: test
 template <unsigned int BITS>
 base_uint<BITS>::base_uint(const std::string& str)
 {
     static_assert(BITS/32 > 0 && BITS%32 == 0, "Template parameter BITS must be a positive multiple of 32.");
 
     SetHex(str);
+    DEBUG_UINT_UPDATE();
 }
 
+// TODO: test
 template <unsigned int BITS>
 base_uint<BITS>::base_uint(const std::vector<unsigned char>& vch)
 {
@@ -28,6 +31,7 @@ base_uint<BITS>::base_uint(const std::vector<unsigned char>& vch)
     {
         this->pn[x] = ReadLE32(vch.data() + x * 4);
     }
+    DEBUG_UINT_UPDATE();
 }
 
 template <unsigned int BITS>
@@ -44,6 +48,7 @@ base_uint<BITS>& base_uint<BITS>::operator<<=(unsigned int shift)
         if (i + k < WIDTH)
             pn[i + k] |= (a.pn[i] << shift);
     }
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -61,6 +66,7 @@ base_uint<BITS>& base_uint<BITS>::operator>>=(unsigned int shift)
         if (i - k >= 0)
             pn[i - k] |= (a.pn[i] >> shift);
     }
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -73,6 +79,7 @@ base_uint<BITS>& base_uint<BITS>::operator*=(uint32_t b32)
         pn[i] = n & 0xffffffff;
         carry = n >> 32;
     }
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -89,6 +96,7 @@ base_uint<BITS>& base_uint<BITS>::operator*=(const base_uint& b)
         }
     }
     *this = a;
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -115,6 +123,7 @@ base_uint<BITS>& base_uint<BITS>::operator/=(const base_uint& b)
         shift--;
     }
     // num now contains the remainder of the division.
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -212,6 +221,7 @@ void base_uint<BITS>::SetHex(const char* psz)
     {
         this->pn[x] = ReadLE32(m_data + x * 4);
     }
+    DEBUG_UINT_UPDATE();
 }
 
 // TODO: test
@@ -248,7 +258,7 @@ template <unsigned int BITS>
 std::vector<unsigned char> base_uint<BITS>::GetChars() const
 {
     std::vector<unsigned char> result;
-    result.resize(BYTES);
+    result.resize(WIDTH_BYTES);
 //    uint8_t m_data_rev[BYTES];
     for (int i = 0; i < this->WIDTH; ++i)
     {
@@ -294,6 +304,7 @@ uint128& uint128::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverfl
         *pfOverflow = nWord != 0 && ((nSize > 34) ||
                                      (nWord > 0xff && nSize > 33) ||
                                      (nWord > 0xffff && nSize > 32));
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -339,6 +350,7 @@ uint160& uint160::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverfl
         *pfOverflow = nWord != 0 && ((nSize > 34) ||
                                      (nWord > 0xff && nSize > 33) ||
                                      (nWord > 0xffff && nSize > 32));
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -384,6 +396,7 @@ uint256& uint256::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverfl
         *pfOverflow = nWord != 0 && ((nSize > 34) ||
                                      (nWord > 0xff && nSize > 33) ||
                                      (nWord > 0xffff && nSize > 32));
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
@@ -429,6 +442,7 @@ uint288& uint288::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverfl
         *pfOverflow = nWord != 0 && ((nSize > 34) ||
                                      (nWord > 0xff && nSize > 33) ||
                                      (nWord > 0xffff && nSize > 32));
+    DEBUG_UINT_UPDATE();
     return *this;
 }
 
