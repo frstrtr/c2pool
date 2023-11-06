@@ -169,18 +169,12 @@ double base_uint<BITS>::getdouble() const
 template <unsigned int BITS>
 std::string base_uint<BITS>::GetHex() const
 {
-    uint8_t m_data_rev[BYTES];
+    uint8_t m_data_rev[WIDTH_BYTES];
     for (int i = 0; i < this->WIDTH; ++i)
     {
-        WriteLE32(m_data_rev + BYTES-4 - i*4, this->pn[i]);
+        WriteBE32(m_data_rev + WIDTH_BYTES - 4 - i * 4, this->pn[i]);
     }
     return HexStr(m_data_rev);
-
-//    base_blob<BITS> b;
-//    for (int x = 0; x < this->WIDTH; ++x) {
-//        WriteLE32(b.begin() + x*4, this->pn[x]);
-//    }
-//    return b.GetHex();
 }
 
 // TODO: test
@@ -192,7 +186,7 @@ void base_uint<BITS>::SetHex(const char* psz)
 //    for (int x = 0; x < this->WIDTH; ++x) {
 //        this->pn[x] = ReadLE32(b.begin() + x*4);
 //    }
-    uint8_t m_data[BYTES];
+    uint8_t m_data[WIDTH_BYTES];
     memset(m_data, 0, sizeof(m_data));
 
     // skip leading spaces
@@ -208,7 +202,7 @@ void base_uint<BITS>::SetHex(const char* psz)
     while (::HexDigit(psz[digits]) != -1)
         digits++;
     unsigned char* p1 = (unsigned char*)m_data;
-    unsigned char* pend = p1 + BYTES;
+    unsigned char* pend = p1 + WIDTH_BYTES;
     while (digits > 0 && p1 < pend) {
         *p1 = ::HexDigit(psz[--digits]);
         if (digits > 0) {
