@@ -483,4 +483,13 @@ inline void from_json(const nlohmann::json& j, uint288& p)
     p.SetHex(j.get<std::string>());
 }
 
+template <typename ToUINT, typename FromUINT>
+ToUINT convert_uint(const FromUINT &value)
+{
+    ToUINT result;
+    result.SetHex(value.GetHex());
+
+    return result;
+}
+
 #endif //C2POOL_UINT256_H
