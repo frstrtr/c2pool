@@ -5,7 +5,6 @@
 #include <iostream>
 
 #include <btclibs/uint256.h>
-#include <btclibs/arith_uint256.h>
 #include <libcoind/types.h>
 #include <libcoind/data.h>
 #include <networks/network.h>
@@ -19,10 +18,10 @@ uint256 CreateUINT256(string _hex){
 }
 
 TEST(BitcoindDataTest, target_to_averate_attempts_test){
-    auto first = CreateUINT256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    uint256 first = CreateUINT256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     auto first_res = coind::data::target_to_average_attempts(first);
     cout << first_res.GetHex() << endl;
-    ASSERT_EQ(first_res.GetHex(), "0000000000000000000000000000000000000000000000000000000000000001");
+    ASSERT_EQ(first_res.GetHex(), uint288("0000000000000000000000000000000000000000000000000000000000000001").GetHex());
     
     auto second = CreateUINT256("1");
     auto second_res = coind::data::target_to_average_attempts(second);
@@ -181,9 +180,12 @@ TEST(CoindDataTest, test_header_hash)
 TEST(CoindDataTest, TargetToDifficulty)
 {
     auto v1 = uint256S("100000000000000000000000000000000");
-    std::cout << std::setprecision(30) << coind::data::target_to_difficulty(v1) << std::endl;
+    auto diff1 = coind::data::target_to_difficulty(v1);
+    std::cout << std::setprecision(30) << diff1 << std::endl;
+    ASSERT_EQ(diff1, 79226953588444722964369244160.0);
     auto v2 = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    std::cout  << coind::data::target_to_difficulty(v2) << std::endl;
+    auto diff2 = coind::data::target_to_difficulty(v2);
+    std::cout << "diff2: " << std::setprecision(88) << diff2 << std::endl;
     auto v3 = uint256S("1");
     std::cout << std::setprecision(70) << coind::data::target_to_difficulty(v3) << std::endl;
     auto v4 = uint256S("1e");
@@ -209,39 +211,39 @@ TEST(CoindDataTest, DifficultyToTarget)
     std::cout << coind::data::difficulty_to_target(v4) << std::endl;
 }
 
-TEST(CoindDataTest, DifficultyToTarget_1_MANUAL)
-{
-    uint256 difficulty = uint256S("100");
-    uint256 result;
-
-    auto v = Uint256ToArith288(difficulty);
-    if (v.IsNull())
-        result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-
-    uint288 u_s;
-    u_s.SetHex("1000000000000000000000000000000000000000000000000");
-
-    auto s = UintToArith288(u_s);
-    s *= 0xffff0000;
-    s += 1;
-
-    auto r = s*v - 1;
-
-    arith_uint256 r_round;
-    r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
-    r.SetHex(ArithToUint256(r_round).GetHex());
-
-    {
-        arith_uint288 _max_value;
-        _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        if (r > _max_value)
-            result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    }
-
-    result = uint256S(r.GetHex()) ;
-
-    std::cout << "result: " << result;
-}
+//TEST(CoindDataTest, DifficultyToTarget_1_MANUAL)
+//{
+//    uint256 difficulty = uint256S("100");
+//    uint256 result;
+//
+//    auto v = Uint256ToArith288(difficulty);
+//    if (v.IsNull())
+//        result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//
+//    uint288 u_s;
+//    u_s.SetHex("1000000000000000000000000000000000000000000000000");
+//
+//    auto s = UintToArith288(u_s);
+//    s *= 0xffff0000;
+//    s += 1;
+//
+//    auto r = s*v - 1;
+//
+//    arith_uint256 r_round;
+//    r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
+//    r.SetHex(ArithToUint256(r_round).GetHex());
+//
+//    {
+//        arith_uint288 _max_value;
+//        _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//        if (r > _max_value)
+//            result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//    }
+//
+//    result = uint256S(r.GetHex()) ;
+//
+//    std::cout << "result: " << result;
+//}
 
 TEST(CoindDataTest, DifficultyToTarget_1)
 {
@@ -290,11 +292,11 @@ TEST(CoindDataTest, AverageAttemptsToTarget)
 //    std::cout << coind::data::target_to_average_attempts(v1) << std::endl;
 
     std::cout << "\n2:\n";
-    auto v2 = Uint256ToArith288(uint256S("1"));
+    auto v2 = uint288("1");
     std::cout  << coind::data::average_attempts_to_target(v2).GetHex() << std::endl;
 
     std::cout << "\n3:\n";
-    auto v3 = Uint256ToArith288(uint256S("1"));
+    auto v3 = uint288("1");
     std::cout << coind::data::average_attempts_to_target(v3).GetHex() << std::endl;
 
 //    std::cout << "\n4:\n";
@@ -302,15 +304,15 @@ TEST(CoindDataTest, AverageAttemptsToTarget)
 //    std::cout << coind::data::average_attempts_to_target(v4) << std::endl;
 
     std::cout << "\n5:\n";
-    auto v5 = Uint256ToArith288(uint256S("8000000000000000000000000000000000000000000000000000000000000000"));
+    auto v5 = uint288("8000000000000000000000000000000000000000000000000000000000000000");
     std::cout << coind::data::average_attempts_to_target(v5).GetHex() << std::endl;
 
     std::cout << "\n6:\n";
-    auto v6 = Uint256ToArith288(uint256S("3fffffff00000003fffffff00000003fffffff00000003fffffff0000"));
+    auto v6 = uint288("3fffffff00000003fffffff00000003fffffff00000003fffffff0000");
     std::cout << coind::data::average_attempts_to_target(v6).GetHex() << std::endl;
 
     {
-        auto local_hash_rate = Uint256ToArith288(uint256S("000000000000000000000000000000000000000000000000000000000000000000369d03"));
+        auto local_hash_rate = uint288("000000000000000000000000000000000000000000000000000000000000000000369d03");
         auto SHARE_PERIOD = 25;
         std::cout << (local_hash_rate * SHARE_PERIOD * 10000 / 167).GetHex() << std::endl;
         std::cout << coind::data::average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 60) << std::endl;
@@ -342,20 +344,20 @@ TEST(CoindDataTest, DOUBLE_TEST)
     uint256 target = uint256S("1ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
     auto diff1 =  coind::data::target_to_difficulty(target) * DUMB_SCRYPT_DIFF1;
-    auto diff2 =  coind::data::target_to_difficulty(target) * DUMB_SCRYPT_DIFF2.GetUint64(0);
+    auto diff2 =  coind::data::target_to_difficulty(target) * DUMB_SCRYPT_DIFF2.GetLow64();
     std::cout << diff1 << " / " << diff2 << std::endl;
     std::cout << coind::data::target_to_difficulty(target) << std::endl;
 
 
 //    uint256 for_div = uint256S("ffff0000000000000000000000000000000000000000000000000001");
-    arith_uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
+    uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
     double for_div_d = for_div.getdouble();
-    double targ_d = UintToArith256(target).getdouble();
+    double targ_d = target.getdouble();
 
-    auto diff = for_div.getdouble() / (UintToArith256(target).getdouble() + 1);
+    auto diff = for_div.getdouble() / (target.getdouble() + 1);
 
     // 0.499992 / 32767.5 / 32767.5
-    std::cout << diff << " / " << diff*DUMB_SCRYPT_DIFF1 << " / " << diff * DUMB_SCRYPT_DIFF2.GetUint64(0) << std::endl;
+    std::cout << diff << " / " << diff*DUMB_SCRYPT_DIFF1 << " / " << diff * DUMB_SCRYPT_DIFF2.GetLow64() << std::endl;
     std::cout << coind::data::target_to_difficulty(target) << std::endl;
     std::cout << (double)1 / DUMB_SCRYPT_DIFF1 << std::endl;
 }
@@ -415,36 +417,36 @@ TEST(CoindDataTest, DOUBLE_TEST2_REVERSE)
 
 }
 
-TEST(CoindDataTest, DifficultyToTarget2)
-{
-    double difficulty = (double) 1.0 / (double)65536;
-    uint256 result;
-
-    if (difficulty == 0)
-        result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-
-    uint288 u_s;
-    u_s.SetHex("1000000000000000000000000000000000000000000000000");
-
-    auto s = UintToArith288(u_s);
-    s *= 0xffff0000;
-    s += 1;
-
-    auto r = s/difficulty - 1;
-
-    arith_uint256 r_round;
-    r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
-    r.SetHex(ArithToUint256(r_round).GetHex());
-
-
-    {
-        arith_uint288 _max_value;
-        _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        if (r > _max_value)
-            result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    }
-
-    result = uint256S(r.GetHex());
-
-    std::cout << result;
-}
+//TEST(CoindDataTest, DifficultyToTarget2)
+//{
+//    double difficulty = (double) 1.0 / (double)65536;
+//    uint256 result;
+//
+//    if (difficulty == 0)
+//        result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//
+//    uint288 u_s;
+//    u_s.SetHex("1000000000000000000000000000000000000000000000000");
+//
+//    auto s = UintToArith288(u_s);
+//    s *= 0xffff0000;
+//    s += 1;
+//
+//    auto r = s/difficulty - 1;
+//
+//    arith_uint256 r_round;
+//    r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
+//    r.SetHex(ArithToUint256(r_round).GetHex());
+//
+//
+//    {
+//        arith_uint288 _max_value;
+//        _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//        if (r > _max_value)
+//            result = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+//    }
+//
+//    result = uint256S(r.GetHex());
+//
+//    std::cout << result;
+//}

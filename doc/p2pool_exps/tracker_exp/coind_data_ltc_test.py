@@ -55,8 +55,21 @@ print('donation_script_to_address = {0}'.format(donation_script_to_address(_net)
 addr_to_pubkey_hash = coind_data_ltc.address_to_pubkey_hash(donation_script_to_address(_net), _net.PARENT)
 print('address_to_pubkey_hash = {0}; value = {1}'.format(addr_to_pubkey_hash, hex(addr_to_pubkey_hash[0])))
 
-pubkey_hash_to_addr = coind_data_ltc.pubkey_hash_to_address(addr_to_pubkey_hash[0], _net.PARENT.ADDRESS_VERSION, -1, _net)
+pubkey_hash_to_addr = coind_data_ltc.pubkey_hash_to_address(addr_to_pubkey_hash[0], _net.PARENT.ADDRESS_VERSION, -1,
+                                                            _net)
 print('pubkey_hash_to_address = {0}'.format(pubkey_hash_to_addr))
 
 bits = pack.FloatingInteger(0xe3eb200c)
 print(bits.target)
+
+
+# ========================================================
+def f_print(f, h):
+    res = f(int(h, 16))
+    print("{:f}".format(res))
+
+print('\ntarget_to_diff:')
+f_print(coind_data_ltc.target_to_difficulty, '100000000000000000000000000000000')
+f_print(coind_data_ltc.target_to_difficulty, 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
+f_print(coind_data_ltc.target_to_difficulty, '1')
+f_print(coind_data_ltc.target_to_difficulty, '1e')
