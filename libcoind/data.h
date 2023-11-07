@@ -1,7 +1,6 @@
 #pragma once
 
 #include <btclibs/uint256.h>
-#include <btclibs/arith_uint256.h>
 #include <btclibs/hash.h>
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/crypto/ripemd160.h>
@@ -40,15 +39,14 @@ namespace coind::data
         return false;
     }
 
-    arith_uint288 target_to_average_attempts(uint256 target);
+    uint288 target_to_average_attempts(uint256 target);
 
-    uint256 average_attempts_to_target(arith_uint288 att);
-    uint256 average_attempts_to_target(uint288 average_attempts);
+    uint256 average_attempts_to_target(uint288 att);
 
     double target_to_difficulty(uint256 target);
 
     /// max_target/difficulty
-    uint256 difficulty_to_target(uint256 difficulty);
+    uint256 difficulty_to_target(const uint256& difficulty);
     /// max_target/(1/difficulty) -> max_target * difficulty
     uint256 difficulty_to_target_1(uint256 difficulty);
 
@@ -193,7 +191,7 @@ namespace coind::data
         PackStream checksum_func(PackStream data)
         {
             auto _hash = hash256(std::move(data));
-            std::vector<unsigned char> res(_hash.begin(), _hash.end());
+            auto res = _hash.GetChars();
 
             res.resize(4);
             return {res};
