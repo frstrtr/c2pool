@@ -452,7 +452,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
             uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work->value().bits.target());
             avg_attempts *= _net->SPREAD;
             avg_attempts *= _net->parent->DUST_THRESHOLD;
-            avg_attempts/block_subsidy;
+            avg_attempts /= block_subsidy;
 
             // TODO: проверить, не переполняется ли граница
             auto target_from_avg = coind::data::average_attempts_to_target(avg_attempts);
