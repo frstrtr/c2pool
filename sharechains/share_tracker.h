@@ -352,7 +352,7 @@ struct TrackerThinkResult
 {
     uint256 best;
     std::vector<std::tuple<NetAddress, uint256>> desired;
-    std::vector<std::tuple<std::tuple<arith_uint256, int32_t, int32_t>, arith_uint256>> decorated_heads;
+    std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
     std::set<NetAddress> bad_peer_addresses;
 };
 
@@ -360,9 +360,9 @@ struct TrackerThinkResult
 
 struct shares_stale_count
 {
-    arith_uint288 good;
-    arith_uint288 doa;
-    arith_uint288 orphan;
+    uint288 good;
+    uint288 doa;
+    uint288 orphan;
 
     shares_stale_count operator/(const int& t) const
     {
@@ -413,12 +413,12 @@ public:
 
     TrackerThinkResult think(const std::function<int32_t(uint256)>& block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs);
 
-    arith_uint288 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
+    uint288 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
     // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
-    std::tuple<int32_t, arith_uint288> score(uint256 share_hash, const std::function<int32_t(uint256)> &block_rel_height_func)
+    std::tuple<int32_t, uint288> score(uint256 share_hash, const std::function<int32_t(uint256)> &block_rel_height_func)
     {
-        arith_uint288 score_res;
+        uint288 score_res;
         auto head_height = verified.get_height(share_hash);
         if (head_height < net->CHAIN_LENGTH)
         {
@@ -456,7 +456,7 @@ public:
 
     std::map<uint64_t, uint256> get_desired_version_counts(uint256 best_share_hash, uint64_t dist)
     {
-        std::map<uint64_t, arith_uint288> _result;
+        std::map<uint64_t, uint288> _result;
 
         auto get_chain_func = get_chain(best_share_hash, dist);
         uint256 hash;
@@ -474,13 +474,13 @@ public:
         std::map<uint64_t, uint256> result;
         for (const auto& v : _result)
         {
-            result[v.first] = ArithToUint256(v.second);
+            result[v.first] = convert_uint<uint256>(v.second);
         }
         return result;
     }
 
-    std::tuple<std::map<std::vector<unsigned char>, arith_uint288>, arith_uint288, arith_uint288>
-    get_cumulative_weights(uint256 start, int32_t max_shares, const arith_uint288& desired_weight)
+    std::tuple<std::map<std::vector<unsigned char>, uint288>, uint288, uint288>
+    get_cumulative_weights(uint256 start, int32_t max_shares, const uint288& desired_weight)
     {
         std::string algh_steps = "gcw debug: "; // FOR DEBUG
         // Если start -- None/Null/0 шара.
@@ -501,9 +501,9 @@ public:
         }
 
         // Поиск desired_weight
-        std::map<std::vector<unsigned char>, arith_uint288> weights;
+        std::map<std::vector<unsigned char>, uint288> weights;
 
-        auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : arith_uint288();
+        auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
 //        LOG_INFO.stream() << "limit = " << limit.GetHex();
         auto cur = get_sum_to_last(start);
         auto next = get_sum_to_last(cur.sum.prev());
@@ -567,7 +567,7 @@ public:
 
             auto [_script, _weight] = *extra_ending->amount.begin();
             //TODO: test (если много воркеров, может происходить неправильное округление)
-            std::pair<std::vector<unsigned char>, arith_uint288> new_weight = {_script,
+            std::pair<std::vector<unsigned char>, uint288> new_weight = {_script,
                                                                                (desired_weight - total_weights) /
                                                                                65535 * _weight /
                                                                                (extra_ending->total_weight / 65535)

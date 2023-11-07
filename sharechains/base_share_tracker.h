@@ -9,8 +9,8 @@ public:
     value_type share;
 
     shares::TreeRulesElement rules;
-    arith_uint288 work;
-    arith_uint288 min_work;
+    uint288 work;
+    uint288 min_work;
     shares::weight::weight_data weight;
     uint64_t height;
 
@@ -78,7 +78,7 @@ public:
 
     uint256 get_work(uint256 hash)
     {
-        return ArithToUint256(get_sum_to_last(hash).sum.work);
+        return convert_uint<uint256>(get_sum_to_last(hash).sum.work);
     }
 };
 
