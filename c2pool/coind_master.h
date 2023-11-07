@@ -143,10 +143,10 @@ namespace c2pool::master
                                       web_root->net_functor(),
                                       [&](const WebNetJson::net_field &net, const auto &query)
                                       {
-                                          arith_uint288 attempts_to_block;
+                                          uint288 attempts_to_block;
                                           attempts_to_block.SetHex(net->get("local")["attempts_to_block"]);
 
-                                          arith_uint288 pool_hash_rate;
+                                          uint288 pool_hash_rate;
                                           pool_hash_rate.SetHex(net->get("pool")["rate"]);
 
                                           json j
