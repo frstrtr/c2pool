@@ -132,7 +132,7 @@ void Share::init()
         throw std::invalid_argument("Share target invalid!");
     }
 
-    if (UintToArith256(pow_hash) > UintToArith256(target))
+    if (pow_hash > target)
     {
         throw std::invalid_argument((boost::format("Share PoW indalid! pow_hash = %1%; target = %2%") % pow_hash.GetHex() % target.GetHex()).str());
     }
