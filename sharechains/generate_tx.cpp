@@ -170,18 +170,17 @@ namespace shares
         return std::make_shared<GeneratedShareTransactionResult>(share_info, _share_data, gentx, other_transaction_hashes, std::move(get_share_F));
     }
 
-    arith_uint256 GenerateShareTransaction::pre_target_calculate(ShareType previous_share, const int32_t &height)
+    uint256 GenerateShareTransaction::pre_target_calculate(ShareType previous_share, const int32_t &height)
     {
-        arith_uint256 _pre_target3;
+        uint288 _pre_target3;
         if (height < net->TARGET_LOOKBEHIND)
         {
-            _pre_target3 = net->MAX_TARGET;
+            _pre_target3 = convert_uint<uint288>(net->MAX_TARGET);
         } else
         {
             auto attempts_per_second = tracker->get_pool_attempts_per_second(_share_data.previous_share_hash, net->TARGET_LOOKBEHIND, true);
 
-            arith_uint288 pre_target;
-            pre_target.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+            uint288 pre_target("10000000000000000000000000000000000000000000000000000000000000000");
             if (!attempts_per_second.IsNull())
             {
                 //equal: 2**256/(net.SHARE_PERIOD*attempts_per_second) - 1
@@ -192,36 +191,34 @@ namespace shares
                 pre_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             }
 
-            arith_uint256 pre_target2;
+            uint288 pre_target2;
             {
-                arith_uint256 _max_target_div10 = UintToArith256(previous_share->max_target)/10;
-                arith_uint256 _min_clip = _max_target_div10*9;
-                arith_uint256 _max_clip = _max_target_div10*11;
-                pre_target2 = math::clip(Arith288ToArith256(pre_target), _min_clip, _max_clip);
+                uint288 _max_target_div10 = convert_uint<uint288>(previous_share->max_target) / 10;
+                uint288 _min_clip = _max_target_div10*9;
+                uint288 _max_clip = _max_target_div10*11;
+                pre_target2 = math::clip(pre_target, _min_clip, _max_clip);
             }
 
-            _pre_target3 = math::clip(pre_target2, UintToArith256(net->MIN_TARGET), UintToArith256(net->MAX_TARGET));
+            _pre_target3 = math::clip(pre_target2, convert_uint<uint288>(net->MIN_TARGET), convert_uint<uint288>(net->MAX_TARGET));
         }
-        uint256 pre_target3 = ArithToUint256(_pre_target3);
-        return _pre_target3;
+        return convert_uint<uint256>(_pre_target3);
     }
 
-    std::tuple<FloatingInteger, FloatingInteger> GenerateShareTransaction::bits_calculate(const arith_uint256 &pre_target)
+    std::tuple<FloatingInteger, FloatingInteger> GenerateShareTransaction::bits_calculate(const uint256 &pre_target)
     {
-        FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(ArithToUint256(pre_target));
+        FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(pre_target);
         FloatingInteger bits;
         {
             LOG_DEBUG_STRATUM << "DESIRED TARGET: " << _desired_target.GetHex();
 
-            arith_uint256 __desired_target = UintToArith256(_desired_target);
-            arith_uint256 _pre_target3_div30 = pre_target/30;
+            uint256 _pre_target3_div30 = pre_target/30;
             bits = FloatingInteger::from_target_upper_bound(
-                    ArithToUint256(math::clip(__desired_target, _pre_target3_div30, pre_target))
+                    math::clip(_desired_target, _pre_target3_div30, pre_target)
             );
 
             LOG_DEBUG_STRATUM << "_pre_target3_div30: " << _pre_target3_div30.GetHex();
             LOG_DEBUG_STRATUM << "pre_target: " << pre_target.GetHex();
-            LOG_DEBUG_STRATUM << "math::clip(__desired_target, _pre_target3_div30, pre_target): " << math::clip(__desired_target, _pre_target3_div30, pre_target).GetHex();
+            LOG_DEBUG_STRATUM << "math::clip(__desired_target, _pre_target3_div30, pre_target): " << math::clip(_desired_target, _pre_target3_div30, pre_target).GetHex();
             LOG_DEBUG_STRATUM << "BITS: " << bits.value.value;
         }
 
@@ -350,11 +347,11 @@ namespace shares
         return std::make_tuple(new_transaction_hashes, transaction_hash_refs, other_transaction_hashes);
     }
 
-    std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
+    std::vector<std::tuple<std::vector<unsigned char>, uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
     {
-        std::map<std::vector<unsigned char>, arith_uint288> weights;
-        arith_uint288 total_weight;
-        arith_uint288 donation_weight;
+        std::map<std::vector<unsigned char>, uint288> weights;
+        uint288 total_weight;
+        uint288 donation_weight;
         {
             uint256 start_hash = prev_share_hash;
 
@@ -371,7 +368,7 @@ namespace shares
 
         //assert
         {
-            arith_uint288 sum_weights;
+            uint288 sum_weights;
             sum_weights.SetHex("0");
             for (auto v : weights)
             {
@@ -383,7 +380,7 @@ namespace shares
         }
 
         // 99.5% goes according to weights prior to this share
-        std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts;
+        std::vector<std::tuple<std::vector<unsigned char>, uint288>> amounts;
         for (const auto& v : weights)
         {
             amounts.emplace_back(v.first, v.second*199*_share_data.subsidy/(200*total_weight));
@@ -413,7 +410,7 @@ namespace shares
                 return std::get<0>(value) == donation_address;
             });
 
-            arith_uint288 sum_amounts{};
+            uint288 sum_amounts{};
             for (const auto& v: amounts)
                 sum_amounts += std::get<1>(v);
 
@@ -423,7 +420,7 @@ namespace shares
                 std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
         }
 
-        if (std::accumulate(amounts.begin(), amounts.end(), arith_uint288{}, [&](arith_uint288 v, const std::tuple<std::vector<unsigned char>, arith_uint288> &p ){
+        if (std::accumulate(amounts.begin(), amounts.end(), uint288{}, [&](uint288 v, const std::tuple<std::vector<unsigned char>, uint288> &p ){
             return v + std::get<1>(p);
         }) != _share_data.subsidy)
             throw std::invalid_argument("Invalid subsidy!");
@@ -431,11 +428,11 @@ namespace shares
         return amounts;
     }
 
-    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<std::tuple<std::vector<unsigned char>, arith_uint288>> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
+    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<std::tuple<std::vector<unsigned char>, uint288>> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
         coind::data::tx_type gentx;
 
-        std::map<std::vector<unsigned char>, arith_uint288> _amounts;
+        std::map<std::vector<unsigned char>, uint288> _amounts;
         for (const auto& v : amounts)
         {
             _amounts[std::get<0>(v)] = std::get<1>(v);
@@ -486,20 +483,13 @@ namespace shares
         const std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
         for (const auto& addr: dests)
         {
-            if (!ArithToUint256(_amounts[addr]).IsNull() && addr != donation_address)
+            if (!_amounts[addr].IsNull() && addr != donation_address)
             {
                 tx_outs.emplace_back(_amounts[addr].GetLow64(), coind::data::address_to_script2(std::string{addr.begin(), addr.end()}, net).data); //value, script
             }
         }
         tx_outs.emplace_back(_amounts[donation_address].GetLow64(), net->DONATION_SCRIPT);
 
-//        for (const auto& script: dests)
-//        {
-//            if (!ArithToUint256(_amounts[script]).IsNull() || script == net->DONATION_SCRIPT)
-//            {
-//                tx_outs.emplace_back(_amounts[script].GetLow64(), script); //value, script
-//            }
-//        }
         // tx3 [+]
         {
             // script='\x6a\x28' + cls.get_ref_hash(net, share_info, ref_merkle_link) + pack.IntType(64).pack(last_txout_nonce)
@@ -571,7 +561,7 @@ namespace shares
 
         uint128 _abswork;
         {
-            arith_uint288 _temp;
+            uint288 _temp;
             if (previous_share)
             {
                 _temp.SetHex(previous_share->abswork->GetHex());
@@ -579,8 +569,7 @@ namespace shares
             auto _temp_avg = coind::data::target_to_average_attempts(bits.target());
 
             _temp = _temp + _temp_avg;
-            arith_uint288 pow2_128; // 2^128
-            pow2_128.SetHex("100000000000000000000000000000000");
+            uint288 pow2_128("100000000000000000000000000000000"); // 2^128
 
             _temp = _temp >= pow2_128 ? _temp - pow2_128 : _temp; // _temp % pow2_128;
             _abswork.SetHex(_temp.GetHex());
