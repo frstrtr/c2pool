@@ -281,7 +281,7 @@ void coind::JSONRPC_Coind::submit_block(coind::data::types::BlockType &block, st
     }
 
     auto block_header_stream = pack_to_stream<coind::data::stream::BlockHeaderType_stream>(block.header);
-    auto success_expected = UintToArith256(parent_net->POW_FUNC(block_header_stream)) <= UintToArith256(FloatingInteger(block.header.bits).target());
+    auto success_expected = parent_net->POW_FUNC(block_header_stream) <= FloatingInteger(block.header.bits).target();
 
     if ((!success && success_expected && !ignore_failure) || (success && !success_expected))
         LOG_ERROR << "Block submittal result: " << success << "(" << res.write() << ") Expected: " << success_expected;
