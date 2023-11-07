@@ -7,7 +7,6 @@
 #include <vector>
 
 #include <btclibs/uint256.h>
-#include <btclibs/arith_uint256.h>
 #include <libcoind/types.h>
 #include <libcoind/data.h>
 
