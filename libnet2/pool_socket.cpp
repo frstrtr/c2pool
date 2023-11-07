@@ -154,8 +154,8 @@ void PoolSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 {
 	//checksum check
-	auto checksum_hash = coind::data::hash256(PackStream(msg->payload, msg->unpacked_len), true);
-    if (!c2pool::dev::compare_str(checksum_hash.data(), msg->checksum, 4))
+	auto checksum = coind::data::hash256(PackStream(msg->payload, msg->unpacked_len), true).GetChars();
+    if (!c2pool::dev::compare_str(checksum.data(), msg->checksum, 4))
     {
         auto [ip, port] = get_addr();
         std::string reason = "[PoolSocket] final_read_message: Invalid hash for " + ip + ":" + port + ", command = " + msg->command;
