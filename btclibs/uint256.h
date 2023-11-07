@@ -388,6 +388,9 @@ public:
     uint256& SetCompact(uint32_t nCompact, bool *pfNegative = nullptr, bool *pfOverflow = nullptr);
     uint32_t GetCompact(bool fNegative = false) const;
 
+    static const uint256 ZERO;
+    static const uint256 ONE;
+
     friend std::istream &operator>>(std::istream &is, uint256 &value);
     friend std::ostream &operator<<(std::ostream &os, const uint256 &value);
 };

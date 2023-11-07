@@ -272,6 +272,9 @@ template class base_uint<256>;
 // Explicit instantiations for base_uint<288>
 template class base_uint<288>;
 
+const uint256 uint256::ZERO(0);
+const uint256 uint256::ONE(1);
+
 // This implementation directly uses shifts instead of going
 // through an intermediate MPI representation.
 uint128& uint128::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverflow)
