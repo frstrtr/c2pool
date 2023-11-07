@@ -6,6 +6,8 @@
 #include <btclibs/uint256.h>
 #include <btclibs/util/strencodings.h>
 #include <libdevcore/random.h>
+#include "common.h"
+
 using namespace std;
 
 TEST(Btclibs, UINT256_INIT)
@@ -169,12 +171,27 @@ TEST(Btclibs, UINT256_SET_NULL)
     ASSERT_TRUE(second.IsNull());
 }
 
-TEST(Btclibs, UINT256_PACK_UNPACK)
+TEST(Btclibs, UINT256_CONVERT_TEST)
 {
-    auto s = uint256S("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    uint256 n(s);
+    uint288 s("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc");
 
+    // old version
+    std::vector<unsigned char> b;
+    b.resize(32);
 
+    for(int x=0; x<uint256::WIDTH_BYTES/4; ++x)
+        WriteLE32(&b[0] + x*4, s.pn[x]);
+
+    uint256 res1(b);
+
+    std::cout << res1.GetHex() << std::endl;
+    ASSERT_EQ(res1.GetHex(), "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc");
+
+    // convert (new version)
+    auto res2 = convert_uint<uint256>(s);
+    std::cout << res2.GetHex() << std::endl;
+    ASSERT_EQ(res2.GetHex(), "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc");
+    ASSERT_EQ(res1, res2);
 }
 
 //int COMPARE(const uint256& a, const uint256& b)
