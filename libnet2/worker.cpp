@@ -428,7 +428,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
     //8
     //TODO: part for merged mining
-    arith_uint256 a_target;
+    uint256 a_target;
     if (desired_pseudoshare_target.IsNull())
     {
         a_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -439,7 +439,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 			//in p2pool: target = bitcoin_data.average_attempts_to_target(local_hash_rate * 1)
 			// target 10 share responses every second by modulating pseudoshare difficulty
 //            target no more than 10 share responses every second node-wide by modulating min pseudoshare difficulty
-            a_target = std::min(a_target, UintToArith256(coind::data::average_attempts_to_target(local_hash_rate/10)));
+            a_target = std::min(a_target, coind::data::average_attempts_to_target(local_hash_rate/10));
 		} else
         {
             //TODO: TEST
@@ -449,18 +449,18 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
             //# one node has the whole p2pool hashrate, it will still only need to process one pseudoshare
             //# every ~0.01 seconds.
 
-            arith_uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work->value().bits.target());
+            uint288 avg_attempts = coind::data::target_to_average_attempts(_coind_node->coind_work->value().bits.target());
             avg_attempts *= _net->SPREAD;
             avg_attempts *= _net->parent->DUST_THRESHOLD;
             avg_attempts/block_subsidy;
 
-            auto target_from_avg = Uint256ToArith288(coind::data::average_attempts_to_target(avg_attempts));
-
+            // TODO: проверить, не переполняется ли граница
+            auto target_from_avg = coind::data::average_attempts_to_target(avg_attempts);
             target_from_avg *= 3000;
 
-            if (target_from_avg < Arith256ToArith288(a_target))
+            if (target_from_avg < a_target)
             {
-                a_target = ArithToUint256(target_from_avg);
+                a_target = target_from_avg;
             }
         }
     } else
@@ -468,7 +468,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
         a_target = desired_pseudoshare_target;
     }
 
-    auto bits_target = UintToArith256(FloatingInteger(gen_sharetx_res->share_info->bits).target());
+    auto bits_target = FloatingInteger(gen_sharetx_res->share_info->bits).target();
     if (a_target < bits_target)
     {
         a_target = bits_target;
@@ -476,9 +476,8 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
     // TODO: part for merged mining
 
-    a_target = math::clip(a_target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX);
-    auto target = ArithToUint256(a_target);
-    LOG_DEBUG_STRATUM << "target =  " << a_target.GetHex();
+    auto target = math::clip(a_target, _net->parent->SANE_TARGET_RANGE_MIN, _net->parent->SANE_TARGET_RANGE_MAX);;
+    LOG_DEBUG_STRATUM << "target =  " << target.GetHex();
 
 
     //9
@@ -595,7 +594,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
                 try
                 {
-                    if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()))
+                    if (pow_hash <= FloatingInteger(header.bits).target())
                     {
                         coind::data::types::BlockType new_block(header, {new_gentx});
                         new_block.txs.insert(new_block.txs.end(), other_transactions.begin(), other_transactions.end());
@@ -651,8 +650,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
 
                 // TODO: and header_hash not in received_header_hashes:
-                if (UintToArith256(pow_hash) <=
-                    UintToArith256(FloatingInteger(_gen_sharetx_res->share_info->bits).target()))
+                if (pow_hash <= FloatingInteger(_gen_sharetx_res->share_info->bits).target())
                 {
                     auto last_txout_nonce = coinbase_nonce.get();
                     auto share = _gen_sharetx_res->get_share(header, last_txout_nonce);
@@ -700,7 +698,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
                     try
                     {
-                        if (UintToArith256(pow_hash) <= UintToArith256(FloatingInteger(header.bits).target()) && _pool_node)
+                        if (pow_hash <= FloatingInteger(header.bits).target() && _pool_node)
                         {
 							_pool_node->broadcast_share(share->hash);
                         }
@@ -728,7 +726,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
                     LOG_TRACE << "pseudoshare_received!!!";
                     // TODO: received_header_hashes.add(header_hash)
                     // TODO: for web static: self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(target), not on_time, user)
-                    recent_shares_ts_work.emplace_back(c2pool::dev::timestamp(), ArithToUint288(coind::data::target_to_average_attempts(target)));
+                    recent_shares_ts_work.emplace_back(c2pool::dev::timestamp(), coind::data::target_to_average_attempts(target));
                     if (recent_shares_ts_work.size() > 50)
                     {
                         recent_shares_ts_work.erase(recent_shares_ts_work.begin(),
@@ -745,7 +743,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
                     local_addr_rate_monitor.add_datum(
                             {
-                                    ArithToUint288(coind::data::target_to_average_attempts(target)),
+                                    coind::data::target_to_average_attempts(target),
                                     address
                             }
                     );
@@ -762,8 +760,8 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
 local_rates Worker::get_local_rates()
 {
-    std::map<std::string, arith_uint288> miner_hash_rates;
-    std::map<std::string, arith_uint288> miner_dead_hash_rates;
+    std::map<std::string, uint288> miner_hash_rates;
+    std::map<std::string, uint288> miner_dead_hash_rates;
 
     auto [datums, dt] = local_rate_monitor.get_datums_in_last();
     for (const auto& datum: datums)
@@ -788,12 +786,11 @@ std::map<std::string, uint288> Worker::get_local_addr_rates()
 
     for (const auto& datum: datums)
     {
-        arith_uint288 temp;
-        temp = ((addr_hash_rates.find(datum.address) != addr_hash_rates.end()) ? UintToArith288(addr_hash_rates[datum.address])
-                                                                                   : UintToArith288(uint288()));
-        temp += UintToArith288(datum.work) / dt;
+        uint288 temp;
+        temp = ((addr_hash_rates.find(datum.address) != addr_hash_rates.end()) ? addr_hash_rates[datum.address] : uint288());
+        temp += datum.work / dt;
 
-        addr_hash_rates[datum.address] = ArithToUint288(temp);
+        addr_hash_rates[datum.address] = temp;
     }
 
     return addr_hash_rates;
@@ -955,9 +952,7 @@ void Worker::compute_work()
         auto bb = _coind_node->best_block_header->value();
         PackStream packed_block_header = bb.get_pack();
 
-        if (bb->previous_block == t.previous_block &&
-            UintToArith256(_net->parent->POW_FUNC(packed_block_header)) <=
-            UintToArith256(FloatingInteger(t.bits).target()))
+        if (bb->previous_block == t.previous_block && _net->parent->POW_FUNC(packed_block_header) <= FloatingInteger(t.bits).target())
         {
             LOG_INFO << "Skipping from block " << bb->previous_block.GetHex() << " to block"
                      << coind::data::hash256(packed_block_header) << "!";
@@ -1020,11 +1015,11 @@ void Worker::init_web_metrics()
     local_rate_metric = _net->web->add<local_rate_metric_type>("local", [&](nlohmann::json& j){
         auto [miner_hash_rates, miner_dead_hash_rates] = get_local_rates();
 
-        arith_uint288 local;
+        uint288 local;
         for (const auto& v : miner_hash_rates)
             local += v.second;
 
-        arith_uint288 local_dead;
+        uint288 local_dead;
         for (const auto& v : miner_dead_hash_rates)
             local_dead += v.second;
 
@@ -1032,7 +1027,7 @@ void Worker::init_web_metrics()
         j["miner_dead_hash_rates"] = miner_dead_hash_rates;
 
         j["rate"] = local;
-        j["doa"] = local.IsNull() ? arith_uint288{} : local_dead/local;
+        j["doa"] = local.IsNull() ? uint288{} : local_dead/local;
 
         if (local.IsNull())
             j["time_to_share"] = nullptr;

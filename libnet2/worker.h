@@ -97,7 +97,7 @@ struct worker_get_work_result
 
 struct local_rate_datum
 {
-    arith_uint288 work;
+    uint288 work;
     bool dead;
     std::string user; // address
     uint256 share_target;
@@ -111,8 +111,8 @@ struct local_addr_rate_datum
 
 struct local_rates
 {
-    std::map<std::string, arith_uint288> miner_hash_rates;
-    std::map<std::string, arith_uint288> miner_dead_hash_rates;
+    std::map<std::string, uint288> miner_hash_rates;
+    std::map<std::string, uint288> miner_dead_hash_rates;
 };
 
 struct stale_counts
@@ -237,13 +237,13 @@ public:
 private:
     void compute_work();
 
-	arith_uint288 _estimate_local_hash_rate()
+	uint288 _estimate_local_hash_rate()
 	{
 		if (recent_shares_ts_work.size() == 50)
 		{
-			auto hash_rate = std::accumulate(recent_shares_ts_work.begin()+1, recent_shares_ts_work.end(),  arith_uint288(),
-											 [&](const arith_uint288 &x, const std::tuple<int32_t, uint288> &y){
-				return x + UintToArith288(std::get<1>(y));
+			auto hash_rate = std::accumulate(recent_shares_ts_work.begin()+1, recent_shares_ts_work.end(),  uint288(),
+											 [&](const uint288 &x, const std::tuple<int32_t, uint288> &y){
+				return x + std::get<1>(y);
 			});
 			hash_rate = hash_rate / (std::get<0>(recent_shares_ts_work.back()) - std::get<0>(recent_shares_ts_work.front()));
 			if (!hash_rate.IsNull())
