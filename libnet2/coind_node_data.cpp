@@ -3,9 +3,9 @@
 void CoindNodeData::handle_header(coind::data::BlockHeaderType new_header)
 {
 	auto packed_new_header = new_header.get_pack();
-	arith_uint256 hash_header = UintToArith256(parent_net->POW_FUNC(packed_new_header));
+	uint256 hash_header = parent_net->POW_FUNC(packed_new_header);
 	//check that header matches current target
-	if (!(hash_header <= UintToArith256(coind_work->value().bits.target())))
+	if (!(hash_header <= coind_work->value().bits.target()))
 		return;
 
 	auto coind_best_block = coind_work->value().previous_block;
