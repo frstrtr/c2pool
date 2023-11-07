@@ -45,8 +45,8 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
 	PackStream packed_header;
 	packed_header << header;
 
-	arith_uint256 pow_func = UintToArith256(net->parent->POW_FUNC(packed_header));
-	arith_uint256 bits_target = UintToArith256(header.bits.bits.target());
+	uint256 pow_func = net->parent->POW_FUNC(packed_header);
+	uint256 bits_target = header.bits.bits.target();
 	if (pow_func > bits_target)
 	{
 		throw std::invalid_argument("received block header fails PoW test");
