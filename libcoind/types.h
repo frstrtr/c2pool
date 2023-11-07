@@ -34,7 +34,7 @@ namespace coind::data::types
 
         bool operator==(const SmallBlockHeaderType &value)
         {
-            return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
+            return version == value.version && previous_block.CompareTo(value.previous_block) == 0 &&
                    timestamp == value.timestamp && bits == value.bits && nonce == value.nonce;
         }
 
@@ -111,9 +111,9 @@ namespace coind::data::types
 //            if (merkle_root.Compare(value.merkle_root) != 0)
 //                assert(false);
 
-            return version == value.version && previous_block.Compare(value.previous_block) == 0 &&
+            return version == value.version && previous_block.CompareTo(value.previous_block) == 0 &&
                    timestamp == value.timestamp && bits == value.bits && nonce == value.nonce &&
-                   merkle_root.Compare(value.merkle_root) == 0;
+                   merkle_root.CompareTo(value.merkle_root) == 0;
         }
 
         bool operator!=(const BlockHeaderType &value) const
