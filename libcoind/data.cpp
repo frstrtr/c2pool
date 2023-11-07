@@ -1,7 +1,6 @@
 #include "data.h"
 
 #include <btclibs/uint256.h>
-#include <btclibs/arith_uint256.h>
 #include <univalue.h>
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
@@ -25,91 +24,65 @@ namespace coind::data
         return false;
     }
 
-//    bool is_segwit_tx(std::shared_ptr<coind::data::TransactionType> tx)
-//    {
-//        if (tx)
-//        {
-//            return tx->wdata.has_value() && tx->wdata->marker == 0 && tx->wdata->flag >= 1;
-//        }
-//        return false;
-//    }
-
-    arith_uint288 target_to_average_attempts(uint256 target)
+    uint288 target_to_average_attempts(uint256 target)
     {
-//        if (target.IsNull())
-//        {
-//            arith_uint288 res;
-//            res.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-//            return res;
-//        }
-
-        arith_uint288 targ;
+        uint288 targ;
         targ.SetHex(target.GetHex());
 
-        arith_uint288 s;
+        uint288 s;
         s.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
 
         s /= (targ + 1);
         return s;
     }
 
-    uint256 average_attempts_to_target(arith_uint288 att)
+    uint256 average_attempts_to_target(uint288 att)
     {
         assert(!att.IsNull());
 
-        arith_uint288 s;
+        uint288 s;
         s.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
         s /= att;
 
-        arith_uint288 _max_value;
+        uint288 _max_value;
         _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         if (s > _max_value)
             return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         s -= 1;
 
-        arith_uint256 r_round;
-        r_round.SetCompact(UintToArith256(uint256S(s.GetHex())).GetCompact() + 0.5);
-        s.SetHex(ArithToUint256(r_round).GetHex());
+        uint256 r_round;
+        r_round.SetCompact(uint256S(s.GetHex()).GetCompact() + 0.5);
+        s.SetHex(r_round.GetHex());
 
         return uint256S(s.GetHex());
     }
 
-    uint256 average_attempts_to_target(uint288 average_attempts)
-    {
-        arith_uint288 att;
-        att.SetHex(average_attempts.GetHex());
-
-        return average_attempts_to_target(att);
-    }
-
     double target_to_difficulty(uint256 target)
     {
-        arith_uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
-        return for_div.getdouble() / (UintToArith256(target).getdouble() + 1);
+        uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
+        return for_div.getdouble() / (target.getdouble() + 1);
     }
 
-    uint256 difficulty_to_target(uint256 difficulty)
+    uint256 difficulty_to_target(const uint256& difficulty)
     {
-        auto v = Uint256ToArith288(difficulty);
+        auto v = convert_uint<uint288>(difficulty);
         if (v.IsNull())
             return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
-        uint288 u_s;
-        u_s.SetHex("1000000000000000000000000000000000000000000000000");
-
-        auto s = UintToArith288(u_s);
+        uint288 s;
+        s.SetHex("1000000000000000000000000000000000000000000000000");
         s *= 0xffff0000;
         s += 1;
 
         auto r = s/v - 1;
 
-        arith_uint256 r_round;
-        r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
-        r.SetHex(ArithToUint256(r_round).GetHex());
+        uint256 r_round;
+        r_round.SetCompact(uint256S(r.GetHex()).GetCompact() + 0.5);
+        r.SetHex(r_round.GetHex());
 
         {
-            arith_uint288 _max_value;
+            uint288 _max_value;
             _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             if (r > _max_value)
                 return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -120,25 +93,25 @@ namespace coind::data
 
     uint256 difficulty_to_target_1(uint256 difficulty)
     {
-        auto v = Uint256ToArith288(difficulty);
+        auto v = convert_uint<uint288>(difficulty);
         if (v.IsNull())
             return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         uint288 u_s;
         u_s.SetHex("1000000000000000000000000000000000000000000000000");
 
-        auto s = UintToArith288(u_s);
+        auto s = u_s;
         s *= 0xffff0000;
         s += 1;
 
         auto r = s*v - 1;
 
-        arith_uint256 r_round;
-        r_round.SetCompact(UintToArith256(uint256S(r.GetHex())).GetCompact() + 0.5);
-        r.SetHex(ArithToUint256(r_round).GetHex());
+        uint256 r_round;
+        r_round.SetCompact(uint256S(r.GetHex()).GetCompact() + 0.5);
+        r.SetHex(r_round.GetHex());
 
         {
-            arith_uint288 _max_value;
+            uint288 _max_value;
             _max_value.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             if (r > _max_value)
                 return uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -203,10 +176,9 @@ namespace coind::data
         CSHA256().Write((unsigned char *)&data[0], data.length()).Finalize(&out1[0]);
         CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
 
-        auto _hash = HexStr(out2);
-        result.SetHex(_hash);
-		if (reverse)
-        	std::reverse(result.begin(), result.end());
+        if (reverse)
+            std::reverse(out2.begin(), out2.end());
+        result.SetHex(HexStr(out2));
 
         return result;
     }
@@ -236,10 +208,10 @@ namespace coind::data
 
         CSHA256().Write((unsigned char *)&data[0], data.length()).Finalize(&out1[0]);
         CRIPEMD160().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
-        result.SetHex(HexStr(out2));
 
-		if (reverse)
-			std::reverse(result.begin(), result.end());
+        if (reverse)
+            std::reverse(out2.begin(), out2.end());
+        result.SetHex(HexStr(out2));
 
         return result;
     }
@@ -273,8 +245,8 @@ namespace coind::data
         CSHA256(init, buf, length).Write((unsigned char *)&data[0], data.size()).Finalize(&out1[0]);
         CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
 
+        reverse(out2.begin(), out2.end());
         result.SetHex(HexStr(out2));
-        reverse(result.begin(), result.end());
 
         return result;
     }
