@@ -192,6 +192,26 @@ TEST(CoindDataTest, TargetToDifficulty)
     std::cout << std::setprecision(70) << coind::data::target_to_difficulty(v4) << std::endl;
 }
 
+TEST(CoindDataTest, TargetToDifficulty_manual)
+{
+    auto f = [](const uint288& target){
+        uint288 for_div("ffff0000000000000000000000000000000000000000000000000001");
+        return for_div / (target + 1);
+    };
+
+    auto diff1 = f(uint288("100000000000000000000000000000000"));
+    std::cout << "diff1: " << std::setprecision(88) << diff1.getdouble() << std::endl;
+
+    auto diff2 = f(uint288("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
+    std::cout << "diff2: " << std::setprecision(88) << diff2.getdouble() << std::endl;
+
+    auto diff3 = f(uint288("1"));
+    std::cout << "diff3: " << std::setprecision(88) << diff3.getdouble() << std::endl;
+
+    auto diff4 = f(uint288("1e"));
+    std::cout << "diff4: " << std::setprecision(88) << diff4.getdouble() << std::endl;
+}
+
 TEST(CoindDataTest, DifficultyToTarget)
 {
     std::cout << "\n1:\n";
