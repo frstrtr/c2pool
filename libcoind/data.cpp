@@ -60,8 +60,12 @@ namespace coind::data
 
     double target_to_difficulty(uint256 target)
     {
-        uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
-        return for_div.getdouble() / (target.getdouble() + 1);
+        uint288 targ(target.GetHex());
+        uint288 for_div("ffff0000000000000000000000000000000000000000000000000001");
+        auto result = for_div / (targ + 1);
+//        uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
+//        return for_div.getdouble() / (target.getdouble() + 1);
+        return result.getdouble();
     }
 
     uint256 difficulty_to_target(const uint256& difficulty)
