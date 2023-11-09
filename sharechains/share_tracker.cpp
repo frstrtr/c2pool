@@ -217,8 +217,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             continue;
 
         auto [head_height, last] = get_height_and_last(head);
-        auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height -
-                                                                                                 net->CHAIN_LENGTH)));
+        auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height - net->CHAIN_LENGTH)));
 
         bool _verified = false;
         uint256 _hash;
@@ -245,8 +244,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                 desired_target = std::min(desired_target, items[temp_hash]->target);
             }
 
-            NetAddress _peer_addr = c2pool::random::RandomChoice(
-                    reverse[last])->second->peer_addr;
+            NetAddress _peer_addr = c2pool::random::RandomChoice(reverse[last])->second->peer_addr;
 
             desired.insert({
                                    _peer_addr,
@@ -257,7 +255,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         }
     }
 
-    for (auto bad : bads)
+    for (const auto& bad : bads)
     {
         if (verified.items.count(bad) != 0)
             throw std::invalid_argument("verified.items.count(bad) != 0");
@@ -316,8 +314,8 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                            });
         }
     }
-
-    std::vector<std::tuple<std::tuple<int32_t, uint288>, uint256>> decorated_tails;
+    // TODO STOPED HERE
+    std::vector<decorated_data<tail_score>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
 //        LOG_TRACE << "tail_hash = " << tail_hash << " head_hashes = [ "; std::for_each(head_hashes.begin(), head_hashes.end(), [](const auto& v){std::cout << v << " ";}); std::cout << "]" << std::endl;
@@ -327,7 +325,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                                            return verified.get_work(a->head) < verified.get_work(b->head);
                                        });
 
-        auto _score = std::make_tuple(score((*max_el)->head, block_rel_height_func), tail_hash);
+        auto _score = decorated_data<tail_score>{{score((*max_el)->head, block_rel_height_func)}, tail_hash};
         decorated_tails.push_back(_score);
     }
     std::sort(decorated_tails.begin(), decorated_tails.end());
@@ -404,7 +402,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     //    if (c2pool.DEBUG))
 //    {
-    LOG_DEBUG_SHARETRACKER << "Desire " << desired.size() << " shares. Cutoff: " << c2pool::dev::timestamp() - timestamp_cutoff << " old diff>" << coind::data::target_to_difficulty(uint256S(target_cutoff.GetHex()));
+    LOG_DEBUG_SHARETRACKER << "Desire " << desired.size() << " shares. Cutoff: " << c2pool::dev::timestamp() - timestamp_cutoff << " old diff>" << coind::data::target_to_difficulty(target_cutoff);
     for (const auto &[peer_addr, hash, ts, targ] : desired)
     {
         LOG_DEBUG_SHARETRACKER << "\t"

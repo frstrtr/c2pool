@@ -225,116 +225,6 @@ struct PreparedList
     };
 };
 
-//class PreparedList
-//{
-//private:
-//    typedef std::shared_ptr<PrepareFork> ptr_fork;
-//private:
-//    std::map<uint256, ptr_node> nodes;
-//
-//    ptr_node make_node(ShareType &value)
-//    {
-//        auto v = std::make_shared<PrepareListNode>(value);
-//        nodes[value->hash] = v;
-//
-//        return v;
-//    }
-//
-//    // Метод создаёт пару из двух нод
-//    void make_pair(ptr_node left, ptr_node right)
-//    {
-//        left->next = right;
-//        right->prev = left;
-//    }
-//
-//    ptr_fork merge_fork(ptr_fork left, ptr_fork right)
-//    {
-//        make_pair(left->head, right->tail);
-//        left->head = right->head;
-//        return left;
-//    }
-//public:
-//    std::vector<ptr_fork> forks;
-//
-//    PreparedList(std::vector<ShareType> data)
-//    {
-//        // Prepare data
-//        // -- map hashes
-//        std::map<uint256, ShareType> hashes;
-//        for (auto &_share : data)
-//        {
-//            hashes[_share->hash] = _share;
-//        }
-//
-//        // -- heads/tails
-//
-//        std::map<uint256, ptr_fork> heads;
-//        std::map<uint256, ptr_fork> tails;
-//
-//        while (!hashes.empty())
-//        {
-//            auto node = make_node(hashes.begin()->second);
-//            hashes.erase(hashes.begin());
-//
-//            if (!heads.count(*node->value->previous_hash) && !tails.count(node->value->hash))
-//            {
-//                std::map<uint256, ShareType>::iterator it;
-//                // make new fork
-//                {
-//                    auto new_fork = std::make_shared<PrepareFork>(node);
-//                    heads[node->value->hash] = new_fork;
-//                    tails[*node->value->previous_hash] = new_fork;
-//                }
-//
-//                while ((it = hashes.find(*node->value->previous_hash)) != hashes.end())
-//                {
-//                    auto new_node = make_node(it->second);
-//                    hashes.erase(it->first);
-//                    make_pair(new_node, node);
-//
-//                    auto _fork = tails.extract(*node->value->previous_hash);
-//                    _fork.mapped()->tail = new_node;
-//                    _fork.key() = *new_node->value->previous_hash;
-//                    tails.insert(std::move(_fork));
-//
-//                    node = new_node;
-//                }
-//                continue;
-//            }
-//
-//            // Проверка на продолжение форка спереди
-//            if (heads.find(*node->value->previous_hash) != heads.end())
-//            {
-//                auto _fork = heads.extract(*node->value->previous_hash);
-//                make_pair(_fork.mapped()->head, node);
-//
-//                _fork.mapped()->head = node;
-//                _fork.key() = node->value->hash;
-//                heads.insert(std::move(_fork));
-//
-//                hashes.erase(node->value->hash);
-//            }
-//
-//            // Проверка на merge форков.
-//            if (tails.find(node->value->hash) != tails.end())
-//            {
-//                auto left_fork = heads.extract(node->value->hash);
-//                auto right_fork = tails.extract(node->value->hash);
-//
-//                auto new_fork = merge_fork(left_fork.mapped(), right_fork.mapped());
-//                heads[new_fork->head->value->hash] = new_fork;
-//                tails[*new_fork->tail->value->previous_hash] = new_fork;
-//            }
-//        }
-//
-//        // set forks
-//        for (auto &_forks : heads)
-//        {
-//            forks.push_back(_forks.second);
-//        }
-//    }
-//};
-
 struct desired_type
 {
     NetAddress peer_addr;
@@ -348,11 +238,62 @@ struct desired_type
     }
 };
 
+template <typename score_type>
+struct decorated_data
+{
+    score_type score;
+    uint256 hash;
+
+    friend inline bool operator>(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score > b.score; }
+    friend inline bool operator<(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score < b.score; }
+//    friend inline bool operator>=(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score >= b.score; }
+//    friend inline bool operator<=(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score <= b.score; }
+    friend inline bool operator==(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score == b.score; }
+    friend inline bool operator!=(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return !(a == b); }
+
+};
+
+struct tail_score
+{
+    int32_t chain_len{};
+    uint288 hashrate;
+
+    friend inline bool operator>(const tail_score& a, const tail_score& b) { return std::tie(a.chain_len, a.hashrate) > std::tie(b.chain_len, b.hashrate); }
+    friend inline bool operator<(const tail_score& a, const tail_score& b) { return std::tie(a.chain_len, a.hashrate) < std::tie(b.chain_len, b.hashrate); }
+    friend inline bool operator==(const tail_score& a, const tail_score& b) { return std::tie(a.chain_len, a.hashrate) == std::tie(b.chain_len, b.hashrate); }
+    friend inline bool operator!=(const tail_score& a, const tail_score& b) { return !(a == b); }
+};
+
+struct head_score
+{
+    uint288 work;
+    int32_t reason;
+    uint32_t time_seen;
+
+    friend inline bool operator>(const head_score& a, const head_score& b) { return std::tie(a.work, a.reason, a.time_seen) > std::tie(b.work, b.reason, b.time_seen); }
+    friend inline bool operator<(const head_score& a, const head_score& b) { return std::tie(a.work, a.reason, a.time_seen) < std::tie(b.work, b.reason, b.time_seen); }
+    friend inline bool operator==(const head_score& a, const head_score& b) { return std::tie(a.work, a.reason, a.time_seen) == std::tie(b.work, b.reason, b.time_seen); }
+    friend inline bool operator!=(const head_score& a, const head_score& b) { return !(a == b); }
+};
+
+struct traditional_score
+{
+    uint288 work;
+    uint32_t time_seen;
+    int32_t reason;
+
+    friend inline bool operator>(const traditional_score& a, const traditional_score& b) { return std::tie(a.work, a.time_seen, a.reason) > std::tie(b.work, b.time_seen, b.reason); }
+    friend inline bool operator<(const traditional_score& a, const traditional_score& b) { return std::tie(a.work, a.time_seen, a.reason) < std::tie(b.work, b.time_seen, b.reason); }
+    friend inline bool operator==(const traditional_score& a, const traditional_score& b) { return std::tie(a.work, a.time_seen, a.reason) == std::tie(b.work, b.time_seen, b.reason); }
+    friend inline bool operator!=(const traditional_score& a, const traditional_score& b) { return !(a == b); }
+};
+
+
 struct TrackerThinkResult
 {
     uint256 best;
     std::vector<std::tuple<NetAddress, uint256>> desired;
-    std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
+    std::vector<decorated_data<head_score>> decorated_heads;
     std::set<NetAddress> bad_peer_addresses;
 };
 
@@ -416,16 +357,17 @@ public:
     uint288 get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work = false);
 
     // returns approximate lower bound on chain's hashrate in the last CHAIN_LENGTH*15//16*SHARE_PERIOD time
-    std::tuple<int32_t, uint288> score(uint256 share_hash, const std::function<int32_t(uint256)> &block_rel_height_func)
+    auto score(const uint256& share_hash, const std::function<int32_t(uint256)> &block_rel_height_func)
     {
         uint288 score_res;
+
         auto head_height = verified.get_height(share_hash);
         if (head_height < net->CHAIN_LENGTH)
         {
-            return std::make_tuple(head_height, score_res);
+            return tail_score{head_height, score_res};
         }
 
-        auto end_point = verified.get_nth_parent_key(share_hash, net->CHAIN_LENGTH * 15 / 16);
+        auto end_point = verified.get_nth_parent_key(share_hash, (net->CHAIN_LENGTH * 15) / 16);
 
         std::optional<int32_t> block_height;
         auto gen_verif_chain = verified.get_chain(end_point, net->CHAIN_LENGTH / 16);
@@ -441,7 +383,7 @@ public:
                 block_height = block_height_temp;
             } else
             {
-                if (block_height.value() > block_height_temp)
+                if (block_height.value() < block_height_temp)
                 {
                     block_height = block_height_temp;
                 }
@@ -451,7 +393,7 @@ public:
         score_res = verified.get_sum(share_hash, end_point).work /
                     ((-block_height.value() + 1) * parent_net->BLOCK_PERIOD);
 
-        return std::make_tuple(net->CHAIN_LENGTH, score_res);
+        return tail_score{net->CHAIN_LENGTH, score_res};
     }
 
     std::map<uint64_t, uint256> get_desired_version_counts(uint256 best_share_hash, uint64_t dist)
