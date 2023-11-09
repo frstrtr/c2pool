@@ -1,0 +1,21 @@
+decorated_heads = sorted(((
+            self.verified.get_work(self.verified.get_nth_parent_hash(h, min(5, self.verified.get_height(h)))) -
+            min(self.items[h].should_punish_reason(previous_block, bits, self, known_txs)[0], 1) * bitcoin_data.target_to_average_attempts(self.items[h].target),
+            #self.items[h].peer_addr is None,
+            -self.items[h].should_punish_reason(previous_block, bits, self, known_txs)[0],
+            #-self.items[h].should_punish_reason(previous_block, bits, self, known_txs)[0] * bitcoin_data.target_to_average_attempts(self.items[h].target),
+            -self.items[h].time_seen,
+), h) for h in self.verified.tails.get(best_tail, []))
+
+
+for h in self.verified.tails.get(best_tail, []):
+    share = self.items[h]
+    reason = share.should_punish_reason(previous_block, bits, self, known_txs) # punish (value); error (msg)
+    ((
+                self.verified.get_work(self.verified.get_nth_parent_hash(h, min(5, self.verified.get_height(h)))) -
+                min(reason[0], 1) * bitcoin_data.target_to_average_attempts(share.target),
+
+                -reason[0],
+
+                -share.time_seen,
+    ), h)
