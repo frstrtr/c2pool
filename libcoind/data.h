@@ -43,7 +43,8 @@ namespace coind::data
 
     uint256 average_attempts_to_target(uint288 att);
 
-    double target_to_difficulty(uint256 target);
+    double target_to_difficulty(const uint256& target);
+    double target_to_difficulty(const uint288& target);
 
     /// max_target/difficulty
     uint256 difficulty_to_target(const uint256& difficulty);

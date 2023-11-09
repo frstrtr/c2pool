@@ -58,11 +58,20 @@ namespace coind::data
         return uint256S(s.GetHex());
     }
 
-    double target_to_difficulty(uint256 target)
+    double target_to_difficulty(const uint256& target)
     {
         uint288 targ(target.GetHex());
         uint288 for_div("ffff0000000000000000000000000000000000000000000000000001");
         auto result = for_div / (targ + 1);
+//        uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
+//        return for_div.getdouble() / (target.getdouble() + 1);
+        return result.getdouble();
+    }
+
+    double target_to_difficulty(const uint288& target)
+    {
+        uint288 for_div("ffff0000000000000000000000000000000000000000000000000001");
+        auto result = for_div / (target + 1);
 //        uint256 for_div("ffff0000000000000000000000000000000000000000000000000001");
 //        return for_div.getdouble() / (target.getdouble() + 1);
         return result.getdouble();
