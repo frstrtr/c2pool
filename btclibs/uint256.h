@@ -402,8 +402,9 @@ public:
     uint288() = default;
     uint288(const base_uint<288> &b) : base_uint<288>(b) {}
     uint288(uint64_t b) : base_uint<288>(b) {}
-    explicit uint288(const std::string& str) : base_uint<288>(str) {}
-    explicit uint288(const std::vector<unsigned char>& vch) : base_uint<288>(vch) {}
+    uint288(const std::string& str) : base_uint<288>(str) {}
+    uint288(const std::vector<unsigned char>& vch) : base_uint<288>(vch) {}
+    uint288(const base_uint<256>& b) : base_uint<288>(b.GetHex()) {}
 
     uint288& SetCompact(uint32_t nCompact, bool *pfNegative = nullptr, bool *pfOverflow = nullptr);
     uint32_t GetCompact(bool fNegative = false) const;
