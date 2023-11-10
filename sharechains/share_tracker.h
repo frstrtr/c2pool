@@ -280,7 +280,7 @@ struct head_score
 struct traditional_score
 {
     uint288 work;
-    uint32_t time_seen{};
+    int32_t time_seen{};
     int32_t reason{};
 
     friend inline bool operator<(const traditional_score& a, const traditional_score& b)
@@ -303,6 +303,7 @@ struct TrackerThinkResult
     std::vector<std::tuple<NetAddress, uint256>> desired;
     std::vector<decorated_data<head_score>> decorated_heads;
     std::set<NetAddress> bad_peer_addresses;
+    int punish_aggressively;
 };
 
 //---> Web Share Tracker
