@@ -314,7 +314,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                            });
         }
     }
-    // TODO STOPED HERE
+
     std::vector<decorated_data<tail_score>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
     {
@@ -329,45 +329,54 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         decorated_tails.push_back(_score);
     }
     std::sort(decorated_tails.begin(), decorated_tails.end());
-    auto [best_tail_score, _best_tail] = decorated_tails.empty() ? std::make_tuple(std::make_tuple(0, uint288()), uint256::ZERO) : decorated_tails.back();
+    auto [best_tail_score, _best_tail] = decorated_tails.empty() ? decorated_data<tail_score>{{0, uint288()}, uint256::ZERO} : decorated_tails.back();
     auto best_tail = _best_tail;
+
 //    if (c2pool.DEBUG)
 //    {
     LOG_DEBUG_SHARETRACKER << decorated_tails.size() << " tails";
     for (auto [score, tail_hash] : decorated_tails)
     {
-        LOG_DEBUG_SHARETRACKER << tail_hash.GetHex() << " (" << std::get<0>(score) << ", " << std::get<1>(score).GetHex() << ")";
+        LOG_DEBUG_SHARETRACKER << tail_hash.GetHex() << " (" << tail_hash << ", [" << score.chain_len << "; " << score.hashrate.GetHex() << "])";
     }
 //    }
 
-    std::vector<std::tuple<std::tuple<uint256, int32_t, int32_t>, uint256>> decorated_heads;
+    std::vector<decorated_data<head_score>> decorated_heads;
     if (verified.tails.find(best_tail) != verified.tails.end())
     {
-        for (auto h : verified.tails[best_tail])
+        for (const auto& h : verified.tails[best_tail])
         {
-            auto el = std::make_tuple(
-                    verified.get_work(
-                            verified.get_nth_parent_key(h->head, std::min(5, verified.get_height(h->head)))),
-                    -std::get<0>(should_punish_reason(items[h->head], previous_block, bits, known_txs)),
-                    -items[h->head]->time_seen);
-            decorated_heads.emplace_back(el, h->head);
+            uint288 work_score = verified.get_work(
+                    verified.get_nth_parent_key(h->head, std::min(5, verified.get_height(h->head)))
+            );
+            work_score -= min(should_punish_reason(items[h->head], previous_block, bits, known_txs).punish, 1) * coind::data::target_to_average_attempts(items[h->head]->target);
+
+            auto score = decorated_data<head_score>{
+                    {
+                            work_score,
+                            should_punish_reason(items[h->head], previous_block, bits, known_txs).punish,
+                            items[h->head]->time_seen
+                    },
+                    h->head
+            };
+            decorated_heads.push_back(score);
         }
+        // Правило сортировки задано в head_score::operator<(...)
         std::sort(decorated_heads.begin(), decorated_heads.end());
     }
-    auto [best_head_score, _best] = decorated_heads.empty() ? std::make_tuple(std::make_tuple(uint256::ZERO, 0, 0), uint256::ZERO) : decorated_heads.back();
+    auto [best_head_score, _best] = decorated_heads.empty() ? decorated_data<head_score>{{uint256::ZERO, 0, 0}, uint256::ZERO} : decorated_heads.back();
     auto best = _best;
+
+
 
 //    if (c2pool.DEBUG))
 //    {
     LOG_DEBUG_SHARETRACKER << "tracker data: heads = " << heads.size() << ", tails = " << tails.size() << "; verified: heads = " << verified.heads.size() << ", tails = " << verified.tails.size();
     LOG_DEBUG_SHARETRACKER << decorated_heads.size() << " heads. Top 10:";
-    int i = decorated_heads.size() - 11;
-    if (i < 0)
-        i = 0;
-    for (; i < decorated_heads.size(); i++)
+    for (auto i = std::max(decorated_heads.size() - 11, size_t{0}); i < decorated_heads.size(); i++)
     {
-        auto _score = std::get<0>(decorated_heads[i]);
-        LOG_DEBUG_SHARETRACKER << "\t" << std::get<1>(decorated_heads[i]).GetHex() << " " << items[std::get<1>(decorated_heads[i])]->previous_hash->GetHex() << " " << std::get<0>(_score) << " " << std::get<1>(_score) << " " << std::get<2>(_score);
+        auto _score = decorated_heads[i].score;
+        LOG_DEBUG_SHARETRACKER << "\t" << decorated_heads[i].hash.GetHex() << " " << items[decorated_heads[i].hash]->previous_hash->GetHex() << " " << _score.work << " " << _score.reason << " " << _score.time_seen;
     }
 //    }
 
@@ -386,13 +395,13 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
         timestamp_cutoff = std::min((uint32_t)c2pool::dev::timestamp(), *best_share->timestamp) - 3600;
 
-        if (std::get<1>(best_tail_score).IsNull())
+        if (best_tail_score.hashrate.IsNull())
         {
             target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         } else
         {
             target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            target_cutoff /= (std::get<1>(best_tail_score) * net->SHARE_PERIOD + 1) * 2;
+            target_cutoff /= (best_tail_score.hashrate * net->SHARE_PERIOD + 1) * 2;
         }
     } else
     {
@@ -501,11 +510,11 @@ std::vector<coind::data::tx_type> ShareTracker::_get_other_txs(ShareType share, 
     return result;
 }
 
-std::tuple<int, std::string> ShareTracker::should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits,
+punish_reason ShareTracker::should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits,
                                                                  const std::map<uint256, coind::data::tx_type> &known_txs)
 {
     if (share->pow_hash <= share->header.stream()->bits.bits.target())
-        return {-1, "block_solution"};
+        return punish_reason{-1, "block_solution"};
 
     std::vector<coind::data::tx_type> other_txs;
     if (share->VERSION < 34)
@@ -530,11 +539,11 @@ std::tuple<int, std::string> ShareTracker::should_punish_reason(ShareType share,
         });
 
         if ((all_txs_size + 3 * stripped_txs_size + 4*80 + share->gentx_weight) > net->BLOCK_MAX_WEIGHT)
-            return {true, "txs over block weight limit"};
+            return punish_reason{true, "txs over block weight limit"};
         if ((stripped_txs_size + 80 + share->gentx_size) > net->BLOCK_MAX_SIZE)
-            return {true, "txs over block size limit"};
+            return punish_reason{true, "txs over block size limit"};
     }
-    return {false, ""};
+    return punish_reason{false, ""};
 }
 
 float ShareTracker::get_average_stale_prop(uint256 share_hash, uint64_t lookbehind)
