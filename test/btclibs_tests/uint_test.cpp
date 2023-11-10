@@ -194,6 +194,12 @@ TEST(Btclibs, UINT256_CONVERT_TEST)
     ASSERT_EQ(res1, res2);
 }
 
+TEST(Btclibs, UINT256_CONVERT_TEST2)
+{
+    uint256 s("fffffffffffffffffffffffffffffffffffffffffffffffffffffffc");
+    uint288 ss = s;
+}
+
 //int COMPARE(const uint256& a, const uint256& b)
 //{
 //    for (int i = a.WIDTH - 1; i >= 0; i--)
