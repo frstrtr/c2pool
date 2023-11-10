@@ -244,13 +244,7 @@ struct decorated_data
     score_type score;
     uint256 hash;
 
-    friend inline bool operator>(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score > b.score; }
     friend inline bool operator<(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score < b.score; }
-//    friend inline bool operator>=(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score >= b.score; }
-//    friend inline bool operator<=(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score <= b.score; }
-    friend inline bool operator==(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return a.score == b.score; }
-    friend inline bool operator!=(const decorated_data<score_type>& a, const decorated_data<score_type>& b) { return !(a == b); }
-
 };
 
 struct tail_score
@@ -258,36 +252,50 @@ struct tail_score
     int32_t chain_len{};
     uint288 hashrate;
 
-    friend inline bool operator>(const tail_score& a, const tail_score& b) { return std::tie(a.chain_len, a.hashrate) > std::tie(b.chain_len, b.hashrate); }
     friend inline bool operator<(const tail_score& a, const tail_score& b) { return std::tie(a.chain_len, a.hashrate) < std::tie(b.chain_len, b.hashrate); }
-    friend inline bool operator==(const tail_score& a, const tail_score& b) { return std::tie(a.chain_len, a.hashrate) == std::tie(b.chain_len, b.hashrate); }
-    friend inline bool operator!=(const tail_score& a, const tail_score& b) { return !(a == b); }
 };
 
 struct head_score
 {
     uint288 work;
-    int32_t reason;
-    uint32_t time_seen;
+    int32_t reason{};
+    int32_t time_seen{};
 
-    friend inline bool operator>(const head_score& a, const head_score& b) { return std::tie(a.work, a.reason, a.time_seen) > std::tie(b.work, b.reason, b.time_seen); }
-    friend inline bool operator<(const head_score& a, const head_score& b) { return std::tie(a.work, a.reason, a.time_seen) < std::tie(b.work, b.reason, b.time_seen); }
-    friend inline bool operator==(const head_score& a, const head_score& b) { return std::tie(a.work, a.reason, a.time_seen) == std::tie(b.work, b.reason, b.time_seen); }
-    friend inline bool operator!=(const head_score& a, const head_score& b) { return !(a == b); }
+    head_score() = default;
+    head_score(uint288 _work, int32_t _reason, int32_t _time_seen) : work(std::move(_work)), reason(_reason), time_seen(_time_seen) { }
+    head_score(uint256 _work, int32_t _reason, int32_t _time_seen) : reason(_reason), time_seen(_time_seen)
+    {
+        work.SetHex(_work.GetHex());
+    }
+
+
+    friend inline bool operator<(const head_score& a, const head_score& b)
+    {
+        if (a.work < b.work) return true;
+        if (b.work < a.work) return false;
+        return std::tie(a.reason, a.time_seen) > std::tie(b.reason, b.time_seen);
+    }
 };
 
 struct traditional_score
 {
     uint288 work;
-    uint32_t time_seen;
-    int32_t reason;
+    uint32_t time_seen{};
+    int32_t reason{};
 
-    friend inline bool operator>(const traditional_score& a, const traditional_score& b) { return std::tie(a.work, a.time_seen, a.reason) > std::tie(b.work, b.time_seen, b.reason); }
-    friend inline bool operator<(const traditional_score& a, const traditional_score& b) { return std::tie(a.work, a.time_seen, a.reason) < std::tie(b.work, b.time_seen, b.reason); }
-    friend inline bool operator==(const traditional_score& a, const traditional_score& b) { return std::tie(a.work, a.time_seen, a.reason) == std::tie(b.work, b.time_seen, b.reason); }
-    friend inline bool operator!=(const traditional_score& a, const traditional_score& b) { return !(a == b); }
+    friend inline bool operator<(const traditional_score& a, const traditional_score& b)
+    {
+        if (a.work < b.work) return true;
+        if (b.work < a.work) return false;
+        return std::tie(a.time_seen, a.reason) > std::tie(b.time_seen, b.reason);
+    }
 };
 
+struct punish_reason
+{
+    int punish;
+    std::string reason;
+};
 
 struct TrackerThinkResult
 {
@@ -557,7 +565,7 @@ public:
 
     std::vector<coind::data::tx_type> _get_other_txs(ShareType share, const std::map<uint256, coind::data::tx_type> &known_txs);
 
-    std::tuple<int, std::string> should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits, const std::map<uint256, coind::data::tx_type> &known_txs);
+    punish_reason should_punish_reason(ShareType share, uint256 previous_block, uint32_t bits, const std::map<uint256, coind::data::tx_type> &known_txs);
 
     float get_average_stale_prop(uint256 share_hash, uint64_t lookbehind);
 
