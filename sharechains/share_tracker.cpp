@@ -364,10 +364,29 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         // Правило сортировки задано в head_score::operator<(...)
         std::sort(decorated_heads.begin(), decorated_heads.end());
     }
-    auto [best_head_score, _best] = decorated_heads.empty() ? decorated_data<head_score>{{uint256::ZERO, 0, 0}, uint256::ZERO} : decorated_heads.back();
-    auto best = _best;
 
-
+    // traditional
+    std::vector<decorated_data<traditional_score>> traditional_sort;
+    if (verified.tails.find(best_tail) != verified.tails.end())
+    {
+        for (const auto& h : verified.tails[best_tail])
+        {
+            auto score = decorated_data<traditional_score>{
+                    {
+                            verified.get_work(
+                                    verified.get_nth_parent_key(h->head, std::min(5, verified.get_height(h->head)))
+                            ),
+                            items[h->head]->time_seen, //assume they can't tell we should punish this share and will be sorting based on time
+                            should_punish_reason(items[h->head], previous_block, bits, known_txs).punish
+                    },
+                    h->head
+            };
+            traditional_sort.push_back(score);
+        }
+        // Правило сортировки задано в traditional_score::operator<(...)
+        std::sort(traditional_sort.begin(), traditional_sort.end());
+    }
+    auto punish_aggressively = traditional_sort.empty() ? false : traditional_sort.back().score.reason;
 
 //    if (c2pool.DEBUG))
 //    {
@@ -378,7 +397,15 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         auto _score = decorated_heads[i].score;
         LOG_DEBUG_SHARETRACKER << "\t" << decorated_heads[i].hash.GetHex() << " " << items[decorated_heads[i].hash]->previous_hash->GetHex() << " " << _score.work << " " << _score.reason << " " << _score.time_seen;
     }
+    LOG_DEBUG_SHARETRACKER << "Traditional sort:";
+    for (auto i = std::max(traditional_sort.size() - 11, size_t{0}); i < traditional_sort.size(); i++)
+    {
+        auto _score = traditional_sort[i].score;
+        LOG_DEBUG_SHARETRACKER << "\t" << traditional_sort[i].hash.GetHex() << " " << items[traditional_sort[i].hash]->previous_hash->GetHex() << " " << _score.work << " " << _score.reason << " " << _score.time_seen;
+    }
 //    }
+
+    auto [best_head_score, best] = decorated_heads.empty() ? decorated_data<head_score>{{uint256::ZERO, 0, 0}, uint256::ZERO} : decorated_heads.back();
 
     uint32_t timestamp_cutoff;
     uint288 target_cutoff;
@@ -393,6 +420,28 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             best = *best_share->previous_hash;
         }
 
+        /* TODO?
+            while punish > 0:
+                print 'Punishing share for %r! Jumping from %s to %s!' % (punish_reason, format_hash(best), format_hash(best_share.previous_hash))
+                best = best_share.previous_hash
+                best_share = self.items[best]
+                punish, punish_reason = best_share.should_punish_reason(previous_block, bits, self, known_txs)
+                if not punish:
+                    def best_descendent(hsh, limit=20):
+                        child_hashes = self.reverse.get(hsh, set())
+                        best_kids = sorted((best_descendent(child, limit-1) for child in child_hashes if not self.items[child].naughty))
+                        if not best_kids or limit<0: # in case the only children are naughty
+                            return 0, hsh
+                        return (best_kids[-1][0]+1, best_kids[-1][1])
+                    try:
+                        gens, hsh = best_descendent(best)
+                        if p2pool.DEBUG: print "best_descendent went %i generations for share %s from %s" % (gens, format_hash(hsh), format_hash(best))
+                        best = hsh
+                        best_share = self.items[best]
+                    except:
+                        traceback.print_exc()
+         */
+
         timestamp_cutoff = std::min((uint32_t)c2pool::dev::timestamp(), *best_share->timestamp) - 3600;
 
         if (best_tail_score.hashrate.IsNull())
@@ -401,8 +450,15 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         } else
         {
             target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            target_cutoff /= (best_tail_score.hashrate * net->SHARE_PERIOD + 1) * 2;
+            target_cutoff /= (best_tail_score.hashrate * net->SHARE_PERIOD + 1) * 2; //TODO: accuracy?
         }
+
+        /*TODO?
+            # Hard fork logic:
+            # If our best share is v34 or higher, we will correctly zero-pad output scripts
+            # Otherwise, we preserve a bug in order to avoid a chainsplit
+            self.net.PARENT.padding_bugfix = (best_share.VERSION >= 35)
+         */
     } else
     {
         timestamp_cutoff = c2pool::dev::timestamp() - 24*60*60;
@@ -428,7 +484,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             desired_result.emplace_back(peer_addr, hash);
     }
     LOG_TRACE << "desired_result = " << desired_result.size();
-    return {best, desired_result, decorated_heads, bad_peer_addresses};
+    return {best, desired_result, decorated_heads, bad_peer_addresses, punish_aggressively};
 }
 
 uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, int32_t dist, bool min_work)
