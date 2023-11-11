@@ -6,6 +6,7 @@
 #include <sstream>
 #include <vector>
 #include <functional>
+#include <boost/date_time.hpp>
 
 namespace c2pool::dev
 {
@@ -26,6 +27,12 @@ namespace c2pool::dev
 
     //int64_t/IntType(64)
     uint32_t timestamp();
+
+    inline std::string format_date(uint32_t _timestamp)
+    {
+        auto t = boost::posix_time::seconds(_timestamp);
+        return boost::posix_time::to_simple_string(t);
+    }
 
     std::vector<unsigned char> bytes_from_uint8(std::vector<uint8_t> data);
 
