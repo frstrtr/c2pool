@@ -96,7 +96,20 @@ namespace coind
 
 			// Connection
 			auto const results = resolver.resolve(ip, port);
-			stream.connect(results);
+
+            boost::system::error_code ec;
+            do {
+                stream.connect(results, ec);
+                if (ec)
+                {
+                    LOG_INFO << "JSONRPC_Coind error when try connect: [" << ec.message()
+                             << "]. Retry after 15 seconds...";
+                    this_thread::sleep_for(15s);
+                }
+            } while(ec);
+
+            if (ec)
+                LOG_INFO << ec.message();
 
 			delete[] encoded_login;
 		}
