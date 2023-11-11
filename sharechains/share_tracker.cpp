@@ -467,7 +467,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     //    if (c2pool.DEBUG))
 //    {
-    LOG_DEBUG_SHARETRACKER << "Desire " << desired.size() << " shares. Cutoff: " << c2pool::dev::timestamp() - timestamp_cutoff << " old diff>" << coind::data::target_to_difficulty(target_cutoff);
+    LOG_DEBUG_SHARETRACKER << "Desire " << desired.size() << " shares. Cutoff: " << c2pool::dev::format_date(c2pool::dev::timestamp() - timestamp_cutoff) << " old diff>" << coind::data::target_to_difficulty(target_cutoff);
     for (const auto &[peer_addr, hash, ts, targ] : desired)
     {
         LOG_DEBUG_SHARETRACKER << "\t"
