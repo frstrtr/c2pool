@@ -20,7 +20,12 @@ void CoindNodeData::handle_header(coind::data::BlockHeaderType new_header)
 
 void CoindNodeData::set_best_share()
 {
-	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
+	auto [_best, _desired, _decorated_heads, _bad_peer_addresses, punish] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
+
+    /* TODO for punish?
+     if self.punish and not oldpunish and best == self.best_share_var.value: # need to reissue work with lower difficulty
+            self.best_share_var.changed.happened(best) # triggers wb.new_work_event to reissue work
+     */
 
 	best_share->set(_best);
     LOG_DEBUG_COIND << "new best_share: " << best_share->value().GetHex();
@@ -52,7 +57,7 @@ void CoindNodeData::set_best_share()
 void CoindNodeData::clean_tracker()
 {
 	// TODO?: Подумать, нужно ли это или очистка шар будет проходить по нашему алгоритму?
-	auto [_best, _desired, _decorated_heads, _bad_peer_addresses] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
+	auto [_best, _desired, _decorated_heads, _bad_peer_addresses, punish] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
 
 	// if (decorated_heads.size() > 0)
 	// {
