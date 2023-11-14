@@ -406,11 +406,11 @@ namespace shares::types
     struct ShareTxInfo
     {
         std::vector<uint256> new_transaction_hashes;             //pack.ListType(pack.IntType(256))
-        std::vector<std::tuple<uint64_t, uint64_t>> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
+        std::vector<tx_hash_refs> transaction_hash_refs; //pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
 
         ShareTxInfo() = default;
 
-        ShareTxInfo(const std::vector<uint256>& _new_transaction_hashes, const std::vector<tuple<uint64_t, uint64_t>>& _transaction_hash_refs)
+        ShareTxInfo(const std::vector<uint256>& _new_transaction_hashes, const std::vector<tx_hash_refs>& _transaction_hash_refs)
         {
             new_transaction_hashes = _new_transaction_hashes;
             transaction_hash_refs = _transaction_hash_refs;
