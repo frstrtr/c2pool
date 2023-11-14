@@ -44,6 +44,26 @@ namespace shares
 
     class GenerateShareTransaction : public std::enable_shared_from_this<GenerateShareTransaction>
     {
+    private:
+        struct bits_calc
+        {
+            FloatingInteger max_bits;
+            FloatingInteger bits;
+        };
+
+        struct weight_amount
+        {
+            std::vector<unsigned char> address;
+            uint288 weight;
+        };
+
+        struct new_tx_data
+        {
+            vector<uint256> new_transaction_hashes;
+            vector<tx_hash_refs> transaction_hash_refs;
+            vector<uint256> other_transaction_hashes;
+        };
+
     public:
         std::shared_ptr<ShareTracker> tracker;
         std::shared_ptr<c2pool::Network> net;
@@ -57,9 +77,7 @@ namespace shares
         SetProperty(uint256, desired_target);
         SetProperty(coind::data::MerkleLink, ref_merkle_link);
         SetProperty(type_desired_other_transaction_hashes_and_fees, desired_other_transaction_hashes_and_fees);
-//        SetProperty(type_known_txs, known_txs);
         SetProperty(unsigned long long, last_txout_nonce);
-//        SetProperty(, base_subsidy);
 
         std::optional<unsigned long long> _base_subsidy;
         GenerateShareTransaction &set_base_subsidy(const unsigned long long &_value)
@@ -93,12 +111,12 @@ namespace shares
         std::shared_ptr<GeneratedShareTransactionResult> operator()(uint64_t version);
 
         uint256 pre_target_calculate(ShareType previous_share, const int32_t &height);
-        std::tuple<FloatingInteger, FloatingInteger> bits_calculate(const uint256 &pre_target);
-        std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> new_tx_hashes_calculate(uint64_t version, uint256 prev_share_hash, int32_t height);
-        std::vector<std::tuple<std::vector<unsigned char>, uint288>> weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string& this_address);
+        bits_calc bits_calculate(const uint256 &pre_target);
+        new_tx_data new_tx_hashes_calculate(uint64_t version, uint256 prev_share_hash, int32_t height);
+        std::vector<weight_amount> weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string& this_address);
         void make_segwit_data(const std::vector<uint256>& other_transaction_hashes);
         std::shared_ptr<shares::types::ShareInfo> share_info_generate(int32_t height, uint256 last, ShareType previous_share, uint64_t version, FloatingInteger max_bits, FloatingInteger bits, bool segwit_activated);
-        coind::data::tx_type gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<std::tuple<std::vector<unsigned char>, uint288>> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str);
+        coind::data::tx_type gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<weight_amount> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str);
         get_share_method get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info);
     };
 
