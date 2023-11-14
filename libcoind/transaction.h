@@ -32,6 +32,15 @@ namespace coind::data::stream
     struct TransactionType_stream;
 }
 
+struct tx_hash_refs
+{
+    int share_count;
+    int tx_count;
+
+    tx_hash_refs() = default;
+    tx_hash_refs(int share, int tx) : share_count(share), tx_count(tx) {}
+};
+
 namespace coind::data
 {
     struct PreviousOutput
