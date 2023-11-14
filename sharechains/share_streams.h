@@ -261,7 +261,7 @@ namespace shares::stream
         }
     };
 
-    struct transaction_hash_refs_stream : public CustomGetter<std::tuple<uint64_t, uint64_t>>
+    struct transaction_hash_refs_stream : public CustomGetter<tx_hash_refs>
     {
         VarIntType share_count;
         VarIntType tx_count;
@@ -273,6 +273,12 @@ namespace shares::stream
 			share_count = std::get<0>(val);
 			tx_count = std::get<1>(val);
 		}
+
+        explicit transaction_hash_refs_stream(const tx_hash_refs &val)
+        {
+            share_count = val.share_count;
+            tx_count = val.tx_count;
+        }
 
         PackStream &write(PackStream &stream)
         {
@@ -286,9 +292,9 @@ namespace shares::stream
             return stream;
         }
 
-		std::tuple<uint64_t, uint64_t> get() const override
+        tx_hash_refs get() const override
 		{
-			return std::make_tuple(share_count.get(), tx_count.get());
+			return {(int)share_count.get(), (int)tx_count.get()};
 		}
     };
 
