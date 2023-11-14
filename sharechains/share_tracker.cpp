@@ -514,7 +514,7 @@ uint288 ShareTracker::get_pool_attempts_per_second(uint256 previous_share_hash, 
 
 std::vector<uint256> ShareTracker::get_other_tx_hashes(ShareType share)
 {
-    uint64_t parents_needed = 0;
+    int parents_needed = 0;
     if ((*share->share_info)->share_tx_info.has_value())
     {
         for (auto [share_count, tx_count]: (*share->share_info)->share_tx_info->transaction_hash_refs)
