@@ -204,7 +204,7 @@ namespace shares
         return convert_uint<uint256>(_pre_target3);
     }
 
-    std::tuple<FloatingInteger, FloatingInteger> GenerateShareTransaction::bits_calculate(const uint256 &pre_target)
+    GenerateShareTransaction::bits_calc GenerateShareTransaction::bits_calculate(const uint256 &pre_target)
     {
         FloatingInteger max_bits = FloatingInteger::from_target_upper_bound(pre_target);
         FloatingInteger bits;
@@ -222,22 +222,22 @@ namespace shares
             LOG_DEBUG_STRATUM << "BITS: " << bits.value.value;
         }
 
-        return std::make_tuple(max_bits, bits);
+        return {max_bits, bits};
     }
 
-    std::tuple<vector<uint256>, vector<tuple<uint64_t, uint64_t>>, vector<uint256>> GenerateShareTransaction::new_tx_hashes_calculate(uint64_t version, uint256 prev_share_hash, int32_t height)
+    GenerateShareTransaction::new_tx_data GenerateShareTransaction::new_tx_hashes_calculate(uint64_t version, uint256 prev_share_hash, int32_t height)
     {
         vector<uint256> new_transaction_hashes;
         int32_t all_transaction_stripped_size = 0;
         int32_t new_transaction_weight = 0;
         int32_t all_transaction_weight = 0;
-        vector<tuple<uint64_t, uint64_t>> transaction_hash_refs;
+        vector<tx_hash_refs> transaction_hash_refs;
         vector<uint256> other_transaction_hashes;
 
         //t1
 
         auto past_shares_generator = tracker->get_chain(prev_share_hash, std::min(height, 100));
-        map<uint256, tuple<int, int>> tx_hash_to_this;
+        map<uint256, tx_hash_refs> tx_hash_to_this;
 
         if (version < 34)
         {
@@ -251,7 +251,7 @@ namespace shares
                     auto tx_hash = (*_share->new_transaction_hashes)[j];
                     if (tx_hash_to_this.find(tx_hash) == tx_hash_to_this.end())
                     {
-                        tx_hash_to_this[tx_hash] = std::make_tuple(1 + i, j);
+                        tx_hash_to_this[tx_hash] = {1 + i, j};
                     }
                 }
                 i += 1;
@@ -287,14 +287,13 @@ namespace shares
                 this_weight = this_real_size + 3 * this_stripped_size;
             }
 
-            if (all_transaction_stripped_size + this_stripped_size + 80 + Share::gentx_size + 500 >
-                net->BLOCK_MAX_SIZE)
+            if (all_transaction_stripped_size + this_stripped_size + 80 + Share::gentx_size + 500 > net->BLOCK_MAX_SIZE)
                 break;
             if (all_transaction_weight + this_weight + 4 * 80 + Share::gentx_size + 2000 >
                 net->BLOCK_MAX_WEIGHT)
                 break;
 
-            tuple<int, int> _this;
+            tx_hash_refs _this{};
             if (_known_txs.has_value())
             {
                 all_transaction_stripped_size += this_stripped_size;
@@ -313,7 +312,7 @@ namespace shares
                 }
 
                 new_transaction_hashes.push_back(tx_hash);
-                _this = std::make_tuple(0, new_transaction_hashes.size() - 1);
+                _this = {0, (int)new_transaction_hashes.size() - 1};
             }
             transaction_hash_refs.emplace_back(_this);
             other_transaction_hashes.push_back(tx_hash);
@@ -344,10 +343,10 @@ namespace shares
         //         80+all_transaction_real_size+cls.gentx_size,
         //         3*80+all_transaction_weight+cls.gentx_weight)
 
-        return std::make_tuple(new_transaction_hashes, transaction_hash_refs, other_transaction_hashes);
+        return {new_transaction_hashes, transaction_hash_refs, other_transaction_hashes};
     }
 
-    std::vector<std::tuple<std::vector<unsigned char>, uint288>> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
+    std::vector<GenerateShareTransaction::weight_amount> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
     {
         std::map<std::vector<unsigned char>, uint288> weights;
         uint288 total_weight;
@@ -370,7 +369,7 @@ namespace shares
         {
             uint288 sum_weights;
             sum_weights.SetHex("0");
-            for (auto v : weights)
+            for (const auto& v : weights)
             {
                 sum_weights += v.second;
             }
@@ -380,10 +379,10 @@ namespace shares
         }
 
         // 99.5% goes according to weights prior to this share
-        std::vector<std::tuple<std::vector<unsigned char>, uint288>> amounts;
+        std::vector<GenerateShareTransaction::weight_amount> amounts;
         for (const auto& v : weights)
         {
-            amounts.emplace_back(v.first, v.second*199*_share_data.subsidy/(200*total_weight));
+            amounts.push_back({v.first, v.second*199*_share_data.subsidy/(200*total_weight)});
         }
 
         // 0.5% goes to block finder
@@ -391,14 +390,14 @@ namespace shares
 //            std::vector<unsigned char> this_script = coind::data::pubkey_hash_to_script2(_share_data.pubkey_hash, net->parent->ADDRESS_VERSION, -1, net).data;
             std::vector<unsigned char> this_address{_this_address.begin(), _this_address.end()};
 
-            auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_address](const auto& value){
-                return std::get<0>(value) == this_address;
+            auto _this_amount = std::find_if(amounts.begin(), amounts.end(), [&this_address](const GenerateShareTransaction::weight_amount& value){
+                return value.address == this_address;
             });
 
             if (_this_amount == amounts.end())
-                amounts.emplace_back(this_address, _share_data.subsidy/200);
+                amounts.push_back({this_address, _share_data.subsidy/200});
             else
-                std::get<1>(*_this_amount) += _share_data.subsidy/200;
+                _this_amount->weight += _share_data.subsidy/200;
         }
 
         //all that's left over is the donation weight and some extra satoshis due to rounding
@@ -406,36 +405,36 @@ namespace shares
             auto _donation_address = coind::data::donation_script_to_address(net);
             std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
 
-            auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const auto& value){
-                return std::get<0>(value) == donation_address;
+            auto _donation_amount = std::find_if(amounts.begin(), amounts.end(), [&](const GenerateShareTransaction::weight_amount& value){
+                return value.address == donation_address;
             });
 
             uint288 sum_amounts{};
             for (const auto& v: amounts)
-                sum_amounts += std::get<1>(v);
+                sum_amounts += v.weight;
 
             if (_donation_amount == amounts.end())
-                amounts.emplace_back(donation_address, _share_data.subsidy - sum_amounts);
+                amounts.push_back({donation_address, _share_data.subsidy - sum_amounts});
             else
-                std::get<1>(*_donation_amount) += _share_data.subsidy - sum_amounts;
+                _donation_amount->weight += _share_data.subsidy - sum_amounts;
         }
 
-        if (std::accumulate(amounts.begin(), amounts.end(), uint288{}, [&](uint288 v, const std::tuple<std::vector<unsigned char>, uint288> &p ){
-            return v + std::get<1>(p);
+        if (std::accumulate(amounts.begin(), amounts.end(), uint288{}, [&](uint288 v, const GenerateShareTransaction::weight_amount &p ){
+            return v + p.weight;
         }) != _share_data.subsidy)
             throw std::invalid_argument("Invalid subsidy!");
 
         return amounts;
     }
 
-    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<std::tuple<std::vector<unsigned char>, uint288>> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
+    coind::data::tx_type GenerateShareTransaction::gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<GenerateShareTransaction::weight_amount> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str)
     {
         coind::data::tx_type gentx;
 
         std::map<std::vector<unsigned char>, uint288> _amounts;
         for (const auto& v : amounts)
         {
-            _amounts[std::get<0>(v)] = std::get<1>(v);
+            _amounts[v.address] = v.weight;
         }
 
         std::vector<std::vector<unsigned char>> dests;
@@ -446,7 +445,7 @@ namespace shares
 //        }
 
         for (const auto& v: amounts)
-            dests.push_back(std::get<0>(v));
+            dests.push_back(v.address);
 
         auto dests_pre_end = std::partition(dests.begin(), dests.end() - 1, [&](auto elem) {
             return elem < dests.back();
@@ -459,7 +458,6 @@ namespace shares
 
             return _amounts[a] != _amounts[b] ? _amounts[a] < _amounts[b] : a < b;
         });
-
 
         //TX_IN
         vector<coind::data::TxInType> tx_ins;
