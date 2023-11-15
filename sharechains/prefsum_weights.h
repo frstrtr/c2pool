@@ -18,7 +18,7 @@ namespace shares::weight
     class weight_data
     {
     public:
-        std::map<std::vector<unsigned char>, uint288> amount; //weight, not sum, just element! //TODO: может быть тоже суммировать?
+        std::map<std::vector<unsigned char>, uint288> amount;
         uint288 total_weight;
         uint288 total_donation_weight;
 

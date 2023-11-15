@@ -452,9 +452,9 @@ public:
         }
 
         // Поиск desired_weight
-        std::map<std::vector<unsigned char>, uint288> weights;
-
+        LOG_INFO << "desired_weight = " << desired_weight.ToString();
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
+        LOG_INFO << "LIMIT = " << limit.ToString();
 //        LOG_INFO.stream() << "limit = " << limit.GetHex();
         auto cur = get_sum_to_last(start);
         auto next = get_sum_to_last(cur.sum.prev());
@@ -478,18 +478,18 @@ public:
             }
 
             algh_steps += "2.3->";
-            for (auto [k, v]: cur.sum.weight.amount)
-            {
-                if (weights.find(k) != weights.end())
-                {
-                    algh_steps += "2.31->";
-                    weights[k] += v;
-                } else
-                {
-                    algh_steps += "2.32->";
-                    weights[k] = v;
-                }
-            }
+//            for (auto [k, v]: cur.sum.weight.amount)
+//            {
+//                if (weights.find(k) != weights.end())
+//                {
+//                    algh_steps += "2.31->";
+//                    weights[k] += v;
+//                } else
+//                {
+//                    algh_steps += "2.32->";
+//                    weights[k] = v;
+//                }
+//            }
 
             cur = next;
             if (exist(cur.sum.prev()))
@@ -507,8 +507,10 @@ public:
         if (extra_ending.has_value())
         {
             algh_steps += "3->";
-            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
+            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash() << ")";
             auto result_sum = get_sum(start, cur.sum.hash());
+            //weights
+            auto weights = result_sum.weight.amount;
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
@@ -545,7 +547,8 @@ public:
             }
             LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
             LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
-            LOG_INFO << algh_steps << "02";
+//            LOG_INFO << algh_steps << "02";
+            LOG_INFO << "02";
             return std::make_tuple(weights, total_weights, total_donation_weights);
         } else
         {
@@ -556,7 +559,8 @@ public:
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-            LOG_INFO << algh_steps << "03";
+            LOG_INFO << "02";
+//            LOG_INFO << algh_steps << "03";
             return std::make_tuple(result_sum.weight.amount, total_weights, total_donation_weights);
         }
     }
