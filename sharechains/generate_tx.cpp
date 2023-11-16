@@ -348,22 +348,12 @@ namespace shares
 
     std::vector<GenerateShareTransaction::weight_amount> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
     {
-        std::map<std::vector<unsigned char>, uint288> weights;
-        uint288 total_weight;
-        uint288 donation_weight;
-        {
-            uint256 start_hash = prev_share_hash;
+        uint256 start_hash = prev_share_hash;
+        int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
 
-            int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
-
-            auto _block_target_attempts = coind::data::target_to_average_attempts(_block_target);
-            auto desired_weight = _block_target_attempts * 65535 * net->SPREAD;
-            auto weights_result = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
-
-            weights = std::get<0>(weights_result);
-            total_weight = std::get<1>(weights_result);
-            donation_weight = std::get<2>(weights_result);
-        }
+        auto _block_target_attempts = coind::data::target_to_average_attempts(_block_target);
+        auto desired_weight = _block_target_attempts * 65535 * net->SPREAD;
+        auto [weights, total_weight, donation_weight] = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
 
         //assert
         {

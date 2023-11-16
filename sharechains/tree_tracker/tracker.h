@@ -107,8 +107,6 @@ public:
             state |= only_tails;
 
         LOG_INFO << "Added share: hash = " << value.hash() << ", prev = " << value.prev() << "; tracker.size = " << items.size();
-        if (items.size() == 400)
-            LOG_INFO << "SHARE 400";
 //        LOG_INFO << "heads: " << heads;
 //        LOG_INFO << "tails: " << tails;
 

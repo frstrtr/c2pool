@@ -20,20 +20,6 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
     for (const auto &share : prepare_shares.build_list())
         add(share);
 
-//    for (auto& fork : prepare_shares.forks)
-//    {
-//        auto share_node = fork->tail;
-//        while (share_node)
-//        {
-//            add(share_node->value);
-//            share_node = share_node->next;
-//        }
-//    }
-
-//    for (auto& _share : _shares)
-//    {
-//        add(_share);
-//    }
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- init shares finished: " << c2pool::dev::timestamp();
 
     LOG_DEBUG_SHARETRACKER << "ShareTracker::init -- known shares started: " << c2pool::dev::timestamp();
@@ -52,16 +38,6 @@ void ShareTracker::init(const std::vector<ShareType>& _shares, const std::vector
 
         for (const auto &share : prepare_verified_shares.build_list())
             verified.add(share);
-
-//        for (auto& fork : prepare_verified_shares.forks)
-//        {
-//            auto share_node = fork->tail;
-//            while (share_node)
-//            {
-//                verified.add(share_node->value);
-//                share_node = share_node->next;
-//            }
-//        }
     }
 
 //    for (auto& share_hash : known_verified_share_hashes)
