@@ -306,6 +306,13 @@ struct TrackerThinkResult
     int punish_aggressively;
 };
 
+struct cumulative_weights
+{
+    std::map<std::vector<unsigned char>, uint288> weights;
+    uint288 total_weights;
+    uint288 total_donation_weights;
+};
+
 //---> Web Share Tracker
 
 struct shares_stale_count
@@ -430,8 +437,7 @@ public:
         return result;
     }
 
-    std::tuple<std::map<std::vector<unsigned char>, uint288>, uint288, uint288>
-    get_cumulative_weights(uint256 start, int32_t max_shares, const uint288& desired_weight)
+    cumulative_weights get_cumulative_weights(uint256 start, int32_t max_shares, const uint288& desired_weight)
     {
         std::string algh_steps = "gcw debug: "; // FOR DEBUG
         // Если start -- None/Null/0 шара.
@@ -549,7 +555,7 @@ public:
             LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
 //            LOG_INFO << algh_steps << "02";
             LOG_INFO << "02";
-            return std::make_tuple(weights, total_weights, total_donation_weights);
+            return {weights, total_weights, total_donation_weights};
         } else
         {
             LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
@@ -561,7 +567,7 @@ public:
 
             LOG_INFO << "02";
 //            LOG_INFO << algh_steps << "03";
-            return std::make_tuple(result_sum.weight.amount, total_weights, total_donation_weights);
+            return {result_sum.weight.amount, total_weights, total_donation_weights};
         }
     }
 
