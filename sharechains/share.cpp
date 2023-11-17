@@ -250,7 +250,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
                 self.naughty = 0
      */
 
-    LOG_INFO << "GENTX FOR SHARE: " << hash << "; " << *gentx->gentx;
+//    LOG_INFO << "GENTX FOR SHARE: " << hash << "; " << *gentx->gentx;
 
     assert(other_tx_hashes == gentx->other_transaction_hashes);
     if (*share_info->get() != *gentx->share_info)

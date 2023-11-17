@@ -74,58 +74,6 @@ void NodeManager::run()
     _context->run();
 }
 
-//void NodeManager::run()
-//{
-//    LOG_INFO << "Making asio io_context in NodeManager...";
-//    _context = make_shared<boost::asio::io_context>(4);
-//
-//    //0:    COIND
-//    LOG_INFO << "Init Coind...";
-//    _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, coind_address, coind_port, coind_login);
-//    //1:    Determining payout address
-//    //2:    ShareStore
-//    LOG_INFO << "ShareStore initialization...";
-//    //TODO: init
-//    //_share_store = std::make_shared<ShareStore>("dgb"); //TODO: init
-//    //Init work:
-//    //3:    ShareTracker
-//    LOG_INFO << "ShareTracker initialization...";
-//    _tracker = std::make_shared<ShareTracker>(_net);
-//    //3.1:  Save shares every 60 seconds
-//    //TODO: timer in _tracker constructor
-//
-//    //4:    CoindNode
-//    LOG_INFO << "CoindNode initialization...";
-//    //TODO: _coind_node = std::make_shared<CoindNode>(_context, _parent_net, _coind, _tracker);
-//    //4.1:  CoindNode.start?
-//    LOG_INFO << "CoindNode starting...";
-//    //TODO: coind_node()->start();
-//    //...success!
-//
-//    //Joing c2pool/p2pool network:
-//    //5:    AddrStore
-//    _addr_store = std::make_shared<c2pool::dev::AddrStore>("data//digibyte//addrs", _net);
-//    //5.1:  Bootstrap_addrs
-//    //5.2:  Parse CLI args for addrs
-//    //6:    P2PNode
-////        TODO:_p2pnode = std::make_shared<P2PNode>(_context, _net, _config, _addr_store, _coind_node, _tracker);
-//    //6.1:  P2PNode.start?
-//    //TODO: p2pNode()->start();
-//    //7:    Save addrs every 60 seconds
-//    //TODO: timer in _addr_store constructor
-//    //...success!
-//
-//    //Start listening for workers with a JSON-RPC server:
-//    //8:    Worker
-////TODO:        _worker = std::make_shared<c2pool::libnet::Worker>(_net, _p2pnode, _coind_node, _tracker);
-//    //9:    Stratum
-//
-//    //10:   WebRoot
-//    //...success!
-//    _is_loaded = true;
-//    _context->run();
-//}
-
 bool NodeManager::is_loaded() const
 {
     return _is_loaded;
