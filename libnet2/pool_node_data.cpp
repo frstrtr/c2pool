@@ -63,10 +63,12 @@ void PoolNodeData::handle_bestblock(coind::data::stream::BlockHeaderType_stream 
 
 void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
 {
+    auto t1 = c2pool::dev::timestamp(); // start
     PreparedList prepare_shares;
     prepare_shares.add(shares_data.items);
 
     std::vector<ShareType> shares = prepare_shares.build_list();
+    auto t2 = c2pool::dev::timestamp(); // prepare time
 //    for (auto& fork : prepare_shares.forks)
 //    {
 //        auto share_node = fork->head;
@@ -110,18 +112,22 @@ void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
 		new_count++;
 		tracker->add(share);
 	}
-
+    auto t3 = c2pool::dev::timestamp(); // processing time
 	known_txs->add(all_new_txs);
 
+    auto t77 = c2pool::dev::timestamp(); //
 	if (new_count)
 	{
 		coind_node->set_best_share();
 	}
 
+    auto t4 = c2pool::dev::timestamp(); // finish
 	if (shares.size() > 5)
 	{
+        LOG_INFO << "t4-t3: " << c2pool::dev::format_date(t4-t3) << "; t77-t3 = " << c2pool::dev::format_date(t77-t3) << "; t4-t77 = " << c2pool::dev::format_date(t4-t77);
+        LOG_INFO << "Prepare shares time: " << c2pool::dev::format_date(t2-t1) << "; Processing time: " << c2pool::dev::format_date(t3-t2) << "; Full time: " << c2pool::dev::format_date(t4-t1);
 		LOG_INFO << "... done processing " << shares.size() << " shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
-//        std::this_thread::sleep_for(0.2s);
+        //        std::this_thread::sleep_for(0.2s);
 	}
 }
 
