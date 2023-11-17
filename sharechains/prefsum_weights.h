@@ -36,7 +36,7 @@ namespace shares::weight
             amount = {{{share->address.begin(), share->address.end()}, att * (65535 - *share->donation)}};
             total_weight = att*65535;
             total_donation_weight = att * (*share->donation);
-            LOG_INFO << "NEW WEIGHT: [" << share->hash << "]: att = " << att.GetHex() << "; total_weight = " << total_weight.GetHex() << "; total_donation_weight = " << total_donation_weight.GetHex();
+//            LOG_INFO << "NEW WEIGHT: [" << share->hash << "]: att = " << att.GetHex() << "; total_weight = " << total_weight.GetHex() << "; total_donation_weight = " << total_donation_weight.GetHex();
         }
 
         void operator+=(const weight_data &element)

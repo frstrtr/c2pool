@@ -439,12 +439,12 @@ public:
 
     cumulative_weights get_cumulative_weights(uint256 start, int32_t max_shares, const uint288& desired_weight)
     {
-        std::string algh_steps = "gcw debug: "; // FOR DEBUG
+//        std::string algh_steps = "gcw debug: "; // FOR DEBUG
         // Если start -- None/Null/0 шара.
         if (start.IsNull())
         {
             // 0
-            LOG_INFO << algh_steps << "01";
+//            LOG_INFO << algh_steps << "01";
             return {{}, {}, {}};
         }
 
@@ -453,14 +453,14 @@ public:
         // Ограничиваем цепочку до размера max_shares.
         if (start_height > max_shares)
         {
-            algh_steps += "1->";
+//            algh_steps += "1->";
             last = get_nth_parent_key(start, max_shares);
         }
 
         // Поиск desired_weight
-        LOG_INFO << "desired_weight = " << desired_weight.ToString();
+//        LOG_INFO << "desired_weight = " << desired_weight.ToString();
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
-        LOG_INFO << "LIMIT = " << limit.ToString();
+//        LOG_INFO << "LIMIT = " << limit.ToString();
 //        LOG_INFO.stream() << "limit = " << limit.GetHex();
         auto cur = get_sum_to_last(start);
         auto next = get_sum_to_last(cur.sum.prev());
@@ -468,22 +468,22 @@ public:
 
         while (cur.sum.hash() != last)
         {
-            algh_steps += "2->";
+//            algh_steps += "2->";
 //            LOG_INFO.stream() << "[" << cur.sum.hash() << "->" << cur.sum.prev() << "]: total_weight = " << cur.sum.weight.total_weight.GetHex() << "; donation_weight = " << cur.sum.weight.total_donation_weight.GetHex();
             if (limit == next.sum.weight.total_weight)
             {
-                algh_steps += "2.1->";
+//                algh_steps += "2.1->";
                 break;
             }
 
             if (limit > next.sum.weight.total_weight)
             {
-                algh_steps += "2.2->";
+//                algh_steps += "2.2->";
                 extra_ending = std::make_optional<shares::weight::weight_data>(cur.sum.share);
                 break;
             }
 
-            algh_steps += "2.3->";
+//            algh_steps += "2.3->";
 //            for (auto [k, v]: cur.sum.weight.amount)
 //            {
 //                if (weights.find(k) != weights.end())
@@ -500,11 +500,11 @@ public:
             cur = next;
             if (exist(cur.sum.prev()))
             {
-                algh_steps += "2.41->";
+//                algh_steps += "2.41->";
                 next = get_sum_to_last(next.sum.prev());
             } else
             {
-                algh_steps += "2.42->";
+//                algh_steps += "2.42->";
                 break;
             }
         }
@@ -512,8 +512,8 @@ public:
         // Если мы почти набрали предел и следующая шара переваливает по весу, то каждый воркер, указанный в этой шаре, будет эвивалентно процентно получать соответствующую ему долю.
         if (extra_ending.has_value())
         {
-            algh_steps += "3->";
-            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash() << ")";
+//            algh_steps += "3->";
+//            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash() << ")";
             auto result_sum = get_sum(start, cur.sum.hash());
             //weights
             auto weights = result_sum.weight.amount;
@@ -522,7 +522,7 @@ public:
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
+//            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
 
             auto [_script, _weight] = *extra_ending->amount.begin();
             //TODO: test (если много воркеров, может происходить неправильное округление)
@@ -534,38 +534,38 @@ public:
 
             if (weights.find(new_weight.first) != weights.end())
             {
-                algh_steps += "3.1->";
+//                algh_steps += "3.1->";
                 weights[new_weight.first] += new_weight.second;
             } else
             {
-                algh_steps += "3.2->";
+//                algh_steps += "3.2->";
                 weights[new_weight.first] = new_weight.second;
             }
 
             total_donation_weights += (desired_weight - total_weights)/65535*extra_ending->total_donation_weight/(extra_ending->total_weight/65535);
             total_weights = desired_weight;
 
-            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
-            LOG_INFO << "extra_ending.amount: ";
-            for (auto v : extra_ending->amount)
-            {
-                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
-            }
-            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
-            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
+//            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
+//            LOG_INFO << "extra_ending.amount: ";
+//            for (auto v : extra_ending->amount)
+//            {
+//                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
+//            }
+//            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
+//            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
 //            LOG_INFO << algh_steps << "02";
-            LOG_INFO << "02";
+//            LOG_INFO << "02";
             return {weights, total_weights, total_donation_weights};
         } else
         {
-            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
+//            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
             auto result_sum = get_sum(start, /*std::get<2>(prev)*/cur.sum.hash());
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-            LOG_INFO << "02";
+//            LOG_INFO << "03";
 //            LOG_INFO << algh_steps << "03";
             return {result_sum.weight.amount, total_weights, total_donation_weights};
         }

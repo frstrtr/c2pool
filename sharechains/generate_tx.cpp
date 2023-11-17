@@ -364,7 +364,7 @@ namespace shares
                 sum_weights += v.second;
             }
 
-            LOG_INFO << "GCW RESULT: total_weight = " << total_weight.ToString() << "; sum_weights = " << sum_weights.ToString() << "; donation_weight = " << donation_weight.ToString() << "; sum = " << (sum_weights + donation_weight).ToString() << "; equal?: " << (total_weight == (sum_weights + donation_weight));
+//            LOG_INFO << "GCW RESULT: total_weight = " << total_weight.ToString() << "; sum_weights = " << sum_weights.ToString() << "; donation_weight = " << donation_weight.ToString() << "; sum = " << (sum_weights + donation_weight).ToString() << "; equal?: " << (total_weight == (sum_weights + donation_weight));
             assert(total_weight == (sum_weights + donation_weight));
         }
 
