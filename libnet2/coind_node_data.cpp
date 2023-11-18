@@ -20,6 +20,7 @@ void CoindNodeData::handle_header(coind::data::BlockHeaderType new_header)
 
 void CoindNodeData::set_best_share()
 {
+    auto t1 = c2pool::dev::timestamp();
 	auto [_best, _desired, _decorated_heads, _bad_peer_addresses, punish] = tracker->think(get_height_rel_highest.ref_func(), coind_work->value().previous_block, coind_work->value().bits.get(), known_txs->value());
 
     /* TODO for punish?
@@ -27,11 +28,13 @@ void CoindNodeData::set_best_share()
             self.best_share_var.changed.happened(best) # triggers wb.new_work_event to reissue work
      */
 
+    auto t2 = c2pool::dev::timestamp();
 	best_share->set(_best);
     LOG_DEBUG_COIND << "new best_share: " << best_share->value().GetHex();
     if (!best_share->value().IsNull())
         LOG_DEBUG_COIND << "REAL NEW BEST SHARE: " << best_share->value().GetHex();
 	desired->set(_desired);
+    auto t3 = c2pool::dev::timestamp();
 
     if (tracker->exist(_best))
         cur_share_version = tracker->get(_best)->VERSION;
@@ -52,6 +55,11 @@ void CoindNodeData::set_best_share()
 			}
 		}
 	}
+    auto t4 = c2pool::dev::timestamp();
+    LOG_INFO << "SET_BEST_SHARE TIME:";
+//    LOG_INFO << "\t" << "t2-t1:" << c2pool::dev::format_date(t2-t1);
+//    LOG_INFO << "\t" << "t3-t2:" << c2pool::dev::format_date(t3-t2);
+//    LOG_INFO << "\t" << "t4-t3:" << c2pool::dev::format_date(t4-t3);
 }
 
 void CoindNodeData::clean_tracker()
