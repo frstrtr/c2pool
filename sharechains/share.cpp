@@ -4,6 +4,8 @@
 #include <tuple>
 #include <set>
 #include <string>
+#include <chrono>
+#include <iomanip>
 
 #include <univalue.h>
 #include <libdevcore/logger.h>
@@ -141,6 +143,7 @@ void Share::init()
 
 void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<std::map<uint256, coind::data::tx_type>> other_txs)
 {
+    auto start = std::chrono::high_resolution_clock::now();
     if (*timestamp > (c2pool::dev::timestamp() + 600))
     {
         throw std::invalid_argument(
@@ -149,7 +152,6 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
     }
 
     std::map<uint64_t, uint256> counts;
-
     if (!previous_hash->IsNull())
     {
         auto previous_share = _tracker->get(*previous_hash);
@@ -173,6 +175,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
         //elif type(self) is type(previous_share).SUCCESSOR:
         //      raise p2p.PeerMisbehavingError('switch without enough history')
     }
+    auto t1 = std::chrono::high_resolution_clock::now();
 
     std::vector<uint256> other_tx_hashes;
     if (VERSION < 34)
@@ -184,6 +187,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
                                                                share_count))->share_info->get()->share_tx_info->new_transaction_hashes[tx_count]);
         }
     }
+    auto t2 = std::chrono::high_resolution_clock::now();
 
 
     auto gentx_F = std::make_shared<shares::GenerateShareTransaction>(_tracker);
@@ -195,6 +199,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
             set_ref_merkle_link(*ref_merkle_link->get()).
             set_last_txout_nonce(last_txout_nonce);
 
+    auto t3 = std::chrono::high_resolution_clock::now();
     // set known txs
     if (other_txs.has_value())
         gentx_F->set_known_txs(other_txs.value());
@@ -217,8 +222,10 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
         gentx_F->set_desired_other_transaction_hashes_and_fees(
                 desired_other_transaction_hashes_and_fees);
     }
+    auto t4 = std::chrono::high_resolution_clock::now();
 
     auto gentx = (*gentx_F)(VERSION);
+    auto t5 = std::chrono::high_resolution_clock::now();
 
     /* TODO:
      * if self.VERSION < 34:
@@ -257,7 +264,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
         throw std::invalid_argument("share_info invalid");
     if (coind::data::get_txid(gentx->gentx) != gentx_hash)
         throw std::invalid_argument((boost::format("gentx doesn't match hash_link: txid = %1%, gentx_hash = %2%") % coind::data::get_txid(gentx->gentx).GetHex() % gentx_hash).str());
-
+    auto t6 = std::chrono::high_resolution_clock::now();
     // Check merkle link
     if (VERSION < 34)
     {
@@ -269,6 +276,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
         if (_merkle_link != *merkle_link->get())
             throw std::invalid_argument("merkle_link and other_tx_hashes do not match");
     }
+    auto t7 = std::chrono::high_resolution_clock::now();
 
     //TODO: wanna for upd protocol version???
     // update_min_protocol_version(counts, self)
@@ -284,7 +292,17 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
         gentx_weight = weight_stream.size();
     }
 
+    auto final = std::chrono::high_resolution_clock::now();
 
+    LOG_INFO << "\tCHECK TIME: " << std::fixed << std::setprecision(10) << std::chrono::duration<double>(final-start).count() << "s.";
+    LOG_INFO << "\t\t" << "t1-start:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t1-start).count() << "s.";
+    LOG_INFO << "\t\t" << "t2-t1:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t2-t1).count() << "s.";
+    LOG_INFO << "\t\t" << "t3-t2:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t3-t2).count() << "s.";
+    LOG_INFO << "\t\t" << "t4-t3:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t4-t3).count() << "s.";
+    LOG_INFO << "\t\t" << "t5-t4:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t5-t4).count() << "s.";
+    LOG_INFO << "\t\t" << "t6-t5:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t6-t5).count() << "s.";
+    LOG_INFO << "\t\t" << "t7-t6:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(t7-t6).count() << "s.";
+    LOG_INFO << "\t\t" << "final-t7:" << std::fixed << std::setprecision(10) << std::chrono::duration<double>(final-t7).count() << "s.";
 //
 //    type(self).gentx_size   = self.gentx_size # saving this share's gentx size as a class variable is an ugly hack, and you're welcome to hate me for doing it. But it works.
 //            type(self).gentx_weight = self.gentx_weight
