@@ -1,0 +1,176 @@
+{
+  "main": {
+    "id": "1ab75b73b2622e07",
+    "type": "split",
+    "children": [
+      {
+        "id": "e0aa35c8248f30f3",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "b15e89d5d2b84bba",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Переработка системы загрузки шар.md",
+                "mode": "source",
+                "source": false
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "c1cb3a71c947846c",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5813721ca62fc6c5",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Shares/Download.md",
+                "mode": "preview",
+                "source": false
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "36b96176adb7c422",
+    "type": "split",
+    "children": [
+      {
+        "id": "e9cde361b9ab47e8",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "08a5ba4eebe93322",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical"
+              }
+            }
+          },
+          {
+            "id": "6675bc15c1740817",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              }
+            }
+          },
+          {
+            "id": "d44ba37cf175edbe",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {}
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "7a0f4ffab3bc7a7d",
+    "type": "split",
+    "children": [
+      {
+        "id": "37dd93f28def32d7",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "dc453e007ee1ae14",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Переработка системы загрузки шар.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              }
+            }
+          },
+          {
+            "id": "66dd6f710e458306",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Переработка системы загрузки шар.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              }
+            }
+          },
+          {
+            "id": "d1be7bed960f03c4",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true
+              }
+            }
+          },
+          {
+            "id": "0b0abc22424ac1d7",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Переработка системы загрузки шар.md"
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Меню быстрого перехода": false,
+      "graph:Граф": false,
+      "canvas:Создать новый холст": false,
+      "daily-notes:Сегодняшняя заметка": false,
+      "templates:Вставить шаблон": false,
+      "command-palette:Открыть палитру команд": false,
+      "obsidian-excalidraw-plugin:Create new drawing": false
+    }
+  },
+  "active": "b15e89d5d2b84bba",
+  "lastOpenFiles": [
+    "Shares/Download.md",
+    "Переработка системы загрузки шар.md",
+    "Events.md",
+    "Без названия",
+    "Shares"
+  ]
+}
