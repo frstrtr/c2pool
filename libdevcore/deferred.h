@@ -227,6 +227,7 @@ namespace c2pool::deferred
             }
             else
             {
+                std::cout << "ReplyMatcher doesn't store this key";
                 throw std::invalid_argument("ReplyMatcher doesn't store this key!");
             }
         }
@@ -284,7 +285,7 @@ namespace c2pool::deferred
 
         ReturnType yield(std::shared_ptr<Fiber> fiber, Args... ARGS)
         {
-            shared_deferred<ReturnType> def = make_deferred<ReturnType>();;
+            shared_deferred<ReturnType> def = make_deferred<ReturnType>();
 
             auto id = this->operator()(fiber->io, ARGS...);
             result[id]->add_callback([&, def = def](ReturnType res){
