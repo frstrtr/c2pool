@@ -23,6 +23,13 @@ namespace c2pool::random
         return list[pos];
     }
 
+    template <typename T>
+    T RandomChoice(const std::vector<T> &list)
+    {
+        int pos = RandomInt(0, list.size());
+        return list[pos];
+    }
+
 
     template <typename Key, typename Value>
     Value RandomChoice(std::map<Key, Value> _map)

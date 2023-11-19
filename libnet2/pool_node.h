@@ -138,10 +138,81 @@ public:
 
 class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, protected WebPoolNode, public enable_shared_from_this<PoolNode>
 {
+    struct DownloadShareManager
+    {
+        std::shared_ptr<PoolNode> node{};
+
+        DownloadShareManager() = default;
+
+        void response_shares(const std::vector<ShareType> &shares, const NetAddress& peer_addr)
+        {
+            if (shares.empty())
+                // TODO: sleep 1s
+                return;
+
+            HandleSharesData _shares;
+            for (auto& _share : shares)
+            {
+                _shares.add(_share, {});
+            }
+
+            node->handle_shares(_shares, peer_addr);
+        }
+
+        void request_shares(const std::vector<std::tuple<NetAddress, uint256>>& desired)
+        {
+            LOG_DEBUG_POOL << "REQUEST SHARES";
+            auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
+
+            if (node->peers.empty())
+            {
+                LOG_WARNING << "request_shares: peers.size() == 0";
+                // TODO: sleep 1s
+                return;
+            }
+
+            auto peer = c2pool::random::RandomChoice(node->peers);
+            auto [peer_ip, peer_port] = peer->get_addr();
+
+            LOG_INFO << "Requesting parent share " << share_hash.GetHex() << "; from peer: " << peer_ip << ":"
+                     << peer_port;
+//          TODO:  try
+//            {
+            std::vector<uint256> stops;
+            {
+                std::set<uint256> _stops;
+                for (const auto &s: node->tracker->heads)
+                {
+                    _stops.insert(s.first);
+                }
+
+                for (const auto &s: node->tracker->heads)
+                {
+                    uint256 stop_hash = node->tracker->get_nth_parent_key(s.first, std::min(
+                            std::max(0, node->tracker->get_height_and_last(s.first).height - 1), 10));
+                    _stops.insert(stop_hash);
+                }
+                stops = vector<uint256>{_stops.begin(), _stops.end()};
+            }
+
+            LOG_TRACE << "Stops: " << stops;
+
+            peer->get_shares.yield(node->context, [&, peer = peer](const std::vector<ShareType> &shares)
+                                   { response_shares(shares, peer->get_addr()); },
+                                   std::vector<uint256>{share_hash},
+                                   (uint64_t) c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
+                                   stops
+            );
+//            }
+        }
+
+        void start(const std::shared_ptr<PoolNode> &_node);
+    };
+
 private:
     uint64_t nonce; // node_id
 
-    std::shared_ptr<c2pool::deferred::Fiber> _download_shares_fiber;
+    DownloadShareManager download_share_manager;
 public:
 	PoolNode(std::shared_ptr<io::io_context> _context)
 			: PoolNodeData(std::move(_context)),
@@ -215,7 +286,7 @@ public:
 private:
     void start();
 
-    void download_shares();
+//    void download_shares();
 
     void init_web_metrics() override;
 };

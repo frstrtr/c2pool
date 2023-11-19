@@ -37,6 +37,15 @@ std::vector<NetAddress> PoolNodeClient::get_good_peers(int max_count)
 	return result;
 }
 
+void PoolNode::DownloadShareManager::start(const std::shared_ptr<PoolNode> &_node)
+{
+    node = _node;
+    node->coind_node->desired->changed->subscribe([&](const std::vector<std::tuple<NetAddress, uint256>>& new_value){
+        if (!new_value.empty())
+            request_shares(new_value);
+    });
+}
+
 void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake)
 {
     LOG_DEBUG_POOL << "handle message_version";
@@ -607,7 +616,7 @@ void PoolNode::start()
         return;
     }
 
-    download_shares();
+    download_share_manager.start(shared_from_this());
 
     coind_node->best_block_header->changed->subscribe([&](coind::data::BlockHeaderType header){
         for (auto _peer : peers)
@@ -636,90 +645,90 @@ void PoolNode::start()
      */
 }
 
-void PoolNode::download_shares()
-{
-    _download_shares_fiber = c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
-    {
-        auto _node = shared_from_this();
-        LOG_DEBUG_POOL << "Start download_shares!";
-        while (true)
-        {
-            auto desired = _node->coind_node->desired->get_when_satisfies([&](const auto &desired)
-                                                                         {
-                                                                             LOG_DEBUG_POOL << "desired.size() != 0: " << (desired.size() != 0);
-                                                                             return desired.size() != 0;
-                                                                         })->yield(fiber);
-            LOG_DEBUG_POOL << "DOWNLOAD SHARE1";
-            auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
-
-            if (_node->peers.size() == 0)
-            {
-                LOG_WARNING << "download_shares: peers.size() == 0";
-                fiber->sleep(1s);
-                continue;
-            }
-            auto peer = c2pool::random::RandomChoice(_node->peers);
-            auto [peer_ip, peer_port] = peer->get_addr();
-
-            LOG_INFO << "Requesting parent share " << share_hash.GetHex() << " from " << peer_ip << ":" << peer_port;
-
-            std::vector<ShareType> shares;
-//            try
+//void PoolNode::download_shares()
+//{
+//    _download_shares_fiber = c2pool::deferred::Fiber::run(context, [&](const std::shared_ptr<c2pool::deferred::Fiber> &fiber)
+//    {
+//        auto _node = shared_from_this();
+//        LOG_DEBUG_POOL << "Start download_shares!";
+//        while (true)
+//        {
+//            auto desired = _node->coind_node->desired->get_when_satisfies([&](const auto &desired)
+//                                                                         {
+//                                                                             LOG_DEBUG_POOL << "desired.size() != 0: " << (desired.size() != 0);
+//                                                                             return desired.size() != 0;
+//                                                                         })->yield(fiber);
+//            LOG_DEBUG_POOL << "DOWNLOAD SHARE1";
+//            auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
+//
+//            if (_node->peers.size() == 0)
 //            {
-                std::vector<uint256> stops;
-                {
-                    std::set<uint256> _stops;
-                    for (const auto& s : _node->tracker->heads)
-                    {
-                        _stops.insert(s.first);
-                    }
-
-                    for (const auto& s : _node->tracker->heads)
-                    {
-                        uint256 stop_hash = _node->tracker->get_nth_parent_key(s.first, std::min(std::max(0, _node->tracker->get_height_and_last(s.first).height - 1), 10));
-                        _stops.insert(stop_hash);
-                    }
-                    stops = vector<uint256>{_stops.begin(), _stops.end()};
-                }
-
-                LOG_TRACE << "Stops: " << stops;
-
-                shares = peer->get_shares.yield(fiber,
-                                                     std::vector<uint256>{share_hash},
-                                                     (uint64_t)c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
-                                                     stops
-                                                     );
+//                LOG_WARNING << "download_shares: peers.size() == 0";
+//                fiber->sleep(1s);
+//                continue;
 //            }
-            //TODO: catch: timeout/any error
-
-            if (shares.empty())
-            {
-                fiber->sleep(1s);
-                continue;
-            }
-
-            HandleSharesData _shares;
-            for (auto& _share : shares)
-            {
-                _shares.add(_share, {});
-            }
-
-//            PreparedList prepare_shares(shares);
-//            for (auto& fork : prepare_shares.forks)
-//            {
-//                auto share_node = fork->tail;
-//                while (share_node)
+//            auto peer = c2pool::random::RandomChoice(_node->peers);
+//            auto [peer_ip, peer_port] = peer->get_addr();
+//
+//            LOG_INFO << "Requesting parent share " << share_hash.GetHex() << " from " << peer_ip << ":" << peer_port;
+//
+//            std::vector<ShareType> shares;
+////            try
+////            {
+//                std::vector<uint256> stops;
 //                {
-//                    post_shares.add(share_node->value, {});
-//                    share_node = share_node->next;
+//                    std::set<uint256> _stops;
+//                    for (const auto& s : _node->tracker->heads)
+//                    {
+//                        _stops.insert(s.first);
+//                    }
+//
+//                    for (const auto& s : _node->tracker->heads)
+//                    {
+//                        uint256 stop_hash = _node->tracker->get_nth_parent_key(s.first, std::min(std::max(0, _node->tracker->get_height_and_last(s.first).height - 1), 10));
+//                        _stops.insert(stop_hash);
+//                    }
+//                    stops = vector<uint256>{_stops.begin(), _stops.end()};
 //                }
+//
+//                LOG_TRACE << "Stops: " << stops;
+//
+//                shares = peer->get_shares.yield(fiber,
+//                                                     std::vector<uint256>{share_hash},
+//                                                     (uint64_t)c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
+//                                                     stops
+//                                                     );
+////            }
+//            //TODO: catch: timeout/any error
+//
+//            if (shares.empty())
+//            {
+//                fiber->sleep(1s);
+//                continue;
 //            }
-
-            _node->handle_shares(_shares, peer->get_addr());
-            fiber->sleep(500ms);
-        }
-    });
-}
+//
+//            HandleSharesData _shares;
+//            for (auto& _share : shares)
+//            {
+//                _shares.add(_share, {});
+//            }
+//
+////            PreparedList prepare_shares(shares);
+////            for (auto& fork : prepare_shares.forks)
+////            {
+////                auto share_node = fork->tail;
+////                while (share_node)
+////                {
+////                    post_shares.add(share_node->value, {});
+////                    share_node = share_node->next;
+////                }
+////            }
+//
+//            _node->handle_shares(_shares, peer->get_addr());
+//            fiber->sleep(500ms);
+//        }
+//    });
+//}
 
 void PoolNode::init_web_metrics()
 {
