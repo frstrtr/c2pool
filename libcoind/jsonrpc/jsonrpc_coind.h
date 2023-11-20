@@ -29,13 +29,31 @@ namespace coind
 		tcp::resolver resolver;
 		beast::tcp_stream stream;
 
-		const char *req_format = "{\"jsonrpc\": \"2.0\", \"id\":\"curltest\", \"method\": \"%s\", \"params\": %s }";
+		const char *req_format = R"({"jsonrpc": "2.0", "id":"curltest", "method": "%s", "params": %s })";
 		http::request<http::string_body> req;
 
 		char *authorization;
 		char *host;
-
+        const char *ip;
+        const char *port;
 	private:
+        void reconnect()
+        {
+            auto const results = resolver.resolve(ip, port);
+
+            boost::system::error_code ec;
+            do
+            {
+                stream.connect(results, ec);
+                if (ec)
+                {
+                    LOG_INFO << "JSONRPC_Coind error when try connect: [" << ec.message()
+                             << "]. Retry after 15 seconds...";
+                    this_thread::sleep_for(15s);
+                }
+            } while (ec);
+        }
+
 		//TODO: template request params
 		UniValue _request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
@@ -75,43 +93,28 @@ namespace coind
 
 		// login = "login:password"
 		JSONRPC_Coind(std::shared_ptr<io::io_context> _context, shared_ptr<coind::ParentNetwork> _parent_net,
-					  const char *ip, const char *port, const char *login) : context(_context), parent_net(_parent_net),
-																			 resolver(*_context), stream(*_context)
+					  const char *_ip, const char *_port, const char *login) : context(_context), parent_net(_parent_net),
+																			 resolver(*_context), stream(*_context),
+                                                                             ip(_ip), port(_port)
 		{
-			//Request
-			req = {http::verb::post, "/", 11};
+            //Request
+            req = {http::verb::post, "/", 11};
 
-			host = new char[strlen(ip) + strlen(port) + 2];
-			sprintf(host, "%s:%s", ip, port);
-			req.set(http::field::host, host);
+            host = new char[strlen(ip) + strlen(port) + 2];
+            sprintf(host, "%s:%s", ip, port);
+            req.set(http::field::host, host);
 
-			req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-			req.set(http::field::content_type, "application/json");
+            req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+            req.set(http::field::content_type, "application/json");
 
-			char *encoded_login = new char[32];
-			boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
-			authorization = new char[6 + strlen(encoded_login) + 1];
-			sprintf(authorization, "Basic %s", encoded_login);
-			req.set(http::field::authorization, authorization);
+            char *encoded_login = new char[32];
+            boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
+            authorization = new char[6 + strlen(encoded_login) + 1];
+            sprintf(authorization, "Basic %s", encoded_login);
+            req.set(http::field::authorization, authorization);
+            delete[] encoded_login;
 
-			// Connection
-			auto const results = resolver.resolve(ip, port);
-
-            boost::system::error_code ec;
-            do {
-                stream.connect(results, ec);
-                if (ec)
-                {
-                    LOG_INFO << "JSONRPC_Coind error when try connect: [" << ec.message()
-                             << "]. Retry after 15 seconds...";
-                    this_thread::sleep_for(15s);
-                }
-            } while(ec);
-
-            if (ec)
-                LOG_INFO << ec.message();
-
-			delete[] encoded_login;
+			reconnect();
 		}
 
 		~JSONRPC_Coind()
@@ -157,26 +160,26 @@ namespace coind
 			return request("getnetworkinfo");
 		}
 
-		UniValue getblock(std::shared_ptr<GetBlockRequest> req)
+		UniValue getblock(std::shared_ptr<GetBlockRequest> _req)
 		{
-			return request("getblock", req);
+			return request("getblock", _req);
 		}
 
-		UniValue getblockheader(std::shared_ptr<GetBlockHeaderRequest> req, bool full = false)
+		UniValue getblockheader(std::shared_ptr<GetBlockHeaderRequest> _req, bool full = false)
 		{
 			if (full)
-				return request_with_error("getblockheader", req);
+				return request_with_error("getblockheader", _req);
 			else
-				return request("getblockheader", req);
+				return request("getblockheader", _req);
 		}
 
 		//https://bitcoincore.org/en/doc/0.18.0/rpc/mining/getblocktemplate/
-		UniValue getblocktemplate(std::shared_ptr<GetBlockTemplateRequest> req, bool full = false)
+		UniValue getblocktemplate(std::shared_ptr<GetBlockTemplateRequest> _req, bool full = false)
 		{
 			if (full)
-				return request_with_error("getblocktemplate", req);
+				return request_with_error("getblocktemplate", _req);
 			else
-				return request("getblocktemplate", req);
+				return request("getblocktemplate", _req);
 		}
 
 	};
