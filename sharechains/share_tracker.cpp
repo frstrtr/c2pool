@@ -157,17 +157,17 @@ void ShareTracker::remove(uint256 hash)
 
 bool ShareTracker::attempt_verify(ShareType share)
 {
-    auto t1 = c2pool::dev::timestamp();
+    auto t1 = c2pool::dev::debug_timestamp();
     if (verified.exist(share->hash))
     {
         return true;
     }
-    auto t2 = c2pool::dev::timestamp();
+    auto t2 = c2pool::dev::debug_timestamp();
 
     auto [height, last] = get_height_and_last(share->hash);
     if (height < net->CHAIN_LENGTH + 1 && !last.IsNull())
         throw std::invalid_argument("attempt_verify error");
-    auto t3 = c2pool::dev::timestamp();
+    auto t3 = c2pool::dev::debug_timestamp();
     try
     {
         share->check(shared_from_this());
@@ -177,11 +177,11 @@ bool ShareTracker::attempt_verify(ShareType share)
         LOG_WARNING << "Share check failed (" << e.what() << "): " << share->hash << " -> " << (share->previous_hash->IsNull() ? uint256::ZERO.GetHex() : share->previous_hash->GetHex());
         return false;
     }
-    auto t4 = c2pool::dev::timestamp();
+    auto t4 = c2pool::dev::debug_timestamp();
 
     verified.add(share);
-    auto final = c2pool::dev::timestamp();
-    LOG_INFO << "\tATTEMPT_VERIFY TIME: " << c2pool::dev::format_date(final-t1);
+    auto final = c2pool::dev::debug_timestamp();
+//    LOG_INFO << "\tATTEMPT_VERIFY TIME: " << final-t1;
 //    LOG_INFO << "\t\t" << "t2-t1:" << c2pool::dev::format_date(t2-t1);
 //    LOG_INFO << "\t\t" << "t3-t2:" << c2pool::dev::format_date(t3-t2);
 //    LOG_INFO << "\t\t" << "t4-t3:" << c2pool::dev::format_date(t4-t3);
@@ -191,7 +191,7 @@ bool ShareTracker::attempt_verify(ShareType share)
 
 TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &block_rel_height_func, uint256 previous_block, uint32_t bits, std::map<uint256, coind::data::tx_type> known_txs)
 {
-    auto t1 = c2pool::dev::timestamp();
+    auto t1 = c2pool::dev::debug_timestamp();
     std::set<desired_type> desired;
     std::set<NetAddress> bad_peer_addresses;
 
@@ -240,7 +240,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
                            });
         }
     }
-    auto t2 = c2pool::dev::timestamp();
+    auto t2 = c2pool::dev::debug_timestamp();
 
     for (const auto& bad : bads)
     {
@@ -258,15 +258,15 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             LOG_ERROR << "BAD REMOVE ERROR:  " << ec.message();
         }
     }
-    auto t3 = c2pool::dev::timestamp();
+    auto t3 = c2pool::dev::debug_timestamp();
 
     for (auto [head, tail] : verified.heads)
     {
-        auto t31 = c2pool::dev::timestamp();
+        auto t31 = c2pool::dev::debug_timestamp();
         auto [head_height, last_hash] = verified.get_height_and_last(head);
         auto [last_height, last_last_hash] = get_height_and_last(last_hash);
 
-        auto t32 = c2pool::dev::timestamp();
+        auto t32 = c2pool::dev::debug_timestamp();
         // XXX: review boundary conditions
         auto want = std::max(net->CHAIN_LENGTH - head_height, 0);
         auto can = last_last_hash.IsNull() ? last_height : std::max(last_height - 1 - net->CHAIN_LENGTH, 0);
@@ -280,11 +280,11 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             if (!attempt_verify(get(share_hash)))
                 break;
         }
-        auto t34 = c2pool::dev::timestamp();
+        auto t34 = c2pool::dev::debug_timestamp();
 
         if (head_height < net->CHAIN_LENGTH && !last_last_hash.IsNull())
         {
-            auto t35 = c2pool::dev::timestamp();
+            auto t35 = c2pool::dev::debug_timestamp();
             uint32_t desired_timestamp = *items[head]->timestamp;
             uint256 desired_target = items[head]->target;
 
@@ -315,7 +315,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 //        LOG_INFO << "\t\t\t" << "t34-t33:" << c2pool::dev::format_date(t34-t33);
 
     }
-    auto t4 = c2pool::dev::timestamp();
+    auto t4 = c2pool::dev::debug_timestamp();
 
     std::vector<decorated_data<tail_score>> decorated_tails;
     for (auto [tail_hash, head_hashes] : verified.tails)
@@ -334,7 +334,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
     auto [best_tail_score, _best_tail] = decorated_tails.empty() ? decorated_data<tail_score>{{0, uint288()}, uint256::ZERO} : decorated_tails.back();
     auto best_tail = _best_tail;
 
-    auto t5 = c2pool::dev::timestamp();
+    auto t5 = c2pool::dev::debug_timestamp();
 //    if (c2pool.DEBUG)
 //    {
     LOG_DEBUG_SHARETRACKER << decorated_tails.size() << " tails";
@@ -367,7 +367,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         // Правило сортировки задано в head_score::operator<(...)
         std::sort(decorated_heads.begin(), decorated_heads.end());
     }
-    auto t6 = c2pool::dev::timestamp();
+    auto t6 = c2pool::dev::debug_timestamp();
 
     // traditional
     std::vector<decorated_data<traditional_score>> traditional_sort;
@@ -391,7 +391,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         std::sort(traditional_sort.begin(), traditional_sort.end());
     }
     auto punish_aggressively = traditional_sort.empty() ? false : traditional_sort.back().score.reason;
-    auto t7 = c2pool::dev::timestamp();
+    auto t7 = c2pool::dev::debug_timestamp();
 
 //    if (c2pool.DEBUG))
 //    {
@@ -412,7 +412,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
     auto [best_head_score, best] = decorated_heads.empty() ? decorated_data<head_score>{{uint256::ZERO, 0, 0}, uint256::ZERO} : decorated_heads.back();
 
-    auto t8 = c2pool::dev::timestamp();
+    auto t8 = c2pool::dev::debug_timestamp();
 
     uint32_t timestamp_cutoff;
     uint288 target_cutoff;
@@ -471,7 +471,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         timestamp_cutoff = c2pool::dev::timestamp() - 24*60*60;
         target_cutoff.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     }
-    auto t9 = c2pool::dev::timestamp();
+    auto t9 = c2pool::dev::debug_timestamp();
 
     //    if (c2pool.DEBUG))
 //    {
@@ -492,8 +492,8 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             desired_result.emplace_back(peer_addr, hash);
     }
     LOG_TRACE << "desired_result = " << desired_result.size();
-    auto final = c2pool::dev::timestamp();
-    LOG_INFO << "\tSET_BEST_SHARE TIME: " << c2pool::dev::format_date(final-t1);
+    auto final = c2pool::dev::debug_timestamp();
+    LOG_INFO << "\tSET_BEST_SHARE TIME: " << final-t1;
 //    LOG_INFO << "\t\t" << "t2-t1:" << c2pool::dev::format_date(t2-t1);
 //    LOG_INFO << "\t\t" << "t3-t2:" << c2pool::dev::format_date(t3-t2);
 //    LOG_INFO << "\t\t" << "t4-t3:" << c2pool::dev::format_date(t4-t3);
