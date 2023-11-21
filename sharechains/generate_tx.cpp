@@ -33,7 +33,7 @@ namespace shares
 
     std::shared_ptr<GeneratedShareTransactionResult> GenerateShareTransaction::operator()(uint64_t version)
     {
-        //t0
+        t0 = c2pool::dev::debug_timestamp();
         ShareType previous_share = tracker->get(_share_data.previous_share_hash);
         uint256 prev_share_hash = previous_share ? previous_share->hash : uint256::ZERO;
 
@@ -48,6 +48,7 @@ namespace shares
 
         auto [new_transaction_hashes, transaction_hash_refs, other_transaction_hashes] = new_tx_hashes_calculate(version, prev_share_hash, height);
 
+        auto t11 = c2pool::dev::debug_timestamp();;
         set<uint256> included_transactions = set<uint256>(other_transaction_hashes.begin(),
                                                           other_transaction_hashes.end());
 
@@ -72,6 +73,7 @@ namespace shares
                     definite_fees += 0;
             }
         }
+        auto t12 = c2pool::dev::debug_timestamp();
 
         if (!fees_none_contains)
         {
@@ -107,10 +109,12 @@ namespace shares
             delete _share_data.addr.address;
             _share_data.addr.address = nullptr;
         }
+        auto t13 = c2pool::dev::debug_timestamp();
 
         // Weight Amount Calculate
         auto amounts = weight_amount_calculate(prev_share_hash.IsNull() ? uint256::ZERO : (*previous_share->share_data)->previous_share_hash, height, this_address);
 
+        auto t14 = c2pool::dev::debug_timestamp();
         bool segwit_activated = is_segwit_activated(version, net);
         if (!_segwit_data.has_value() && !_known_txs.has_value())
         {
@@ -130,7 +134,7 @@ namespace shares
         {
             make_segwit_data(other_transaction_hashes);
         }
-
+        auto t15 = c2pool::dev::debug_timestamp();
 //      witness_reserved_value_str = '[P2Pool]'*4
 //		witness_reserved_value = pack.IntType(256).unpack(witness_reserved_value_str)
 //		witness_commitment_hash = bitcoin_data.get_witness_commitment_hash(segwit_data['wtxid_merkle_root'], witness_reserved_value)
@@ -146,18 +150,25 @@ namespace shares
 
             witness_commitment_hash = coind::data::get_witness_commitment_hash(_segwit_data.value().wtxid_merkle_root, witness_reserved_value);
         }
+        auto t16 = c2pool::dev::debug_timestamp();
 
 
         if (version < 34)
             set_share_tx_info(shares::types::ShareTxInfo{new_transaction_hashes, transaction_hash_refs});
 
         std::shared_ptr<shares::types::ShareInfo> share_info = share_info_generate(height, last, previous_share, version, max_bits, bits, segwit_activated);
+        auto t17 = c2pool::dev::debug_timestamp();
 
         auto gentx = gentx_generate(version, segwit_activated, witness_commitment_hash, amounts, share_info, witness_reserved_value_str);
+        auto t18 = c2pool::dev::debug_timestamp();
 
         get_share_method get_share_F = get_share_func(version, gentx, other_transaction_hashes, share_info);
+        auto t19 = c2pool::dev::debug_timestamp();
 
-//		t5 = time.time()
+        t5 = c2pool::dev::debug_timestamp();
+        // TODO: log_info -> log_debug
+        LOG_INFO << t5-t0 << " for data.py:generate_transaction(). Parts: " << t1-t0 << " " << t2-t1 << " " << t3-t2 << " " << t4-t3 << " " << t5-t4;
+        LOG_INFO << "other parts: " << t12-t11 << " " << t13-t12 << " " << t14-t13 << " " << t15-t14 << " " << t16-t15 << " " << t17-t16 << " " << t18-t17 << " " << t19-t18;
 //		if p2pool.BENCH: print "%8.3f ms for data.py:generate_transaction(). Parts: %8.3f %8.3f %8.3f %8.3f %8.3f " % (
 //			(t5-t0)*1000.,
 //			(t1-t0)*1000.,
@@ -227,14 +238,13 @@ namespace shares
 
     GenerateShareTransaction::new_tx_data GenerateShareTransaction::new_tx_hashes_calculate(uint64_t version, uint256 prev_share_hash, int32_t height)
     {
+        t1 = c2pool::dev::debug_timestamp();
         vector<uint256> new_transaction_hashes;
         int32_t all_transaction_stripped_size = 0;
         int32_t new_transaction_weight = 0;
         int32_t all_transaction_weight = 0;
         vector<tx_hash_refs> transaction_hash_refs;
         vector<uint256> other_transaction_hashes;
-
-        //t1
 
         auto past_shares_generator = tracker->get_chain(prev_share_hash, std::min(height, 100));
         map<uint256, tx_hash_refs> tx_hash_to_this;
@@ -258,7 +268,7 @@ namespace shares
             }
         }
 
-        //t2
+        t2 = c2pool::dev::debug_timestamp();
         for (auto [tx_hash, fee]: _desired_other_transaction_hashes_and_fees)
         {
             int32_t this_stripped_size = 0;
@@ -318,7 +328,7 @@ namespace shares
             other_transaction_hashes.push_back(tx_hash);
         }
 
-        //t3
+        t3 = c2pool::dev::debug_timestamp();
 
         // Тут в питон-коде проводятся махинации с упаковкой в типы C, для оптимизации памяти. Нам, по идее, это не нужно.
         // if transaction_hash_refs and max(transaction_hash_refs) < 2**16:
@@ -326,7 +336,7 @@ namespace shares
         // elif transaction_hash_refs and max(transaction_hash_refs) < 2**32: # in case we see blocks with more than 65536 tx
         //     transaction_hash_refs = array.array('L', transaction_hash_refs)
 
-        //t4
+        t4 = c2pool::dev::debug_timestamp();
 
         // if all_transaction_stripped_size:
         //     print "Generating a share with %i bytes, %i WU (new: %i B, %i WU) in %i tx (%i new), plus est gentx of %i bytes/%i WU" % (
@@ -348,13 +358,15 @@ namespace shares
 
     std::vector<GenerateShareTransaction::weight_amount> GenerateShareTransaction::weight_amount_calculate(uint256 prev_share_hash, int32_t height, const std::string &_this_address)
     {
+        auto tw1 = c2pool::dev::debug_timestamp();
         uint256 start_hash = prev_share_hash;
         int32_t max_shares = max(0, min(height, net->REAL_CHAIN_LENGTH) - 1);
 
+        auto tw2 = c2pool::dev::debug_timestamp();
         auto _block_target_attempts = coind::data::target_to_average_attempts(_block_target);
         auto desired_weight = _block_target_attempts * 65535 * net->SPREAD;
         auto [weights, total_weight, donation_weight] = tracker->get_cumulative_weights(start_hash, max_shares, desired_weight);
-
+        auto tw3 = c2pool::dev::debug_timestamp();
         //assert
         {
             uint288 sum_weights;
@@ -367,6 +379,7 @@ namespace shares
 //            LOG_INFO << "GCW RESULT: total_weight = " << total_weight.ToString() << "; sum_weights = " << sum_weights.ToString() << "; donation_weight = " << donation_weight.ToString() << "; sum = " << (sum_weights + donation_weight).ToString() << "; equal?: " << (total_weight == (sum_weights + donation_weight));
             assert(total_weight == (sum_weights + donation_weight));
         }
+        auto tw4 = c2pool::dev::debug_timestamp();
 
         // 99.5% goes according to weights prior to this share
         std::vector<GenerateShareTransaction::weight_amount> amounts;
@@ -390,6 +403,7 @@ namespace shares
                 _this_amount->weight += _share_data.subsidy/200;
         }
 
+        auto tw5 = c2pool::dev::debug_timestamp();
         //all that's left over is the donation weight and some extra satoshis due to rounding
         {
             auto _donation_address = coind::data::donation_script_to_address(net);
@@ -409,11 +423,15 @@ namespace shares
                 _donation_amount->weight += _share_data.subsidy - sum_amounts;
         }
 
+        auto tw6 = c2pool::dev::debug_timestamp();
         if (std::accumulate(amounts.begin(), amounts.end(), uint288{}, [&](uint288 v, const GenerateShareTransaction::weight_amount &p ){
             return v + p.weight;
         }) != _share_data.subsidy)
             throw std::invalid_argument("Invalid subsidy!");
 
+        auto tw7 = c2pool::dev::debug_timestamp();
+
+        LOG_INFO << "weight_amount_calculate time: " << tw2-tw1 << " " << tw3-tw2 << " " << tw4-tw3 << " " << tw5-tw4 << " " << tw6-tw5 << " " << tw7-tw6;
         return amounts;
     }
 
