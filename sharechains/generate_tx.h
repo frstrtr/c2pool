@@ -118,6 +118,9 @@ namespace shares
         std::shared_ptr<shares::types::ShareInfo> share_info_generate(int32_t height, uint256 last, ShareType previous_share, uint64_t version, FloatingInteger max_bits, FloatingInteger bits, bool segwit_activated);
         coind::data::tx_type gentx_generate(uint64_t version, bool segwit_activated, uint256 witness_commitment_hash, std::vector<weight_amount> amounts, std::shared_ptr<shares::types::ShareInfo> &share_info, const char* witness_reserved_value_str);
         get_share_method get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info);
+    private:
+        // for debug
+        c2pool::dev::debug_timestamp t0, t1, t2, t3, t4, t5;
     };
 
 #undef SetProperty
