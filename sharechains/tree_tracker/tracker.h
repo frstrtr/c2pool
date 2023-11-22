@@ -221,22 +221,30 @@ public:
     // sum_element, head, tail
     sum_to_last get_sum_to_last(hash_type hash)
     {
+        auto t0 = c2pool::dev::debug_timestamp();
         sum_element result;
 
         shared_lock lock(mutex_);
+        auto t1 = c2pool::dev::debug_timestamp();
         if (items.find(hash) != items.end())
         {
 //            LOG_TRACE << "FORK: " << hash << "; " << (fork_by_key.find(hash) != fork_by_key.end());
             auto fork = fork_by_key[hash];
             result.share = items[hash];
+            auto t2 = c2pool::dev::debug_timestamp();
             result += fork->get_sum(hash);
             fork = fork->prev_fork;
+            auto t3 = c2pool::dev::debug_timestamp();
 
             while (fork)
             {
                 result += fork->get_sum_all();
                 fork = fork->prev_fork;
             }
+
+            auto t4 = c2pool::dev::debug_timestamp();
+
+            LOG_INFO << "get_sum_to_last t: " << t1-t0 << "; " << t2-t1 << "; " << t3-t2 << "; " << t4-t3;
         } else
             return {sum_element(hash), hash, hash};
 
