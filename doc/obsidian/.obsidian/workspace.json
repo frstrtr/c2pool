@@ -4,16 +4,16 @@
     "type": "split",
     "children": [
       {
-        "id": "a2adff47613fa9f4",
+        "id": "284867954ed445d3",
         "type": "tabs",
         "children": [
           {
-            "id": "eb73d052bd03828d",
+            "id": "349048c68a4da353",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Reconnect.md",
+                "file": "Проблемы/Долгое выполнение set_best_share.md",
                 "mode": "source",
                 "source": false
               }
@@ -85,7 +85,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Reconnect.md",
+                "file": "Проблемы/Долгое выполнение set_best_share.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -102,7 +102,7 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "Reconnect.md",
+                "file": "Проблемы/Долгое выполнение set_best_share.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               }
@@ -125,7 +125,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "Reconnect.md"
+                "file": "Проблемы/Долгое выполнение set_best_share.md"
               }
             }
           }
@@ -147,13 +147,18 @@
       "obsidian-excalidraw-plugin:Create new drawing": false
     }
   },
-  "active": "eb73d052bd03828d",
+  "active": "349048c68a4da353",
   "lastOpenFiles": [
-    "Reconnect.md",
-    "Shares/Share Download.md",
-    "Events.md",
+    "imgs/gentx_debug_time_excel.png",
+    "Проблемы/Долгое выполнение set_best_share.md",
+    "GenerateShareTransaction.md",
     "Переработка системы загрузки шар.md",
-    "Без названия",
+    "imgs",
+    "Events.md",
+    "Shares/Share Download.md",
+    "Reconnect.md",
+    "Проблемы",
+    "Проблема",
     "Shares"
   ]
 }
