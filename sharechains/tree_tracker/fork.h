@@ -147,6 +147,19 @@ public:
         return result;
     }
 
+    sum_element get_sum_element(hash_type hash)
+    {
+        for (auto &cluster : clusters)
+        {
+            if (clusters.exist(hash))
+            {
+                return cluster.data[cluster.reverse[hash]];
+            }
+        }
+
+        throw std::out_of_range("fork.get_sum_element: hash not found");
+    }
+
     // result -> (left_hash, right_hash]
     sum_element get_sum_range(hash_type left_hash, hash_type right_hash)
     {
