@@ -466,14 +466,70 @@ public:
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
 //        LOG_INFO << "LIMIT = " << limit.ToString();
 //        LOG_INFO.stream() << "limit = " << limit.GetHex();
-        auto cur = get_sum_to_last(start);
-        auto next = get_sum_to_last(cur.sum.prev());
+
+        // OLD
+
+        std::optional<shares::weight::weight_data> extra_ending_old;
+        auto cur_old = get_sum_to_last(start);
+        auto next_old = get_sum_to_last(cur_old.sum.prev());
+
+        while (cur_old.sum.hash() != last)
+        {
+            if (limit == next_old.sum.weight.total_weight)
+            {
+                break;
+            }
+
+            if (limit > next_old.sum.weight.total_weight)
+            {
+                extra_ending_old = std::make_optional<shares::weight::weight_data>(cur_old.sum.share);
+                break;
+            }
+
+            cur_old = next_old;
+            if (exist(cur_old.sum.prev()))
+            {
+                next_old = get_sum_to_last(next_old.sum.prev());
+            } else
+            {
+                break;
+            }
+        }
+
+        /////////////////////////////////////////////////////////OLD
+
+        struct calc_element
+        {
+            uint256 hash;
+            uint256 prev;
+
+            sum_element sum;
+
+            calc_element() = default;
+
+            calc_element(uint256 _hash, uint256 _prev, sum_element _sum)
+            {
+                hash = _hash;
+                prev = _prev;
+                sum = _sum;
+            }
+
+            calc_element(const sum_to_last& el)
+            {
+                hash = el.sum.hash();
+                prev = el.sum.prev();
+                sum = el.sum;
+            }
+        };
+
+        auto cur = calc_element{get_sum_to_last(start)};
+        auto next = calc_element{get_sum_to_last(cur.prev)};
         std::optional<shares::weight::weight_data> extra_ending;
         auto tgcw5 = c2pool::dev::debug_timestamp();
 
         double tc1 = 0;
         double tc2 = 0;
-        while (cur.sum.hash() != last)
+        while (cur.hash != last)
         {
 //            algh_steps += "2->";
 //            LOG_INFO.stream() << "[" << cur.sum.hash() << "->" << cur.sum.prev() << "]: total_weight = " << cur.sum.weight.total_weight.GetHex() << "; donation_weight = " << cur.sum.weight.total_donation_weight.GetHex();
@@ -486,32 +542,19 @@ public:
             if (limit > next.sum.weight.total_weight)
             {
 //                algh_steps += "2.2->";
-                extra_ending = std::make_optional<shares::weight::weight_data>(cur.sum.share);
+                extra_ending = std::make_optional<shares::weight::weight_data>(items[cur.hash]);
                 break;
             }
 
-//            algh_steps += "2.3->";
-//            for (auto [k, v]: cur.sum.weight.amount)
-//            {
-//                if (weights.find(k) != weights.end())
-//                {
-//                    algh_steps += "2.31->";
-//                    weights[k] += v;
-//                } else
-//                {
-//                    algh_steps += "2.32->";
-//                    weights[k] = v;
-//                }
-//            }
-
             auto cycle_t = c2pool::dev::debug_timestamp();
             cur = next;
-            if (exist(cur.sum.prev()))
+            if (exist(cur.prev))
             {
                 tc1 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
                 cycle_t = c2pool::dev::debug_timestamp();
 //                algh_steps += "2.41->";
-                next = get_sum_to_last(next.sum.prev());
+                auto _share = get(next.prev);
+                next = calc_element{_share->hash, *_share->previous_hash, next.sum - BaseTrackerElement(_share)};//;get_sum_to_last(next.sum.prev());
                 tc2 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
             } else
             {
@@ -528,8 +571,8 @@ public:
         if (extra_ending.has_value())
         {
 //            algh_steps += "3->";
-//            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash() << ")";
-            auto result_sum = get_sum(start, cur.sum.hash());
+            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.hash << ")";
+            auto result_sum = get_sum(start, cur.hash);
             //weights
             auto weights = result_sum.weight.amount;
             //total weights
@@ -537,7 +580,7 @@ public:
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-//            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
+            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
 
             auto [_script, _weight] = *extra_ending->amount.begin();
             //TODO: test (если много воркеров, может происходить неправильное округление)
@@ -560,23 +603,25 @@ public:
             total_donation_weights += (desired_weight - total_weights)/65535*extra_ending->total_donation_weight/(extra_ending->total_weight/65535);
             total_weights = desired_weight;
 
-//            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
-//            LOG_INFO << "extra_ending.amount: ";
-//            for (auto v : extra_ending->amount)
-//            {
-//                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
-//            }
-//            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
-//            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
+            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
+            LOG_INFO << "extra_ending.amount: ";
+            for (auto v : extra_ending->amount)
+            {
+                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
+            }
+            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
+            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
 //            LOG_INFO << algh_steps << "02";
 //            LOG_INFO << "02";
             auto tgcw71 = c2pool::dev::debug_timestamp();
             LOG_INFO << "get_cumulative_weights time1: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw71-tgcw6;
+            if (new_weight.second > uint288("88677748d45f57dfd525d1773c5f50f370f804f7ee927aa"))
+                LOG_ERROR << "BUG";
             return {weights, total_weights, total_donation_weights};
         } else
         {
 //            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
-            auto result_sum = get_sum(start, /*std::get<2>(prev)*/cur.sum.hash());
+            auto result_sum = get_sum(start, /*std::get<2>(prev)*/cur.hash);
             //total weights
             auto total_weights = result_sum.weight.total_weight;
             //total donation weights
