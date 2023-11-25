@@ -440,12 +440,10 @@ public:
     cumulative_weights get_cumulative_weights(uint256 start, int32_t max_shares, const uint288& desired_weight)
     {
         auto tgcw1 = c2pool::dev::debug_timestamp();
-//        std::string algh_steps = "gcw debug: "; // FOR DEBUG
         // Если start -- None/Null/0 шара.
         if (start.IsNull())
         {
             // 0
-//            LOG_INFO << algh_steps << "01";
             return {{}, {}, {}};
         }
 
@@ -456,16 +454,12 @@ public:
         // Ограничиваем цепочку до размера max_shares.
         if (start_height > max_shares)
         {
-//            algh_steps += "1->";
             last = get_nth_parent_key(start, max_shares);
         }
         auto tgcw4 = c2pool::dev::debug_timestamp();
 
         // Поиск desired_weight
-//        LOG_INFO << "desired_weight = " << desired_weight.ToString();
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
-//        LOG_INFO << "LIMIT = " << limit.ToString();
-//        LOG_INFO.stream() << "limit = " << limit.GetHex();
 
         // OLD
 
@@ -507,11 +501,11 @@ public:
 
             calc_element() = default;
 
-            calc_element(uint256 _hash, uint256 _prev, sum_element _sum)
+            calc_element(uint256 _hash, uint256 _prev, sum_element &_sum)
             {
-                hash = _hash;
-                prev = _prev;
-                sum = _sum;
+                hash = std::move(_hash);
+                prev = std::move(_prev);
+                sum = std::move(_sum);
             }
 
             calc_element(const sum_to_last& el)
@@ -529,19 +523,18 @@ public:
 
         double tc1 = 0;
         double tc2 = 0;
+        double tc3 = 0;
+        double tc4 = 0;
         while (cur.hash != last)
         {
-//            algh_steps += "2->";
 //            LOG_INFO.stream() << "[" << cur.sum.hash() << "->" << cur.sum.prev() << "]: total_weight = " << cur.sum.weight.total_weight.GetHex() << "; donation_weight = " << cur.sum.weight.total_donation_weight.GetHex();
             if (limit == next.sum.weight.total_weight)
             {
-//                algh_steps += "2.1->";
                 break;
             }
 
             if (limit > next.sum.weight.total_weight)
             {
-//                algh_steps += "2.2->";
                 extra_ending = std::make_optional<shares::weight::weight_data>(items[cur.hash]);
                 break;
             }
@@ -552,17 +545,22 @@ public:
             {
                 tc1 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
                 cycle_t = c2pool::dev::debug_timestamp();
-//                algh_steps += "2.41->";
-                auto _share = get(next.prev);
-                next = calc_element{_share->hash, *_share->previous_hash, next.sum - BaseTrackerElement(_share)};//;get_sum_to_last(next.sum.prev());
+//                auto _share = get(next.prev);
+                auto el = get_sum_for_element(next.prev);
                 tc2 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+                cycle_t = c2pool::dev::debug_timestamp();
+                auto new_res = next.sum - el;
+                tc3 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+                cycle_t = c2pool::dev::debug_timestamp();
+                next = calc_element{el.hash(), el.prev(), new_res};//;get_sum_to_last(next.sum.prev());
+                tc4 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+                cycle_t = c2pool::dev::debug_timestamp();
             } else
             {
-//                algh_steps += "2.42->";
                 break;
             }
         }
-        LOG_INFO << std::fixed << std::setprecision(10) << tc1 << "s; " << tc2 << "s";
+        LOG_INFO << std::fixed << std::setprecision(10) << tc1 << "s; " << tc2 << "s; " << tc3 << "s; " << tc4 << "s";
         LOG_INFO.unsetf(std::ios_base::fixed);
 
         auto tgcw6 = c2pool::dev::debug_timestamp();
@@ -570,7 +568,6 @@ public:
         // Если мы почти набрали предел и следующая шара переваливает по весу, то каждый воркер, указанный в этой шаре, будет эвивалентно процентно получать соответствующую ему долю.
         if (extra_ending.has_value())
         {
-//            algh_steps += "3->";
             LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.hash << ")";
             auto result_sum = get_sum(start, cur.hash);
             //weights
@@ -592,11 +589,9 @@ public:
 
             if (weights.find(new_weight.first) != weights.end())
             {
-//                algh_steps += "3.1->";
                 weights[new_weight.first] += new_weight.second;
             } else
             {
-//                algh_steps += "3.2->";
                 weights[new_weight.first] = new_weight.second;
             }
 
@@ -611,16 +606,15 @@ public:
             }
             LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
             LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
-//            LOG_INFO << algh_steps << "02";
-//            LOG_INFO << "02";
+
             auto tgcw71 = c2pool::dev::debug_timestamp();
             LOG_INFO << "get_cumulative_weights time1: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw71-tgcw6;
             if (new_weight.second > uint288("88677748d45f57dfd525d1773c5f50f370f804f7ee927aa"))
                 LOG_ERROR << "BUG";
+            LOG_INFO << "02";
             return {weights, total_weights, total_donation_weights};
         } else
         {
-//            LOG_INFO << "2result_sum = get_sum(" << start.ToString() << ", " << cur.sum.hash();
             auto result_sum = get_sum(start, /*std::get<2>(prev)*/cur.hash);
             //total weights
             auto total_weights = result_sum.weight.total_weight;
@@ -628,7 +622,6 @@ public:
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
 //            LOG_INFO << "03";
-//            LOG_INFO << algh_steps << "03";
             auto tgcw72 = c2pool::dev::debug_timestamp();
             LOG_INFO << "get_cumulative_weights time2: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw72-tgcw6;
             return {result_sum.weight.amount, total_weights, total_donation_weights};
