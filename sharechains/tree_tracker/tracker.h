@@ -244,11 +244,24 @@ public:
 
             auto t4 = c2pool::dev::debug_timestamp();
 
-            LOG_INFO << "get_sum_to_last t: " << t1-t0 << "; " << t2-t1 << "; " << t3-t2 << "; " << t4-t3;
+//            LOG_INFO << "get_sum_to_last t: " << t1-t0 << "; " << t2-t1 << "; " << t3-t2 << "; " << t4-t3;
         } else
             return {sum_element(hash), hash, hash};
 
         return {result, hash, fork_by_key[hash]->get_chain_tail()};
+    }
+
+    // return sum value for one element
+    sum_element get_sum_for_element(const hash_type& hash)
+    {
+        sum_element result;
+
+        shared_lock lock(mutex_);
+        if (items.find(hash) != items.end())
+        {
+            auto fork = fork_by_key[hash];
+            return fork->get_sum_element(hash);
+        }
     }
 
     int32_t get_height(hash_type hash)
