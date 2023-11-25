@@ -151,9 +151,9 @@ public:
     {
         for (auto &cluster : clusters)
         {
-            if (clusters.exist(hash))
+            if (cluster.exist(hash))
             {
-                return cluster.data[cluster.reverse[hash]];
+                return cluster.data[cluster.reverse[hash]]->sum;
             }
         }
 
