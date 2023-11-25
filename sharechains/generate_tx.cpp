@@ -167,7 +167,7 @@ namespace shares
 
         t5 = c2pool::dev::debug_timestamp();
         // TODO: log_info -> log_debug
-        LOG_INFO << t5-t0 << " for data.py:generate_transaction(). Parts: " << t1-t0 << " " << t2-t1 << " " << t3-t2 << " " << t4-t3 << " " << t5-t4;
+        LOG_INFO << t5-t0 << " for generate_transaction(). Parts: " << t1-t0 << " " << t2-t1 << " " << t3-t2 << " " << t4-t3 << " " << t5-t4;
         LOG_INFO << "other parts: " << t12-t11 << " " << t13-t12 << " " << t14-t13 << " " << t15-t14 << " " << t16-t15 << " " << t17-t16 << " " << t18-t17 << " " << t19-t18;
 //		if p2pool.BENCH: print "%8.3f ms for data.py:generate_transaction(). Parts: %8.3f %8.3f %8.3f %8.3f %8.3f " % (
 //			(t5-t0)*1000.,
