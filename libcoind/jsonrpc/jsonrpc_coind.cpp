@@ -36,11 +36,16 @@ UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr
             boost::beast::http::read(stream, buffer, response);
             break;
         }
-        catch (...)
+        catch (const std::exception& ex)
         {
-            LOG_ERROR << "JSONRPC::_request error; DISCONNECTED";
+            LOG_ERROR << "JSONRPC::_request error:" << ex.what() << "; socket DISCONNECTED";
             reconnect();
         }
+//        catch (...)
+//        {
+//            LOG_ERROR << "JSONRPC::_request error: DISCONNECTED2";
+//            reconnect();
+//        }
     }
 
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
