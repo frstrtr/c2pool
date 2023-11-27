@@ -462,11 +462,14 @@ public:
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
 
         // OLD
-
+        std::ofstream f_old("f_old.txt");
         std::optional<shares::weight::weight_data> extra_ending_old;
         auto cur_old = get_sum_to_last(start);
         auto next_old = get_sum_to_last(cur_old.sum.prev());
 
+        f_old << "start = " << start.GetHex() << "; prev() = " << cur_old.sum.prev() << std::endl;
+        f_old << "START: cur [" << cur_old.sum.hash() << " : " << cur_old.sum.prev() << "]->" << cur_old.sum.weight.total_weight << std::endl;
+        f_old << "START: next [" << next_old.sum.hash() << " : " << next_old.sum.prev() << "]->" << next_old.sum.weight.total_weight << std::endl;
         while (cur_old.sum.hash() != last)
         {
             if (limit == next_old.sum.weight.total_weight)
@@ -477,6 +480,7 @@ public:
             if (limit > next_old.sum.weight.total_weight)
             {
                 extra_ending_old = std::make_optional<shares::weight::weight_data>(cur_old.sum.share);
+                f_old << "END: (share = " << cur_old.sum.share->hash.GetHex() << "; " << cur_old.sum.share->previous_hash->GetHex() << "); total = " << extra_ending_old->total_weight << std::endl;
                 break;
             }
 
@@ -484,6 +488,10 @@ public:
             if (exist(cur_old.sum.prev()))
             {
                 next_old = get_sum_to_last(next_old.sum.prev());
+
+                f_old << "cur [" << cur_old.sum.hash().GetHex() << " : " << cur_old.sum.prev().GetHex() << "]->" << cur_old.sum.weight.total_weight << std::endl;
+                f_old << "next [" << next_old.sum.hash().GetHex() << " : " << next_old.sum.prev().GetHex() << "]->" << next_old.sum.weight.total_weight << std::endl;
+                f_old << "__________________________________" << std::endl;
             } else
             {
                 break;
@@ -516,8 +524,12 @@ public:
             }
         };
 
+        std::ofstream f("f.txt");
         auto cur = calc_element{get_sum_to_last(start)};
         auto next = calc_element{get_sum_to_last(cur.prev)};
+        f << "start = " << start.GetHex() << "; prev() = " << cur.prev << std::endl;
+        f << "START: cur [" << cur.hash.GetHex() << " : " << cur.prev.GetHex() << "]->" << cur.sum.weight.total_weight << std::endl;
+        f << "START: next [" << next.hash.GetHex() << " : " << next.prev.GetHex() << "]->" << next.sum.weight.total_weight << std::endl;
         std::optional<shares::weight::weight_data> extra_ending;
         auto tgcw5 = c2pool::dev::debug_timestamp();
 
@@ -536,6 +548,7 @@ public:
             if (limit > next.sum.weight.total_weight)
             {
                 extra_ending = std::make_optional<shares::weight::weight_data>(items[cur.hash]);
+                f << "END: (share = " << cur.hash.GetHex() << "; " << cur.prev.GetHex() << "); total = " << extra_ending->total_weight << std::endl;
                 break;
             }
 
@@ -546,7 +559,7 @@ public:
                 tc1 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
                 cycle_t = c2pool::dev::debug_timestamp();
 //                auto _share = get(next.prev);
-                auto el = get_sum_for_element(next.prev);
+                auto el = get_sum_for_element(next.hash);
                 tc2 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
                 cycle_t = c2pool::dev::debug_timestamp();
                 auto new_res = next.sum - el;
@@ -555,6 +568,10 @@ public:
                 next = calc_element{el.hash(), el.prev(), new_res};//;get_sum_to_last(next.sum.prev());
                 tc4 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
                 cycle_t = c2pool::dev::debug_timestamp();
+
+                f << "cur [" << cur.hash.GetHex() << " : " << cur.prev.GetHex() << "]->" << cur.sum.weight.total_weight << std::endl;
+                f << "next [" << next.hash.GetHex() << " : " << next.prev.GetHex() << "]->" << next.sum.weight.total_weight << std::endl;
+                f << "__________________________________" << std::endl;
             } else
             {
                 break;
@@ -562,6 +579,9 @@ public:
         }
         LOG_INFO << std::fixed << std::setprecision(10) << tc1 << "s; " << tc2 << "s; " << tc3 << "s; " << tc4 << "s";
         LOG_INFO.unsetf(std::ios_base::fixed);
+
+        f_old.close();
+        f.close();
 
         auto tgcw6 = c2pool::dev::debug_timestamp();
 
