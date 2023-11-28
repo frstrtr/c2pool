@@ -40,6 +40,7 @@ std::vector<NetAddress> PoolNodeClient::get_good_peers(int max_count)
 void PoolNode::DownloadShareManager::start(const std::shared_ptr<PoolNode> &_node)
 {
     node = _node;
+    strand = std::make_shared<boost::asio::io_service::strand>(*node->context);
     node->coind_node->desired->changed->subscribe([&](const std::vector<std::tuple<NetAddress, uint256>>& new_value){
         if (!new_value.empty())
             request_shares(new_value);

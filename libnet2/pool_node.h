@@ -140,28 +140,48 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
 {
     struct DownloadShareManager
     {
+        struct resp_data
+        {
+            std::vector<ShareType> shares;
+            NetAddress peer_addr;
+        };
+
+        std::shared_ptr<boost::asio::io_service::strand> strand;
         std::shared_ptr<PoolNode> node{};
+
+        int64_t id_gen{0};
 
         DownloadShareManager() = default;
 
-        void response_shares(const std::vector<ShareType> &shares, const NetAddress& peer_addr)
+        void handle(const resp_data& value)
         {
-            if (shares.empty())
+            if (value.shares.empty())
                 // TODO: sleep 1s
                 return;
 
             HandleSharesData _shares;
-            for (auto& _share : shares)
+            for (auto& _share : value.shares)
             {
                 _shares.add(_share, {});
             }
 
-            node->handle_shares(_shares, peer_addr);
+            node->handle_shares(_shares, value.peer_addr);
+        }
+
+        void processing_request(const std::vector<ShareType> &shares, const NetAddress& peer_addr, uint64_t _id)
+        {
+            resp_data resp{shares, peer_addr};
+            strand->post([&, resp = std::move(resp), _id = _id]()
+            {
+                handle(resp);
+                LOG_INFO << "Finish processing download share, id = " << _id;
+            });
         }
 
         void request_shares(const std::vector<std::tuple<NetAddress, uint256>>& desired)
         {
-            LOG_DEBUG_POOL << "REQUEST SHARES";
+            auto id = id_gen++;
+            LOG_DEBUG_POOL << "REQUEST SHARES, id " << id;
             auto [peer_addr, share_hash] = c2pool::random::RandomChoice(desired);
 
             if (node->peers.empty())
@@ -174,7 +194,7 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
             auto peer = c2pool::random::RandomChoice(node->peers);
             auto [peer_ip, peer_port] = peer->get_addr();
 
-            LOG_INFO << "Requesting parent share " << share_hash.GetHex() << "; from peer: " << peer_ip << ":"
+            LOG_INFO << "Requesting[" << id <<"] parent share " << share_hash.GetHex() << "; from peer: " << peer_ip << ":"
                      << peer_port;
 //          TODO:  try
 //            {
@@ -198,7 +218,7 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
             LOG_TRACE << "Stops: " << stops;
 
             peer->get_shares.yield(node->context, [&, peer = peer](const std::vector<ShareType> &shares)
-                                   { response_shares(shares, peer->get_addr()); },
+                                   { processing_request(shares, peer->get_addr(), id); },
                                    std::vector<uint256>{share_hash},
                                    (uint64_t) c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares
                                    stops

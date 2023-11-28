@@ -145,6 +145,7 @@ void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_
 
 	peer->get_shares.yield(context, [&, _peer = peer, _addr = addr](std::vector<ShareType> shares)
 	{
+        LOG_DEBUG_POOL << "handle_share_hashes get_shares called";
 		HandleSharesData _shares;
 		for (const auto& _share: shares)
 		{
