@@ -149,7 +149,9 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
         std::shared_ptr<boost::asio::io_service::strand> strand;
         std::shared_ptr<PoolNode> node{};
 
-        int64_t id_gen{0};
+        int64_t id_gen {0};
+        bool is_processing {false};
+        std::optional<std::vector<std::tuple<NetAddress, uint256>>> cache_desired;
 
         DownloadShareManager() = default;
 
@@ -175,6 +177,17 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
             {
                 handle(resp);
                 LOG_INFO << "Finish processing download share, id = " << _id;
+                if (cache_desired)
+                {
+                    strand->post([&, copy_cache = cache_desired.value()]()
+                                 {
+                                     request_shares(copy_cache);
+                                 });
+                    cache_desired.reset();
+                } else
+                {
+                    is_processing = false;
+                }
             });
         }
 
@@ -217,7 +230,7 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
 
             LOG_TRACE << "Stops: " << stops;
 
-            peer->get_shares.yield(node->context, [&, peer = peer](const std::vector<ShareType> &shares)
+            peer->get_shares.yield(node->context, [&, peer = peer, id=id](const std::vector<ShareType> &shares)
                                    { processing_request(shares, peer->get_addr(), id); },
                                    std::vector<uint256>{share_hash},
                                    (uint64_t) c2pool::random::RandomInt(0, 500), //randomize parents so that we eventually get past a too large block of shares

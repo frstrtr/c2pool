@@ -42,8 +42,17 @@ void PoolNode::DownloadShareManager::start(const std::shared_ptr<PoolNode> &_nod
     node = _node;
     strand = std::make_shared<boost::asio::io_service::strand>(*node->context);
     node->coind_node->desired->changed->subscribe([&](const std::vector<std::tuple<NetAddress, uint256>>& new_value){
-        if (!new_value.empty())
-            request_shares(new_value);
+        if (new_value.empty())
+            return;
+
+        if (is_processing)
+        {
+            cache_desired = new_value;
+            return;
+        }
+
+        is_processing = true;
+        request_shares(new_value);
     });
 }
 
