@@ -588,7 +588,7 @@ public:
         // Если мы почти набрали предел и следующая шара переваливает по весу, то каждый воркер, указанный в этой шаре, будет эвивалентно процентно получать соответствующую ему долю.
         if (extra_ending.has_value())
         {
-            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.hash << ")";
+//            LOG_INFO << "1result_sum = get_sum(" << start.ToString() << ", " << cur.hash << ")";
             auto result_sum = get_sum(start, cur.hash);
             //weights
             auto weights = result_sum.weight.amount;
@@ -597,7 +597,7 @@ public:
             //total donation weights
             auto total_donation_weights = result_sum.weight.total_donation_weight;
 
-            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
+//            LOG_INFO << "result_sum: weight = " << result_sum.weight << "; height = " << result_sum.height << "; work = " << result_sum.work.GetHex() << ", min_work = " << result_sum.min_work.GetHex();
 
             auto [_script, _weight] = *extra_ending->amount.begin();
             //TODO: test (если много воркеров, может происходить неправильное округление)
@@ -618,14 +618,14 @@ public:
             total_donation_weights += (desired_weight - total_weights)/65535*extra_ending->total_donation_weight/(extra_ending->total_weight/65535);
             total_weights = desired_weight;
 
-            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
-            LOG_INFO << "extra_ending.amount: ";
-            for (auto v : extra_ending->amount)
-            {
-                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
-            }
-            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
-            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
+//            LOG_INFO << "extra_ending: total_weight = " << extra_ending->total_weight.ToString() << "; total_donation_weight = " << extra_ending->total_donation_weight.ToString();
+//            LOG_INFO << "extra_ending.amount: ";
+//            for (auto v : extra_ending->amount)
+//            {
+//                LOG_INFO << "\t\t" << PackStream(v.first) << ": " << v.second.ToString();
+//            }
+//            LOG_INFO << "new_weight: " << PackStream(new_weight.first) << ": " << new_weight.second.ToString();
+//            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
 
             auto tgcw71 = c2pool::dev::debug_timestamp();
             LOG_INFO << "get_cumulative_weights time1: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw71-tgcw6;
