@@ -124,7 +124,6 @@ void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
     auto t4 = c2pool::dev::debug_timestamp(); // finish
 	if (shares.size() > 5)
 	{
-        LOG_INFO << "t4-t3: " << t4-t3 << "; t77-t3 = " << t77-t3 << "; t4-t77 = " << t4-t77;
         LOG_INFO << "Prepare shares time: " << t2-t1 << "; Processing time: " << t3-t2 << "; Full time: " << t4-t1;
 		LOG_INFO << "... done processing " << shares.size() << " shares. New: " << new_count << " Have: " << tracker->items.size() << "/~" << 2*net->CHAIN_LENGTH;
         //        std::this_thread::sleep_for(0.2s);

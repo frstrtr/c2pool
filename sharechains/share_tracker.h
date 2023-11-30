@@ -461,44 +461,44 @@ public:
         // Поиск desired_weight
         auto limit = get_sum_to_last(start).sum.weight.total_weight >= desired_weight ? get_sum_to_last(start).sum.weight.total_weight - desired_weight : uint288();
 
-        // OLD
-        std::ofstream f_old("f_old.txt");
-        std::optional<shares::weight::weight_data> extra_ending_old;
-        auto cur_old = get_sum_to_last(start);
-        auto next_old = get_sum_to_last(cur_old.sum.prev());
-
-        f_old << "start = " << start.GetHex() << "; prev() = " << cur_old.sum.prev() << std::endl;
-        f_old << "START: cur [" << cur_old.sum.hash() << " : " << cur_old.sum.prev() << "]->" << cur_old.sum.weight.total_weight << std::endl;
-        f_old << "START: next [" << next_old.sum.hash() << " : " << next_old.sum.prev() << "]->" << next_old.sum.weight.total_weight << std::endl;
-        while (cur_old.sum.hash() != last)
-        {
-            if (limit == next_old.sum.weight.total_weight)
-            {
-                break;
-            }
-
-            if (limit > next_old.sum.weight.total_weight)
-            {
-                extra_ending_old = std::make_optional<shares::weight::weight_data>(cur_old.sum.share);
-                f_old << "END: (share = " << cur_old.sum.share->hash.GetHex() << "; " << cur_old.sum.share->previous_hash->GetHex() << "); total = " << extra_ending_old->total_weight << std::endl;
-                break;
-            }
-
-            cur_old = next_old;
-            if (exist(cur_old.sum.prev()))
-            {
-                next_old = get_sum_to_last(next_old.sum.prev());
-
-                f_old << "cur [" << cur_old.sum.hash().GetHex() << " : " << cur_old.sum.prev().GetHex() << "]->" << cur_old.sum.weight.total_weight << std::endl;
-                f_old << "next [" << next_old.sum.hash().GetHex() << " : " << next_old.sum.prev().GetHex() << "]->" << next_old.sum.weight.total_weight << std::endl;
-                f_old << "__________________________________" << std::endl;
-            } else
-            {
-                break;
-            }
-        }
-
-        /////////////////////////////////////////////////////////OLD
+//        // OLD
+//        std::ofstream f_old("f_old.txt");
+//        std::optional<shares::weight::weight_data> extra_ending_old;
+//        auto cur_old = get_sum_to_last(start);
+//        auto next_old = get_sum_to_last(cur_old.sum.prev());
+//
+//        f_old << "start = " << start.GetHex() << "; prev() = " << cur_old.sum.prev() << std::endl;
+//        f_old << "START: cur [" << cur_old.sum.hash() << " : " << cur_old.sum.prev() << "]->" << cur_old.sum.weight.total_weight << std::endl;
+//        f_old << "START: next [" << next_old.sum.hash() << " : " << next_old.sum.prev() << "]->" << next_old.sum.weight.total_weight << std::endl;
+//        while (cur_old.sum.hash() != last)
+//        {
+//            if (limit == next_old.sum.weight.total_weight)
+//            {
+//                break;
+//            }
+//
+//            if (limit > next_old.sum.weight.total_weight)
+//            {
+//                extra_ending_old = std::make_optional<shares::weight::weight_data>(cur_old.sum.share);
+//                f_old << "END: (share = " << cur_old.sum.share->hash.GetHex() << "; " << cur_old.sum.share->previous_hash->GetHex() << "); total = " << extra_ending_old->total_weight << std::endl;
+//                break;
+//            }
+//
+//            cur_old = next_old;
+//            if (exist(cur_old.sum.prev()))
+//            {
+//                next_old = get_sum_to_last(next_old.sum.prev());
+//
+//                f_old << "cur [" << cur_old.sum.hash().GetHex() << " : " << cur_old.sum.prev().GetHex() << "]->" << cur_old.sum.weight.total_weight << std::endl;
+//                f_old << "next [" << next_old.sum.hash().GetHex() << " : " << next_old.sum.prev().GetHex() << "]->" << next_old.sum.weight.total_weight << std::endl;
+//                f_old << "__________________________________" << std::endl;
+//            } else
+//            {
+//                break;
+//            }
+//        }
+//
+//        /////////////////////////////////////////////////////////OLD
 
         struct calc_element
         {
@@ -524,12 +524,12 @@ public:
             }
         };
 
-        std::ofstream f("f.txt");
+//        std::ofstream f("f.txt");
         auto cur = calc_element{get_sum_to_last(start)};
         auto next = calc_element{get_sum_to_last(cur.prev)};
-        f << "start = " << start.GetHex() << "; prev() = " << cur.prev << std::endl;
-        f << "START: cur [" << cur.hash.GetHex() << " : " << cur.prev.GetHex() << "]->" << cur.sum.weight.total_weight << std::endl;
-        f << "START: next [" << next.hash.GetHex() << " : " << next.prev.GetHex() << "]->" << next.sum.weight.total_weight << std::endl;
+//        f << "start = " << start.GetHex() << "; prev() = " << cur.prev << std::endl;
+//        f << "START: cur [" << cur.hash.GetHex() << " : " << cur.prev.GetHex() << "]->" << cur.sum.weight.total_weight << std::endl;
+//        f << "START: next [" << next.hash.GetHex() << " : " << next.prev.GetHex() << "]->" << next.sum.weight.total_weight << std::endl;
         std::optional<shares::weight::weight_data> extra_ending;
         auto tgcw5 = c2pool::dev::debug_timestamp();
 
@@ -548,40 +548,40 @@ public:
             if (limit > next.sum.weight.total_weight)
             {
                 extra_ending = std::make_optional<shares::weight::weight_data>(items[cur.hash]);
-                f << "END: (share = " << cur.hash.GetHex() << "; " << cur.prev.GetHex() << "); total = " << extra_ending->total_weight << std::endl;
+//                f << "END: (share = " << cur.hash.GetHex() << "; " << cur.prev.GetHex() << "); total = " << extra_ending->total_weight << std::endl;
                 break;
             }
 
-            auto cycle_t = c2pool::dev::debug_timestamp();
+//            auto cycle_t = c2pool::dev::debug_timestamp();
             cur = next;
             if (exist(cur.prev))
             {
-                tc1 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
-                cycle_t = c2pool::dev::debug_timestamp();
+//                tc1 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+//                cycle_t = c2pool::dev::debug_timestamp();
 //                auto _share = get(next.prev);
                 auto el = get_sum_for_element(next.hash);
-                tc2 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
-                cycle_t = c2pool::dev::debug_timestamp();
+//                tc2 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+//                cycle_t = c2pool::dev::debug_timestamp();
                 auto new_res = next.sum - el;
-                tc3 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
-                cycle_t = c2pool::dev::debug_timestamp();
+//                tc3 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+//                cycle_t = c2pool::dev::debug_timestamp();
                 next = calc_element{el.hash(), el.prev(), new_res};//;get_sum_to_last(next.sum.prev());
-                tc4 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
-                cycle_t = c2pool::dev::debug_timestamp();
+//                tc4 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
+//                cycle_t = c2pool::dev::debug_timestamp();
 
-                f << "cur [" << cur.hash.GetHex() << " : " << cur.prev.GetHex() << "]->" << cur.sum.weight.total_weight << std::endl;
-                f << "next [" << next.hash.GetHex() << " : " << next.prev.GetHex() << "]->" << next.sum.weight.total_weight << std::endl;
-                f << "__________________________________" << std::endl;
+//                f << "cur [" << cur.hash.GetHex() << " : " << cur.prev.GetHex() << "]->" << cur.sum.weight.total_weight << std::endl;
+//                f << "next [" << next.hash.GetHex() << " : " << next.prev.GetHex() << "]->" << next.sum.weight.total_weight << std::endl;
+//                f << "__________________________________" << std::endl;
             } else
             {
                 break;
             }
         }
-        LOG_INFO << std::fixed << std::setprecision(10) << tc1 << "s; " << tc2 << "s; " << tc3 << "s; " << tc4 << "s";
-        LOG_INFO.unsetf(std::ios_base::fixed);
+//        LOG_INFO << std::fixed << std::setprecision(10) << tc1 << "s; " << tc2 << "s; " << tc3 << "s; " << tc4 << "s";
+//        LOG_INFO.unsetf(std::ios_base::fixed);
 
-        f_old.close();
-        f.close();
+//        f_old.close();
+//        f.close();
 
         auto tgcw6 = c2pool::dev::debug_timestamp();
 
@@ -628,10 +628,10 @@ public:
 //            LOG_INFO << "desired_weight = " << desired_weight.ToString() << "; total_weights = " << total_weights.ToString() << "; total_weight2 = " << extra_ending->total_weight.ToString();
 
             auto tgcw71 = c2pool::dev::debug_timestamp();
-            LOG_INFO << "get_cumulative_weights time1: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw71-tgcw6;
+//            LOG_INFO << "get_cumulative_weights time1: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw71-tgcw6;
             if (new_weight.second > uint288("88677748d45f57dfd525d1773c5f50f370f804f7ee927aa"))
                 LOG_ERROR << "BUG";
-            LOG_INFO << "02";
+//            LOG_INFO << "02";
             return {weights, total_weights, total_donation_weights};
         } else
         {
@@ -643,7 +643,7 @@ public:
 
 //            LOG_INFO << "03";
             auto tgcw72 = c2pool::dev::debug_timestamp();
-            LOG_INFO << "get_cumulative_weights time2: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw72-tgcw6;
+//            LOG_INFO << "get_cumulative_weights time2: " << tgcw2-tgcw1 << " " << tgcw3-tgcw2 << " " << tgcw4-tgcw3 << " " << tgcw5-tgcw4 << " " << tgcw6-tgcw5 << " " << tgcw72-tgcw6;
             return {result_sum.weight.amount, total_weights, total_donation_weights};
         }
     }

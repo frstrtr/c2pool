@@ -491,18 +491,18 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
         if (ts >= timestamp_cutoff)
             desired_result.emplace_back(peer_addr, hash);
     }
-    LOG_TRACE << "desired_result = " << desired_result.size();
+//    LOG_TRACE << "desired_result = " << desired_result.size();
     auto final = c2pool::dev::debug_timestamp();
-    LOG_INFO << "\tSET_BEST_SHARE TIME: " << final-t1;
-    LOG_INFO << "\t\t" << "t2-t1:" << t2-t1;
-    LOG_INFO << "\t\t" << "t3-t2:" << t3-t2;
-    LOG_INFO << "\t\t" << "t4-t3:" << t4-t3;
-    LOG_INFO << "\t\t" << "t5-t4:" << t5-t4;
-    LOG_INFO << "\t\t" << "t6-t5:" << t6-t5;
-    LOG_INFO << "\t\t" << "t7-t6:" << t7-t6;
-    LOG_INFO << "\t\t" << "t8-t7:" << t8-t7;
-    LOG_INFO << "\t\t" << "t9-t8:" << t9-t8;
-    LOG_INFO << "\t\t" << "final-t9:" << final-t9;
+//    LOG_INFO << "\tSET_BEST_SHARE TIME: " << final-t1;
+//    LOG_INFO << "\t\t" << "t2-t1:" << t2-t1;
+//    LOG_INFO << "\t\t" << "t3-t2:" << t3-t2;
+//    LOG_INFO << "\t\t" << "t4-t3:" << t4-t3;
+//    LOG_INFO << "\t\t" << "t5-t4:" << t5-t4;
+//    LOG_INFO << "\t\t" << "t6-t5:" << t6-t5;
+//    LOG_INFO << "\t\t" << "t7-t6:" << t7-t6;
+//    LOG_INFO << "\t\t" << "t8-t7:" << t8-t7;
+//    LOG_INFO << "\t\t" << "t9-t8:" << t9-t8;
+//    LOG_INFO << "\t\t" << "final-t9:" << final-t9;
     return {best, desired_result, decorated_heads, bad_peer_addresses, punish_aggressively};
 }
 

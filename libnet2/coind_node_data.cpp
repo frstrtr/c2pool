@@ -56,7 +56,7 @@ void CoindNodeData::set_best_share()
 		}
 	}
     auto t4 = c2pool::dev::timestamp();
-    LOG_INFO << "SET_BEST_SHARE TIME:";
+//    LOG_INFO << "SET_BEST_SHARE TIME:";
 //    LOG_INFO << "\t" << "t2-t1:" << c2pool::dev::format_date(t2-t1);
 //    LOG_INFO << "\t" << "t3-t2:" << c2pool::dev::format_date(t3-t2);
 //    LOG_INFO << "\t" << "t4-t3:" << c2pool::dev::format_date(t4-t3);
