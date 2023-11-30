@@ -314,19 +314,19 @@ public:
     virtual hash_type get_nth_parent_key(hash_type hash, int32_t n) const
     {
         shared_lock lock(mutex_);
-        std::fstream f("tracker_debug/nth_parent_"+hash.ToString()+"_"+to_string(n), std::ios_base::out);
+//        std::fstream f("tracker_debug/nth_parent_"+hash.ToString()+"_"+to_string(n), std::ios_base::out);
         for (int i = 0; i < n; i++)
         {
             if (items.find(hash) != items.end())
             {
-                f << hash.ToString() << "(prev:" + items.at(hash)->previous_hash->ToString() + ") -> " << i << "[max=" << n << "];\n";
+//                f << hash.ToString() << "(prev:" + items.at(hash)->previous_hash->ToString() + ") -> " << i << "[max=" << n << "];\n";
                 hash = *items.at(hash)->previous_hash;
             }
             else
                 throw std::invalid_argument("get_nth_parent_key: items not exis't hash");
         }
-        f << hash.ToString() << "(prev:" + items.at(hash)->previous_hash->ToString() + ") -> " << n-1 << "[max=" << n << "];\n";
-        f.close();
+//        f << hash.ToString() << "(prev:" + items.at(hash)->previous_hash->ToString() + ") -> " << n-1 << "[max=" << n << "];\n";
+//        f.close();
         return hash;
     }
 
