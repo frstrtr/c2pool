@@ -73,3 +73,9 @@ f_print(coind_data_ltc.target_to_difficulty, '100000000000000000000000000000000'
 f_print(coind_data_ltc.target_to_difficulty, 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
 f_print(coind_data_ltc.target_to_difficulty, '1')
 f_print(coind_data_ltc.target_to_difficulty, '1e')
+
+
+# ========================================================
+test_script = '6d76523771526369376d655036615a31526b79517a61737674324655327970524d62'.decode('hex')
+print("test_script = {0}".format(data_to_bytes(test_script)))
+print(coind_data_ltc.script2_to_address(test_script, 111, -1, _net))
