@@ -4,6 +4,7 @@ import pack
 import hashlib
 import math,  p2pool_math
 import random
+import binascii
 
 mask = (1<<64) - 1
 
@@ -516,7 +517,8 @@ def script2_to_address(script2, addr_ver, bech32_ver, net):
                  script2_to_p2sh_address, script2_to_cashaddress]:
         try:
             return func(script2, addr_ver, bech32_ver, net)
-        except AddrError:
+        except AddrError as err:
+            print(err)
             pass
     raise ValueError("Invalid script2 hash %s" % binascii.hexlify(script2))
 
