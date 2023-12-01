@@ -767,10 +767,11 @@ void PoolNode::init_web_metrics()
     });
 
     current_payouts_metric = net->web->add<current_payouts_metric_type>("current_payouts", [&](nlohmann::json &j){
-        for (const auto &[script, value] : tracker->get_expected_payouts(best_share->value(), FloatingInteger(coind_node->coind_work->value().bits).target(), coind_node->coind_work->value().subsidy))
+        for (const auto &[address, value] : tracker->get_expected_payouts(best_share->value(), FloatingInteger(coind_node->coind_work->value().bits).target(), coind_node->coind_work->value().subsidy))
         {
-            LOG_INFO.stream() << "script: " << script << ", value: " << value;
-            j[coind::data::script2_to_address(PackStream{script}, net->parent->ADDRESS_VERSION, -1, net)] = (value/1e8);
+            std::string _address(address.begin(), address.end());
+            LOG_INFO.stream() << "address_bytes: " << address << ", address_str: " << _address << ", value: " << value;
+            j[_address] = (value/1e8);
         }
     });
 //    stale_counts_metric = net->web->add<stale_counts_metric_type>("stale_counts");
