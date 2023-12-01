@@ -644,17 +644,19 @@ ShareTracker::get_expected_payouts(uint256 best_share_hash, uint256 block_target
     double sum = 0;
 
     auto [weights, total_weight, donation_weight] = get_cumulative_weights(best_share_hash, min(get_height(best_share_hash), net->REAL_CHAIN_LENGTH), coind::data::target_to_average_attempts(block_target) * net->SPREAD * 65535);
-    for (const auto &[script, weight] : weights)
+    for (const auto &[address, weight] : weights)
     {
         //TODO: optimize .getdouble()?
         auto payout = subsidy * (weight.getdouble()/total_weight.getdouble());
 
-        res[script] = payout;
+        res[address] = payout;
         sum += payout;
     }
 
-    auto donation_script = net->DONATION_SCRIPT;
-    res[donation_script] = (res.count(donation_script) ? res[donation_script] : 0) + subsidy - sum;
+    auto _donation_address = coind::data::donation_script_to_address(net);
+    std::vector<unsigned char> donation_address{_donation_address.begin(), _donation_address.end()};
+
+    res[donation_address] = (res.count(donation_address) ? res[donation_address] : 0) + subsidy - sum;
 
     return res;
 }
