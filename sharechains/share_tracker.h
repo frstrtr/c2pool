@@ -565,7 +565,7 @@ public:
                 auto new_res = next.sum - el;
 //                tc3 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
 //                cycle_t = c2pool::dev::debug_timestamp();
-                next = calc_element{el.hash(), el.prev(), new_res};//;get_sum_to_last(next.sum.prev());
+                next = calc_element{el.prev(), *get(el.prev())->previous_hash , new_res};//;get_sum_to_last(next.sum.prev());
 //                tc4 += (c2pool::dev::debug_timestamp() - cycle_t).t.count();
 //                cycle_t = c2pool::dev::debug_timestamp();
 

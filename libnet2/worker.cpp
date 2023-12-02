@@ -657,7 +657,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
 
                     LOG_INFO << "GOT SHARE! " << user << ", " << share->hash
                              << ", prev = " << (share->previous_hash ? share->previous_hash->GetHex() : "null") << ", age " << c2pool::dev::timestamp() - getwork_time
-                             << "s, " << (!on_time ? "DEAD OR ARRIVAL" : "");
+                             << "s, " << (!on_time ? "DEAD ON ARRIVAL" : "");
 
                     // XXX: ???
                     //# node.py will sometimes forget transactions if bitcoind's work has changed since this stratum
@@ -691,10 +691,19 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
                         my_doa_share_hashes.insert(share->hash);
                     }
 
-                    _tracker->add(share);
-                    LOG_INFO << "Tracker items count = " << _tracker->items.size();
+                    auto sibling_count = _tracker->reverse[*share->previous_hash].size();
+                    if (on_time || sibling_count < 4)
+                    {
+                        _tracker->add(share);
+                        LOG_INFO << "Tracker items count = " << _tracker->items.size();
+                    } else {
+                        LOG_INFO << "Already have " << sibling_count << " DOA shares with this parent. Not adding more.";
+                    }
 
-                    _coind_node->set_best_share();
+                    if (on_time)
+                        _coind_node->set_best_share();
+                    else
+                        LOG_INFO << "Not considering work switching to DOA share";
 
                     try
                     {

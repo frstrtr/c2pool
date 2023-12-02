@@ -203,6 +203,11 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             continue;
 
         auto [head_height, last] = get_height_and_last(head);
+        if (head_height <= 1)
+        {
+            LOG_INFO << "BUG2!";
+            auto [head_height2, last2] = get_height_and_last(head);
+        }
         auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height - net->CHAIN_LENGTH)));
 
         bool _verified = false;
@@ -232,6 +237,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
             NetAddress _peer_addr = c2pool::random::RandomChoice(reverse[last])->second->peer_addr;
 
+            LOG_INFO << "DESIRED1: " << _verified << "; " << last;
             desired.insert({
                                    _peer_addr,
                                    last,
@@ -284,6 +290,7 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
         if (head_height < net->CHAIN_LENGTH && !last_last_hash.IsNull())
         {
+            LOG_INFO << "DESIRED2";
             auto t35 = c2pool::dev::debug_timestamp();
             uint32_t desired_timestamp = *items[head]->timestamp;
             uint256 desired_target = items[head]->target;
@@ -397,13 +404,15 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 //    {
     LOG_DEBUG_SHARETRACKER << "tracker data: heads = " << heads.size() << ", tails = " << tails.size() << "; verified: heads = " << verified.heads.size() << ", tails = " << verified.tails.size();
     LOG_DEBUG_SHARETRACKER << decorated_heads.size() << " heads. Top 10:";
-    for (auto i = std::max(decorated_heads.size() - 11, size_t{0}); i < decorated_heads.size(); i++)
+    for (auto i = (decorated_heads.size() > 10 ? decorated_heads.size() - 11 : 0); //std::max(decorated_heads.size() - 11, size_t{0});
+        i < decorated_heads.size(); i++)
     {
         auto _score = decorated_heads[i].score;
         LOG_DEBUG_SHARETRACKER << "\t" << decorated_heads[i].hash.GetHex() << " " << items[decorated_heads[i].hash]->previous_hash->GetHex() << " " << _score.work << " " << _score.reason << " " << _score.time_seen;
     }
     LOG_DEBUG_SHARETRACKER << "Traditional sort:";
-    for (auto i = std::max(traditional_sort.size() - 11, size_t{0}); i < traditional_sort.size(); i++)
+    for (auto i = (traditional_sort.size() > 10 ? traditional_sort.size() - 11 : 0);//std::max(traditional_sort.size() - 11, size_t{0});
+        i < traditional_sort.size(); i++)
     {
         auto _score = traditional_sort[i].score;
         LOG_DEBUG_SHARETRACKER << "\t" << traditional_sort[i].hash.GetHex() << " " << items[traditional_sort[i].hash]->previous_hash->GetHex() << " " << _score.work << " " << _score.reason << " " << _score.time_seen;
