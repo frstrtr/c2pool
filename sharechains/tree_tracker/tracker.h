@@ -97,7 +97,8 @@ public:
             new_fork = 0,
             only_heads = 1,
             only_tails = 1 << 1,
-            both = only_heads | only_tails
+            both = only_heads | only_tails,
+            split = 1 << 2
         };
 
         int state = new_fork;
@@ -105,10 +106,16 @@ public:
             state |= only_heads;
         if (tails.count(value.hash()))
             state |= only_tails;
+        if ((state == new_fork) && (items.count(value.prev())))
+            state = split;
 
-//        LOG_INFO << "Added share: hash = " << value.hash() << ", prev = " << value.prev() << "; tracker.size = " << items.size();
 //        LOG_INFO << "heads: " << heads;
 //        LOG_INFO << "tails: " << tails;
+        if (state == split)
+        {
+            LOG_INFO << "Added share: hash = " << value.hash() << ", prev = " << value.prev() << "; tracker.size = " << items.size();
+            LOG_INFO << "STATE: " << state;
+        }
 
         switch (state)
         {
@@ -132,7 +139,7 @@ public:
                 auto right_fork = tails.extract(value.hash());
 
                 tails[left_fork.mapped()->get_chain_tail()].clear();
-                for (auto &_fork : right_fork.mapped())
+                for (auto &_fork: right_fork.mapped())
                 {
                     _fork->insert_fork(left_fork.mapped());
 
@@ -191,6 +198,21 @@ public:
                 }
                 tail_forks.key() = value.prev();
                 tails.insert(std::move(tail_forks));
+            }
+                break;
+            case split:
+                // раскол от шары уже существующего форка.
+            {
+                // make new fork
+//                items.count(value.prev())
+                auto new_fork = make_fork();
+                new_fork->insert(value);
+                new_fork->insert_fork(fork_by_key[new_fork->tail], new_fork->tail);
+                heads[new_fork->head] = new_fork;
+                tails[new_fork->get_chain_tail()].insert(new_fork);
+                fork_by_key_add(value.hash(), new_fork);
+                LOG_INFO << "new_fork for split: head = " << new_fork->head << ", tail = " << new_fork->tail;
+//                fork_by_key[value.hash()] = new_fork;
             }
                 break;
         }
