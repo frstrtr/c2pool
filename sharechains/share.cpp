@@ -295,7 +295,7 @@ void Share::check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<s
     auto _diff = coind::data::target_to_difficulty(target)*net->parent->DUMB_SCRYPT_DIFF.getdouble();
 
     //TODO: if not naughty
-    LOG_INFO << "Received good share: diff=" << _diff << ", hash=" << hash.GetHex() << ", miner=" << address;
+//    LOG_INFO << "Received good share: diff=" << _diff << ", hash=" << hash.GetHex() << ", miner=" << address;
     //TODO: else
     /*
         print("Received naughty=%i share: diff=%.2e hash=%064x miner=%s" %

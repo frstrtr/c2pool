@@ -486,4 +486,17 @@ public:
     {
         return end;
     }
+
+    //TODO: remove?
+//    // Проверяет, находится ли left, левее right?
+//    bool check_pos(auto left, auto right)
+//    {
+//        if (!(exist(left) && exist(right)))
+//            return false;
+//
+//        if (reverse[left] < reverse[right])
+//            return true;
+//        else
+//            return false;
+//    }
 };
