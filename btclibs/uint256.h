@@ -21,11 +21,11 @@ class uint_error : public std::runtime_error {
 public:
     explicit uint_error(const std::string& str) : std::runtime_error(str) {}
 };
-#define DEBUG_UINT
+//#define DEBUG_UINT
 
 #ifdef DEBUG_UINT
 #define DEBUG_UINT_UPDATE() hex_data = GetHex()
-#define DEBUG_UINT_UPDATE_NUM(num) num.hex_data = num.GetHex();
+#define DEBUG_UINT_UPDATE_NUM(num) num.hex_data = (num).GetHex();
 #else
 #define DEBUG_UINT_UPDATE()
 #define DEBUG_UINT_UPDATE_NUM(num)

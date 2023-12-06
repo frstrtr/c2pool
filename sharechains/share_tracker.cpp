@@ -203,11 +203,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
             continue;
 
         auto [head_height, last] = get_height_and_last(head);
-        if (head_height <= 1)
-        {
-            LOG_INFO << "BUG2!";
-            auto [head_height2, last2] = get_height_and_last(head);
-        }
         auto get_chain_f = get_chain(head, last.IsNull() ? head_height : std::min(5, std::max(0, head_height - net->CHAIN_LENGTH)));
 
         bool _verified = false;
@@ -564,6 +559,11 @@ std::vector<uint256> ShareTracker::get_other_tx_hashes(ShareType share)
     }
 
     std::vector<uint256> result;
+
+    // В случае, если share_tx_info не существует (version < 34)
+    if (!(*share->share_info)->share_tx_info.has_value())
+        return result;
+
     for (auto [share_count, tx_count]: (*share->share_info)->share_tx_info->transaction_hash_refs)
     {
         if (last_shares[share_count]->share_info->get()->share_tx_info.has_value())

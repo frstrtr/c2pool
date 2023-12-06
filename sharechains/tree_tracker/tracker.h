@@ -111,11 +111,10 @@ public:
 
 //        LOG_INFO << "heads: " << heads;
 //        LOG_INFO << "tails: " << tails;
-        if (state == split)
-        {
-            LOG_INFO << "Added share: hash = " << value.hash() << ", prev = " << value.prev() << "; tracker.size = " << items.size();
-            LOG_INFO << "STATE: " << state;
-        }
+//        if (state == split)
+//        {
+//            LOG_DEBUG_SHARETRACKER << "Added share: hash = " << value.hash() << ", prev = " << value.prev() << "; tracker.size = " << items.size();
+//        }
 
         switch (state)
         {
