@@ -3,6 +3,7 @@ add_executable(c2pool_main c2pool.cpp
                         node_manager.h node_manager.cpp)
 
 target_link_libraries(c2pool_main Boost::program_options libnet2 libdevcore networks sharechains web_interface)
+target_link_libraries(c2pool_main Qt6::Core Qt6::Widgets Qt6::Gui Qt6::Network)
 
 set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/web)
 file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/web)
