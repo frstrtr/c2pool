@@ -14,12 +14,15 @@ using namespace c2pool::dev;
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
+#include <QCoreApplication>
+#include <QtWidgets/QApplication>
 
 #include <libdevcore/config.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <networks/network.h>
 
+#include "c2pool_version.h"
 #include "node_manager.h"
 
 //TODO: move macros to other.h
@@ -27,15 +30,16 @@ namespace po = boost::program_options;
 #define fmt_c(TEMPL, DATA) fmt(TEMPL, DATA).data()
 
 
-int main(int ac, char *av[])
+int main(int argc, char *argv[])
 {
+    QCoreApplication a(argc, argv);
     c2pool_config::INIT();
     //========================================================================================================================
     //TODO:
     //  add: --bench; --rconsole; --web-static; --merged; --coinbtext; --disable-advertise; --iocp; --irc-announce;
     //       --no-bugreport; --p2pool-node; --disable-upnp; --external-ip; --bitcoind_rpc_userpass; --allow-obsolete-bitcoind
     //========================================================================================================================
-    po::options_description desc(fmt("c2pool (ver. %1%)\nAllowed options", 0.1)); //TODO: get %Version from Network config
+    po::options_description desc(fmt("c2pool (ver. %1%)\nAllowed options", c2pool::version_str()));
 
     // args main
     desc.add_options()("help", "produce help message");
@@ -51,7 +55,7 @@ int main(int ac, char *av[])
     cmd_options.add(desc);
 
     po::variables_map vm;
-    po::parsed_options parse_option = po::parse_command_line(ac, av, cmd_options);
+    po::parsed_options parse_option = po::parse_command_line(argc, argv, cmd_options);
     po::store(parse_option, vm);
     po::notify(vm);
 
@@ -63,7 +67,7 @@ int main(int ac, char *av[])
 
     if (vm.count("version"))
     {
-        cout << 0.1 << endl; //TODO
+        cout << c2pool::version_str() << endl;
         return C2PoolErrors::success;
     }
 
