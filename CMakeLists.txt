@@ -21,6 +21,21 @@ endif ()
 
 project(c2pool)
 
+#Version system BEGIN
+file(READ "version.cfg" ver)
+
+string(REGEX MATCH "C2POOL_MAJOR ([0-9]*)" _ ${ver})
+set(ver_major ${CMAKE_MATCH_1})
+
+string(REGEX MATCH "C2POOL_MINOR ([0-9]*)" _ ${ver})
+set(ver_minor ${CMAKE_MATCH_1})
+
+string(REGEX MATCH "C2POOL_PATCH ([0-9]*)" _ ${ver})
+set(ver_patch ${CMAKE_MATCH_1})
+
+message("version: ${ver_major}.${ver_minor}.${ver_patch}")
+#Version system END
+
 include_directories (${PROJECT_SOURCE_DIR})
 include_directories (${PROJECT_BINARY_DIR})
 
