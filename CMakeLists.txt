@@ -59,6 +59,9 @@ include_directories(${Boost_INCLUDE_DIRS})
 
 set (CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+find_package(Qt6 CONFIG REQUIRED Core Widgets Gui Network)
+qt_standard_project_setup()
+
 ##hunter_add_package(crc32c)
 #hunter_add_package(leveldb)
 #find_package(leveldb REQUIRED)
