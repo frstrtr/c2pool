@@ -50,6 +50,7 @@ int main(int argc, char *argv[])
     desc.add_options()("datadir", po::value<string>()->default_value(""), "store data in this directory (default: <directory with c2pool build>/data)");
     desc.add_options()("give-author", po::value<float>()->default_value(0), "donate this percentage of work towards the development of p2pool (default: 0.0)");
     desc.add_options()("web_server", po::value<std::string>(), "ip:port for web site");
+    desc.add_options()("disable_check_version", "use for disable check actual c2pool version from github");
 
     po::options_description cmd_options;
     cmd_options.add(desc);
@@ -58,6 +59,11 @@ int main(int argc, char *argv[])
     po::parsed_options parse_option = po::parse_command_line(argc, argv, cmd_options);
     po::store(parse_option, vm);
     po::notify(vm);
+
+    if (!vm.count("disable_check_version"))
+    {
+        c2pool::check_version();
+    }
 
     if (vm.count("help"))
     {
