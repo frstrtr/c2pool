@@ -64,7 +64,7 @@ endif()
 set(Boost_DEBUG on)
 set(Boost_USE_STATIC_LIBS ON)
 
-find_package(Boost 1.71.0 COMPONENTS program_options log log_setup coroutine REQUIRED)
+find_package(Boost 1.78.0 COMPONENTS program_options log log_setup coroutine REQUIRED)
 if(Boost_FOUND)
 	MESSAGE( STATUS "Boost_INCLUDE_DIRS = ${Boost_INCLUDE_DIRS}.")
     MESSAGE( STATUS "Boost_LIBRARIES = ${BOOST_LIBRARYDIR}.")
