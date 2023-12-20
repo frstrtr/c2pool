@@ -23,6 +23,7 @@ namespace po = boost::program_options;
 #include <networks/network.h>
 
 #include "c2pool_version.h"
+#include "c2pool_main_menu.h"
 #include "node_manager.h"
 
 //TODO: move macros to other.h
@@ -32,7 +33,7 @@ namespace po = boost::program_options;
 
 int main(int argc, char *argv[])
 {
-    QCoreApplication a(argc, argv);
+    QApplication app(argc, argv);
     c2pool_config::INIT();
     //========================================================================================================================
     //TODO:
@@ -46,7 +47,8 @@ int main(int argc, char *argv[])
     desc.add_options()("version,v", "version");
     desc.add_options()("trace", "enable trace logs");
     desc.add_options()("debug", po::value<std::vector<std::string>>()->multitoken(), "");
-    desc.add_options()("networks", po::value<std::vector<std::string>>()->multitoken(), "");
+//    desc.add_options()("networks", po::value<std::vector<std::string>>()->multitoken(), "");
+    desc.add_options()("ui_config", "open Qt UI for net configs");
     desc.add_options()("datadir", po::value<string>()->default_value(""), "store data in this directory (default: <directory with c2pool build>/data)");
     desc.add_options()("give-author", po::value<float>()->default_value(0), "donate this percentage of work towards the development of p2pool (default: 0.0)");
     desc.add_options()("web_server", po::value<std::string>(), "ip:port for web site");
@@ -63,6 +65,15 @@ int main(int argc, char *argv[])
     if (!vm.count("disable_check_version"))
     {
         c2pool::check_version();
+    }
+
+    if (vm.count("ui_config"))
+    {
+//        QApplication app(argc, argv);
+        c2pool::ui::MainMenu mainMenu;
+
+        mainMenu.show();
+        return QApplication::exec();
     }
 
     if (vm.count("help"))

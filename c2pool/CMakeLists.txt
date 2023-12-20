@@ -1,15 +1,12 @@
 add_executable(c2pool_main c2pool.cpp 
-                        coind_master.h c2pool_version.h
+                        coind_master.h c2pool_version.h c2pool_main_menu.h ui/configure_window.h ui/main_menu.h
                         node_manager.h node_manager.cpp)
 
 target_link_libraries(c2pool_main Boost::program_options libnet2 libdevcore networks sharechains web_interface)
 target_link_libraries(c2pool_main Qt6::Core Qt6::Widgets Qt6::Gui Qt6::Network)
 
 target_compile_definitions(c2pool_main PRIVATE C2POOL_MAJOR=${ver_major})
-#add_ compile_definitions(C2POOL_MAJOR=${ver_major})
-#add_compile_definitions(C2POOL_MINOR=${ver_minor})
 target_compile_definitions(c2pool_main PRIVATE C2POOL_MINOR=${ver_minor})
-#add_compile_definitions(C2POOL_PATCH=${ver_patch})
 target_compile_definitions(c2pool_main PRIVATE C2POOL_PATCH=${ver_patch})
 
 set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/web)

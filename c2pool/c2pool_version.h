@@ -20,7 +20,8 @@ namespace c2pool
     inline void check_version()
     {
         QNetworkAccessManager manager;
-        QUrl url("https://pastebin.com/raw/v0q2uZRU");
+        QUrl url("https://raw.githubusercontent.com/frstrtr/c2pool/master/version.cfg");
+//        QUrl url("https://pastebin.com/raw/v0q2uZRU");
 
         QNetworkRequest request(url);
         QNetworkReply *reply = manager.get(request);
