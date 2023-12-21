@@ -57,10 +57,11 @@ namespace c2pool::dev
 
     coind_config::coind_config(std::string _name, boost::property_tree::ptree &pt) : coind_config(std::move(_name))
     {
-        testnet = pt.get<bool>("testnet");
-        address = pt.get<std::string>("address");
-        numaddresses = pt.get<int>("numaddresses");
-        timeaddresses = pt.get<int>("timeaddresses");
+        auto _general = pt.get_child("General");
+        testnet = _general.get<bool>("testnet");
+        address = _general.get<std::string>("address");
+        numaddresses = _general.get<int>("numaddresses");
+        timeaddresses = _general.get<int>("timeaddresses");
 
         // Coind
         auto _coind = pt.get_child("coind");

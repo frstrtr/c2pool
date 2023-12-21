@@ -149,7 +149,7 @@ int main(int argc, char *argv[])
     }
 
     //Creating and initialization coinds network, config and NodeManager
-    auto nodes = c2pool::master::make_nodes(coind_threads, vm, web_server);
+    auto nodes = c2pool::master::make_nodes(coind_threads, web_server);
 
     //Init exit handler
     ExitSignalHandler exitSignalHandler;

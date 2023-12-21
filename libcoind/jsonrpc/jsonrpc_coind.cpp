@@ -64,7 +64,7 @@ UniValue coind::JSONRPC_Coind::request(const char *method_name, std::shared_ptr<
 	auto result =  _request(method_name, req_params);
 	if (!result["error"].isNull())
 	{
-		LOG_ERROR << "Error in request JSONRPC_COIND[" << parent_net->net_name << "]: " << result["error"].get_str();
+		LOG_ERROR << "Error in request JSONRPC_COIND[" << parent_net->net_name << "]: " << result["error"]["coded"].get_int() << ", " << result["error"]["coded"].get_str();
 	}
 
     if (result.exists("result"))
