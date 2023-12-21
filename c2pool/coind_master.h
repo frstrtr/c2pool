@@ -12,6 +12,8 @@
 #include <sharechains/share_tracker.h>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/post.hpp>
+#include <QtWidgets/QApplication>
+#include <QSettings>
 using namespace c2pool::dev;
 using namespace shares;
 
@@ -60,21 +62,29 @@ namespace c2pool::master
         return std::move(node);
     }
 
-    std::vector<std::shared_ptr<NodeManager>> make_nodes(boost::asio::thread_pool &thread_pool, po::variables_map &vm, const std::shared_ptr<WebServer>& web)
+    std::vector<std::shared_ptr<NodeManager>> make_nodes(boost::asio::thread_pool &thread_pool, const std::shared_ptr<WebServer>& web)
     {
-        if (vm.count("networks") == 0)
+        QSettings networks(QApplication::applicationDirPath() + "/networks.cfg", QSettings::IniFormat);
+
+        if (networks.allKeys().empty())
         {
-            LOG_ERROR << "Empty network list in args!";
+            LOG_ERROR << "Empty network list networks.cfg!";
             std::exit(0);
         }
 
-        auto networks = vm["networks"].as<std::vector<std::string>>();
-        LOG_INFO.stream() << "Starting with networks: " << networks;
-
+        LOG_INFO << "Starting with networks: ";
         std::vector<std::shared_ptr<NodeManager>> nodes;
-        for (const auto& net : networks)
+        for (auto net_name : networks.allKeys())
         {
-            nodes.push_back(std::move(make_node(thread_pool, net, web)));
+            LOG_INFO << "\t" << net_name.toStdString() << " " << (networks.value(net_name).toBool() ? "true" : "false");
+        }
+
+        for (auto net_name : networks.allKeys())
+        {
+            if (networks.value(net_name).toBool())
+            {
+                nodes.push_back(std::move(make_node(thread_pool, net_name.toStdString(), web)));
+            }
         }
         return std::move(nodes);
     }
