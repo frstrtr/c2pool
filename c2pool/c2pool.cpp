@@ -14,8 +14,11 @@ using namespace c2pool::dev;
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
-#include <QCoreApplication>
+#ifdef C2POOL_UI_USE
 #include <QtWidgets/QApplication>
+#else
+#include <QCoreApplication>
+#endif
 
 #include <libdevcore/config.h>
 #include <libdevcore/logger.h>
@@ -33,7 +36,11 @@ namespace po = boost::program_options;
 
 int main(int argc, char *argv[])
 {
+#ifdef C2POOL_UI_USE
     QApplication app(argc, argv);
+#else
+    QCoreApplication app(argc, argv);
+#endif
     c2pool_config::INIT();
     //========================================================================================================================
     //TODO:
@@ -69,11 +76,14 @@ int main(int argc, char *argv[])
 
     if (vm.count("ui_config"))
     {
-//        QApplication app(argc, argv);
+#ifdef C2POOL_UI_USE
         c2pool::ui::MainMenu mainMenu;
 
         mainMenu.show();
         return QApplication::exec();
+#else
+        LOG_WARNING << "You are using the --ui_config argument, but UI support is disabled in your build";
+#endif
     }
 
     if (vm.count("help"))
