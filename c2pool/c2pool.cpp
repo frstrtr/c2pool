@@ -16,6 +16,7 @@ using namespace c2pool::dev;
 namespace po = boost::program_options;
 #ifdef C2POOL_UI_USE
 #include <QtWidgets/QApplication>
+#include "c2pool_main_menu.h"
 #else
 #include <QCoreApplication>
 #endif
@@ -26,7 +27,6 @@ namespace po = boost::program_options;
 #include <networks/network.h>
 
 #include "c2pool_version.h"
-#include "c2pool_main_menu.h"
 #include "node_manager.h"
 
 //TODO: move macros to other.h
