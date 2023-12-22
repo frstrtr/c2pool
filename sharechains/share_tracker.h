@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <stack>
 
 #include "base_share_tracker.h"
 #include "share_store.h"
