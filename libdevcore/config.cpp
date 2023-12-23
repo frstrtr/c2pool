@@ -91,10 +91,12 @@ namespace c2pool::dev
 
         ptree root;
 
-        root.put("testnet", false);
-        root.put("address", "");
-        root.put("numaddresses", 2);
-        root.put("timeaddresses", 172800);
+        // General
+        ptree general;
+        general.put("testnet", false);
+        general.put("address", "");
+        general.put("numaddresses", 2);
+        general.put("timeaddresses", 172800);
 
         // Coind
         ptree coind;
@@ -117,6 +119,9 @@ namespace c2pool::dev
         worker.put("worker_port", 5027);
         worker.put("fee", 0);
 
+        root.push_back(
+                ptree::value_type("General", general)
+        );
         root.push_back(
                 ptree::value_type("coind", coind)
         );
