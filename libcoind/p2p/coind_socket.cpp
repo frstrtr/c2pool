@@ -18,14 +18,13 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
                                     {
                                         read_command(msg);
                                     } else {
-                                        LOG_WARNING << "prefix doesn't match";
-                                        disconnect();
+                                        disconnect("prefix doesn't match");
                                     }
 								}
 								else
 								{
-									LOG_ERROR << "Coind read_prefix: " << ec << " " << ec.message();
-									disconnect();
+//									LOG_ERROR << "Coind read_prefix: " << ec << " " << ec.message();
+                                    disconnect((boost::format("read_prefix (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -43,8 +42,7 @@ void CoindSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-									LOG_ERROR << ec << " " << ec.message();
-									disconnect();
+                                    disconnect((boost::format("read_command (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -61,8 +59,7 @@ void CoindSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-									LOG_ERROR << ec << " " << ec.message();
-									disconnect();
+                                    disconnect((boost::format("read_length (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -79,8 +76,7 @@ void CoindSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-									LOG_ERROR << ec << " " << ec.message();
-									disconnect();
+                                    disconnect((boost::format("read_checksum (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -106,8 +102,7 @@ void CoindSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-									LOG_ERROR << "read_payload: " << ec << " " << ec.message();
-									disconnect();
+                                    disconnect((boost::format("read_payload (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -119,8 +114,7 @@ void CoindSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
     if (!c2pool::dev::compare_str(checksum.data(), msg->checksum, 4))
     {
         auto [ip, port] = get_addr();
-        LOG_WARNING << "Invalid hash for " << ip << ":" << port << ", command = " << msg->command;
-        disconnect(); //TODO: badPeerHappened
+        disconnect((boost::format("Invalid hash for %1%:%2%, command %3%") % ip % port % msg->command).str());
         return;
     }
 

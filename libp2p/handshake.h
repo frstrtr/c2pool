@@ -39,10 +39,10 @@ public:
 
 	virtual void handle_message(std::shared_ptr<RawMessage> raw_msg) = 0;
 
-    virtual void disconnect(std::string reason)
+    virtual void disconnect(const std::string &reason)
     {
         LOG_DEBUG_P2P << "Base Handshake disconnect called with reason: " << reason;
         event_disconnect->happened();
-        socket->disconnect();
+        socket->disconnect(reason);
     }
 };

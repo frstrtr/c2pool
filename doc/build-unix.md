@@ -1,3 +1,5 @@
+required openssl >= 3
+
 ```shell
 sudo apt update & apt upgrade
 sudo apt install wget

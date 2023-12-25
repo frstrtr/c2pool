@@ -39,6 +39,10 @@ protected:
         LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
 
 		protocol = std::make_shared<CoindProtocol>(context, socket, handler_manager);
+        protocol->event_disconnect->subscribe([]()
+        {
+            LOG_INFO << "COIND DISCONNECTED";
+        });
     }
 };
 

@@ -69,7 +69,7 @@ public:
     virtual void read() = 0;
 
     virtual bool isConnected() = 0;
-    virtual void disconnect() = 0;
+    virtual void disconnect(const std::string& reason) = 0;
 
     virtual void set_addr() = 0;
     virtual NetAddress get_addr()
