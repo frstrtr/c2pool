@@ -50,11 +50,10 @@ public:
 		// TODO:
 	}
 
-    void disconnect(std::string reason) override
+    void disconnect(const std::string& reason) override
     {
         auto [ip, port] = get_addr();
-        LOG_WARNING << "PoolProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
         event_disconnect->happened();
-        socket->disconnect();
+        socket->disconnect(reason);
     }
 };

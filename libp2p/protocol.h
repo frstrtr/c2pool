@@ -48,7 +48,7 @@ public:
         return socket->get_addr() < rhs.socket->get_addr();
     }
 
-    virtual void disconnect(std::string reason);
+    virtual void disconnect(const std::string& reason);
 };
 
 template <typename T>

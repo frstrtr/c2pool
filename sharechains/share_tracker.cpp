@@ -232,7 +232,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
             NetAddress _peer_addr = c2pool::random::RandomChoice(reverse[last])->second->peer_addr;
 
-            LOG_INFO << "DESIRED1: " << _verified << "; " << last;
             desired.insert({
                                    _peer_addr,
                                    last,
@@ -285,7 +284,6 @@ TrackerThinkResult ShareTracker::think(const std::function<int32_t(uint256)> &bl
 
         if (head_height < net->CHAIN_LENGTH && !last_last_hash.IsNull())
         {
-            LOG_INFO << "DESIRED2";
             auto t35 = c2pool::dev::debug_timestamp();
             uint32_t desired_timestamp = *items[head]->timestamp;
             uint256 desired_target = items[head]->target;

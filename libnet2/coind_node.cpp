@@ -26,7 +26,8 @@ void CoindNode::start()
 	poll_header();
 
 	//BEST SHARE
-	coind_work->changed->subscribe([&](coind::getwork_result result){
+	coind_work->changed->subscribe([&](coind::getwork_result result)
+    {
 		set_best_share();
 	});
 	set_best_share();

@@ -58,8 +58,7 @@ public:
                                      LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
                                      if (_ec)
                                      {
-                                         LOG_ERROR << "[CoindSocket] write error: " << _ec << ":" << _ec.message();
-                                         disconnect();
+                                         disconnect((boost::format("write error (%1%: %2%)") % _ec % _ec.message()).str());
                                      } else
                                      {
                                          last_message_sent = cmd;
@@ -87,12 +86,11 @@ public:
 		return socket->is_open();
 	}
 
-	void disconnect() override
+	void disconnect(const std::string& reason) override
 	{
         auto [_addr, _port] = get_addr();
-        LOG_INFO << "Coind socket disconnected from " << _addr << ":" << _port;
+        LOG_WARNING << "Coind socket has been disconnected from " << _addr << ":" << _port << ", for a reason: " << reason;
         LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
-		// TODO: call event disconnect
 		socket->close();
 	}
 };

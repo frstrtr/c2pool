@@ -127,7 +127,7 @@ public:
                 heads[new_fork->head] = new_fork;
                 tails[new_fork->tail].insert(new_fork);
                 fork_by_key_add(value.hash(), new_fork);
-                LOG_INFO << "new_fork: head = " << new_fork->head << ", tail = " << new_fork->tail;
+                LOG_DEBUG_SHARETRACKER << "new_fork: head = " << new_fork->head << ", tail = " << new_fork->tail;
 //                fork_by_key[value.hash()] = new_fork;
             }
                 break;
