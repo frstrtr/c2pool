@@ -41,7 +41,6 @@ public:
 	void out_time_ping()
 	{
 		//TODO: out of ping timer;
-//		socket->disconnect();
         disconnect("out of ping");
 	}
 
@@ -52,8 +51,6 @@ public:
 
     void disconnect(const std::string& reason) override
     {
-        auto [ip, port] = get_addr();
-        event_disconnect->happened();
         socket->disconnect(reason);
     }
 };

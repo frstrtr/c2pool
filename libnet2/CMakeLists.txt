@@ -1,10 +1,10 @@
 set(libnet2_sources
         pool_node.cpp pool_node.h
         pool_socket.cpp pool_socket.h
-        pool_protocol.cpp pool_protocol.h
-        pool_handshake.cpp pool_handshake.h
+        pool_protocol.h
+        pool_handshake.h
         pool_protocol_data.h
-        pool_messages.h pool_messages.cpp
+        pool_messages.h
         pool_node_data.h pool_node_data.cpp
 
         worker.h worker.cpp

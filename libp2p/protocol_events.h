@@ -13,18 +13,15 @@ class ProtocolEvents
     bool stopped = false;
 public:
     Event<> event_handle_message;   // Вызывается, когда мы получаем любое сообщение.
-    Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
 
     explicit ProtocolEvents()
     {
         event_handle_message = make_event();
-        event_disconnect = make_event();
     }
 
     ~ProtocolEvents()
     {
         delete event_handle_message;
-        delete event_disconnect;
     }
 
 protected:

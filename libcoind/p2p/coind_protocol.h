@@ -25,8 +25,6 @@ public:
 
     void disconnect(const std::string& reason) override
     {
-        auto [ip, port] = get_addr();
-        event_disconnect->happened();
         socket->disconnect(reason);
     }
 
