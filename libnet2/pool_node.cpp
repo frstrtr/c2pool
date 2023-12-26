@@ -136,7 +136,8 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
             _socket->write(msg_have_tx);
         }
     });
-    handshake->event_disconnect->subscribe([&, _id = id_add_to_remote_view_of_my_known_txs](){ known_txs->added->unsubscribe(_id); });
+    //TODO: copy pointer event_disconnect to handshake/protocol class
+    handshake->get_socket()->event_disconnect->subscribe([&, _id = id_add_to_remote_view_of_my_known_txs](){ known_txs->added->unsubscribe(_id); });
 
     // remove_from_remote_view_of_my_known_txs
     auto id_remove_from_remote_view_of_my_known_txs = known_txs->removed->subscribe([&, _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> removed)
@@ -166,7 +167,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
              */
         }
     });
-    handshake->event_disconnect->subscribe([&, _id = id_remove_from_remote_view_of_my_known_txs](){ known_txs->removed->unsubscribe(_id); });
+    handshake->get_socket()->event_disconnect->subscribe([&, _id = id_remove_from_remote_view_of_my_known_txs](){ known_txs->removed->unsubscribe(_id); });
 
     auto id_update_remote_view_of_my_known_txs = known_txs->transitioned->subscribe([&, peer = std::shared_ptr<PoolProtocolData>(handshake), _socket = handshake->get_socket()](std::map<uint256, coind::data::tx_type> before, std::map<uint256, coind::data::tx_type> after){
         std::map<uint256, coind::data::tx_type> added;
@@ -222,7 +223,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
             // TODO: reactor.callLater(20, self.known_txs_cache.pop, key)
         }
     });
-    handshake->event_disconnect->subscribe([&, _id = id_update_remote_view_of_my_known_txs](){ known_txs->transitioned->unsubscribe(_id); });
+    handshake->get_socket()->event_disconnect->subscribe([&, _id = id_update_remote_view_of_my_known_txs](){ known_txs->transitioned->unsubscribe(_id); });
 
     {
         std::vector<uint256> tx_hashes;
@@ -295,7 +296,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
             socket->write(msg_remember_tx);
         }
     });
-    handshake->event_disconnect->subscribe([&, _id = id_update_remote_view_of_my_mining_txs](){ mining_txs->transitioned->unsubscribe(_id); });
+    handshake->get_socket()->event_disconnect->subscribe([&, _id = id_update_remote_view_of_my_mining_txs](){ mining_txs->transitioned->unsubscribe(_id); });
 
     for (auto x : mining_txs->value())
     {

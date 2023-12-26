@@ -26,7 +26,6 @@ public:
 
     explicit BaseProtocol (std::shared_ptr<Socket> _socket) : socket(std::move(_socket))
     {
-        socket->bad_peer->subscribe([&](const std::string &reason){ disconnect(reason); });
     }
 
 public:
