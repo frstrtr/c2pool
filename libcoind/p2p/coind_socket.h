@@ -91,6 +91,7 @@ public:
         auto [_addr, _port] = get_addr();
         LOG_WARNING << "Coind socket has been disconnected from " << _addr << ":" << _port << ", for a reason: " << reason;
         LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
+        event_disconnect->happened();
 		socket->close();
 	}
 };

@@ -21,7 +21,8 @@ enum connection_type
 class Socket
 {
 public:
-    Event<std::string> bad_peer; // call disconnect from Protocol; Protocol need sub to this event
+//    Event<std::string> bad_peer; // call disconnect from Protocol; Protocol need sub to this event
+    Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
 protected:
     typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> handler_type;
     handler_type handler;
@@ -50,12 +51,12 @@ protected:
             not_received.erase(key);
     }
 public:
-    explicit Socket(connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), bad_peer(make_event<std::string>()) {}
-    Socket(handler_type message_handler, connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), bad_peer(make_event<std::string>()), handler(std::move(message_handler)){}
+    explicit Socket(connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), event_disconnect(make_event()) {}
+    Socket(handler_type message_handler, connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), event_disconnect(make_event()), handler(std::move(message_handler)){}
 
     ~Socket()
     {
-        delete bad_peer;
+        delete event_disconnect;
     }
 
     void set_message_handler(handler_type message_handler)
