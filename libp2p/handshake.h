@@ -22,13 +22,9 @@ public:
 	Handshake(auto _socket) : socket(_socket)
 	{
 		socket->set_message_handler(std::bind(&Handshake::handle_message, this, std::placeholders::_1));
-        bad_peer_event_id = socket->bad_peer->subscribe([&](const std::string &reason){ disconnect(reason); });
 	}
 
-    ~Handshake()
-    {
-        socket->bad_peer->unsubscribe(bad_peer_event_id);
-    }
+    ~Handshake() = default;
 
 	auto get_socket() const
 	{
@@ -42,7 +38,6 @@ public:
     virtual void disconnect(const std::string &reason)
     {
         LOG_DEBUG_P2P << "Base Handshake disconnect called with reason: " << reason;
-        event_disconnect->happened();
         socket->disconnect(reason);
     }
 };
