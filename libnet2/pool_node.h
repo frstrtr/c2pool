@@ -49,8 +49,19 @@ public:
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
 		auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
-		auto ip = _protocol->get_socket()->get_addr().ip;
+        auto _sock = _protocol->get_socket();
+        auto ip = _sock->get_addr().ip;
         peers[_protocol->nonce] = _protocol;
+
+        _sock->event_disconnect->subscribe(
+                [&, _ip = ip]()
+                {
+                    auto proto = server_connections[_ip];
+
+                    proto->stop();
+                    peers.erase(proto->nonce);
+                    server_connections.erase(_ip);
+                });
         server_connections[ip] = std::move(_protocol);
     }
 
@@ -91,8 +102,19 @@ public:
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
         auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
 
-        auto ip = _protocol->get_socket()->get_addr().ip;
+        auto _sock = _protocol->get_socket();
+        auto ip = _sock->get_addr().ip;
         peers[_protocol->nonce] = _protocol;
+        _sock->event_disconnect->subscribe(
+                [&, _ip = ip]()
+                {
+                    auto proto = client_connections[_ip];
+
+                    proto->stop();
+                    peers.erase(proto->nonce);
+                    client_connections.erase(_ip);
+                });
+
         client_connections[ip] = std::move(_protocol);
 	    client_attempts.erase(ip);
     }

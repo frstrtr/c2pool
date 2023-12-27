@@ -24,10 +24,9 @@ public:
         delete event_handle_message;
     }
 
-protected:
+    void stop() { stopped = true; }
     bool is_stopped() const { return stopped;}
 
-    void stop() { stopped = true; }
 };
 
 class ProtocolPinger : virtual ProtocolEvents
@@ -51,7 +50,8 @@ private:
                                  if (ec == boost::system::errc::operation_canceled)
                                  {
 									 // Если таймер был canceled, то он запускается заново без вызова outtimeF()
-                                     start_outtime_ping();
+                                     if (!is_stopped())
+                                        start_outtime_ping();
                                  } else
                                  {
                                      //TODO: error
@@ -73,7 +73,8 @@ private:
 				start_send_ping();
 			} else
 			{
-				// TODO: error
+//                if (ec != boost::system::errc::operation_canceled && is_stopped())
+                    // TODO: error
 			}
 		});
 	}
@@ -96,7 +97,4 @@ public:
     }
 
     ~ProtocolPinger() = default;
-//    {
-//        timer.cancel();
-//    }
 };
