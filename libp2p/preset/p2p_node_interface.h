@@ -81,33 +81,34 @@ public:
 							   [&, _ip = ip, _port = port, _handler = socket_handle](
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
-							   {
-									if (er) {
-										LOG_WARNING << "P2PConnector[resolve]: " << er.message();
-									}
-								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
-								   auto socket = std::make_shared<SocketType>(
-										   _socket, net, connection_type::outgoing
-								   );
+                               {
+                                   if (er)
+                                       LOG_WARNING << "P2PConnector[resolve]: " << er.message();
+
+                                   auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
+                                   auto socket = std::make_shared<SocketType>(
+                                           tcp_socket, net, connection_type::outgoing
+                                   );
 
 
-								   boost::asio::async_connect(*_socket, endpoints,
-															  [sock = std::move(socket), handler = _handler](
-																	  const boost::system::error_code &ec,
-																	  const boost::asio::ip::tcp::endpoint& ep)
-															  {
-                                                                  LOG_INFO << "P2PConnector.Socket try handshake with " << ep.address() << ":"
+                                   boost::asio::async_connect(*tcp_socket, endpoints,
+                                                              [sock = std::move(socket), handler = _handler](
+                                                                      const boost::system::error_code &ec,
+                                                                      const boost::asio::ip::tcp::endpoint &ep)
+                                                              {
+                                                                  LOG_INFO << "P2PConnector.Socket try handshake with "
+                                                                           << ep.address() << ":"
                                                                            << ep.port();
-																  if (!ec)
-																  {
-																	  handler(sock);
-																	  sock->read();
-																  } else
-																  {
-																	  LOG_ERROR << "async_connect: " << ec;
-																  }
-															  });
-							   });
+                                                                  if (!ec)
+                                                                  {
+                                                                      handler(sock);
+                                                                      sock->read();
+                                                                  } else
+                                                                  {
+                                                                      LOG_ERROR << "async_connect: " << ec;
+                                                                  }
+                                                              });
+                               });
 	}
 };
 
