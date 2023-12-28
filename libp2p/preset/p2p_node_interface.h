@@ -35,9 +35,9 @@ public:
 		LOG_INFO << "PoolNode Listener started for port: " << listen_ep.port();
 	}
 
-	void tick(std::function<void(std::shared_ptr<Socket>)> socket_handle, std::function<void()> finish) override
+	void tick() override
 	{
-		acceptor.async_accept([this, handle = std::move(socket_handle), finish=std::move(finish)](boost::system::error_code ec, ip::tcp::socket _socket)
+		acceptor.async_accept([this, handle = socket_handler, finish=finish_handler](boost::system::error_code ec, ip::tcp::socket _socket)
 							  {
 								  if (!ec)
 								  {
@@ -70,21 +70,19 @@ public:
 	{
 	}
 
-	void tick(std::function<void(std::shared_ptr<Socket>)> socket_handle, NetAddress _addr) override
+	void tick(NetAddress addr) override
 	{
-		auto [ip, port] = _addr;
-        LOG_DEBUG_P2P << "P2PConnector try to resolve " << ip << ":" << port;
-		resolver.async_resolve(ip, port,
-							   [&, _ip = ip, _port = port, _handler = socket_handle](
+        LOG_DEBUG_P2P << "P2PConnector try to resolve " << addr.to_string();
+		resolver.async_resolve(addr.ip, addr.port,
+							   [&, _addr = addr, _handler = socket_handler](
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
                                {
                                    if (er)
-                                       LOG_WARNING << "P2PConnector[resolve]: " << er.message();
+                                       error_handler(_addr, "(resolver)" + er.message());
 
                                    auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
                                    auto socket = std::make_shared<SocketType>(tcp_socket, net, connection_type::outgoing);
-
 
                                    boost::asio::async_connect(*tcp_socket, endpoints,
                                                               [sock = std::move(socket), handler = _handler](
@@ -117,18 +115,17 @@ private:
 	ip::tcp::resolver resolver;
 
 public:
-	CoindConnector(const auto& _context, const auto& _net) : context(_context), net(_net), resolver(*context)
-	{
-	}
+	CoindConnector(const auto& _context, const auto& _net) : context(_context), net(_net), resolver(*context) {}
 
-	void tick(std::function<void(std::shared_ptr<Socket>)> socket_handle, NetAddress _addr) override
+	void tick(NetAddress _addr) override
 	{
 		resolver.async_resolve(_addr.ip, _addr.port,
-							   [&, address = _addr, _handler = socket_handle](
+							   [&, address = _addr, _handler = socket_handler](
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
 							   {
-								   if (er) {
+								   if (er)
+                                   {
 									   LOG_WARNING << "P2PConnector[resolve](" << address.to_string() << "): " << er.message();
 									   return;
 								   }
