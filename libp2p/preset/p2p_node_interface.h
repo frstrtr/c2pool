@@ -35,16 +35,14 @@ public:
 		LOG_INFO << "PoolNode Listener started for port: " << listen_ep.port();
 	}
 
-	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle, std::function<void()> finish) override
+	void tick(std::function<void(std::shared_ptr<Socket>)> socket_handle, std::function<void()> finish) override
 	{
 		acceptor.async_accept([this, handle = std::move(socket_handle), finish=std::move(finish)](boost::system::error_code ec, ip::tcp::socket _socket)
 							  {
 								  if (!ec)
 								  {
-									  auto boost_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-									  auto socket = std::make_shared<SocketType>(
-											  boost_socket, net, connection_type::incoming
-									  );
+									  auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
+									  auto socket = std::make_shared<SocketType>(tcp_socket, net, connection_type::incoming);
 									  handle(socket);
 									  socket->read();
 								  }
@@ -68,12 +66,11 @@ private:
 	ip::tcp::resolver resolver;
 
 public:
-	P2PConnector(auto _context, auto _net) : context(std::move(_context)), net(std::move(_net)), resolver(*context)
+	P2PConnector(const auto& _context, const auto& _net) : context(_context), net(_net), resolver(*context)
 	{
 	}
 
-	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
-                    NetAddress _addr) override
+	void tick(std::function<void(std::shared_ptr<Socket>)> socket_handle, NetAddress _addr) override
 	{
 		auto [ip, port] = _addr;
         LOG_DEBUG_P2P << "P2PConnector try to resolve " << ip << ":" << port;
@@ -86,9 +83,7 @@ public:
                                        LOG_WARNING << "P2PConnector[resolve]: " << er.message();
 
                                    auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
-                                   auto socket = std::make_shared<SocketType>(
-                                           tcp_socket, net, connection_type::outgoing
-                                   );
+                                   auto socket = std::make_shared<SocketType>(tcp_socket, net, connection_type::outgoing);
 
 
                                    boost::asio::async_connect(*tcp_socket, endpoints,
@@ -122,12 +117,11 @@ private:
 	ip::tcp::resolver resolver;
 
 public:
-	CoindConnector(auto _context, auto _net) : context(std::move(_context)), net(std::move(_net)), resolver(*context)
+	CoindConnector(const auto& _context, const auto& _net) : context(_context), net(_net), resolver(*context)
 	{
 	}
 
-	void operator()(std::function<void(std::shared_ptr<Socket>)> socket_handle,
-                    NetAddress _addr) override
+	void tick(std::function<void(std::shared_ptr<Socket>)> socket_handle, NetAddress _addr) override
 	{
 		resolver.async_resolve(_addr.ip, _addr.port,
 							   [&, address = _addr, _handler = socket_handle](
@@ -139,9 +133,7 @@ public:
 									   return;
 								   }
 								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
-								   auto socket = std::make_shared<SocketType>(
-										   _socket, net
-								   );
+								   auto socket = std::make_shared<SocketType>(_socket, net);
 
 
 								   boost::asio::async_connect(*_socket, endpoints,
