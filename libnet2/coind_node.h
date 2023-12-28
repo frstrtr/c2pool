@@ -27,9 +27,14 @@ protected:
 public:
     CoindNodeClient(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)){}
 
-	void connect(NetAddress addr)
+    void error_handle(const NetAddress& addr, const std::string& err)
+    {
+        LOG_ERROR << "Coind Client error: " << err;
+    }
+
+	void connect(const NetAddress& addr)
 	{
-		connector->tick([&](std::shared_ptr<Socket> socket){ socket_handle(socket); }, addr);
+		connector->tick(addr);
 	}
 
 protected:
@@ -82,15 +87,27 @@ public:
 
 	template <typename ConnectorType>
 	void run()
-	{
-		if (isRunning)
-			throw std::runtime_error("CoindNode already running");
+    {
+        if (isRunning)
+            throw std::runtime_error("CoindNode already running");
 
-		connector = std::make_shared<ConnectorType>(context, parent_net);
+        connector = std::make_shared<ConnectorType>(context, parent_net);
+        connector->init(
+                // socket handler
+                [&](const std::shared_ptr<Socket> &socket)
+                {
+                    socket_handle(socket);
+                },
+                // error handler
+                [&](const NetAddress& addr, const std::string &err)
+                {
+                    CoindNodeClient::error_handle(addr, err);
+                }
+        );
 
-		start();
-		isRunning = true;
-	}
+        start();
+        isRunning = true;
+    }
 public:
 
     void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol);

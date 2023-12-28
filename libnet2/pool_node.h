@@ -68,20 +68,14 @@ public:
         server_connections[ip] = std::move(_protocol);
     }
 
+    void error_handle(const NetAddress& addr, const std::string& err)
+    {
+        LOG_ERROR << "Pool Server error: " << err;
+    }
+
 	void listen()
     {
-        listener->tick(
-                // socket_handle
-                [&](std::shared_ptr<Socket> socket)
-                {
-                    socket_handle(std::move(socket));
-                },
-                // finish
-                [&]()
-                {
-                    listen();
-                }
-        );
+        listener->tick();
     }
 };
 
@@ -148,15 +142,14 @@ public:
 
         for (const auto &addr: get_good_peers(1))
         {
-            if (client_attempts.find(addr.ip) != client_attempts.end())
+            if (client_attempts.count(addr.ip) || client_connections.count(addr.ip))
             {
 //                LOG_WARNING << "Client already connected to " << addr.to_string() << "!";
                 continue;
             }
             LOG_TRACE << "try to connect: " << addr.to_string();
             client_attempts[addr.ip] = nullptr;
-            connector->tick([&](const std::shared_ptr<Socket> &socket)
-                            { socket_handle(socket); }, addr);
+            connector->tick(addr);
         }
 
         auto_connect();
@@ -170,6 +163,12 @@ public:
                 {
                     try_connect(ec);
                 });
+    }
+
+    void error_handle(const NetAddress& addr, const std::string& err)
+    {
+        LOG_ERROR << "Pool Server[->" << addr.to_string() << "] error: " << err;
+        client_attempts.erase(addr.ip);
     }
 
 	std::vector<NetAddress> get_good_peers(int max_count);
@@ -317,14 +316,43 @@ public:
 	void run(NodeRunState run_state = both)
 	{
 		if (run_state == both || run_state == onlyServer)
-		{
-			listener = std::make_shared<ListenerType>(context, net, config->c2pool_port);
-			listen();
-		}
+        {
+            listener = std::make_shared<ListenerType>(context, net, config->c2pool_port);
+            listener->init(
+                    // socket_handle
+                    [&](std::shared_ptr<Socket> socket)
+                    {
+                        PoolNodeServer::socket_handle(std::move(socket));
+                    },
+                    // error
+                    [&](const NetAddress& addr, const std::string& err)
+                    {
+                        PoolNodeServer::error_handle(addr, err);
+                    },
+                    // finish
+                    [&]()
+                    {
+                        listen();
+                    }
+            );
+            listen();
+        }
 
 		if (run_state == both || run_state == onlyClient)
 		{
 			connector = std::make_shared<ConnectorType>(context, net);
+            connector->init(
+                    // socket_handler
+                    [&](const std::shared_ptr<Socket> &socket)
+                    {
+                        PoolNodeClient::socket_handle(socket);
+                    },
+                    // error_handle
+                    [&](const NetAddress& addr, const std::string& err)
+                    {
+                        PoolNodeClient::error_handle(addr, err);
+                    }
+            );
 			auto_connect();
 		}
         start();
