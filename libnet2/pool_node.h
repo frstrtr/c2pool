@@ -33,16 +33,19 @@ protected:
 private:
     msg_version_handler_type message_version_handle;
 public:
-	PoolNodeServer(std::shared_ptr<io::io_context> _context, msg_version_handler_type version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)) {}
+	PoolNodeServer(const std::shared_ptr<io::io_context>& _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
 
 	void socket_handle(std::shared_ptr<Socket> socket)
-	{
-		auto _socket = socket;
+    {
+        auto _socket = socket;
         socket->set_addr();
-		server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket),
-                                                                        message_version_handle,
-                                                                        [&](const std::shared_ptr<PoolHandshake>& _handshake){handshake_handle(_handshake);});
-	}
+        server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket), message_version_handle,
+                                                                         [&](const std::shared_ptr<PoolHandshake> &_handshake)
+                                                                         {
+                                                                             handshake_handle(_handshake);
+                                                                         }
+        );
+    }
 
     void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
     {
@@ -66,9 +69,20 @@ public:
     }
 
 	void listen()
-	{
-		(*listener)([&](std::shared_ptr<Socket> socket){ socket_handle(std::move(socket));}, [&](){listen();});
-	}
+    {
+        listener->tick(
+                // socket_handle
+                [&](std::shared_ptr<Socket> socket)
+                {
+                    socket_handle(std::move(socket));
+                },
+                // finish
+                [&]()
+                {
+                    listen();
+                }
+        );
+    }
 };
 
 class PoolNodeClient : virtual PoolNodeData
@@ -119,38 +133,44 @@ public:
 	    client_attempts.erase(ip);
     }
 
+    void try_connect(const boost::system::error_code& ec)
+    {
+        if (ec)
+        {
+            LOG_ERROR << "P2PNode::auto_connect: " << ec.message();
+            return;
+        }
+
+        if (!((client_connections.size() < config->desired_conns) &&
+              (addr_store->len() > 0) &&
+              (client_attempts.size() <= config->max_attempts)))
+            return;
+
+        for (const auto &addr: get_good_peers(1))
+        {
+            if (client_attempts.find(addr.ip) != client_attempts.end())
+            {
+//                LOG_WARNING << "Client already connected to " << addr.to_string() << "!";
+                continue;
+            }
+            LOG_TRACE << "try to connect: " << addr.to_string();
+            client_attempts[addr.ip] = nullptr;
+            connector->tick([&](const std::shared_ptr<Socket> &socket)
+                            { socket_handle(socket); }, addr);
+        }
+
+        auto_connect();
+    }
+
 	void auto_connect()
-	{
-		auto_connect_timer.expires_from_now(auto_connect_interval);
-		auto_connect_timer.async_wait([this](boost::system::error_code const &_ec)
-									  {
-										  if (_ec)
-										  {
-											  LOG_ERROR << "P2PNode::auto_connect: " << _ec.message();
-											  return;
-										  }
-
-										  if (!((client_connections.size() < config->desired_conns) &&
-												(addr_store->len() > 0) &&
-												(client_attempts.size() <= config->max_attempts)))
-											  return;
-
-										  for (auto addr: get_good_peers(1))
-										  {
-											  if (client_attempts.find(addr.ip) != client_attempts.end())
-											  {
-												  LOG_WARNING << "Client already connected to " << addr.to_string() << "!";
-												  continue;
-											  }
-
-											  LOG_TRACE << "try to connect: " << addr.to_string();
-
-											  (*connector)([&](std::shared_ptr<Socket> socket){ socket_handle(socket);}, addr);
-										  }
-                                          //TODO remove comment
-//                                          auto_connect();
-									  });
-	}
+    {
+        auto_connect_timer.expires_from_now(auto_connect_interval);
+        auto_connect_timer.async_wait(
+                [this](const boost::system::error_code &ec)
+                {
+                    try_connect(ec);
+                });
+    }
 
 	std::vector<NetAddress> get_good_peers(int max_count);
 };

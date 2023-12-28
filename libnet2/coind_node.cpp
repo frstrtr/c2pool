@@ -110,7 +110,7 @@ void CoindNode::start()
 	stop_signal.watch(t.stop)
 	 */
 
-	LOG_INFO << "... CoindNode[" << parent_net->net_name << "] " << "started!";
+	LOG_INFO << "... CoindNode<" << parent_net->net_name << "> " << "started!";
 }
 
 void CoindNode::work_poller()

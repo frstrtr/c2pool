@@ -29,7 +29,7 @@ public:
 
 	void connect(NetAddress addr)
 	{
-		(*connector)([&](std::shared_ptr<Socket> socket){ socket_handle(socket); }, addr);
+		connector->tick([&](std::shared_ptr<Socket> socket){ socket_handle(socket); }, addr);
 	}
 
 protected:
