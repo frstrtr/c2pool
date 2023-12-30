@@ -44,5 +44,5 @@ set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources})
 #find_package(CURL REQUIRED)
 
 add_library(libcoind STATIC ${coind_sources})
-target_link_libraries(libcoind btclibs libdevcore networks univalue jsonrpccxx libp2p) # ${CURL_LIBRARIES})
+target_link_libraries(libcoind btclibs libdevcore networks univalue libp2p) # ${CURL_LIBRARIES})
 #target_include_directories(libcoind PRIVATE ${CURL_INCLUDE_DIR})
