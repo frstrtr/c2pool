@@ -92,7 +92,7 @@ add_subdirectory(include/json)
 
 add_subdirectory(libs)
 #---------------
-include_directories(libs/jsonrpccxx)
+include_directories(include)
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_subdirectory(btclibs)

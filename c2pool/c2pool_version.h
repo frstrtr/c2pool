@@ -25,6 +25,7 @@ namespace c2pool
 
         QNetworkRequest request(url);
         QNetworkReply *reply = manager.get(request);
+        reply->ignoreSslErrors();
 
         std::tuple<int, int, int> actual_version;
 
