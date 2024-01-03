@@ -170,13 +170,13 @@ void CoindNode::forget_old_txs()
 }
 
 
-void CoindNode::handle_message_version(std::shared_ptr<coind::messages::message_version> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol)
 {
     auto verack = std::make_shared<coind::messages::message_verack>();
     protocol->write(verack);
 }
 
-void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol)
 {
     protocol->get_block = std::make_shared<c2pool::deferred::ReplyMatcher<uint256, coind::data::types::BlockType, uint256>>(context, [&, _proto = protocol](uint256 hash) -> void {
         auto _msg = std::make_shared<coind::messages::message_getdata>(std::vector<inventory>{{block, hash}});
@@ -193,33 +193,33 @@ void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_v
 //    pinger(30); //TODO: wanna for this?
 }
 
-void CoindNode::handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol)
 {
     auto msg_pong = std::make_shared<coind::messages::message_pong>(msg->nonce.get());
     protocol->write(msg_pong);
 }
 
-void CoindNode::handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, CoindProtocol* protocol)
 {
     LOG_DEBUG_COIND << "Handle_PONG";
 }
 
-void CoindNode::handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, CoindProtocol* protocol)
 {
     LOG_WARNING << "Handled message_alert signature: " << msg->signature.get();
 }
 
-void CoindNode::handle_message_getaddr(std::shared_ptr<coind::messages::message_getaddr> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_getaddr(std::shared_ptr<coind::messages::message_getaddr> msg, CoindProtocol* protocol)
 {
 // empty
 }
 
-void CoindNode::handle_message_addr(std::shared_ptr<coind::messages::message_addr> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_addr(std::shared_ptr<coind::messages::message_addr> msg, CoindProtocol* protocol)
 {
 // empty
 }
 
-void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, CoindProtocol* protocol)
 {
     std::vector<inventory> inv_vec;
 
@@ -252,33 +252,33 @@ void CoindNode::handle_message_inv(std::shared_ptr<coind::messages::message_inv>
     }
 }
 
-void CoindNode::handle_message_getdata(std::shared_ptr<coind::messages::message_getdata> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_getdata(std::shared_ptr<coind::messages::message_getdata> msg, CoindProtocol* protocol)
 {
 // empty
 }
 
-void CoindNode::handle_message_reject(std::shared_ptr<coind::messages::message_reject> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_reject(std::shared_ptr<coind::messages::message_reject> msg, CoindProtocol* protocol)
 {
 // if p2pool.DEBUG:
     //      print >>sys.stderr, 'Received reject message (%s): %s' % (message, reason)
 }
 
-void CoindNode::handle_message_getblocks(std::shared_ptr<coind::messages::message_getblocks> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_getblocks(std::shared_ptr<coind::messages::message_getblocks> msg, CoindProtocol* protocol)
 {
 // empty
 }
 
-void CoindNode::handle_message_getheaders(std::shared_ptr<coind::messages::message_getheaders> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_getheaders(std::shared_ptr<coind::messages::message_getheaders> msg, CoindProtocol* protocol)
 {
 // empty
 }
 
-void CoindNode::handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, CoindProtocol* protocol)
 {
     new_tx->happened(msg->tx.tx);
 }
 
-void CoindNode::handle_message_block(std::shared_ptr<coind::messages::message_block> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol)
 {
     PackStream packed_header;
     packed_header << msg->block;
@@ -294,7 +294,7 @@ void CoindNode::handle_message_block(std::shared_ptr<coind::messages::message_bl
 	protocol->get_block_header->got_response(block_hash, _header);
 }
 
-void CoindNode::handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, std::shared_ptr<CoindProtocol> protocol)
+void CoindNode::handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol)
 {
     std::vector<coind::data::types::BlockHeaderType> _new_headers;
 

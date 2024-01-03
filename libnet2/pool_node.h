@@ -23,34 +23,34 @@ namespace ip = io::ip;
 
 class PoolNodeServer : virtual PoolNodeData
 {
-    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, std::shared_ptr<PoolHandshake>)> msg_version_handler_type;
+    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 
 protected:
 	std::shared_ptr<Listener> listener; // from P2PNode::run()
 
-    std::map<std::shared_ptr<Socket>, std::shared_ptr<PoolHandshakeServer>> server_attempts;
-    std::map<HOST_IDENT, std::shared_ptr<PoolProtocol>> server_connections;
+    std::map<Socket*, std::shared_ptr<PoolHandshakeServer>> server_attempts;
+    std::map<HOST_IDENT, PoolProtocol*> server_connections;
 private:
     msg_version_handler_type message_version_handle;
 public:
 	PoolNodeServer(const std::shared_ptr<io::io_context>& _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
 
-	void socket_handle(std::shared_ptr<Socket> socket)
+	void socket_handle(Socket* socket)
     {
         auto _socket = socket;
         socket->set_addr();
         server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket), message_version_handle,
-                                                                         [&](const std::shared_ptr<PoolHandshake> &_handshake)
+                                                                         [&](PoolHandshake* _handshake)
                                                                          {
-                                                                             handshake_handle(_handshake);
+                                                                            handshake_handle(_handshake);
                                                                          }
         );
     }
 
-    void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
+    void handshake_handle(PoolHandshake* _handshake)
     {
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
-		auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
+		auto _protocol = new PoolProtocol(context, _handshake->get_socket(), handler_manager, _handshake);
 
         auto _sock = _protocol->get_socket();
         auto ip = _sock->get_addr().ip;
@@ -65,7 +65,7 @@ public:
                     peers.erase(proto->nonce);
                     server_connections.erase(_ip);
                 });
-        server_connections[ip] = std::move(_protocol);
+        server_connections[ip] = _protocol;
     }
 
     void error_handle(const NetAddress& addr, const std::string& err)
@@ -81,12 +81,12 @@ public:
 
 class PoolNodeClient : virtual PoolNodeData
 {
-    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, std::shared_ptr<PoolHandshake>)> msg_version_handler_type;
+    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 protected:
 	std::shared_ptr<Connector> connector; // from P2PNode::run()
 
-	std::map<HOST_IDENT, std::shared_ptr<PoolHandshakeClient>> client_attempts;
-    std::map<HOST_IDENT, std::shared_ptr<PoolProtocol>> client_connections;
+	std::map<HOST_IDENT, PoolHandshakeClient*> client_attempts;
+    std::map<HOST_IDENT, PoolProtocol*> client_connections;
 private:
 	io::steady_timer auto_connect_timer;
 	const std::chrono::seconds auto_connect_interval{1s};
@@ -95,20 +95,19 @@ private:
 public:
 	PoolNodeClient(std::shared_ptr<io::io_context> _context, msg_version_handler_type version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
-    void socket_handle(std::shared_ptr<Socket> socket)
+    void socket_handle(Socket* socket)
     {
         socket->set_addr();
         auto addr = socket->get_addr();
         client_attempts[addr.ip] =
-                std::make_shared<PoolHandshakeClient>(std::move(socket),
-                                                      message_version_handle,
-                                                      [&](const std::shared_ptr<PoolHandshake>& _handshake){ handshake_handle(_handshake);});
+                new PoolHandshakeClient(socket, message_version_handle,
+                                                      [&](PoolHandshake* _handshake){ handshake_handle(_handshake);});
     }
 
-    void handshake_handle(const std::shared_ptr<PoolHandshake>& _handshake)
+    void handshake_handle(PoolHandshake* handshake)
     {
-        LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
-        auto _protocol = std::make_shared<PoolProtocol>(context, _handshake->get_socket(), handler_manager, _handshake);
+        LOG_DEBUG_POOL << "PoolServer has been connected to: " << handshake->get_socket();
+        auto _protocol = new PoolProtocol(context, handshake->get_socket(), handler_manager, handshake);
 
         auto _sock = _protocol->get_socket();
         auto ip = _sock->get_addr().ip;
@@ -123,7 +122,7 @@ public:
                     client_connections.erase(_ip);
                 });
 
-        client_connections[ip] = std::move(_protocol);
+        client_connections[ip] = _protocol;
 	    client_attempts.erase(ip);
     }
 
@@ -290,8 +289,8 @@ private:
 public:
 	PoolNode(std::shared_ptr<io::io_context> _context)
 			: PoolNodeData(std::move(_context)),
-              PoolNodeServer(context, [&](std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake) { handle_message_version(msg, handshake); }),
-              PoolNodeClient(context, [&](std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake) { handle_message_version(msg, handshake); })
+              PoolNodeServer(context, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); }),
+              PoolNodeClient(context, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); })
 	{
         LOG_INFO << "PoolNode created!";
 		SET_POOL_DEFAULT_HANDLER(addrs);
@@ -320,9 +319,9 @@ public:
             listener = std::make_shared<ListenerType>(context, net, config->c2pool_port);
             listener->init(
                     // socket_handle
-                    [&](std::shared_ptr<Socket> socket)
+                    [&](Socket* socket)
                     {
-                        PoolNodeServer::socket_handle(std::move(socket));
+                        PoolNodeServer::socket_handle(socket);
                     },
                     // error
                     [&](const NetAddress& addr, const std::string& err)
@@ -343,7 +342,7 @@ public:
 			connector = std::make_shared<ConnectorType>(context, net);
             connector->init(
                     // socket_handler
-                    [&](const std::shared_ptr<Socket> &socket)
+                    [&](Socket* socket)
                     {
                         PoolNodeClient::socket_handle(socket);
                     },
@@ -360,32 +359,32 @@ public:
 	}
 
 	// Handshake handlers
-    void handle_message_version(std::shared_ptr<pool::messages::message_version> msg, std::shared_ptr<PoolHandshake> handshake);
+    void handle_message_version(std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake);
 
 	// Pool handlers
-    void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, PoolProtocol* protocol);
 
-    void handle_message_addrme(std::shared_ptr<pool::messages::message_addrme> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_addrme(std::shared_ptr<pool::messages::message_addrme> msg, PoolProtocol* protocol);
 
-    void handle_message_ping(std::shared_ptr<pool::messages::message_ping> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_ping(std::shared_ptr<pool::messages::message_ping> msg, PoolProtocol* protocol);
 
-    void handle_message_getaddrs(std::shared_ptr<pool::messages::message_getaddrs> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_getaddrs(std::shared_ptr<pool::messages::message_getaddrs> msg, PoolProtocol* protocol);
 
-    void handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, PoolProtocol* protocol);
 
-    void handle_message_sharereq(std::shared_ptr<pool::messages::message_sharereq> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_sharereq(std::shared_ptr<pool::messages::message_sharereq> msg, PoolProtocol* protocol);
 
-    void handle_message_sharereply(std::shared_ptr<pool::messages::message_sharereply> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_sharereply(std::shared_ptr<pool::messages::message_sharereply> msg, PoolProtocol* protocol);
 
-    void handle_message_bestblock(std::shared_ptr<pool::messages::message_bestblock> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_bestblock(std::shared_ptr<pool::messages::message_bestblock> msg, PoolProtocol* protocol);
 
-    void handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, PoolProtocol* protocol);
 
-    void handle_message_losing_tx(std::shared_ptr<pool::messages::message_losing_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_losing_tx(std::shared_ptr<pool::messages::message_losing_tx> msg, PoolProtocol* protocol);
 
-    void handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, PoolProtocol* protocol);
 
-    void handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, std::shared_ptr<PoolProtocol> protocol);
+    void handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, PoolProtocol* protocol);
 private:
     void start();
 

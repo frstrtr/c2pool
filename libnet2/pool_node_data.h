@@ -71,7 +71,7 @@ public:
 	VariableDict<uint256, coind::data::tx_type> mining_txs;
 	Variable<uint256> best_share;
 
-	std::map<uint64_t, std::shared_ptr<PoolProtocol>> peers;
+	std::map<uint64_t, PoolProtocol*> peers;
 	std::set<uint256> shared_share_hashes;
 public:
 	PoolNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
@@ -122,7 +122,7 @@ public:
 
 	std::vector<ShareType> handle_get_shares(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetAddress peer_addr);
 	void handle_shares(HandleSharesData shares, NetAddress addr);
-	void handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, NetAddress addr);
+	void handle_share_hashes(std::vector<uint256> hashes, PoolProtocolData* peer, NetAddress addr);
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 	void broadcast_share(uint256 share_hash);
 
@@ -132,5 +132,5 @@ public:
     }
 
 protected:
-	void send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with = {});
+	void send_shares(PoolProtocol* peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with = {});
 };

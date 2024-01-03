@@ -42,7 +42,7 @@ public:
 								  if (!ec)
 								  {
 									  auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-									  auto socket = std::make_shared<SocketType>(tcp_socket, net, connection_type::incoming);
+									  auto socket = new SocketType(tcp_socket, net, connection_type::incoming);
 									  handle(socket);
 									  socket->read();
 								  }
@@ -82,10 +82,10 @@ public:
                                        error_handler(_addr, "(resolver)" + er.message());
 
                                    auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
-                                   auto socket = std::make_shared<SocketType>(tcp_socket, net, connection_type::outgoing);
+                                   auto socket = new SocketType(tcp_socket, net, connection_type::outgoing);
 
                                    boost::asio::async_connect(*tcp_socket, endpoints,
-                                                              [sock = std::move(socket), handler = _handler](
+                                                              [_addr = _addr, sock = std::move(socket), handler = _handler, err_handler = error_handler](
                                                                       const boost::system::error_code &ec,
                                                                       const boost::asio::ip::tcp::endpoint &ep)
                                                               {
@@ -98,7 +98,7 @@ public:
                                                                       sock->read();
                                                                   } else
                                                                   {
-                                                                      LOG_ERROR << "async_connect: " << ec;
+                                                                      err_handler(_addr, "(async_connect)" + ec.message());
                                                                   }
                                                               });
                                });
@@ -130,7 +130,7 @@ public:
 									   return;
 								   }
 								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
-								   auto socket = std::make_shared<SocketType>(_socket, net);
+								   auto socket = new SocketType(_socket, net);
 
 
 								   boost::asio::async_connect(*_socket, endpoints,

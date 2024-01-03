@@ -10,13 +10,13 @@
 #include <libdevcore/stream.h>
 
 template <typename MessageType, typename ProtocolType>
-using handler_type = std::function<void(std::shared_ptr<MessageType>, std::shared_ptr<ProtocolType>)>;
+using handler_type = std::function<void(std::shared_ptr<MessageType>, ProtocolType*)>;
 
 template <typename ProtocolType>
 class Handler
 {
 public:
-    virtual void invoke(PackStream &stream, std::shared_ptr<ProtocolType> _protocol) = 0;
+    virtual void invoke(PackStream &stream, ProtocolType* _protocol) = 0;
 };
 
 template <typename MessageType, typename ProtocolType>
@@ -38,7 +38,7 @@ protected:
 public:
     MessageHandler(handler_type<MessageType, ProtocolType> _handlerF) : handlerF(_handlerF) {}
 
-    void invoke(PackStream &stream, std::shared_ptr<ProtocolType> _protocol) override
+    void invoke(PackStream &stream, ProtocolType* _protocol) override
     {
         auto msg = generate_message(stream);
 //        auto protocol = std::static_pointer_cast<ProtocolType>(_protocol);

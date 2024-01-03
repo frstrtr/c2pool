@@ -15,7 +15,7 @@ class Handshake : public virtual ProtocolEvents
 protected:
     typedef ProtocolType protocol_type;
 
-	std::shared_ptr<Socket> socket;
+	Socket* socket;
 
     int bad_peer_event_id;
 public:

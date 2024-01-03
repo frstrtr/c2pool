@@ -15,7 +15,7 @@
 class PoolHandshake : public Handshake<PoolProtocol>, public PoolProtocolData
 {
 protected:
-    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, std::shared_ptr<PoolHandshake>)> msg_version_handler_type;
+    typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 
     msg_version_handler_type handle_message_version;
 	void send_version()
@@ -50,9 +50,9 @@ public:
     { }
 };
 
-class PoolHandshakeServer : public enable_shared_from_this<PoolHandshakeServer>, public PoolHandshake
+class PoolHandshakeServer : public PoolHandshake
 {
-    std::function<void(std::shared_ptr<PoolHandshakeServer>)> handshake_finish;
+    std::function<void(PoolHandshakeServer*)> handshake_finish;
 public:
 	PoolHandshakeServer(auto _socket, msg_version_handler_type version_handle, auto _finish) : PoolHandshake(_socket, std::move(version_handle)), handshake_finish(std::move(_finish))
 	{
@@ -71,7 +71,7 @@ public:
 			raw_msg->value >> *msg;
 
 			// Если внутри handle_message_version нет никаких ошибок, throw, то вызывается handshake_finish();
-			handle_message_version(msg, this->shared_from_this());
+			handle_message_version(msg, this);
 		} catch (const std::runtime_error &ec)
 		{
             std::string reason = "[PoolHandshakeServer] handle_message error = " + std::string(ec.what());
@@ -79,13 +79,13 @@ public:
 			return;
 		}
 		send_version();
-		handshake_finish(this->shared_from_this());
+		handshake_finish(this);
 	}
 };
 
-class PoolHandshakeClient : public enable_shared_from_this<PoolHandshakeClient>, public PoolHandshake
+class PoolHandshakeClient : public PoolHandshake
 {
-    std::function<void(std::shared_ptr<PoolHandshakeClient>)> handshake_finish;
+    std::function<void(PoolHandshakeClient*)> handshake_finish;
 public:
 	PoolHandshakeClient(auto _socket, msg_version_handler_type version_handle, auto _finish) : PoolHandshake(_socket, version_handle), handshake_finish(std::move(_finish))
 	{
@@ -104,12 +104,12 @@ public:
             raw_msg->value >> *msg;
 
 			// Если внутри handle_message_version нет никаких ошибок, throw, то вызывается handshake_finish();
-            handle_message_version(msg, this->shared_from_this());
+            handle_message_version(msg, this);
         } catch (const std::runtime_error &ec)
         {
             std::string reason = "[PoolHandshakeClient] handle_message error = " + std::string(ec.what());
             disconnect(reason);
         }
-		handshake_finish(this->shared_from_this());
+		handshake_finish(this);
 	}
 };
