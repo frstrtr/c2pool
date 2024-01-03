@@ -130,7 +130,7 @@ void PoolNodeData::handle_shares(HandleSharesData shares_data, NetAddress addr)
 	}
 }
 
-void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, std::shared_ptr<PoolProtocolData> peer, NetAddress addr)
+void PoolNodeData::handle_share_hashes(std::vector<uint256> hashes, PoolProtocolData* peer, NetAddress addr)
 {
 	std::vector<uint256> new_hashes;
 	for (auto x : hashes)
@@ -178,7 +178,7 @@ void PoolNodeData::broadcast_share(uint256 share_hash)
 }
 
 
-void PoolNodeData::send_shares(std::shared_ptr<PoolProtocol> peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with)
+void PoolNodeData::send_shares(PoolProtocol* peer, std::vector<uint256> share_hashes, std::vector<uint256> include_txs_with)
 {
 	auto t0 = c2pool::dev::timestamp();
 	std::set<uint256> tx_hashes;

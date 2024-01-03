@@ -12,7 +12,7 @@ class Listener
 {
 protected:
     // type for function socket_handle();
-    typedef std::function<void(std::shared_ptr<Socket>)> socket_handler_type;
+    typedef std::function<void(Socket*)> socket_handler_type;
     // type for function finish()
     typedef std::function<void()> finish_handler_type;
     // type for function error()
@@ -38,7 +38,7 @@ class Connector
 {
 protected:
     // type for function socket_handle();
-    typedef std::function<void(std::shared_ptr<Socket>)> socket_handler_type;
+    typedef std::function<void(Socket*)> socket_handler_type;
     // type for function error()
     typedef std::function<void(NetAddress, std::string)> error_handler_type;
 

@@ -1,11 +1,8 @@
 #pragma once
 
 #include <functional>
-
 #include <libdevcore/events.h>
-
 #include <boost/asio.hpp>
-
 //TODO: удалением объекта протокола (дисконнект) -- отключать все ивенты.
 
 class ProtocolEvents

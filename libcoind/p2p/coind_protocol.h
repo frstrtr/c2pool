@@ -15,7 +15,7 @@
 class CoindProtocol : public Protocol<CoindProtocol>, public CoindProtocolData, ProtocolPinger
 {
 public:
-    CoindProtocol(const std::shared_ptr<boost::asio::io_context>& _context, std::shared_ptr<Socket> _socket,
+    CoindProtocol(const std::shared_ptr<boost::asio::io_context>& _context, Socket* _socket,
                   HandlerManagerPtr<CoindProtocol> _handler_manager) : Protocol<CoindProtocol>("Coind", std::move(_socket), std::move(_handler_manager)),
                                                                        ProtocolPinger(_context, 30, [this] { out_time_ping(); },
 																					  [](){return 20; /*TODO: return  random.expovariate(1/100)*/}, [&](){ send_ping(); })
