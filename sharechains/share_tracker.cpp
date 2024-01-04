@@ -63,6 +63,7 @@ void ShareTracker::init_web_metrics()
         auto result = get_json(uint256S(hash));;
         LOG_INFO << result.dump();
         j = result;
+        return j;
     });
 
     tracker_info_metric = net->web->add<tracker_info_metric_type>("tracker_info", [&](nlohmann::json& j){
