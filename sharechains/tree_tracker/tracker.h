@@ -283,6 +283,7 @@ public:
             auto fork = fork_by_key[hash];
             return fork->get_sum_element(hash);
         }
+        throw std::out_of_range("get_sum_for_element, hash not found");
     }
 
     int32_t get_height(hash_type hash)
