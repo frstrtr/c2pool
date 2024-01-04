@@ -12,7 +12,7 @@ if(${Qt6Widgets_FOUND})
     target_compile_definitions(c2pool_main PUBLIC C2POOL_UI_USE)
 endif()
 
-target_link_libraries(c2pool_main Boost::program_options libnet2 libdevcore networks sharechains web_interface)
+target_link_libraries(c2pool_main Boost::program_options libnet libdevcore networks sharechains web_interface)
 target_link_libraries(c2pool_main Qt6::Core Qt6::Network)
 
 if(${Qt6Widgets_FOUND})
@@ -33,22 +33,22 @@ file(COPY ${SOURCE_DIR} DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
 # tests
 add_executable(coind_worker coind_worker.cpp)
-target_link_libraries(coind_worker libcoind libnet2 libdevcore networks sharechains libp2ppreset)
+target_link_libraries(coind_worker libcoind libnet libdevcore networks sharechains libp2ppreset)
 
 add_executable(only_pool_node only_pool_node.cpp)
-target_link_libraries(only_pool_node libnet2 libdevcore networks sharechains libp2ppreset)
+target_link_libraries(only_pool_node libnet libdevcore networks sharechains libp2ppreset)
 
 add_executable(only_coind_node only_coind_node.cpp)
-target_link_libraries(only_coind_node libcoind libnet2 libdevcore networks sharechains libp2ppreset)
+target_link_libraries(only_coind_node libcoind libnet libdevcore networks sharechains libp2ppreset)
 
 add_executable(only_jsorpc_coind only_jsorpc_coind.cpp)
-target_link_libraries(only_jsorpc_coind libcoind libnet2 libdevcore networks sharechains libp2ppreset)
+target_link_libraries(only_jsorpc_coind libcoind libnet libdevcore networks sharechains libp2ppreset)
 
 add_executable(only_stratum only_stratum.cpp)
 target_link_libraries(only_stratum libcoind)
 
 add_executable(coind_n_pool coind_n_pool.cpp)
-target_link_libraries(coind_n_pool libcoind libnet2 libdevcore networks sharechains libp2ppreset)
+target_link_libraries(coind_n_pool libcoind libnet libdevcore networks sharechains libp2ppreset)
 
 #exp
 add_executable(net_parser exp/network_parser.cpp)

@@ -1,8 +1,8 @@
 #include <iostream>
 #include <memory>
 
-#include <libnet2/pool_node.h>
-#include <libnet2/pool_socket.h>
+#include <libnet/pool_node.h>
+#include <libnet/pool_socket.h>
 #include <networks/network.h>
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>

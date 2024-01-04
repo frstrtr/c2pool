@@ -5,7 +5,7 @@
 
 #include "stratum_protocol.h"
 
-#include <libnet2/worker.h>
+#include <libnet/worker.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/expiring_dict.h>
 

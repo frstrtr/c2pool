@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-#include <libnet2/pool_handshake.h>
+#include <libnet/pool_handshake.h>
 #include <libp2p/socket.h>
 
 class VirtualSocket : public Socket
