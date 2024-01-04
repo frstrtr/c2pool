@@ -101,8 +101,7 @@ add_subdirectory(networks)
 add_subdirectory(libcoind)
 add_subdirectory(sharechains) #ver. 2
 add_subdirectory(libdevcore)
-#add_subdirectory(libnet)
-add_subdirectory(libnet2)
+add_subdirectory(libnet)
 add_subdirectory(libp2p)
 
 add_subdirectory(c2pool)
