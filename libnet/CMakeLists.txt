@@ -1,4 +1,4 @@
-set(libnet2_sources
+set(libnet_sources
         pool_node.cpp pool_node.h
         pool_socket.cpp pool_socket.h
         pool_protocol.h
@@ -12,7 +12,7 @@ set(libnet2_sources
         coind_node_data.h coind_node_data.cpp
         )
 
-add_library(libnet2 STATIC ${libnet2_sources})
+add_library(libnet STATIC ${libnet_sources})
 
-target_link_libraries(libnet2 libp2p libcoind sharechains)
-#target_link_libraries(libnet2 univalue networks libdevcore sharechains libcoind)
+target_link_libraries(libnet libp2p libcoind sharechains)
+#target_link_libraries(libnet univalue networks libdevcore sharechains libcoind)

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <libnet2/pool_messages.h>
+#include <libnet/pool_messages.h>
 #include <libdevcore/types.h>
 #include <libcoind/p2p/coind_messages.h>
 

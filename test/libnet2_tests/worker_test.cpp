@@ -3,9 +3,9 @@
 #include <memory>
 #include <utility>
 
-#include <libnet2/pool_node_data.h>
-#include <libnet2/coind_node_data.h>
-#include <libnet2/worker.h>
+#include <libnet/pool_node_data.h>
+#include <libnet/coind_node_data.h>
+#include <libnet/worker.h>
 #include <libdevcore/common.h>
 #include <sharechains/share_tracker.h>
 #include <sharechains/share_store.h>
