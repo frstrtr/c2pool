@@ -109,16 +109,6 @@ public:
         return *this;
     }
 
-//    operator UniValue()
-//    {
-//        UniValue result(UniValue::VOBJ);
-//
-//        result.pushKV("timestamp", timestamp);
-//        result.pushKV("contents", address);
-//
-//        return result;
-//    }
-
     friend bool operator==(const addr &first, const addr &second);
 
     friend bool operator!=(const addr &first, const addr &second);

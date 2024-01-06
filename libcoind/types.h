@@ -53,21 +53,6 @@ namespace coind::data::types
             stream << ", nonce = " << nonce;
             stream << ")";
         }
-
-//        SmallBlockHeaderType &operator=(UniValue value);
-
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            result.pushKV("version", (uint64_t) version);
-//            result.pushKV("previous_block", previous_block.GetHex());
-//            result.pushKV("timestamp", (uint64_t) timestamp);
-//            result.pushKV("bits", (uint64_t) bits);
-//            result.pushKV("nonce", (uint64_t) nonce);
-//
-//            return result;
-//        }
     };
 
     class BlockHeaderType : public SmallBlockHeaderType
