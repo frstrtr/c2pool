@@ -95,35 +95,6 @@ namespace coind::data{
 
             return stream;
         }
-
-//        MerkleLink &operator=(UniValue value)
-//        {
-//            for (auto hex_str: value["branch"].get_array().getValues())
-//            {
-//                uint256 temp_uint256;
-//                temp_uint256.SetHex(hex_str.get_str());
-//                branch.push_back(temp_uint256);
-//            }
-//            index = value["index"].get_int();
-//
-//            return *this;
-//        }
-
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            UniValue branch_list(UniValue::VARR);
-//            for (auto num: branch)
-//            {
-//                branch_list.push_back(num.GetHex());
-//            }
-//
-//            result.pushKV("branch", branch_list);
-//            result.pushKV("index", index);
-//
-//            return result;
-//        }
     };
 
     struct merkle_record_type

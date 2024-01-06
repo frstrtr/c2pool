@@ -83,25 +83,6 @@ namespace shares::types
 
             return stream;
         }
-
-//        HashLinkType &operator=(UniValue value)
-//        {
-//            state = value["state"].get_str();
-//            extra_data = value["extra_data"].get_str();
-//            length = value["length"].get_int64();
-//            return *this;
-//        }
-
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            result.pushKV("state", state);
-//            result.pushKV("extra_data", extra_data);
-//            result.pushKV("length", (uint64_t) length);
-//
-//            return result;
-//        }
     };
 
     class SegwitData
@@ -143,25 +124,6 @@ namespace shares::types
 
             return stream;
         }
-
-//        SegwitData &operator=(UniValue value)
-//        {
-//            txid_merkle_link = value["txid_merkle_link"].get_obj();
-//
-//            wtxid_merkle_root.SetHex(value["wtxid_merkle_root"].get_str());
-//
-//            return *this;
-//        }
-//
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            result.pushKV("txid_merkle_link", txid_merkle_link);
-//            result.pushKV("wtxid_merkle_root", wtxid_merkle_root.GetHex());
-//
-//            return result;
-//        }
     };
 
     struct ShareAddrType
@@ -370,36 +332,6 @@ namespace shares::types
 
             return stream;
         }
-
-//        ShareData &operator=(UniValue value)
-//        {
-//            previous_share_hash.SetHex(value["previous_share_hash"].get_str());
-//            coinbase = value["coinbase"].get_str();
-//            nonce = value["nonce"].get_int64();
-//            pubkey_hash.SetHex(value["pubkey_hash"].get_str());
-//            subsidy = value["subsidy"].get_int64();
-//            donation = value["donation"].get_int();
-//            stale_info = (StaleInfo) value["stale_info"].get_int();
-//            desired_version = value["desired_version"].get_int64();
-//
-//            return *this;
-//        }
-//
-//        operator UniValue()
-//        {
-//            UniValue result(UniValue::VOBJ);
-//
-//            result.pushKV("previous_share_hash", previous_share_hash.GetHex());
-//            result.pushKV("coinbase", coinbase);
-//            result.pushKV("nonce", (uint64_t) nonce);
-//            result.pushKV("pubkey_hash", pubkey_hash.GetHex());
-//            result.pushKV("subsidy", (uint64_t) subsidy);
-//            result.pushKV("donation", donation);
-//            result.pushKV("stale_info", (int) stale_info);
-//            result.pushKV("desired_version", (uint64_t) desired_version);
-//
-//            return result;
-//        }
     };
 
     struct ShareTxInfo
