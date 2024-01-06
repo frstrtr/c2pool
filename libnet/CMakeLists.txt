@@ -15,4 +15,3 @@ set(libnet_sources
 add_library(libnet STATIC ${libnet_sources})
 
 target_link_libraries(libnet libp2p libcoind sharechains)
-#target_link_libraries(libnet univalue networks libdevcore sharechains libcoind)

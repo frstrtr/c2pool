@@ -7,7 +7,6 @@
 #include <chrono>
 #include <iomanip>
 
-#include <univalue.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/common.h>
 #include <libdevcore/addr_store.h>
