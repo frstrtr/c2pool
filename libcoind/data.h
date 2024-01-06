@@ -9,7 +9,6 @@
 #include <btclibs/span.h>
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
-#include <univalue.h>
 #include <networks/network.h>
 #include "transaction.h"
 
@@ -28,8 +27,6 @@ using std::vector, std::tuple, std::string, std::shared_ptr;
 
 namespace coind::data
 {
-    bool is_segwit_tx(UniValue tx);
-
     inline bool is_segwit_tx(std::shared_ptr<coind::data::TransactionType> tx)
     {
         if (tx)

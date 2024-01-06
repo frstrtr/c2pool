@@ -4,7 +4,6 @@
 #include <memory>
 #include <string>
 
-#include "univalue.h"
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
 #include <btclibs/uint256.h>

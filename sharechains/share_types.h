@@ -1,7 +1,6 @@
 #pragma once
 
 #include <btclibs/uint256.h>
-#include <univalue.h>
 #include <boost/optional.hpp>
 #include <libdevcore/stream_types.h>
 #include <libdevcore/stream.h>
