@@ -7,4 +7,4 @@ set_target_properties(sharechains_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CM
 
 target_compile_definitions(sharechains_test PRIVATE RESOURCES_DIR=\"${CMAKE_SOURCE_DIR}\")
 target_link_libraries(sharechains_test gtest gtest_main)
-target_link_libraries(sharechains_test btclibs networks sharechains univalue)
+target_link_libraries(sharechains_test btclibs networks sharechains)
