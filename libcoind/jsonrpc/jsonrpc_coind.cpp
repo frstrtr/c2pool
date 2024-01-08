@@ -4,6 +4,7 @@
 #include <iostream>
 using std::set;
 
+/*
 UniValue coind::JSONRPC_Coind::_request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_params)
 {
 	char* params;
@@ -86,6 +87,7 @@ UniValue coind::JSONRPC_Coind::request_with_error(const char *method_name, std::
 {
 	return _request(method_name, req_params);
 }
+*/
 
 bool coind::JSONRPC_Coind::check()
 {
