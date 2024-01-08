@@ -6,28 +6,26 @@
 #include <vector>
 #include <memory>
 
+#include <nlohmann/json.hpp>
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
+
+#include <climits>
 
 #include "types.h"
 
 using namespace boost::dll;
 using namespace boost::filesystem;
 
-using std::shared_ptr;
-using std::map;
-using std::string;
-using std::tuple;
-
 #define EMPTY_ADDR_VALUE {0, 0, 0}
 
-namespace c2pool{
+namespace c2pool
+{
     class Network;
 }
 
 namespace c2pool::dev
 {
-
     struct AddrValue
     {
         int service;
@@ -36,17 +34,21 @@ namespace c2pool::dev
 
         AddrValue() {}
 
-        AddrValue(int _service, int64_t _first_seen, int64_t _last_seen){
+        AddrValue(int _service, int64_t _first_seen, int64_t _last_seen)
+        {
             service = _service;
             first_seen = _first_seen;
             last_seen = _last_seen;
         }
+
+        NLOHMANN_DEFINE_TYPE_INTRUSIVE(AddrValue, service, first_seen, last_seen);
     };
 
     class AddrStore
     {
+        typedef std::map<NetAddress, AddrValue> store_type;
     public:
-        AddrStore(string path, shared_ptr<c2pool::Network> net);
+        AddrStore(std::string path, shared_ptr<c2pool::Network> net);
         void SaveToFile();
         bool Check(NetAddress addr);
 
@@ -55,12 +57,12 @@ namespace c2pool::dev
         AddrValue Get(NetAddress key);
         std::vector<std::pair<NetAddress, AddrValue>> GetAll();
 
-        string ToJSON();
-        void FromJSON(string json);
+        nlohmann::json ToJSON();
+        void FromJSON(std::string j_str);
         
         size_t len() { return store.size(); }
     private:
-        std::map<NetAddress, AddrValue> store;
+        store_type store;
         std::string filePath;
     };
 

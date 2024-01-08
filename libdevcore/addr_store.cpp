@@ -1,21 +1,20 @@
 #include "addr_store.h"
-#include "logger.h"
-#include "common.h"
-#include <univalue.h>
-#include <networks/network.h>
 
 #include <fstream>
 #include <string>
 #include <memory>
 
+#include <networks/network.h>
+#include <nlohmann/json.hpp>
+
 #include "filesystem.h"
+#include "logger.h"
+#include "common.h"
 using namespace c2pool::filesystem;
-using std::shared_ptr;
-using std::string;
 
 namespace c2pool::dev
 {
-    AddrStore::AddrStore(string path, shared_ptr<c2pool::Network> net)
+    AddrStore::AddrStore(std::string path, std::shared_ptr<c2pool::Network> net)
     {
         filePath = path;
         std::fstream AddrsFile = getFile(path);
@@ -26,7 +25,7 @@ namespace c2pool::dev
         {
             std::stringstream tmp;
             tmp << AddrsFile.rdbuf();
-            string json = tmp.str();
+            std::string json = tmp.str();
 
             FromJSON(json);
         }
@@ -41,18 +40,15 @@ namespace c2pool::dev
             store[key] = {
                 0,
                 (int64_t) c2pool::dev::timestamp(),
-                (int64_t) c2pool::dev::timestamp()};
+                (int64_t) c2pool::dev::timestamp()
+            };
         }
 
         //SAVE IN FILE
         if (!store.empty())
-        {
             SaveToFile();
-        }
         else
-        {
             LOG_WARNING << "AddrStore is empty!";
-        }
 
         AddrsFile.close();
     }
@@ -68,10 +64,7 @@ namespace c2pool::dev
 
     bool AddrStore::Check(NetAddress key)
     {
-        if (store.find(key) != store.end())
-            return true;
-        else
-            return false;
+        return store.find(key) != store.end();
     }
 
     AddrValue AddrStore::Get(NetAddress key)
@@ -86,9 +79,7 @@ namespace c2pool::dev
     {
         std::vector<std::pair<NetAddress, AddrValue>> res;
         for (auto kv : store)
-        {
             res.push_back(kv);
-        }
         return res;
     }
 
@@ -110,39 +101,25 @@ namespace c2pool::dev
         return true;
     }
 
-    string AddrStore::ToJSON()
+    nlohmann::json AddrStore::ToJSON()
     {
-        UniValue dict(UniValue::VARR);
-
-        for (auto kv : store)
-        {
-            UniValue value(UniValue::VOBJ);
-
-            value.pushKV("address", kv.first.ip);
-            value.pushKV("port", kv.first.port);
-            value.pushKV("services", kv.second.service);
-            value.pushKV("first_seen", kv.second.first_seen);
-            value.pushKV("last_seen", kv.second.last_seen);
-
-            dict.push_back(value);
-        }
-
-        std::string json = dict.write();
-        return json;
+        nlohmann::json j(store);
+        // for (const auto& [k, v] : store)
+        // {
+        //     j.push_back({
+        //         {"address", k.ip},
+        //         {"port", k.port},
+        //         {"service", v.service},
+        //         {"first_seen", v.first_seen},
+        //         {"last_seen", v.last_seen}
+        //     });
+        // }
+        return j;
     }
 
-    void AddrStore::FromJSON(string json)
+    void AddrStore::FromJSON(string j_str)
     {
-        UniValue AddrsValue(UniValue::VARR);
-        AddrsValue.read(json); //TODO: add check for valid json.
-
-        for (int i = 0; i < AddrsValue.size(); i++)
-        {
-            NetAddress key(AddrsValue[i]["address"].get_str(),
-                                       AddrsValue[i]["port"].get_str());
-            store[key] = {AddrsValue[i]["services"].get_int(),
-                          AddrsValue[i]["first_seen"].get_int64(),
-                          AddrsValue[i]["last_seen"].get_int64()};
-        }
+        auto j = nlohmann::json::parse(j_str);
+        store = j.get<store_type>();
     }
 } // namespace c2pool::p2p
