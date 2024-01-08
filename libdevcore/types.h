@@ -9,7 +9,7 @@
 #include "logger.h"
 #include "stream_types.h"
 
-#include <univalue.h>
+#include <nlohmann/json.hpp>
 #include <btclibs/uint256.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
@@ -27,34 +27,13 @@ public:
     int port;
 
     address_type();
-
     address_type(unsigned long long _services, std::string _address, int _port);
-
 	address_type(unsigned long long _services, std::string _address, std::string _port);
 
-    address_type &operator=(UniValue value)
-    {
-        services = value["services"].get_uint64();
-
-        address = value["address"].get_str();
-        port = value["port"].get_int();
-        return *this;
-    }
-
-    operator UniValue()
-    {
-        UniValue result(UniValue::VOBJ);
-
-        result.pushKV("services", (uint64_t) services);
-        result.pushKV("address", address);
-        result.pushKV("port", port);
-
-        return result;
-    }
-
     friend bool operator==(const address_type &first, const address_type &second);
-
     friend bool operator!=(const address_type &first, const address_type &second);
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(address_type, services, address, port);
 };
 
 class share_type
@@ -68,25 +47,9 @@ public:
     std::string contents;
 
     share_type();
-
     share_type(int _type, std::string _contents);
 
-    share_type &operator=(UniValue value)
-    {
-        type = value["type"].get_int();
-        contents = value["contents"].get_str();
-        return *this;
-    }
-
-    operator UniValue()
-    {
-        UniValue result(UniValue::VOBJ);
-
-        result.pushKV("type", type);
-        result.pushKV("contents", contents);
-
-        return result;
-    }
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(share_type, type, contents);
 };
 
 class addr
@@ -96,22 +59,13 @@ public:
     address_type address;
 
     addr();
-
     addr(uint32_t t, address_type a);
-
     addr(uint32_t t, int _services, std::string _address, int _port);
 
-    addr &operator=(UniValue value)
-    {
-        timestamp = value["timestamp"].get_int64();
-
-        address = value["address"].get_obj();
-        return *this;
-    }
-
     friend bool operator==(const addr &first, const addr &second);
-
     friend bool operator!=(const addr &first, const addr &second);
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(addr, timestamp, address);
 };
 
 enum inventory_type
@@ -131,7 +85,6 @@ public:
     uint256 hash;
 
     inventory();
-
     inventory(inventory_type _type, uint256 _hash);
 
     inventory_type parse_inv_type(std::string _type)
@@ -148,22 +101,7 @@ public:
         return inventory_type::tx; //if error
     }
 
-    inventory &operator=(UniValue value)
-    {
-        type = parse_inv_type(value["type"].get_str());
-        hash.SetHex(value["hash"].get_str());
-        return *this;
-    }
-
-    operator UniValue()
-    {
-        UniValue result(UniValue::VOBJ);
-
-        result.pushKV("type", type);
-        result.pushKV("hash", hash.GetHex());
-
-        return result;
-    }
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(inventory, type, hash);
 };
 
 namespace stream
@@ -460,17 +398,11 @@ struct NetAddress
     std::string ip{};
     std::string port{};
 
-    NetAddress()
-    {
-
-    }
+    NetAddress() = default;
 
     NetAddress(const std::string& _ip, const std::string& _port): ip(_ip), port(_port) {}
 
-    NetAddress(const std::string& _ip, const int& _port) : ip(_ip)
-    {
-        port = std::to_string(_port);
-    }
+    NetAddress(const std::string& _ip, const int& _port) : ip(_ip), port(std::to_string(_port)) {}
 
     //TODO: NetAddress(const std::string& full_address)
 
@@ -503,6 +435,8 @@ struct NetAddress
     {
         return !(*this == value);
     }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NetAddress, ip, port);
 };
 
 typedef std::tuple<std::string, std::string> addr_type; //old name: c2pool::libnet::addr
