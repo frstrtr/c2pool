@@ -15,28 +15,19 @@ set(coind_tool_sources
         jsonrpc/stratum.cpp
         jsonrpc/stratum_protocol.h
         jsonrpc/stratum_protocol.cpp
-        )
+)
 
-set(jsonrpc_sources 
-#        jsonrpc/coind.h
+set(jsonrpc_sources
         jsonrpc/requests.h 
         jsonrpc/results.h 
-#        jsonrpc/coind.cpp
-        )
+)
 
 set(coind_p2p_sources
         p2p/coind_messages.h
         p2p/coind_socket.h p2p/coind_socket.cpp
         p2p/coind_protocol.h
         p2p/coind_protocol_data.h
-
-#        p2p/messages.h
-#        p2p/messages.cpp
-#        p2p/p2p_protocol.h
-#        p2p/p2p_protocol.cpp
-#        p2p/p2p_socket.h
-#        p2p/p2p_socket.cpp
-        )
+)
 
 set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources})
 

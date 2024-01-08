@@ -3,7 +3,6 @@
 #include <memory>
 
 #include "stratum.h"
-
 #include <boost/asio.hpp>
 
 class StratumNode
@@ -26,4 +25,3 @@ public:
 private:
     void disconnect(const addr_t& addr);
 };
-

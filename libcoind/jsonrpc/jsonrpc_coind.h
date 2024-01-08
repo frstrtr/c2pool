@@ -1,7 +1,7 @@
 #ifndef C2POOL_JSONRPC_COIND_H
 #define C2POOL_JSONRPC_COIND_H
 
-#include <univalue.h>
+#include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 namespace io = boost::asio;
@@ -19,18 +19,19 @@ using tcp = io::ip::tcp;
 #include <libcoind/types.h>
 using namespace coind::jsonrpc::data;
 
+// rework for include/jsonrpccxx
 namespace coind
 {
 	class JSONRPC_Coind
 	{
 	private:
 		std::shared_ptr<io::io_context> context;
-		shared_ptr<coind::ParentNetwork> parent_net;
+		std::shared_ptr<coind::ParentNetwork> parent_net;
 		tcp::resolver resolver;
 		beast::tcp_stream stream;
 
-		const char *req_format = R"({"jsonrpc": "2.0", "id":"curltest", "method": "%s", "params": %s })";
-		http::request<http::string_body> req;
+		// const char *req_format = R"({"jsonrpc": "2.0", "id":"curltest", "method": "%s", "params": %s })";
+		http::request<http::string_body> http_request;
 
 		char *authorization;
 		char *host;
@@ -54,12 +55,58 @@ namespace coind
             } while (ec);
         }
 
+		inline nlohmann::json reque(std::string method_name, nlohmann::json params = nlohmann::json::array())
+		{
+			nlohmann::json req 
+			{
+				{"jsonrpc", "2.0"},
+				{"id", "curltest"},
+				{"method", method_name},
+				{"params", params}
+			};
+
+			std::string request_body = req.dump();
+			http_request.body() = request_body;
+			http_request.prepare_payload();
+
+			http::write(stream, http_request);
+
+			beast::flat_buffer buffer;
+			boost::beast::http::response<boost::beast::http::dynamic_body> response;
+			while (true)
+			{
+				try
+        		{
+            		boost::beast::http::read(stream, buffer, response);
+            		break;
+        		}
+        		catch (const std::exception& ex)
+        		{
+            		LOG_ERROR << "JSONRPC disconnected for reason: _request." << ex.what();
+            		reconnect();
+        		}
+//        		catch (...)
+//        		{
+//            		LOG_ERROR << "JSONRPC::_request error: DISCONNECTED2";
+//            		reconnect();
+//        		}
+			}
+
+			std::string json_result = boost::beast::buffers_to_string(response.body().data());
+    		LOG_DEBUG_COIND_JSONRPC << "json_result: " << json_result;
+
+			nlohmann::json result;
+			result.parse(json_result);
+
+			return result;
+		}
+
 		//TODO: template request params
-		UniValue _request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
+		// UniValue _request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
-		UniValue request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr, bool ignore_result = false);
+		// UniValue request(const char *method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr, bool ignore_result = false);
 
-		UniValue request_with_error(const char* method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
+		// UniValue request_with_error(const char* method_name, std::shared_ptr<coind::jsonrpc::data::TemplateRequest> req_param = nullptr);
 
 		enum coind_error_codes
 		{
@@ -70,14 +117,7 @@ namespace coind
 		//0 = OK!
 		std::tuple<int, std::string> check_error(UniValue result)
 		{
-			if (result.exists("error"))
-			{
-				if (result["error"].empty())
-				{
-					return std::make_tuple(0, "");
-				}
-			}
-			else
+			if (!result.exists("error") || result["error"].empty())
 			{
 				return std::make_tuple(0, "");
 			}
@@ -181,9 +221,7 @@ namespace coind
 			else
 				return request("getblocktemplate", _req);
 		}
-
 	};
-
 } // namespace coind
 
 #endif // C2POOL_JSONRPC_COIND_H
