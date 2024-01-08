@@ -56,16 +56,10 @@ namespace coind
         {
             if (cached_heights.find(block_hash) != cached_heights.end())
                 return cached_heights[block_hash];
-            UniValue x;
-            try
-            {
-                x = _jsonrpc_coind->getblock(std::make_shared<GetBlockRequest>(block_hash));
-            } catch (const std::exception &except)
-            {
-                throw except;
-            }
+                
+            nlohmann::json x = _jsonrpc_coind->getblock(std::make_shared<GetBlockRequest>(block_hash));
 
-            int32_t result = x.exists("blockcount") ? x["blockcount"].get_int() : x["height"].get_int();
+            int32_t result = x.contains("blockcount") ? x["blockcount"].get<int>() : x["height"].get<int>();
             cached_heights[block_hash] = result;
 
             return result;
