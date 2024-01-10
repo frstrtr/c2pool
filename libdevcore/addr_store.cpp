@@ -119,7 +119,15 @@ namespace c2pool::dev
 
     void AddrStore::FromJSON(string j_str)
     {
-        auto j = nlohmann::json::parse(j_str);
+        nlohmann::json j;
+        try 
+        {
+            j = nlohmann::json::parse(j_str);
+        } catch(const nlohmann::json::exception& e)
+        {
+            LOG_WARNING << "AddrStore::FromJSON " << e.what() << ", j_str = " << j_str;
+            return;
+        }
         store = j.get<store_type>();
     }
 } // namespace c2pool::p2p
