@@ -646,11 +646,16 @@ PackStream pack_to_stream(T value)
 }
 
 template <typename StreamType>
-typename StreamType::get_type unpack(std::vector<unsigned char> data)
+typename StreamType::get_type unpack(PackStream stream)
 {
-    PackStream stream(std::move(data));
-
     StreamType stream_value;
     stream >> stream_value;
     return stream_value.get();
+}
+
+template <typename StreamType>
+typename StreamType::get_type unpack(std::vector<unsigned char> data)
+{
+    PackStream stream(std::move(data));
+    return unpack<StreamType>(stream);
 }
