@@ -28,7 +28,7 @@ void NodeManager::run()
 
     // JSONRPC Coind
     LOG_INFO << "Init Coind (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "])...";
-    _coind = std::make_shared<coind::JSONRPC_Coind>(_context, _parent_net, _config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str(), _config->jsonrpc_coind_login.c_str());
+    _coind = std::make_shared<CoindRPC>(_context, _parent_net, CoindRPC::rpc_auth_data{_config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str()}, _config->jsonrpc_coind_login.c_str());
     _coind->check();
 
     // Determining payout address
@@ -109,7 +109,7 @@ shared_ptr<PoolNode> NodeManager::pool_node() const
     return _pool_node;
 }
 
-shared_ptr<coind::JSONRPC_Coind> NodeManager::coind() const
+shared_ptr<CoindRPC> NodeManager::coind() const
 {
     return _coind;
 }
@@ -163,7 +163,7 @@ create_set_method(c2pool::dev::AddrStore, _addr_store);
 
 create_set_method(PoolNode, _pool_node);
 
-create_set_method(coind::JSONRPC_Coind, _coind);
+create_set_method(CoindRPC, _coind);
 
 create_set_method(CoindNode, _coind_node);
 

@@ -5,7 +5,7 @@
 #include "pool_node_data.h"
 #include <libcoind/height_tracker.h>
 #include <libcoind/p2p/coind_protocol.h>
-#include <libcoind/jsonrpc/jsonrpc_coind.h>
+#include <libcoind/jsonrpc/coindrpc.h>
 #include <sharechains/share_tracker.h>
 #include <networks/network.h>
 #include <boost/asio.hpp>
@@ -20,7 +20,7 @@ public:
 	std::shared_ptr<io::io_context> context;
 	std::shared_ptr<coind::ParentNetwork> parent_net;
 	std::shared_ptr<ShareTracker> tracker;
-	std::shared_ptr<coind::JSONRPC_Coind> coind;
+	std::shared_ptr<CoindRPC> coind;
 	std::shared_ptr<PoolNodeData> pool_node;
 
     std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
@@ -70,7 +70,7 @@ public:
 		return this;
 	}
 
-	auto set_coind(std::shared_ptr<coind::JSONRPC_Coind> _coind)
+	auto set_coind(std::shared_ptr<CoindRPC> _coind)
 	{
 		coind = std::move(_coind);
         get_height_rel_highest.set_jsonrpc_coind(coind);
