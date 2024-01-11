@@ -9,7 +9,7 @@
 #include <libdevcore/addr_store.h>
 #include <libp2p/preset/p2p_node_interface.h>
 #include <libp2p/node.h>
-#include <libcoind/jsonrpc/jsonrpc_coind.h>
+#include <libcoind/jsonrpc/coindrpc.h>
 #include <libcoind/p2p/coind_socket.h>
 #include <libcoind/jsonrpc/stratum_node.h>
 #include <web_interface/webserver.h>
@@ -47,7 +47,7 @@ public:
 
     shared_ptr<PoolNode> pool_node() const;
 
-    shared_ptr<coind::JSONRPC_Coind> coind() const;
+    shared_ptr<CoindRPC> coind() const;
 
     shared_ptr<CoindNode> coind_node() const;
 
@@ -66,7 +66,7 @@ protected:
     shared_ptr<c2pool::dev::coind_config> _config;
     shared_ptr<c2pool::dev::AddrStore> _addr_store;
     shared_ptr<PoolNode> _pool_node;
-    shared_ptr<coind::JSONRPC_Coind> _coind;
+    shared_ptr<CoindRPC> _coind;
     shared_ptr<CoindNode> _coind_node;
     shared_ptr<ShareTracker> _tracker;
     shared_ptr<Worker> _worker;
@@ -102,7 +102,7 @@ public:
 
     create_set_method(PoolNode, _pool_node);
 
-    create_set_method(coind::JSONRPC_Coind, _coind);
+    create_set_method(CoindRPC, _coind);
 
     create_set_method(CoindNode, _coind_node);
 

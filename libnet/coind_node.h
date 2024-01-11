@@ -7,7 +7,7 @@
 #include <libcoind/height_tracker.h>
 #include <libcoind/p2p/coind_protocol.h>
 #include <libcoind/p2p/coind_messages.h>
-#include <libcoind/jsonrpc/jsonrpc_coind.h>
+#include <libcoind/jsonrpc/coindrpc.h>
 #include <libp2p/node.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
