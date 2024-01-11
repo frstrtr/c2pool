@@ -5,8 +5,9 @@ set(coind_tool_sources
         transaction.h
         transaction.cpp
         height_tracker.h
-        jsonrpc/jsonrpc_coind.h
-        jsonrpc/jsonrpc_coind.cpp
+        # jsonrpc/jsonrpc_coind.h
+        # jsonrpc/jsonrpc_coind.cpp
+        jsonrpc/coindrpc.h jsonrpc/coindrpc.cpp
         jsonrpc/txidcache.h
 
         jsonrpc/stratum_node.h
