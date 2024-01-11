@@ -7,7 +7,7 @@
 #include <optional>
 #include <algorithm>
 
-#include <univalue.h>
+#include <nlohmann/json.hpp>
 #include <btclibs/uint256.h>
 #include <btclibs/util/strencodings.h>
 #include <libcoind/transaction.h>
@@ -37,7 +37,7 @@ namespace coind
 
         getwork_result() {}
 
-        getwork_result(UniValue work, vector<shared_ptr<coind::data::TransactionType>> unpacked_txs, vector<uint256> txhashes, time_t _latency)
+        getwork_result(nlohmann::json work, vector<shared_ptr<coind::data::TransactionType>> unpacked_txs, vector<uint256> txhashes, time_t _latency)
         {
             /*
                 version=work['version'],
@@ -56,49 +56,42 @@ namespace coind
                 bits=bitcoin_data.FloatingIntegerType().unpack(work['bits'].decode('hex')[::-1]) if isinstance(work['bits'], (str, unicode)) else bitcoin_data.FloatingInteger(work['bits']),
                 coinbaseflags=work['coinbaseflags'].decode('hex') if 'coinbaseflags' in work else ''.join(x.decode('hex') for x in work['coinbaseaux'].itervalues()) if 'coinbaseaux' in work else '',
             */
-            version = work["version"].get_int();
-            previous_block.SetHex(work["previousblockhash"].get_str());
+            version = work["version"].get<int>();
+            previous_block = work["previousblockhash"].get<uint256>();
             transactions = unpacked_txs;
             transaction_hashes = txhashes;
 
-            for (auto x : work["transactions"].getValues())
+            for (auto x : work["transactions"])
             {
                 optional<uint64_t> fee;
-                if (x.exists("fee"))
-                {
-                    fee = x["fee"].get_int64();
-                }
+                if (x.contains("fee"))
+                    fee = x["fee"].get<int64_t>();
+
                 transaction_fees.push_back(fee);
             }
-            subsidy = work["coinbasevalue"].get_int64();
-            if (work.exists("time"))
-            {
-                time = work["time"].get_int64();
-            }
+            
+            subsidy = work["coinbasevalue"].get<int64_t>();
+            if (work.contains("time"))
+                time = work["time"].get<int64_t>();
             else
-            {
-                time = work["curtime"].get_int64();
-            }
+                time = work["curtime"].get<int64_t>();
 
-            if (work.exists("coinbaseflags"))
+            if (work.contains("coinbaseflags"))
             {
-                coinbaseflags = PackStream(ParseHex(work["coinbaseflags"].get_str()));
+                coinbaseflags = PackStream(ParseHex(work["coinbaseflags"].get<std::string>()));
             }
-            else
+            else if (work.contains("coinbaseaux"))
             {
-                if (work.exists("coinbaseaux"))
+                for (auto x : work["coinbaseaux"])
                 {
-                    for (auto x : work["coinbaseaux"].getValues())
-                    {
-                        PackStream _x(ParseHex(x.get_str()));
-                        coinbaseflags << _x;
-                    }
+                    PackStream _x(ParseHex(x.get<std::string>()));
+                    coinbaseflags << _x;
                 }
             }
 
-            if (work["bits"].isStr())
+            if (work["bits"].is_string())
             {
-                auto _bits_v = ParseHex(work["bits"].get_str());
+                auto _bits_v = ParseHex(work["bits"].get<std::string>());
                 std::reverse(_bits_v.begin(), _bits_v.end());
                 PackStream _bits_stream(_bits_v);
                 FloatingIntegerType _bits;
@@ -107,22 +100,18 @@ namespace coind
             }
             //TODO: ? else bitcoin_data.FloatingInteger(work['bits']),
 
-            height = work["height"].get_int();
-            for (auto rule : work["rules"].getValues())
-            {
-                rules.push_back(rule.get_str());
-            }
+            height = work["height"].get<int>();
+            rules = work["rules"].get<std::vector<std::string>>();
 
             last_update = c2pool::dev::timestamp();
             latency = _latency;
 
-            mweb = "01" + (work.exists("mweb") ? work["mweb"].get_str() : "");
+            mweb = "01" + (work.contains("mweb") ? work["mweb"].get<std::string>() : "");
         }
 
         bool operator==(getwork_result const &val) const
         {
-            return
-                    std::make_tuple(version, previous_block.GetHex(), transactions, transaction_hashes, subsidy, time, bits.get(), coinbaseflags.data, height, rules, last_update, latency, mweb) == std::make_tuple(val.version, val.previous_block.GetHex(), val.transactions, val.transaction_hashes, val.subsidy, val.time, val.bits.get(), val.coinbaseflags.data, val.height, val.rules, val.last_update, val.latency, val.mweb);
+            return std::make_tuple(version, previous_block.GetHex(), transactions, transaction_hashes, subsidy, time, bits.get(), coinbaseflags.data, height, rules, last_update, latency, mweb) == std::make_tuple(val.version, val.previous_block.GetHex(), val.transactions, val.transaction_hashes, val.subsidy, val.time, val.bits.get(), val.coinbaseflags.data, val.height, val.rules, val.last_update, val.latency, val.mweb);
         }
         bool operator!=(getwork_result const &val) const
         {
