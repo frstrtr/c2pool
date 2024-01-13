@@ -15,7 +15,6 @@ namespace coind{
 		map<string, uint256> cache; //getblocktemplate.transacions[].data; hash256(packed data)
 	private:
 		bool _started = false;
-
 		time_t time_started = 0;
 
 	public:

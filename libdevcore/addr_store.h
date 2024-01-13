@@ -5,12 +5,11 @@
 #include <tuple>
 #include <vector>
 #include <memory>
+#include <climits>
 
 #include <nlohmann/json.hpp>
 #include <boost/dll.hpp>
 #include <boost/filesystem.hpp>
-
-#include <climits>
 
 #include "types.h"
 
@@ -48,7 +47,7 @@ namespace c2pool::dev
     {
         typedef std::map<NetAddress, AddrValue> store_type;
     public:
-        AddrStore(std::string path, shared_ptr<c2pool::Network> net);
+        AddrStore(std::string path, c2pool::Network* net);
         void SaveToFile();
         bool Check(NetAddress addr);
 

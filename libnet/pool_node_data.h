@@ -58,12 +58,12 @@ struct HandleSharesData
 class PoolNodeData
 {
 public:
-	std::shared_ptr<c2pool::dev::coind_config> config;
-	std::shared_ptr<io::io_context> context;
-	std::shared_ptr<c2pool::Network> net;
-	std::shared_ptr<c2pool::dev::AddrStore> addr_store;
-	std::shared_ptr<ShareTracker> tracker;
-	std::shared_ptr<CoindNodeData> coind_node;
+	c2pool::dev::coind_config* config;
+	io::io_context* context;
+	c2pool::Network* net;
+	c2pool::dev::AddrStore* addr_store;
+	ShareTracker* tracker;
+	CoindNodeData* coind_node;
 	HandlerManagerPtr<PoolProtocol> handler_manager;
 
     //From CoindNode
@@ -74,36 +74,36 @@ public:
 	std::map<uint64_t, PoolProtocol*> peers;
 	std::set<uint256> shared_share_hashes;
 public:
-	PoolNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
+	PoolNodeData(io::io_context* _context) : context(_context)
 	{
 		handler_manager = std::make_shared<HandlerManager<PoolProtocol>>();
 	}
 
-	auto set_net(std::shared_ptr<c2pool::Network> _net)
+	auto set_net(c2pool::Network* _net)
 	{
-		net = std::move(_net);
+		net = _net;
 		return this;
 	}
 
-	auto set_config(std::shared_ptr<c2pool::dev::coind_config> _config)
+	auto set_config(c2pool::dev::coind_config* _config)
 	{
-		config = std::move(_config);
+		config = _config;
 		return this;
 	}
 
-	auto set_addr_store(std::shared_ptr<c2pool::dev::AddrStore> _addr_store)
+	auto set_addr_store(c2pool::dev::AddrStore* _addr_store)
 	{
-		addr_store = std::move(_addr_store);
+		addr_store = _addr_store;
 		return this;
 	}
 
-	auto set_tracker(std::shared_ptr<ShareTracker> _tracker)
+	auto set_tracker(ShareTracker* _tracker)
 	{
-		tracker = std::move(_tracker);
+		tracker = _tracker;
 		return this;
 	}
 
-    PoolNodeData* set_coind_node(std::shared_ptr<CoindNodeData> _coind_node);
+    PoolNodeData* set_coind_node(CoindNodeData* _coind_node);
 
 public:
 	void got_addr(NetAddress _addr, uint64_t services, int64_t timestamp)

@@ -347,16 +347,16 @@ protected:
 
 //---> Share Tracker
 
-class ShareTracker : public BaseShareTracker, protected WebShareTracker, public std::enable_shared_from_this<ShareTracker>
+class ShareTracker : public BaseShareTracker, protected WebShareTracker
 {
 public:
     ShareStore share_store;
     VerifiedShareTracker verified;
 public:
-    shared_ptr<c2pool::Network> net;
-    shared_ptr<coind::ParentNetwork> parent_net;
+    c2pool::Network* net;
+    coind::ParentNetwork* parent_net;
 public:
-    ShareTracker(shared_ptr<c2pool::Network> _net);
+    ShareTracker(c2pool::Network* _net);
 
     void init(const std::vector<ShareType>& _shares, const std::vector<uint256>& known_verified_share_hashes);
     void init_web_metrics() override;

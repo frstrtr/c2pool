@@ -10,8 +10,6 @@
 #include <btclibs/uint256.h>
 #include <web_interface/metrics.hpp>
 
-using std::shared_ptr;
-
 class CoindNodeData;
 class PoolNodeData;
 
@@ -218,8 +216,8 @@ class Worker : WebWorker
 public:
 	const int32_t COINBASE_NONCE_LENGTH = 8;
 public:
-    Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeData> pool_node,
-           std::shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker);
+    Worker(c2pool::Network* net, PoolNodeData* pool_node,
+           CoindNodeData* coind_node, ShareTracker* tracker);
 
     worker_get_work_result
     get_work(std::string pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
@@ -254,10 +252,10 @@ private:
 protected:
     void init_web_metrics() override;
 public:
-    std::shared_ptr<c2pool::Network> _net;
-    std::shared_ptr<PoolNodeData> _pool_node;
-    std::shared_ptr<CoindNodeData> _coind_node;
-    std::shared_ptr<ShareTracker> _tracker;
+    c2pool::Network* _net;
+    PoolNodeData* _pool_node;
+    CoindNodeData* _coind_node;
+    ShareTracker* _tracker;
 
     math::RateMonitor<local_rate_datum> local_rate_monitor;
     math::RateMonitor<local_addr_rate_datum> local_addr_rate_monitor;

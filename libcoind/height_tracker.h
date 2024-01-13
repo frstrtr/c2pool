@@ -17,7 +17,7 @@ namespace coind
     class HeightTrackerBase
     {
     protected:
-        std::shared_ptr<CoindRPC> _jsonrpc_coind;
+        CoindRPC* _jsonrpc_coind;
         std::function<uint256()> get_best_block_func;
         std::map<uint256, int32_t> cached_heights;
 
@@ -27,9 +27,9 @@ namespace coind
         HeightTrackerBase() { }
         HeightTrackerBase(const HeightTrackerBase& copy) = delete;
 
-        void set_jsonrpc_coind(std::shared_ptr<CoindRPC> jsonrpc_coind)
+        void set_jsonrpc_coind(CoindRPC* jsonrpc_coind)
         {
-            _jsonrpc_coind = std::move(jsonrpc_coind);
+            _jsonrpc_coind = jsonrpc_coind;
         }
 
         void set_get_best_block_func(std::function<uint256()> _get_best_block_func)

@@ -100,13 +100,7 @@ namespace c2pool
             gentx_before_refhash = gentx_stream.data;
         }
 
-        parent = std::make_shared<coind::ParentNetwork>(name, _pt.get_child("parent_network"));
-
-//        for (auto v = parent->PREFIX; v < parent->PREFIX+parent->PREFIX_LENGTH; v++)
-//        {
-//            std::cout << (unsigned int) *v << " ";
-//        }
-//        std::cout << std::endl;
+        parent = new coind::ParentNetwork(name, _pt.get_child("parent_network"));
     }
 
     boost::property_tree::ptree Network::make_default_network()
@@ -152,7 +146,7 @@ namespace c2pool
         return root;
     }
 
-    std::shared_ptr<c2pool::Network> load_network_file(std::string net_name)
+    c2pool::Network* load_network_file(std::string net_name)
     {
         auto path = boost::filesystem::current_path() / net_name;
 
@@ -177,7 +171,7 @@ namespace c2pool
         boost::property_tree::ptree pt;
         boost::property_tree::ini_parser::read_ini((path/"network.cfg").string(), pt);
 
-        return std::make_shared<c2pool::Network>(net_name, pt);
+        return new c2pool::Network(net_name, pt);
     }
 } // namespace c2pool::config
 

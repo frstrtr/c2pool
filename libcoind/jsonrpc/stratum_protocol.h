@@ -20,7 +20,7 @@ class StratumProtocol : public jsonrpccxx::IClientConnector, protected virtual P
 {
 public:
 //    StratumProtocol();
-    StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f);
+    StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f);
     ~StratumProtocol()
     {
         delete event_disconnect;
@@ -37,7 +37,7 @@ public:
     void disconnect(std::string reason);
 
 protected:
-    std::shared_ptr<boost::asio::io_context> _context;
+    boost::asio::io_context* _context;
 
     JsonRpc2Server server;
     JsonRpcClient client;

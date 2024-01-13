@@ -25,7 +25,7 @@ protected:
 
     CoindProtocol* protocol;
 public:
-    CoindNodeClient(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)){}
+    CoindNodeClient(io::io_context* _context) : CoindNodeData(_context){}
 
     void error_handle(const NetAddress& addr, const std::string& err)
     {
@@ -59,8 +59,7 @@ class CoindNode : public virtual CoindNodeData, CoindNodeClient
 private:
 	bool isRunning = false;
 public:
-    CoindNode(std::shared_ptr<io::io_context> _context) : CoindNodeData(std::move(_context)), CoindNodeClient(context),
-                                                          work_poller_t(*context), forget_old_txs_t(*context)
+    CoindNode(io::io_context* _context) : CoindNodeData(_context), CoindNodeClient(context), work_poller_t(*context), forget_old_txs_t(*context)
     {
 		SET_POOL_DEFAULT_HANDLER(version);
 		SET_POOL_DEFAULT_HANDLER(verack);

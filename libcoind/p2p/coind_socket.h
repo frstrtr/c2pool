@@ -13,7 +13,7 @@ class CoindSocket : public Socket
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
-	std::shared_ptr<coind::ParentNetwork> net;
+	coind::ParentNetwork* net;
 
     void set_addr() override
     {
@@ -31,13 +31,11 @@ private:
     }
 public:
 
-    CoindSocket(auto _socket, auto _net) : Socket(), socket(std::move(_socket)), net(std::move(_net))
-	{
-	}
+    CoindSocket(auto _socket, auto _net) : Socket(), socket(std::move(_socket)), net(_net)
+	{ }
 
-    CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(std::move(_net))
-	{
-	}
+    CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(_net)
+	{ }
 
 //	// Write
 //	void write_prefix(std::shared_ptr<Message> msg);

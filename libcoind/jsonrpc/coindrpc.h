@@ -37,12 +37,12 @@ public:
 		}
 	};
 protected:
-    std::shared_ptr<io::io_context> context;
+    io::io_context* context;
 
 	rpc_auth_data auth;
     jsonrpccxx::JsonRpcClient client;
 
-    std::shared_ptr<coind::ParentNetwork> parent_net;
+    coind::ParentNetwork* parent_net;
 	tcp::resolver resolver;
 	beast::tcp_stream stream;
     http::request<http::string_body> http_request;
@@ -67,7 +67,7 @@ private:
 
 public:
 	// login = "login:password"
-    CoindRPC(std::shared_ptr<io::io_context> ctx, std::shared_ptr<coind::ParentNetwork> _parent_net, rpc_auth_data _auth, const char* login) : context(std::move(ctx)), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
+    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) : context(ctx), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
     {
 		http_request = {http::verb::post, "/", 11};
 
@@ -170,6 +170,4 @@ public:
 		nlohmann::json j = nlohmann::json::object({{"rules", rules}});
 		return client.CallMethod<nlohmann::json>(id, "getblocktemplate", {j});
 	}
-
-
 };

@@ -14,7 +14,7 @@ using namespace c2pool::filesystem;
 
 namespace c2pool::dev
 {
-    AddrStore::AddrStore(std::string path, std::shared_ptr<c2pool::Network> net)
+    AddrStore::AddrStore(std::string path, c2pool::Network* net)
     {
         filePath = path;
         std::fstream AddrsFile = getFile(path);

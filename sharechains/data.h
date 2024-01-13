@@ -18,17 +18,17 @@ class ShareTracker;
 
 namespace shares
 {
-	bool is_segwit_activated(int version, shared_ptr<c2pool::Network> net);
+	bool is_segwit_activated(int version, c2pool::Network* net);
 
 	uint256 check_hash_link(shared_ptr<::HashLinkType> hash_link, std::vector<unsigned char> data, std::vector<unsigned char> const_ending = {});
 
     shared_ptr<::HashLinkType> prefix_to_hash_link(std::vector<unsigned char> prefix, std::vector<unsigned char> const_ending = {});
 
-    PackStream get_ref_hash(uint64_t version, std::shared_ptr<c2pool::Network> net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data = nullopt);
+    PackStream get_ref_hash(uint64_t version, c2pool::Network* net, types::ShareData &share_data, types::ShareInfo &share_info, coind::data::MerkleLink ref_merkle_link, std::optional<types::SegwitData> segwit_data = nullopt);
 }
 
 // pack_share<--->load_share
-ShareType inline load_share(PackStream &stream, shared_ptr<c2pool::Network> net, const NetAddress& peer_addr)
+ShareType inline load_share(PackStream &stream, c2pool::Network* net, const NetAddress& peer_addr)
 {
     PackedShareData packed_share;
     try
@@ -41,7 +41,7 @@ ShareType inline load_share(PackStream &stream, shared_ptr<c2pool::Network> net,
 
     PackStream _stream(packed_share.contents.value);
 
-    ShareDirector director(std::move(net));
+    ShareDirector director(net);
     switch (packed_share.type.value)
     {
         case 17:

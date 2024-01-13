@@ -27,7 +27,7 @@ namespace c2pool::dev
         return _instance;
     }
 
-    std::shared_ptr<coind_config> load_config_file(const std::string &name)
+    coind_config* load_config_file(const std::string &name)
     {
         auto path = boost::filesystem::current_path() / name;
 
@@ -52,7 +52,7 @@ namespace c2pool::dev
         boost::property_tree::ptree pt;
         boost::property_tree::ini_parser::read_ini((path/"config.cfg").string(), pt);
 
-        return std::make_shared<c2pool::dev::coind_config>(name, pt);
+        return new c2pool::dev::coind_config(name, pt);
     }
 
     coind_config::coind_config(std::string _name, boost::property_tree::ptree &pt) : coind_config(std::move(_name))

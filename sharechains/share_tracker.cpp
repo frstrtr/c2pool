@@ -3,7 +3,7 @@
 #include <btclibs/uint256.h>
 #include <algorithm>
 
-ShareTracker::ShareTracker(shared_ptr<c2pool::Network> _net) : BaseShareTracker(), verified(*this), net(_net), parent_net(_net->parent), share_store(_net)
+ShareTracker::ShareTracker(c2pool::Network* _net) : BaseShareTracker(), verified(*this), net(_net), parent_net(_net->parent), share_store(_net)
 {
 
 }
@@ -171,7 +171,7 @@ bool ShareTracker::attempt_verify(ShareType share)
     auto t3 = c2pool::dev::debug_timestamp();
     try
     {
-        share->check(shared_from_this());
+        share->check(this);
     }
     catch (const std::invalid_argument &e)
     {

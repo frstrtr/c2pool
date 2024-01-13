@@ -17,11 +17,11 @@ class CoindNodeData
 private:
     bool _connected = false;
 public:
-	std::shared_ptr<io::io_context> context;
-	std::shared_ptr<coind::ParentNetwork> parent_net;
-	std::shared_ptr<ShareTracker> tracker;
-	std::shared_ptr<CoindRPC> coind;
-	std::shared_ptr<PoolNodeData> pool_node;
+	io::io_context* context;
+	coind::ParentNetwork* parent_net;
+	ShareTracker* tracker;
+	CoindRPC* coind;
+	PoolNodeData* pool_node;
 
     std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
 	HandlerManagerPtr<CoindProtocol> handler_manager;
@@ -44,7 +44,7 @@ public:
 	Variable<coind::data::BlockHeaderType> best_block_header;
 	coind::HeightTracker get_height_rel_highest; // wanna for init get_block_height func!
 public:
-	CoindNodeData(std::shared_ptr<io::io_context> _context) : context(std::move(_context))
+	CoindNodeData(io::io_context* _context) : context(_context)
 	{
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
 
@@ -64,28 +64,28 @@ public:
         best_block_header = make_variable<coind::data::BlockHeaderType>();
 	}
 
-	auto set_parent_net(std::shared_ptr<coind::ParentNetwork> _net)
+	auto set_parent_net(coind::ParentNetwork* _net)
 	{
-		parent_net = std::move(_net);
+		parent_net = _net;
 		return this;
 	}
 
-	auto set_coind(std::shared_ptr<CoindRPC> _coind)
+	auto set_coind(CoindRPC* _coind)
 	{
-		coind = std::move(_coind);
+		coind = _coind;
         get_height_rel_highest.set_jsonrpc_coind(coind);
 		return this;
 	}
 
-	auto set_tracker(std::shared_ptr<ShareTracker> _tracker)
+	auto set_tracker(ShareTracker* _tracker)
 	{
-		tracker = std::move(_tracker);
+		tracker = _tracker;
 		return this;
 	}
 
-	auto set_pool_node(std::shared_ptr<PoolNodeData> _pool_node)
+	auto set_pool_node(PoolNodeData* _pool_node)
 	{
-		pool_node = std::move(_pool_node);
+		pool_node = _pool_node;
 		return this;
 	}
 

@@ -254,7 +254,7 @@ namespace coind::data
         return result;
     }
 
-    PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, c2pool::Network* _net)
     {
         if (version == -1 && bech32_ver >= 0)
         {

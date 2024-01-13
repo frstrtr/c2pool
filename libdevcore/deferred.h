@@ -29,11 +29,10 @@ namespace c2pool::deferred
     class Fiber
     {
     public:
-        std::shared_ptr<boost::asio::io_context> io;
+        boost::asio::io_context* io;
         boost::asio::yield_context yield;
 
-        Fiber(std::shared_ptr<boost::asio::io_context> _io, boost::asio::yield_context &yieldContext) : io(std::move(_io)),
-                                                                                                        yield(std::move(yieldContext))
+        Fiber(boost::asio::io_context* _io, boost::asio::yield_context &yieldContext) : io(_io), yield(std::move(yieldContext))
         {
 
         }
@@ -64,7 +63,7 @@ namespace c2pool::deferred
             timer.async_wait(yield);
         }
 
-        static std::shared_ptr<Fiber> run(std::shared_ptr<boost::asio::io_context> io, std::function<void(std::shared_ptr<Fiber>)> f)
+        static std::shared_ptr<Fiber> run(boost::asio::io_context* io, std::function<void(std::shared_ptr<Fiber>)> f)
         {
             std::shared_ptr<Fiber> fiber;
             boost::asio::spawn([&](boost::asio::yield_context yieldContext){
@@ -83,7 +82,7 @@ namespace c2pool::deferred
         std::promise<T> result;
 
         // TODO: add timeout
-        T yield(const std::shared_ptr<boost::asio::io_context>& _context, boost::asio::yield_context &_yield)
+        T yield(boost::asio::io_context* _context, boost::asio::yield_context &_yield)
         {
             auto future = result.get_future();
             while (!is_ready(future))
@@ -108,7 +107,6 @@ namespace c2pool::deferred
     {
         return std::make_shared<Deferred<T>>();
     }
-
 
     template<typename ReturnType>
     class result_reply
@@ -151,10 +149,7 @@ namespace c2pool::deferred
         }
     public:
         // + 10 milliseconds -- tip for call await_result before await_timeout if t == timeout
-        result_reply(const std::shared_ptr<io::io_context>& _context, time_t t) : timeout_timer(*_context,
-                                                                                         std::chrono::seconds(t) +
-                                                                                         std::chrono::milliseconds(10)),
-                                                                           await_timer(*_context, 1ms)
+        result_reply(io::io_context* _context, time_t t) : timeout_timer(*_context, std::chrono::seconds(t) + std::chrono::milliseconds(10)), await_timer(*_context, 1ms)
         {
             _future = _promise.get_future().share();
         }
@@ -200,11 +195,10 @@ namespace c2pool::deferred
     {
         std::map<Key, std::shared_ptr<result_reply<ReturnType>>> result;
         std::function<void(Args...)> func;
-        std::shared_ptr<io::io_context> context;
+        io::io_context* context;
         time_t timeout_t;
 
-        ReplyMatcher(std::shared_ptr<io::io_context> _context, std::function<void(Args...)> _func,
-                     time_t _timeout_t = 5) : context(std::move(_context)), func(_func), timeout_t(_timeout_t)
+        ReplyMatcher(io::io_context* _context, std::function<void(Args...)> _func, time_t _timeout_t = 5) : context(_context), func(_func), timeout_t(_timeout_t)
         {
         }
 
@@ -255,7 +249,7 @@ namespace c2pool::deferred
                                                                        timeout_func(std::move(_timeout_func))
         {}
 
-        uint256 operator()(std::shared_ptr<io::io_context> _context, Args... ARGS)
+        uint256 operator()(io::io_context* _context, Args... ARGS)
         {
             uint256 id;
             do
@@ -277,7 +271,7 @@ namespace c2pool::deferred
             result[id]->set_value(val);
         }
 
-        void yield(std::shared_ptr<io::io_context> _context, std::function<void(ReturnType)> __f, Args... ARGS)
+        void yield(io::io_context* _context, std::function<void(ReturnType)> __f, Args... ARGS)
         {
             auto id = this->operator()(_context, ARGS...);
             result[id]->add_callback(__f);

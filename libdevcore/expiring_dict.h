@@ -10,10 +10,10 @@ class expiring_dict
 {
 private:
     const boost::posix_time::time_duration expiry_time;
-    std::shared_ptr<boost::asio::io_context> context;
+    boost::asio::io_context* context;
     std::map<Key, std::tuple<Value, std::shared_ptr<boost::asio::deadline_timer>>> values;
 public:
-    expiring_dict(std::shared_ptr<boost::asio::io_context> _context, int32_t expiry_seconds) : context(_context), expiry_time(boost::posix_time::seconds(expiry_seconds)) { }
+    expiring_dict(boost::asio::io_context* _context, int32_t expiry_seconds) : context(_context), expiry_time(boost::posix_time::seconds(expiry_seconds)) { }
 
     void add(Key key, Value value)
     {

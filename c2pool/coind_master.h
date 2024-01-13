@@ -25,7 +25,7 @@ namespace po = boost::program_options;
 namespace c2pool::master
 {
 
-    std::shared_ptr<NodeManager> make_node(boost::asio::thread_pool &thread_pool, const std::string &name, const std::shared_ptr<WebServer>& web)
+    NodeManager* make_node(boost::asio::thread_pool &thread_pool, const std::string &name, WebServer* web)
     {
         LOG_INFO << "Starting " << name << " initialization...";
 
@@ -33,7 +33,7 @@ namespace c2pool::master
         LOG_INFO << name << " network initialization...";
         auto net = c2pool::load_network_file(name);
         LOG_INFO << name << " config initialization...";
-        auto cfg = c2pool::dev::load_config_file(name);//std::make_shared<c2pool::dev::coind_config>(name);
+        auto cfg = c2pool::dev::load_config_file(name);
         LOG_INFO << "web server initialization...";
         auto root = web->get_web_root();
 
@@ -46,15 +46,15 @@ namespace c2pool::master
         web_net->add("address_explorer_url_prefix", net->parent->ADDRESS_EXPLORER_URL_PREFIX);
         web_net->add("tx_explorer_url_prefix", net->parent->TX_EXPLORER_URL_PREFIX);
 
-
         //NodeManager
         LOG_INFO << name << " NodeManager initialization...";
-        auto node = std::make_shared<NodeManager>(net, cfg, web);
+        auto node = new NodeManager(net, cfg, web);
 
         //run manager in another thread from thread_pool.
         boost::asio::post(thread_pool, [&]() { node->run(); });
 
-        while (!node->is_loaded()) {
+        while (!node->is_loaded()) 
+        {
             using namespace chrono_literals;
             std::this_thread::sleep_for(100ms);
         }
@@ -62,7 +62,7 @@ namespace c2pool::master
         return std::move(node);
     }
 
-    std::vector<std::shared_ptr<NodeManager>> make_nodes(boost::asio::thread_pool &thread_pool, const std::shared_ptr<WebServer>& web)
+    std::vector<NodeManager*> make_nodes(boost::asio::thread_pool &thread_pool, WebServer* web)
     {
         QSettings networks(QApplication::applicationDirPath() + "/networks.cfg", QSettings::IniFormat);
 
@@ -73,7 +73,7 @@ namespace c2pool::master
         }
 
         LOG_INFO << "Starting with networks: ";
-        std::vector<std::shared_ptr<NodeManager>> nodes;
+        std::vector<NodeManager*> nodes;
         for (auto net_name : networks.allKeys())
         {
             LOG_INFO << "\t" << net_name.toStdString() << " " << (networks.value(net_name).toBool() ? "true" : "false");
@@ -83,13 +83,13 @@ namespace c2pool::master
         {
             if (networks.value(net_name).toBool())
             {
-                nodes.push_back(std::move(make_node(thread_pool, net_name.toStdString(), web)));
+                nodes.push_back(make_node(thread_pool, net_name.toStdString(), web));
             }
         }
         return std::move(nodes);
     }
 
-    void init_web(const std::shared_ptr<WebServer>& web)
+    void init_web(WebServer* web)
     {
         //---> Create WebRoot
         auto web_root = std::make_shared<WebRoot>(
@@ -274,8 +274,6 @@ namespace c2pool::master
 
         //---> Finish configure web_root/web_server
         web->add_web_root(web_root);
-
-
 
         //---> New net
 //        auto &web_dgb = web_root->new_net("dgb");

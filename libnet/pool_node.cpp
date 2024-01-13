@@ -37,7 +37,7 @@ std::vector<NetAddress> PoolNodeClient::get_good_peers(int max_count)
 	return result;
 }
 
-void PoolNode::DownloadShareManager::start(const std::shared_ptr<PoolNode> &_node)
+void PoolNode::DownloadShareManager::start(PoolNode* _node)
 {
     node = _node;
     strand = std::make_shared<boost::asio::io_service::strand>(*node->context);
@@ -628,7 +628,7 @@ void PoolNode::start()
         return;
     }
 
-    download_share_manager.start(shared_from_this());
+    download_share_manager.start(this);
 
     coind_node->best_block_header->changed->subscribe([&](coind::data::BlockHeaderType header){
         for (auto _peer : peers)

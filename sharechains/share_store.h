@@ -37,14 +37,14 @@ struct ShareTypeStream : Getter<PackedShareData>
 class ShareStore
 {
 private:
-    std::shared_ptr<c2pool::Network> net;
+    c2pool::Network* net;
 
 	unique_ptr<Database<IntType(256), ShareTypeStream>> shares;
 	unique_ptr<Database<IntType(256), ShareTypeStream>> verified_shares;
 public:
     ShareStore() = delete;
 
-    ShareStore(std::shared_ptr<c2pool::Network> _net) : net(std::move(_net))
+    ShareStore(c2pool::Network* _net) : net(_net)
     {
         auto filepath = c2pool::filesystem::getProjectPath() / net->net_name;
 

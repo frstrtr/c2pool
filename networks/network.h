@@ -15,14 +15,6 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/ini_parser.hpp>
 
-using std::shared_ptr;
-
-//TODO: legacy remove?
-namespace coind::jsonrpc
-{
-    class Coind;
-}
-
 namespace coind
 {
     class ParentNetwork;
@@ -33,14 +25,14 @@ namespace c2pool
 #define CREATE_ADDR(addr, port) std::make_tuple<std::string, std::string>(addr, port)
     class Network;
 
-    std::shared_ptr<c2pool::Network> load_network_file(std::string net_name);
+    c2pool::Network* load_network_file(std::string net_name);
 
     class Network
     {
     public:
         const std::string net_name;
     public:
-        std::shared_ptr<coind::ParentNetwork> parent;
+        coind::ParentNetwork* parent;
         std::shared_ptr<NetDataField> web;
 
         static boost::property_tree::ptree make_default_network();

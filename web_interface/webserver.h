@@ -114,16 +114,16 @@ public:
     }
 };
 
-class WebServer : public std::enable_shared_from_this<WebServer>
+class WebServer
 {
-    std::shared_ptr<asio::io_context> ioc;
+    asio::io_context* ioc;
     std::shared_ptr<WebRoot> web;
     tcp::acceptor acceptor;
     std::shared_ptr<session> _session;
 
     std::atomic<bool> _is_running{false};
 public:
-    WebServer(const std::shared_ptr<asio::io_context>& _ioc, tcp::endpoint endpoint) : ioc(_ioc), acceptor(net::make_strand(*ioc))
+    WebServer(asio::io_context* _ioc, tcp::endpoint endpoint) : ioc(_ioc), acceptor(net::make_strand(*ioc))
     {
         boost::system::error_code ec;
 
@@ -188,9 +188,7 @@ private:
         // The new connection gets its own strand
         acceptor.async_accept(
                 asio::make_strand(*ioc),
-                beast::bind_front_handler(
-                        &WebServer::on_accept,
-                        shared_from_this()));
+                beast::bind_front_handler(&WebServer::on_accept, this));
     }
 
     void on_accept(beast::error_code ec, tcp::socket socket)

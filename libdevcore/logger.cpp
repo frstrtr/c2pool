@@ -3,7 +3,6 @@
 using c2pool::dev::c2pool_config;
 
 #include <memory>
-using std::shared_ptr;
 
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
