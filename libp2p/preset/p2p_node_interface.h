@@ -18,12 +18,12 @@ template <typename SocketType>
 class P2PListener : public Listener
 {
 private:
-	std::shared_ptr<io::io_context> context;
-	std::shared_ptr<c2pool::Network> net;
+	io::io_context* context;
+	c2pool::Network* net;
 
 	ip::tcp::acceptor acceptor;
 public:
-	P2PListener(auto _context, auto _net, auto port) : context(std::move(_context)), net(std::move(_net)), acceptor(*context)
+	P2PListener(auto _context, auto _net, auto port) : context(_context), net(_net), acceptor(*context)
 	{
 		ip::tcp::endpoint listen_ep(ip::tcp::v4(), port);
 
@@ -60,13 +60,13 @@ template <typename SocketType>
 class P2PConnector : public Connector
 {
 private:
-	std::shared_ptr<io::io_context> context;
-	std::shared_ptr<c2pool::Network> net;
+	io::io_context* context;
+	c2pool::Network* net;
 
 	ip::tcp::resolver resolver;
 
 public:
-	P2PConnector(const auto& _context, const auto& _net) : context(_context), net(_net), resolver(*context)
+	P2PConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context)
 	{
 	}
 
@@ -109,13 +109,13 @@ template <typename SocketType>
 class CoindConnector : public Connector
 {
 private:
-	std::shared_ptr<io::io_context> context;
-	std::shared_ptr<coind::ParentNetwork> net;
+	io::io_context* context;
+	coind::ParentNetwork* net;
 
 	ip::tcp::resolver resolver;
 
 public:
-	CoindConnector(const auto& _context, const auto& _net) : context(_context), net(_net), resolver(*context) {}
+	CoindConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context) {}
 
 	void tick(NetAddress _addr) override
 	{

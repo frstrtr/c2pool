@@ -59,17 +59,17 @@ bool Work::operator!=(const Work &value) const
     return !(*this == value);
 }
 
-Worker::Worker(std::shared_ptr<c2pool::Network> net, std::shared_ptr<PoolNodeData> pool_node,
-               shared_ptr<CoindNodeData> coind_node, std::shared_ptr<ShareTracker> tracker) : _net(std::move(net)),
+Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node,
+               CoindNodeData* coind_node, ShareTracker* tracker) : _net(net),
                                                                                                           current_work(make_variable<Work>(Work{})),
                                                                                                           new_work(make_event()),
                                                                                                           share_received(make_event()),
                                                                                                           pseudoshare_received(make_event()),
                                                                                                           removed_unstales(make_variable<std::tuple<int32_t, int32_t, int32_t>>(std::make_tuple(0,0,0))),
                                                                                                           removed_doa_unstales(make_variable<int32_t>(0)),
-                                                                                                          _pool_node(std::move(pool_node)),
-                                                                                                          _coind_node(std::move(coind_node)),
-                                                                                                          _tracker(std::move(tracker)),
+                                                                                                          _pool_node(pool_node),
+                                                                                                          _coind_node(coind_node),
+                                                                                                          _tracker(tracker),
                                                                                                           local_rate_monitor(10 * 60),
                                                                                                           local_addr_rate_monitor(10 * 60)
 

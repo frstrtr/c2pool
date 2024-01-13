@@ -28,18 +28,19 @@ class PoolNodeServer : virtual PoolNodeData
 protected:
 	std::shared_ptr<Listener> listener; // from P2PNode::run()
 
-    std::map<Socket*, std::shared_ptr<PoolHandshakeServer>> server_attempts;
+    std::map<Socket*, PoolHandshakeServer*> server_attempts;
     std::map<HOST_IDENT, PoolProtocol*> server_connections;
 private:
     msg_version_handler_type message_version_handle;
 public:
-	PoolNodeServer(const std::shared_ptr<io::io_context>& _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
+	PoolNodeServer(io::io_context* _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
 
 	void socket_handle(Socket* socket)
     {
+        // TODO: remove
         auto _socket = socket;
         socket->set_addr();
-        server_attempts[_socket] = std::make_shared<PoolHandshakeServer>(std::move(socket), message_version_handle,
+        server_attempts[_socket] = new PoolHandshakeServer(std::move(socket), message_version_handle,
                                                                          [&](PoolHandshake* _handshake)
                                                                          {
                                                                             handshake_handle(_handshake);
@@ -93,7 +94,7 @@ private:
 
     msg_version_handler_type message_version_handle;
 public:
-	PoolNodeClient(std::shared_ptr<io::io_context> _context, msg_version_handler_type version_handle) : PoolNodeData(std::move(_context)), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
+	PoolNodeClient(io::io_context* _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
     void socket_handle(Socket* socket)
     {
@@ -176,7 +177,7 @@ public:
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, protected WebPoolNode, public enable_shared_from_this<PoolNode>
+class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, protected WebPoolNode
 {
     struct DownloadShareManager
     {
@@ -187,7 +188,7 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
         };
 
         std::shared_ptr<boost::asio::io_service::strand> strand;
-        std::shared_ptr<PoolNode> node{};
+        PoolNode* node{};
 
         int64_t id_gen {0};
         bool is_processing {false};
@@ -279,7 +280,7 @@ class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, pr
 //            }
         }
 
-        void start(const std::shared_ptr<PoolNode> &_node);
+        void start(PoolNode* _node);
     };
 
 private:
@@ -287,8 +288,7 @@ private:
 
     DownloadShareManager download_share_manager;
 public:
-	PoolNode(std::shared_ptr<io::io_context> _context)
-			: PoolNodeData(std::move(_context)),
+	PoolNode(io::io_context* _context) : PoolNodeData(_context),
               PoolNodeServer(context, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); }),
               PoolNodeClient(context, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); })
 	{

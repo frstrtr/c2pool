@@ -26,7 +26,7 @@ namespace shares
         get_share = std::move(_get_share);
     }
 
-    GenerateShareTransaction::GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker) : tracker(_tracker), net(_tracker->net)
+    GenerateShareTransaction::GenerateShareTransaction(ShareTracker* _tracker) : tracker(_tracker), net(_tracker->net)
     {
 
     }

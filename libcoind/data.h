@@ -19,12 +19,6 @@
 #include <iostream>
 #include <memory>
 
-using std::vector, std::tuple, std::string, std::shared_ptr;
-
-//namespace coind::data{
-//    class TransactionType;
-//}
-
 namespace coind::data
 {
     inline bool is_segwit_tx(std::shared_ptr<coind::data::TransactionType> tx)
@@ -195,7 +189,7 @@ namespace coind::data
         }
     };
 
-    inline std::string pubkey_hash_to_address(auto pubkey_hash, int32_t addr_ver, int32_t bech32_ver, shared_ptr<c2pool::Network> _net)
+    inline std::string pubkey_hash_to_address(auto pubkey_hash, int32_t addr_ver, int32_t bech32_ver, c2pool::Network* _net)
     {
         if (addr_ver == -1)
         {
@@ -222,12 +216,12 @@ namespace coind::data
         return result;
     }
 
-    inline auto pubkey_to_address(auto pubkey, shared_ptr<c2pool::Network> _net)
+    inline auto pubkey_to_address(auto pubkey, c2pool::Network* _net)
     {
         return pubkey_hash_to_address(hash160(pubkey), _net->parent->ADDRESS_VERSION, -1, _net);
     }
 
-    inline auto get_legacy_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
+    inline auto get_legacy_pubkey_hash(auto address, c2pool::Network* _net)
     {
         // P2PKH or P2SH address
         vector<unsigned char> decoded_addr;
@@ -248,7 +242,7 @@ namespace coind::data
         return std::make_tuple(human_addr.pubkey_hash.value, human_addr.version.get(), -1);
     }
 
-    inline auto address_to_pubkey_hash(auto address, shared_ptr<c2pool::Network> _net)
+    inline auto address_to_pubkey_hash(auto address, c2pool::Network* _net)
     {
         //TODO:
 //        try
@@ -271,9 +265,9 @@ namespace coind::data
          */
     }
 
-    PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net);
+    PackStream pubkey_hash_to_script2(uint160 pubkey_hash, int32_t version, int32_t bech32_ver, c2pool::Network* _net);
 
-    auto address_to_script2(auto address, shared_ptr<c2pool::Network> _net)
+    auto address_to_script2(auto address, c2pool::Network* _net)
     {
         auto res = address_to_pubkey_hash(address, _net);
         return pubkey_hash_to_script2(std::get<0>(res), std::get<1>(res), std::get<2>(res), _net);
@@ -290,7 +284,7 @@ namespace coind::data
         return pubkey;
     }
 
-    inline std::string script2_to_pubkey_address(const PackStream& script2, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_pubkey_address(const PackStream& script2, c2pool::Network* _net)
     {
         PackStream pubkey;
 
@@ -311,7 +305,7 @@ namespace coind::data
         return pubkey_to_address(pubkey, _net);
     }
 
-    inline std::string script2_to_pubkey_hash_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_pubkey_hash_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, c2pool::Network* _net)
     {
         //TODO: Check for BCH and BSV length, could be longer than 20 bytes
         uint160 pubkey_hash;
@@ -335,7 +329,7 @@ namespace coind::data
         return pubkey_hash_to_address(pubkey_hash, addr_ver, bech32_ver, _net);
     }
 
-    inline std::string script2_to_cashaddress(const PackStream& script2, int32_t addr_ver, int32_t ca_ver, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_cashaddress(const PackStream& script2, int32_t addr_ver, int32_t ca_ver, c2pool::Network* _net)
     {
         //TODO: Check for BCH and BSV length, could be longer than 20 bytes
         uint160 pubkey_hash;
@@ -368,7 +362,7 @@ namespace coind::data
         return pubkey_hash_to_address(pubkey_hash, addr_ver, ca_ver, _net);
     }
 
-    inline std::string script2_to_bech32_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_bech32_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, c2pool::Network* _net)
     {
         //TODO: Check for BCH and BSV length, could be longer than 20 bytes
         uint160 pubkey_hash;
@@ -390,7 +384,7 @@ namespace coind::data
         return pubkey_hash_to_address(pubkey_hash, addr_ver, bech32_ver, _net);
     }
 
-    inline std::string script2_to_p2sh_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_p2sh_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, c2pool::Network* _net)
     {
         //TODO: Check for BCH and BSV length, could be longer than 20 bytes
         uint160 pubkey_hash;
@@ -414,7 +408,7 @@ namespace coind::data
         return pubkey_hash_to_address(pubkey_hash, addr_ver, bech32_ver, _net);
     }
 
-    inline std::string script2_to_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, const shared_ptr<c2pool::Network>& _net)
+    inline std::string script2_to_address(const PackStream& script2, int32_t addr_ver, int32_t bech32_ver, c2pool::Network* _net)
     {
         //TODO: optimize (избавиться от перебора всех методов)
         try
@@ -450,7 +444,7 @@ namespace coind::data
         throw std::invalid_argument((boost::format("Invalid script2 hash: %1%") % HexStr(script2.data)).str());
     }
 
-    inline auto donation_script_to_address(shared_ptr<c2pool::Network> _net)
+    inline auto donation_script_to_address(c2pool::Network* _net)
     {
         try
         {

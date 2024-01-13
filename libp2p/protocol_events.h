@@ -83,7 +83,7 @@ private:
 
 public:
 
-    ProtocolPinger(const std::shared_ptr<boost::asio::io_context>& _context, time_t outtime_t, std::function<void()> outtime_f, std::function<time_t()> send_ping_t, std::function<void()> send_ping_f)
+    ProtocolPinger(boost::asio::io_context* _context, time_t outtime_t, std::function<void()> outtime_f, std::function<time_t()> send_ping_t, std::function<void()> send_ping_f)
             : outtime_ping_time(outtime_t), timer_outtime(*_context), outtimeF(std::move(outtime_f)),
 			  send_ping_time(std::move(send_ping_t)), timer_send_ping(*_context), send_pingF(std::move(send_ping_f))
     {

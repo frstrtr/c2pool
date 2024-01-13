@@ -1,6 +1,6 @@
 #include "stratum_node.h"
 
-StratumNode::StratumNode(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<Worker> worker) : _context(std::move(context)), acceptor(*_context), _worker(std::move(worker))
+StratumNode::StratumNode(boost::asio::io_context* context, Worker* worker) : _context(context), acceptor(*_context), _worker(worker)
 {
     ip::tcp::endpoint listen_ep(ip::tcp::v4(), 1131);
 
@@ -41,12 +41,12 @@ void StratumNode::listen()
                                   }
 
                                   auto socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-                                  auto stratum = std::make_shared<Stratum>(_context, std::move(socket), _worker,
+                                  auto stratum = new Stratum(_context, std::move(socket), _worker,
                                                                            [&](const addr_t &addr)
                                                                            {
                                                                                disconnect(addr);
                                                                            });
-                                  miners[_addr] = std::move(stratum);
+                                  miners[_addr] = stratum;
                                   listen();
                               } else
                               {
@@ -74,7 +74,7 @@ void StratumNode::disconnect(const addr_t& addr)
         auto stratum = miners[addr];
         miners.erase(addr);
         ban(addr);
-        stratum.reset();
+        delete stratum;
     } else
     {
         throw std::invalid_argument("StratumNode::disconnect received wrong addr");

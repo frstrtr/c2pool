@@ -65,10 +65,10 @@ namespace shares
         };
 
     public:
-        std::shared_ptr<ShareTracker> tracker;
-        std::shared_ptr<c2pool::Network> net;
+        ShareTracker* tracker;
+        c2pool::Network* net;
 
-        GenerateShareTransaction(std::shared_ptr<ShareTracker> _tracker);
+        GenerateShareTransaction(ShareTracker* _tracker);
 
     public:
         SetProperty(types::ShareData, share_data);

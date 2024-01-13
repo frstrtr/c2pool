@@ -4,7 +4,7 @@
 #include <string>
 #include <libdevcore/logger.h>
 
-StratumProtocol::StratumProtocol(std::shared_ptr<boost::asio::io_context> context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f) : ProtocolEvents(), _context(std::move(context)), _socket(std::move(socket)), client(*this, version::v2), disconnect_in_node_f(std::move(_disconnect_in_node_f)),
+StratumProtocol::StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f) : ProtocolEvents(), _context(context), _socket(std::move(socket)), client(*this, version::v2), disconnect_in_node_f(std::move(_disconnect_in_node_f)),
                                                                                                                                                                                                               addr(std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port()))
 {
     event_disconnect = make_event();

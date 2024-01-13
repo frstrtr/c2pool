@@ -3,7 +3,7 @@
 #include "coind_node_data.h"
 #include <sharechains/share.h>
 
-PoolNodeData* PoolNodeData::set_coind_node(std::shared_ptr<CoindNodeData> _coind_node)
+PoolNodeData* PoolNodeData::set_coind_node(CoindNodeData* _coind_node)
 {
     coind_node = std::move(_coind_node);
 

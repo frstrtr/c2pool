@@ -26,7 +26,7 @@ public:
 //	std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
 
 public:
-	PoolProtocol(std::shared_ptr<boost::asio::io_context> _context, Socket* _socket, HandlerManagerPtr<PoolProtocol> _handler_manager, PoolProtocolData* _data) : 
+	PoolProtocol(boost::asio::io_context* _context, Socket* _socket, HandlerManagerPtr<PoolProtocol> _handler_manager, PoolProtocolData* _data) : 
 																											  Protocol<PoolProtocol>("Pool", _socket, _handler_manager), PoolProtocolData(*_data),
                                                                                                               ProtocolPinger(_context, 100, [&](){out_time_ping();},
 																															 [](){return 20; /*TODO: return c2pool::random::Expovariate(1/100);*/}, [&](){ send_ping(); })

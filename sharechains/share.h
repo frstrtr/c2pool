@@ -35,7 +35,7 @@ public:
 	const uint64_t VERSION; // Share version, init in constructor
 	static const int32_t gentx_size = 50000;
 
-    shared_ptr<c2pool::Network> net;
+    c2pool::Network* net;
     NetAddress peer_addr;
 public:
     ///objs
@@ -82,7 +82,7 @@ public:
 
     int32_t gentx_weight;
 public:
-	Share(uint64_t version, std::shared_ptr<c2pool::Network> _net, const NetAddress& _addr) : VERSION(version)
+	Share(uint64_t version, c2pool::Network* _net, const NetAddress& _addr) : VERSION(version)
 	{
         net = _net;
         peer_addr = _addr;
@@ -111,7 +111,7 @@ public:
     void init();
 
     /// check for verify share.
-    void check(const std::shared_ptr<ShareTracker>& _tracker, std::optional<std::map<uint256, coind::data::tx_type>> other_txs = nullopt);
+    void check(ShareTracker* _tracker, std::optional<std::map<uint256, coind::data::tx_type>> other_txs = nullopt);
 /* TODO:
 	/// share -> block
 	coind::data::stream::BlockType_stream as_block(const std::shared_ptr<ShareTracker>& _tracker, std::map<uint256, coind::data::tx_type> known_txs);

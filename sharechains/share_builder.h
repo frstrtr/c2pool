@@ -13,9 +13,9 @@ class BaseShareBuilder
 {
 protected:
 	ShareType share;
-	std::shared_ptr<c2pool::Network> net;
+	c2pool::Network* net;
 public:
-	BaseShareBuilder(std::shared_ptr<c2pool::Network> _net) : net(std::move(_net))
+	BaseShareBuilder(c2pool::Network* _net) : net(_net)
 	{
 		Reset();
 	}
@@ -106,7 +106,7 @@ protected:
 class ShareObjectBuilder : public BaseShareBuilder, public enable_shared_from_this<ShareObjectBuilder>
 {
 public:
-	ShareObjectBuilder(std::shared_ptr<c2pool::Network> _net) : BaseShareBuilder(_net) { }
+	ShareObjectBuilder(c2pool::Network* _net) : BaseShareBuilder(_net) { }
 public:
     auto min_header(const coind::data::types::SmallBlockHeaderType &data)
     {
@@ -183,7 +183,7 @@ public:
 class ShareStreamBuilder : public BaseShareBuilder, public enable_shared_from_this<ShareStreamBuilder>
 {
 public:
-	ShareStreamBuilder(std::shared_ptr<c2pool::Network> _net) : BaseShareBuilder(_net) { }
+	ShareStreamBuilder(c2pool::Network* _net) : BaseShareBuilder(_net) { }
 public:
 	auto min_header(PackStream &stream)
 	{
@@ -264,7 +264,7 @@ class ShareDirector
 private:
 	std::shared_ptr<ShareStreamBuilder> builder;
 public:
-	ShareDirector(std::shared_ptr<c2pool::Network> _net)
+	ShareDirector(c2pool::Network* _net)
 	{
 		builder = std::make_shared<ShareStreamBuilder>(_net);
 	}

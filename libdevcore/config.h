@@ -23,7 +23,7 @@ namespace c2pool::dev
     };
 
     class coind_config;
-    std::shared_ptr<coind_config> load_config_file(const std::string &name);
+    coind_config* load_config_file(const std::string &name);
 
     class coind_config
     {

@@ -15,7 +15,7 @@ class PoolSocket : public Socket
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
-	std::shared_ptr<c2pool::Network> net;
+	c2pool::Network* net;
 
     void set_addr() override
     {
@@ -27,12 +27,12 @@ private:
     }
 public:
 
-	PoolSocket(auto _socket, auto _net, auto conn_type) : Socket(conn_type), socket(std::move(_socket)), net(std::move(_net))
+	PoolSocket(auto _socket, auto _net, auto conn_type) : Socket(conn_type), socket(std::move(_socket)), net(_net)
 	{
 		LOG_DEBUG_POOL << "PoolSocket created";
 	}
 
-	PoolSocket(auto _socket, auto _net, handler_type message_handler, auto conn_type) : Socket(std::move(message_handler), conn_type), socket(std::move(_socket)), net(std::move(_net))
+	PoolSocket(auto _socket, auto _net, handler_type message_handler, auto conn_type) : Socket(std::move(message_handler), conn_type), socket(std::move(_socket)), net(_net)
 	{
         LOG_DEBUG_POOL << "PoolSocket created2";
 	}

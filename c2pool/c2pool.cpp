@@ -119,7 +119,7 @@ int main(int argc, char *argv[])
 
     //Createing web server
     LOG_INFO << "web_server initialization in new thread...";
-    std::shared_ptr<WebServer> web_server;
+    WebServer* web_server;
 
     tcp::endpoint web_endpoint;
     if (vm.count("web_server"))
@@ -142,9 +142,9 @@ int main(int argc, char *argv[])
     }
 
     std::thread web_server_thread([&web_server, &web_endpoint](){
-        auto ioc = std::make_shared<boost::asio::io_context>();
+        auto ioc = new boost::asio::io_context();
 
-        web_server = std::make_shared<WebServer>(ioc, web_endpoint);
+        web_server = new WebServer(ioc, web_endpoint);
         c2pool::master::init_web(web_server);
         web_server->run();
 
