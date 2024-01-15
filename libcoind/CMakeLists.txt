@@ -5,8 +5,6 @@ set(coind_tool_sources
         transaction.h
         transaction.cpp
         height_tracker.h
-        # jsonrpc/jsonrpc_coind.h
-        # jsonrpc/jsonrpc_coind.cpp
         jsonrpc/coindrpc.h jsonrpc/coindrpc.cpp
         jsonrpc/txidcache.h
 
@@ -19,7 +17,6 @@ set(coind_tool_sources
 )
 
 set(jsonrpc_sources
-        jsonrpc/requests.h 
         jsonrpc/results.h 
 )
 
