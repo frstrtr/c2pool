@@ -1,6 +1,3 @@
 [submodule "libs/googletest"]
 	path = libs/googletest
 	url = https://github.com/frstrtr/googletest.git
-[submodule "libs/univalue"]
-	path = libs/univalue
-	url = https://github.com/frstrtr/univalue.git

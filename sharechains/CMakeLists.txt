@@ -6,4 +6,4 @@ MESSAGE(${sources})
 
 add_library(sharechains STATIC ${sources}
         tree_tracker/cluster.h tree_tracker/fork.h tree_tracker/tracker.h base_share_tracker.h tree_tracker/rules.h)
-target_link_libraries(sharechains PRIVATE libdevcore networks univalue libcoind btclibs)
+target_link_libraries(sharechains PRIVATE libdevcore networks libcoind btclibs)
