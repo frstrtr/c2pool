@@ -618,7 +618,7 @@ namespace shares
 
     get_share_method GenerateShareTransaction::get_share_func(uint64_t version, coind::data::tx_type gentx, vector<uint256> other_transaction_hashes, std::shared_ptr<shares::types::ShareInfo> share_info)
     {
-        return [=, gentx_data = shared_from_this()](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
+        return [=, this, gentx_data = shared_from_this()](const coind::data::types::BlockHeaderType& header, uint64_t last_txout_nonce)
         {
             coind::data::types::SmallBlockHeaderType min_header{header.version, header.previous_block, header.timestamp, header.bits, header.nonce};
             std::shared_ptr<ShareObjectBuilder> builder = std::make_shared<ShareObjectBuilder>(net);
