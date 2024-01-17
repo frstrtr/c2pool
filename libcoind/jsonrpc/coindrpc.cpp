@@ -8,12 +8,19 @@ bool CoindRPC::check()
 		return false;
 	}
 
-	bool version_check_result = parent_net->version_check(getnetworkinfo()["version"].get<int>());
-	if (!version_check_result)
-	{
-		LOG_ERROR << "Coind daemon too old! Upgrade!";
-		return false;
-	}
+    try
+    {
+        auto networkinfo = getnetworkinfo();
+        bool version_check_result = parent_net->version_check(networkinfo["version"].get<int>());
+	    if (!version_check_result)
+	    {
+		    LOG_ERROR << "Coind daemon too old! Upgrade!";
+		    return false;
+	    }
+    } catch (const jsonrpccxx::JsonRpcException& ex)
+    {
+        LOG_WARNING << "CoindRPC::check() exception: " << ex.what();
+    }
 
     try 
     {
@@ -119,14 +126,14 @@ coind::getwork_result CoindRPC::getwork(coind::TXIDCache &txidcache, const map<u
         map<string, uint256> keepers;
         for (int i = 0; i < txhashes.size(); i++)
         {
-            std::string x;
-            if (work["transactions"].contains("data"))
-                x = work["transactions"].at(i);
+            auto x = work["transactions"].at(i);
+            std::string keep;
+            if (x.contains("data"))
+                keep = x["data"].get<std::string>();
             else
-                x = work["transactions"].get<std::string>();
-
+                keep = x.get<std::string>();
             uint256 txid = txhashes[i];
-            keepers[x] = txid;
+            keepers[keep] = txid;
         }
         txidcache.clear();
         txidcache.add(keepers);
