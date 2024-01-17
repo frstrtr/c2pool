@@ -47,7 +47,7 @@ protected:
 	beast::tcp_stream stream;
     http::request<http::string_body> http_request;
 
-private:
+public:
     void reconnect()
     {
         auto const results = resolver.resolve(auth.ip, auth.port);
