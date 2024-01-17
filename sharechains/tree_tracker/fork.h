@@ -213,21 +213,23 @@ class SubFork : public Fork<SumType, SIZE>
 {
 private:
     typedef Fork<SumType, SIZE> fork_type;
+    typedef typename fork_type::hash_type hash_type;
+    typedef typename fork_type::sum_element sum_element;
 public:
     std::shared_ptr<fork_type> fork;
-    fork_type::hash_type split_point; // точка разделения на sub_fork.
+    hash_type split_point; // точка разделения на sub_fork.
 
-    SubFork(const std::shared_ptr<fork_type> &_fork, const fork_type::hash_type &_point) : Fork<SumType, SIZE>(), fork(_fork), split_point(_point)
+    SubFork(const std::shared_ptr<fork_type> &_fork, const hash_type &_point) : Fork<SumType, SIZE>(), fork(_fork), split_point(_point)
     {
         this->prev_fork = fork->prev_fork;
     }
 
-    virtual fork_type::hash_type get_head() const override
+    virtual hash_type get_head() const override
     {
         return fork->head;
     }
 
-    virtual fork_type::hash_type get_tail() const override
+    virtual hash_type get_tail() const override
     {
         return fork->tail;
     }
@@ -237,7 +239,7 @@ public:
         return fork->prev_fork;
     }
 
-    void insert(fork_type::sum_element value) override
+    void insert(sum_element value) override
     {
         throw std::logic_error("Try to insert value in SubFork!");
     }
@@ -247,9 +249,9 @@ public:
         return fork->empty();
     }
 
-    fork_type::sum_element get_sum(fork_type::hash_type hash) override
+    sum_element get_sum(hash_type hash) override
     {
-        typename fork_type::sum_element result;
+        sum_element result;
 
         //cluster_num, pos;
         std::optional<int> split_pos;
@@ -273,7 +275,7 @@ public:
         return result;
     }
 
-    fork_type::sum_element get_sum_element(fork_type::hash_type hash) override
+    sum_element get_sum_element(hash_type hash) override
     {
         //cluster_num, pos;
         std::optional<int> split_pos;
@@ -299,7 +301,7 @@ public:
         throw std::logic_error("Try to insert fork in SubFork!");
     }
 
-    fork_type::sum_element get_sum_all() override
+    sum_element get_sum_all() override
     {
         return get_sum(split_point);
     }
