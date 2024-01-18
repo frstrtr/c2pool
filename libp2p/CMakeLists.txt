@@ -1,6 +1,7 @@
 set(libp2p_source
         socket.h
         socket_data.h
+        net_supervisor.h        
         message.h protocol.h handler.h handshake.h protocol.cpp protocol_events.h node.h)
 
 set(libp2ppreset_source
