@@ -7,6 +7,7 @@
 #include "jsonrpccxx/server.hpp"
 
 #include <networks/network.h>
+#include <libp2p/net_supervisor.h>
 #include <libdevcore/logger.h>
 #include <libcoind/data.h>
 #include <libcoind/types.h>
@@ -86,7 +87,7 @@ public:
 
 public:
 	// login = "login:password"
-    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) : context(ctx), reconnect_timer(context), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
+    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) : context(ctx), reconnect_timer(*context), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
     {
 		http_request = {http::verb::post, "/", 11};
 
@@ -103,8 +104,6 @@ public:
         sprintf(auth.authorization, "Basic %s", encoded_login);
         http_request.set(http::field::authorization, auth.authorization);
         delete[] encoded_login;
-
-		reconnect();
     }
 
     ~CoindRPC()
