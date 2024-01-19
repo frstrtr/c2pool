@@ -19,7 +19,7 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = io::ip::tcp;
 
-class CoindRPC : public jsonrpccxx::IClientConnector
+class CoindRPC : public jsonrpccxx::IClientConnector, public SupervisorElement
 {
 	const std::string id = "curltest";
 public:
@@ -38,6 +38,7 @@ public:
 	};
 protected:
     io::io_context* context;
+	io::steady_timer reconnect_timer;
 
 	rpc_auth_data auth;
     jsonrpccxx::JsonRpcClient client;
@@ -48,26 +49,44 @@ protected:
     http::request<http::string_body> http_request;
 
 public:
-    void reconnect()
+    void reconnect() override
     {
         auto const results = resolver.resolve(auth.ip, auth.port);
 
         boost::system::error_code ec;
-        do
+        stream.connect(results, ec);
+
+        if (ec)
         {
-            stream.connect(results, ec);
-            if (ec)
-            {
-                LOG_INFO << "JSONRPC_Coind error when try connect: [" << ec.message()
-                         << "]. Retry after 15 seconds...";
-                this_thread::sleep_for(15s);
-            }
-        } while (ec);
+            LOG_INFO << "JSONRPC_Coind error when try connect: [" << ec.message()
+                     << "]. Retry after 15 seconds...";
+            reconnect_timer.expires_from_now(std::chrono::seconds(15));
+			reconnect_timer.async_wait(
+				[this](const auto& ec)
+				{
+					reconnect();
+				}
+			);
+        } else 
+		{
+			reconnected();
+		}
     }
+
+	void stop() override
+	{
+		if (state != disconnected)
+			return;
+
+		beast::error_code ec;
+		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+		set_state(disconnected);
+	}
 
 public:
 	// login = "login:password"
-    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) : context(ctx), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
+    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) : context(ctx), reconnect_timer(context), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
     {
 		http_request = {http::verb::post, "/", 11};
 
@@ -110,19 +129,14 @@ public:
 		beast::flat_buffer buffer;
 		boost::beast::http::response<boost::beast::http::dynamic_body> response;
 
-		while (true)
-		{
-			try
-        	{
-        		boost::beast::http::read(stream, buffer, response);
-        		break;
-        	}
-        	catch (const std::exception& ex)
-        	{
-        		LOG_ERROR << "JSONRPC disconnected for reason: _request." << ex.what();
-        		reconnect();
-        	}
-		}
+		try
+        {
+        	boost::beast::http::read(stream, buffer, response);
+        }
+        catch (const std::exception& ex)
+        {
+        	restart("JSONRPC disconnected for reason: " + std::string(ex.what()));
+        }
 
 		std::string json_result = boost::beast::buffers_to_string(response.body().data());
     	LOG_DEBUG_COIND_JSONRPC << "json_result: " << json_result;
