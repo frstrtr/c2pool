@@ -58,8 +58,8 @@ public:
     void init(uint8_t l, finish_type&& finish_func, restart_type&& restart_network_func) 
     {
         layer = l;
-        finish_reconnecting = finish_func;
-        restart_network = restart_network_func;
+        finish_reconnecting = std::move(finish_func);
+        restart_network = std::move(restart_network_func);
     }
 
     // called for disconnect
@@ -83,7 +83,10 @@ protected:
     {
         // reconnect queue empty
         if (!reconnect_queue.size())
+        {
+            current = nullptr;
             return;
+        }
 
         current = reconnect_queue.front();
         reconnect_queue.pop();
@@ -111,7 +114,7 @@ public:
     // Called when finished reconnect for element
     void finish_element(SupervisorElement* element)
     {
-        if (!element || element != current)
+        if (!element)
         {
             throw std::invalid_argument("NetSupervisor::finish_element called for incorrect element");
         }

@@ -27,6 +27,7 @@ void NodeManager::run()
     LOG_INFO << "Init Coind (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "])...";
     
     _coind = new CoindRPC(_context, _parent_net, CoindRPC::rpc_auth_data{_config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str()}, _config->jsonrpc_coind_login.c_str());
+    add(_coind, 0);
     do {
         _coind->reconnect();
     } while (!_coind->check());
