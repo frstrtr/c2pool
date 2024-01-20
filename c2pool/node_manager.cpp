@@ -51,6 +51,7 @@ void NodeManager::run()
 
     // CoindNode
     _coind_node = new CoindNode(_context);
+    add(_coind_node, 1);
 
     _coind_node
             ->set_parent_net(_parent_net)
