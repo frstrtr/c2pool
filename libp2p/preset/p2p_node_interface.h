@@ -4,8 +4,8 @@
 #include <functional>
 #include <tuple>
 
-//#include "p2p_socket.h"
 #include <networks/network.h>
+#include <libp2p/net_supervisor.h>
 #include <libp2p/node.h>
 #include <libp2p/socket.h>
 #include <libdevcore/logger.h>
@@ -66,9 +66,7 @@ private:
 	ip::tcp::resolver resolver;
 
 public:
-	P2PConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context)
-	{
-	}
+	P2PConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context) {}
 
 	void tick(NetAddress addr) override
 	{
@@ -111,44 +109,62 @@ class CoindConnector : public Connector
 private:
 	io::io_context* context;
 	coind::ParentNetwork* net;
+	SupervisorElement* net_element;
 
 	ip::tcp::resolver resolver;
 
 public:
-	CoindConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context) {}
+	CoindConnector(auto _context, auto _net, SupervisorElement* _net_element) : context(_context), net(_net), net_element(net_element), resolver(*context) {}
 
-	void tick(NetAddress _addr) override
+	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
-		resolver.async_resolve(_addr.ip, _addr.port,
-							   [&, address = _addr, _handler = socket_handler](
-									   const boost::system::error_code &er,
-									   const boost::asio::ip::tcp::resolver::results_type endpoints)
-							   {
-								   if (er)
-                                   {
-									   LOG_WARNING << "P2PConnector[resolve](" << address.to_string() << "): " << er.message();
-									   return;
-								   }
-								   std::shared_ptr<ip::tcp::socket> _socket = std::make_shared<ip::tcp::socket>(*context);
-								   auto socket = new SocketType(_socket, net);
+		auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
+		auto socket = new SocketType(tcp_socket, net);
 
+		boost::asio::async_connect(*tcp_socket, endpoints,
+			[&, socket = std::move(socket)]
+			(const boost::system::error_code &ec, boost::asio::ip::tcp::endpoint ep)
+			{
+				if (!net_element->is_available())
+				{
+					delete socket;
+					return;
+				}
+				
+				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
+				if (!ec)
+				{
+					socket_handler(sock);
+					socket->read();
+				} else
+				{
+					LOG_ERROR << "async_connect: " << ec;
+				}
+			}
+		);
+	}
 
-								   boost::asio::async_connect(*_socket, endpoints,
-															  [sock = std::move(socket), handler = _handler](
-																	  const boost::system::error_code &ec,
-																	  boost::asio::ip::tcp::endpoint ep)
-															  {
-                                                                  LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":"
-                                                                           << ep.port();
-																  if (!ec)
-																  {
-																	  handler(sock);
-																	  sock->read();
-																  } else
-																  {
-																	  LOG_ERROR << "async_connect: " << ec;
-																  }
-															  });
-							   });
+	void stop()
+	{
+		resolver.cancel();
+	}
+
+	void tick(NetAddress address) override
+	{
+		resolver.async_resolve(address.ip, address.port,
+			[&, address = address]
+			(const boost::system::error_code &er, boost::asio::ip::tcp::resolver::results_type endpoints)
+			{
+				if (!net_element->is_available())
+					return;
+
+				if (er)
+				{
+					LOG_WARNING << "P2PConnector[resolve](" << address.to_string() << "): " << er.message();
+					return;
+				}
+				connect_socket(endpoints);
+			}
+		);
 	}
 };

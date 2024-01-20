@@ -39,5 +39,6 @@ public:
     {
         LOG_DEBUG_P2P << "Base Handshake disconnect called with reason: " << reason;
         socket->disconnect(reason);
+		delete socket;
     }
 };
