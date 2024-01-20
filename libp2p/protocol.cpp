@@ -16,4 +16,5 @@ void BaseProtocol::disconnect(const std::string &reason)
 {
     LOG_DEBUG_P2P << "BaseProtocol disconnect called!";
     socket->disconnect(reason);
+    delete socket;
 }
