@@ -28,7 +28,7 @@ public:
 public:
     uint64_t cur_share_version = 0;
 	coind::TXIDCache txidcache;
-	Event<> stop;
+	Event<> stop_event;
 
 	VariableDict<uint256, coind::data::tx_type> known_txs;
 	VariableDict<uint256, coind::data::tx_type> mining_txs;

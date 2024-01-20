@@ -37,14 +37,11 @@ public:
     CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(_net)
 	{ }
 
-//	// Write
-//	void write_prefix(std::shared_ptr<Message> msg);
-//	void write_message_data(std::shared_ptr<Message> msg);
+// Write
 
 	void write(std::shared_ptr<Message> msg) override
 	{
         LOG_DEBUG_COIND << "Coind socket write msg: " << msg->command;
-//		write_prefix(msg);
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
 
         LOG_DEBUG_COIND << "\tMessage data: " << *_msg;
@@ -81,14 +78,17 @@ public:
 
 	bool isConnected() override
 	{
-		return socket->is_open();
+		return socket && socket->is_open();
 	}
 
 	void disconnect(const std::string& reason) override
 	{
-        auto [_addr, _port] = get_addr();
-        LOG_WARNING << "Coind socket has been disconnected from " << _addr << ":" << _port << ", for a reason: " << reason;
-        LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
+        if (!reason.empty())
+        {
+            auto [_addr, _port] = get_addr();
+            LOG_WARNING << "Coind socket has been disconnected from " << _addr << ":" << _port << ", for a reason: " << reason;
+            LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
+        }
         event_disconnect->happened();
 		socket->close();
 	}

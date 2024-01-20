@@ -8,6 +8,7 @@
 #include <libcoind/p2p/coind_protocol.h>
 #include <libcoind/p2p/coind_messages.h>
 #include <libcoind/jsonrpc/coindrpc.h>
+#include <libp2p/net_supervisor.h>
 #include <libp2p/node.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
@@ -21,11 +22,11 @@ namespace ip = boost::asio::ip;
 class CoindNodeClient : virtual CoindNodeData
 {
 protected:
-    std::shared_ptr<Connector> connector; // from P2PNode::run()
+    std::unique_ptr<Connector> connector; // from P2PNode::run()
 
     CoindProtocol* protocol;
 public:
-    CoindNodeClient(io::io_context* _context) : CoindNodeData(_context){}
+    CoindNodeClient(io::io_context* _context) : CoindNodeData(_context) {}
 
     void error_handle(const NetAddress& addr, const std::string& err)
     {
@@ -54,7 +55,7 @@ protected:
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<coind::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class CoindNode : public virtual CoindNodeData, CoindNodeClient
+class CoindNode : public virtual CoindNodeData, public SupervisorElement, CoindNodeClient
 {
 private:
 	bool isRunning = false;
@@ -84,13 +85,40 @@ public:
         });
     }
 
+    // SupervisorElement
+    void stop() override
+    {
+        if (state == disconnected)
+            return;
+
+        // stop connector
+        connector->stop();
+
+        // disconnect protocol
+        if (protocol)
+        {
+            protocol->disconnect("");
+            
+            delete protocol;
+            protocol = nullptr;
+        }
+
+        set_state(disconnected);
+    }
+
+    void reconnect() override
+    {
+        connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
+    }
+
+    // Node
 	template <typename ConnectorType>
 	void run()
     {
         if (isRunning)
             throw std::runtime_error("CoindNode already running");
 
-        connector = std::make_shared<ConnectorType>(context, parent_net);
+        connector = std::make_unique<ConnectorType>(context, parent_net, this);
         connector->init(
                 // socket handler
                 [&](Socket* socket)

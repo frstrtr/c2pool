@@ -26,6 +26,7 @@ public:
     void disconnect(const std::string& reason) override
     {
         socket->disconnect(reason);
+		delete socket;
     }
 
 private:
@@ -63,7 +64,6 @@ private:
 
     void out_time_ping()
     {
-        //TODO: out of ping timer;
-        socket->disconnect("out time ping");
+        disconnect("out time ping");
     }
 };
