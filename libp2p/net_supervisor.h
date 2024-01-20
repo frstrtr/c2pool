@@ -7,8 +7,8 @@
 
 enum net_state
 {
-    disconnected,
-    reconnecting,
+    disconnected = 0,
+    processing,
     connected
 };
 
@@ -53,9 +53,19 @@ public:
     {
         state = new_state;
     }
+
+    bool is_connected() const
+    {
+        return state == connected;
+    }
+
+    bool is_available() const
+    {
+        return state != disconnected;
+    }
 public:
     // call once when initialize element
-    void init(uint8_t l, finish_type&& finish_func, restart_type&& restart_network_func) 
+    void init_supervisor(uint8_t l, finish_type&& finish_func, restart_type&& restart_network_func) 
     {
         layer = l;
         finish_reconnecting = std::move(finish_func);
@@ -91,6 +101,7 @@ protected:
         current = reconnect_queue.front();
         reconnect_queue.pop();
 
+        current->set_state(processing);
         current->reconnect();
     }
 public:
@@ -99,7 +110,7 @@ public:
         if (!layers[element->get_layer()].count(element))
         {
             layers[element->get_layer()].insert(element);
-            element->init(
+            element->init_supervisor(
                 layer, 
                 [this](SupervisorElement* element){ finish_element(element); },
                 [this](SupervisorElement* element, const std::string& reason){ restart(element, reason); }
