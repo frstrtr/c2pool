@@ -32,6 +32,7 @@ public:
     }
 
 	virtual void tick() = 0;
+    virtual void stop() = 0;
 };
 
 class Connector
@@ -54,6 +55,7 @@ public:
     }
 
 	virtual void tick(NetAddress _addr) = 0;
+    virtual void stop() = 0;
 };
 
 enum NodeRunState

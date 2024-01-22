@@ -161,8 +161,7 @@ void CoindNodeData::clean_tracker()
 void CoindNodeData::submit_block(coind::data::types::BlockType &block, bool ignore_failure)
 {
     // P2P
-
-    if (!is_connected())
+    if (!status->is_connected())
     {
         //TODO: add net.PARENT.BLOCK_EXPLORER_URL_PREFIX
         LOG_ERROR << "No bitcoind connection when block submittal attempted!"; //<< /*net.PARENT.BLOCK_EXPLORER_URL_PREFIX <<*/ /*bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header'])))*/

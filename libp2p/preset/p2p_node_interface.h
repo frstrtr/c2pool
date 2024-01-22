@@ -35,6 +35,11 @@ public:
 		LOG_INFO << "PoolNode Listener started for port: " << listen_ep.port();
 	}
 
+	void stop() override
+	{
+		//TODO:
+	}
+
 	void tick() override
 	{
 		acceptor.async_accept([this, handle = socket_handler, finish=finish_handler](boost::system::error_code ec, ip::tcp::socket _socket)
@@ -67,6 +72,11 @@ private:
 
 public:
 	P2PConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context) {}
+
+	void stop() override
+	{
+		//TODO:
+	}
 
 	void tick(NetAddress addr) override
 	{
@@ -109,12 +119,12 @@ class CoindConnector : public Connector
 private:
 	io::io_context* context;
 	coind::ParentNetwork* net;
-	SupervisorElement* net_element;
+	ConnectionStatus* status;
 
 	ip::tcp::resolver resolver;
 
 public:
-	CoindConnector(auto _context, auto _net, SupervisorElement* _net_element) : context(_context), net(_net), net_element(net_element), resolver(*context) {}
+	CoindConnector(auto _context, auto _net, ConnectionStatus* _status) : context(_context), net(_net), status(_status), resolver(*context) {}
 
 	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
@@ -125,26 +135,25 @@ public:
 			[&, socket = std::move(socket)]
 			(const boost::system::error_code &ec, boost::asio::ip::tcp::endpoint ep)
 			{
-				if (!net_element->is_available())
+				if (!status->is_available())
 				{
-					delete socket;
 					return;
 				}
 				
 				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
 				if (!ec)
 				{
-					socket_handler(sock);
-					socket->read();
+					socket_handler(socket);
 				} else
 				{
 					LOG_ERROR << "async_connect: " << ec;
+					delete socket;
 				}
 			}
 		);
 	}
 
-	void stop()
+	void stop() override
 	{
 		resolver.cancel();
 	}
@@ -155,7 +164,7 @@ public:
 			[&, address = address]
 			(const boost::system::error_code &er, boost::asio::ip::tcp::resolver::results_type endpoints)
 			{
-				if (!net_element->is_available())
+				if (!status->is_available())
 					return;
 
 				if (er)
