@@ -1,18 +1,45 @@
 #pragma once
 #include <map>
 #include <set>
-#include <queue>
+#include <stack>
 
 #include <libdevcore/logger.h>
 
 enum net_state
 {
     disconnected = 0,
-    processing,
+    disconnecting, // in progress to disconnect
+    processing, // in progress to connect
     connected
 };
 
-class SupervisorElement
+class ConnectionStatus 
+{
+protected:
+    net_state state {net_state::disconnected};
+public:
+    net_state get_state() const
+    {
+        return state;
+    }
+
+    void set_state(net_state new_state)
+    {
+        state = new_state;
+    }
+
+    bool is_available() const
+    {
+        return state != disconnected && state != disconnecting;
+    }
+
+    bool is_connected() const
+    {
+        return state == connected;
+    }
+};
+
+class SupervisorElement : public ConnectionStatus
 {
     typedef std::function<void(SupervisorElement*)> finish_type;
     typedef std::function<void(SupervisorElement*, std::string)> restart_type;
@@ -22,7 +49,6 @@ private:
     // functor, called when need stop and reconnecting all network [NetSupervisor::restart]
     restart_type restart_network;
 protected:
-    net_state state {net_state::disconnected};
     uint8_t layer{};
 public:
     SupervisorElement() = default;
@@ -39,29 +65,9 @@ public:
         restart_network(this, reason);
     }
 
-    net_state get_state() const
-    {
-        return state;
-    }
-
     uint8_t get_layer() const
     {
         return layer;
-    }
-
-    void set_state(net_state new_state)
-    {
-        state = new_state;
-    }
-
-    bool is_connected() const
-    {
-        return state == connected;
-    }
-
-    bool is_available() const
-    {
-        return state != disconnected;
     }
 public:
     // call once when initialize element
@@ -83,23 +89,22 @@ class NetSupervisor
 protected:
     // Network layers [0; 2^8]
     std::map<uint8_t, std::set<SupervisorElement*>> layers; 
-    // Container from which service reconnection occurs in the order of queue
-    std::queue<SupervisorElement*> reconnect_queue;
+    // Container from which service reconnection occurs in the order of stack
+    std::stack<SupervisorElement*> reconnect_elements;
     // Current element for reconnect
     SupervisorElement* current;
 protected:
-    // iterate reconnect_queue for reconnect();
-    inline void next_queue()
+    // iterate reconnect_elements for reconnect();
+    inline void next_element()
     {
-        // reconnect queue empty
-        if (!reconnect_queue.size())
+        if (reconnect_elements.empty())
         {
             current = nullptr;
             return;
         }
 
-        current = reconnect_queue.front();
-        reconnect_queue.pop();
+        current = reconnect_elements.top();
+        reconnect_elements.pop();
 
         current->set_state(processing);
         current->reconnect();
@@ -131,29 +136,33 @@ public:
         }
         
         element->set_state(connected);
-        next_queue();
+        next_element();
     }
 
     void restart(SupervisorElement* element, const std::string& reason)
     {
-        //TODO: REASON
-        std::queue<SupervisorElement*> new_reconnect_queue;
+        LOG_INFO << "Restart network from layer = " << element->get_layer() << "; reason: " << reason;
+        std::stack<SupervisorElement*> new_reconnect_elements;
 
         // Stop all supervisor elements upper.
-        auto layer_it = layers.find(element->get_layer());
-        while (layer_it != layers.end())
+        auto last_layer = element->get_layer();
+        for (auto layer_it = layers.rbegin(); layer_it != layers.rend(); layer_it++)
         {
             for (auto& el : layer_it->second)
             {
-                new_reconnect_queue.push(el);
+                new_reconnect_elements.push(el);
+                el->set_state(disconnecting);
                 el->stop();
             }
-            layer_it++;
+            
+            // layer_it == element->layer
+            if (last_layer == layer_it->first)
+                break;
         }
 
         // Start reconnect again
-        std::swap(reconnect_queue, new_reconnect_queue);
+        std::swap(reconnect_elements, new_reconnect_elements);
 
-        next_queue();
+        next_element();
     }
 };
