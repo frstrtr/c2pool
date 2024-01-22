@@ -14,14 +14,13 @@ namespace ip = io::ip;
 
 class CoindNodeData
 {
-private:
-    bool _connected = false;
 public:
 	io::io_context* context;
 	coind::ParentNetwork* parent_net;
 	ShareTracker* tracker;
 	CoindRPC* coind;
 	PoolNodeData* pool_node;
+	ConnectionStatus* status;
 
     std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
 	HandlerManagerPtr<CoindProtocol> handler_manager;
@@ -44,11 +43,11 @@ public:
 	Variable<coind::data::BlockHeaderType> best_block_header;
 	coind::HeightTracker get_height_rel_highest; // wanna for init get_block_height func!
 public:
-	CoindNodeData(io::io_context* _context) : context(_context)
+	CoindNodeData(io::io_context* _context, ConnectionStatus* _status) : context(_context), status(_status)
 	{
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
 
-        stop = make_event();
+        stop_event = make_event();
 
         known_txs = make_vardict<uint256, coind::data::tx_type>({});
         mining_txs = make_vardict<uint256, coind::data::tx_type>({});
@@ -101,15 +100,4 @@ public:
 	void handle_header(coind::data::BlockHeaderType new_header);
 
     void submit_block(coind::data::types::BlockType &block, bool ignore_failure);
-
-    void set_connection_status(bool value)
-    {
-        _connected = value;
-    }
-
-    // true after handle_message_verack
-    virtual bool is_connected()
-    {
-        return _connected;
-    }
 };

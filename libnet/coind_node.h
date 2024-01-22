@@ -26,7 +26,7 @@ protected:
 
     CoindProtocol* protocol;
 public:
-    CoindNodeClient(io::io_context* _context) : CoindNodeData(_context) {}
+    CoindNodeClient(io::io_context* _context, ConnectionStatus* status) : CoindNodeData(_context, status) {}
 
     void error_handle(const NetAddress& addr, const std::string& err)
     {
@@ -45,10 +45,13 @@ protected:
         LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
 
 		protocol = new CoindProtocol(context, socket, handler_manager);
-        protocol->get_socket()->event_disconnect->subscribe([]()
+        socket->event_disconnect->subscribe([]()
         {
             LOG_INFO << "COIND DISCONNECTED";
         });
+
+        // start accept messages
+        socket->read();
     }
 };
 
@@ -60,7 +63,7 @@ class CoindNode : public virtual CoindNodeData, public SupervisorElement, CoindN
 private:
 	bool isRunning = false;
 public:
-    CoindNode(io::io_context* _context) : CoindNodeData(_context), CoindNodeClient(context), work_poller_t(*context), forget_old_txs_t(*context)
+    CoindNode(io::io_context* _context) : CoindNodeData(_context, this), CoindNodeClient(context, this), work_poller_t(*context), forget_old_txs_t(*context)
     {
 		SET_POOL_DEFAULT_HANDLER(version);
 		SET_POOL_DEFAULT_HANDLER(verack);
@@ -98,7 +101,7 @@ public:
         if (protocol)
         {
             protocol->disconnect("");
-            
+
             delete protocol;
             protocol = nullptr;
         }
@@ -109,6 +112,7 @@ public:
     void reconnect() override
     {
         connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
+        reconnected();
     }
 
     // Node
