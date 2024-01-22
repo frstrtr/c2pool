@@ -23,7 +23,7 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-//									LOG_ERROR << "Coind read_prefix: " << ec << " " << ec.message();
+									// LOG_ERROR << "Coind read_prefix: " << ec << " " << ec.message();
                                     disconnect((boost::format("read_prefix (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});

@@ -115,9 +115,25 @@ void CoindNode::start()
 
 void CoindNode::work_poller()
 {
-    coind_work->set(coind->getwork(txidcache, known_txs->value()));
+    try 
+    {
+        coind_work->set(coind->getwork(txidcache, known_txs->value()));
+    } catch (const jsonrpccxx::JsonRpcException& ex)
+    {
+        coind->restart("work_poller getwork exception: " + std::string(ex.what()));
+        return;
+    }
+
     work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-    work_poller_t.async_wait([&](const boost::system::error_code &ec){ work_poller(); });
+    work_poller_t.async_wait(
+        [&](const boost::system::error_code &ec)
+        {
+            if (ec == boost::system::errc::operation_canceled && !status->is_available())
+                return;
+
+            work_poller(); 
+        }
+    );
 }
 
 void CoindNode::poll_header()
@@ -188,7 +204,7 @@ void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_v
         _proto->write(_msg);
     });
 
-    set_connection_status(true);
+    reconnected();
 
 //    pinger(30); //TODO: wanna for this?
 }
