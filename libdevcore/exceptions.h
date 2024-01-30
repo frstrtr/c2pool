@@ -2,6 +2,8 @@
 #include <string>
 #include <stdexcept>
 
+#include "types.h"
+
 namespace c2pool
 {
     enum ExceptionCode
@@ -54,13 +56,23 @@ struct NodeExcept : public c2pool::C2PoolExceptData
 
 struct NetExcept : public c2pool::C2PoolExceptData
 {
-    std::string ip;
+    NetAddress address;
 
-    NetExcept(std::string _ip) : c2pool::C2PoolExceptData(c2pool::net_errc), ip(_ip)
+    NetExcept(NetAddress _address) : c2pool::C2PoolExceptData(c2pool::net_errc), address(_address)
     {
 
     }
 };
+
+class coindrpc_exception : public c2pool::base_c2pool_exception
+{
+public:
+    coindrpc_exception(std::string reason, c2pool::C2PoolExceptData* data) : c2pool::base_c2pool_exception(reason, data)
+    {
+
+    }
+};
+
 class coind_exception : public c2pool::base_c2pool_exception
 {
 public:
@@ -79,6 +91,15 @@ public:
     }
 };
 
+class stratum_exception : public c2pool::base_c2pool_exception
+{
+public:
+    stratum_exception(std::string reason, c2pool::C2PoolExceptData* data) : c2pool::base_c2pool_exception(reason, data)
+    {
+
+    }
+};
+
 template <typename ExceptT, typename DataT, typename... Args>
 ExceptT make_except(std::string reason, Args... args)
 {
@@ -88,15 +109,15 @@ ExceptT make_except(std::string reason, Args... args)
 class NodeExceptionHandler 
 {
 public:
-    void HandleException(const c2pool::C2PoolExceptData* data)
+    void HandleException(const c2pool::base_c2pool_exception& ex)
     {
-        switch (data->code)
+        switch (ex.where())
         {
         case c2pool::node_errc:
             HandleNodeException();
             break;
         case c2pool::net_errc:
-            HandleNetException((NetExcept*)data);
+            HandleNetException((NetExcept*)ex.get_data());
             break;
         default:
             break;
