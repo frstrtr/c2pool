@@ -9,6 +9,7 @@
 #include <networks/network.h>
 #include <libp2p/net_supervisor.h>
 #include <libdevcore/logger.h>
+#include <libdevcore/exceptions.h>
 #include <libcoind/data.h>
 #include <libcoind/types.h>
 
@@ -20,7 +21,8 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = io::ip::tcp;
 
-class CoindRPC : public jsonrpccxx::IClientConnector, public SupervisorElement
+// In CoindRPC only NodeException!
+class CoindRPC : public jsonrpccxx::IClientConnector, public NodeExceptionHandler, public SupervisorElement
 {
 	const std::string id = "curltest";
 public:
@@ -134,7 +136,7 @@ public:
         }
         catch (const std::exception& ex)
         {
-        	restart("JSONRPC disconnected for reason: " + std::string(ex.what()));
+        	throw make_except<coindrpc_exception, NodeExcept>("error when try to read response -> " + std::string(ex.what()));
         }
 
 		std::string json_result = boost::beast::buffers_to_string(response.body().data());
@@ -182,5 +184,15 @@ public:
 	{
 		nlohmann::json j = nlohmann::json::object({{"rules", rules}});
 		return client.CallMethod<nlohmann::json>(id, "getblocktemplate", {j});
+	}
+protected:
+	void HandleNodeException() override
+	{
+		restart();
+	}
+
+    void HandleNetException(NetExcept* data) override
+	{
+		return;
 	}
 };
