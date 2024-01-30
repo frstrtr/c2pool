@@ -42,8 +42,8 @@ public:
 class SupervisorElement : public ConnectionStatus
 {
     typedef std::function<void(SupervisorElement*)> finish_type;
-    typedef std::function<void(SupervisorElement*, std::string)> restart_type;
-private:
+    typedef std::function<void(SupervisorElement*)> restart_type;
+
     // functor, called when finished reconnecting [NetSupervisor::finish_element]
     finish_type finish_reconnecting;
     // functor, called when need stop and reconnecting all network [NetSupervisor::restart]
@@ -60,9 +60,9 @@ public:
     }
     
     // stop and reconnect all network
-    void restart(const std::string& reason)
+    void restart()
     {
-        restart_network(this, reason);
+        restart_network(this);
     }
 
     uint8_t get_layer() const
@@ -80,7 +80,7 @@ public:
 
     // called for disconnect
     virtual void stop() = 0;
-    // 
+    // called for reconnect, when element disconnected
     virtual void reconnect() = 0;
 };
 
@@ -118,7 +118,7 @@ public:
             element->init_supervisor(
                 layer, 
                 [this](SupervisorElement* element){ finish_element(element); },
-                [this](SupervisorElement* element, const std::string& reason){ restart(element, reason); }
+                [this](SupervisorElement* element){ restart(element); }
             );
         }
         else
@@ -139,9 +139,9 @@ public:
         next_element();
     }
 
-    void restart(SupervisorElement* element, const std::string& reason)
+    void restart(SupervisorElement* element)
     {
-        LOG_INFO << "Restart network from layer = " << element->get_layer() << "; reason: " << reason;
+        LOG_INFO << "Restart network from layer = " << element->get_layer();
         std::stack<SupervisorElement*> new_reconnect_elements;
 
         // Stop all supervisor elements upper.
