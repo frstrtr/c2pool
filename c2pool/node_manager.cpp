@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <boost/asio.hpp>
+#include <libdevcore/exceptions.h>
 
 using boost::asio::ip::tcp;
 using namespace shares::types;
@@ -9,6 +10,37 @@ using namespace shares::types;
 
 NodeManager::NodeManager(c2pool::Network* _network, c2pool::dev::coind_config* _cfg, WebServer* _web) : _net(_network), _parent_net(_network->parent), _config(_cfg), _web_server(_web)
 {
+}
+
+void NodeManager::network_cycle()
+{
+    while (true)
+    {
+        try 
+        {
+            _context->run();
+            break;
+        }
+        catch (const coindrpc_exception& ex) //layer#1
+        {
+            LOG_ERROR << "CoindRPC exception: " << ex.what();
+            _coind_rpc->HandleException(ex);
+        }
+        catch (const coind_exception& ex) //layer#2
+        {
+            
+        }
+        catch (const pool_exception& ex) //layer#3
+        {
+
+        }
+        catch (const stratum_exception& ex) //layer#4
+        {
+
+        }
+        
+        _context->restart();
+    }
 }
 
 void NodeManager::run()
@@ -26,11 +58,11 @@ void NodeManager::run()
     // JSONRPC Coind
     LOG_INFO << "Init Coind (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "])...";
     
-    _coind = new CoindRPC(_context, _parent_net, CoindRPC::rpc_auth_data{_config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str()}, _config->jsonrpc_coind_login.c_str());
-    add(_coind, 0);
+    _coind_rpc = new CoindRPC(_context, _parent_net, CoindRPC::rpc_auth_data{_config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str()}, _config->jsonrpc_coind_login.c_str());
+    add(_coind_rpc, 0);
     do {
-        _coind->reconnect();
-    } while (!_coind->check());
+        _coind_rpc->reconnect();
+    } while (!_coind_rpc->check());
 
     // Determining payout address
     // TODO
@@ -43,6 +75,7 @@ void NodeManager::run()
 
     // Pool Node
     _pool_node = new PoolNode(_context);
+    // add(_pool_node, 2);
     _pool_node
             ->set_net(_net)
             ->set_config(_config)
@@ -55,7 +88,7 @@ void NodeManager::run()
 
     _coind_node
             ->set_parent_net(_parent_net)
-            ->set_coind(_coind)
+            ->set_coind(_coind_rpc)
             ->set_tracker(_tracker)
             ->set_pool_node(_pool_node);
 
@@ -69,11 +102,12 @@ void NodeManager::run()
 
     // Stratum
     _stratum = new StratumNode(_context, _worker);
+    // add(_stratum, 4);
     _stratum->listen();
 
     //...success!
     _is_loaded = true;
-    _context->run();
+    network_cycle();
 }
 
 bool NodeManager::is_loaded() const
@@ -111,9 +145,9 @@ PoolNode* NodeManager::pool_node() const
     return _pool_node;
 }
 
-CoindRPC* NodeManager::coind() const
+CoindRPC* NodeManager::coind_rpc() const
 {
-    return _coind;
+    return _coind_rpc;
 }
 
 CoindNode* NodeManager::coind_node() const
@@ -159,7 +193,7 @@ create_set_method(coind::ParentNetwork, _parent_net);
 create_set_method(c2pool::dev::coind_config, _config);
 create_set_method(c2pool::dev::AddrStore, _addr_store);
 create_set_method(PoolNode, _pool_node);
-create_set_method(CoindRPC, _coind);
+create_set_method(CoindRPC, _coind_rpc);
 create_set_method(CoindNode, _coind_node);
 create_set_method(ShareTracker, _tracker);
 //create_set_method(ShareStore, _share_store);

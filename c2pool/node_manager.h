@@ -19,16 +19,14 @@ class NodeManager : public NetSupervisor
 {
 protected:
     NodeManager() {}
-
+    
+    void network_cycle();
 public:
     NodeManager(c2pool::Network* _network, c2pool::dev::coind_config* _cfg, WebServer* _web);
+    //TODO: ~NodeManager();
 
     void start() {}
-
-    // ~NodeManager();
-
     void run();
-
     bool is_loaded() const;
 
 public:
@@ -38,7 +36,7 @@ public:
     c2pool::dev::coind_config* config() const;
     c2pool::dev::AddrStore* addr_store() const;
     PoolNode* pool_node() const;
-    CoindRPC* coind() const;
+    CoindRPC* coind_rpc() const;
     CoindNode* coind_node() const;
     ShareTracker* tracker() const;
     Worker* worker() const;
@@ -52,7 +50,7 @@ protected:
     c2pool::dev::coind_config* _config;
     c2pool::dev::AddrStore* _addr_store;
     PoolNode* _pool_node;
-    CoindRPC* _coind;
+    CoindRPC* _coind_rpc;
     CoindNode* _coind_node;
     ShareTracker* _tracker;
     Worker* _worker;
@@ -81,7 +79,7 @@ public:
     create_set_method(c2pool::dev::coind_config, _config);
     create_set_method(c2pool::dev::AddrStore, _addr_store);
     create_set_method(PoolNode, _pool_node);
-    create_set_method(CoindRPC, _coind);
+    create_set_method(CoindRPC, _coind_rpc);
     create_set_method(CoindNode, _coind_node);
     create_set_method(ShareTracker, _tracker);
     create_set_method(Worker, _worker);
