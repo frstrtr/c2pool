@@ -58,7 +58,7 @@ protected:
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<coind::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class CoindNode : public virtual CoindNodeData, public SupervisorElement, CoindNodeClient
+class CoindNode : public virtual CoindNodeData, public NodeExceptionHandler, public SupervisorElement, CoindNodeClient
 {
 private:
 	bool isRunning = false;
@@ -100,7 +100,7 @@ public:
         // disconnect protocol
         if (protocol)
         {
-            protocol->disconnect("");
+            protocol->disconnect();
 
             delete protocol;
             protocol = nullptr;
@@ -139,6 +139,17 @@ public:
         start();
         isRunning = true;
     }
+
+protected:
+    void HandleNodeException() override
+	{
+		restart();
+	}
+
+    void HandleNetException(NetExcept* data) override
+	{
+		restart();
+	}
 public:
 
     void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol);

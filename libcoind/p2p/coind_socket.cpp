@@ -2,6 +2,7 @@
 
 #include <libp2p/preset/p2p_socket_data.h>
 #include <libdevcore/str.h>
+#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 
@@ -18,13 +19,12 @@ void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
                                     {
                                         read_command(msg);
                                     } else {
-                                        disconnect("prefix doesn't match");
+										throw make_except<coind_exception, NodeExcept>("[socket] prefix doesn't match");
                                     }
 								}
 								else
 								{
-									// LOG_ERROR << "Coind read_prefix: " << ec << " " << ec.message();
-                                    disconnect((boost::format("read_prefix (%1%: %2%)") % ec % ec.message()).str());
+									throw make_except<coind_exception, NodeExcept>((boost::format("[socket] read_prefix (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -42,7 +42,7 @@ void CoindSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    disconnect((boost::format("read_command (%1%: %2%)") % ec % ec.message()).str());
+									throw make_except<coind_exception, NodeExcept>((boost::format("[socket] read_command (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -59,7 +59,7 @@ void CoindSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    disconnect((boost::format("read_length (%1%: %2%)") % ec % ec.message()).str());
+                                    throw make_except<coind_exception, NodeExcept>((boost::format("[socket] read_length (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -76,7 +76,7 @@ void CoindSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    disconnect((boost::format("read_checksum (%1%: %2%)") % ec % ec.message()).str());
+                                    throw make_except<coind_exception, NodeExcept>((boost::format("[socket] read_checksum (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -95,14 +95,12 @@ void CoindSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 							{
 								if (!ec)
 								{
-									// LOG_INFO << "read_payload";
-//									LOG_DEBUG << "HANDLE MESSAGE!";
 									final_read_message(msg);
 									read();
 								}
 								else
 								{
-                                    disconnect((boost::format("read_payload (%1%: %2%)") % ec % ec.message()).str());
+                                    throw make_except<coind_exception, NodeExcept>((boost::format("[socket] read_payload (%1%: %2%)") % ec % ec.message()).str());
 								}
 							});
 }
@@ -114,8 +112,7 @@ void CoindSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
     if (!c2pool::dev::compare_str(checksum.data(), msg->checksum, 4))
     {
         auto [ip, port] = get_addr();
-        disconnect((boost::format("Invalid hash for %1%:%2%, command %3%") % ip % port % msg->command).str());
-        return;
+		throw make_except<coind_exception, NodeExcept>((boost::format("[socket] Invalid hash for %1%:%2%, command %3%") % ip % port % msg->command).str());
     }
 
 	//Make raw message

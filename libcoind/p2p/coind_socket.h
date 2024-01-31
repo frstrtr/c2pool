@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include <libdevcore/exceptions.h>
 #include <libp2p/preset/p2p_socket_data.h>
 #include <libp2p/socket.h>
 #include <libp2p/message.h>
@@ -48,18 +49,18 @@ public:
 
         add_not_received(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-                                 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
-                                 {
-                                     LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
-                                     if (_ec)
-                                     {
-                                         disconnect((boost::format("write error (%1%: %2%)") % _ec % _ec.message()).str());
-                                     } else
-                                     {
-                                         last_message_sent = cmd;
-                                         remove_not_received(cmd);
-                                     }
-                                 });
+                                [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
+                                {
+                                    LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
+                                    if (_ec)
+                                    {
+                                        throw make_except<coind_exception, NodeExcept>((boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str());
+                                    } else
+                                    {
+                                        last_message_sent = cmd;
+                                        remove_not_received(cmd);
+                                    }
+                                });
 	}
 
 	// Read
@@ -81,15 +82,12 @@ public:
 		return socket && socket->is_open();
 	}
 
-	void disconnect(const std::string& reason) override
+	void disconnect() override
 	{
-        if (!reason.empty())
-        {
-            auto [_addr, _port] = get_addr();
-            LOG_WARNING << "Coind socket has been disconnected from " << _addr << ":" << _port << ", for a reason: " << reason;
-            LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
-        }
-        event_disconnect->happened();
+        LOG_WARNING << "Coind socket has been disconnected from " << get_addr().to_string() << ".";
+        LOG_INFO.stream() << "\tLast message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
+
 		socket->close();
+        event_disconnect->happened();
 	}
 };

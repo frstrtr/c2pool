@@ -1,6 +1,7 @@
 #include "coind_node.h"
 
 #include <libdevcore/deferred.h>
+#include <libdevcore/exceptions.h>
 
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
@@ -120,7 +121,7 @@ void CoindNode::work_poller()
         coind_work->set(coind->getwork(txidcache, known_txs->value()));
     } catch (const jsonrpccxx::JsonRpcException& ex)
     {
-        coind->restart("work_poller getwork exception: " + std::string(ex.what()));
+        throw make_except<coindrpc_exception, NodeExcept>("work_poller getwork exception -> " + std::string(ex.what()));
         return;
     }
 
