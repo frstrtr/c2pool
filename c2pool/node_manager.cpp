@@ -28,7 +28,8 @@ void NodeManager::network_cycle()
         }
         catch (const coind_exception& ex) //layer#2
         {
-            
+            LOG_ERROR << "Coind Node exception: " << ex.what();
+            _coind_node->HandleException(ex);
         }
         catch (const pool_exception& ex) //layer#3
         {

@@ -12,9 +12,9 @@ void BaseProtocol::set_socket(Socket* _socket)
     _socket->set_message_handler(std::bind(&BaseProtocol::handle, this, std::placeholders::_1));
 }
 
-void BaseProtocol::disconnect(const std::string &reason)
+void BaseProtocol::disconnect()
 {
     LOG_DEBUG_P2P << "BaseProtocol disconnect called!";
-    socket->disconnect(reason);
+    socket->disconnect();
     delete socket;
 }

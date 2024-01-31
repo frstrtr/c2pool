@@ -10,6 +10,7 @@
 #include <libp2p/handler.h>
 #include <libp2p/protocol_events.h>
 #include <libdevcore/deferred.h>
+#include <libdevcore/exceptions.h>
 
 //https://en.bitcoin.it/wiki/Protocol_documentation
 class CoindProtocol : public Protocol<CoindProtocol>, public CoindProtocolData, ProtocolPinger
@@ -23,9 +24,9 @@ public:
 		send_version();
     }
 
-    void disconnect(const std::string& reason) override
+    void disconnect() override
     {
-        socket->disconnect(reason);
+        socket->disconnect();
 		delete socket;
     }
 
@@ -64,6 +65,6 @@ private:
 
     void out_time_ping()
     {
-        disconnect("out time ping");
+        throw make_except<coind_exception, NodeExcept>("out time ping");
     }
 };

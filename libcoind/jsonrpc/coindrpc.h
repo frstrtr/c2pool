@@ -21,7 +21,6 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = io::ip::tcp;
 
-// In CoindRPC only NodeException!
 class CoindRPC : public jsonrpccxx::IClientConnector, public NodeExceptionHandler, public SupervisorElement
 {
 	const std::string id = "curltest";
@@ -193,6 +192,6 @@ protected:
 
     void HandleNetException(NetExcept* data) override
 	{
-		return;
+		restart();
 	}
 };
