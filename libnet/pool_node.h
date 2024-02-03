@@ -14,6 +14,7 @@
 #include "pool_node_data.h"
 #include <libp2p/handler.h>
 #include <libp2p/node.h>
+#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
@@ -177,7 +178,7 @@ public:
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class PoolNode : public virtual PoolNodeData, PoolNodeServer, PoolNodeClient, protected WebPoolNode
+class PoolNode : public virtual PoolNodeData, public NodeExceptionHandler, PoolNodeServer, PoolNodeClient, protected WebPoolNode
 {
     struct DownloadShareManager
     {
@@ -391,5 +392,16 @@ private:
 //    void download_shares();
 
     void init_web_metrics() override;
+
+protected:
+    void HandleNodeException() override
+	{
+		restart();
+	}
+
+    void HandleNetException(NetExcept* data) override
+	{
+		//TODO
+	}
 };
 #undef SET_POOL_DEFAULT_HANDLER

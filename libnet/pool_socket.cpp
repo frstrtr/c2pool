@@ -18,13 +18,12 @@ void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
                                     {
                                         read_command(msg);
                                     } else {
-                                        disconnect("prefix doesn't match");
+										throw make_except<pool_exception, NetExcept>("[socket] prefix doesn't match", get_addr());
                                     }
 								}
 								else
 								{
-                                    std::string reason = "read_prefix: " + ec.message();
-                                    disconnect(reason);
+                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_prefix (%1%: %2%)") % ec % ec.message()).str(), get_addr());
 								}
 							});
 }
@@ -42,8 +41,7 @@ void PoolSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    std::string reason = "read_command: " + ec.message();
-                                    disconnect(reason);
+                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_command (%1%: %2%)") % ec % ec.message()).str(), get_addr());
 								}
 							});
 }
@@ -60,8 +58,7 @@ void PoolSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    std::string reason = "read_length: " + ec.message();
-                                    disconnect(reason);
+                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_length (%1%: %2%)") % ec % ec.message()).str(), get_addr());
 								}
 							});
 }
@@ -78,8 +75,7 @@ void PoolSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    std::string reason = "read_checksum: " + ec.message();
-                                    disconnect(reason);
+                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_checksum (%1%: %2%)") % ec % ec.message()).str(), get_addr());
 								}
 							});
 }
@@ -103,8 +99,7 @@ void PoolSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 								}
 								else
 								{
-                                    std::string reason = "read_payload: " + ec.message();
-                                    disconnect(reason);
+                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_payload (%1%: %2%)") % ec % ec.message()).str(), get_addr());
 								}
 							});
 }
@@ -115,10 +110,7 @@ void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 	auto checksum = coind::data::hash256(PackStream(msg->payload, msg->unpacked_len), true).GetChars();
     if (!c2pool::dev::compare_str(checksum.data(), msg->checksum, 4))
     {
-        auto [ip, port] = get_addr();
-        std::string reason = "final_read_message: Invalid hash for " + ip + ":" + port + ", command = " + msg->command;
-        disconnect(reason);
-        return;
+		throw make_except<coind_exception, NetExcept>((boost::format("[socket] Invalid hash for %1%, command %2%") % get_addr().to_string() % msg->command).str(), get_addr());
     }
 
 	//Make raw message

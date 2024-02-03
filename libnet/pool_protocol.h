@@ -8,6 +8,7 @@
 
 #include "pool_protocol_data.h"
 #include "pool_messages.h"
+#include <libdevcore/exceptions.h>
 #include <libp2p/protocol.h>
 #include <libp2p/handler.h>
 #include <libcoind/transaction.h>
@@ -41,7 +42,7 @@ public:
 	void out_time_ping()
 	{
 		//TODO: out of ping timer;
-        disconnect("out of ping");
+        throw make_except<pool_exception, NetExcept>("out time ping", get_addr());
 	}
 
 	void bad_peer_happened()
@@ -49,8 +50,8 @@ public:
 		// TODO:
 	}
 
-    void disconnect(const std::string& reason) override
+    void disconnect() override
     {
-        socket->disconnect(reason);
+        socket->disconnect();
     }
 };

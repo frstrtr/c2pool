@@ -8,6 +8,7 @@
 #include <libp2p/message.h>
 #include <networks/network.h>
 #include <libdevcore/logger.h>
+#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 
@@ -21,8 +22,6 @@ private:
     {
         boost::system::error_code ec;
         auto ep = socket->remote_endpoint(ec);
-//        LOG_INFO << socket->local_endpoint(ec).address().to_string();
-        // TODO: log ec;
         addr = {ep.address().to_string(), std::to_string(ep.port())};
     }
 public:
@@ -37,7 +36,8 @@ public:
         LOG_DEBUG_POOL << "PoolSocket created2";
 	}
 
-	~PoolSocket(){
+	~PoolSocket()
+    {
         LOG_DEBUG_POOL << "PoolSocket removed";
 	}
 
@@ -61,8 +61,7 @@ public:
                                      LOG_DEBUG_POOL << "[PoolSocket] peer receive message_" << cmd;
                                      if (_ec)
                                      {
-                                         std::string reason = "write error: " + _ec.message();
-                                         disconnect(reason);
+                                        throw make_except<pool_exception, NetExcept>((boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str(), get_addr());
                                      } else
                                      {
                                         last_message_sent = cmd;
@@ -90,12 +89,12 @@ public:
 		return socket->is_open();
 	}
 
-	void disconnect(const std::string& reason) override
+	void disconnect() override
 	{
-        auto [_addr, _port] = get_addr();
-        LOG_WARNING << "Pool socket has been disconnected from " << _addr << ":" << _port << ", for a reason: " << reason;
+        LOG_WARNING << "Pool socket has been disconnected from " << get_addr().to_string() << ".";
         LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
-        event_disconnect->happened();
+
 		socket->close();
+        event_disconnect->happened();
 	}
 };
