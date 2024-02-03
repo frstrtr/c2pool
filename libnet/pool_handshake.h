@@ -7,6 +7,7 @@
 #include "pool_messages.h"
 #include "pool_protocol_data.h"
 #include <libp2p/handshake.h>
+#include <libdevcore/exceptions.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/types.h>
 
@@ -34,7 +35,8 @@ protected:
 
 public:
     PoolHandshake(auto socket, msg_version_handler_type _handler)
-            : Handshake(socket), PoolProtocolData(3501, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
+            : 	Handshake(socket), 
+				PoolProtocolData(3501, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
                         LOG_DEBUG_POOL << "ID: " << _id.GetHex();
@@ -46,7 +48,13 @@ public:
 //                        auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, 10 /*_parents*/, _stops);
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
                         _socket->write(msg);
-                    }, 15, [_socket = socket](std::string msg){_socket->disconnect((boost::format("Timeout get_shares: %1%") % msg).str());})), handle_message_version(std::move(_handler))
+                    }, 15, 
+					[addr = get_addr()](std::string msg)
+					{
+						throw make_except<pool_exception, NetExcept>((boost::format("Timeout get_shares: %1%") % msg).str(), addr);
+					})
+				), 
+				handle_message_version(std::move(_handler))
     { }
 };
 
@@ -62,11 +70,11 @@ public:
 	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
 	{
         LOG_DEBUG_POOL << "Pool handshake server handle message: " << raw_msg->command;
+		if (raw_msg->command != "version")
+			throw make_except<pool_exception, NetExcept>("[PoolHandshakeServer] msg != version", get_addr());
+
 		try
 		{
-			if (raw_msg->command != "version")
-				throw std::runtime_error("msg != version");
-
 			auto msg = std::make_shared<pool::messages::message_version>();
 			raw_msg->value >> *msg;
 
@@ -74,10 +82,9 @@ public:
 			handle_message_version(msg, this);
 		} catch (const std::runtime_error &ec)
 		{
-            std::string reason = "[PoolHandshakeServer] handle_message error = " + std::string(ec.what());
-            disconnect(reason);
-			return;
+			throw make_except<pool_exception, NetExcept>("[PoolHandshakeServer] handle_message error = " + std::string(ec.what()), get_addr());
 		}
+
 		send_version();
 		handshake_finish(this);
 	}
@@ -95,11 +102,11 @@ public:
 	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
 	{
         LOG_DEBUG_POOL << "Pool handshake client handle message: " << raw_msg->command;
+        if (raw_msg->command != "version")
+            throw make_except<pool_exception, NetExcept>("[PoolHandshakeClient] msg != version", get_addr());
+
         try
         {
-            if (raw_msg->command != "version")
-                throw std::runtime_error("msg != version");
-
             auto msg = std::make_shared<pool::messages::message_version>();
             raw_msg->value >> *msg;
 
@@ -107,8 +114,7 @@ public:
             handle_message_version(msg, this);
         } catch (const std::runtime_error &ec)
         {
-            std::string reason = "[PoolHandshakeClient] handle_message error = " + std::string(ec.what());
-            disconnect(reason);
+			throw make_except<pool_exception, NetExcept>("[PoolHandshakeClient] handle_message error = " + std::string(ec.what()), get_addr());
         }
 		handshake_finish(this);
 	}
