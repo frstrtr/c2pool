@@ -12,6 +12,7 @@
 #include "pool_protocol.h"
 #include "pool_handshake.h"
 #include "pool_node_data.h"
+#include <libp2p/net_supervisor.h>
 #include <libp2p/handler.h>
 #include <libp2p/node.h>
 #include <libdevcore/exceptions.h>
@@ -27,7 +28,7 @@ class PoolNodeServer : virtual PoolNodeData
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 
 protected:
-	std::shared_ptr<Listener> listener; // from P2PNode::run()
+	std::unique_ptr<Listener> listener; // from P2PNode::run()
 
     std::map<Socket*, PoolHandshakeServer*> server_attempts;
     std::map<HOST_IDENT, PoolProtocol*> server_connections;
@@ -79,13 +80,38 @@ public:
     {
         listener->tick();
     }
+
+    void stop_server()
+    {   
+        // disable listener
+        listener->stop();
+
+        // disconnect and delete all server_connections
+        for (auto& [addr, protocol] : server_connections) 
+        {
+            if (protocol)
+            {
+                protocol->disconnect();
+                delete protocol;
+            }            
+        }
+        server_connections.clear();
+
+        // stop all server attempts
+        for (auto& [socket, handshake] : server_attempts)
+        {
+            handshake->disconnect();
+            delete handshake;
+        }
+        server_attempts.clear();
+    }
 };
 
 class PoolNodeClient : virtual PoolNodeData
 {
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 protected:
-	std::shared_ptr<Connector> connector; // from P2PNode::run()
+	std::unique_ptr<Connector> connector; // from P2PNode::run()
 
 	std::map<HOST_IDENT, PoolHandshakeClient*> client_attempts;
     std::map<HOST_IDENT, PoolProtocol*> client_connections;
@@ -132,7 +158,8 @@ public:
     {
         if (ec)
         {
-            LOG_ERROR << "P2PNode::auto_connect: " << ec.message();
+            if (ec != boost::system::errc::operation_canceled)
+                LOG_ERROR << "P2PNode::auto_connect: " << ec.message();
             return;
         }
 
@@ -173,12 +200,40 @@ public:
     }
 
 	std::vector<NetAddress> get_good_peers(int max_count);
+
+    void stop_client()
+    {   
+        // disable connector
+        connector->stop();
+
+        // disconnect and delete all client_connections
+        for (auto& [addr, protocol] : client_connections) 
+        {
+            if (protocol)
+            {
+                protocol->disconnect();
+                delete protocol;
+            }            
+        }
+        client_connections.clear();
+
+        // stop all client attempts
+        for (auto& [socket, handshake] : client_attempts)
+        {
+            handshake->disconnect();
+            delete handshake;
+        }
+        client_attempts.clear();
+
+        // stop auto_connect_timer
+        auto_connect_timer.cancel();
+    }
 };
 
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
 
-class PoolNode : public virtual PoolNodeData, public NodeExceptionHandler, PoolNodeServer, PoolNodeClient, protected WebPoolNode
+class PoolNode : public virtual PoolNodeData, public NodeExceptionHandler, public SupervisorElement, PoolNodeServer, PoolNodeClient, protected WebPoolNode
 {
     struct DownloadShareManager
     {
@@ -317,7 +372,7 @@ public:
 	{
 		if (run_state == both || run_state == onlyServer)
         {
-            listener = std::make_shared<ListenerType>(context, net, config->c2pool_port);
+            listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
             listener->init(
                     // socket_handle
                     [&](Socket* socket)
@@ -340,7 +395,7 @@ public:
 
 		if (run_state == both || run_state == onlyClient)
 		{
-			connector = std::make_shared<ConnectorType>(context, net);
+			connector = std::make_unique<ConnectorType>(context, net);
             connector->init(
                     // socket_handler
                     [&](Socket* socket)
@@ -394,6 +449,25 @@ private:
     void init_web_metrics() override;
 
 protected:
+    // SupervisorElement
+    void stop() override
+    {
+        if (state == disconnected)
+            return;
+
+        stop_server();
+        stop_client();
+
+        set_state(disconnected);
+    }
+
+    void reconnect() override
+    {
+        //TODO: restart server+client
+        reconnected();
+    }
+
+    // NodeExceptionHandler
     void HandleNodeException() override
 	{
 		restart();
@@ -401,7 +475,7 @@ protected:
 
     void HandleNetException(NetExcept* data) override
 	{
-		//TODO
+		//TODO: disconnect peer
 	}
 };
 #undef SET_POOL_DEFAULT_HANDLER
