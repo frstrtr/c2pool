@@ -37,7 +37,7 @@ public:
 
 	void stop() override
 	{
-		//TODO:
+		acceptor.cancel();
 	}
 
 	void tick() override
@@ -54,6 +54,7 @@ public:
 								  else
 								  {
 									  LOG_ERROR << "P2P Listener: " << ec.message();
+									  error_handler()
 								  }
 								  finish();
 							  });
@@ -75,7 +76,7 @@ public:
 
 	void stop() override
 	{
-		//TODO:
+		resolver.cancel();
 	}
 
 	void tick(NetAddress addr) override
@@ -86,8 +87,12 @@ public:
 									   const boost::system::error_code &er,
 									   const boost::asio::ip::tcp::resolver::results_type endpoints)
                                {
-                                   if (er)
-                                       error_handler(_addr, "(resolver)" + er.message());
+                                   if (er) 
+								   {
+										if (er != boost::system::errc::operation_canceled)
+                                       		error_handler(_addr, "(resolver)" + er.message());
+										return;
+								   }
 
                                    auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
                                    auto socket = new SocketType(tcp_socket, net, connection_type::outgoing);

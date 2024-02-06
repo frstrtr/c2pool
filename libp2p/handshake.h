@@ -37,7 +37,6 @@ public:
 
     virtual void disconnect()
     {
-        LOG_DEBUG_P2P << "Base Handshake disconnect called";
         socket->disconnect();
 		delete socket;
     }
