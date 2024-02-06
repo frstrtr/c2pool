@@ -21,7 +21,7 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-#define HOST_IDENT std::string
+#define HOST_IDENT NetAddress
 
 class PoolNodeServer : virtual PoolNodeData
 {
@@ -30,7 +30,7 @@ class PoolNodeServer : virtual PoolNodeData
 protected:
 	std::unique_ptr<Listener> listener; // from P2PNode::run()
 
-    std::map<Socket*, PoolHandshakeServer*> server_attempts;
+    std::map<HOST_IDENT, PoolHandshakeServer*> server_attempts;
     std::map<HOST_IDENT, PoolProtocol*> server_connections;
 private:
     msg_version_handler_type message_version_handle;
@@ -39,10 +39,8 @@ public:
 
 	void socket_handle(Socket* socket)
     {
-        // TODO: remove
-        auto _socket = socket;
         socket->set_addr();
-        server_attempts[_socket] = new PoolHandshakeServer(std::move(socket), message_version_handle,
+        server_attempts[socket->get_addr()] = new PoolHandshakeServer(socket, message_version_handle,
                                                                          [&](PoolHandshake* _handshake)
                                                                          {
                                                                             handshake_handle(_handshake);
@@ -50,30 +48,32 @@ public:
         );
     }
 
-    void handshake_handle(PoolHandshake* _handshake)
+    void handshake_handle(PoolHandshake* handshake)
     {
-        LOG_DEBUG_POOL << "PoolServer has been connected to: " << _handshake->get_socket();
-		auto _protocol = new PoolProtocol(context, _handshake->get_socket(), handler_manager, _handshake);
+        LOG_DEBUG_POOL << "PoolServer has been connected to: " << handshake->get_socket();
+        auto sock = handshake->get_socket();
+        auto addr = sock->get_addr();
 
-        auto _sock = _protocol->get_socket();
-        auto ip = _sock->get_addr().ip;
-        peers[_protocol->nonce] = _protocol;
+		auto protocol = new PoolProtocol(context, sock, handler_manager, handshake);
+        peers[protocol->nonce] = protocol;
 
-        _sock->event_disconnect->subscribe(
-                [&, _ip = ip]()
+        sock->event_disconnect->subscribe(
+                [&, addr = addr]()
                 {
-                    auto proto = server_connections[_ip];
+                    auto proto = server_connections[addr];
 
                     proto->stop();
                     peers.erase(proto->nonce);
-                    server_connections.erase(_ip);
+                    server_connections.erase(addr);
                 });
-        server_connections[ip] = _protocol;
+        server_connections[addr] = protocol;
     }
 
+    // handshake error in listener
     void error_handle(const NetAddress& addr, const std::string& err)
     {
         LOG_ERROR << "Pool Server error: " << err;
+        server_attempts.erase(addr);
     }
 
 	void listen()
@@ -126,8 +126,7 @@ public:
     void socket_handle(Socket* socket)
     {
         socket->set_addr();
-        auto addr = socket->get_addr();
-        client_attempts[addr.ip] =
+        client_attempts[socket->get_addr()] =
                 new PoolHandshakeClient(socket, message_version_handle,
                                                       [&](PoolHandshake* _handshake){ handshake_handle(_handshake);});
     }
@@ -135,23 +134,23 @@ public:
     void handshake_handle(PoolHandshake* handshake)
     {
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << handshake->get_socket();
-        auto _protocol = new PoolProtocol(context, handshake->get_socket(), handler_manager, handshake);
+        auto sock = handshake->get_socket();
+        auto addr = sock->get_addr();
+        auto protocol = new PoolProtocol(context, sock, handler_manager, handshake);
 
-        auto _sock = _protocol->get_socket();
-        auto ip = _sock->get_addr().ip;
-        peers[_protocol->nonce] = _protocol;
-        _sock->event_disconnect->subscribe(
-                [&, _ip = ip]()
+        peers[protocol->nonce] = protocol;
+        sock->event_disconnect->subscribe(
+                [&, addr=addr]()
                 {
-                    auto proto = client_connections[_ip];
+                    auto proto = client_connections[addr];
 
                     proto->stop();
                     peers.erase(proto->nonce);
-                    client_connections.erase(_ip);
+                    client_connections.erase(addr);
                 });
 
-        client_connections[ip] = _protocol;
-	    client_attempts.erase(ip);
+        client_connections[addr] = protocol;
+	    client_attempts.erase(addr);
     }
 
     void try_connect(const boost::system::error_code& ec)
@@ -170,13 +169,13 @@ public:
 
         for (const auto &addr: get_good_peers(1))
         {
-            if (client_attempts.count(addr.ip) || client_connections.count(addr.ip))
+            if (client_attempts.count(addr) || client_connections.count(addr))
             {
 //                LOG_WARNING << "Client already connected to " << addr.to_string() << "!";
                 continue;
             }
             LOG_TRACE << "try to connect: " << addr.to_string();
-            client_attempts[addr.ip] = nullptr;
+            client_attempts[addr] = nullptr;
             connector->tick(addr);
         }
 
@@ -193,10 +192,11 @@ public:
                 });
     }
 
+    // handshake error in connector
     void error_handle(const NetAddress& addr, const std::string& err)
     {
         LOG_ERROR << "Pool Server[->" << addr.to_string() << "] error: " << err;
-        client_attempts.erase(addr.ip);
+        client_attempts.erase(addr);
     }
 
 	std::vector<NetAddress> get_good_peers(int max_count);
