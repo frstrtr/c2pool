@@ -55,7 +55,7 @@ int main(int ac, char *av[])
 //			->set_net(net)
 //			->set_config(config)
 //			->set_addr_store(addr_store);
-//	pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>(pool_node_mode);
+//	pool_node->run<PoolListener<PoolSocket>, P2PConnector<PoolSocket>>(pool_node_mode);
 
 	// JSONRPC Coind
 	std::shared_ptr<coind::JSONRPC_Coind> coind = std::make_shared<coind::JSONRPC_Coind>(context, parent_net, coind_ip, coind_port, coind_login);

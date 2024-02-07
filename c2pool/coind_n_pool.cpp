@@ -75,7 +75,7 @@ int main(int ac, char *av[])
     pool_node->set_coind_node(coind_node);
 
     coind_node->run<CoindConnector<CoindSocket>>();
-    pool_node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
+    pool_node->run<PoolListener<PoolSocket>, P2PConnector<PoolSocket>>();
 
 
 //     Worker
