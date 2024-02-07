@@ -173,6 +173,9 @@ int main(int argc, char *argv[])
 //        std::cout << "main thread: " << (DGB == nullptr) << std::endl;
     }
 
+    //TODO: REMOVE!
+    std::exit(-1);
+
     if (web_server_thread.joinable())
         web_server_thread.join();
 

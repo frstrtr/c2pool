@@ -35,7 +35,7 @@ int main()
 		->set_config(config)
 		->set_addr_store(addr_store)
         ->set_tracker(tracker);
-	node->run<P2PListener<PoolSocket>, P2PConnector<PoolSocket>>();
+	node->run<PoolListener<PoolSocket>, P2PConnector<PoolSocket>>();
 
 	// DEBUG
 	boost::asio::steady_timer t(*context, 10s);

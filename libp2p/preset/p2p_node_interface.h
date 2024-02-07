@@ -15,24 +15,28 @@ namespace io = boost::asio;
 namespace ip = io::ip;
 
 template <typename SocketType>
-class P2PListener : public Listener
+class PoolListener : public Listener
 {
 private:
 	io::io_context* context;
 	c2pool::Network* net;
 
 	ip::tcp::acceptor acceptor;
+	ip::tcp::endpoint listen_ep;
 public:
-	P2PListener(auto _context, auto _net, auto port) : context(_context), net(_net), acceptor(*context)
+	PoolListener(auto _context, auto _net, auto port) 
+		: context(_context), net(_net), acceptor(*context), listen_ep(ip::tcp::v4(), port) 
 	{
-		ip::tcp::endpoint listen_ep(ip::tcp::v4(), port);
+	}
 
+	void run() override
+	{
 		acceptor.open(listen_ep.protocol());
 		acceptor.set_option(io::socket_base::reuse_address(true));
 		acceptor.bind(listen_ep);
 		acceptor.listen();
 
-		LOG_INFO << "PoolNode Listener started for port: " << listen_ep.port();
+		LOG_INFO << "PoolListener started for port: " << listen_ep.port();
 	}
 
 	void stop() override
@@ -42,24 +46,32 @@ public:
 
 	void tick() override
 	{
-		acceptor.async_accept([this, handle = socket_handler, finish=finish_handler](boost::system::error_code ec, ip::tcp::socket _socket)
-							  {
-								  if (!ec)
-								  {
-									  auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-									  auto socket = new SocketType(tcp_socket, net, connection_type::incoming);
-									  handle(socket);
-									  socket->read();
-								  }
-								  else
-								  {
-									  LOG_ERROR << "P2P Listener: " << ec.message();
-									  error_handler()
-								  }
-								  finish();
-							  });
-	}
+		acceptor.async_accept(
+			[this, handle = socket_handler, finish=finish_handler]
+			(boost::system::error_code ec, ip::tcp::socket socket_)
+			{
+				if (ec)
+				{
+					if (ec == boost::system::errc::operation_canceled)
+					{
+						LOG_DEBUG_POOL << "PoolListener canceled";
+					} else 
+					{
+				 		error_handler(ec);
+					}
+					return;
+				}
 
+				auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(socket_));
+				auto socket = new SocketType(tcp_socket, net, connection_type::incoming);
+				handle(socket);
+				socket->read();
+				
+				// continue accept connections
+				tick();
+			}
+		);
+	}
 };
 
 template <typename SocketType>
