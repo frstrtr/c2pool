@@ -35,17 +35,31 @@ protected:
 private:
     msg_version_handler_type message_version_handle;
 public:
-	PoolNodeServer(io::io_context* _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
+	PoolNodeServer(io::io_context* _context, msg_version_handler_type version_handle) 
+        : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
+
+    template <typename ListenerType>
+    void init()
+    {
+        listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
+        listener->init(
+                // socket from listener
+                [&](Socket* socket)
+                {
+                    socket_handle(socket);
+                }
+        );
+    }
 
 	void socket_handle(Socket* socket)
     {
-        socket->set_addr();
         server_attempts[socket->get_addr()] = new PoolHandshakeServer(socket, message_version_handle,
                                                                          [&](PoolHandshake* _handshake)
                                                                          {
                                                                             handshake_handle(_handshake);
                                                                          }
         );
+        socket->read();
     }
 
     void handshake_handle(PoolHandshake* handshake)
@@ -69,19 +83,12 @@ public:
         server_connections[addr] = protocol;
     }
 
-    // handshake error in listener
-    void error_handle(const NetAddress& addr, const std::string& err)
+	void start()
     {
-        LOG_ERROR << "Pool Server error: " << err;
-        server_attempts.erase(addr);
+        listener->run();
     }
 
-	void listen()
-    {
-        listener->tick();
-    }
-
-    void stop_server()
+    void stop()
     {   
         // disable listener
         listener->stop();
@@ -370,30 +377,13 @@ public:
 	template <typename ListenerType, typename ConnectorType>
 	void run(NodeRunState run_state = both)
 	{
-		if (run_state == both || run_state == onlyServer)
+		if (run_state & onlyServer)
         {
-            listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
-            listener->init(
-                    // socket_handle
-                    [&](Socket* socket)
-                    {
-                        PoolNodeServer::socket_handle(socket);
-                    },
-                    // error
-                    [&](const NetAddress& addr, const std::string& err)
-                    {
-                        PoolNodeServer::error_handle(addr, err);
-                    },
-                    // finish
-                    [&]()
-                    {
-                        listen();
-                    }
-            );
-            listen();
+            PoolNodeServer::init<ListenerType>();
+            PoolNodeServer::start();
         }
 
-		if (run_state == both || run_state == onlyClient)
+		if (run_state & onlyClient)
 		{
 			connector = std::make_unique<ConnectorType>(context, net);
             connector->init(

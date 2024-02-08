@@ -9,6 +9,7 @@
 #include <libp2p/node.h>
 #include <libp2p/socket.h>
 #include <libdevcore/logger.h>
+#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;
@@ -36,6 +37,7 @@ public:
 		acceptor.bind(listen_ep);
 		acceptor.listen();
 
+		async_loop();
 		LOG_INFO << "PoolListener started for port: " << listen_ep.port();
 	}
 
@@ -44,7 +46,8 @@ public:
 		acceptor.cancel();
 	}
 
-	void tick() override
+protected:
+	void async_loop() override
 	{
 		acceptor.async_accept(
 			[this, handle = socket_handler, finish=finish_handler]
@@ -55,20 +58,19 @@ public:
 					if (ec == boost::system::errc::operation_canceled)
 					{
 						LOG_DEBUG_POOL << "PoolListener canceled";
+						return;
 					} else 
 					{
-				 		error_handler(ec);
+				 		throw make_except<pool_exception, NodeExcept>("[PoolListener] " + ec.message());
 					}
-					return;
 				}
 
 				auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(socket_));
 				auto socket = new SocketType(tcp_socket, net, connection_type::incoming);
 				handle(socket);
-				socket->read();
 				
 				// continue accept connections
-				tick();
+				async_loop();
 			}
 		);
 	}
