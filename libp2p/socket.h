@@ -70,6 +70,7 @@ public:
     virtual bool isConnected() = 0;
     virtual void disconnect() = 0;
 
+    // call in constructor
     virtual void set_addr() = 0;
     virtual NetAddress get_addr()
     {
