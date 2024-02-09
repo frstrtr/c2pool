@@ -12,16 +12,20 @@
 class Listener
 {
 protected:
-    // type for function socket_handle();
+    // type for function PoolNodeServer::socket_handle();
     typedef std::function<void(Socket*)> socket_handler_type;
+    // type for function PoolNodeServer::disconnect();
+    typedef std::function<void(const NetAddress& addr)> disconnect_type;
 
     socket_handler_type socket_handler;
+    disconnect_type disconnect;
 public:
     Listener() = default;
 
-	void init(socket_handler_type socket_handler_)
+	void init(socket_handler_type socket_handler_, disconnect_type disconnect_)
     {
         socket_handler = std::move(socket_handler_);
+        disconnect = std::move(disconnect_);
     }
 
     virtual void run() = 0;
