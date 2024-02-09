@@ -35,8 +35,8 @@ protected:
 private:
     msg_version_handler_type message_version_handle;
 public:
-	PoolNodeServer(io::io_context* _context, msg_version_handler_type version_handle) 
-        : PoolNodeData(_context), message_version_handle(std::move(version_handle)) {}
+	PoolNodeServer(io::io_context* context_, msg_version_handler_type version_handle) 
+        : PoolNodeData(context_), message_version_handle(std::move(version_handle)) {}
 
     template <typename ListenerType>
     void init()
@@ -47,6 +47,11 @@ public:
                 [&](Socket* socket)
                 {
                     socket_handle(socket);
+                },
+                // disconnect
+                [&](const NetAddress& addr)
+                {
+                    disconnect(addr);
                 }
         );
     }
@@ -98,7 +103,7 @@ public:
         {
             if (protocol)
             {
-                protocol->disconnect();
+                protocol->close();
                 delete protocol;
             }            
         }
@@ -107,10 +112,30 @@ public:
         // stop all server attempts
         for (auto& [socket, handshake] : server_attempts)
         {
-            handshake->disconnect();
+            handshake->close();
             delete handshake;
         }
         server_attempts.clear();
+    }
+
+    void disconnect(const NetAddress& addr)
+    {
+        if (server_attempts.count(addr))
+        {
+            auto handshake = server_attempts[addr];
+            handshake->close();
+            delete handshake;
+            server_attempts.erase(addr);
+        }
+
+        if (server_connections.count(addr))
+        {
+            auto protocol = server_connections[addr];
+            peers.erase(protocol->nonce);
+            protocol->close();
+            delete protocol;
+            server_connections.erase(addr);
+        }
     }
 };
 
@@ -433,9 +458,6 @@ public:
     void handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, PoolProtocol* protocol);
 private:
     void start();
-
-//    void download_shares();
-
     void init_web_metrics() override;
 
 protected:

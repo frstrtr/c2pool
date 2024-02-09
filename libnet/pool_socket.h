@@ -14,9 +14,11 @@
 
 class PoolSocket : public Socket
 {
+	typedef std::function<void(const std::string&)> error_handler_type;
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 	c2pool::Network* net;
+	error_handler_type error_handler;
 
     void set_addr() override
     {
@@ -26,13 +28,15 @@ private:
     }
 public:
 
-	PoolSocket(auto socket_, auto net_, auto conn_type) : Socket(conn_type), socket(std::move(socket_)), net(net_)
+	PoolSocket(auto socket_, auto net_, auto conn_type) 
+		: Socket(conn_type), socket(std::move(socket_)), net(net_)
 	{
 		set_addr();
 		LOG_DEBUG_POOL << "PoolSocket created";
 	}
 
-	PoolSocket(auto socket_, auto net_, handler_type message_handler, auto conn_type) : Socket(std::move(message_handler), conn_type), socket(std::move(socket_)), net(net_)
+	PoolSocket(auto socket_, auto net_, handler_type message_handler, error_handler_type err_handler, auto conn_type) 
+		: Socket(std::move(message_handler), conn_type), error_handler(std::move(err_handler)), socket(std::move(socket_)), net(net_)
 	{
 		set_addr();
         LOG_DEBUG_POOL << "PoolSocket created2";
@@ -98,5 +102,10 @@ public:
 
 		socket->close();
         event_disconnect->happened();
+	}
+
+	void error(const std::string& err) override 
+	{
+		error_handler(err);
 	}
 };

@@ -18,8 +18,10 @@ enum connection_type
     outgoing
 };
 
-class Socket
+template <typename... TYPES>
+class BaseSocket : public TYPES...
 {
+    typedef BaseSocket<TYPES...> socket_type;
 public:
 //    Event<std::string> bad_peer; // call disconnect from Protocol; Protocol need sub to this event
     Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
@@ -49,10 +51,17 @@ protected:
             not_received.erase(key);
     }
 public:
-    explicit Socket(connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), event_disconnect(make_event()) {}
-    Socket(handler_type message_handler, connection_type conn_type = connection_type::unknown) : conn_type_(conn_type), event_disconnect(make_event()), handler(std::move(message_handler)){}
+    explicit BaseSocket(connection_type conn_type = connection_type::unknown) 
+        : conn_type_(conn_type), event_disconnect(make_event()) 
+    {
+    }
 
-    ~Socket()
+    BaseSocket(handler_type message_handler, connection_type conn_type = connection_type::unknown) 
+        : conn_type_(conn_type), event_disconnect(make_event()), handler(std::move(message_handler))
+    {    
+    }
+
+    ~BaseSocket()
     {
         delete event_disconnect;
     }
@@ -69,6 +78,7 @@ public:
 
     virtual bool isConnected() = 0;
     virtual void disconnect() = 0;
+    virtual void error(const std::string& err) = 0;
 
     // call in constructor
     virtual void set_addr() = 0;
@@ -82,7 +92,7 @@ public:
         return addr_local;
     }
 
-    friend std::ostream& operator<<(std::ostream& stream, const Socket* value)
+    friend std::ostream& operator<<(std::ostream& stream, const socket_type* value)
     {
         auto [local_ip, local_port] = value->addr_local;
         auto [ip, port] = value->addr;
@@ -90,5 +100,20 @@ public:
         stream << "(local addr = " << local_ip << ":" << local_port
         << ", global addr = " << ip << ":" << port << ")";
         return stream;
+    }
+};
+
+typedef BaseSocket<> Socket;
+
+struct CustomSocketDisconnect
+{
+    // type for function PoolNodeServer::disconnect();
+    typedef std::function<void(const NetAddress& addr)> disconnect_type;
+
+    disconnect_type disconnect;
+
+    CustomSocketDisconnect(disconnect_type disconnect_) 
+        : disconnect(std::move(disconnect_)) 
+    {
     }
 };
