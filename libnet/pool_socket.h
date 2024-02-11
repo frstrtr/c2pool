@@ -12,7 +12,7 @@
 
 #include <boost/asio.hpp>
 
-class PoolSocket : public Socket
+class PoolSocket : public BaseSocket<CustomSocketDisconnect>
 {
 	typedef std::function<void(const std::string&)> error_handler_type;
 private:
@@ -29,7 +29,7 @@ private:
 public:
 
 	PoolSocket(auto socket_, auto net_, auto conn_type) 
-		: Socket(conn_type), socket(std::move(socket_)), net(net_)
+		: socket_type(conn_type), socket(std::move(socket_)), net(net_)
 	{
 		set_addr();
 		LOG_DEBUG_POOL << "PoolSocket created";

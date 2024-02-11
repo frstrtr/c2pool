@@ -18,13 +18,11 @@ enum connection_type
     outgoing
 };
 
-template <typename... TYPES>
-class BaseSocket : public TYPES...
+template <typename... COMPONENTS>
+class BaseSocket : public COMPONENTS...
 {
-    typedef BaseSocket<TYPES...> socket_type;
 public:
-//    Event<std::string> bad_peer; // call disconnect from Protocol; Protocol need sub to this event
-    Event<> event_disconnect;       // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
+    typedef BaseSocket<COMPONENTS...> socket_type;
 protected:
     typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> handler_type;
     handler_type handler;
@@ -33,32 +31,13 @@ protected:
     NetAddress addr_local;
 
     connection_type conn_type_; // unk, in, out
-    std::string last_message_sent; // last message sent by me and received by peer.
-    std::string last_message_received; // last message sent by peer and received by me.
-    std::map<std::string, int32_t> not_received; // messages sent by me and not yet received by peer
-
-    void add_not_received(const std::string& key)
-    {
-        auto &it = not_received[key];
-        it += 1;
-    }
-
-    void remove_not_received(const std::string& key)
-    {
-        auto &it = not_received[key];
-        it -= 1;
-        if (it <= 0)
-            not_received.erase(key);
-    }
 public:
-    explicit BaseSocket(connection_type conn_type = connection_type::unknown) 
-        : conn_type_(conn_type), event_disconnect(make_event()) 
-    {
-    }
+    Event<> event_disconnect; // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
 
-    BaseSocket(handler_type message_handler, connection_type conn_type = connection_type::unknown) 
-        : conn_type_(conn_type), event_disconnect(make_event()), handler(std::move(message_handler))
-    {    
+    template <typename...Args>
+    explicit BaseSocket(connection_type conn_type = connection_type::unknown, Args&&...args)
+        : conn_type_(conn_type), event_disconnect(make_event()), TYPES(std::forward<Args>(args))...
+    {
     }
 
     ~BaseSocket()
@@ -66,7 +45,7 @@ public:
         delete event_disconnect;
     }
 
-    void set_message_handler(handler_type message_handler)
+    void set_handler(handler_type message_handler)
     {
         handler = std::move(message_handler);
     }
@@ -76,29 +55,26 @@ public:
     virtual void write(std::shared_ptr<Message> msg) = 0;
     virtual void read() = 0;
 
-    virtual bool isConnected() = 0;
-    virtual void disconnect() = 0;
+    virtual bool is_c onnected() = 0;
+    virtual void close() = 0;
     virtual void error(const std::string& err) = 0;
 
     // call in constructor
-    virtual void set_addr() = 0;
-    virtual NetAddress get_addr()
+    virtual void init_addr() = 0;
+    NetAddress get_addr()
     {
         return addr;
     }
 
-    virtual NetAddress get_addr_local()
+    NetAddress get_addr_local()
     {
         return addr_local;
     }
 
     friend std::ostream& operator<<(std::ostream& stream, const socket_type* value)
     {
-        auto [local_ip, local_port] = value->addr_local;
-        auto [ip, port] = value->addr;
-
-        stream << "(local addr = " << local_ip << ":" << local_port
-        << ", global addr = " << ip << ":" << port << ")";
+        stream << "(local addr = " << value->addr_local.to_string()
+                << ", global addr = " << value->addr.to_string() << ")";
         return stream;
     }
 };
@@ -115,5 +91,26 @@ struct CustomSocketDisconnect
     CustomSocketDisconnect(disconnect_type disconnect_) 
         : disconnect(std::move(disconnect_)) 
     {
+    }
+};
+
+struct DebugMessages
+{
+    std::string last_message_sent; // last message sent by me and received by peer.
+    std::string last_message_received; // last message sent by peer and received by me.
+    std::map<std::string, int32_t> not_received; // messages sent by me and not yet received by peer
+
+    void add_not_received(const std::string& key)
+    {
+        auto &it = not_received[key];
+        it += 1;
+    }
+
+    void remove_not_received(const std::string& key)
+    {
+        auto &it = not_received[key];
+        it -= 1;
+        if (it <= 0)
+            not_received.erase(key);
     }
 };

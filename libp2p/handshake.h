@@ -13,15 +13,17 @@ template <typename ProtocolType>
 class Handshake : public virtual ProtocolEvents
 {
 protected:
-    typedef ProtocolType protocol_type;
-
 	Socket* socket;
-
-    int bad_peer_event_id;
 public:
-	Handshake(auto _socket) : socket(_socket)
+	Handshake(auto socket_) : socket(socket_)
 	{
-		socket->set_message_handler(std::bind(&Handshake::handle_message, this, std::placeholders::_1));
+		socket->set_message_handler
+		(
+			[this](const std::shared_ptr<RawMessage>& raw_msg)
+			{
+				handle_message(raw_msg);
+			}
+		);
 	}
 
     ~Handshake() = default;
@@ -35,7 +37,7 @@ public:
 
 	virtual void handle_message(std::shared_ptr<RawMessage> raw_msg) = 0;
 
-    virtual void disconnect()
+    virtual void close()
     {
         socket->disconnect();
 		delete socket;
