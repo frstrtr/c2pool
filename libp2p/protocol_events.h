@@ -52,11 +52,11 @@ public:
             }
         );
 
-        event_handle_message->subscribe(
+        events->event_handle_message->subscribe(
             [this]()
             { 
-                timer_timeout->restart();
-                timer_ping->restart();
+                timer_timeout.restart();
+                timer_ping.restart();
             }
         );
     }
