@@ -6,32 +6,61 @@
 #include <functional>
 #include <utility>
 
+#include <libdevcore/logger.h>
 #include "socket.h"
 #include "message.h"
 #include "protocol_events.h"
 #include "handler.h"
-#include <libdevcore/logger.h>
 
-class BaseProtocol : public virtual ProtocolEvents
+template <typename SocketType, typename ProtocolType, typename... COMPONENTS>
+class BaseProtocol : public ProtocolEvents, public COMPONENTS... 
 {
 protected:
-    Socket* socket;
+	typedef SocketType socket_type;
+    HandlerManagerPtr<ProtocolType> handler_manager;
+	SocketType* socket;
 
 public:
-    virtual void write(std::shared_ptr<Message> msg);
-    virtual void handle(std::shared_ptr<RawMessage> raw_msg) = 0;
+    virtual void write(std::shared_ptr<Message> msg) = 0;
+    
 public:
-    // Not safe, socket->message_handler = nullptr; wanna for manual setup
-    BaseProtocol() = default;
-
-    explicit BaseProtocol (Socket* _socket) : socket(_socket)
+    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr<ProtocolType> handler_manager_) 
+        : socket(socket_), handler_manager(handler_manager_), COMPONENTS(this, std::forward<Args>(args))...
     {
+        socket->set_message_handler
+		(
+			[this](const std::shared_ptr<RawMessage>& raw_msg)
+			{
+				handle_message(raw_msg);
+			}
+		);
     }
 
+    ~BaseProtocol() = default;
+
 public:
-    void set_socket(Socket* _socket);
-    Socket* get_socket() { return socket; }
-    auto get_addr() { return socket->get_addr(); }
+    auto get_socket() const { return socket; }
+    auto get_addr() const { return socket->get_addr(); }
+
+    void handle_message(std::shared_ptr<RawMessage> raw_msg) 
+	{
+        auto handler = handler_manager->get_handler(raw_msg->command);
+        if (handler)
+        {
+            LOG_DEBUG_P2P << name << " protocol call handler for " << raw_msg->command;
+            handler->invoke(raw_msg->value, (ProtocolType*)this);
+        } else
+        {
+            LOG_WARNING << "Handler " << raw_msg->command << " not found!";
+        }
+        event_handle_message->happened();
+	}
+
+    void close()
+    {
+        socket->close();
+		delete socket;
+    }
 
     bool operator<(BaseProtocol* rhs)
     {
@@ -44,50 +73,6 @@ public:
             // TODO: throw
         }
 
-        return socket->get_addr() < rhs->socket->get_addr();
-    }
-
-    virtual void disconnect();
-};
-
-template <typename T>
-class Protocol : public BaseProtocol
-{
-protected:
-    std::string name;
-    HandlerManagerPtr<T> handler_manager;
-
-public:
-    // Not safe, socket->message_handler = nullptr; handler_manager = nullptr; wanna for manual setup
-    Protocol() : BaseProtocol() {}
-    explicit Protocol(std::string _name) : BaseProtocol(), name(_name) {}
-
-    Protocol (std::string _name, Socket* _socket) : BaseProtocol(_socket), name(std::move(_name)) {}
-
-    Protocol (std::string _name, Socket* _socket, HandlerManagerPtr<T> _handler_manager): BaseProtocol(_socket), name(std::move(_name)),
-                                                                                       handler_manager(_handler_manager)
-    {
-        _socket->set_message_handler(std::bind(&Protocol::handle, this, std::placeholders::_1));
-    }
-
-    virtual void handle(std::shared_ptr<RawMessage> raw_msg) override
-    {
-        event_handle_message->happened(); // ProtocolEvents::event_handle_message
-
-        auto handler = handler_manager->get_handler(raw_msg->command);
-        if (handler)
-        {
-            LOG_DEBUG_P2P << name << " protocol call handler for " << raw_msg->command;
-            handler->invoke(raw_msg->value, (T*)this);
-        } else
-        {
-            LOG_WARNING << "Handler " << raw_msg->command << " not found!";
-        }
-    }
-
-public:
-    void set_handler_manager(HandlerManagerPtr<T> _mngr)
-    {
-        handler_manager = _mngr;
+        return get_addr() < rhs->get_addr();
     }
 };
