@@ -36,7 +36,7 @@ public:
 
     template <typename...Args>
     explicit BaseSocket(connection_type conn_type = connection_type::unknown, Args&&...args)
-        : conn_type_(conn_type), event_disconnect(make_event()), TYPES(std::forward<Args>(args))...
+        : conn_type_(conn_type), event_disconnect(make_event()), COMPONENTS(std::forward<Args>(args))...
     {
     }
 
@@ -55,7 +55,7 @@ public:
     virtual void write(std::shared_ptr<Message> msg) = 0;
     virtual void read() = 0;
 
-    virtual bool is_c onnected() = 0;
+    virtual bool is_connected() = 0;
     virtual void close() = 0;
     virtual void error(const std::string& err) = 0;
 
