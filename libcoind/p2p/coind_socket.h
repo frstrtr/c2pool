@@ -10,13 +10,13 @@
 
 #include <boost/asio.hpp>
 
-class CoindSocket : public Socket
+class CoindSocket : public BaseSocket<DebugMessages>
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 	coind::ParentNetwork* net;
 
-    void set_addr() override
+    void init_addr() override
     {
         boost::system::error_code ec;
 
@@ -32,22 +32,16 @@ private:
     }
 public:
 
-    CoindSocket(auto _socket, auto _net) : Socket(), socket(std::move(_socket)), net(_net)
-	{ }
-
-    CoindSocket(auto _socket, auto _net, handler_type message_handler) : Socket(std::move(message_handler)), socket(std::move(_socket)), net(_net)
-	{ }
-
-// Write
+    CoindSocket(auto socket_, auto net_) : BaseSocket(), socket(std::move(socket_)), net(net_)
+	{ 
+        
+    }
 
 	void write(std::shared_ptr<Message> msg) override
 	{
-        LOG_DEBUG_COIND << "Coind socket write msg: " << msg->command;
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
+        LOG_DEBUG_COIND << "\tCoind socket write msg: " << msg->command << ", Message data: \n" << *_msg;
 
-        LOG_DEBUG_COIND << "\tMessage data: " << *_msg;
-
-        add_not_received(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
                                 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
                                 {
@@ -57,10 +51,10 @@ public:
                                         throw make_except<coind_exception, NodeExcept>((boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str());
                                     } else
                                     {
-                                        last_message_sent = cmd;
-                                        remove_not_received(cmd);
+                                        event_peer_receive->happened(cmd);
                                     }
                                 });
+        event_send_message->happened(msg->command);
 	}
 
 	// Read
@@ -77,15 +71,15 @@ public:
 		read_prefix(msg);
 	}
 
-	bool isConnected() override
+	bool is_connected() override
 	{
 		return socket && socket->is_open();
 	}
 
-	void disconnect() override
+	void close() override
 	{
         LOG_WARNING << "Coind socket has been disconnected from " << get_addr().to_string() << ".";
-        LOG_INFO.stream() << "\tLast message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
+        LOG_INFO << messages_stat();
 
 		socket->close();
         event_disconnect->happened();
