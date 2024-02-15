@@ -10,6 +10,7 @@
 #include <libdevcore/types.h>
 
 #include "message.h"
+#include "socket_components.h"
 
 enum connection_type
 {
@@ -19,7 +20,7 @@ enum connection_type
 };
 
 template <typename... COMPONENTS>
-class BaseSocket : public COMPONENTS...
+class BaseSocket : public SocketEvents, public COMPONENTS...
 {
 public:
     typedef BaseSocket<COMPONENTS...> socket_type;
@@ -31,23 +32,27 @@ protected:
     NetAddress addr_local;
 
     connection_type conn_type_; // unk, in, out
-public:
-    Event<> event_disconnect; // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
 
+public:
     template <typename...Args>
     explicit BaseSocket(connection_type conn_type = connection_type::unknown, Args&&...args)
-        : conn_type_(conn_type), event_disconnect(make_event()), COMPONENTS(std::forward<Args>(args))...
+        : conn_type_(conn_type), COMPONENTS(this, std::forward<Args>(args))...
     {
     }
 
     ~BaseSocket()
     {
-        delete event_disconnect;
     }
 
     void set_handler(handler_type message_handler)
     {
         handler = std::move(message_handler);
+    }
+
+    void handle(std::shared_ptr<RawMessage> raw_msg)
+    {
+        event_handle_message->happened(raw_msg->command);
+        handler(raw_msg);
     }
 
     connection_type get_type() const { return conn_type_; }
@@ -80,37 +85,3 @@ public:
 };
 
 typedef BaseSocket<> Socket;
-
-struct CustomSocketDisconnect
-{
-    // type for function PoolNodeServer::disconnect();
-    typedef std::function<void(const NetAddress& addr)> disconnect_type;
-
-    disconnect_type disconnect;
-
-    CustomSocketDisconnect(disconnect_type disconnect_) 
-        : disconnect(std::move(disconnect_)) 
-    {
-    }
-};
-
-struct DebugMessages
-{
-    std::string last_message_sent; // last message sent by me and received by peer.
-    std::string last_message_received; // last message sent by peer and received by me.
-    std::map<std::string, int32_t> not_received; // messages sent by me and not yet received by peer
-
-    void add_not_received(const std::string& key)
-    {
-        auto &it = not_received[key];
-        it += 1;
-    }
-
-    void remove_not_received(const std::string& key)
-    {
-        auto &it = not_received[key];
-        it -= 1;
-        if (it <= 0)
-            not_received.erase(key);
-    }
-};
