@@ -53,6 +53,7 @@ public:
         {
             LOG_WARNING << "Handler " << raw_msg->command << " not found!";
         }
+        
         event_handle_message->happened();
 	}
 
