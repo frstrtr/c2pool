@@ -8,14 +8,16 @@
 
 #include "pool_protocol_data.h"
 #include "pool_messages.h"
+#include "pool_socket.h"
 #include <libdevcore/exceptions.h>
 #include <libp2p/protocol.h>
+#include <libp2p/protocol_events.h>
 #include <libp2p/handler.h>
 #include <libcoind/transaction.h>
 
 #include <boost/asio/io_context.hpp>
 
-class PoolProtocol : public Protocol<PoolProtocol>, public PoolProtocolData, ProtocolPinger
+class PoolProtocol : public BaseProtocol<PoolSocket, Pinger>, public PoolProtocolData
 {
 public:
 //	std::set<uint256> remote_tx_hashes;
@@ -27,31 +29,20 @@ public:
 //	std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
 
 public:
-	PoolProtocol(boost::asio::io_context* _context, Socket* _socket, HandlerManagerPtr<PoolProtocol> _handler_manager, PoolProtocolData* _data) : 
-																											  Protocol<PoolProtocol>("Pool", _socket, _handler_manager), PoolProtocolData(*_data),
-                                                                                                              ProtocolPinger(_context, 100, [&](){out_time_ping();},
-																															 [](){return 20; /*TODO: return c2pool::random::Expovariate(1/100);*/}, [&](){ send_ping(); })
-	{}
-
-	void send_ping()
+	PoolProtocol(boost::asio::io_context* context_, Socket* socket_, HandlerManagerPtr handler_manager_, PoolProtocolData* data_) 
+		: BaseProtocol<PoolSocket, Pinger>(socket_, handler_manager_, 20, 100), PoolProtocolData(*data_)
 	{
-		auto ping_msg = std::make_shared<pool::messages::message_ping>();
-		socket->write(ping_msg);
 	}
 
-	void out_time_ping()
+	void timeout() override 
 	{
 		//TODO: out of ping timer;
         throw make_except<pool_exception, NetExcept>("out time ping", get_addr());
 	}
 
-	void bad_peer_happened()
+    void send_ping() override
 	{
-		// TODO:
+		auto ping_msg = std::make_shared<pool::messages::message_ping>();
+		socket->write(ping_msg);
 	}
-
-    void disconnect() override
-    {
-        socket->disconnect();
-    }
 };

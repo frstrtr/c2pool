@@ -263,7 +263,7 @@ public:
 };
 
 #define SET_POOL_DEFAULT_HANDLER(msg) \
-	handler_manager->new_handler<pool::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
+	handler_manager->new_handler<pool::messages::message_##msg, PoolProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
 
 class PoolNode : public virtual PoolNodeData, public NodeExceptionHandler, public SupervisorElement, PoolNodeServer, PoolNodeClient, protected WebPoolNode
 {

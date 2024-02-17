@@ -64,7 +64,7 @@ public:
 	c2pool::dev::AddrStore* addr_store;
 	ShareTracker* tracker;
 	CoindNodeData* coind_node;
-	HandlerManagerPtr<PoolProtocol> handler_manager;
+	HandlerManagerPtr handler_manager;
 
     //From CoindNode
 	VariableDict<uint256, coind::data::tx_type> known_txs;
