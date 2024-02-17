@@ -23,7 +23,7 @@ public:
 	ConnectionStatus* status;
 
     std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
-	HandlerManagerPtr<CoindProtocol> handler_manager;
+	HandlerManagerPtr handler_manager;
 public:
     uint64_t cur_share_version = 0;
 	coind::TXIDCache txidcache;
@@ -43,7 +43,7 @@ public:
 	Variable<coind::data::BlockHeaderType> best_block_header;
 	coind::HeightTracker get_height_rel_highest; // wanna for init get_block_height func!
 public:
-	CoindNodeData(io::io_context* _context, ConnectionStatus* _status) : context(_context), status(_status)
+	CoindNodeData(io::io_context* context_, ConnectionStatus* status_) : context(context_), status(status_)
 	{
 		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
 
