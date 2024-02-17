@@ -12,19 +12,21 @@
 #include "protocol_events.h"
 #include "handler.h"
 
-template <typename SocketType, typename ProtocolType, typename... COMPONENTS>
-class BaseProtocol : public ProtocolEvents, public COMPONENTS... 
+template <typename SocketType, typename... COMPONENTS>
+class BaseProtocol : public NetworkHandler, public ProtocolEvents, public COMPONENTS... 
 {
 protected:
 	typedef SocketType socket_type;
-    HandlerManagerPtr<ProtocolType> handler_manager;
+
+    HandlerManagerPtr handler_manager;
 	SocketType* socket;
 
 public:
     virtual void write(std::shared_ptr<Message> msg) = 0;
     
 public:
-    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr<ProtocolType> handler_manager_) 
+    template <typenames... Args>
+    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr handler_manager_, Args... args) 
         : socket(socket_), handler_manager(handler_manager_), COMPONENTS(this, std::forward<Args>(args))...
     {
         socket->set_message_handler
