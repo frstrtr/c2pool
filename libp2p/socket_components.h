@@ -77,21 +77,21 @@ public:
     DebugMessages(SocketEvents* events_) : events(events_)
     {
         events->event_handle_message->subscribe(
-            [&](std::string& command)
+            [&](const std::string& command)
             {
                 peer_to_me(command);
             }
         );
 
         events->event_peer_receive->subscribe(
-            [&](std::string& command)
+            [&](const std::string& command)
             {
                 me_to_peer(command);
             }
         );
 
         events->event_send_message->subscribe(
-            [&](std::string& command)
+            [&](const std::string& command)
             {
                 me_not_yet_to_peer(command);
             }
