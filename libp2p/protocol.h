@@ -9,7 +9,7 @@
 #include <libdevcore/logger.h>
 #include "socket.h"
 #include "message.h"
-#include "protocol_events.h"
+#include "protocol_components.h"
 #include "handler.h"
 
 template <typename SocketType, typename... COMPONENTS>
@@ -23,13 +23,13 @@ protected:
 
 public:
     virtual void write(std::shared_ptr<Message> msg) = 0;
-    
+
 public:
-    template <typenames... Args>
-    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr handler_manager_, Args... args) 
+    template <typename... Args>
+    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr handler_manager_, Args&&...args) 
         : socket(socket_), handler_manager(handler_manager_), COMPONENTS(this, std::forward<Args>(args))...
     {
-        socket->set_message_handler
+        socket->set_handler
 		(
 			[this](const std::shared_ptr<RawMessage>& raw_msg)
 			{
@@ -49,8 +49,8 @@ public:
         auto handler = handler_manager->get_handler(raw_msg->command);
         if (handler)
         {
-            LOG_DEBUG_P2P << name << " protocol call handler for " << raw_msg->command;
-            handler->invoke(raw_msg->value, (ProtocolType*)this);
+            LOG_DEBUG_P2P << "Protocol call handler for " << raw_msg->command;
+            handler->invoke(raw_msg->value, this);
         } else
         {
             LOG_WARNING << "Handler " << raw_msg->command << " not found!";

@@ -3,7 +3,7 @@
 #include <memory>
 #include <functional>
 
-#include <libp2p/protocol_events.h>
+#include <libp2p/protocol_components.h>
 
 #include "socket.h"
 #include "message.h"
@@ -13,11 +13,12 @@ class BaseHandshake : public ProtocolEvents, public COMPONENTS...
 {
 protected:
 	typedef SocketType socket_type;
-	SocketType* socket;
+	socket_type* socket;
 
 	virtual void handle_raw(std::shared_ptr<RawMessage> raw_msg) = 0;
 public:
-	Handshake(socket_type* socket_) : socket(socket_), COMPONENTS(this, std::forward<Args>(args))...
+	template <typename... Args>
+	BaseHandshake(socket_type* socket_, Args... args) : socket(socket_), COMPONENTS(this, std::forward<Args>(args))...
 	{
 		socket->set_message_handler
 		(
@@ -28,7 +29,7 @@ public:
 		);
 	}
 
-    ~Handshake() = default;
+    ~BaseHandshake() = default;
 
 	auto get_socket() const { return socket; }
     auto get_addr() const { return socket->get_addr(); }

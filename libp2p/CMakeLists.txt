@@ -7,7 +7,7 @@ set(libp2p_source
         protocol.h 
         handler.h 
         handshake.h 
-        protocol_events.h node.h)
+        protocol_components.h node.h)
 
 set(libp2ppreset_source
         preset/p2p_socket_data.h
