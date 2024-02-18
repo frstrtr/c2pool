@@ -4,7 +4,7 @@
 #include <memory>
 
 #include <libp2p/protocol.h>
-#include <libp2p/protocol_events.h>
+#include <libp2p/protocol_components.h>
 #include <libp2p/handler.h>
 
 #include <boost/asio.hpp>

@@ -15,7 +15,7 @@ class Listener
 protected:
     typedef SocketType socket_type;
     // type for function PoolNodeServer::socket_handle();
-    typedef std::function<void(SocketType*)> socket_handler_type;
+    typedef std::function<void(socket_type*)> socket_handler_type;
 
     socket_handler_type socket_handler;
 public:
@@ -38,7 +38,7 @@ class Connector
 protected:
     typedef SocketType socket_type;
     // type for function socket_handle();
-    typedef std::function<void(SocketType*)> socket_handler_type;
+    typedef std::function<void(socket_type*)> socket_handler_type;
     // type for function error()
     typedef std::function<void(NetAddress, std::string)> error_handler_type;
 
