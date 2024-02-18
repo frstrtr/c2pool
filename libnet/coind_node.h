@@ -22,7 +22,7 @@ namespace ip = boost::asio::ip;
 class CoindNodeClient : virtual CoindNodeData
 {
 protected:
-    std::unique_ptr<Connector> connector; // from P2PNode::run()
+    std::unique_ptr<Connector<BaseCoindSocket>> connector;
 
     CoindProtocol* protocol;
 public:

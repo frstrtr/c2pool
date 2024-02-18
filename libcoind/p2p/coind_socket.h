@@ -10,7 +10,9 @@
 
 #include <boost/asio.hpp>
 
-class CoindSocket : public BaseSocket<DebugMessages>
+typedef BaseSocket<DebugMessages> BaseCoindSocket;
+
+class CoindSocket : public BaseCoindSocket
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
@@ -30,9 +32,17 @@ private:
         // TODO: log ec;
         addr_local = {ep.address().to_string(), std::to_string(ep.port())};
     }
+
+	void read_prefix(std::shared_ptr<ReadSocketData> msg);
+	void read_command(std::shared_ptr<ReadSocketData> msg);
+	void read_length(std::shared_ptr<ReadSocketData> msg);
+	void read_checksum(std::shared_ptr<ReadSocketData> msg);
+	void read_payload(std::shared_ptr<ReadSocketData> msg);
+	void final_read_message(std::shared_ptr<ReadSocketData> msg);
 public:
 
-    CoindSocket(auto socket_, auto net_) : BaseSocket(), socket(std::move(socket_)), net(net_)
+    CoindSocket(auto socket_, auto net_) 
+        : BaseCoindSocket(), socket(socket_), net(net_)
 	{ 
         
     }
@@ -58,13 +68,6 @@ public:
 	}
 
 	// Read
-	void read_prefix(std::shared_ptr<ReadSocketData> msg);
-	void read_command(std::shared_ptr<ReadSocketData> msg);
-	void read_length(std::shared_ptr<ReadSocketData> msg);
-	void read_checksum(std::shared_ptr<ReadSocketData> msg);
-	void read_payload(std::shared_ptr<ReadSocketData> msg);
-	void final_read_message(std::shared_ptr<ReadSocketData> msg);
-
 	void read() override
 	{
 		std::shared_ptr<ReadSocketData> msg = std::make_shared<ReadSocketData>(net->PREFIX_LENGTH);

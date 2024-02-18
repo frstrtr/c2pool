@@ -49,7 +49,8 @@ void CoindNodeData::set_best_share()
 			{
 				if (peer.second->get_addr() == bad_peer_address)
 				{
-					peer.second->bad_peer_happened();
+					//TODO: UPDATE FOR BAN BAD PEER
+					// peer.second->bad_peer_happened();
 					break;
 				}
 			}
