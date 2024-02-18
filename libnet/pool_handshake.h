@@ -13,7 +13,9 @@
 
 #include <boost/asio.hpp>
 
-class PoolHandshake : public Handshake<PoolProtocol>, public PoolProtocolData
+typedef BaseHandshake<BasePoolSocket> BasePoolHandshake;
+
+class PoolHandshake : public BasePoolHandshake, public PoolProtocolData
 {
 protected:
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
@@ -34,8 +36,8 @@ protected:
 	}
 
 public:
-    PoolHandshake(auto socket, msg_version_handler_type _handler)
-            : 	Handshake(socket), 
+    PoolHandshake(auto socket, msg_version_handler_type handler_)
+            : 	BasePoolHandshake(socket), 
 				PoolProtocolData(3501, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
@@ -54,7 +56,7 @@ public:
 						throw make_except<pool_exception, NetExcept>((boost::format("Timeout get_shares: %1%") % msg).str(), addr);
 					})
 				), 
-				handle_message_version(std::move(_handler))
+				handle_message_version(std::move(handler_))
     { }
 };
 
@@ -67,7 +69,7 @@ public:
 
 	}
 
-	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
+	void handle_raw(std::shared_ptr<RawMessage> raw_msg) override
 	{
         LOG_DEBUG_POOL << "Pool handshake server handle message: " << raw_msg->command;
 		if (raw_msg->command != "version")
@@ -99,7 +101,7 @@ public:
 		send_version();
 	}
 
-	void handle_message(std::shared_ptr<RawMessage> raw_msg) override
+	void handle_raw(std::shared_ptr<RawMessage> raw_msg) override
 	{
         LOG_DEBUG_POOL << "Pool handshake client handle message: " << raw_msg->command;
         if (raw_msg->command != "version")

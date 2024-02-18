@@ -28,7 +28,7 @@ class PoolNodeServer : virtual PoolNodeData
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 
 protected:
-	std::unique_ptr<Listener> listener; // from P2PNode::run()
+	std::unique_ptr<Listener<BasePoolSocket>> listener; // from P2PNode::run()
 
     std::map<HOST_IDENT, PoolHandshakeServer*> server_attempts;
     std::map<HOST_IDENT, PoolProtocol*> server_connections;
@@ -44,7 +44,7 @@ public:
         listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
         listener->init(
                 // socket from listener
-                [&](Socket* socket)
+                [&](BasePoolSocket* socket)
                 {
                     socket_handle(socket);
                 },
@@ -56,7 +56,7 @@ public:
         );
     }
 
-	void socket_handle(Socket* socket)
+	void socket_handle(BasePoolSocket* socket)
     {
         server_attempts[socket->get_addr()] = new PoolHandshakeServer(socket, message_version_handle,
                                                                          [&](PoolHandshake* _handshake)
@@ -72,20 +72,21 @@ public:
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << handshake->get_socket();
         auto sock = handshake->get_socket();
         auto addr = sock->get_addr();
-
 		auto protocol = new PoolProtocol(context, sock, handler_manager, handshake);
+        
         peers[protocol->nonce] = protocol;
-
         sock->event_disconnect->subscribe(
                 [&, addr = addr]()
                 {
                     auto proto = server_connections[addr];
 
-                    proto->stop();
+                    proto->close();
                     peers.erase(proto->nonce);
                     server_connections.erase(addr);
                 });
+        
         server_connections[addr] = protocol;
+        server_attempts.erase(addr);
     }
 
 	void start()
@@ -143,7 +144,7 @@ class PoolNodeClient : virtual PoolNodeData
 {
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
 protected:
-	std::unique_ptr<Connector> connector; // from P2PNode::run()
+	std::unique_ptr<Connector<BasePoolSocket>> connector; // from P2PNode::run()
 
 	std::map<HOST_IDENT, PoolHandshakeClient*> client_attempts;
     std::map<HOST_IDENT, PoolProtocol*> client_connections;
@@ -153,14 +154,35 @@ private:
 
     msg_version_handler_type message_version_handle;
 public:
-	PoolNodeClient(io::io_context* _context, msg_version_handler_type version_handle) : PoolNodeData(_context), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
+	PoolNodeClient(io::io_context* context_, msg_version_handler_type version_handle) 
+        : PoolNodeData(context_), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
-    void socket_handle(Socket* socket)
+    template <typename ConnectorType>
+    void init()
     {
-        socket->set_addr();
+        connector = std::make_unique<ConnectorType>(context, net);
+
+        connector->init(
+                // socket_handler
+                [&](BasePoolSocket* socket)
+                {
+                    socket_handle(socket);
+                },
+                // error_handle
+                [&](const NetAddress& addr, const std::string& err)
+                {
+                    PoolNodeClient::error_handle(addr, err);
+                }
+        );
+		auto_connect();
+    }
+
+    void socket_handle(BasePoolSocket* socket)
+    {
         client_attempts[socket->get_addr()] =
                 new PoolHandshakeClient(socket, message_version_handle,
                                                       [&](PoolHandshake* _handshake){ handshake_handle(_handshake);});
+        //TODO: socket->read()?
     }
 
     void handshake_handle(PoolHandshake* handshake)
@@ -176,13 +198,18 @@ public:
                 {
                     auto proto = client_connections[addr];
 
-                    proto->stop();
+                    proto->close();
                     peers.erase(proto->nonce);
                     client_connections.erase(addr);
                 });
 
         client_connections[addr] = protocol;
 	    client_attempts.erase(addr);
+    }
+
+    void start()
+    {
+        connector->run();
     }
 
     void try_connect(const boost::system::error_code& ec)
@@ -233,7 +260,7 @@ public:
 
 	std::vector<NetAddress> get_good_peers(int max_count);
 
-    void stop_client()
+    void stop()
     {   
         // disable connector
         connector->stop();
@@ -243,7 +270,7 @@ public:
         {
             if (protocol)
             {
-                protocol->disconnect();
+                protocol->close();
                 delete protocol;
             }            
         }
@@ -252,7 +279,7 @@ public:
         // stop all client attempts
         for (auto& [socket, handshake] : client_attempts)
         {
-            handshake->disconnect();
+            handshake->close();
             delete handshake;
         }
         client_attempts.clear();
@@ -410,20 +437,8 @@ public:
 
 		if (run_state & onlyClient)
 		{
-			connector = std::make_unique<ConnectorType>(context, net);
-            connector->init(
-                    // socket_handler
-                    [&](Socket* socket)
-                    {
-                        PoolNodeClient::socket_handle(socket);
-                    },
-                    // error_handle
-                    [&](const NetAddress& addr, const std::string& err)
-                    {
-                        PoolNodeClient::error_handle(addr, err);
-                    }
-            );
-			auto_connect();
+            PoolNodeClient::init<ConnectorType>();
+            PoolNodeClient::start();
 		}
         start();
         init_web_metrics();
@@ -467,8 +482,8 @@ protected:
         if (state == disconnected)
             return;
 
-        stop_server();
-        stop_client();
+        PoolNodeServer::stop();
+        PoolNodeClient::stop();
 
         set_state(disconnected);
     }

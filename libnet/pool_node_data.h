@@ -76,7 +76,7 @@ public:
 public:
 	PoolNodeData(io::io_context* _context) : context(_context)
 	{
-		handler_manager = std::make_shared<HandlerManager<PoolProtocol>>();
+		handler_manager = std::make_shared<HandlerManager>();
 	}
 
 	auto set_net(c2pool::Network* _net)

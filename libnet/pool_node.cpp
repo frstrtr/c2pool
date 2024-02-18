@@ -100,7 +100,7 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
 		std::string reason =
 			 "[handle_message_version] Detected duplicate connection, disconnecting from "
 			+ addr.to_string();
-        handshake->disconnect();
+        handshake->disconnect(reason);
 		return;
 	}
 
