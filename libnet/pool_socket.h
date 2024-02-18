@@ -12,7 +12,9 @@
 
 #include <boost/asio.hpp>
 
-class PoolSocket : public BaseSocket<CustomSocketDisconnect>
+typedef BaseSocket<DebugMessages, CustomSocketDisconnect> BasePoolSocket;
+
+class PoolSocket : public BasePoolSocket
 {
 	typedef std::function<void(const std::string&)> error_handler_type;
 private:
@@ -20,31 +22,38 @@ private:
 	c2pool::Network* net;
 	error_handler_type error_handler;
 
-    void set_addr() override
+    void init_addr() override
     {
         boost::system::error_code ec;
         auto ep = socket->remote_endpoint(ec);
         addr = {ep.address().to_string(), std::to_string(ep.port())};
     }
+
+	void read_prefix(std::shared_ptr<ReadSocketData> msg);
+	void read_command(std::shared_ptr<ReadSocketData> msg);
+	void read_length(std::shared_ptr<ReadSocketData> msg);
+	void read_checksum(std::shared_ptr<ReadSocketData> msg);
+	void read_payload(std::shared_ptr<ReadSocketData> msg);
+	void final_read_message(std::shared_ptr<ReadSocketData> msg);
 public:
 
 	PoolSocket(auto socket_, auto net_, auto conn_type) 
-		: socket_type(conn_type), socket(std::move(socket_)), net(net_)
+		: BasePoolSocket(conn_type), socket(socket_), net(net_)
 	{
-		set_addr();
+		init_addr();
 		LOG_DEBUG_POOL << "PoolSocket created";
 	}
 
-	PoolSocket(auto socket_, auto net_, handler_type message_handler, error_handler_type err_handler, auto conn_type) 
-		: Socket(std::move(message_handler), conn_type), error_handler(std::move(err_handler)), socket(std::move(socket_)), net(net_)
-	{
-		set_addr();
-        LOG_DEBUG_POOL << "PoolSocket created2";
-	}
+	// PoolSocket(auto socket_, auto net_, handler_type message_handler, error_handler_type err_handler, auto conn_type) 
+	// 	: Socket(std::move(message_handler), conn_type), error_handler(std::move(err_handler)), socket(std::move(socket_)), net(net_)
+	// {
+	// 	init_addr();
+    //     LOG_DEBUG_POOL << "PoolSocket created2";
+	// }
 
 	~PoolSocket()
     {
-        LOG_DEBUG_POOL << "PoolSocket removed";
+        LOG_DEBUG_POOL << "PoolSocket " << get_addr().to_string() << " removed";
 	}
 
 	void write(std::shared_ptr<Message> msg) override
@@ -60,7 +69,7 @@ public:
             LOG_INFO << "message length > max_payload_length!";
         }
 
-        add_not_received(msg->command);
+        event_send_message->happened(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
                                  [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
                                  {
@@ -70,35 +79,27 @@ public:
                                         throw make_except<pool_exception, NetExcept>((boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str(), get_addr());
                                      } else
                                      {
-                                        last_message_sent = cmd;
-                                        remove_not_received(cmd);
+                                        event_peer_receive->happened(cmd);
                                      }
                                  });
 	}
 
 	// Read
-	void read_prefix(std::shared_ptr<ReadSocketData> msg);
-	void read_command(std::shared_ptr<ReadSocketData> msg);
-	void read_length(std::shared_ptr<ReadSocketData> msg);
-	void read_checksum(std::shared_ptr<ReadSocketData> msg);
-	void read_payload(std::shared_ptr<ReadSocketData> msg);
-	void final_read_message(std::shared_ptr<ReadSocketData> msg);
-
 	void read() override
 	{
 		std::shared_ptr<ReadSocketData> msg = std::make_shared<ReadSocketData>(net->PREFIX_LENGTH);
 		read_prefix(msg);
 	}
 
-	bool isConnected() override
+	bool is_connected() override
 	{
 		return socket->is_open();
 	}
 
-	void disconnect() override
+	void close() override
 	{
         LOG_WARNING << "Pool socket has been disconnected from " << get_addr().to_string() << ".";
-        LOG_INFO.stream() << "Last message peer handle = " << last_message_sent << "; Last message received = " << last_message_received << "; not_received = " << not_received;
+        LOG_INFO.stream() << messages_stat();
 
 		socket->close();
         event_disconnect->happened();

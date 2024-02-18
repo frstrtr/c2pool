@@ -11,13 +11,15 @@
 #include "pool_socket.h"
 #include <libdevcore/exceptions.h>
 #include <libp2p/protocol.h>
-#include <libp2p/protocol_events.h>
+#include <libp2p/protocol_components.h>
 #include <libp2p/handler.h>
 #include <libcoind/transaction.h>
 
 #include <boost/asio/io_context.hpp>
 
-class PoolProtocol : public BaseProtocol<PoolSocket, Pinger>, public PoolProtocolData
+typedef BaseProtocol<BasePoolSocket, Pinger> BasePoolProtocol;
+
+class PoolProtocol : public BasePoolProtocol, public PoolProtocolData
 {
 public:
 //	std::set<uint256> remote_tx_hashes;
@@ -29,11 +31,17 @@ public:
 //	std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
 
 public:
-	PoolProtocol(boost::asio::io_context* context_, Socket* socket_, HandlerManagerPtr handler_manager_, PoolProtocolData* data_) 
-		: BaseProtocol<PoolSocket, Pinger>(socket_, handler_manager_, 20, 100), PoolProtocolData(*data_)
+	PoolProtocol(boost::asio::io_context* context_, BasePoolSocket* socket_, HandlerManagerPtr handler_manager_, PoolProtocolData* data_) 
+		: BasePoolProtocol(socket_, handler_manager_, context_, 20, 100), PoolProtocolData(*data_)
 	{
 	}
 
+	void write(std::shared_ptr<Message> msg) 
+	{
+		socket->write(msg);
+	}
+	
+protected:
 	void timeout() override 
 	{
 		//TODO: out of ping timer;
