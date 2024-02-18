@@ -1,33 +1,25 @@
-//
-//  CoindProtocol->init(...<events>...)
-//
 #pragma once
 #include <memory>
 
+#include "coind_socket.h"
 #include "coind_protocol_data.h"
 #include "coind_messages.h"
 #include <libp2p/protocol.h>
 #include <libp2p/handler.h>
-#include <libp2p/protocol_events.h>
+#include <libp2p/protocol_components.h>
 #include <libdevcore/deferred.h>
 #include <libdevcore/exceptions.h>
 
+typedef BaseProtocol<BaseCoindSocket, Pinger> BaseCoindProtocol;
+
 //https://en.bitcoin.it/wiki/Protocol_documentation
-class CoindProtocol : public Protocol<CoindProtocol>, public CoindProtocolData, ProtocolPinger
+class CoindProtocol : public BaseCoindProtocol, public CoindProtocolData
 {
 public:
-    CoindProtocol(boost::asio::io_context* context_, Socket* socket_,
-                  HandlerManagerPtr handler_manager_) : Protocol<CoindProtocol>("Coind", socket_, std::move(handler_manager_)),
-                                                                       ProtocolPinger(context_, 30, [this] { out_time_ping(); },
-																					  [](){return 20; /*TODO: return  random.expovariate(1/100)*/}, [&](){ send_ping(); })
+    CoindProtocol(boost::asio::io_context* context_, BaseCoindSocket* socket_, HandlerManagerPtr handler_manager_) 
+		: BaseCoindProtocol(socket_, handler_manager_, context_, 20, 30)
     {
 		send_version();
-    }
-
-    void disconnect() override
-    {
-        socket->disconnect();
-		delete socket;
     }
 
 private:
@@ -57,14 +49,14 @@ private:
 		write(msg);
 	}
 
-	void send_ping()
+	void timeout() override 
+	{
+		throw make_except<coind_exception, NodeExcept>("out time ping");
+	}
+
+    void send_ping() override
 	{
 		auto ping_msg = std::make_shared<coind::messages::message_ping>(1234);
 		socket->write(ping_msg);
 	}
-
-    void out_time_ping()
-    {
-        throw make_except<coind_exception, NodeExcept>("out time ping");
-    }
 };

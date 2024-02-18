@@ -8,7 +8,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/buffer.hpp>
 
-#include <libp2p/protocol_events.h>
+#include <libp2p/protocol_components.h>
 
 #include <memory>
 using namespace jsonrpccxx;

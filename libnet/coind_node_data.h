@@ -45,7 +45,7 @@ public:
 public:
 	CoindNodeData(io::io_context* context_, ConnectionStatus* status_) : context(context_), status(status_)
 	{
-		handler_manager = std::make_shared<HandlerManager<CoindProtocol>>();
+		handler_manager = std::make_shared<HandlerManager>();
 
         stop_event = make_event();
 
