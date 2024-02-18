@@ -9,7 +9,7 @@ namespace c2pool
     {
         boost::asio::steady_timer timer;
 
-        time_t t; // seconds
+        int t; // seconds
         std::function<void()> handler;
         std::function<void()> cancel_handler;
     private:
@@ -35,7 +35,7 @@ namespace c2pool
         {
         }
 
-        void start(time_t t_, std::function<void()> handler_, std::function<void()> cancel_ = nullptr)
+        void start(int t_, std::function<void()> handler_, std::function<void()> cancel_ = nullptr)
         {
             t = t_;
             handler = std::move(handler_);
@@ -51,7 +51,7 @@ namespace c2pool
             timer.cancel();
         }
 
-        void restart(std::optional<time_t> new_t = std::nullopt)
+        void restart(std::optional<int> new_t = std::nullopt)
         {
             if (new_t)
                 t = new_t.value();

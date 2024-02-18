@@ -85,7 +85,7 @@ public:
         }
 	}
 
-    void happened(Args & ... args)
+    void happened(const Args & ... args)
     {
         times += 1;
 
