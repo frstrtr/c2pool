@@ -26,15 +26,15 @@ class Pinger
 private:
     ProtocolEvents* events;
 
-    time_t frequency_t; // частота отправки сообщения ping
-    time_t timeout_t;   // время, через которое pinger посчитает, что peer отключён.
+    int frequency_t; // частота отправки сообщения ping
+    int timeout_t;   // время, через которое pinger посчитает, что peer отключён.
 
     c2pool::Timer timer_timeout;
     c2pool::Timer timer_ping;
 
 public:
-    Pinger(boost::asio::io_context* context, auto frequency_, auto timeout_)
-        : timer_timeout(*context), timer_ping(*context), frequency_t(frequency_), timeout_t(timeout_)
+    Pinger(ProtocolEvents* events_, boost::asio::io_context* context, auto frequency_, auto timeout_)
+        : events(events_), timer_timeout(*context), timer_ping(*context), frequency_t(frequency_), timeout_t(timeout_)
     {
         timer_timeout.start(
             timeout_t,
