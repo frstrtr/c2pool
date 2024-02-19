@@ -20,7 +20,7 @@ public:
 	template <typename... Args>
 	BaseHandshake(socket_type* socket_, Args... args) : socket(socket_), COMPONENTS(this, std::forward<Args>(args))...
 	{
-		socket->set_message_handler
+		socket->set_handler
 		(
 			[this](const std::shared_ptr<RawMessage>& raw_msg)
 			{
