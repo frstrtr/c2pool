@@ -22,11 +22,11 @@ struct P2PWriteSocketData : public WriteSocketData
     {
         PackStream value;
 
-        // prefix [+]
+        // prefix
         PackStream prefix_stream(prefix);
         value << prefix_stream;
 
-        //command [+]
+        //command
         auto command = new char[12]{'\0'};
         memcpy(command, msg->command.c_str(), msg->command.size());
         PackStream s_command(command, 12);
@@ -37,11 +37,11 @@ struct P2PWriteSocketData : public WriteSocketData
         PackStream payload_stream;
         payload_stream << *msg;
 
-        //len [+]
+        //len
         IntType(32) unpacked_len(payload_stream.size());
         value << unpacked_len;
 
-        //checksum [+]
+        //checksum
         PackStream payload_checksum_stream;
         payload_checksum_stream << *msg;
 
@@ -55,7 +55,7 @@ struct P2PWriteSocketData : public WriteSocketData
         PackStream checksum(packed_checksum);
         value << checksum;
 
-        //payload [+]
+        //payload
         value << payload_stream;
 
         //result

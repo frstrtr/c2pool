@@ -93,7 +93,7 @@ public:
 		resolver.cancel();
 	}
 
-	void tick(NetAddress addr) override
+	void try_connect(NetAddress addr) override
 	{
         LOG_DEBUG_P2P << "P2PConnector try to resolve " << addr.to_string();
 		resolver.async_resolve(addr.ip, addr.port,
@@ -177,7 +177,7 @@ public:
 		resolver.cancel();
 	}
 
-	void tick(NetAddress address) override
+	void try_connecct(NetAddress address) override
 	{
 		resolver.async_resolve(address.ip, address.port,
 			[&, address = address]
