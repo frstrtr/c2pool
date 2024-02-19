@@ -44,7 +44,8 @@ public:
     CoindSocket(auto socket_, auto net_) 
         : BaseCoindSocket(), socket(socket_), net(net_)
 	{ 
-        
+        init_addr();
+        LOG_DEBUG_COIND << "CoindSocket created";
     }
 
 	void write(std::shared_ptr<Message> msg) override

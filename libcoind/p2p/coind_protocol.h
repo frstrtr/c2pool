@@ -22,6 +22,11 @@ public:
 		send_version();
     }
 
+	void write(std::shared_ptr<Message> msg) override
+	{
+		socket->write(msg);
+	}
+
 private:
 
 	void send_version()
