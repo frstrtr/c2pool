@@ -35,13 +35,12 @@ public:
 
 	void connect(const NetAddress& addr)
 	{
-		connector->tick(addr);
+		connector->try_connect(addr);
 	}
 
 protected:
-    void socket_handle(Socket* socket)
+    void socket_handle(BaseCoindSocket* socket)
     {
-        socket->set_addr();
         LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
 
 		protocol = new CoindProtocol(context, socket, handler_manager);
@@ -55,8 +54,8 @@ protected:
     }
 };
 
-#define SET_POOL_DEFAULT_HANDLER(msg) \
-	handler_manager->new_handler<coind::messages::message_##msg>(#msg, [&](auto _msg, auto _proto){ handle_message_##msg(_msg, _proto); });
+#define SET_COIND_DEFAULT_HANDLER(msg) \
+	handler_manager->new_handler<coind::messages::message_##msg, CoindProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
 
 class CoindNode : public virtual CoindNodeData, public NodeExceptionHandler, public SupervisorElement, CoindNodeClient
 {
@@ -65,22 +64,22 @@ private:
 public:
     CoindNode(io::io_context* _context) : CoindNodeData(_context, this), CoindNodeClient(context, this), work_poller_t(*context), forget_old_txs_t(*context)
     {
-		SET_POOL_DEFAULT_HANDLER(version);
-		SET_POOL_DEFAULT_HANDLER(verack);
-		SET_POOL_DEFAULT_HANDLER(ping);
-		SET_POOL_DEFAULT_HANDLER(pong);
-		SET_POOL_DEFAULT_HANDLER(alert);
-		SET_POOL_DEFAULT_HANDLER(getaddr);
-		SET_POOL_DEFAULT_HANDLER(addr);
-		SET_POOL_DEFAULT_HANDLER(inv);
-		SET_POOL_DEFAULT_HANDLER(getdata);
-		SET_POOL_DEFAULT_HANDLER(reject);
-		SET_POOL_DEFAULT_HANDLER(getblocks);
-		SET_POOL_DEFAULT_HANDLER(getheaders);
+		SET_COIND_DEFAULT_HANDLER(version);
+		SET_COIND_DEFAULT_HANDLER(verack);
+		SET_COIND_DEFAULT_HANDLER(ping);
+		SET_COIND_DEFAULT_HANDLER(pong);
+		SET_COIND_DEFAULT_HANDLER(alert);
+		SET_COIND_DEFAULT_HANDLER(getaddr);
+		SET_COIND_DEFAULT_HANDLER(addr);
+		SET_COIND_DEFAULT_HANDLER(inv);
+		SET_COIND_DEFAULT_HANDLER(getdata);
+		SET_COIND_DEFAULT_HANDLER(reject);
+		SET_COIND_DEFAULT_HANDLER(getblocks);
+		SET_COIND_DEFAULT_HANDLER(getheaders);
 
-		SET_POOL_DEFAULT_HANDLER(tx);
-		SET_POOL_DEFAULT_HANDLER(block);
-		SET_POOL_DEFAULT_HANDLER(headers);
+		SET_COIND_DEFAULT_HANDLER(tx);
+		SET_COIND_DEFAULT_HANDLER(block);
+		SET_COIND_DEFAULT_HANDLER(headers);
 
         set_send_block([&](const auto &block){
             auto msg = std::make_shared<coind::messages::message_block>(block);
@@ -100,10 +99,7 @@ public:
         // disconnect protocol
         if (protocol)
         {
-            protocol->disconnect();
-
-            delete protocol;
-            protocol = nullptr;
+            CoindNodeClient::stop();
         }
 
         set_state(disconnected);
