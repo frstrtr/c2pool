@@ -36,7 +36,7 @@ public:
 	{
 	}
 
-	void write(std::shared_ptr<Message> msg) 
+	void write(std::shared_ptr<Message> msg) override
 	{
 		socket->write(msg);
 	}
