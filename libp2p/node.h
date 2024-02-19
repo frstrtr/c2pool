@@ -9,6 +9,14 @@
 
 #include "socket.h"
 
+enum NodeRunState
+{
+    disable = 0,
+	onlyClient = 1,
+	onlyServer = 1 << 1,
+	both = onlyClient | onlyServer
+};
+
 template <typename SocketType>
 class Listener
 {
@@ -53,15 +61,23 @@ public:
         error_handler = std::move(error_handle_);
     }
 
-	virtual void tick(NetAddress addr_) = 0;
+	virtual void try_connect(NetAddress addr_) = 0;
     virtual void run() = 0;
     virtual void stop() = 0;
 };
 
-enum NodeRunState
+class Client
 {
-    disable = 0,
-	onlyClient = 1,
-	onlyServer = 1 << 1,
-	both = onlyClient | onlyServer
+    
+};
+
+class Server
+{
+    std::unique_ptr<Listener<BasePoolSocket>> listener;
+public:
+    template <typename ListenerType>
+    void init()
+    {
+        
+    }
 };
