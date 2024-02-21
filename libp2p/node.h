@@ -66,18 +66,76 @@ public:
     virtual void stop() = 0;
 };
 
-class Client
-{
-    
-};
-
+template <typename BaseSocketType>
 class Server
 {
-    std::unique_ptr<Listener<BasePoolSocket>> listener;
+protected:
+    typedef BaseSocketType socket_type;
+    typedef Listener<socket_type> listener_type;
+    
+    std::unique_ptr<listener_type> listener;
+
+    virtual void socket_handle(socket_type* socket) = 0;
+
 public:
-    template <typename ListenerType>
-    void init()
+    Server() = default;
+
+    template <typename ListenerType, typename... Args>
+    void init(Args&&... args)
     {
-        
+        listener = std::make_unique<ListenerType>(args...);//(context, net, config->c2pool_port);
+        listener->init(
+                // socket from listener
+                [&](socket_type* socket)
+                {
+                    socket_handle(socket);
+                },
+                // disconnect
+                [&](const NetAddress& addr)
+                {
+                    disconnect(addr);
+                }
+        );
     }
+
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual void disconnect(const NetAddress& addr) = 0;
+};
+
+template <typename BaseSocketType>
+class Client
+{
+protected:
+    typedef BaseSocketType socket_type;
+    typedef Connector<socket_type> connector_type;
+
+    std::unique_ptr<connector_type> connector;
+
+    virtual void socket_handle(socket_type* socket) = 0;
+
+public:
+    Client() = default;
+
+    template <typename ConnectorType, typename... Args>
+    void init(Args&&... args)
+    {
+        connector = std::make_unique<ConnectorType>(args...);//(context, net);
+        connector->init(
+                // socket_handler
+                [&](BasePoolSocket* socket)
+                {
+                    socket_handle(socket);
+                },
+                // disconnect
+                [&](const NetAddress& addr)
+                {
+                    disconnect(addr);
+                }
+        );
+    }
+
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual void disconnect(const NetAddress& addr) = 0;
 };
