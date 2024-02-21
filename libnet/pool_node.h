@@ -21,53 +21,10 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-#define HOST_IDENT NetAddress
-
-class PoolNodeServer : virtual PoolNodeData
+class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
 {
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
-
-protected:
-	std::unique_ptr<Listener<BasePoolSocket>> listener; // from P2PNode::run()
-
-    std::map<HOST_IDENT, PoolHandshakeServer*> server_attempts;
-    std::map<HOST_IDENT, PoolProtocol*> server_connections;
-private:
     msg_version_handler_type message_version_handle;
-public:
-	PoolNodeServer(io::io_context* context_, msg_version_handler_type version_handle) 
-        : PoolNodeData(context_), message_version_handle(std::move(version_handle)) {}
-
-    template <typename ListenerType>
-    void init()
-    {
-        listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
-        listener->init(
-                // socket from listener
-                [&](BasePoolSocket* socket)
-                {
-                    socket_handle(socket);
-                },
-                // disconnect
-                [&](const NetAddress& addr)
-                {
-                    disconnect(addr);
-                }
-        );
-    }
-
-	void socket_handle(BasePoolSocket* socket)
-    {
-        server_attempts[socket->get_addr()] = new PoolHandshakeServer(socket, message_version_handle,
-                                                                         [&](PoolHandshake* _handshake)
-                                                                         {
-                                                                            handshake_handle(_handshake);
-                                                                         }
-        );
-        
-        // start accept messages
-        socket->read();
-    }
 
     void handshake_handle(PoolHandshake* handshake)
     {
@@ -91,13 +48,39 @@ public:
         server_attempts.erase(addr);
     }
 
-	void start()
+protected:
+    std::map<NetAddress, PoolHandshakeServer*> server_attempts;
+    std::map<NetAddress, PoolProtocol*> server_connections;
+
+    void socket_handle(socket_type* socket) override
+    {
+        server_attempts[socket->get_addr()] = 
+            new PoolHandshakeServer
+            (
+                socket,
+                message_version_handle,
+                [&](PoolHandshake* _handshake)
+                {
+                   handshake_handle(_handshake);
+                }
+            );
+        
+        // start accept messages
+        socket->read();
+    }
+public:
+	PoolNodeServer(io::io_context* context_, msg_version_handler_type version_handle) 
+        : Server<BasePoolSocket>(), PoolNodeData(context_), message_version_handle(std::move(version_handle)) 
+    {
+    }
+
+    void start() override
     {
         listener->run();
     }
 
-    void stop()
-    {   
+    void stop() override
+    {
         // disable listener
         listener->stop();
 
@@ -121,7 +104,7 @@ public:
         server_attempts.clear();
     }
 
-    void disconnect(const NetAddress& addr)
+    void disconnect(const NetAddress& addr) override
     {
         if (server_attempts.count(addr))
         {
@@ -142,54 +125,17 @@ public:
     }
 };
 
-class PoolNodeClient : virtual PoolNodeData
+class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
 {
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
-protected:
-	std::unique_ptr<Connector<BasePoolSocket>> connector; // from P2PNode::run()
-
-	std::map<HOST_IDENT, PoolHandshakeClient*> client_attempts;
-    std::map<HOST_IDENT, PoolProtocol*> client_connections;
-private:
-	io::steady_timer auto_connect_timer;
-	const std::chrono::seconds auto_connect_interval{1s};
-
     msg_version_handler_type message_version_handle;
-public:
-	PoolNodeClient(io::io_context* context_, msg_version_handler_type version_handle) 
-        : PoolNodeData(context_), message_version_handle(std::move(version_handle)), auto_connect_timer(*context) {}
 
-    template <typename ConnectorType>
-    void init()
-    {
-        connector = std::make_unique<ConnectorType>(context, net);
-
-        connector->init(
-                // socket_handler
-                [&](BasePoolSocket* socket)
-                {
-                    socket_handle(socket);
-                },
-                // error_handle
-                [&](const NetAddress& addr, const std::string& err)
-                {
-                    PoolNodeClient::error_handle(addr, err);
-                }
-        );
-		auto_connect();
-    }
-
-    void socket_handle(BasePoolSocket* socket)
-    {
-        client_attempts[socket->get_addr()] =
-                new PoolHandshakeClient(socket, message_version_handle,
-                                                      [&](PoolHandshake* _handshake){ handshake_handle(_handshake);});
-        //TODO: socket->read()?
-    }
+    c2pool::Timer connect_timer;
+    const int connect_interval{1};
 
     void handshake_handle(PoolHandshake* handshake)
     {
-        LOG_DEBUG_POOL << "PoolServer has been connected to: " << handshake->get_socket();
+        LOG_DEBUG_POOL << "PoolClient has been connected to: " << handshake->get_socket();
         auto sock = handshake->get_socket();
         auto addr = sock->get_addr();
         auto protocol = new PoolProtocol(context, sock, handler_manager, handshake);
@@ -209,20 +155,8 @@ public:
 	    client_attempts.erase(addr);
     }
 
-    void start()
+    void resolve_connection()
     {
-        connector->run();
-    }
-
-    void try_connect(const boost::system::error_code& ec)
-    {
-        if (ec)
-        {
-            if (ec != boost::system::errc::operation_canceled)
-                LOG_ERROR << "P2PNode::auto_connect: " << ec.message();
-            return;
-        }
-
         if (!((client_connections.size() < config->desired_conns) &&
               (addr_store->len() > 0) &&
               (client_attempts.size() <= config->max_attempts)))
@@ -237,33 +171,53 @@ public:
             }
             LOG_TRACE << "try to connect: " << addr.to_string();
             client_attempts[addr] = nullptr;
-            connector->tick(addr);
+            connector->try_connect(addr);
         }
-
-        auto_connect();
     }
+protected:
 
-	void auto_connect()
+    std::map<NetAddress, PoolHandshakeClient*> client_attempts;
+    std::map<NetAddress, PoolProtocol*> client_connections;
+
+    std::vector<NetAddress> get_good_peers(int max_count);
+
+    void socket_handle(socket_type* socket)
     {
-        auto_connect_timer.expires_from_now(auto_connect_interval);
-        auto_connect_timer.async_wait(
-                [this](const boost::system::error_code &ec)
-                {
-                    try_connect(ec);
-                });
+        client_attempts[socket->get_addr()] =
+                new PoolHandshakeClient
+                (
+                    socket,
+                    message_version_handle,
+                    [&](PoolHandshake* _handshake)
+                    { 
+                        handshake_handle(_handshake);
+                    }
+                );
+
+        // start accept messages
+        socket->read();
     }
 
-    // handshake error in connector
-    void error_handle(const NetAddress& addr, const std::string& err)
+public:
+    PoolNodeClient(io::io_context* context_, msg_version_handler_type version_handle) 
+        : Client<BasePoolSocket>(), PoolNodeData(context_), message_version_handle(std::move(version_handle)), connect_timer(context, true)
     {
-        LOG_ERROR << "Pool Server[->" << addr.to_string() << "] error: " << err;
-        client_attempts.erase(addr);
     }
 
-	std::vector<NetAddress> get_good_peers(int max_count);
+    void start()
+    {
+        connector->run();
+        connect_timer.start(
+            connect_interval,
+            [&]()
+            {
+                resolve_connection();
+            }
+        );
+    }
 
     void stop()
-    {   
+    {
         // disable connector
         connector->stop();
 
@@ -287,9 +241,32 @@ public:
         client_attempts.clear();
 
         // stop auto_connect_timer
-        auto_connect_timer.cancel();
+        connect_timer.stop();
+    }
+    
+    void disconnect(const NetAddress& addr)
+    {
+        if (client_attempts.count(addr))
+        {
+            auto handshake = client_attempts[addr];
+            handshake->close();
+            delete handshake;
+            client_attempts.erase(addr);
+        }
+
+        if (client_connections.count(addr))
+        {
+            auto protocol = client_connections[addr];
+            peers.erase(protocol->nonce);
+            protocol->close();
+            delete protocol;
+            client_connections.erase(addr);
+        }
     }
 };
+
+    // listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
+    // connector = std::make_unique<ConnectorType>(context, net);
 
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg, PoolProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
