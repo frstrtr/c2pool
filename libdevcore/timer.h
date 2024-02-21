@@ -10,6 +10,7 @@ namespace c2pool
         boost::asio::steady_timer timer;
 
         int t; // seconds
+        bool repeat;
         std::function<void()> handler;
         std::function<void()> cancel_handler;
     private:
@@ -22,6 +23,9 @@ namespace c2pool
                     if (!ec)
                     {
                         handler();
+
+                        if (repeat)
+                            restart();
                     } else
                     {
                         if (cancel_handler) 
@@ -31,7 +35,7 @@ namespace c2pool
             );
         }
     public:
-        Timer(boost::asio::io_context* context) : timer(*context)
+        Timer(boost::asio::io_context* context, bool repeat_ = false) : timer(*context), repeat(repeat_)
         {
         }
 
