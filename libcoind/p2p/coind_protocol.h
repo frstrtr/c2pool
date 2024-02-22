@@ -16,8 +16,8 @@ typedef BaseProtocol<BaseCoindSocket, Pinger> BaseCoindProtocol;
 class CoindProtocol : public BaseCoindProtocol, public CoindProtocolData
 {
 public:
-    CoindProtocol(boost::asio::io_context* context_, BaseCoindSocket* socket_, HandlerManagerPtr handler_manager_) 
-		: BaseCoindProtocol(socket_, handler_manager_, context_, 20, 30)
+    CoindProtocol(boost::asio::io_context* context_, BaseCoindSocket* socket_, HandlerManagerPtr handler_manager_, error_handler_type error_handler_) 
+		: BaseCoindProtocol(socket_, handler_manager_, error_handler_, context_, 20, 30)
     {
 		send_version();
     }

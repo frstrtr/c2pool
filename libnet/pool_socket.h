@@ -12,15 +12,13 @@
 
 #include <boost/asio.hpp>
 
-typedef BaseSocket<DebugMessages, CustomSocketDisconnect> BasePoolSocket;
+typedef BaseSocket<DebugMessages> BasePoolSocket;
 
 class PoolSocket : public BasePoolSocket
 {
-	typedef std::function<void(const std::string&)> error_handler_type;
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
-	c2pool::Network* net;
-	error_handler_type error_handler;
+	c2pool::Network* net;	
 
     void init_addr() override
     {
@@ -37,19 +35,12 @@ private:
 	void final_read_message(std::shared_ptr<ReadSocketData> msg);
 public:
 
-	PoolSocket(auto socket_, auto net_, auto conn_type) 
-		: BasePoolSocket(conn_type), socket(socket_), net(net_)
+	PoolSocket(auto socket_, auto net_, connection_type type_, error_handler_type error_handler_) 
+		: BasePoolSocket(type_, error_handler_), socket(socket_), net(net_)
 	{
 		init_addr();
 		LOG_DEBUG_POOL << "PoolSocket created";
 	}
-
-	// PoolSocket(auto socket_, auto net_, handler_type message_handler, error_handler_type err_handler, auto conn_type) 
-	// 	: Socket(std::move(message_handler), conn_type), error_handler(std::move(err_handler)), socket(std::move(socket_)), net(net_)
-	// {
-	// 	init_addr();
-    //     LOG_DEBUG_POOL << "PoolSocket created2";
-	// }
 
 	~PoolSocket()
     {
@@ -103,10 +94,5 @@ public:
 
 		socket->close();
         event_disconnect->happened();
-	}
-
-	void error(const std::string& err) override 
-	{
-		error_handler(err);
 	}
 };
