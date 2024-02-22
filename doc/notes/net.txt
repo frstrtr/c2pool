@@ -1,0 +1,25 @@
+socket:
+    - ошибка
+        - системная -- передача в node для дальнейшего решения.
+            - отключение пира
+                    or
+            - отключение ноды
+        - протокол -- неправильный prefix/command/etc...
+            - отключение пира
+    Example:
+        ERROR -> Socket::error(ERROR) -> NodeServer::error_socket(ERROR, addr) -> 
+            protcl: NodeServer::disconnect(addr) -> Protocol::cancel() -> Socket::cancel();
+            or
+            system: throw
+protocol:
+    - ошибка
+        - системная 
+        - протокол -- ping, etc...
+            - отключение пира
+    Example:
+        ERROR -> Protocol::error(ERROR) -> NodeServer::error_protocol(ERROR, addr) ->
+            protcl: NodeServer::disconnect(addr) -> Protocol::cancel() -> Socket::cancel();
+            or
+            system: throw
+
+
