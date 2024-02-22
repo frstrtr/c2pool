@@ -130,5 +130,5 @@ void CoindSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 
     event_handle_message->happened(msg->command);
 	//Protocol handle message
-	handler(raw_message);
+	msg_handler(raw_message);
 }

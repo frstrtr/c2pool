@@ -31,7 +31,11 @@ class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
         LOG_DEBUG_POOL << "PoolServer has been connected to: " << handshake->get_socket();
         auto sock = handshake->get_socket();
         auto addr = sock->get_addr();
-		auto protocol = new PoolProtocol(context, sock, handler_manager, handshake);
+		auto protocol 
+            = new PoolProtocol
+                (
+                    context, sock, handler_manager, handshake
+                );
         
         peers[protocol->nonce] = protocol;
         sock->event_disconnect->subscribe(

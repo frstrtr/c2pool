@@ -41,8 +41,8 @@ private:
 	void final_read_message(std::shared_ptr<ReadSocketData> msg);
 public:
 
-    CoindSocket(auto socket_, auto net_) 
-        : BaseCoindSocket(), socket(socket_), net(net_)
+    CoindSocket(auto socket_, auto net_, connection_type type_, error_handler_type error_handler_) 
+        : BaseCoindSocket(type_, error_handler_), socket(socket_), net(net_)
 	{ 
         init_addr();
         LOG_DEBUG_COIND << "CoindSocket created";
