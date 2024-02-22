@@ -31,19 +31,6 @@ struct SocketEvents
 
 };
 
-struct CustomSocketDisconnect
-{
-    // type for function PoolNodeServer::disconnect();
-    typedef std::function<void(const NetAddress& addr)> disconnect_type;
-
-    disconnect_type disconnect;
-
-    CustomSocketDisconnect(disconnect_type disconnect_) 
-        : disconnect(std::move(disconnect_)) 
-    {
-    }
-};
-
 class DebugMessages
 {
 private:
