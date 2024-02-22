@@ -21,6 +21,13 @@ public:
     }
 };
 
+struct PingerConfig
+{
+    boost::asio::io_context* context;
+    int frequency;
+    int timeout;
+};
+
 class Pinger
 {
 private:
@@ -33,8 +40,8 @@ private:
     c2pool::Timer timer_ping;
 
 public:
-    Pinger(ProtocolEvents* events_, boost::asio::io_context* context, auto frequency_, auto timeout_)
-        : events(events_), timer_timeout(*context), timer_ping(*context), frequency_t(frequency_), timeout_t(timeout_)
+    Pinger(ProtocolEvents* events_, PingerConfig&& config)
+        : events(events_), timer_timeout(config.context), timer_ping(config.context), frequency_t(config.frequency), timeout_t(config.timeout)
     {
         timer_timeout.start(
             timeout_t,
