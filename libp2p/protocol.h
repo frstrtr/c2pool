@@ -17,17 +17,21 @@ class BaseProtocol : public NetworkHandler, public ProtocolEvents, public COMPON
 {
 protected:
 	typedef SocketType socket_type;
+    socket_type* socket;
 
+    typedef std::function<void(const std::string&, NetAddress)> error_handler_type;
+    error_handler_type error_handler;
+    
     HandlerManagerPtr handler_manager;
-	SocketType* socket;
-
+    
 public:
     virtual void write(std::shared_ptr<Message> msg) = 0;
 
 public:
     template <typename... Args>
-    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr handler_manager_, Args&&...args) 
-        : socket(socket_), handler_manager(handler_manager_), COMPONENTS(this, std::forward<Args>(args))...
+    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr handler_manager_, error_handler_type error_handler_, Args&&...args)
+        : socket(socket_), handler_manager(handler_manager_), error_handler(error_handler_),
+            COMPONENTS(this, std::forward<Args>(args))...
     {
         socket->set_handler
 		(
@@ -58,6 +62,11 @@ public:
         
         event_handle_message->happened();
 	}
+
+    void error(std::string reason)
+    {
+        error_handler(reason, get_addr());
+    }
 
     void close()
     {

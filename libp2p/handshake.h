@@ -15,10 +15,13 @@ protected:
 	typedef SocketType socket_type;
 	socket_type* socket;
 
+	typedef std::function<void(const std::string&, NetAddress)> error_handler_type;
+    error_handler_type error_handler;
+
 	virtual void handle_raw(std::shared_ptr<RawMessage> raw_msg) = 0;
 public:
 	template <typename... Args>
-	BaseHandshake(socket_type* socket_, Args... args) : socket(socket_), COMPONENTS(this, std::forward<Args>(args))...
+	BaseHandshake(socket_type* socket_, error_handler_type error_handler_, Args... args) : socket(socket_), error_handler(error_handler_), COMPONENTS(this, std::forward<Args>(args))...
 	{
 		socket->set_handler
 		(
@@ -39,6 +42,11 @@ public:
 		handle_raw(raw_msg);
 		event_handle_message->happened();
 	}
+
+	void error(std::string reason)
+    {
+        error_handler(reason, get_addr());
+    }
 
     void close()
     {
