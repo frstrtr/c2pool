@@ -22,16 +22,20 @@ class Listener
 {
 protected:
     typedef SocketType socket_type;
-    // type for function PoolNodeServer::socket_handle();
+    // type for function socket_handle();
     typedef std::function<void(socket_type*)> socket_handler_type;
+    // type for Server::error(...)
+    typedef std::function<void(const std::string&, const NetAddress&)> error_handler_type;
 
     socket_handler_type socket_handler;
+    error_handler_type error_handler;
 public:
     Listener() = default;
 
-	void init(socket_handler_type socket_handler_)
+    void init(socket_handler_type socket_handler_, error_handler_type error_handle_)
     {
         socket_handler = std::move(socket_handler_);
+        error_handler = std::move(error_handle_);
     }
 
     virtual void run() = 0;
@@ -47,8 +51,8 @@ protected:
     typedef SocketType socket_type;
     // type for function socket_handle();
     typedef std::function<void(socket_type*)> socket_handler_type;
-    // type for function error()
-    typedef std::function<void(NetAddress, std::string)> error_handler_type;
+    // type for Server::error(...)
+    typedef std::function<void(const std::string&, const NetAddress&)> error_handler_type;
 
     socket_handler_type socket_handler;
     error_handler_type error_handler;
@@ -75,8 +79,6 @@ protected:
     
     std::unique_ptr<listener_type> listener;
 
-    virtual void socket_handle(socket_type* socket) = 0;
-
 public:
     Server() = default;
 
@@ -90,10 +92,10 @@ public:
                 {
                     socket_handle(socket);
                 },
-                // disconnect
-                [&](const NetAddress& addr)
+                // error
+                [&](const std::string& reason, const NetAddress& addr)
                 {
-                    disconnect(addr);
+                    error(reason, addr);
                 }
         );
     }
@@ -101,6 +103,9 @@ public:
     virtual void start() = 0;
     virtual void stop() = 0;
     virtual void disconnect(const NetAddress& addr) = 0;
+protected:
+    virtual void error(const std::string& reason, const NetAddress& addr) = 0;
+    virtual void socket_handle(socket_type* socket) = 0;
 };
 
 template <typename BaseSocketType>
@@ -111,8 +116,6 @@ protected:
     typedef Connector<socket_type> connector_type;
 
     std::unique_ptr<connector_type> connector;
-
-    virtual void socket_handle(socket_type* socket) = 0;
 
 public:
     Client() = default;
@@ -127,10 +130,10 @@ public:
                 {
                     socket_handle(socket);
                 },
-                // disconnect
-                [&](const NetAddress& addr)
+                // error
+                [&](const std::string& reason, const NetAddress& addr)
                 {
-                    disconnect(addr);
+                    error(reason, addr);
                 }
         );
     }
@@ -138,4 +141,7 @@ public:
     virtual void start() = 0;
     virtual void stop() = 0;
     virtual void disconnect(const NetAddress& addr) = 0;
+protected:
+    virtual void error(const std::string& reason, const NetAddress& addr) = 0;
+    virtual void socket_handle(socket_type* socket) = 0;
 };

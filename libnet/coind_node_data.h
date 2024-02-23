@@ -2,12 +2,13 @@
 
 #include <memory>
 
-#include "pool_node_data.h"
 #include <libcoind/height_tracker.h>
-#include <libcoind/p2p/coind_protocol.h>
 #include <libcoind/jsonrpc/coindrpc.h>
 #include <sharechains/share_tracker.h>
 #include <networks/network.h>
+#include "pool_node_data.h"
+#include "coind_protocol.h"
+
 #include <boost/asio.hpp>
 namespace io = boost::asio;
 namespace ip = io::ip;

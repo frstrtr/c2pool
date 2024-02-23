@@ -7,6 +7,12 @@
 #include <libdevcore/stream.h>
 #include <libdevcore/stream_types.h>
 
+/** Message header.
+ * (4) message start.
+ * (12) command.
+ * (4) size.
+ * (4) checksum.
+ */
 struct ReadSocketData
 {
     const int COMMAND_LEN = 12;

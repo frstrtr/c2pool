@@ -34,7 +34,11 @@ class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
 		auto protocol 
             = new PoolProtocol
                 (
-                    context, sock, handler_manager, handshake
+                    context, sock, handler_manager, handshake,
+                    [](const std::string& reason, NetAddress addr)
+                    {
+                        
+                    }
                 );
         
         peers[protocol->nonce] = protocol;

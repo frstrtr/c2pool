@@ -4,9 +4,10 @@
 #include <map>
 
 #include "coind_node_data.h"
+#include "coind_protocol.h"
+#include "coind_messages.h"
+
 #include <libcoind/height_tracker.h>
-#include <libcoind/p2p/coind_protocol.h>
-#include <libcoind/p2p/coind_messages.h>
 #include <libcoind/jsonrpc/coindrpc.h>
 #include <libp2p/net_supervisor.h>
 #include <libp2p/node.h>
@@ -19,14 +20,12 @@
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
-class CoindNodeClient : virtual CoindNodeData
+class CoindNodeClient : public Client<BaseCoindSocket>, virtual CoindNodeData
 {
 protected:
-    std::unique_ptr<Connector<BaseCoindSocket>> connector;
-
     CoindProtocol* protocol;
 public:
-    CoindNodeClient(io::io_context* _context, ConnectionStatus* status) : CoindNodeData(_context, status) {}
+    CoindNodeClient(io::io_context* context_, ConnectionStatus* status) : Client<BaseCoindSocket>(), CoindNodeData(context_, status) {}
 
     void error_handle(const NetAddress& addr, const std::string& err)
     {
