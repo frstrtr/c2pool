@@ -8,6 +8,10 @@ set(libnet_sources
         pool_node_data.h pool_node_data.cpp
 
         worker.h worker.cpp
+        
+        coind_messages.h
+        coind_socket.h coind_socket.cpp
+        coind_protocol.h coind_protocol_data.h
         coind_node.h coind_node.cpp
         coind_node_data.h coind_node_data.cpp
         )
