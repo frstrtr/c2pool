@@ -20,14 +20,7 @@ set(jsonrpc_sources
         jsonrpc/results.h 
 )
 
-set(coind_p2p_sources
-        p2p/coind_messages.h
-        p2p/coind_socket.h p2p/coind_socket.cpp
-        p2p/coind_protocol.h
-        p2p/coind_protocol_data.h
-)
-
-set(coind_sources ${coind_tool_sources} ${jsonrpc_sources} ${coind_p2p_sources})
+set(coind_sources ${coind_tool_sources} ${jsonrpc_sources})
 
 #set(CURL_LIBRARY "-lcurl")
 #find_package(CURL REQUIRED)
