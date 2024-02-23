@@ -84,13 +84,13 @@ public:
 
     void start() override
     {
-        listener->run();
+        interface->run();
     }
 
     void stop() override
     {
         // disable listener
-        listener->stop();
+        interface->stop();
 
         // disconnect and delete all server_connections
         for (auto& [addr, protocol] : server_connections) 
@@ -179,7 +179,7 @@ class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
             }
             LOG_TRACE << "try to connect: " << addr.to_string();
             client_attempts[addr] = nullptr;
-            connector->try_connect(addr);
+            interface->try_connect(addr);
         }
     }
 protected:
@@ -214,7 +214,7 @@ public:
 
     void start()
     {
-        connector->run();
+        interface->run();
         connect_timer.start(
             connect_interval,
             [&]()
@@ -227,7 +227,7 @@ public:
     void stop()
     {
         // disable connector
-        connector->stop();
+        interface->stop();
 
         // disconnect and delete all client_connections
         for (auto& [addr, protocol] : client_connections) 
