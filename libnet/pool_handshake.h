@@ -36,8 +36,8 @@ protected:
 	}
 
 public:
-    PoolHandshake(auto socket, msg_version_handler_type handler_)
-            : 	BasePoolHandshake(socket), 
+    PoolHandshake(auto socket, error_handler_type error_handler_, msg_version_handler_type handler_)
+            : 	BasePoolHandshake(socket, error_handler_), 
 				PoolProtocolData(3501, c2pool::deferred::QueryDeferrer<std::vector<ShareType>, std::vector<uint256>, uint64_t, std::vector<uint256>>(
                     [_socket = socket](uint256 _id, std::vector<uint256> _hashes, unsigned long long _parents, std::vector<uint256> _stops)
                     {
@@ -64,7 +64,8 @@ class PoolHandshakeServer : public PoolHandshake
 {
     std::function<void(PoolHandshakeServer*)> handshake_finish;
 public:
-	PoolHandshakeServer(auto _socket, msg_version_handler_type version_handle, auto _finish) : PoolHandshake(_socket, std::move(version_handle)), handshake_finish(std::move(_finish))
+	PoolHandshakeServer(auto socket_, error_handler_type error_handler_, msg_version_handler_type version_handle_, auto finish_)
+		: PoolHandshake(socket_, error_handler_, version_handle_), handshake_finish(std::move(finish_))
 	{
 
 	}
@@ -96,7 +97,8 @@ class PoolHandshakeClient : public PoolHandshake
 {
     std::function<void(PoolHandshakeClient*)> handshake_finish;
 public:
-	PoolHandshakeClient(auto _socket, msg_version_handler_type version_handle, auto _finish) : PoolHandshake(_socket, version_handle), handshake_finish(std::move(_finish))
+	PoolHandshakeClient(auto socket_, error_handler_type error_handler_, msg_version_handler_type version_handle_, auto finish_)
+		: PoolHandshake(socket_, error_handler_, version_handle_), handshake_finish(std::move(finish_))
 	{
 		send_version();
 	}
