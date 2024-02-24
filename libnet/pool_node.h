@@ -66,6 +66,10 @@ protected:
             new PoolHandshakeServer
             (
                 socket,
+                [&](const std::string& reason, const NetAddress& addr)
+                {
+                    error(reason, addr);
+                },
                 message_version_handle,
                 [&](PoolHandshake* _handshake)
                 {
@@ -146,7 +150,15 @@ class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
         LOG_DEBUG_POOL << "PoolClient has been connected to: " << handshake->get_socket();
         auto sock = handshake->get_socket();
         auto addr = sock->get_addr();
-        auto protocol = new PoolProtocol(context, sock, handler_manager, handshake);
+        auto protocol 
+            = new PoolProtocol
+                (
+                    context, sock, handler_manager, handshake,
+                    [](const std::string& reason, NetAddress addr)
+                    {
+                        
+                    }
+                );
 
         peers[protocol->nonce] = protocol;
         sock->event_disconnect->subscribe(
@@ -193,14 +205,18 @@ protected:
     {
         client_attempts[socket->get_addr()] =
                 new PoolHandshakeClient
-                (
-                    socket,
-                    message_version_handle,
-                    [&](PoolHandshake* _handshake)
-                    { 
-                        handshake_handle(_handshake);
-                    }
-                );
+            (
+                socket,
+                [&](const std::string& reason, const NetAddress& addr)
+                {
+                    error(reason, addr);
+                },
+                message_version_handle,
+                [&](PoolHandshake* _handshake)
+                {
+                   handshake_handle(_handshake);
+                }
+            );
 
         // start accept messages
         socket->read();
