@@ -62,5 +62,12 @@ namespace c2pool
 
             timer_logic();
         }
+
+        void happened()
+        {
+            handler();
+            if (repeat)
+                restart();
+        }
     };
 }
