@@ -13,12 +13,16 @@ void CoindNode::start()
 	//COIND:
 	coind_work->set(coind->getwork(txidcache));
     get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work->value()](){return _coind_work.previous_block; });
-	new_block->subscribe([&](uint256 _value)
-						{
-							//Если получаем новый блок, то обновляем таймер
-							work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-						});
-	work_poller();
+	new_block->subscribe(
+        [&](uint256 _value)
+	    {
+	    	//Если получаем новый блок, то обновляем таймер
+            work_poller_t.restart();
+	    }
+    );
+
+    work_poller_t.start(15, [&](){ work_poller(); });
+    work_poller_t.happened();
 
 	//PEER:
 	coind_work->changed->subscribe([&](coind::getwork_result result){
@@ -103,7 +107,10 @@ void CoindNode::start()
     */
 
     if (cur_share_version < 34)
-        forget_old_txs();
+    {
+        forget_old_txs_t.start(10, [&](){ forget_old_txs(); });
+        forget_old_txs_t.happened();
+    }
 
 	/* TODO:
 	t = deferral.RobustLoopingCall(self.clean_tracker)
@@ -125,16 +132,7 @@ void CoindNode::work_poller()
         return;
     }
 
-    work_poller_t.expires_from_now(boost::posix_time::seconds(15));
-    work_poller_t.async_wait(
-        [&](const boost::system::error_code &ec)
-        {
-            if (ec == boost::system::errc::operation_canceled && !status->is_available())
-                return;
-
-            work_poller(); 
-        }
-    );
+    work_poller_t.restart();
 }
 
 void CoindNode::poll_header()
@@ -182,8 +180,7 @@ void CoindNode::forget_old_txs()
     }
     known_txs->set(new_known_txs);
 
-    forget_old_txs_t.expires_from_now(boost::posix_time::seconds(10));
-    forget_old_txs_t.async_wait([&](const boost::system::error_code &ec){ forget_old_txs(); });
+    forget_old_txs_t.restart();
 }
 
 

@@ -20,29 +20,57 @@
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
-class CoindNodeClient : public Client<BaseCoindSocket>, virtual CoindNodeData
+class CoindNodeClient : public Client<BaseCoindSocket>
 {
 protected:
+    CoindNodeData* node_data;
     CoindProtocol* protocol;
+    
 public:
-    CoindNodeClient(io::io_context* context_, ConnectionStatus* status) : Client<BaseCoindSocket>(), CoindNodeData(context_, status) {}
-
-    void error_handle(const NetAddress& addr, const std::string& err)
-    {
-        LOG_ERROR << "Coind Client error: " << err;
-    }
+    CoindNodeClient(CoindNodeData* node_data_) 
+        : Client<BaseCoindSocket>(), node_data(node_data_) {}
 
 	void connect(const NetAddress& addr)
 	{
-		connector->try_connect(addr);
+		interface->try_connect(addr);
 	}
 
+    void start() override
+    {
+
+    }
+
+    void stop() override
+    {
+
+    }
+
+    void disconnect(const NetAddress& addr)
+    {
+
+    }
+
 protected:
-    void socket_handle(BaseCoindSocket* socket)
+    void error(const std::string& reason, const NetAddress& addr) override
+    {
+        LOG_ERROR << "Coind Client error: " << reason;
+    }
+
+
+    void socket_handle(BaseCoindSocket* socket) override
     {
         LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
 
-		protocol = new CoindProtocol(context, socket, handler_manager);
+		protocol 
+            = new CoindProtocol(
+                node_data->context, 
+                socket, 
+                node_data->handler_manager,
+                [&](const std::string& reason, const NetAddress& addr)
+                {
+                    error(reason, addr);
+                }
+            );
         socket->event_disconnect->subscribe([]()
         {
             LOG_INFO << "COIND DISCONNECTED";
@@ -61,7 +89,8 @@ class CoindNode : public virtual CoindNodeData, public NodeExceptionHandler, pub
 private:
 	bool isRunning = false;
 public:
-    CoindNode(io::io_context* _context) : CoindNodeData(_context, this), CoindNodeClient(context, this), work_poller_t(*context), forget_old_txs_t(*context)
+    CoindNode(io::io_context* context_) 
+        : CoindNodeData(context_, this), CoindNodeClient(this), work_poller_t(context, true), forget_old_txs_t(context, true)
     {
 		SET_COIND_DEFAULT_HANDLER(version);
 		SET_COIND_DEFAULT_HANDLER(verack);
@@ -91,15 +120,8 @@ public:
     {
         if (state == disconnected)
             return;
-
-        // stop connector
-        connector->stop();
-
-        // disconnect protocol
-        if (protocol)
-        {
-            CoindNodeClient::stop();
-        }
+        
+        CoindNodeClient::stop();
 
         set_state(disconnected);
     }
@@ -117,19 +139,8 @@ public:
         if (isRunning)
             throw std::runtime_error("CoindNode already running");
 
-        connector = std::make_unique<ConnectorType>(context, parent_net, this);
-        connector->init(
-                // socket handler
-                [&](Socket* socket)
-                {
-                    socket_handle(socket);
-                },
-                // error handler
-                [&](const NetAddress& addr, const std::string &err)
-                {
-                    CoindNodeClient::error_handle(addr, err);
-                }
-        );
+        CoindNodeClient::init<ConnectorType>();
+        CoindNodeClient::start();
 
         start();
         isRunning = true;
@@ -164,8 +175,8 @@ public:
     void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol);
     void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol);
 private:
-    boost::asio::deadline_timer work_poller_t;
-	boost::asio::deadline_timer forget_old_txs_t;
+    c2pool::Timer work_poller_t;
+	c2pool::Timer forget_old_txs_t;
 
 	void start();
     void work_poller();
