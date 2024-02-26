@@ -19,7 +19,7 @@ protected:
 	typedef SocketType socket_type;
     socket_type* socket;
 
-    typedef std::function<void(const std::string&, NetAddress)> error_handler_type;
+    typedef std::function<void(const libp2p::error&)> error_handler_type;
     error_handler_type error_handler;
     
     HandlerManagerPtr handler_manager;
@@ -63,9 +63,9 @@ public:
         event_handle_message->happened();
 	}
 
-    void error(std::string reason)
+    void error(libp2p::errcode errc_, std::string reason)
     {
-        error_handler(reason, get_addr());
+        error_handler(libp2p::error{errc_, reason, get_addr()});
     }
 
     void close()

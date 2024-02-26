@@ -10,7 +10,6 @@
 #include <libp2p/preset/p2p_node_interface.h>
 #include <libp2p/node.h>
 #include <libcoind/jsonrpc/coindrpc.h>
-#include <libcoind/p2p/coind_socket.h>
 #include <libcoind/jsonrpc/stratum_node.h>
 #include <web_interface/webserver.h>
 #include <libp2p/net_supervisor.h>

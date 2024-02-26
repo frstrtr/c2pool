@@ -90,17 +90,13 @@ void PoolNode::handle_message_version(std::shared_ptr<pool::messages::message_ve
 	}
 
 	//detect duplicate in node->peers
-	if (peers.find(msg->nonce.get()) != peers.end())
-	{
-
-	}
 	if (peers.count(msg->nonce.get()) != 0)
 	{
 		auto addr = handshake->get_socket()->get_addr();
 		std::string reason =
 			 "[handle_message_version] Detected duplicate connection, disconnecting from "
 			+ addr.to_string();
-        handshake->error(reason);
+        handshake->error(libp2p::BAD_PEER, reason);
 		return;
 	}
 
@@ -430,7 +426,7 @@ void PoolNode::handle_message_shares(std::shared_ptr<pool::messages::message_sha
                     if (flag)
                     {
                         std::string reason = (boost::format("Peer referenced unknown transaction %1%, disconnecting") % tx_hash.GetHex()).str();
-                        protocol->disconnect(reason);
+                        protocol->error(libp2p::BAD_PEER, reason);
                         return;
                     }
                 }
@@ -530,7 +526,7 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
         if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
         {
             std::string reason = "[handle_message_remember_tx] Peer referenced transaction twice, disconnecting";
-            protocol->disconnect(reason);
+            protocol->error(libp2p::BAD_PEER, reason);
             return;
         }
 
@@ -555,7 +551,7 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 			if (!founded_cache)
 			{
                 std::string reason = "[handle_message_remember_tx] Peer referenced unknown transaction " + tx_hash.ToString() + " disconnecting";
-                protocol->disconnect(reason);
+                protocol->error(libp2p::BAD_PEER, reason);
 				return;
 			}
         }
@@ -578,7 +574,7 @@ void PoolNode::handle_message_remember_tx(std::shared_ptr<pool::messages::messag
 		if (protocol->remembered_txs.find(tx_hash) != protocol->remembered_txs.end())
 		{
             std::string reason = "[handle_message_remember_tx] Peer referenced transaction twice, disconnecting";
-            protocol->disconnect(reason);
+            protocol->error(libp2p::BAD_PEER, reason);
 			return;
 		}
 

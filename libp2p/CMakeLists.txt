@@ -1,4 +1,5 @@
 set(libp2p_source
+        net_errors.h
         socket.h
         socket_components.h
         socket_data.h

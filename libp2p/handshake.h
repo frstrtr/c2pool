@@ -5,6 +5,7 @@
 
 #include <libp2p/protocol_components.h>
 
+#include "net_errors.h"
 #include "socket.h"
 #include "message.h"
 
@@ -15,7 +16,7 @@ protected:
 	typedef SocketType socket_type;
 	socket_type* socket;
 
-	typedef std::function<void(const std::string&, NetAddress)> error_handler_type;
+	typedef std::function<void(const libp2p::error&)> error_handler_type;
     error_handler_type error_handler;
 
 	virtual void handle_raw(std::shared_ptr<RawMessage> raw_msg) = 0;
@@ -44,9 +45,9 @@ public:
 		event_handle_message->happened();
 	}
 
-	void error(std::string reason)
+	void error(libp2p::errcode errc_, std::string reason)
     {
-        error_handler(reason, get_addr());
+        error_handler(libp2p::error{errc_, reason, get_addr()});
     }
 
     void close()

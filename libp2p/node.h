@@ -7,6 +7,7 @@
 #include <utility>
 #include <boost/system/error_code.hpp>
 
+#include "net_errors.h"
 #include "socket.h"
 
 enum NodeRunState
@@ -27,7 +28,7 @@ protected:
     // type for function socket_handle();
     using socket_handler_type = std::function<void(socket_type*)>;
     // type for Server::error(...)
-    using error_handler_type = std::function<void(const std::string&, const NetAddress&)>;
+    using error_handler_type = std::function<void(const libp2p::error&)>;
 
     socket_handler_type socket_handler;
     error_handler_type error_handler;
@@ -56,7 +57,7 @@ protected:
     // type for function socket_handle();
     using socket_handler_type = std::function<void(socket_type*)>;
     // type for Server::error(...)
-    using error_handler_type = std::function<void(const std::string&, const NetAddress&)>;
+    using error_handler_type = std::function<void(const libp2p::error&)>;
 
     socket_handler_type socket_handler;
     error_handler_type error_handler;
@@ -98,9 +99,9 @@ public:
                     socket_handle(socket);
                 },
                 // error
-                [&](const std::string& reason, const NetAddress& addr)
+                [&](const libp2p::error& err)
                 {
-                    error(reason, addr);
+                    error(err);
                 }
         );
     }
@@ -109,7 +110,7 @@ public:
     virtual void stop() = 0;
     virtual void disconnect(const NetAddress& addr) = 0;
 protected:
-    virtual void error(const std::string& reason, const NetAddress& addr) = 0;
+    virtual void error(const libp2p::error&) = 0;
     virtual void socket_handle(socket_type* socket) = 0;
 };
 

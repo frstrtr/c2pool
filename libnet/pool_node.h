@@ -35,7 +35,7 @@ class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
             = new PoolProtocol
                 (
                     context, sock, handler_manager, handshake,
-                    [](const std::string& reason, NetAddress addr)
+                    [](libp2p::error err)
                     {
                         
                     }
@@ -66,9 +66,9 @@ protected:
             new PoolHandshakeServer
             (
                 socket,
-                [&](const std::string& reason, const NetAddress& addr)
+                [&](const libp2p::error& err)
                 {
-                    error(reason, addr);
+                    error(err);
                 },
                 message_version_handle,
                 [&](PoolHandshake* _handshake)
@@ -154,7 +154,7 @@ class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
             = new PoolProtocol
                 (
                     context, sock, handler_manager, handshake,
-                    [](const std::string& reason, NetAddress addr)
+                    [](libp2p::error err)
                     {
                         
                     }
@@ -207,9 +207,9 @@ protected:
                 new PoolHandshakeClient
             (
                 socket,
-                [&](const std::string& reason, const NetAddress& addr)
+                [&](const libp2p::error& err)
                 {
-                    error(reason, addr);
+                    error(err);
                 },
                 message_version_handle,
                 [&](PoolHandshake* _handshake)
