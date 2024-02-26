@@ -9,6 +9,7 @@
 #include <libdevcore/events.h>
 #include <libdevcore/types.h>
 
+#include "net_errors.h"
 #include "message.h"
 #include "socket_components.h"
 
@@ -28,7 +29,7 @@ protected:
     typedef std::function<void(std::shared_ptr<RawMessage> raw_msg)> msg_handler_type;
     msg_handler_type msg_handler;
 
-    typedef std::function<void(const std::string&, NetAddress)> error_handler_type;
+    typedef std::function<void(const libp2p::error&)> error_handler_type;
     error_handler_type error_handler;
 
     NetAddress addr;
@@ -65,9 +66,9 @@ public:
 
     virtual bool is_connected() = 0;
     virtual void close() = 0;
-    virtual void error(const std::string& err)
+    virtual void error(libp2p::errcode errc_, const std::string& reason)
 	{
-		error_handler(err, get_addr());
+		error_handler(libp2p::error{errc_, reason, get_addr()});
 	}
 
     // call in constructor

@@ -25,7 +25,7 @@ class CoindNodeClient : public Client<BaseCoindSocket>
 protected:
     CoindNodeData* node_data;
     CoindProtocol* protocol;
-    
+
 public:
     CoindNodeClient(CoindNodeData* node_data_) 
         : Client<BaseCoindSocket>(), node_data(node_data_) {}
@@ -51,11 +51,10 @@ public:
     }
 
 protected:
-    void error(const std::string& reason, const NetAddress& addr) override
+    void error(const libp2p::error& err) override
     {
-        LOG_ERROR << "Coind Client error: " << reason;
+        throw make_except<coind_exception, NodeExcept>(err.reason);
     }
-
 
     void socket_handle(BaseCoindSocket* socket) override
     {
@@ -66,9 +65,9 @@ protected:
                 node_data->context, 
                 socket, 
                 node_data->handler_manager,
-                [&](const std::string& reason, const NetAddress& addr)
+                [&](const libp2p::error& err)
                 {
-                    error(reason, addr);
+                    error(err);
                 }
             );
         socket->event_disconnect->subscribe([]()
