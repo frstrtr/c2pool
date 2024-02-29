@@ -70,7 +70,7 @@ public:
         error_handler = std::move(error_handle_);
     }
 
-	virtual void try_connect(NetAddress addr_) = 0;
+	virtual void try_connect(const NetAddress& addr_) = 0;
     virtual void run() = 0;
     virtual void stop() = 0;
 };

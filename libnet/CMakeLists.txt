@@ -1,6 +1,6 @@
 set(libnet_sources
-        pool_node_interface.h 
-        pool_node_network.h pool_node_network.cpp
+        pool_interface.h 
+        pool_network.h pool_network.cpp
         pool_node.cpp pool_node.h
         pool_socket.cpp pool_socket.h
         pool_protocol.h

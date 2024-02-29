@@ -10,8 +10,7 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-template <typename SocketType>
-class PoolListener : public Listener
+class PoolListener : public Listener<BasePoolSocket>
 {
 private:
 	io::io_context* context;
@@ -71,8 +70,7 @@ protected:
 	}
 };
 
-template <typename SocketType>
-class P2PConnector : public Connector
+class PoolConnector : public Connector<BasePoolSocket>
 {
 private:
 	io::io_context* context;
@@ -81,7 +79,8 @@ private:
 	ip::tcp::resolver resolver;
 
 public:
-	P2PConnector(auto _context, auto _net) : context(_context), net(_net), resolver(*context) {}
+	PoolConnector(auto _context, auto _net) 
+		: context(_context), net(_net), resolver(*context) {}
 
 	void stop() override
 	{

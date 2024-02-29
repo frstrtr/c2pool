@@ -2,11 +2,12 @@
 
 #include <memory>
 #include <boost/asio.hpp>
+#include <libnet/pool_interface.h>
+#include <libnet/coind_interface.h>
 #include <libdevcore/exceptions.h>
 
 using boost::asio::ip::tcp;
 using namespace shares::types;
-
 
 NodeManager::NodeManager(c2pool::Network* _network, c2pool::dev::coind_config* _cfg, WebServer* _web) : _net(_network), _parent_net(_network->parent), _config(_cfg), _web_server(_web)
 {
@@ -96,7 +97,7 @@ void NodeManager::run()
     _pool_node->set_coind_node(_coind_node);
 
     _coind_node->run<CoindConnector<CoindSocket>>();
-    _pool_node->run<PoolListener<PoolSocket>, P2PConnector<PoolSocket>>();
+    _pool_node->run<PoolListener<PoolSocket>, PoolConnector<PoolSocket>>();
 
     // Worker
     _worker = new Worker(_net, _pool_node, _coind_node, _tracker);

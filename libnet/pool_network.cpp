@@ -1,11 +1,11 @@
-#include "pool_node_interface.h"
+#include "pool_network.h"
 
 std::vector<NetAddress> PoolNodeClient::get_good_peers(int max_count)
 {
 	int t = c2pool::dev::timestamp();
 
 	std::vector<std::pair<float, NetAddress>> values;
-	for (auto kv : addr_store->GetAll())
+	for (auto kv : data->addr_store->GetAll())
 	{
 		values.push_back(
 				std::make_pair(
