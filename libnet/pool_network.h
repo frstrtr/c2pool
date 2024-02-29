@@ -1,9 +1,13 @@
 #pragma once
 
+#include "pool_handshake.h"
+#include "pool_node_data.h"
 #include <libp2p/node.h>
 
-class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
+class PoolNodeServer : public Server<BasePoolSocket>
 {
+    PoolNodeData* data;
+
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
     msg_version_handler_type message_version_handle;
 
@@ -15,21 +19,21 @@ class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
 		auto protocol 
             = new PoolProtocol
                 (
-                    context, sock, handler_manager, handshake,
+                    data->context, sock, data->handler_manager, handshake,
                     [](libp2p::error err)
                     {
                         
                     }
                 );
         
-        peers[protocol->nonce] = protocol;
+        data->peers[protocol->nonce] = protocol;
         sock->event_disconnect->subscribe(
                 [&, addr = addr]()
                 {
                     auto proto = server_connections[addr];
 
                     proto->close();
-                    peers.erase(proto->nonce);
+                    data->peers.erase(proto->nonce);
                     server_connections.erase(addr);
                 });
         
@@ -40,30 +44,10 @@ class PoolNodeServer : public Server<BasePoolSocket>, virtual PoolNodeData
 protected:
     std::map<NetAddress, PoolHandshakeServer*> server_attempts;
     std::map<NetAddress, PoolProtocol*> server_connections;
-
-    void socket_handle(socket_type* socket) override
-    {
-        server_attempts[socket->get_addr()] = 
-            new PoolHandshakeServer
-            (
-                socket,
-                [&](const libp2p::error& err)
-                {
-                    error(err);
-                },
-                message_version_handle,
-                [&](PoolHandshake* _handshake)
-                {
-                   handshake_handle(_handshake);
-                }
-            );
-        
-        // start accept messages
-        socket->read();
-    }
+    
 public:
-	PoolNodeServer(io::io_context* context_, msg_version_handler_type version_handle) 
-        : Server<BasePoolSocket>(), PoolNodeData(context_), message_version_handle(std::move(version_handle)) 
+	PoolNodeServer(PoolNodeData* data_, msg_version_handler_type version_handle) 
+        : Server<BasePoolSocket>(), data(data_), message_version_handle(std::move(version_handle)) 
     {
     }
 
@@ -110,16 +94,45 @@ public:
         if (server_connections.count(addr))
         {
             auto protocol = server_connections[addr];
-            peers.erase(protocol->nonce);
+            data->peers.erase(protocol->nonce);
             protocol->close();
             delete protocol;
             server_connections.erase(addr);
         }
     }
+
+protected:
+    void error(const libp2p::error&) override 
+    {
+
+    }
+
+    void socket_handle(socket_type* socket) override
+    {
+        server_attempts[socket->get_addr()] = 
+            new PoolHandshakeServer
+            (
+                socket,
+                [&](const libp2p::error& err)
+                {
+                    error(err);
+                },
+                message_version_handle,
+                [&](PoolHandshake* _handshake)
+                {
+                   handshake_handle(_handshake);
+                }
+            );
+        
+        // start accept messages
+        socket->read();
+    }
 };
 
-class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
+class PoolNodeClient : public Client<BasePoolSocket>
 {
+    PoolNodeData* data;
+
     typedef std::function<void(std::shared_ptr<pool::messages::message_version>, PoolHandshake*)> msg_version_handler_type;
     msg_version_handler_type message_version_handle;
 
@@ -134,21 +147,21 @@ class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
         auto protocol 
             = new PoolProtocol
                 (
-                    context, sock, handler_manager, handshake,
+                    data->context, sock, data->handler_manager, handshake,
                     [](libp2p::error err)
                     {
                         
                     }
                 );
 
-        peers[protocol->nonce] = protocol;
+        data->peers[protocol->nonce] = protocol;
         sock->event_disconnect->subscribe(
                 [&, addr=addr]()
                 {
                     auto proto = client_connections[addr];
 
                     proto->close();
-                    peers.erase(proto->nonce);
+                    data->peers.erase(proto->nonce);
                     client_connections.erase(addr);
                 });
 
@@ -158,9 +171,9 @@ class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
 
     void resolve_connection()
     {
-        if (!((client_connections.size() < config->desired_conns) &&
-              (addr_store->len() > 0) &&
-              (client_attempts.size() <= config->max_attempts)))
+        if (!((client_connections.size() < data->config->desired_conns) &&
+              (data->addr_store->len() > 0) &&
+              (client_attempts.size() <= data->config->max_attempts)))
             return;
 
         for (const auto &addr: get_good_peers(1))
@@ -175,37 +188,16 @@ class PoolNodeClient : public Client<BasePoolSocket>, virtual PoolNodeData
             interface->try_connect(addr);
         }
     }
-protected:
 
+protected:
     std::map<NetAddress, PoolHandshakeClient*> client_attempts;
     std::map<NetAddress, PoolProtocol*> client_connections;
 
     std::vector<NetAddress> get_good_peers(int max_count);
 
-    void socket_handle(socket_type* socket)
-    {
-        client_attempts[socket->get_addr()] =
-                new PoolHandshakeClient
-            (
-                socket,
-                [&](const libp2p::error& err)
-                {
-                    error(err);
-                },
-                message_version_handle,
-                [&](PoolHandshake* _handshake)
-                {
-                   handshake_handle(_handshake);
-                }
-            );
-
-        // start accept messages
-        socket->read();
-    }
-
 public:
-    PoolNodeClient(io::io_context* context_, msg_version_handler_type version_handle) 
-        : Client<BasePoolSocket>(), PoolNodeData(context_), message_version_handle(std::move(version_handle)), connect_timer(context, true)
+    PoolNodeClient(PoolNodeData* data_, msg_version_handler_type version_handle)
+        : Client<BasePoolSocket>(), data(data_), message_version_handle(std::move(version_handle)), connect_timer(data->context, true)
     {
     }
 
@@ -262,10 +254,37 @@ public:
         if (client_connections.count(addr))
         {
             auto protocol = client_connections[addr];
-            peers.erase(protocol->nonce);
+            data->peers.erase(protocol->nonce);
             protocol->close();
             delete protocol;
             client_connections.erase(addr);
         }
+    }
+
+protected:
+    void error(const libp2p::error&) override 
+    {
+
+    }
+
+    void socket_handle(socket_type* socket) override
+    {
+        client_attempts[socket->get_addr()] =
+                new PoolHandshakeClient
+            (
+                socket,
+                [&](const libp2p::error& err)
+                {
+                    error(err);
+                },
+                message_version_handle,
+                [&](PoolHandshake* _handshake)
+                {
+                   handshake_handle(_handshake);
+                }
+            );
+
+        // start accept messages
+        socket->read();
     }
 };

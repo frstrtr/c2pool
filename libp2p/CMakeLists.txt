@@ -12,7 +12,6 @@ set(libp2p_source
 
 set(libp2ppreset_source
         preset/p2p_socket_data.h
-        preset/p2p_node_interface.h
 )
 
 # TODO: library to interface

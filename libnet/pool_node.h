@@ -12,7 +12,7 @@
 #include "pool_protocol.h"
 #include "pool_handshake.h"
 #include "pool_node_data.h"
-#include "pool_node_network.h"
+#include "pool_network.h"
 #include <libp2p/net_supervisor.h>
 #include <libp2p/handler.h>
 #include <libdevcore/exceptions.h>
@@ -134,9 +134,9 @@ private:
 
     DownloadShareManager download_share_manager;
 public:
-	PoolNode(io::io_context* _context) : PoolNodeData(_context),
-              PoolNodeServer(context, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); }),
-              PoolNodeClient(context, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); })
+	PoolNode(io::io_context* context_) : PoolNodeData(context_),
+              PoolNodeServer(this, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); }),
+              PoolNodeClient(this, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); })
 	{
         LOG_INFO << "PoolNode created!";
 		SET_POOL_DEFAULT_HANDLER(addrs);

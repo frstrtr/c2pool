@@ -7,7 +7,6 @@
 #include <networks/network.h>
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>
-#include <libp2p/preset/p2p_node_interface.h>
 #include <libp2p/node.h>
 #include <libcoind/jsonrpc/coindrpc.h>
 #include <libcoind/jsonrpc/stratum_node.h>
