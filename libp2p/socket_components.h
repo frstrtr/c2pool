@@ -8,6 +8,8 @@
 #include <libdevcore/events.h>
 #include <libdevcore/types.h>
 
+// У каждого компонента обязательно должно быть 2 аргумента, один из которых его конфиг.
+// В противном случае будет ошибка "mismatched argument pack lengths while expanding ‘TYPES’"
 struct SocketEvents
 {
     Event<> event_disconnect;                   // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
@@ -35,6 +37,11 @@ struct SocketEvents
 
 class DebugMessages
 {
+public:
+    struct config
+    {
+        
+    };
 private:
     SocketEvents* events;
 
@@ -63,7 +70,7 @@ private:
     }
 
 public:
-    DebugMessages(SocketEvents* events_) : events(events_)
+    DebugMessages(SocketEvents* events_, config&& cfg) : events(events_)
     {
         events->event_handle_message->subscribe(
             [&](const std::string& command)

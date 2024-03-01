@@ -5,6 +5,8 @@
 #include <libdevcore/timer.h>
 #include <boost/asio.hpp>
 
+// У каждого компонента обязательно должно быть 2 аргумента, один из которых его конфиг.
+// В противном случае будет ошибка "mismatched argument pack lengths while expanding ‘TYPES’"
 class ProtocolEvents
 {
 public:
@@ -21,15 +23,15 @@ public:
     }
 };
 
-struct PingerConfig
-{
-    boost::asio::io_context* context;
-    int frequency;
-    int timeout;
-};
-
 class Pinger
 {
+public:
+    struct config
+    {
+        boost::asio::io_context* context;
+        int frequency;
+        int timeout;
+    };
 private:
     ProtocolEvents* events;
 
@@ -40,7 +42,7 @@ private:
     c2pool::Timer timer_ping;
 
 public:
-    Pinger(ProtocolEvents* events_, PingerConfig&& config)
+    Pinger(ProtocolEvents* events_, config&& config)
         : events(events_), timer_timeout(config.context), timer_ping(config.context), frequency_t(config.frequency), timeout_t(config.timeout)
     {
         timer_timeout.start(
