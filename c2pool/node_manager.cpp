@@ -96,8 +96,8 @@ void NodeManager::run()
 
     _pool_node->set_coind_node(_coind_node);
 
-    _coind_node->run<CoindConnector<CoindSocket>>();
-    _pool_node->run<PoolListener<PoolSocket>, PoolConnector<PoolSocket>>();
+    _coind_node->run<CoindConnector>();
+    _pool_node->run<PoolListener, PoolConnector>();
 
     // Worker
     _worker = new Worker(_net, _pool_node, _coind_node, _tracker);

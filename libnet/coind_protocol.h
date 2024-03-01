@@ -17,7 +17,7 @@ class CoindProtocol : public BaseCoindProtocol, public CoindProtocolData
 {
 public:
     CoindProtocol(boost::asio::io_context* context_, BaseCoindSocket* socket_, HandlerManagerPtr handler_manager_, error_handler_type error_handler_) 
-		: BaseCoindProtocol(socket_, handler_manager_, error_handler_, PingerConfig{context_, 20, 30})
+		: BaseCoindProtocol(socket_, handler_manager_, error_handler_, Pinger::config{context_, 20, 30})
     {
 		send_version();
     }

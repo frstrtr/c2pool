@@ -24,11 +24,7 @@ private:
 
 	ip::tcp::resolver resolver;
 
-public:
-	CoindConnector(auto context_, auto net_, ConnectionStatus* status_) 
-        : context(context_), net(net_), status(status_), resolver(*context) {}
-
-	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
+    void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
 		auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
 		auto socket = new CoindSocket(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
@@ -48,12 +44,18 @@ public:
 					socket_handler(socket);
 				} else
 				{
-					LOG_ERROR << "async_connect: " << ec;
+					//TODO: error
 					delete socket;
 				}
 			}
 		);
 	}
+
+public:
+	CoindConnector(auto context_, auto net_, ConnectionStatus* status_) 
+        : context(context_), net(net_), status(status_), resolver(*context)
+    {
+    }
     
     void run() override
     {
@@ -67,6 +69,7 @@ public:
 
 	void try_connect(const NetAddress& addr_) override
 	{
+        LOG_DEBUG_COIND << "CoindConnector try to resolve " << addr_.to_string();
 		resolver.async_resolve(addr_.ip, addr_.port,
 			[&, address = addr_]
 			(const boost::system::error_code &er, boost::asio::ip::tcp::resolver::results_type endpoints)
