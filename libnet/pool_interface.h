@@ -19,8 +19,8 @@ private:
 	ip::tcp::acceptor acceptor;
 	ip::tcp::endpoint listen_ep;
 public:
-	PoolListener(auto _context, auto _net, auto port) 
-		: context(_context), net(_net), acceptor(*context), listen_ep(ip::tcp::v4(), port) 
+	PoolListener(auto context_, auto net_, auto port) 
+		: context(context_), net(net_), acceptor(*context), listen_ep(ip::tcp::v4(), port) 
 	{
 	}
 
@@ -44,7 +44,7 @@ protected:
 	void async_loop() override
 	{
 		acceptor.async_accept(
-			[this, handle = socket_handler, finish=finish_handler]
+			[&]
 			(boost::system::error_code ec, ip::tcp::socket socket_)
 			{
 				if (ec)
@@ -60,8 +60,8 @@ protected:
 				}
 
 				auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(socket_));
-				auto socket = new SocketType(tcp_socket, net, connection_type::incoming);
-				handle(socket);
+				auto socket = new PoolSocket(tcp_socket, net, connection_type::incoming, [&](const libp2p::error& err){ error_handler(err); });
+				socket_handler(socket);
 				
 				// continue accept connections
 				async_loop();
@@ -78,50 +78,61 @@ private:
 
 	ip::tcp::resolver resolver;
 
+	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
+	{
+		auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
+        auto socket = new PoolSocket(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
+
+        boost::asio::async_connect(*tcp_socket, endpoints,
+            [&, socket = std::move(socket)]
+			(const boost::system::error_code &ec, const boost::asio::ip::tcp::endpoint &ep)
+            {
+                LOG_INFO << "PoolConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
+                if (!ec)
+                {
+                    socket_handler(socket);
+                } else
+                {
+					//TODO: error
+					delete socket;
+                }
+            }
+		);
+	}
+
 public:
-	PoolConnector(auto _context, auto _net) 
-		: context(_context), net(_net), resolver(*context) {}
+	PoolConnector(auto context_, auto net_) 
+		: context(context_), net(net_), resolver(*context)
+	{
+	}
+
+	void run() override
+	{
+		
+	}
 
 	void stop() override
 	{
 		resolver.cancel();
 	}
 
-	void try_connect(NetAddress addr) override
+	void try_connect(const NetAddress& addr_) override
 	{
-        LOG_DEBUG_P2P << "P2PConnector try to resolve " << addr.to_string();
-		resolver.async_resolve(addr.ip, addr.port,
-							   [&, _addr = addr, _handler = socket_handler](
-									   const boost::system::error_code &er,
-									   const boost::asio::ip::tcp::resolver::results_type endpoints)
-                               {
-                                   if (er) 
-								   {
-										if (er != boost::system::errc::operation_canceled)
-                                       		error_handler(_addr, "(resolver)" + er.message());
-										return;
-								   }
+		LOG_DEBUG_P2P << "PoolConnector try to resolve " << addr_.to_string();
+		resolver.async_resolve(addr_.ip, addr_.port,
+			[&, address = addr_]
+			(const boost::system::error_code& er, boost::asio::ip::tcp::resolver::results_type endpoints)
+			{
+            	if (er) 
+				{
+					//TODO:
+					// if (er != boost::system::errc::operation_canceled)
+            	    // 		error_handler(_addr, "(resolver)" + er.message());
+					return;
+				}
 
-                                   auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
-                                   auto socket = new SocketType(tcp_socket, net, connection_type::outgoing);
-
-                                   boost::asio::async_connect(*tcp_socket, endpoints,
-                                                              [_addr = _addr, sock = std::move(socket), handler = _handler, err_handler = error_handler](
-                                                                      const boost::system::error_code &ec,
-                                                                      const boost::asio::ip::tcp::endpoint &ep)
-                                                              {
-                                                                  LOG_INFO << "P2PConnector.Socket try handshake with "
-                                                                           << ep.address() << ":"
-                                                                           << ep.port();
-                                                                  if (!ec)
-                                                                  {
-                                                                      handler(sock);
-                                                                      sock->read();
-                                                                  } else
-                                                                  {
-                                                                      err_handler(_addr, "(async_connect)" + ec.message());
-                                                                  }
-                                                              });
-                               });
+				connect_socket(endpoints);
+			}
+		);
 	}
 };

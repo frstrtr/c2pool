@@ -32,7 +32,7 @@ public:
 
 public:
 	PoolProtocol(boost::asio::io_context* context_, BasePoolSocket* socket_, HandlerManagerPtr handler_manager_, PoolProtocolData* data_, error_handler_type error_handler_)
-		: BasePoolProtocol(socket_, handler_manager_, error_handler_, PingerConfig{context_, 20, 100}), PoolProtocolData(*data_)
+		: BasePoolProtocol(socket_, handler_manager_, error_handler_, Pinger::config{context_, 20, 100}), PoolProtocolData(*data_)
 	{
 	}
 

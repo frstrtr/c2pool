@@ -36,7 +36,7 @@ private:
 public:
 
 	PoolSocket(auto socket_, auto net_, connection_type type_, error_handler_type error_handler_) 
-		: BasePoolSocket(type_, error_handler_), socket(socket_), net(net_)
+		: BasePoolSocket(type_, error_handler_, DebugMessages::config{}), socket(socket_), net(net_)
 	{
 		init_addr();
 		LOG_DEBUG_POOL << "PoolSocket created";

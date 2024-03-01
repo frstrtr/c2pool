@@ -39,10 +39,10 @@ private:
 	void read_checksum(std::shared_ptr<ReadSocketData> msg);
 	void read_payload(std::shared_ptr<ReadSocketData> msg);
 	void final_read_message(std::shared_ptr<ReadSocketData> msg);
+    
 public:
-
     CoindSocket(auto socket_, auto net_, connection_type type_, error_handler_type error_handler_) 
-        : BaseCoindSocket(type_, error_handler_), socket(socket_), net(net_)
+        : BaseCoindSocket(type_, error_handler_, DebugMessages::config{}), socket(socket_), net(net_)
 	{ 
         init_addr();
         LOG_DEBUG_COIND << "CoindSocket created";
