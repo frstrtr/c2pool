@@ -38,14 +38,14 @@ private:
 				// 	return;
 				// }
 				
-				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
 				if (!ec)
 				{
+					LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
 					socket_handler(socket);
 				} else
 				{
-					//TODO: error
 					delete socket;
+					error()
 				}
 			}
 		);
@@ -59,7 +59,6 @@ public:
     
     void run() override
     {
-
     }
 
 	void stop() override
