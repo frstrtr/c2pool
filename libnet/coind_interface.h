@@ -20,7 +20,7 @@ class CoindConnector : public Connector<BaseCoindSocket>
 private:
 	io::io_context* context;
 	coind::ParentNetwork* net;
-	ConnectionStatus* status;
+	/*ConnectionStatus* status;*/
 
 	ip::tcp::resolver resolver;
 
@@ -33,10 +33,10 @@ private:
 			[&, socket = std::move(socket)]
 			(const boost::system::error_code &ec, boost::asio::ip::tcp::endpoint ep)
 			{
-				if (!status->is_available())
-				{
-					return;
-				}
+				// if (!status->is_available())
+				// {
+				// 	return;
+				// }
 				
 				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
 				if (!ec)
@@ -52,8 +52,8 @@ private:
 	}
 
 public:
-	CoindConnector(auto context_, auto net_, ConnectionStatus* status_) 
-        : context(context_), net(net_), status(status_), resolver(*context)
+	CoindConnector(auto context_, auto net_/*, ConnectionStatus* status_*/) 
+        : context(context_), net(net_), /*status(status_),*/ resolver(*context)
     {
     }
     
@@ -74,8 +74,8 @@ public:
 			[&, address = addr_]
 			(const boost::system::error_code &er, boost::asio::ip::tcp::resolver::results_type endpoints)
 			{
-				if (!status->is_available())
-					return;
+				// if (!status->is_available())
+				// 	return;
 
 				if (er)
 				{

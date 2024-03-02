@@ -138,7 +138,7 @@ public:
         if (isRunning)
             throw std::runtime_error("CoindNode already running");
 
-        CoindNodeClient::init<ConnectorType>();
+        CoindNodeClient::init<ConnectorType>(context, parent_net);
         CoindNodeClient::start();
 
         start();
