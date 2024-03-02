@@ -44,8 +44,7 @@ public:
 protected:
 	void timeout() override 
 	{
-		//TODO: out of ping timer;
-        throw make_except<pool_exception, NetExcept>("out time ping", get_addr());
+		error(libp2p::PING_TIMEOUT, "ping timeout!");
 	}
 
     void send_ping() override

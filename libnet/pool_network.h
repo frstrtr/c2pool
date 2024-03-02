@@ -270,7 +270,7 @@ protected:
     void socket_handle(socket_type* socket) override
     {
         client_attempts[socket->get_addr()] =
-                new PoolHandshakeClient
+            new PoolHandshakeClient
             (
                 socket,
                 [&](const libp2p::error& err)
