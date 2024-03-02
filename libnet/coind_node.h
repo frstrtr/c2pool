@@ -3,8 +3,8 @@
 #include <memory>
 #include <map>
 
+#include "coind_network.h"
 #include "coind_node_data.h"
-#include "coind_protocol.h"
 #include "coind_messages.h"
 
 #include <libcoind/height_tracker.h>
@@ -20,70 +20,10 @@
 namespace io = boost::asio;
 namespace ip = boost::asio::ip;
 
-class CoindNodeClient : public Client<BaseCoindSocket>
-{
-protected:
-    CoindNodeData* node_data;
-    CoindProtocol* protocol;
-
-public:
-    CoindNodeClient(CoindNodeData* node_data_) 
-        : Client<BaseCoindSocket>(), node_data(node_data_) {}
-
-	void connect(const NetAddress& addr)
-	{
-		interface->try_connect(addr);
-	}
-
-    void start() override
-    {
-
-    }
-
-    void stop() override
-    {
-
-    }
-
-    void disconnect(const NetAddress& addr)
-    {
-
-    }
-
-protected:
-    void error(const libp2p::error& err) override
-    {
-        throw make_except<coind_exception, NodeExcept>(err.reason);
-    }
-
-    void socket_handle(BaseCoindSocket* socket) override
-    {
-        LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
-
-		protocol 
-            = new CoindProtocol(
-                node_data->context, 
-                socket, 
-                node_data->handler_manager,
-                [&](const libp2p::error& err)
-                {
-                    error(err);
-                }
-            );
-        socket->event_disconnect->subscribe([]()
-        {
-            LOG_INFO << "COIND DISCONNECTED";
-        });
-
-        // start accept messages
-        socket->read();
-    }
-};
-
 #define SET_COIND_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<coind::messages::message_##msg, CoindProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
 
-class CoindNode : public virtual CoindNodeData, public NodeExceptionHandler, public SupervisorElement, CoindNodeClient
+class CoindNode : public CoindNodeData, public NodeExceptionHandler, public SupervisorElement, CoindNodeClient
 {
 private:
 	bool isRunning = false;
@@ -114,6 +54,20 @@ public:
         });
     }
 
+    // Node
+	template <typename ConnectorType>
+	void run()
+    {
+        if (isRunning)
+            throw std::runtime_error("CoindNode already running");
+
+        CoindNodeClient::init<ConnectorType>(context, parent_net);
+        CoindNodeClient::start();
+
+        start();
+        isRunning = true;
+    }
+
     // SupervisorElement
     void stop() override
     {
@@ -129,20 +83,6 @@ public:
     {
         connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
         reconnected();
-    }
-
-    // Node
-	template <typename ConnectorType>
-	void run()
-    {
-        if (isRunning)
-            throw std::runtime_error("CoindNode already running");
-
-        CoindNodeClient::init<ConnectorType>(context, parent_net);
-        CoindNodeClient::start();
-
-        start();
-        isRunning = true;
     }
 
 protected:
