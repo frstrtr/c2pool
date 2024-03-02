@@ -1,0 +1,67 @@
+#pragma once
+
+#include "coind_socket.h"
+#include "coind_protocol.h"
+#include "coind_node_data.h"
+
+#include <libp2p/node.h>
+
+class CoindNodeClient : public Client<BaseCoindSocket>
+{
+protected:
+    CoindNodeData* node_data;
+    CoindProtocol* protocol;
+
+public:
+    CoindNodeClient(CoindNodeData* node_data_) 
+        : Client<BaseCoindSocket>(), node_data(node_data_) {}
+
+	void connect(const NetAddress& addr)
+	{
+		interface->try_connect(addr);
+	}
+
+    void start() override
+    {
+
+    }
+
+    void stop() override
+    {
+        protocol->close();
+    }
+
+    void disconnect(const NetAddress& addr)
+    {
+        protocol->close();
+    }
+
+protected:
+    void error(const libp2p::error& err) override
+    {
+        throw make_except<coind_exception, NodeExcept>(err.reason);
+    }
+
+    void socket_handle(BaseCoindSocket* socket) override
+    {
+        LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
+
+		protocol 
+            = new CoindProtocol(
+                node_data->context, 
+                socket, 
+                node_data->handler_manager,
+                [&](const libp2p::error& err)
+                {
+                    error(err);
+                }
+            );
+        socket->event_disconnect->subscribe([]()
+        {
+            LOG_INFO << "COIND DISCONNECTED";
+        });
+
+        // start accept messages
+        socket->read();
+    }
+};
