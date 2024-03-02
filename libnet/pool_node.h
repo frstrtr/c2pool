@@ -17,9 +17,6 @@
 #include <libp2p/handler.h>
 #include <libdevcore/exceptions.h>
 
-// listener = std::make_unique<ListenerType>(context, net, config->c2pool_port);
-// connector = std::make_unique<ConnectorType>(context, net);
-
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg, PoolProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
 
@@ -162,13 +159,13 @@ public:
 	{
 		if (run_state & onlyServer)
         {
-            PoolNodeServer::init<ListenerType>();
+            PoolNodeServer::init<ListenerType>(context, net, config->c2pool_port);
             PoolNodeServer::start();
         }
 
 		if (run_state & onlyClient)
 		{
-            PoolNodeClient::init<ConnectorType>();
+            PoolNodeClient::init<ConnectorType>(context, net);
             PoolNodeClient::start();
 		}
         start();

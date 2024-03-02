@@ -91,7 +91,7 @@ public:
     template <typename ConnectorType, typename... Args>
     void init(Args&&... args)
     {
-        interface = std::make_unique<interface_type>(args...);//(context, net);
+        interface = std::make_unique<ConnectorType>(args...);//(context, net);
         interface->init(
                 // socket_handler
                 [&](BasePoolSocket* socket)
