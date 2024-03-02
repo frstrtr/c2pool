@@ -6,7 +6,8 @@ namespace libp2p
 {
     enum errcode
     {
-        BAD_PEER
+        BAD_PEER,
+        PING_TIMEOUT
     };
 
     class error
