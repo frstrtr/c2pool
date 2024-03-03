@@ -19,7 +19,7 @@ enum NodeRunState
 };
 
 template <typename SocketType>
-class Listener
+class BaseInterface
 {
 public:
     using socket_type = SocketType;
@@ -33,8 +33,12 @@ protected:
     socket_handler_type socket_handler;
     error_handler_type error_handler;
 
+    void error(const libp2p::errcode& errc, const std::string& reason, const NetAddress& addr)
+    {
+        error_handler(libp2p::error{errc, reason, addr});
+    }
+
 public:
-    Listener() = default;
     void init(socket_handler_type socket_handler_, error_handler_type error_handle_)
     {
         socket_handler = std::move(socket_handler_);
@@ -43,36 +47,24 @@ public:
 
     virtual void run() = 0;
     virtual void stop() = 0;
+};
+
+template <typename SocketType>
+class Listener : public BaseInterface<SocketType>
+{
+public:
+    Listener() = default;
+    
 protected:
     virtual void async_loop() = 0;
 };
 
 template <typename SocketType>
-class Connector
+class Connector : public BaseInterface<SocketType>
 {
 public:
-    using socket_type = SocketType;
-
-protected:
-    // type for function socket_handle();
-    using socket_handler_type = std::function<void(socket_type*)>;
-    // type for Server::error(...)
-    using error_handler_type = std::function<void(const libp2p::error&)>;
-
-    socket_handler_type socket_handler;
-    error_handler_type error_handler;
-
-public:
 	Connector() = default;
-    void init(socket_handler_type socket_handler_, error_handler_type error_handle_)
-    {
-        socket_handler = std::move(socket_handler_);
-        error_handler = std::move(error_handle_);
-    }
-
 	virtual void try_connect(const NetAddress& addr_) = 0;
-    virtual void run() = 0;
-    virtual void stop() = 0;
 };
 
 // InterfaceType = Listener or Connector
