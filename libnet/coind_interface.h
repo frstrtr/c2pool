@@ -37,16 +37,19 @@ private:
 				// {
 				// 	return;
 				// }
-				
-				if (!ec)
-				{
-					LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
-					socket_handler(socket);
-				} else
+				if (ec)
 				{
 					delete socket;
-					error()
+					if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, "CoindConnector::connect_socket: " + ec.message(), NetAddress{ep});
+					else
+						LOG_DEBUG_COIND << "CoindConnector::connect_socket canceled";
+					return;
 				}
+				
+				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
+				socket_handler(socket);
+				
 			}
 		);
 	}
@@ -71,16 +74,20 @@ public:
         LOG_DEBUG_COIND << "CoindConnector try to resolve " << addr_.to_string();
 		resolver.async_resolve(addr_.ip, addr_.port,
 			[&, address = addr_]
-			(const boost::system::error_code &er, boost::asio::ip::tcp::resolver::results_type endpoints)
+			(const boost::system::error_code &ec, boost::asio::ip::tcp::resolver::results_type endpoints)
 			{
 				// if (!status->is_available())
 				// 	return;
 
-				if (er)
+				if (ec)
 				{
-					LOG_WARNING << "P2PConnector[resolve](" << address.to_string() << "): " << er.message();
+					if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, "CoindConnector::try_connect: " + ec.message(), address);
+					else
+						LOG_DEBUG_COIND << "CoindConnector::try_connect canceled";
 					return;
 				}
+
 				connect_socket(endpoints);
 			}
 		);
