@@ -219,6 +219,8 @@ protected:
     void reconnect() override
     {
         //TODO: restart server+client
+        PoolNodeServer::start();
+        PoolNodeClient::start();
         reconnected();
     }
 
