@@ -13,6 +13,7 @@
 #include <btclibs/uint256.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/asio/ip/tcp.hpp>
 
 class address_type
 {
@@ -400,10 +401,12 @@ struct NetAddress
 
     NetAddress() = default;
 
-    NetAddress(const std::string& _ip, const std::string& _port): ip(_ip), port(_port) {}
-
-    NetAddress(const std::string& _ip, const int& _port) : ip(_ip), port(std::to_string(_port)) {}
-
+    NetAddress(const std::string& _ip, const std::string& _port)
+        : ip(_ip), port(_port) {}
+    NetAddress(const std::string& _ip, const int& _port) 
+        : ip(_ip), port(std::to_string(_port)) {}
+    NetAddress(const boost::asio::ip::tcp::endpoint& ep)
+        : ip(ep.address().to_string()), port(std::to_string(ep.port())) {}
     //TODO: NetAddress(const std::string& full_address)
 
     std::string to_string() const
