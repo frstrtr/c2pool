@@ -23,8 +23,10 @@ private:
     void init_addr() override
     {
         boost::system::error_code ec;
-        auto ep = socket->remote_endpoint(ec);
-        addr = {ep.address().to_string(), std::to_string(ep.port())};
+        // global; TODO: log ec;
+        addr = {socket->remote_endpoint(ec)};
+        // local; TODO: log ec;
+        addr_local = {socket->local_endpoint(ec)};
     }
 
 	void read_prefix(std::shared_ptr<ReadSocketData> msg);
@@ -49,18 +51,15 @@ public:
 
 	void write(std::shared_ptr<Message> msg) override
 	{
-        LOG_DEBUG_POOL << "Pool Socket write for " << msg->command << "!";
-
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
-
-        LOG_DEBUG_POOL << "\tMessage data: " << *_msg;
+		LOG_DEBUG_POOL << "\tPool socket write msg: " << msg->command << ", Message data: \n" << *_msg;
 
         if (_msg->len > 8000000)
         {
             LOG_WARNING << "message length > max_payload_length!";
         }
 
-        event_send_message->happened(msg->command);
+		event_send_message->happened(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
             [&, cmd = msg->command](boost::system::error_code ec, std::size_t length)
             {
@@ -88,7 +87,7 @@ public:
 
 	bool is_connected() override
 	{
-		return socket->is_open();
+		return socket && socket->is_open();
 	}
 
 	void close() override
