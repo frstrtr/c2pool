@@ -39,6 +39,7 @@ public:
 protected:
     void error(const libp2p::error& err) override
     {
+        LOG_ERROR << "Coind[client]: [" << err.errc << "/" << err.addr.to_string() << "]" << err.reason;
         throw make_except<coind_exception, NodeExcept>(err.reason);
     }
 

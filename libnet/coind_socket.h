@@ -21,16 +21,10 @@ private:
     void init_addr() override
     {
         boost::system::error_code ec;
-
-        // global
-        auto ep = socket->remote_endpoint(ec);
-        // TODO: log ec;
-        addr = {ep.address().to_string(), std::to_string(ep.port())};
-
-        // local
-        ep = socket->local_endpoint(ec);
-        // TODO: log ec;
-        addr_local = {ep.address().to_string(), std::to_string(ep.port())};
+        // global; TODO: log ec;
+        addr = {socket->remote_endpoint(ec)};
+        // local; TODO: log ec;
+        addr_local = {socket->local_endpoint(ec)};
     }
 
 	void read_prefix(std::shared_ptr<ReadSocketData> msg);
@@ -53,19 +47,23 @@ public:
         std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
         LOG_DEBUG_COIND << "\tCoind socket write msg: " << msg->command << ", Message data: \n" << *_msg;
 
-        boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-                                [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
-                                {
-                                    LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
-                                    if (_ec)
-                                    {
-                                        throw make_except<coind_exception, NodeExcept>((boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str());
-                                    } else
-                                    {
-                                        event_peer_receive->happened(cmd);
-                                    }
-                                });
         event_send_message->happened(msg->command);
+        boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
+            [&, cmd = msg->command](boost::system::error_code ec, std::size_t length)
+            {
+                if (ec)
+                {
+                    if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % ec % ec.message()).str());
+					else
+						LOG_DEBUG_COIND << "PoolSocket::write canceled";
+					return;
+                }
+
+                LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
+                event_peer_receive->happened(cmd);
+            }
+        );
 	}
 
 	// Read
