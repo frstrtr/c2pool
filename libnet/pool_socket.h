@@ -67,7 +67,7 @@ public:
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
-						error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str());
+						error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % ec % ec.message()).str());
 					else
 						LOG_DEBUG_POOL << "PoolSocket::write canceled";
 					return;
