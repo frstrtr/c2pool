@@ -30,7 +30,6 @@ void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 
 void PoolSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 {
-
 	boost::asio::async_read(*socket, boost::asio::buffer(msg->command, msg->COMMAND_LEN),
 		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
 		{
