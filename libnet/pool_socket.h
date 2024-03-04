@@ -57,22 +57,26 @@ public:
 
         if (_msg->len > 8000000)
         {
-            LOG_INFO << "message length > max_payload_length!";
+            LOG_WARNING << "message length > max_payload_length!";
         }
 
         event_send_message->happened(msg->command);
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-                                 [&, cmd = msg->command](boost::system::error_code _ec, std::size_t length)
-                                 {
-                                     LOG_DEBUG_POOL << "[PoolSocket] peer receive message_" << cmd;
-                                     if (_ec)
-                                     {
-                                        throw make_except<pool_exception, NetExcept>((boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str(), get_addr());
-                                     } else
-                                     {
-                                        event_peer_receive->happened(cmd);
-                                     }
-                                 });
+            [&, cmd = msg->command](boost::system::error_code ec, std::size_t length)
+            {
+				if (ec)
+				{
+					if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % _ec % _ec.message()).str());
+					else
+						LOG_DEBUG_POOL << "PoolSocket::write canceled";
+					return;
+				}
+                
+				LOG_DEBUG_POOL << "[PoolSocket] peer receive message_" << cmd;
+                event_peer_receive->happened(cmd);
+            }
+		);
 	}
 
 	// Read
@@ -90,7 +94,7 @@ public:
 	void close() override
 	{
         LOG_WARNING << "Pool socket has been disconnected from " << get_addr().to_string() << ".";
-        LOG_INFO.stream() << messages_stat();
+        LOG_INFO << messages_stat();
 
 		socket->close();
         event_disconnect->happened();
