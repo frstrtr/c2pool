@@ -8,76 +8,82 @@
 // Read
 void PoolSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 {
-	boost::asio::async_read(*socket,
-							boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
-							[this, msg](boost::system::error_code ec, std::size_t length)
-							{
-                                if (!ec)
-                                {
-                                    if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
-                                    {
-                                        read_command(msg);
-                                    } else {
-										throw make_except<pool_exception, NetExcept>("[socket] prefix doesn't match", get_addr());
-                                    }
-								}
-								else
-								{
-                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_prefix (%1%: %2%)") % ec % ec.message()).str(), get_addr());
-								}
-							});
+	boost::asio::async_read(*socket, boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
+		[this, msg](boost::system::error_code ec, std::size_t length)
+		{
+			if (ec)
+			{
+				if (ec != boost::system::errc::operation_canceled)
+					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_prefix (%1%: %2%)") % ec % ec.message()).str());
+				else
+					LOG_DEBUG_POOL << "PoolSocket::read_prefix canceled";
+				return;
+			}
+
+			if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
+                read_command(msg);
+            else
+				error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
+		}
+	);
 }
 
 void PoolSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 {
 
-	boost::asio::async_read(*socket,
-							boost::asio::buffer(msg->command, msg->COMMAND_LEN),
-							[this, msg](boost::system::error_code ec, std::size_t /*length*/)
-							{
-								if (!ec)
-								{
-									read_length(msg);
-								}
-								else
-								{
-                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_command (%1%: %2%)") % ec % ec.message()).str(), get_addr());
-								}
-							});
+	boost::asio::async_read(*socket, boost::asio::buffer(msg->command, msg->COMMAND_LEN),
+		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
+		{
+			if (ec)
+			{
+				if (ec != boost::system::errc::operation_canceled)
+					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_command (%1%: %2%)") % ec % ec.message()).str());
+				else
+					LOG_DEBUG_POOL << "PoolSocket::read_command canceled";
+				return;
+			}
+
+			read_length(msg);
+		}
+	);
 }
 
 void PoolSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 {
-	boost::asio::async_read(*socket,
-							boost::asio::buffer(msg->len, msg->LEN_LEN),
-							[this, msg](boost::system::error_code ec, std::size_t /*length*/)
-							{
-								if (!ec)
-								{
-									read_checksum(msg);
-								}
-								else
-								{
-                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_length (%1%: %2%)") % ec % ec.message()).str(), get_addr());
-								}
-							});
+	boost::asio::async_read(*socket, boost::asio::buffer(msg->len, msg->LEN_LEN),
+		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
+		{
+			if (ec)
+			{
+				if (ec != boost::system::errc::operation_canceled)
+					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_length (%1%: %2%)") % ec % ec.message()).str());
+				else
+					LOG_DEBUG_POOL << "PoolSocket::read_length canceled";
+				return;
+			}
+
+			read_checksum(msg);
+		}
+	);
 }
 
 void PoolSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 {
-	boost::asio::async_read(*socket,
-							boost::asio::buffer(msg->checksum, msg->CHECKSUM_LEN),
-							[this, msg](boost::system::error_code ec, std::size_t /*length*/)
-							{
-								if (!ec)
-								{
-									read_payload(msg);
-								}
-								else
-								{
-                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_checksum (%1%: %2%)") % ec % ec.message()).str(), get_addr());
-								}
-							});
+	boost::asio::async_read(*socket, boost::asio::buffer(msg->checksum, msg->CHECKSUM_LEN),
+		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
+		{
+			if (ec)
+			{
+				if (ec != boost::system::errc::operation_canceled)
+					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_checksum (%1%: %2%)") % ec % ec.message()).str());
+				else
+					LOG_DEBUG_POOL << "PoolSocket::read_checksum canceled";
+				return;
+			}
+
+			read_payload(msg);
+		}
+	);
 }
 
 void PoolSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
@@ -88,20 +94,22 @@ void PoolSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 	msg->unpacked_len = payload_len.get();
 	msg->payload = new char[msg->unpacked_len+1];
 
-	boost::asio::async_read(*socket,
-							boost::asio::buffer(msg->payload, msg->unpacked_len),
-							[this, msg](boost::system::error_code ec, std::size_t length)
-							{
-								if (!ec)
-								{
-									final_read_message(msg);
-									read();
-								}
-								else
-								{
-                                    throw make_except<pool_exception, NetExcept>((boost::format("[socket] read_payload (%1%: %2%)") % ec % ec.message()).str(), get_addr());
-								}
-							});
+	boost::asio::async_read(*socket, boost::asio::buffer(msg->payload, msg->unpacked_len),
+		[this, msg](boost::system::error_code ec, std::size_t length)
+		{
+			if (ec)
+			{
+				if (ec != boost::system::errc::operation_canceled)
+					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_payload (%1%: %2%)") % ec % ec.message()).str());
+				else
+					LOG_DEBUG_POOL << "PoolSocket::read_payload canceled";
+				return;
+			}
+
+			final_read_message(msg);
+			read();
+		}
+	);
 }
 
 void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
@@ -110,7 +118,8 @@ void PoolSocket::final_read_message(std::shared_ptr<ReadSocketData> msg)
 	auto checksum = coind::data::hash256(PackStream(msg->payload, msg->unpacked_len), true).GetChars();
     if (!c2pool::dev::compare_str(checksum.data(), msg->checksum, 4))
     {
-		throw make_except<coind_exception, NetExcept>((boost::format("[socket] Invalid hash for %1%, command %2%") % get_addr().to_string() % msg->command).str(), get_addr());
+		error(libp2p::BAD_PEER, (boost::format("[socket] Invalid hash for %1%, command %2%") % get_addr().to_string() % msg->command).str());
+		return;
     }
 
 	//Make raw message
