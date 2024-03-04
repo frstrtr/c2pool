@@ -49,14 +49,11 @@ protected:
 			{
 				if (ec)
 				{
-					if (ec == boost::system::errc::operation_canceled)
-					{
-						LOG_DEBUG_POOL << "PoolListener canceled";
-						return;
-					} else 
-					{
-				 		throw make_except<pool_exception, NodeExcept>("[PoolListener] " + ec.message());
-					}
+					if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, "PoolListener::async_loop: " + ec.message(), NetAddress{socket_.remote_endpoint()});
+					else
+						LOG_DEBUG_POOL << "PoolListener::async_loop canceled";
+					return;
 				}
 
 				auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(socket_));
@@ -87,15 +84,18 @@ private:
             [&, socket = std::move(socket)]
 			(const boost::system::error_code &ec, const boost::asio::ip::tcp::endpoint &ep)
             {
-                LOG_INFO << "PoolConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
-                if (!ec)
-                {
-                    socket_handler(socket);
-                } else
-                {
-					//TODO: error
+				if (ec)
+				{
 					delete socket;
-                }
+					if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, "PoolConnector::connect_socket: " + ec.message(), ep);
+					else
+						LOG_DEBUG_POOL << "PoolConnector::connect_socket canceled";
+					return;
+				}
+
+				LOG_INFO << "PoolConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
+                socket_handler(socket);
             }
 		);
 	}
@@ -117,16 +117,17 @@ public:
 
 	void try_connect(const NetAddress& addr_) override
 	{
-		LOG_DEBUG_P2P << "PoolConnector try to resolve " << addr_.to_string();
+		LOG_DEBUG_POOL << "PoolConnector try to resolve " << addr_.to_string();
 		resolver.async_resolve(addr_.ip, addr_.port,
 			[&, address = addr_]
-			(const boost::system::error_code& er, boost::asio::ip::tcp::resolver::results_type endpoints)
+			(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::results_type endpoints)
 			{
-            	if (er) 
+				if (ec)
 				{
-					//TODO:
-					// if (er != boost::system::errc::operation_canceled)
-            	    // 		error_handler(_addr, "(resolver)" + er.message());
+					if (ec != boost::system::errc::operation_canceled)
+						error(libp2p::ASIO_ERROR, "PoolConnector::try_connect: " + ec.message(), address);
+					else
+						LOG_DEBUG_POOL << "PoolConnector::try_connect canceled";
 					return;
 				}
 
