@@ -4,6 +4,21 @@
 #include "pool_node_data.h"
 #include <libp2p/node.h>
 
+template <typename CommunicationType>
+inline void base_pool_error(const libp2p::error& err, CommunicationType* communicator)
+{
+    switch (err.errc)
+    {
+    case libp2p::SYSTEM_ERROR:
+        throw make_except<pool_exception, NodeExcept>(err.reason);
+    // case libp2p::ASIO_ERROR:
+        // ???
+    default:
+        communicator->disconnect(err.addr);
+        break;
+    }
+}
+
 class PoolNodeServer : public Server<BasePoolSocket>
 {
     PoolNodeData* data;
@@ -102,9 +117,10 @@ public:
     }
 
 protected:
-    void error(const libp2p::error&) override 
+    void error(const libp2p::error& err) override 
     {
-
+        LOG_ERROR << "POOL[server]: [" << err.errc << "/" << err.addr.to_string() << "]" << err.reason;
+        base_pool_error(err, this);
     }
 
     void socket_handle(socket_type* socket) override
@@ -183,7 +199,7 @@ class PoolNodeClient : public Client<BasePoolSocket>
 //                LOG_WARNING << "Client already connected to " << addr.to_string() << "!";
                 continue;
             }
-            LOG_TRACE << "try to connect: " << addr.to_string();
+            LOG_TRACE << "PoolNodeClient try to connect: " << addr.to_string();
             client_attempts[addr] = nullptr;
             interface->try_connect(addr);
         }
@@ -262,9 +278,10 @@ public:
     }
 
 protected:
-    void error(const libp2p::error&) override 
+    void error(const libp2p::error& err) override 
     {
-
+        LOG_ERROR << "POOL[client]: [" << err.errc << "/" << err.addr.to_string() << "]" << err.reason;
+        base_pool_error(err, this);
     }
 
     void socket_handle(socket_type* socket) override
