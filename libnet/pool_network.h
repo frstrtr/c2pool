@@ -171,16 +171,6 @@ class PoolNodeClient : public Client<BasePoolSocket>
                 );
 
         data->peers[protocol->nonce] = protocol;
-        sock->event_disconnect->subscribe(
-                [&, addr=addr]()
-                {
-                    auto proto = client_connections[addr];
-
-                    proto->close();
-                    data->peers.erase(proto->nonce);
-                    client_connections.erase(addr);
-                });
-
         client_connections[addr] = protocol;
 	    client_attempts.erase(addr);
     }
