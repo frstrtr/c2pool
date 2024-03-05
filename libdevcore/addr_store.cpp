@@ -1,6 +1,7 @@
 #include "addr_store.h"
 
 #include <fstream>
+#include <streambuf>
 #include <string>
 #include <memory>
 
@@ -17,16 +18,15 @@ namespace c2pool::dev
     AddrStore::AddrStore(std::string path, c2pool::Network* net)
     {
         filePath = path;
-        std::fstream AddrsFile = getFile(path);
+        // std::fstream AddrsFile = getFile(path);
+        std::fstream AddrsFile(path);
 
         //FILE
         //exist file
         if (AddrsFile)
-        {
-            std::stringstream tmp;
-            tmp << AddrsFile.rdbuf();
-            std::string json = tmp.str();
-
+        {   
+            std::string json((std::istreambuf_iterator<char>(AddrsFile)),
+                 std::istreambuf_iterator<char>());
             FromJSON(json);
         }
         else
