@@ -47,10 +47,11 @@ void NodeManager::network_cycle()
 
 void NodeManager::run()
 {
-    LOG_INFO << "Making asio io_context in NodeManager...";
+    LOG_INFO << "\t\t" << " Making asio io_context in NodeManager...";
     _context = new boost::asio::io_context(0);
 
     // AddrStore
+    LOG_INFO << "\t\t" << " AddrStore initialization...";
     _addr_store = new c2pool::dev::AddrStore(_net->net_name + "/addrs", _net);
     // TODO: Bootstrap_addrs
     // TODO: Parse CLI args for addrs
@@ -58,8 +59,7 @@ void NodeManager::run()
     //    timer in _addr_store constructor
 
     // JSONRPC Coind
-    LOG_INFO << "Init Coind (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "])...";
-    
+    LOG_INFO << "\t\t" << " CoindJsonRPC (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "]) initialization...";
     _coind_rpc = new CoindRPC(_context, _parent_net, CoindRPC::rpc_auth_data{_config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str()}, _config->jsonrpc_coind_login.c_str());
     add(_coind_rpc, 0);
     do {
@@ -70,12 +70,14 @@ void NodeManager::run()
     // TODO
 
     // Share Tracker
+    LOG_INFO << "\t\t" << " ShareTracker initialization...";
     _tracker = new ShareTracker(_net);
     _tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){_tracker->init(shares, known);});
     //TODO: Save shares every 60 seconds
     // timer in _tracker constructor
 
     // Pool Node
+    LOG_INFO << "\t\t" << " PoolNode initialization...";
     _pool_node = new PoolNode(_context);
     // add(_pool_node, 2);
     _pool_node
@@ -85,6 +87,7 @@ void NodeManager::run()
             ->set_tracker(_tracker);
 
     // CoindNode
+    LOG_INFO << "\t\t" << " CoindNode initialization...";
     _coind_node = new CoindNode(_context);
     add(_coind_node, 1);
 
@@ -100,9 +103,11 @@ void NodeManager::run()
     _pool_node->run<PoolListener, PoolConnector>();
 
     // Worker
+    LOG_INFO << "\t\t" << " Worker initialization...";
     _worker = new Worker(_net, _pool_node, _coind_node, _tracker);
 
     // Stratum
+    LOG_INFO << "\t\t" << " StratumNode initialization...";
     _stratum = new StratumNode(_context, _worker);
     // add(_stratum, 4);
     _stratum->listen();

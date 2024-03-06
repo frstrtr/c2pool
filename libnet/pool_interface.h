@@ -32,7 +32,7 @@ public:
 		acceptor.listen();
 
 		async_loop();
-		LOG_INFO << "PoolListener started for port: " << listen_ep.port();
+		LOG_INFO << "\t\t PoolListener started for port: " << listen_ep.port();
 	}
 
 	void stop() override

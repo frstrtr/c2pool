@@ -8,7 +8,7 @@
 
 void CoindNode::start()
 {
-	LOG_INFO << "... CoindNode<" << parent_net->net_name << "> starting...";
+	LOG_INFO << "\t\t CoindNode starting...";
     reconnect();
 	//COIND:
 	coind_work->set(coind->getwork(txidcache));
@@ -118,7 +118,7 @@ void CoindNode::start()
 	stop_signal.watch(t.stop)
 	 */
 
-	LOG_INFO << "... CoindNode<" << parent_net->net_name << "> " << "started!";
+	LOG_INFO << "\t\t CoindNode started!";
 }
 
 void CoindNode::work_poller()

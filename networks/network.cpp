@@ -21,7 +21,7 @@ namespace c2pool
 
     Network::Network(std::string name) : net_name(name)
     {
-        LOG_INFO << "Created Network [" << name << "].";
+        LOG_INFO << "\t\t\tCreated Network [" << name << "].";
     }
 
     Network::Network(std::string name, boost::property_tree::ptree &_pt) : Network(name)

@@ -963,7 +963,7 @@ void Worker::compute_work()
 
         if (bb->previous_block == t.previous_block && _net->parent->POW_FUNC(packed_block_header) <= FloatingInteger(t.bits).target())
         {
-            LOG_INFO << "Skipping from block " << bb->previous_block.GetHex() << " to block"
+            LOG_INFO << "Skipping from block " << bb->previous_block.GetHex() << " to block "
                      << coind::data::hash256(packed_block_header) << "!";
 
             t = {

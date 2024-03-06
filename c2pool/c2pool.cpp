@@ -118,7 +118,7 @@ int main(int argc, char *argv[])
     boost::asio::thread_pool coind_threads(1);
 
     //Createing web server
-    LOG_INFO << "web_server initialization in new thread...";
+    LOG_INFO << "\tweb_server initialization in new thread...";
     WebServer* web_server;
 
     tcp::endpoint web_endpoint;
@@ -154,7 +154,7 @@ int main(int argc, char *argv[])
 
     while (!web_server || (web_server && !web_server->is_running()))
     {
-        LOG_INFO << "\t...wait for web server initialization";
+        LOG_INFO << "\t\t...wait for web server initialization";
         this_thread::sleep_for(std::chrono::seconds(1));
     }
 
