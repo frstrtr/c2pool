@@ -48,7 +48,7 @@ public:
             //TODO: close proj
         } else
         {
-            LOG_INFO << "DB was opened with path: " << (filepath / name).string();
+            LOG_DEBUG_DB << "DB was opened with path: " << (filepath / name).string();
         }
     }
 

@@ -135,7 +135,6 @@ public:
               PoolNodeServer(this, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); }),
               PoolNodeClient(this, [&](std::shared_ptr<pool::messages::message_version> msg, PoolHandshake* handshake) { handle_message_version(msg, handshake); })
 	{
-        LOG_INFO << "PoolNode created!";
 		SET_POOL_DEFAULT_HANDLER(addrs);
 		SET_POOL_DEFAULT_HANDLER(addrme);
 		SET_POOL_DEFAULT_HANDLER(ping);

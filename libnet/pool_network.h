@@ -119,7 +119,7 @@ public:
 protected:
     void error(const libp2p::error& err) override 
     {
-        LOG_ERROR << "POOL[server]: [" << err.errc << "/" << err.addr.to_string() << "]" << err.reason;
+        LOG_ERROR << "[Pool.server]: <" << err.errc << "/" << err.addr.to_string() << "> " << err.reason;
         base_pool_error(err, this);
     }
 
@@ -270,7 +270,7 @@ public:
 protected:
     void error(const libp2p::error& err) override 
     {
-        LOG_ERROR << "POOL[client]: [" << err.errc << "/" << err.addr.to_string() << "]" << err.reason;
+        LOG_ERROR << "[Pool.client]: <" << err.errc << "/" << err.addr.to_string() << "> " << err.reason;
         base_pool_error(err, this);
     }
 

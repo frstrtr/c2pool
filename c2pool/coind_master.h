@@ -27,14 +27,14 @@ namespace c2pool::master
 
     NodeManager* make_node(boost::asio::thread_pool &thread_pool, const std::string &name, WebServer* web)
     {
-        LOG_INFO << "Starting " << name << " initialization...";
+        LOG_INFO << "\tStarting " << name << " initialization...";
 
         //Networks/Configs
-        LOG_INFO << name << " network initialization...";
+        LOG_INFO << "\t\t" << " Network initialization...";
         auto net = c2pool::load_network_file(name);
-        LOG_INFO << name << " config initialization...";
+        LOG_INFO << "\t\t" << " Config initialization...";
         auto cfg = c2pool::dev::load_config_file(name);
-        LOG_INFO << "web server initialization...";
+        LOG_INFO << "\t\t" << " WebServer initialization...";
         auto root = web->get_web_root();
 
         //------> new net in web_root
@@ -47,7 +47,7 @@ namespace c2pool::master
         web_net->add("tx_explorer_url_prefix", net->parent->TX_EXPLORER_URL_PREFIX);
 
         //NodeManager
-        LOG_INFO << name << " NodeManager initialization...";
+        LOG_INFO << "\t\t" << " NodeManager initialization...";
         auto node = new NodeManager(net, cfg, web);
 
         //run manager in another thread from thread_pool.
@@ -58,7 +58,7 @@ namespace c2pool::master
             using namespace chrono_literals;
             std::this_thread::sleep_for(100ms);
         }
-        LOG_INFO << name << " started!";
+        LOG_INFO << "........" << name << " started!........";
         return std::move(node);
     }
 
@@ -72,11 +72,11 @@ namespace c2pool::master
             std::exit(0);
         }
 
-        LOG_INFO << "Starting with networks: ";
+        LOG_INFO << "\tStarting networks (name -> activated?): ";
         std::vector<NodeManager*> nodes;
         for (auto net_name : networks.allKeys())
         {
-            LOG_INFO << "\t" << net_name.toStdString() << " " << (networks.value(net_name).toBool() ? "true" : "false");
+            LOG_INFO << "\t\t" << net_name.toStdString() << " -> " << (networks.value(net_name).toBool() ? "true" : "false");
         }
 
         for (auto net_name : networks.allKeys())
