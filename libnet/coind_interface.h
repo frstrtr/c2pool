@@ -48,6 +48,7 @@ private:
 				}
 				
 				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
+				socket->init_addr();
 				socket_handler(socket);
 				
 			}

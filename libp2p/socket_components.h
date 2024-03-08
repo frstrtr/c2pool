@@ -15,7 +15,7 @@ struct SocketEvents
     Event<> event_disconnect;                   // Вызывается, когда мы каким-либо образом отключаемся от пира или он от нас.
     Event<std::string> event_handle_message;    // Вызывается, когда мы получаем любое сообщение.
     Event<std::string> event_peer_receive;      // Вызывается, когда удалённый peer получает сообщение.
-    Event<std::string> event_send_message;     // Вызывается, когда мы отправляем сообщение.
+    Event<std::string> event_send_message;      // Вызывается, когда мы отправляем сообщение.
 
     explicit SocketEvents()
     {
