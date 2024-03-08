@@ -20,15 +20,6 @@ private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 	c2pool::Network* net;	
 
-    void init_addr() override
-    {
-        boost::system::error_code ec;
-        // global; TODO: log ec;
-        addr = {socket->remote_endpoint(ec)};
-        // local; TODO: log ec;
-        addr_local = {socket->local_endpoint(ec)};
-    }
-
 	void read_prefix(std::shared_ptr<ReadSocketData> msg);
 	void read_command(std::shared_ptr<ReadSocketData> msg);
 	void read_length(std::shared_ptr<ReadSocketData> msg);
@@ -40,7 +31,6 @@ public:
 	PoolSocket(auto socket_, auto net_, connection_type type_, error_handler_type error_handler_) 
 		: BasePoolSocket(type_, error_handler_, DebugMessages::config{}), socket(socket_), net(net_)
 	{
-		init_addr();
 		LOG_DEBUG_POOL << "PoolSocket created";
 	}
 
@@ -84,6 +74,20 @@ public:
 		std::shared_ptr<ReadSocketData> msg = std::make_shared<ReadSocketData>(net->PREFIX_LENGTH);
 		read_prefix(msg);
 	}
+
+	void init_addr() override
+    {
+        boost::system::error_code ec;
+		auto _addr = socket->remote_endpoint(ec);
+		if (ec)
+			LOG_WARNING << "PoolSocket init_addr.remote: " << ec << " " << ec.message();
+        addr = {socket->remote_endpoint(ec)};
+
+		_addr = socket->local_endpoint(ec);
+		if (ec)
+			LOG_WARNING << "PoolSocket init_addr.local: " << ec << " " << ec.message();
+        addr_local = {socket->local_endpoint(ec)};
+    }
 
 	bool is_connected() override
 	{

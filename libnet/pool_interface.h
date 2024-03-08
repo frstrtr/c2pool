@@ -58,6 +58,7 @@ protected:
 
 				auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(socket_));
 				auto socket = new PoolSocket(tcp_socket, net, connection_type::incoming, [&](const libp2p::error& err){ error_handler(err); });
+				socket->init_addr();
 				socket_handler(socket);
 				
 				// continue accept connections
@@ -94,6 +95,7 @@ private:
 					return;
 				}
 
+				socket->init_addr();
 				LOG_INFO << "PoolConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
                 socket_handler(socket);
             }
