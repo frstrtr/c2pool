@@ -1,7 +1,7 @@
 # file(GLOB devcore_sources "*.h" "*.cpp")
 
 #from devcore
-set(devcore_sources exceptions.h addr_store.h addr_store.cpp common.h common.cpp config.h config.cpp
+set(devcore_sources addr_store.h addr_store.cpp common.h common.cpp config.h config.cpp
     filesystem.h filesystem.cpp logger.h logger.cpp random.h random.cpp str.h str.cpp)
 
 #from dbshell
