@@ -4,7 +4,7 @@
 #include <boost/asio.hpp>
 #include <libnet/pool_interface.h>
 #include <libnet/coind_interface.h>
-#include <libdevcore/exceptions.h>
+#include <libp2p/net_error.h>
 
 using boost::asio::ip::tcp;
 using namespace shares::types;
@@ -22,25 +22,12 @@ void NodeManager::network_cycle()
             _context->run();
             break;
         }
-        catch (const coindrpc_exception& ex) //layer#1
+        catch (const node_exception& ex)
         {
-            LOG_ERROR << "CoindRPC exception: " << ex.what();
-            _coind_rpc->HandleException(ex);
+            LOG_ERROR << "Node exception: " << ex.what();
+            restart(ex.node());
         }
-        catch (const coind_exception& ex) //layer#2
-        {
-            LOG_ERROR << "Coind Node exception: " << ex.what();
-            _coind_node->HandleException(ex);
-        }
-        catch (const pool_exception& ex) //layer#3
-        {
 
-        }
-        catch (const stratum_exception& ex) //layer#4
-        {
-
-        }
-        
         _context->restart();
     }
 }
