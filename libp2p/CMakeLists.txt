@@ -2,13 +2,17 @@ set(libp2p_source
         net_errors.h
         socket.h
         socket_components.h
-        socket_data.h
-        net_supervisor.h        
+        socket_data.h     
         message.h 
         protocol.h 
         handler.h 
         handshake.h 
-        protocol_components.h node.h)
+        protocol_components.h 
+        node.h
+        network_process.h
+        network_tree_node.h
+        network_tree.h
+)
 
 set(libp2ppreset_source
         preset/p2p_socket_data.h
