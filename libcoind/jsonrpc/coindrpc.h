@@ -7,9 +7,9 @@
 #include "jsonrpccxx/server.hpp"
 
 #include <networks/network.h>
-#include <libp2p/net_supervisor.h>
 #include <libdevcore/logger.h>
-#include <libdevcore/exceptions.h>
+#include <libp2p/net_errors.h>
+#include <libp2p/network_tree_node.h>
 #include <libcoind/data.h>
 #include <libcoind/types.h>
 
@@ -21,7 +21,7 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = io::ip::tcp;
 
-class CoindRPC : public jsonrpccxx::IClientConnector, public NodeExceptionHandler, public SupervisorElement
+class CoindRPC : public jsonrpccxx::IClientConnector, public NetworkTreeNode
 {
 	const std::string id = "curltest";
 public:
@@ -51,7 +51,7 @@ protected:
     http::request<http::string_body> http_request;
 
 public:
-    void reconnect() override
+    void run() override
     {
         auto const results = resolver.resolve(auth.ip, auth.port);
 
@@ -66,24 +66,19 @@ public:
 			reconnect_timer.async_wait(
 				[this](const auto& ec)
 				{
-					reconnect();
+					run();
 				}
 			);
         } else 
 		{
-			reconnected();
+			connected();
 		}
     }
 
 	void stop() override
 	{
-		if (state != disconnected)
-			return;
-
 		beast::error_code ec;
 		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-
-		set_state(disconnected);
 	}
 
 public:
@@ -135,7 +130,7 @@ public:
         }
         catch (const std::exception& ex)
         {
-        	throw make_except<coindrpc_exception, NodeExcept>("error when try to read response -> " + std::string(ex.what()));
+        	throw libp2p::node_exception("error when try to read response -> " + std::string(ex.what()), this);
         }
 
 		std::string json_result = boost::beast::buffers_to_string(response.body().data());
@@ -183,15 +178,5 @@ public:
 	{
 		nlohmann::json j = nlohmann::json::object({{"rules", rules}});
 		return client.CallMethod<nlohmann::json>(id, "getblocktemplate", {j});
-	}
-protected:
-	void HandleNodeException() override
-	{
-		restart();
-	}
-
-    void HandleNetException(NetExcept* data) override
-	{
-		restart();
 	}
 };
