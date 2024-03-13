@@ -1,6 +1,10 @@
 #pragma once
+
 #include <string>
+#include <stdexcept>
+
 #include <libdevcore/types.h>
+#include "network_tree_node.h"
 
 namespace libp2p
 {
@@ -29,6 +33,21 @@ namespace libp2p
             : errc(errc_), reason(reason_), addr(addr_)
         {
             
+        }
+    };
+
+    class node_exception : public std::runtime_error
+    {
+        NetworkTreeNode* node;
+    public:
+        node_exception(const std::string& reason, NetworkTreeNode* node_)
+            : std::runtime_error(reason), node(node_)
+        {
+        }
+
+        NetworkTreeNode* get_node() const
+        {
+            return node;
         }
     };
 }
