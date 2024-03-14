@@ -4,8 +4,10 @@
 #include <string>
 #include <libdevcore/logger.h>
 
-StratumProtocol::StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f) : ProtocolEvents(), _context(context), _socket(std::move(socket)), client(*this, version::v2), disconnect_in_node_f(std::move(_disconnect_in_node_f)),
-                                                                                                                                                                                                              addr(std::make_tuple(_socket->remote_endpoint().address().to_string(), _socket->remote_endpoint().port()))
+StratumProtocol::StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(NetAddress)> _disconnect_in_node_f) 
+    : _context(context), _socket(std::move(socket)), 
+        client(*this, version::v2), disconnect_in_node_f(std::move(_disconnect_in_node_f)), 
+        addr(_socket->remote_endpoint())
 {
     event_disconnect = make_event();
     Read();
@@ -51,19 +53,21 @@ std::string StratumProtocol::Send(const std::string &request)
 {
     auto _req = request + "\n";
     LOG_DEBUG_STRATUM << "StratumProtocol send message: " << request;
-    boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), [&](const boost::system::error_code& ec, std::size_t bytes_transferred){
-        if (ec)
+    boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), 
+        [&](const boost::system::error_code& ec, std::size_t bytes_transferred)
         {
-            disconnect("Response error = " + ec.message());
+            if (ec)
+            {
+                disconnect("Response error = " + ec.message());
+            }
         }
-    });
+    );
     return {};
 }
 
 void StratumProtocol::disconnect(std::string reason)
 {
-    auto [ip, port] = get_addr();
-    LOG_WARNING << "StratumProtocol(" << ip << ":" << port << ") has been disconnected for a reason: " << reason;
+    LOG_WARNING << "StratumProtocol(" << get_addr().to_string() << ") has been disconnected for a reason: " << reason;
     event_disconnect->happened();
     _socket->close();
     disconnect_in_node_f(get_addr());

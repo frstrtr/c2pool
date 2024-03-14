@@ -6,8 +6,9 @@
 
 #include <utility>
 
-Stratum::Stratum(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, Worker* worker, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f)
-                : StratumProtocol(context, std::move(socket), std::move(_disconnect_in_node_f)), _worker(worker), _t_send_work(*context), handler_map(_context, 300)
+Stratum::Stratum(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, Worker* worker, std::function<void(NetAddress)> _disconnect_in_node_f)
+    : StratumProtocol(context, std::move(socket), std::move(_disconnect_in_node_f)),
+     _worker(worker), _t_send_work(*context), handler_map(_context, 300)
 {
     server.Add("mining.subscribe", GetUncheckedHandle([&](const json &value)
                                                       {
