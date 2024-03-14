@@ -58,6 +58,12 @@ public:
         calculate_chain(tree_start, chain);
     }
 
+    void launch()
+    {
+        std::future<void> reconnect_process = std::async(&NetworkTree::run, this);
+        process->start(reconnect_process);
+    }
+
     void restart(NetworkTreeNode* node)
     {
         // new process
@@ -79,7 +85,6 @@ public:
             v->stop_node();
 
         // run
-        std::future<void> reconnect_process = std::async(&NetworkTree::run, this);
-        process->start(reconnect_process);
+        launch();
     }
 };

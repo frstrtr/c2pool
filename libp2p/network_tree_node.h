@@ -39,25 +39,33 @@ class NetworkTreeNode
         state = NetworkState::offline;
     }
 
-protected:
-    // call when node connected
-    void connected()
-    {
-        task->ready();
-        // task.reset();
-        state = NetworkState::connected;
-    }
-
 public:
     NetworkTreeNode()
     {
 
     }
 
+    // call when node connected
+    void connected()
+    {
+        task->ready();
+        state = NetworkState::connected;
+    }
+
     void add_next_network_layer(NetworkTreeNode* node)
     {
         next.push_back(node);
         node->prev = this;
+    }
+
+    NetworkState get_status() const
+    {
+        return state;
+    }
+
+    bool is_connected() const
+    {
+        return get_status() == NetworkState::connected;
     }
 
     virtual void run() = 0;
