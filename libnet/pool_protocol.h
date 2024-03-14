@@ -9,7 +9,6 @@
 #include "pool_protocol_data.h"
 #include "pool_messages.h"
 #include "pool_socket.h"
-#include <libdevcore/exceptions.h>
 #include <libp2p/protocol.h>
 #include <libp2p/protocol_components.h>
 #include <libp2p/handler.h>

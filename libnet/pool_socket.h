@@ -8,7 +8,6 @@
 #include <libp2p/message.h>
 #include <networks/network.h>
 #include <libdevcore/logger.h>
-#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 

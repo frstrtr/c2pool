@@ -7,7 +7,6 @@
 #include "pool_messages.h"
 #include "pool_protocol_data.h"
 #include <libp2p/handshake.h>
-#include <libdevcore/exceptions.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/types.h>
 
@@ -51,9 +50,9 @@ public:
                         auto msg = std::make_shared<pool::messages::message_sharereq>(_id, _hashes, _parents, _stops);
                         _socket->write(msg);
                     }, 15, 
-					[addr = get_addr()](std::string msg)
+					[&](std::string msg)
 					{
-						throw make_except<pool_exception, NetExcept>((boost::format("Timeout get_shares: %1%") % msg).str(), addr);
+						error(libp2p::BAD_PEER, (boost::format("Timeout get_shares: %1%") % msg).str());
 					})
 				), 
 				handle_message_version(std::move(handler_))
@@ -74,8 +73,7 @@ public:
 	{
         LOG_DEBUG_POOL << "Pool handshake server handle message: " << raw_msg->command;
 		if (raw_msg->command != "version")
-			throw make_except<pool_exception, NetExcept>("[PoolHandshakeServer] msg != version", get_addr());
-
+			error(libp2p::BAD_PEER, "[PoolHandshakeServer] msg != version");
 		try
 		{
 			auto msg = std::make_shared<pool::messages::message_version>();
@@ -85,7 +83,7 @@ public:
 			handle_message_version(msg, this);
 		} catch (const std::runtime_error &ec)
 		{
-			throw make_except<pool_exception, NetExcept>("[PoolHandshakeServer] handle_message error = " + std::string(ec.what()), get_addr());
+			error(libp2p::BAD_PEER, "[PoolHandshakeServer] handle_message error = " + std::string(ec.what()));
 		}
 
 		send_version();
@@ -107,7 +105,7 @@ public:
 	{
         LOG_DEBUG_POOL << "Pool handshake client handle message: " << raw_msg->command;
         if (raw_msg->command != "version")
-            throw make_except<pool_exception, NetExcept>("[PoolHandshakeClient] msg != version", get_addr());
+            error(libp2p::BAD_PEER, "[PoolHandshakeClient] msg != version");
 
         try
         {
@@ -118,7 +116,7 @@ public:
             handle_message_version(msg, this);
         } catch (const std::runtime_error &ec)
         {
-			throw make_except<pool_exception, NetExcept>("[PoolHandshakeClient] handle_message error = " + std::string(ec.what()), get_addr());
+			error(libp2p::BAD_PEER, "[PoolHandshakeClient] handle_message error = " + std::string(ec.what()));
         }
 		handshake_finish(this);
 	}
