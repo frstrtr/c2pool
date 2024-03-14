@@ -10,7 +10,7 @@
 #include "net_errors.h"
 #include "socket.h"
 
-enum NodeRunState
+enum NodeMode
 {
     disable = 0,
 	onlyClient = 1,
