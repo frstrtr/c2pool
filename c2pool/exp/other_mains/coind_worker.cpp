@@ -34,7 +34,7 @@ int main(int ac, char *av[])
 	const char *coind_port = av[2];
 	const char *coind_login = av[3];
 
-	NodeRunState pool_node_mode = both;
+	NodeMode pool_node_mode = both;
 	if (ac >= 5)
 	{
 		std::stringstream ss;
@@ -42,7 +42,7 @@ int main(int ac, char *av[])
 		int _pool_node_mode;
 		ss >> _pool_node_mode;
 
-		pool_node_mode = (NodeRunState) _pool_node_mode;
+		pool_node_mode = (NodeMode) _pool_node_mode;
 		std::cout << pool_node_mode << std::endl;
 	}
 
