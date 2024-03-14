@@ -4,12 +4,13 @@
 #include <boost/asio.hpp>
 #include <libnet/pool_interface.h>
 #include <libnet/coind_interface.h>
-#include <libp2p/net_error.h>
+#include <libp2p/net_errors.h>
 
 using boost::asio::ip::tcp;
 using namespace shares::types;
 
-NodeManager::NodeManager(c2pool::Network* _network, c2pool::dev::coind_config* _cfg, WebServer* _web) : _net(_network), _parent_net(_network->parent), _config(_cfg), _web_server(_web)
+NodeManager::NodeManager(c2pool::Network* _network, c2pool::dev::coind_config* _cfg, WebServer* _web) 
+    : net(_network), parent_net(_network->parent), config(_cfg), web_server(_web)
 {
 }
 
@@ -19,88 +20,89 @@ void NodeManager::network_cycle()
     {
         try 
         {
-            _context->run();
+            context->run();
             break;
         }
-        catch (const node_exception& ex)
+        catch (const libp2p::node_exception& ex)
         {
             LOG_ERROR << "Node exception: " << ex.what();
-            restart(ex.node());
+            restart(ex.get_node());
         }
 
-        _context->restart();
+        context->restart();
     }
 }
 
 void NodeManager::run()
 {
     LOG_INFO << "\t\t" << " Making asio io_context in NodeManager...";
-    _context = new boost::asio::io_context(0);
+    context = new boost::asio::io_context(0);
 
     // AddrStore
     LOG_INFO << "\t\t" << " AddrStore initialization...";
-    _addr_store = new c2pool::dev::AddrStore(_net->net_name + "/addrs", _net);
+    addr_store = new c2pool::dev::AddrStore(net->net_name + "/addrs", net);
     // TODO: Bootstrap_addrs
     // TODO: Parse CLI args for addrs
     // TODO: Save addrs every 60 seconds
     //    timer in _addr_store constructor
 
     // JSONRPC Coind
-    LOG_INFO << "\t\t" << " CoindJsonRPC (" << _config->coind_ip << ":" << _config->jsonrpc_coind_port << "[" << _config->jsonrpc_coind_login << "]) initialization...";
-    _coind_rpc = new CoindRPC(_context, _parent_net, CoindRPC::rpc_auth_data{_config->coind_ip.c_str(), _config->jsonrpc_coind_port.c_str()}, _config->jsonrpc_coind_login.c_str());
-    add(_coind_rpc, 0);
-    do {
-        _coind_rpc->reconnect();
-    } while (!_coind_rpc->check());
+    LOG_INFO << "\t\t" << " CoindJsonRPC (" << config->coind_ip << ":" << config->jsonrpc_coind_port << "[" << config->jsonrpc_coind_login << "]) initialization...";
+    coind_rpc = new CoindRPC(context, parent_net, CoindRPC::rpc_auth_data{config->coind_ip.c_str(), config->jsonrpc_coind_port.c_str()}, config->jsonrpc_coind_login.c_str());
+    //TODO remove
+    // do {
+    //     _coind_rpc->reconnect();
+    // } while (!_coind_rpc->check());
 
     // Determining payout address
     // TODO
 
     // Share Tracker
     LOG_INFO << "\t\t" << " ShareTracker initialization...";
-    _tracker = new ShareTracker(_net);
-    _tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){_tracker->init(shares, known);});
+    tracker = new ShareTracker(net);
+    tracker->share_store.legacy_init(c2pool::filesystem::getProjectPath() / "shares.0", [&](auto shares, auto known){tracker->init(shares, known);});
     //TODO: Save shares every 60 seconds
     // timer in _tracker constructor
 
-    // Pool Node
+    // Init Pool Node
     LOG_INFO << "\t\t" << " PoolNode initialization...";
-    _pool_node = new PoolNode(_context);
-    // add(_pool_node, 2);
-    _pool_node
-            ->set_net(_net)
-            ->set_config(_config)
-            ->set_addr_store(_addr_store)
-            ->set_tracker(_tracker);
+    pool_node = new PoolNode(context);
+    pool_node
+            ->set_net(net)
+            ->set_config(config)
+            ->set_addr_store(addr_store)
+            ->set_tracker(tracker);
+    pool_node->init<PoolListener, PoolConnector>();
 
-    // CoindNode
+    // Init Coind Node
     LOG_INFO << "\t\t" << " CoindNode initialization...";
-    _coind_node = new CoindNode(_context);
-    add(_coind_node, 1);
+    coind_node = new CoindNode(context);
+    coind_node
+            ->set_parent_net(parent_net)
+            ->set_coind(coind_rpc)
+            ->set_tracker(tracker)
+            ->set_pool_node(pool_node);
+    coind_node->init<CoindConnector>();
 
-    _coind_node
-            ->set_parent_net(_parent_net)
-            ->set_coind(_coind_rpc)
-            ->set_tracker(_tracker)
-            ->set_pool_node(_pool_node);
+    pool_node->set_coind_node(coind_node); // init coind_node in pool_node
 
-    _pool_node->set_coind_node(_coind_node);
-
-    _coind_node->run<CoindConnector>();
-    _pool_node->run<PoolListener, PoolConnector>();
+    coind_rpc->add_next_network_layer(coind_node);
+    coind_node->add_next_network_layer(pool_node);
 
     // Worker
     LOG_INFO << "\t\t" << " Worker initialization...";
-    _worker = new Worker(_net, _pool_node, _coind_node, _tracker);
+    worker = new Worker(net, pool_node, coind_node, tracker);
 
     // Stratum
     LOG_INFO << "\t\t" << " StratumNode initialization...";
-    _stratum = new StratumNode(_context, _worker);
-    // add(_stratum, 4);
-    _stratum->listen();
+    stratum = new StratumNode(context, worker);
+    pool_node->add_next_network_layer(stratum);
+    // stratum->listen();
 
     //...success!
     _is_loaded = true;
+    init(context, coind_rpc);
+    launch();
     network_cycle();
 }
 
@@ -108,91 +110,3 @@ bool NodeManager::is_loaded() const
 {
     return _is_loaded;
 }
-
-boost::asio::io_context* NodeManager::context() const
-{
-    return _context;
-}
-
-c2pool::Network* NodeManager::net() const
-{
-    return _net;
-}
-
-coind::ParentNetwork* NodeManager::parent_net() const
-{
-    return _parent_net;
-}
-
-c2pool::dev::coind_config* NodeManager::config() const
-{
-    return _config;
-}
-
-c2pool::dev::AddrStore* NodeManager::addr_store() const
-{
-    return _addr_store;
-}
-
-PoolNode* NodeManager::pool_node() const
-{
-    return _pool_node;
-}
-
-CoindRPC* NodeManager::coind_rpc() const
-{
-    return _coind_rpc;
-}
-
-CoindNode* NodeManager::coind_node() const
-{
-    return _coind_node;
-}
-
-ShareTracker* NodeManager::tracker() const
-{
-    return _tracker;
-}
-
-//ShareStore* NodeManager::share_store() const
-//{
-//    return _share_store;
-//}
-
-Worker* NodeManager::worker() const
-{
-    return _worker;
-}
-
-StratumNode* NodeManager::stratum() const
-{
-    return _stratum;
-}
-
-WebServer* NodeManager::web_server() const
-{
-    return _web_server;
-}
-
-
-#define create_set_method(type, var_name)                      \
-    void TestNodeManager::set##var_name(type* _val)            \
-    {                                                          \
-        var_name = _val;                                       \
-    }
-
-create_set_method(boost::asio::io_context, _context);
-create_set_method(c2pool::Network, _net);
-create_set_method(coind::ParentNetwork, _parent_net);
-create_set_method(c2pool::dev::coind_config, _config);
-create_set_method(c2pool::dev::AddrStore, _addr_store);
-create_set_method(PoolNode, _pool_node);
-create_set_method(CoindRPC, _coind_rpc);
-create_set_method(CoindNode, _coind_node);
-create_set_method(ShareTracker, _tracker);
-//create_set_method(ShareStore, _share_store);
-create_set_method(Worker, _worker);
-create_set_method(StratumNode, _stratum);
-create_set_method(WebServer, _web_server)
-
-#undef create_set_method
