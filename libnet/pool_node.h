@@ -13,14 +13,13 @@
 #include "pool_handshake.h"
 #include "pool_node_data.h"
 #include "pool_network.h"
-#include <libp2p/net_supervisor.h>
+
 #include <libp2p/handler.h>
-#include <libdevcore/exceptions.h>
 
 #define SET_POOL_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<pool::messages::message_##msg, PoolProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
 
-class PoolNode : public PoolNodeData, public NodeExceptionHandler, public SupervisorElement, PoolNodeServer, PoolNodeClient, protected WebPoolNode
+class PoolNode : public PoolNodeData, PoolNodeServer, PoolNodeClient, protected WebPoolNode
 {
     struct DownloadShareManager
     {
@@ -127,6 +126,7 @@ class PoolNode : public PoolNodeData, public NodeExceptionHandler, public Superv
     };
 
 private:
+    NodeMode mode {NodeMode::disable};
     uint64_t nonce; // node_id
 
     DownloadShareManager download_share_manager;
@@ -154,20 +154,18 @@ public:
 	}
 
 	template <typename ListenerType, typename ConnectorType>
-	void run(NodeRunState run_state = both)
+	void init(NodeMode mode_ = both)
 	{
-		if (run_state & onlyServer)
+        mode = mode_;
+		if (mode & onlyServer)
         {
             PoolNodeServer::init<ListenerType>(context, net, config->c2pool_port);
-            PoolNodeServer::start();
         }
 
-		if (run_state & onlyClient)
+		if (mode & onlyClient)
 		{
             PoolNodeClient::init<ConnectorType>(context, net);
-            PoolNodeClient::start();
 		}
-        start();
         init_web_metrics();
 	}
 
@@ -202,36 +200,36 @@ private:
     void start();
     void init_web_metrics() override;
 
-protected:
-    // SupervisorElement
+public:
+    void run() override
+    {
+        if (mode & disable)
+        {
+            LOG_WARNING << "PoolNode mode = disable!";
+            return;
+        }
+
+        PoolNode::start();
+		
+        if (mode & onlyServer)
+        {
+            PoolNodeServer::start();
+        }
+
+		if (mode & onlyClient)
+		{
+            PoolNodeClient::start();
+		}
+
+        connected(); //TODO: only after first connect?
+    }
+
     void stop() override
     {
-        if (state == disconnected)
-            return;
+        //TODO: stop PoolNode::start()?
 
         PoolNodeServer::stop();
         PoolNodeClient::stop();
-
-        set_state(disconnected);
     }
-
-    void reconnect() override
-    {
-        //TODO: restart server+client
-        PoolNodeServer::start();
-        PoolNodeClient::start();
-        reconnected();
-    }
-
-    // NodeExceptionHandler
-    void HandleNodeException() override
-	{
-		restart();
-	}
-
-    void HandleNetException(NetExcept* data) override
-	{
-		//TODO: disconnect peer
-	}
 };
 #undef SET_POOL_DEFAULT_HANDLER

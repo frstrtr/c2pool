@@ -3,14 +3,15 @@
 #include "pool_handshake.h"
 #include "pool_node_data.h"
 #include <libp2p/node.h>
+#include <libp2p/network_tree_node.h>
 
 template <typename CommunicationType>
-inline void base_pool_error(const libp2p::error& err, CommunicationType* communicator)
+inline void base_pool_error(const libp2p::error& err, NetworkTreeNode* node, CommunicationType* communicator)
 {
     switch (err.errc)
     {
     case libp2p::SYSTEM_ERROR:
-        throw make_except<pool_exception, NodeExcept>(err.reason);
+        throw libp2p::node_exception(err.reason, node);
     // case libp2p::ASIO_ERROR:
         // ???
     default:
@@ -120,7 +121,7 @@ protected:
     void error(const libp2p::error& err) override 
     {
         LOG_ERROR << "[Pool.server]: <" << err.errc << "/" << err.addr.to_string() << "> " << err.reason;
-        base_pool_error(err, this);
+        base_pool_error(err, data, this);
     }
 
     void socket_handle(socket_type* socket) override
@@ -271,7 +272,7 @@ protected:
     void error(const libp2p::error& err) override 
     {
         LOG_ERROR << "[Pool.client]: <" << err.errc << "/" << err.addr.to_string() << "> " << err.reason;
-        base_pool_error(err, this);
+        base_pool_error(err, data, this);
     }
 
     void socket_handle(socket_type* socket) override
