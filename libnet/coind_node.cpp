@@ -1,7 +1,6 @@
 #include "coind_node.h"
 
 #include <libdevcore/deferred.h>
-#include <libdevcore/exceptions.h>
 
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
@@ -9,7 +8,6 @@
 void CoindNode::start()
 {
 	LOG_INFO << "\t\t CoindNode starting...";
-    reconnect();
 	//COIND:
 	coind_work->set(coind->getwork(txidcache));
     get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work->value()](){return _coind_work.previous_block; });
@@ -128,8 +126,7 @@ void CoindNode::work_poller()
         coind_work->set(coind->getwork(txidcache, known_txs->value()));
     } catch (const jsonrpccxx::JsonRpcException& ex)
     {
-        throw make_except<coindrpc_exception, NodeExcept>("work_poller getwork exception -> " + std::string(ex.what()));
-        return;
+        throw libp2p::node_exception("work_poller getwork exception -> " + std::string(ex.what()), this);
     }
 
     work_poller_t.restart();
@@ -202,7 +199,7 @@ void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_v
         _proto->write(_msg);
     });
 
-    reconnected();
+    connected();
 
 //    pinger(30); //TODO: wanna for this?
 }

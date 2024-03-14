@@ -4,6 +4,7 @@
 #include "coind_protocol.h"
 #include "coind_node_data.h"
 
+#include <libp2p/network_tree_node.h>
 #include <libp2p/node.h>
 
 class CoindNodeClient : public Client<BaseCoindSocket>
@@ -14,7 +15,9 @@ protected:
 
 public:
     CoindNodeClient(CoindNodeData* node_data_) 
-        : Client<BaseCoindSocket>(), node_data(node_data_) {}
+        : Client<BaseCoindSocket>(), node_data(node_data_)
+    {
+    }
 
 	void connect(const NetAddress& addr)
 	{
@@ -40,7 +43,7 @@ protected:
     void error(const libp2p::error& err) override
     {
         LOG_ERROR << "Coind[client]: [" << err.errc << "/" << err.addr.to_string() << "]" << err.reason;
-        throw make_except<coind_exception, NodeExcept>(err.reason);
+        throw libp2p::node_exception(err.reason, node_data);
     }
 
     void socket_handle(BaseCoindSocket* socket) override
@@ -64,5 +67,6 @@ protected:
 
         // start accept messages
         socket->read();
+        node_data->connected();
     }
 };

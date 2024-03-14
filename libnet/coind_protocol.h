@@ -8,7 +8,6 @@
 #include <libp2p/handler.h>
 #include <libp2p/protocol_components.h>
 #include <libdevcore/deferred.h>
-#include <libdevcore/exceptions.h>
 
 typedef BaseProtocol<BaseCoindSocket, Pinger> BaseCoindProtocol;
 
@@ -56,7 +55,7 @@ private:
 
 	void timeout() override 
 	{
-		throw make_except<coind_exception, NodeExcept>("out time ping");
+		error(libp2p::PING_TIMEOUT, "ping timeout");
 	}
 
     void send_ping() override

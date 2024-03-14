@@ -9,7 +9,6 @@
 
 #include <libcoind/height_tracker.h>
 #include <libcoind/jsonrpc/coindrpc.h>
-#include <libp2p/net_supervisor.h>
 #include <libp2p/node.h>
 #include <libdevcore/logger.h>
 #include <libdevcore/events.h>
@@ -23,13 +22,11 @@ namespace ip = boost::asio::ip;
 #define SET_COIND_DEFAULT_HANDLER(msg) \
 	handler_manager->new_handler<coind::messages::message_##msg, CoindProtocol>(#msg, [&](auto msg_, auto proto_){ handle_message_##msg(msg_, proto_); });
 
-class CoindNode : public CoindNodeData, public NodeExceptionHandler, public SupervisorElement, CoindNodeClient
+class CoindNode : public CoindNodeData, CoindNodeClient
 {
-private:
-	bool isRunning = false;
 public:
     CoindNode(io::io_context* context_) 
-        : CoindNodeData(context_, this), CoindNodeClient(this), work_poller_t(context, true), forget_old_txs_t(context, true)
+        : CoindNodeData(context_), CoindNodeClient(this), work_poller_t(context, true), forget_old_txs_t(context, true)
     {
 		SET_COIND_DEFAULT_HANDLER(version);
 		SET_COIND_DEFAULT_HANDLER(verack);
@@ -54,47 +51,24 @@ public:
         });
     }
 
-    // Node
 	template <typename ConnectorType>
-	void run()
+	void init()
     {
-        if (isRunning)
-            throw std::runtime_error("CoindNode already running");
-
         CoindNodeClient::init<ConnectorType>(context, parent_net);
-        CoindNodeClient::start();
-
-        start();
-        isRunning = true;
     }
 
-    // SupervisorElement
+    void run() override
+    {
+        CoindNodeClient::start();
+        CoindNode::start();
+        connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
+    }
+
     void stop() override
     {
-        if (state == disconnected)
-            return;
-        
         CoindNodeClient::stop();
-
-        set_state(disconnected);
     }
 
-    void reconnect() override
-    {
-        connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
-        reconnected();
-    }
-
-protected:
-    void HandleNodeException() override
-	{
-		restart();
-	}
-
-    void HandleNetException(NetExcept* data) override
-	{
-		restart();
-	}
 public:
 
     void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol);
