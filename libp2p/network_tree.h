@@ -32,11 +32,13 @@ protected:
             if (node->state == NetworkState::connected)
                 continue;
 
+            if (process->is_canceled())
+                return;
+
             auto task = process->make_task();
 
             // push run_node to ctx thread
             boost::asio::post(*ctx, [&](){node->run_node(task);});
-
             switch (process->wait())
             {
             case cancel:
@@ -60,8 +62,10 @@ public:
 
     void launch()
     {
+        process = std::make_unique<ReconnectProcess>();
+
         std::future<void> reconnect_process = std::async(&NetworkTree::run, this);
-        process->start(reconnect_process);
+        process->start(std::move(reconnect_process));
     }
 
     void restart(NetworkTreeNode* node)
@@ -73,7 +77,6 @@ public:
             // reset unique_ptr process
             process.reset();
         }
-        process = std::make_unique<ReconnectProcess>();
 
         // calculate stop chain
         std::vector<NetworkTreeNode*> stop_chain;

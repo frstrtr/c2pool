@@ -2,6 +2,7 @@
 #include <future>
 #include <atomic>
 #include <tuple>
+#include <mutex>
 
 #include "network_tree_node.h"
 
@@ -25,25 +26,26 @@ class ReconnectTask
     std::promise<ReconnectTaskState> state;
     std::atomic_bool alive;
 public:
-    ReconnectTask() : alive(true)
+    ReconnectTask()
     {
+        alive.store(true);
     }
 
     void ready()
     {
-        if (alive)
+        if (alive.load())
         {
             state.set_value(ReconnectTaskState::ready);
-            alive = false;
+            alive.store(false);
         }
     }
 
     void cancel()
     {
-        if (alive)
+        if (alive.load())
         {
             state.set_value(ReconnectTaskState::cancel);
-            alive = false;
+            alive.store(false);
         }
     }
 
@@ -56,6 +58,9 @@ public:
 class ReconnectProcess
 {
     std::future<void> process_future;
+
+    std::mutex mutex;
+    std::atomic_bool canceled{false};
 public:
     std::shared_ptr<ReconnectTask> task;
 
@@ -63,13 +68,14 @@ public:
     {
     }
 
-    void start(std::future<void>& fut)
+    void start(std::future<void>&& fut)
     {
         process_future = std::move(fut);
     }
 
     std::shared_ptr<ReconnectTask> make_task()
     {
+        std::lock_guard<std::mutex> lock(mutex);
         task = std::make_shared<ReconnectTask>();
         return task;
     }
@@ -90,9 +96,18 @@ public:
 
     void cancel()
     {
-        if (task)
-            task->cancel();
+        canceled.store(true);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (task)
+                task->cancel();
+        }
         if (process_future.valid())
             process_future.wait();
+    }
+
+    bool is_canceled()
+    {
+        return canceled.load();
     }
 };
