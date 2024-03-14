@@ -2,7 +2,6 @@
 
 #include <libp2p/preset/p2p_socket_data.h>
 #include <libdevcore/str.h>
-#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 

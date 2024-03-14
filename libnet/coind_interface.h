@@ -5,11 +5,9 @@
 #include <tuple>
 
 #include <networks/network.h>
-#include <libp2p/net_supervisor.h>
 #include <libp2p/node.h>
 #include <libp2p/socket.h>
 #include <libdevcore/logger.h>
-#include <libdevcore/exceptions.h>
 
 #include <boost/asio.hpp>
 namespace io = boost::asio;

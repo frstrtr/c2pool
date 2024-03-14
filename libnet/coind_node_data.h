@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include <libp2p/network_tree_node.h>
 #include <libcoind/height_tracker.h>
 #include <libcoind/jsonrpc/coindrpc.h>
 #include <sharechains/share_tracker.h>
@@ -13,7 +14,7 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-class CoindNodeData
+class CoindNodeData : public NetworkTreeNode
 {
 public:
 	io::io_context* context;
@@ -21,7 +22,6 @@ public:
 	ShareTracker* tracker;
 	CoindRPC* coind;
 	PoolNodeData* pool_node;
-	ConnectionStatus* status;
 
     std::function<void(coind::data::types::BlockType)> send_block; //send block in p2p
 	HandlerManagerPtr handler_manager;
@@ -44,7 +44,7 @@ public:
 	Variable<coind::data::BlockHeaderType> best_block_header;
 	coind::HeightTracker get_height_rel_highest; // wanna for init get_block_height func!
 public:
-	CoindNodeData(io::io_context* context_, ConnectionStatus* status_) : context(context_), status(status_)
+	CoindNodeData(io::io_context* context_) : context(context_)
 	{
 		handler_manager = std::make_shared<HandlerManager>();
 
