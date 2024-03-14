@@ -8,6 +8,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/buffer.hpp>
 
+#include <libdevcore/types.h>
 #include <libp2p/protocol_components.h>
 
 #include <memory>
@@ -16,11 +17,11 @@ using namespace jsonrpccxx;
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-class StratumProtocol : public jsonrpccxx::IClientConnector, protected virtual ProtocolEvents
+class StratumProtocol : public jsonrpccxx::IClientConnector
 {
 public:
 //    StratumProtocol();
-    StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(std::tuple<std::string, unsigned short>)> _disconnect_in_node_f);
+    StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(NetAddress)> _disconnect_in_node_f);
     ~StratumProtocol()
     {
         delete event_disconnect;
@@ -43,8 +44,8 @@ protected:
     JsonRpcClient client;
 
     std::shared_ptr<ip::tcp::socket> _socket;
-    const std::tuple<std::string, unsigned short> addr;
-    std::function<void(std::tuple<std::string, unsigned short>)> disconnect_in_node_f;
+    const NetAddress addr;
+    std::function<void(NetAddress)> disconnect_in_node_f;
     Event<> event_disconnect;
 private:
     io::streambuf buffer;
