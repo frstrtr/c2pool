@@ -59,19 +59,19 @@ bool Work::operator!=(const Work &value) const
     return !(*this == value);
 }
 
-Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node,
-               CoindNodeData* coind_node, ShareTracker* tracker) : _net(net),
-                                                                                                          current_work(make_variable<Work>(Work{})),
-                                                                                                          new_work(make_event()),
-                                                                                                          share_received(make_event()),
-                                                                                                          pseudoshare_received(make_event()),
-                                                                                                          removed_unstales(make_variable<std::tuple<int32_t, int32_t, int32_t>>(std::make_tuple(0,0,0))),
-                                                                                                          removed_doa_unstales(make_variable<int32_t>(0)),
-                                                                                                          _pool_node(pool_node),
-                                                                                                          _coind_node(coind_node),
-                                                                                                          _tracker(tracker),
-                                                                                                          local_rate_monitor(10 * 60),
-                                                                                                          local_addr_rate_monitor(10 * 60)
+Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node, CoindNodeData* coind_node, ShareTracker* tracker) 
+    : _net(net),
+        current_work(make_variable<Work>(Work{})),
+        new_work(make_event()),
+        share_received(make_event()),
+        pseudoshare_received(make_event()),
+        removed_unstales(make_variable<std::tuple<int32_t, int32_t, int32_t>>(std::make_tuple(0,0,0))),
+        removed_doa_unstales(make_variable<int32_t>(0)),
+        _pool_node(pool_node),
+        _coind_node(coind_node),
+        _tracker(tracker),
+        local_rate_monitor(10 * 60),
+        local_addr_rate_monitor(10 * 60)
 
 {
     // DOA Rule for PrefsumShare
@@ -203,16 +203,10 @@ Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node,
      */
 
     // COMBINE WORK
-
     _coind_node->coind_work->changed->subscribe([&](const auto &work){ compute_work(); });
     _coind_node->best_block_header->changed->subscribe([&](const auto &block_header){ compute_work(); });
-    compute_work();
-
 
     current_work->transitioned->subscribe([&](const auto& before, const auto& after){
-//        LOG_TRACE << "CURRENT WORK.TRANSITIONED:";
-//        LOG_TRACE << "\tBefore: " << before;
-//        LOG_TRACE << "\tafter: " << after;
         //  # trigger LP if version/previous_block/bits changed or transactions changed from nothing
         if ((std::tie(before.version, before.previous_block, before.bits) != std::tie(after.version, after.previous_block, after.bits)) || (before.transactions.empty() && !after.transactions.empty()))
         {
@@ -226,6 +220,20 @@ Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node,
     });
 
     init_web_metrics();
+}
+
+void Worker::run()
+{
+    LOG_INFO << "Worker running...";
+    
+    compute_work();
+    //TODO:
+    connected();
+}
+
+void Worker::stop()
+{
+    //TODO:
 }
 
 worker_get_work_result
