@@ -232,6 +232,8 @@ public:
 
         PoolNodeServer::stop();
         PoolNodeClient::stop();
+
+        peers.clear();
     }
 };
 #undef SET_POOL_DEFAULT_HANDLER
