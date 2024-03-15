@@ -45,6 +45,7 @@ public:
         LOG_INFO << "StratumNode stop";
         // stop boost::asio::acceptor
         acceptor.cancel();
+        acceptor.close();
 
         // disconnect all miners
         for (const auto& [addr_, stratum_] : miners)
