@@ -81,14 +81,14 @@ private:
         auto socket = new PoolSocket(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
 
         boost::asio::async_connect(*tcp_socket, endpoints,
-            [&, socket = std::move(socket)]
+            [&, socket = std::move(socket), copy_endpoints = endpoints]
 			(const boost::system::error_code &ec, const boost::asio::ip::tcp::endpoint &ep)
             {
 				if (ec)
 				{
 					delete socket;
 					if (ec != boost::system::errc::operation_canceled)
-						error(libp2p::ASIO_ERROR, "PoolConnector::connect_socket: " + ec.message(), ep);
+						error(libp2p::ASIO_ERROR, "PoolConnector::connect_socket: " + ec.message(), NetAddress(*copy_endpoints));
 					else
 						LOG_DEBUG_POOL << "PoolConnector::connect_socket canceled";
 					return;

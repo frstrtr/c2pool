@@ -203,6 +203,7 @@ private:
 public:
     void run() override
     {
+        LOG_INFO << "PoolNode running...";
         if (mode & disable)
         {
             LOG_WARNING << "PoolNode mode = disable!";
@@ -221,7 +222,8 @@ public:
             PoolNodeClient::start();
 		}
 
-        connected(); //TODO: only after first connect?
+        if (!net->PERSIST)
+            connected();
     }
 
     void stop() override
