@@ -16,7 +16,6 @@ inline void base_pool_error(const libp2p::error& err, NetworkTreeNode* node, Com
         // ???
     default:
         communicator->disconnect(err.addr);
-        break;
     }
 }
 
@@ -36,25 +35,19 @@ class PoolNodeServer : public Server<BasePoolSocket>
             = new PoolProtocol
                 (
                     data->context, sock, data->handler_manager, handshake,
-                    [](libp2p::error err)
+                    [&](libp2p::error err)
                     {
-                        
+                        error(err);
                     }
                 );
         
         data->peers[protocol->nonce] = protocol;
-        sock->event_disconnect->subscribe(
-                [&, addr = addr]()
-                {
-                    auto proto = server_connections[addr];
-
-                    proto->close();
-                    data->peers.erase(proto->nonce);
-                    server_connections.erase(addr);
-                });
-        
         server_connections[addr] = protocol;
         server_attempts.erase(addr);
+
+        // Set PoolNode::NetworkTreeNode connected
+        if ((data->peers.size() == 1) && data->net->PERSIST)
+            data->connected();
     }
 
 protected:
@@ -102,8 +95,11 @@ public:
         if (server_attempts.count(addr))
         {
             auto handshake = server_attempts[addr];
-            handshake->close();
-            delete handshake;
+            if (handshake)
+            {
+                handshake->close();
+                delete handshake;
+            }
             server_attempts.erase(addr);
         }
 
@@ -165,15 +161,19 @@ class PoolNodeClient : public Client<BasePoolSocket>
             = new PoolProtocol
                 (
                     data->context, sock, data->handler_manager, handshake,
-                    [](libp2p::error err)
+                    [&](libp2p::error err)
                     {
-                        
+                        error(err);
                     }
                 );
 
         data->peers[protocol->nonce] = protocol;
         client_connections[addr] = protocol;
 	    client_attempts.erase(addr);
+
+        // Set PoolNode::NetworkTreeNode connected
+        if ((data->peers.size() == 1) && data->net->PERSIST)
+            data->connected();
     }
 
     void resolve_connection()
@@ -253,8 +253,11 @@ public:
         if (client_attempts.count(addr))
         {
             auto handshake = client_attempts[addr];
-            handshake->close();
-            delete handshake;
+            if (handshake)
+            {
+                handshake->close();
+                delete handshake;
+            }
             client_attempts.erase(addr);
         }
 
