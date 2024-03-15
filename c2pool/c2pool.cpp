@@ -141,21 +141,27 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    std::thread web_server_thread([&web_server, &web_endpoint](){
-        auto ioc = new boost::asio::io_context();
+    std::promise<bool> web_server_status;
+    auto web_server_status_future = web_server_status.get_future();
+    std::thread web_server_thread(
+        [&web_server, &web_endpoint, &web_server_status]()
+        {
+            auto ioc = new boost::asio::io_context();
 
-        web_server = new WebServer(ioc, web_endpoint);
-        c2pool::master::init_web(web_server);
-        web_server->run();
+            web_server = new WebServer(ioc, web_endpoint);
+            c2pool::master::init_web(web_server);
+            web_server->run();
 
-        ioc->run();
-    });
+            web_server_status.set_value(true);
+
+            ioc->run();
+        }
+    );
     web_server_thread.detach();
 
-    while (!web_server || (web_server && !web_server->is_running()))
+    if (web_server_status_future.get())
     {
-        LOG_INFO << "\t\t...wait for web server initialization";
-        this_thread::sleep_for(std::chrono::seconds(1));
+        LOG_INFO << "\t\tweb server initialized!";
     }
 
     //Creating and initialization coinds network, config and NodeManager
