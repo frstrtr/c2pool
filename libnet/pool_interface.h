@@ -36,7 +36,9 @@ public:
 
 	void stop() override
 	{
+		// stop boost::asio::acceptor
 		acceptor.cancel();
+		acceptor.close();
 	}
 
 protected:

@@ -37,6 +37,7 @@ public:
         {
             protocol->close();
             delete protocol;
+            protocol = nullptr;
         }
     }
 
@@ -46,6 +47,7 @@ public:
         {
             protocol->close();
             delete protocol;
+            protocol = nullptr;
         }
     }
 
