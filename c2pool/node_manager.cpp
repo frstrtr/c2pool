@@ -20,8 +20,9 @@ void NodeManager::network_cycle()
     {
         try 
         {
+            LOG_TRACE << "CONTEXT STARTED";
             context->run();
-            break;
+            // break;
         }
         catch (const libp2p::node_exception& ex)
         {
@@ -29,8 +30,10 @@ void NodeManager::network_cycle()
             restart(ex.get_node());
         }
 
+        std::this_thread::sleep_for(std::chrono::seconds(5));
         context->restart();
     }
+    LOG_TRACE << "Context finished";
 }
 
 void NodeManager::run()
@@ -92,11 +95,12 @@ void NodeManager::run()
     // Worker
     LOG_INFO << "\t\t" << " Worker initialization...";
     worker = new Worker(net, pool_node, coind_node, tracker);
+    pool_node->add_next_network_layer(worker);
 
     // Stratum
     LOG_INFO << "\t\t" << " StratumNode initialization...";
     stratum = new StratumNode(context, worker);
-    pool_node->add_next_network_layer(stratum);
+    worker->add_next_network_layer(stratum);
     // stratum->listen();
 
     //...success!
