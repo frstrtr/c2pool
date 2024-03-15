@@ -4,10 +4,10 @@
 #include <string>
 #include <libdevcore/logger.h>
 
-StratumProtocol::StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(NetAddress)> _disconnect_in_node_f) 
-    : _context(context), _socket(std::move(socket)), 
-        client(*this, version::v2), disconnect_in_node_f(std::move(_disconnect_in_node_f)), 
-        addr(_socket->remote_endpoint())
+StratumProtocol::StratumProtocol(boost::asio::io_context* context_, std::unique_ptr<ip::tcp::socket> socket_, disconnect_func_type disconnect_func_) 
+    : context(context_), socket(std::move(socket_)), 
+        client(*this, version::v2), disconnect_func(std::move(disconnect_func_)), 
+        addr(socket->remote_endpoint())
 {
     event_disconnect = make_event();
     Read();
@@ -15,7 +15,7 @@ StratumProtocol::StratumProtocol(boost::asio::io_context* context, std::shared_p
 
 void StratumProtocol::Read()
 {
-    boost::asio::async_read_until(*_socket, buffer, "\n", [&](const boost::system::error_code& ec, std::size_t len)
+    boost::asio::async_read_until(*socket, buffer, "\n", [&](const boost::system::error_code& ec, std::size_t len)
     {
         if (!ec)
         {
@@ -53,7 +53,7 @@ std::string StratumProtocol::Send(const std::string &request)
 {
     auto _req = request + "\n";
     LOG_DEBUG_STRATUM << "StratumProtocol send message: " << request;
-    boost::asio::async_write(*_socket, io::buffer(_req.data(),_req.size()), 
+    boost::asio::async_write(*socket, io::buffer(_req.data(),_req.size()), 
         [&](const boost::system::error_code& ec, std::size_t bytes_transferred)
         {
             if (ec)
@@ -65,10 +65,8 @@ std::string StratumProtocol::Send(const std::string &request)
     return {};
 }
 
-void StratumProtocol::disconnect(std::string reason)
+void StratumProtocol::close()
 {
-    LOG_WARNING << "StratumProtocol(" << get_addr().to_string() << ") has been disconnected for a reason: " << reason;
+    socket->close();
     event_disconnect->happened();
-    _socket->close();
-    disconnect_in_node_f(get_addr());
 }

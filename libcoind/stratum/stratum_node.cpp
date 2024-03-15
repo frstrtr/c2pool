@@ -20,16 +20,21 @@ void StratumNode::miner_processing(ip::tcp::socket& _socket)
     {
         LOG_WARNING << addr.to_string() << " already connected!";
         _socket.close();
-        ban(addr);
+        ban(addr, 10);
         return;
     }
 
-    auto socket = std::make_shared<ip::tcp::socket>(std::move(_socket));
-    auto stratum = new Stratum(_context, std::move(socket), _worker,
-                                             [&](const addr_t &addr_)
-                                             {
-                                                 disconnect(addr_);
-                                             });
+    auto socket = std::make_unique<ip::tcp::socket>(std::move(_socket));
+    auto stratum = 
+        new Stratum(
+            _context,
+            std::move(socket), 
+            _worker,
+            [&](const addr_t &addr_, std::string reason, int ban_time)
+            {
+                disconnect(addr_, reason, ban_time);
+            }
+        );
     miners[addr] = stratum;
 }
 
@@ -51,11 +56,11 @@ void StratumNode::listen()
     );
 }
 
-void StratumNode::ban(const StratumNode::addr_t& addr)
+void StratumNode::ban(const StratumNode::addr_t& addr, int sec)
 {
     auto ban_timer = std::make_unique<c2pool::Timer>(_context);
     ban_timer->start(
-        10, // 10 second ban
+        sec, // default = 10 second ban
         [&, addr = addr]()
         {
             bans.erase(addr.ip);
@@ -66,14 +71,16 @@ void StratumNode::ban(const StratumNode::addr_t& addr)
     LOG_INFO << addr.ip << " banned in StratumNode!";
 }
 
-void StratumNode::disconnect(const addr_t& addr, bool is_ban)
+void StratumNode::disconnect(const addr_t& addr, std::string reason, int ban_time)
 {
-    if (miners.find(addr) != miners.end())
+    LOG_WARNING << "StratumProtocol(" << addr.to_string() << ") has been disconnected for a reason: " << reason;
+    if (miners.count(addr))
     {
         auto stratum = miners[addr];
+        stratum->close();
         miners.erase(addr);
-        if (is_ban)
-            ban(addr);
+        if (ban_time)
+            ban(addr, ban_time);
         delete stratum;
     } else
     {

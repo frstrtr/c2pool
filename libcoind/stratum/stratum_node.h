@@ -49,18 +49,19 @@ public:
         // disconnect all miners
         for (const auto& [addr_, stratum_] : miners)
         {
-            disconnect(addr_, false);
+            disconnect(addr_, "stop node");
         }
 
         // discard all bans
         for (auto& [addr_, timer_] : bans)
         {
-            timer_->happened();
+            timer_->stop();
         }
+        bans.clear();
     }
 private:
     void listen();
-    void ban(const addr_t& _addr);
-    void disconnect(const addr_t& addr, bool is_ban = true);
+    void ban(const addr_t& _addr, int sec);
+    void disconnect(const addr_t& addr, std::string reason, int ban_time = 10);
     void miner_processing(ip::tcp::socket& _socket);
 };
