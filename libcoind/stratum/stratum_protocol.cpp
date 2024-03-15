@@ -58,6 +58,9 @@ std::string StratumProtocol::Send(const std::string &request)
         {
             if (ec)
             {
+                if (ec == boost::system::errc::operation_canceled /*|| ec == boost::asio::error::eof*/)
+                    return;
+                    
                 disconnect("Response error = " + ec.message());
             }
         }
@@ -67,6 +70,7 @@ std::string StratumProtocol::Send(const std::string &request)
 
 void StratumProtocol::close()
 {
+    socket->cancel();
     socket->close();
     event_disconnect->happened();
 }
