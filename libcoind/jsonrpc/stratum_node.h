@@ -27,6 +27,7 @@ public:
 
     void run() override
     {
+        LOG_INFO << "StratumNode running...";
         // init + listen boost::asio::acceptor
         ip::tcp::endpoint listen_ep(ip::tcp::v4(), 1131);
 
@@ -41,6 +42,7 @@ public:
 
     void stop() override
     {
+        LOG_INFO << "StratumNode stop";
         // stop boost::asio::acceptor
         acceptor.cancel();
 

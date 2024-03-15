@@ -7,15 +7,15 @@ StratumNode::StratumNode(boost::asio::io_context* context, Worker* worker) : _co
 void StratumNode::miner_processing(ip::tcp::socket& _socket)
 {
     auto addr = NetAddress(_socket.remote_endpoint());
-    LOG_INFO << "Stratum connected from: " << addr.to_string();
 
     if (bans.find(addr.ip) != bans.end())
     {
-        LOG_TRACE << "Miner banned!";
+        LOG_DEBUG_STRATUM << "Miner " << addr.to_string() << " banned!";
         _socket.close();
         return;
     }
 
+    LOG_INFO << "Stratum connected from: " << addr.to_string();
     if (miners.find(addr) != miners.end())
     {
         LOG_WARNING << addr.to_string() << " already connected!";

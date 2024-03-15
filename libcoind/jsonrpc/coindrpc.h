@@ -51,39 +51,69 @@ protected:
     http::request<http::string_body> http_request;
 
 public:
+	void try_connect()
+	{
+		auto const results = resolver.resolve(auth.ip, auth.port);
+		boost::asio::ip::tcp::endpoint endpoint = *results; //(boost::asio::ip::make_address(auth.ip), auth.port);
+
+        stream.async_connect(endpoint, 
+			[&](boost::system::error_code ec)
+			{
+				if (ec)
+				{
+					if (ec == boost::system::errc::operation_canceled)
+						return;
+					
+					LOG_ERROR << "CoindRPC error when try connect: [" << ec.message() << "].";
+				} else 
+				{
+					try
+					{
+						if (check())
+						{
+							connected();
+							return;
+						}
+					}
+					catch(const jsonrpccxx::JsonRpcException& e)
+					{
+						LOG_ERROR << e.what();
+					}
+				}
+				
+				LOG_INFO << "Retry after 15 seconds...";
+				stream.close();
+				reconnect_timer.expires_from_now(std::chrono::seconds(15));
+				reconnect_timer.async_wait(
+					[this](const auto& ec)
+					{
+						try_connect();
+					}
+				);
+			}
+		);
+	}
+
     void run() override
     {
-        auto const results = resolver.resolve(auth.ip, auth.port);
-
-        boost::system::error_code ec;
-        stream.connect(results, ec);
-
-        if (ec)
-        {
-            LOG_INFO << "JSONRPC_Coind error when try connect: [" << ec.message()
-                     << "]. Retry after 15 seconds...";
-            reconnect_timer.expires_from_now(std::chrono::seconds(15));
-			reconnect_timer.async_wait(
-				[this](const auto& ec)
-				{
-					run();
-				}
-			);
-        } else 
-		{
-			connected();
-		}
+		LOG_INFO << "CoindRPC running...";
+		try_connect();
     }
 
 	void stop() override
 	{
 		beast::error_code ec;
 		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+		stream.close();
 	}
 
 public:
 	// login = "login:password"
-    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) : context(ctx), reconnect_timer(*context), resolver(*context), stream(*context), client(*this, jsonrpccxx::version::v2), parent_net(_parent_net), auth(_auth)
+    CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) 
+		: context(ctx), reconnect_timer(*context), 
+			resolver(*context), stream(*context), 
+			client(*this, jsonrpccxx::version::v2), 
+			parent_net(_parent_net), auth(_auth)
     {
 		http_request = {http::verb::post, "/", 11};
 
@@ -119,7 +149,14 @@ public:
 	{
 		http_request.body() = request;
 		http_request.prepare_payload();
-		http::write(stream, http_request);
+		try
+		{
+			http::write(stream, http_request);	
+		}
+		catch(const std::exception& e)
+		{
+			throw libp2p::node_exception("error when try to send message in CoindRPC -> " + std::string(e.what()), this);
+		}
 
 		beast::flat_buffer buffer;
 		boost::beast::http::response<boost::beast::http::dynamic_body> response;
