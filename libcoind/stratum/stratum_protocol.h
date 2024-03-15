@@ -11,6 +11,7 @@
 #include <libdevcore/types.h>
 #include <libp2p/protocol_components.h>
 
+#include <string>
 #include <memory>
 using namespace jsonrpccxx;
 
@@ -19,9 +20,11 @@ namespace ip = io::ip;
 
 class StratumProtocol : public jsonrpccxx::IClientConnector
 {
+protected:
+    using disconnect_func_type = std::function<void(const NetAddress&, std::string, int)>;
 public:
 //    StratumProtocol();
-    StratumProtocol(boost::asio::io_context* context, std::shared_ptr<ip::tcp::socket> socket, std::function<void(NetAddress)> _disconnect_in_node_f);
+    StratumProtocol(boost::asio::io_context* context_, std::unique_ptr<ip::tcp::socket> socket_, disconnect_func_type disconnect_func_);
     ~StratumProtocol()
     {
         delete event_disconnect;
@@ -35,18 +38,23 @@ public:
         return addr;
     }
 
-    void disconnect(std::string reason);
+    void close();
 
 protected:
-    boost::asio::io_context* _context;
+    boost::asio::io_context* context;
 
     JsonRpc2Server server;
     JsonRpcClient client;
 
-    std::shared_ptr<ip::tcp::socket> _socket;
+    std::shared_ptr<ip::tcp::socket> socket;
     const NetAddress addr;
-    std::function<void(NetAddress)> disconnect_in_node_f;
+    disconnect_func_type disconnect_func; // StratumNode::disconnect
     Event<> event_disconnect;
+
+    void disconnect(std::string reason, int ban_time = 10)
+    {
+        disconnect_func(get_addr(), reason, ban_time);
+    }
 private:
     io::streambuf buffer;
 };
