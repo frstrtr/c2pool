@@ -6,6 +6,7 @@
 #include <sharechains/share_tracker.h>
 #include <sharechains/share_types.h>
 #include <networks/network.h>
+#include <libp2p/network_tree_node.h>
 #include <libdevcore/events.h>
 #include <btclibs/uint256.h>
 #include <web_interface/metrics.hpp>
@@ -211,13 +212,16 @@ protected:
     virtual void init_web_metrics() = 0;
 };
 
-class Worker : WebWorker
+class Worker : WebWorker, public NetworkTreeNode
 {
 public:
 	const int32_t COINBASE_NONCE_LENGTH = 8;
 public:
     Worker(c2pool::Network* net, PoolNodeData* pool_node,
            CoindNodeData* coind_node, ShareTracker* tracker);
+
+    void run() override;
+    void stop() override;
 
     worker_get_work_result
     get_work(std::string pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
