@@ -104,6 +104,7 @@ public:
 	{
 		beast::error_code ec;
 		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+		stream.cancel();
 		stream.close();
 	}
 
