@@ -1,7 +1,7 @@
 #include <iostream>
 #include <memory>
 
-#include <libcoind/jsonrpc/stratum.h>
+#include <libcoind/stratum/stratum.h>
 
 int main(int ac, char *av[])
 {

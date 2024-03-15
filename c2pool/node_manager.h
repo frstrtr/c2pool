@@ -9,7 +9,7 @@
 #include <libdevcore/addr_store.h>
 #include <libp2p/node.h>
 #include <libcoind/jsonrpc/coindrpc.h>
-#include <libcoind/jsonrpc/stratum_node.h>
+#include <libcoind/stratum/stratum_node.h>
 #include <web_interface/webserver.h>
 #include <libp2p/network_tree.h>
 

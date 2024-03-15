@@ -12,7 +12,7 @@
 #include <libp2p/preset/p2p_node_interface.h>
 #include <libp2p/node.h>
 #include <libcoind/jsonrpc/jsonrpc_coind.h>
-#include <libcoind/jsonrpc/stratum.h>
+#include <libcoind/stratum/stratum.h>
 
 #include <boost/asio.hpp>
 
