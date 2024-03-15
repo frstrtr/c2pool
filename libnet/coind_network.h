@@ -34,12 +34,19 @@ public:
         interface->stop();
 
         if (protocol)
+        {
             protocol->close();
+            delete protocol;
+        }
     }
 
     void disconnect(const NetAddress& addr)
     {
-        protocol->close();
+        if (protocol)
+        {
+            protocol->close();
+            delete protocol;
+        }
     }
 
 protected:
