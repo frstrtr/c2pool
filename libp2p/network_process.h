@@ -53,6 +53,11 @@ public:
     {
         return state.get_future();
     }
+
+    bool is_alive() const
+    {
+        return alive.load();
+    }
 };
 
 class ReconnectProcess

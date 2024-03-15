@@ -14,6 +14,8 @@ class NetworkTreeNode
     
     void run_node(std::shared_ptr<ReconnectTask> task_)
     {
+        if (!task_->is_alive())
+            return;
         state = NetworkState::processing;
         task = std::move(task_);
         
