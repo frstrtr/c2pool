@@ -200,8 +200,6 @@ void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_v
     });
 
     connected();
-
-//    pinger(30); //TODO: wanna for this?
 }
 
 void CoindNode::handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol)

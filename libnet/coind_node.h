@@ -59,6 +59,8 @@ public:
 
     void run() override
     {
+        LOG_INFO << "CoindNode running...";
+
         CoindNodeClient::start();
         CoindNode::start();
         connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));

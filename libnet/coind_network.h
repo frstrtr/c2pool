@@ -31,7 +31,10 @@ public:
 
     void stop() override
     {
-        protocol->close();
+        interface->stop();
+
+        if (protocol)
+            protocol->close();
     }
 
     void disconnect(const NetAddress& addr)
