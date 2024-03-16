@@ -13,7 +13,7 @@
 
 typedef BaseSocket<DebugMessages> BasePoolSocket;
 
-class PoolSocket : public BasePoolSocket, std::enable_shared_from_this<PoolSocket>
+class PoolSocket : public BasePoolSocket, public std::enable_shared_from_this<PoolSocket>
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
@@ -49,20 +49,22 @@ public:
         }
 
 		event_send_message->happened(msg->command);
+
+		auto socket_ = shared_from_this();
         boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-            [&, cmd = msg->command](boost::system::error_code ec, std::size_t length)
+            [socket_, cmd = msg->command](boost::system::error_code ec, std::size_t length)
             {
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
-						error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % ec % ec.message()).str());
+						socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % ec % ec.message()).str());
 					else
 						LOG_DEBUG_POOL << "PoolSocket::write canceled";
 					return;
 				}
                 
 				LOG_DEBUG_POOL << "[PoolSocket] peer receive message_" << cmd;
-                event_peer_receive->happened(cmd);
+                socket_->event_peer_receive->happened(cmd);
             }
 		);
 	}
