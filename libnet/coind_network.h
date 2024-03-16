@@ -58,7 +58,7 @@ protected:
         throw libp2p::node_exception(err.reason, node_data);
     }
 
-    void socket_handle(BaseCoindSocket* socket) override
+    void socket_handle(std::shared_ptr<BaseCoindSocket> socket) override
     {
         LOG_DEBUG_COIND << "CoindNode has been connected to: " << socket;
 

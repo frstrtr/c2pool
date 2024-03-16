@@ -13,7 +13,7 @@
 
 typedef BaseSocket<DebugMessages> BasePoolSocket;
 
-class PoolSocket : public BasePoolSocket
+class PoolSocket : public BasePoolSocket, std::enable_shared_from_this<PoolSocket>
 {
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;

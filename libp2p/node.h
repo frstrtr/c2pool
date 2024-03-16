@@ -26,7 +26,7 @@ public:
 
 protected:
     // type for function socket_handle();
-    using socket_handler_type = std::function<void(socket_type*)>;
+    using socket_handler_type = std::function<void(std::shared_ptr<socket_type>)>;
     // type for Server::error(...)
     using error_handler_type = std::function<void(const libp2p::error&)>;
 
@@ -86,7 +86,7 @@ public:
         interface = std::make_unique<ConnectorType>(args...);//(context, net);
         interface->init(
                 // socket_handler
-                [&](BasePoolSocket* socket)
+                [&](std::shared_ptr<BasePoolSocket> socket)
                 {
                     socket_handle(socket);
                 },
@@ -103,7 +103,7 @@ public:
     virtual void disconnect(const NetAddress& addr) = 0;
 protected:
     virtual void error(const libp2p::error&) = 0;
-    virtual void socket_handle(socket_type* socket) = 0;
+    virtual void socket_handle(std::shared_ptr<socket_type> socket) = 0;
 };
 
 template <typename BaseSocketType>

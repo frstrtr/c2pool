@@ -83,7 +83,7 @@ public:
         return addr_local;
     }
 
-    friend std::ostream& operator<<(std::ostream& stream, const socket_type* value)
+    friend std::ostream& operator<<(std::ostream& stream, const std::shared_ptr<socket_type> value)
     {
         stream << "(local addr = " << value->addr_local.to_string()
                 << ", global addr = " << value->addr.to_string() << ")";

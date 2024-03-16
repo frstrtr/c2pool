@@ -123,7 +123,7 @@ protected:
         base_pool_error(err, data, this);
     }
 
-    void socket_handle(socket_type* socket) override
+    void socket_handle(std::shared_ptr<socket_type> socket) override
     {
         server_attempts[socket->get_addr()] = 
             new PoolHandshakeServer
@@ -284,7 +284,7 @@ protected:
         base_pool_error(err, data, this);
     }
 
-    void socket_handle(socket_type* socket) override
+    void socket_handle(std::shared_ptr<socket_type> socket) override
     {
         client_attempts[socket->get_addr()] =
             new PoolHandshakeClient

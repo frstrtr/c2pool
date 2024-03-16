@@ -58,7 +58,7 @@ protected:
 				}
 
 				auto tcp_socket = std::make_shared<ip::tcp::socket>(std::move(socket_));
-				auto socket = new PoolSocket(tcp_socket, net, connection_type::incoming, [&](const libp2p::error& err){ error_handler(err); });
+				auto socket = std::make_shared<PoolSocket>(tcp_socket, net, connection_type::incoming, [&](const libp2p::error& err){ error_handler(err); });
 				socket->init_addr();
 				socket_handler(socket);
 				
@@ -80,7 +80,7 @@ private:
 	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
 		auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
-        auto socket = new PoolSocket(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
+        auto socket = std::make_shared<PoolSocket>(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
 
         boost::asio::async_connect(*tcp_socket, endpoints,
             [&, socket = std::move(socket), copy_endpoints = endpoints]
@@ -88,7 +88,6 @@ private:
             {
 				if (ec)
 				{
-					delete socket;
 					if (ec != boost::system::errc::operation_canceled)
 						error(libp2p::ASIO_ERROR, "PoolConnector::connect_socket: " + ec.message(), NetAddress(*copy_endpoints));
 					else

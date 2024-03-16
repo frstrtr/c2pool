@@ -17,7 +17,7 @@ class BaseProtocol : public NetworkHandler, public ProtocolEvents, public COMPON
 {
 protected:
 	typedef SocketType socket_type;
-    socket_type* socket;
+    std::shared_ptr<socket_type> socket;
 
     typedef std::function<void(const libp2p::error&)> error_handler_type;
     error_handler_type error_handler;
@@ -29,8 +29,8 @@ public:
 
 public:
     template <typename... Args>
-    explicit BaseProtocol (socket_type* socket_, HandlerManagerPtr handler_manager_, error_handler_type error_handler_, Args&&...args)
-        : socket(socket_), handler_manager(handler_manager_), error_handler(error_handler_),
+    explicit BaseProtocol (std::shared_ptr<socket_type> socket_, HandlerManagerPtr handler_manager_, error_handler_type error_handler_, Args&&...args)
+        : socket(std::move(socket_)), handler_manager(handler_manager_), error_handler(error_handler_),
             COMPONENTS(this, std::forward<Args>(args))...
     {
         socket->set_handler
@@ -71,7 +71,7 @@ public:
     void close()
     {
         socket->close();
-		delete socket;
+        socket.reset();
     }
 
     bool operator<(BaseProtocol* rhs)
