@@ -15,11 +15,10 @@ StratumProtocol::StratumProtocol(boost::asio::io_context* context_, std::unique_
 
 void StratumProtocol::Read()
 {
+    if (is_closed())
+        return; 
     boost::asio::async_read_until(*socket, buffer, "\n", [&](const boost::system::error_code& ec, std::size_t len)
     {
-        if (is_closed())
-            return; 
-
         if (!ec && buffer.size())
         {
             std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), len);
@@ -32,16 +31,22 @@ void StratumProtocol::Read()
                 LOG_WARNING << "StratumProtocol::read error while parsing data :" << data;
             }
             request["jsonrpc"] = "2.0";
-            LOG_DEBUG_STRATUM << "StratumProtocol get request = " << request.dump();
-            auto response = server.HandleRequest(request.dump()); //TODO: boost::asio::post for async handling?
+            auto request_data = request.dump();
+            LOG_DEBUG_STRATUM << "StratumProtocol get request = " << request_data;
             
-            // Check, if StratumProtocol disconnected in server.HandleRequest
-            if (is_closed())
-                return; 
+            boost::asio::post(*context, 
+                [this, req = request_data]
+                {
+                    auto response = server.HandleRequest(req);
+                    
+                    // Check, if StratumProtocol disconnected in server.HandleRequest
+                    if (!is_closed())
+                        Send(response);
+                }
+            );
 
             buffer.consume(len);
             Read();
-            Send(response);
         } else
         {
             if (ec == boost::system::errc::operation_canceled /*|| ec == boost::asio::error::eof*/)
