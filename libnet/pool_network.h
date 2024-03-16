@@ -110,6 +110,9 @@ public:
             protocol->close();
             delete protocol;
             server_connections.erase(addr);
+
+            if (data->peers.empty())
+                throw libp2p::node_exception("All PoolNode peers are disconnected.", data);
         }
     }
 
@@ -268,6 +271,9 @@ public:
             protocol->close();
             delete protocol;
             client_connections.erase(addr);
+
+            if (data->peers.empty())
+                throw libp2p::node_exception("All PoolNode peers are disconnected.", data);
         }
     }
 
