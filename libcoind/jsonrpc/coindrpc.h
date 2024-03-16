@@ -75,14 +75,13 @@ public:
 							return;
 						}
 					}
-					catch(const jsonrpccxx::JsonRpcException& e)
+					catch(const libp2p::node_exception& e)
 					{
-						LOG_ERROR << e.what();
+						LOG_ERROR << "Error when try check CoindRPC: " << e.what();
 					}
 				}
 				
 				LOG_INFO << "Retry after 15 seconds...";
-				stream.close();
 				reconnect_timer.expires_from_now(std::chrono::seconds(15));
 				reconnect_timer.async_wait(
 					[this](const auto& ec)
@@ -90,6 +89,7 @@ public:
 						try_connect();
 					}
 				);
+				stream.close();
 			}
 		);
 	}
@@ -102,9 +102,9 @@ public:
 
 	void stop() override
 	{
+		LOG_INFO << "CoindRPC stop";
 		beast::error_code ec;
 		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-		stream.cancel();
 		stream.close();
 	}
 
@@ -185,36 +185,49 @@ public:
 	void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
 	// Methods
+
+	nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {})
+	{
+		try
+		{
+			return client.CallMethod<nlohmann::json>(id, method, params);
+		}
+		catch (const jsonrpccxx::JsonRpcException& ex)
+		{
+			throw libp2p::node_exception("CallAPIMethod error: " + std::string(ex.what()), this);
+		}
+	}
+
 	nlohmann::json getnetworkinfo()
 	{
-		return client.CallMethod<nlohmann::json>(id, "getnetworkinfo");
+		return CallAPIMethod("getnetworkinfo");
 	}
 
 	nlohmann::json getblockchaininfo()
 	{
-		return client.CallMethod<nlohmann::json>(id, "getblockchaininfo");
+		return CallAPIMethod("getblockchaininfo");
 	}
 
 	nlohmann::json getmininginfo()
 	{
-		return client.CallMethod<nlohmann::json>(id, "getmininginfo");
+		return CallAPIMethod("getmininginfo");
 	}
 
 	// verbose: true -- json result, false -- hex-encode result;
 	nlohmann::json getblockheader(uint256 header, bool verbose = true)
 	{
-		return client.CallMethod<nlohmann::json>(id, "getblockheader", {header, verbose});
+		return CallAPIMethod("getblockheader", {header, verbose});
 	}
 
 	// verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
 	nlohmann::json getblock(uint256 blockhash, int verbosity = 1)
 	{
-		return client.CallMethod<nlohmann::json>(id, "getblock", {blockhash, verbosity});
+		return CallAPIMethod("getblock", {blockhash, verbosity});
 	}
 
 	nlohmann::json getblocktemplate(std::vector<string> rules)
 	{
 		nlohmann::json j = nlohmann::json::object({{"rules", rules}});
-		return client.CallMethod<nlohmann::json>(id, "getblocktemplate", {j});
+		return CallAPIMethod("getblocktemplate", {j});
 	}
 };
