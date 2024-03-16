@@ -10,53 +10,40 @@ StratumProtocol::StratumProtocol(boost::asio::io_context* context_, std::unique_
         addr(socket->remote_endpoint())
 {
     event_disconnect = make_event();
-    Read(0);
+    Read();
 }
 
-void StratumProtocol::Read(int i)
+void StratumProtocol::Read()
 {
-    if (!socket || !socket->is_open())
+    boost::asio::async_read_until(*socket, buffer, "\n", [&](const boost::system::error_code& ec, std::size_t len)
     {
-        return; // exit
-    }
-
-    boost::asio::async_read_until(*socket, buffer, "\n", [&, i = i](const boost::system::error_code& ec, std::size_t len)
-    {
-        LOG_INFO << i << ":"  << "TEST SOCKET " << (bool)socket;
-        if (!socket || !socket->is_open())
-        {
-            return; // exit
-        }
-        LOG_INFO << i << ":" << 1;
+        if (is_closed())
+            return; 
 
         if (!ec && buffer.size())
         {
-            LOG_INFO << i << ":"  << 2;
             std::string data(boost::asio::buffer_cast<const char *>(buffer.data()), len);
-            LOG_INFO << i << ":"  << 3;
             json request;
             try
             {
                 request = json::parse(data);
-                LOG_INFO << i << ":"  << 4;
             } catch (...)
             {
                 LOG_WARNING << "StratumProtocol::read error while parsing data :" << data;
             }
             request["jsonrpc"] = "2.0";
             LOG_DEBUG_STRATUM << "StratumProtocol get request = " << request.dump();
-            LOG_INFO << i << ":"  << 5;
-            auto response = server.HandleRequest(request.dump());
-            LOG_INFO << i << ":"  << 6;
+            auto response = server.HandleRequest(request.dump()); //TODO: boost::asio::post for async handling?
+            
+            // Check, if StratumProtocol disconnected in server.HandleRequest
+            if (is_closed())
+                return; 
+
             buffer.consume(len);
-            LOG_INFO << i << ":"  << 7;
-            Read(i+1);
-            LOG_INFO << i << ":"  << 8;
+            Read();
             Send(response);
-            LOG_INFO << i << ":"  << 9;
         } else
         {
-            LOG_INFO << i << ":"  << 10;
             if (ec == boost::system::errc::operation_canceled /*|| ec == boost::asio::error::eof*/)
                 return;
 
@@ -65,9 +52,7 @@ void StratumProtocol::Read(int i)
 
             disconnect("StratumProtocol::read() error = " + ec.message());
         }
-        LOG_INFO << i << ":"  << 11;
     });
-    LOG_INFO << i << ":"  << 12;
 }
 
 std::string StratumProtocol::Send(const std::string &request)
@@ -91,9 +76,11 @@ std::string StratumProtocol::Send(const std::string &request)
 
 void StratumProtocol::close()
 {
+    closed = true;
+
     socket->cancel();
     socket->close();
     socket.reset();
     event_disconnect->happened();
-    LOG_INFO << addr.to_string() << " closed! " << (bool)socket;
+    LOG_INFO << addr.to_string() << " closed!";
 }

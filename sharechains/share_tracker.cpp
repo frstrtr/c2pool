@@ -152,7 +152,7 @@ void ShareTracker::add(ShareType share)
 void ShareTracker::remove(uint256 hash)
 {
     auto res = get(hash);
-    //TODO:
+    LOG_WARNING << "TRY TO REMOVE SHARE";
     removed->happened(res);
 }
 
