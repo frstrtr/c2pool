@@ -49,12 +49,12 @@ jobs:
       id: cache-boost
       with:
         path: "~/boost"
-        key: libboost1.71-all-dev
+        key: libboost1.78-all-dev
     - name: Install boost
       run: |
-          sudo apt-get update && sudo apt-get install -yq libboost-filesystem1.71-dev && sudo apt-get install -yq libboost1.71-all-dev
+          sudo apt-get update && sudo apt-get install -yq libboost-filesystem1.78-dev && sudo apt-get install -yq libboost1.78-all-dev
           mkdir -p ~/boost
-          for dep in libboost1.71-all-dev; do
+          for dep in libboost1.78-all-dev; do
             dpkg -L $dep | while IFS= read -r f; do if test -f $f; then echo $f; fi; done | xargs cp --parents --target-directory ~/boost/
           done
       
