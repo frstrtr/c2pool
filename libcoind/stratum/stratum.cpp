@@ -36,7 +36,7 @@ void Stratum::_send_work()
     }
     catch (const std::runtime_error &ec) //TODO: to jsonrpc_error
     {
-        disconnect(ec.what());
+        disconnect("_send_work error: " + std::string(ec.what()));
         return;
     }
 
@@ -92,7 +92,13 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
     username = _username;
     LOG_DEBUG_STRATUM << "Auth with [username: " << _username << ", password: " << _password << "]";
 
-    context->post([&](){_send_work();});
+    context->post(
+        [&]()
+        {
+            if (socket && socket->is_open())
+                _send_work();
+        }
+    );
 
     return json({true});
 }
