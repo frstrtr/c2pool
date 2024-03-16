@@ -1,6 +1,7 @@
 #include "stratum_node.h"
 
-StratumNode::StratumNode(boost::asio::io_context* context, Worker* worker) : _context(context), acceptor(*_context), _worker(worker)
+StratumNode::StratumNode(boost::asio::io_context* context, Worker* worker) 
+    : _context(context), acceptor(*_context), _worker(worker)
 {
 }
 

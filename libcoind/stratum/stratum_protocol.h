@@ -46,7 +46,7 @@ protected:
     JsonRpc2Server server;
     JsonRpcClient client;
 
-    std::shared_ptr<ip::tcp::socket> socket;
+    std::unique_ptr<ip::tcp::socket> socket;
     const NetAddress addr;
     disconnect_func_type disconnect_func; // StratumNode::disconnect
     Event<> event_disconnect;
