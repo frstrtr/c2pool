@@ -30,7 +30,7 @@ public:
         delete event_disconnect;
     }
 
-    void Read();
+    void Read(int i);
     std::string Send(const std::string &request) override;
 
     auto get_addr() const
