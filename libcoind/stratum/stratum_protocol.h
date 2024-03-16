@@ -30,7 +30,7 @@ public:
         delete event_disconnect;
     }
 
-    void Read(int i);
+    void Read();
     std::string Send(const std::string &request) override;
 
     auto get_addr() const
@@ -39,7 +39,10 @@ public:
     }
 
     void close();
-
+    inline bool is_closed() const
+    {
+        return closed;
+    }
 protected:
     boost::asio::io_context* context;
 
@@ -57,4 +60,6 @@ protected:
     }
 private:
     io::streambuf buffer;
+
+    bool closed{false};
 };

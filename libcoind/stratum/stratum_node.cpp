@@ -82,7 +82,14 @@ void StratumNode::disconnect(const addr_t& addr, std::string reason, int ban_tim
         miners.erase(addr);
         if (ban_time)
             ban(addr, ban_time);
-        delete stratum;
+        
+        _context->post(
+            [stratum = stratum]
+            {
+                // Завершатся существующие Read/Send и только после этого удалится объект StratumProtocol.
+                delete stratum;
+            }
+        );
     } else
     {
         throw libp2p::node_exception("StratumNode::disconnect received wrong addr = " + addr.to_string(), this);;
