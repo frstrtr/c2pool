@@ -30,7 +30,7 @@ public:
 //	std::vector<std::map<uint256, coind::data::tx_type>> known_txs_cache;
 
 public:
-	PoolProtocol(boost::asio::io_context* context_, BasePoolSocket* socket_, HandlerManagerPtr handler_manager_, PoolProtocolData* data_, error_handler_type error_handler_)
+	PoolProtocol(boost::asio::io_context* context_, std::shared_ptr<BasePoolSocket> socket_, HandlerManagerPtr handler_manager_, PoolProtocolData* data_, error_handler_type error_handler_)
 		: BasePoolProtocol(socket_, handler_manager_, error_handler_, Pinger::config{context_, 20, 100}), PoolProtocolData(*data_)
 	{
 	}

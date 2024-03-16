@@ -25,19 +25,14 @@ private:
     void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
 		auto tcp_socket = std::make_shared<ip::tcp::socket>(*context);
-		auto socket = new CoindSocket(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
+		auto socket = std::make_shared<CoindSocket>(tcp_socket, net, connection_type::outgoing, [&](const libp2p::error& err){ error_handler(err); });
 
 		boost::asio::async_connect(*tcp_socket, endpoints,
 			[&, socket = std::move(socket)]
 			(const boost::system::error_code &ec, boost::asio::ip::tcp::endpoint ep)
 			{
-				// if (!status->is_available())
-				// {
-				// 	return;
-				// }
 				if (ec)
 				{
-					delete socket;
 					if (ec != boost::system::errc::operation_canceled)
 						error(libp2p::ASIO_ERROR, "CoindConnector::connect_socket: " + ec.message(), NetAddress{ep});
 					else
@@ -48,14 +43,13 @@ private:
 				LOG_INFO << "CoindConnector.Socket try handshake with " << ep.address() << ":" << ep.port();
 				socket->init_addr();
 				socket_handler(socket);
-				
 			}
 		);
 	}
 
 public:
-	CoindConnector(auto context_, auto net_/*, ConnectionStatus* status_*/) 
-        : context(context_), net(net_), /*status(status_),*/ resolver(*context)
+	CoindConnector(auto context_, auto net_) 
+        : context(context_), net(net_), resolver(*context)
     {
     }
     
@@ -75,9 +69,6 @@ public:
 			[&, address = addr_]
 			(const boost::system::error_code &ec, boost::asio::ip::tcp::resolver::results_type endpoints)
 			{
-				// if (!status->is_available())
-				// 	return;
-
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)

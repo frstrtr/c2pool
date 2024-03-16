@@ -14,7 +14,7 @@ class BaseHandshake : public ProtocolEvents, public COMPONENTS...
 {
 protected:
 	typedef SocketType socket_type;
-	socket_type* socket;
+	std::shared_ptr<socket_type> socket;
 
 	typedef std::function<void(const libp2p::error&)> error_handler_type;
     error_handler_type error_handler;
@@ -22,7 +22,7 @@ protected:
 	virtual void handle_raw(std::shared_ptr<RawMessage> raw_msg) = 0;
 public:
 	template <typename... Args>
-	BaseHandshake(socket_type* socket_, error_handler_type error_handler_, Args... args) 
+	BaseHandshake(std::shared_ptr<socket_type> socket_, error_handler_type error_handler_, Args... args) 
 		: socket(socket_), error_handler(error_handler_), COMPONENTS(this, std::forward<Args>(args))...
 	{
 		socket->set_handler
@@ -53,6 +53,6 @@ public:
     void close()
     {
         socket->close();
-		delete socket;
+		socket.reset();
     }
 };
