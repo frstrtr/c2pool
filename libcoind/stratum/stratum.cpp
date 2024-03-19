@@ -98,7 +98,8 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
     context->post(
         [&]()
         {
-            _send_work();
+            if (socket)
+                _send_work();
         }
     );
 
