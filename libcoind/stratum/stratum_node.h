@@ -48,7 +48,13 @@ public:
         acceptor.close();
 
         // disconnect all miners
+        std::vector<addr_t> disconnect_addrs;
         for (const auto& [addr_, stratum_] : miners)
+        {
+            disconnect_addrs.push_back(addr_);
+        }
+
+        for (const auto& addr_ : disconnect_addrs)
         {
             disconnect(addr_, "stop node");
         }
