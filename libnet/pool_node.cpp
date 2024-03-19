@@ -420,7 +420,7 @@ void PoolNode::handle_message_sharereq(std::shared_ptr<pool::messages::message_s
 {
     //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
     auto shares = handle_get_shares(msg->hashes.get(), msg->parents.get(), msg->stops.get(), protocol->get_addr());
-    LOG_INFO << "sharereq: " << msg->hashes.get() << "; " << msg->parents.get() << "; " << msg->stops.get() << "; " << protocol->get_addr();
+    LOG_INFO << "sharereq: " << msg->hashes.get() << "; " << msg->parents.get() << "; " << msg->stops.get() << "; " << protocol->get_addr().to_string();
     std::vector<PackedShareData> _shares;
     try
     {
