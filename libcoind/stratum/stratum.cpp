@@ -27,6 +27,9 @@ Stratum::Stratum(boost::asio::io_context* context, std::unique_ptr<ip::tcp::sock
 
 void Stratum::_send_work()
 {
+    if (!socket || !socket->is_open())
+        return;
+
     worker_get_work_result get_work_result;
 
     try
@@ -95,8 +98,7 @@ json Stratum::mining_authorize(const std::string &_username, const std::string &
     context->post(
         [&]()
         {
-            if (socket && socket->is_open())
-                _send_work();
+            _send_work();
         }
     );
 
