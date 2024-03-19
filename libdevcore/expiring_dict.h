@@ -34,6 +34,12 @@ public:
         _timer->async_wait(
             [&, _key = key](const boost::system::error_code &ec) 
             {
+                if (ec)
+                {
+                    if (ec == boost::system::errc::operation_canceled)
+                        return;
+                    LOG_ERROR << "Expiring dict error: " << ec.message();
+                }
                 values.erase(_key);
             }
         );
