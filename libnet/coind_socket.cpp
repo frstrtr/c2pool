@@ -8,79 +8,83 @@
 // Read
 void CoindSocket::read_prefix(std::shared_ptr<ReadSocketData> msg)
 {
+	auto socket_ = shared_from_this();
 	boost::asio::async_read(*socket, boost::asio::buffer(msg->prefix, net->PREFIX_LENGTH),
-		[this, msg](boost::system::error_code ec, std::size_t length)
+		[socket_, msg](boost::system::error_code ec, std::size_t length)
 		{
 			if (ec)
 			{
 				if (ec != boost::system::errc::operation_canceled)
-					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_prefix (%1%: %2%)") % ec % ec.message()).str());
+					socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] read_prefix (%1%: %2%)") % ec % ec.message()).str());
 				else
 					LOG_DEBUG_COIND << "PoolSocket::read_prefix canceled";
 				return;
 			}
 
-			if (c2pool::dev::compare_str(msg->prefix, net->PREFIX, length))
-                read_command(msg);
+			if (c2pool::dev::compare_str(msg->prefix, socket_->net->PREFIX, length))
+                socket_->read_command(msg);
             else
-				error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
+				socket_->error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
 		}
 	);
 }
 
 void CoindSocket::read_command(std::shared_ptr<ReadSocketData> msg)
 {
+	auto socket_ = shared_from_this();
 	boost::asio::async_read(*socket, boost::asio::buffer(msg->command, msg->COMMAND_LEN),
-		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
+		[socket_, msg](boost::system::error_code ec, std::size_t /*length*/)
 		{
 			if (ec)
 			{
 				if (ec != boost::system::errc::operation_canceled)
-					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_command (%1%: %2%)") % ec % ec.message()).str());
+					socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] read_command (%1%: %2%)") % ec % ec.message()).str());
 				else
 					LOG_DEBUG_COIND << "CoindSocket::read_command canceled";
 				return;
 			}
 
-			read_length(msg);
+			socket_->read_length(msg);
 		}
 	);
 }
 
 void CoindSocket::read_length(std::shared_ptr<ReadSocketData> msg)
 {
+	auto socket_ = shared_from_this();
 	boost::asio::async_read(*socket, boost::asio::buffer(msg->len, msg->LEN_LEN),
-		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
+		[socket_, msg](boost::system::error_code ec, std::size_t /*length*/)
 		{
 			if (ec)
 			{
 				if (ec != boost::system::errc::operation_canceled)
-					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_length (%1%: %2%)") % ec % ec.message()).str());
+					socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] read_length (%1%: %2%)") % ec % ec.message()).str());
 				else
 					LOG_DEBUG_COIND << "CoindSocket::read_length canceled";
 				return;
 			}
 
-			read_checksum(msg);
+			socket_->read_checksum(msg);
 		}
 	);
 }
 
 void CoindSocket::read_checksum(std::shared_ptr<ReadSocketData> msg)
 {
+	auto socket_ = shared_from_this();
 	boost::asio::async_read(*socket, boost::asio::buffer(msg->checksum, msg->CHECKSUM_LEN),
-		[this, msg](boost::system::error_code ec, std::size_t /*length*/)
+		[socket_, msg](boost::system::error_code ec, std::size_t /*length*/)
 		{
 			if (ec)
 			{
 				if (ec != boost::system::errc::operation_canceled)
-					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_checksum (%1%: %2%)") % ec % ec.message()).str());
+					socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] read_checksum (%1%: %2%)") % ec % ec.message()).str());
 				else
 					LOG_DEBUG_COIND << "CoindSocket::read_checksum canceled";
 				return;
 			}
 
-			read_payload(msg);
+			socket_->read_payload(msg);
 		}
 	);
 }
@@ -93,20 +97,21 @@ void CoindSocket::read_payload(std::shared_ptr<ReadSocketData> msg)
 	msg->unpacked_len = payload_len.get();
 	msg->payload = new char[msg->unpacked_len+1];
 
+	auto socket_ = shared_from_this();
 	boost::asio::async_read(*socket, boost::asio::buffer(msg->payload, msg->unpacked_len),
-		[this, msg](boost::system::error_code ec, std::size_t length)
+		[socket_, msg](boost::system::error_code ec, std::size_t length)
 		{
 			if (ec)
 			{
 				if (ec != boost::system::errc::operation_canceled)
-					error(libp2p::ASIO_ERROR, (boost::format("[socket] read_payload (%1%: %2%)") % ec % ec.message()).str());
+					socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] read_payload (%1%: %2%)") % ec % ec.message()).str());
 				else
 					LOG_DEBUG_POOL << "PoolSocket::read_payload canceled";
 				return;
 			}
 
-			final_read_message(msg);
-			read();
+			socket_->final_read_message(msg);
+			socket_->read();
 		}
 	);
 }
