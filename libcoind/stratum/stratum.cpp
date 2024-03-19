@@ -8,7 +8,7 @@
 
 Stratum::Stratum(boost::asio::io_context* context, std::unique_ptr<ip::tcp::socket> socket, Worker* worker, disconnect_func_type disconnect_func_)
     : StratumProtocol(context, std::move(socket), std::move(disconnect_func_)),
-     _worker(worker), _t_send_work(*context), handler_map(context, 300)
+     _worker(worker), handler_map(context, 300)
 {
     server.Add("mining.subscribe", GetUncheckedHandle([&](const json &value)
                                                       {

@@ -15,7 +15,6 @@ class Stratum : public StratumProtocol
 public:
     Stratum(boost::asio::io_context* context, std::unique_ptr<ip::tcp::socket> socket, Worker* worker, disconnect_func_type disconnect_func_);
 
-    boost::asio::deadline_timer _t_send_work;
     Worker* _worker;
 private:
     std::string username;
