@@ -420,7 +420,7 @@ void PoolNode::handle_message_sharereq(std::shared_ptr<pool::messages::message_s
 {
     //std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, std::tuple<std::string, std::string> peer_addr
     auto shares = handle_get_shares(msg->hashes.get(), msg->parents.get(), msg->stops.get(), protocol->get_addr());
-
+    LOG_INFO << "sharereq: " << msg->hashes.get() << "; " << msg->parents.get() << "; " << msg->stops.get() << "; " << protocol->get_addr();
     std::vector<PackedShareData> _shares;
     try
     {
@@ -431,12 +431,14 @@ void PoolNode::handle_message_sharereq(std::shared_ptr<pool::messages::message_s
         }
         auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), good, _shares);
         protocol->write(reply_msg);
+        LOG_INFO << "first try";
     }
     catch (const std::invalid_argument &e)
     {
 		// TODO: check for too_long
         auto reply_msg = std::make_shared<message_sharereply>(msg->id.get(), too_long, std::vector<PackedShareData>{});
         protocol->write(reply_msg);
+        LOG_INFO << "second try";
     }
 }
 
