@@ -7,6 +7,7 @@ namespace c2pool
 {
     class Timer
     {
+        std::shared_ptr<bool> stoped;
         boost::asio::steady_timer timer;
 
         int t; // seconds
@@ -18,8 +19,11 @@ namespace c2pool
         {
             timer.expires_from_now(boost::asio::chrono::seconds(t));
             timer.async_wait(
-                [&](const boost::system::error_code& ec)
+                [&, stoped_ = stoped](const boost::system::error_code& ec)
                 {
+                    if (*stoped_)
+                        return;
+
                     if (!ec)
                     {
                         handler();
@@ -37,6 +41,12 @@ namespace c2pool
     public:
         Timer(boost::asio::io_context* context, bool repeat_ = false) : timer(*context), repeat(repeat_)
         {
+            stoped = std::make_shared<bool>(false);
+        }
+
+        ~Timer()
+        {
+            *stoped = true;
         }
 
         void start(int t_, std::function<void()> handler_, std::function<void()> cancel_ = nullptr)
