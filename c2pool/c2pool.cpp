@@ -57,7 +57,7 @@ int main(int argc, char *argv[])
 //    desc.add_options()("networks", po::value<std::vector<std::string>>()->multitoken(), "");
     desc.add_options()("ui_config", "open Qt UI for net configs");
     desc.add_options()("datadir", po::value<string>()->default_value(""), "store data in this directory (default: <directory with c2pool build>/data)");
-    desc.add_options()("give-author", po::value<float>()->default_value(0), "donate this percentage of work towards the development of p2pool (default: 0.0)");
+    desc.add_options()("give-author", po::value<float>()->default_value(0)->value_name("<arg>"), "donate this percentage of work towards the development of p2pool (default: 0.0)");
     desc.add_options()("web_server", po::value<std::string>(), "ip:port for web site");
     desc.add_options()("disable_check_version", "use for disable check actual c2pool version from github");
 
