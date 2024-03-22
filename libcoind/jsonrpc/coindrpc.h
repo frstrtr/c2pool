@@ -72,6 +72,7 @@ public:
 						if (check())
 						{
 							connected();
+							LOG_INFO << "...CoindRPC connected!";
 							return;
 						}
 					}
@@ -102,10 +103,11 @@ public:
 
 	void stop() override
 	{
-		LOG_INFO << "CoindRPC stop";
+		LOG_INFO << "CoindRPC stopping...!";
 		beast::error_code ec;
 		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
 		stream.close();
+		LOG_INFO << "...CoindRPC stopped!";
 	}
 
 public:

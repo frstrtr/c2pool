@@ -68,7 +68,9 @@ public:
 
     void stop() override
     {
+        LOG_INFO << "CoindNode stopping...!";
         CoindNodeClient::stop();
+        LOG_INFO << "...CoindNode stopped!";
     }
 
 public:

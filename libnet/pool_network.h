@@ -47,7 +47,10 @@ class PoolNodeServer : public Server<BasePoolSocket>
 
         // Set PoolNode::NetworkTreeNode connected
         if ((data->peers.size() == 1) && data->net->PERSIST)
+        {
             data->connected();
+            LOG_INFO << "...PoolNode connected!";
+        }
     }
 
 protected:
@@ -176,7 +179,10 @@ class PoolNodeClient : public Client<BasePoolSocket>
 
         // Set PoolNode::NetworkTreeNode connected
         if ((data->peers.size() == 1) && data->net->PERSIST)
+        {
             data->connected();
+            LOG_INFO << "...PoolNode connected!";
+        }
     }
 
     void resolve_connection()

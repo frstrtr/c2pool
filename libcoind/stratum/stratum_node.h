@@ -38,11 +38,12 @@ public:
 
         // start processing stratum connections
         listen();
+        LOG_INFO << "...StratumNode connected!";
     }
 
     void stop() override
     {
-        LOG_INFO << "StratumNode stop";
+        LOG_INFO << "StratumNode stopping...!";
         // stop boost::asio::acceptor
         acceptor.cancel();
         acceptor.close();
@@ -65,6 +66,7 @@ public:
             timer_->stop();
         }
         bans.clear();
+        LOG_INFO << "...StratumNode stopped!";
     }
 private:
     void listen();
