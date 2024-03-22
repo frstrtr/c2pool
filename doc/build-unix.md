@@ -1,4 +1,10 @@
-required openssl >= 3
+| Name      | Version|
+|-----------|--------|
+| CMake     | >= 3.22|
+| OpenSSL   | >= 3.xx|
+| GCC       | 9      |
+| Boost     | 1.78   |
+
 
 ```shell
 sudo apt update & apt upgrade
@@ -9,8 +15,14 @@ sudo apt install g++-9
 sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 900 --slave /usr/bin/g++ g++ /usr/bin/g++-9
 
 sudo apt install cmake
-sudo apt-get install libsnappy-dev libleveldb-dev
+sudo apt install make
+sudo apt-get install libleveldb-dev
 sudo apt install qt6-base-dev
+```
+
+If ui config is needed:
+```shell
+sudo apt-get install libgl1-mesa-dev
 ```
 
 install boost 1.78.0:
@@ -19,9 +31,7 @@ wget -O boost_1_78_0.tar.gz https://boostorg.jfrog.io/artifactory/main/release/1
 tar xzvf boost_1_78_0.tar.gz
 cd boost_1_78_0
 ./bootstrap.sh --prefix=/usr/
-./b2
 sudo ./b2 install
-cd ..
 ```
 
 install c2pool:
@@ -33,7 +43,12 @@ cmake -DCMAKE_BUILD_TYPE=Debug -S . -B build
 cmake --build build --target c2pool_main -j 6
 ```
 
-run:
+UI Config:
+```shell
+./c2pool_main --ui_config
+```
+
+Run:
 ```shell
 cd build/c2pool
 ./c2pool_main --web_server=0.0.0.0:8083
