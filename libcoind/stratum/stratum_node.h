@@ -38,6 +38,7 @@ public:
 
         // start processing stratum connections
         listen();
+        connected();
         LOG_INFO << "...StratumNode connected!";
     }
 
