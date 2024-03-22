@@ -223,17 +223,22 @@ public:
 		}
 
         if (!net->PERSIST)
+        {
             connected();
+            LOG_INFO << "...PoolNode[persist] connected!";
+        }
     }
 
     void stop() override
     {
+        LOG_INFO << "PoolNode stopping...!";
         //TODO: stop PoolNode::start()?
 
         PoolNodeServer::stop();
         PoolNodeClient::stop();
 
         peers.clear();
+        LOG_INFO << "...PoolNode stopped!";
     }
 };
 #undef SET_POOL_DEFAULT_HANDLER

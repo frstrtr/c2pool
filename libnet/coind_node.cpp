@@ -1,16 +1,20 @@
 #include "coind_node.h"
 
 #include <libdevcore/deferred.h>
+#include <libdevcore/common.h>
 
 #include <boost/range/combine.hpp>
 #include <boost/foreach.hpp>
 
 void CoindNode::start()
 {
+    c2pool::dev::debug_timestamp t0;
 	LOG_INFO << "\t\t CoindNode starting...";
 	//COIND:
 	coind_work->set(coind->getwork(txidcache));
+    c2pool::dev::debug_timestamp t1;
     get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work->value()](){return _coind_work.previous_block; });
+    c2pool::dev::debug_timestamp t2;
 	new_block->subscribe(
         [&](uint256 _value)
 	    {
@@ -21,12 +25,14 @@ void CoindNode::start()
 
     work_poller_t.start(15, [&](){ work_poller(); });
     work_poller_t.happened();
+    c2pool::dev::debug_timestamp t3;
 
 	//PEER:
 	coind_work->changed->subscribe([&](coind::getwork_result result){
 		this->poll_header();
 	});
 	poll_header();
+    c2pool::dev::debug_timestamp t4;
 
 	//BEST SHARE
 	coind_work->changed->subscribe([&](coind::getwork_result result)
@@ -34,6 +40,7 @@ void CoindNode::start()
 		set_best_share();
 	});
 	set_best_share();
+    c2pool::dev::debug_timestamp t5;
 
 	// p2p logic and join p2pool network
 
@@ -56,6 +63,7 @@ void CoindNode::start()
         mining_txs->set(new_mining_txs);
         known_txs->add(added_known_txs);
 	});
+    c2pool::dev::debug_timestamp t6;
 
 	// add p2p transactions from bitcoind to known_txs
 	new_tx->subscribe([&](coind::data::tx_type _tx)
@@ -87,6 +95,7 @@ void CoindNode::start()
                     }
                 });
     }
+    c2pool::dev::debug_timestamp t7;
 
     /* TODO: GOT BLOCK FROM PEER! Passing to bitcoind!
      *
@@ -109,6 +118,7 @@ void CoindNode::start()
         forget_old_txs_t.start(10, [&](){ forget_old_txs(); });
         forget_old_txs_t.happened();
     }
+    c2pool::dev::debug_timestamp t8;
 
 	/* TODO:
 	t = deferral.RobustLoopingCall(self.clean_tracker)
@@ -116,7 +126,7 @@ void CoindNode::start()
 	stop_signal.watch(t.stop)
 	 */
 
-	LOG_INFO << "\t\t CoindNode started!";
+	LOG_INFO << "\t\t CoindNode started! " << t1-t0 << "; " << t2-t1 << "; " << t3-t2 << "; " << t4-t3 << "; " << t5-t4 << "; " << t6-t5 << "; " << t7-t6 << "; " << t8-t7;
 }
 
 void CoindNode::work_poller()
@@ -200,6 +210,7 @@ void CoindNode::handle_message_verack(std::shared_ptr<coind::messages::message_v
     });
 
     connected();
+    LOG_INFO << "...CoindNode connected!";
 }
 
 void CoindNode::handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol)

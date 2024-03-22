@@ -229,11 +229,14 @@ void Worker::run()
     compute_work();
     //TODO:
     connected();
+    LOG_INFO << "...Worker connected!";
 }
 
 void Worker::stop()
 {
+    LOG_INFO << "Worker stopping...!";
     //TODO:
+    LOG_INFO << "...Worker stopped!";
 }
 
 worker_get_work_result
