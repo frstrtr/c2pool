@@ -79,6 +79,5 @@ protected:
 
         // start accept messages
         socket->read();
-        node_data->connected();
     }
 };
