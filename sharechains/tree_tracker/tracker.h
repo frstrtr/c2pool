@@ -137,6 +137,8 @@ public:
                 auto left_fork = heads.extract(value.prev());
                 auto right_fork = tails.extract(value.hash());
 
+                left_fork.mapped()->insert(value);
+
                 tails[left_fork.mapped()->get_chain_tail()].clear();
                 for (auto &_fork: right_fork.mapped())
                 {
@@ -152,9 +154,8 @@ public:
                         forks.erase(forks.begin() + i);
                     }
                 }
-//                fork_by_key_add(value.hash(), heads[value.hash()]);
-//                    std::remove(forks.begin(), forks.end(), )
-//                    forks.erase(forks.find(left_fork.mapped()));
+                
+                fork_by_key_add(value.hash(), left_fork.mapped());
             }
                 break;
             case only_heads:
