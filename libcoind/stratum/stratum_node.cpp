@@ -44,6 +44,12 @@ void StratumNode::listen()
     acceptor.async_accept(
         [this](const boost::system::error_code &ec, ip::tcp::socket socket)
         {
+            if (!is_connected())
+            {
+                LOG_DEBUG_STRATUM << "StratunNode::listen() stopped, because is not connected";
+                return;
+            }
+
             if (ec)
             {
                 if (ec == boost::system::errc::operation_canceled)

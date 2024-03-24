@@ -27,7 +27,7 @@ namespace C2Log
         NONE = 0,
         POOL = (1 << 0),
         COIND = (1 << 2),
-        COIND_JSONRPC = (1 << 3),
+        COIND_RPC = (1 << 3),
         SHARETRACKER = (1 << 4),
         DB = (1 << 5),
         OTHER = (1 << 6),
@@ -50,7 +50,7 @@ namespace C2Log
 
     #define LOG_DEBUG_POOL LOG_DEBUG(C2Log, POOL)
     #define LOG_DEBUG_COIND LOG_DEBUG(C2Log, COIND)
-    #define LOG_DEBUG_COIND_JSONRPC LOG_DEBUG(C2Log, COIND_JSONRPC)
+    #define LOG_DEBUG_COIND_RPC LOG_DEBUG(C2Log, COIND_RPC)
     #define LOG_DEBUG_SHARETRACKER LOG_DEBUG(C2Log, SHARETRACKER)
     #define LOG_DEBUG_DB LOG_DEBUG(C2Log, DB)
     #define LOG_DEBUG_OTHER LOG_DEBUG(C2Log, OTHER)
