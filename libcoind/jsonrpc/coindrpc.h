@@ -174,7 +174,7 @@ public:
         }
 
 		std::string json_result = boost::beast::buffers_to_string(response.body().data());
-    	LOG_DEBUG_COIND_JSONRPC << "json_result: " << json_result;
+    	LOG_DEBUG_COIND_RPC << "json_result: " << json_result;
 
 		return json_result;
 	}

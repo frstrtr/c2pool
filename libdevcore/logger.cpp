@@ -62,7 +62,7 @@ namespace C2Log
             {"none", C2Log::NONE},
             {"pool", C2Log::POOL},
             {"coind", C2Log::COIND},
-            {"coind_jsonrpc", C2Log::COIND_JSONRPC},
+            {"coindrpc", C2Log::COIND_RPC},
             {"sharetracker", C2Log::SHARETRACKER},
             {"db", C2Log::DB},
             {"other", C2Log::OTHER},
