@@ -8,6 +8,7 @@
 
 #include <networks/network.h>
 #include <libdevcore/logger.h>
+#include <libdevcore/timer.h>
 #include <libp2p/net_errors.h>
 #include <libp2p/network_tree_node.h>
 #include <libcoind/data.h>
@@ -40,7 +41,7 @@ public:
 	};
 protected:
     io::io_context* context;
-	io::steady_timer reconnect_timer;
+	c2pool::Timer reconnect_timer;
 
 	rpc_auth_data auth;
     jsonrpccxx::JsonRpcClient client;
@@ -83,13 +84,7 @@ public:
 				}
 				
 				LOG_INFO << "Retry after 15 seconds...";
-				reconnect_timer.expires_from_now(std::chrono::seconds(15));
-				reconnect_timer.async_wait(
-					[this](const auto& ec)
-					{
-						try_connect();
-					}
-				);
+				reconnect_timer.start(15, [this] { try_connect(); });
 				stream.close();
 			}
 		);
@@ -105,6 +100,7 @@ public:
 	{
 		LOG_INFO << "CoindRPC stopping...!";
 		beast::error_code ec;
+		reconnect_timer.stop();
 		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
 		stream.close();
 		LOG_INFO << "...CoindRPC stopped!";
@@ -113,7 +109,7 @@ public:
 public:
 	// login = "login:password"
     CoindRPC(io::io_context* ctx, coind::ParentNetwork* _parent_net, rpc_auth_data _auth, const char* login) 
-		: context(ctx), reconnect_timer(*context), 
+		: context(ctx), reconnect_timer(context), 
 			resolver(*context), stream(*context), 
 			client(*this, jsonrpccxx::version::v2), 
 			parent_net(_parent_net), auth(_auth)
