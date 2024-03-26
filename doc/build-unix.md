@@ -6,9 +6,19 @@
 | Boost     | 1.78   |
 
 > [!WARNING]
-> While compiling you may get an error like:
-> c++: internal compiler error: Killed (program cc1plus)
+<blockquote>
+While compiling you may get an error like:
+c++: internal compiler error: Killed (program cc1plus)
+</blockquote>
+>>>
+1
+2
+>>>
 
+<<<
+1
+2
+<<<
 
 ```shell
 sudo apt update & apt upgrade
