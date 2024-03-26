@@ -1,3 +1,13 @@
+> [!WARNING]
+> While compiling you may get an error like:\
+> `c++: internal compiler error: Killed (program cc1plus)`\
+> \
+> Reasons:
+> 1. Low ram/swap. Increase ram/swap or decrease the amount of make -j to 1 (more compile threads -> more mem usage).
+> 2. SELinux/grsecurity/Hardened kernel: Kernels that use ASLR as a security measure tend to mess up GCC's precompiled header implementation. Try using an unhardened kernel (without ASLR), or compiling using clang, or gcc without pch. (you can get this issue when using OVH hosting).
+
+
+# Dependencies
 | Name      | Version|
 |-----------|--------|
 | CMake     | >= 3.22|
@@ -5,10 +15,7 @@
 | GCC       | 9      |
 | Boost     | 1.78   |
 
-> [!WARNING]
-> While compiling you may get an error like:\
-> `c++: internal compiler error: Killed (program cc1plus)`
-
+# Instruction
 ```shell
 sudo apt update & apt upgrade
 sudo apt install wget
