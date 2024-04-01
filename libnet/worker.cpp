@@ -613,7 +613,7 @@ Worker::get_work(std::string address, uint256 desired_share_target, uint256 desi
                         _coind_node->submit_block(new_block, false);
 
                         //TODO: add self.node.net.PARENT.BLOCK_EXPLORER_URL_PREFIX
-                        LOG_INFO << "GOT BLOCK FROM MINER! Passing to " << _net->parent->net_name << " coind!" << header_hash.GetHex() << "\n";
+                        LOG_INFO << "GOT BLOCK FROM MINER! Passing to " << _net->parent->net_name << " coin daemon!" << header_hash.GetHex() << "\n";
 
                         // add block to web-statistic
                         founded_blocks.push_back({{"ts", header.timestamp}, {"hash", header_hash.GetHex()}});
