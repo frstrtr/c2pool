@@ -28,17 +28,22 @@ void CoindNode::start()
     c2pool::dev::debug_timestamp t3;
 
 	//PEER:
-	coind_work->changed->subscribe([&](coind::getwork_result result){
-		this->poll_header();
-	});
+	coind_work->changed->subscribe(
+        [&](coind::getwork_result result)
+        {
+		    this->poll_header();
+	    }
+    );
 	poll_header();
     c2pool::dev::debug_timestamp t4;
 
 	//BEST SHARE
-	coind_work->changed->subscribe([&](coind::getwork_result result)
-    {
-		set_best_share();
-	});
+	coind_work->changed->subscribe(
+        [&](coind::getwork_result result)
+        {
+	    	set_best_share();
+	    }
+    );
 	set_best_share();
     c2pool::dev::debug_timestamp t5;
 
