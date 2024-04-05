@@ -34,7 +34,8 @@ void StratumProtocol::Read()
             auto request_data = request.dump();
             LOG_DEBUG_STRATUM << "StratumProtocol get request = " << request_data;
             
-            boost::asio::post(*context, 
+            boost::asio::post(
+                *context, 
                 [this, req = request_data]
                 {
                     auto response = server.HandleRequest(req);
