@@ -35,6 +35,8 @@ protected:
     virtual void run_node() = 0;
     // called from Workflow thread!
     virtual void stop_node() = 0;
+    // called when node stopped
+    virtual void disconnect_notify() = 0;
 
     // non-thread safe
     // call when node connected
@@ -89,6 +91,7 @@ private:
             [&]
             {
                 disconnected();
+                disconnect_notify();
             },
             mutex
         );

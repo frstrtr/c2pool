@@ -4,7 +4,7 @@
 #include <stdexcept>
 
 #include <libdevcore/types.h>
-#include "network_tree_node.h"
+#include "workflow_node.h"
 
 namespace libp2p
 {
@@ -38,14 +38,14 @@ namespace libp2p
 
     class node_exception : public std::runtime_error
     {
-        NetworkTreeNode* node;
+        WorkflowNode* node;
     public:
-        node_exception(const std::string& reason, NetworkTreeNode* node_)
+        node_exception(const std::string& reason, WorkflowNode* node_)
             : std::runtime_error(reason), node(node_)
         {
         }
 
-        NetworkTreeNode* get_node() const
+        WorkflowNode* get_node() const
         {
             return node;
         }
