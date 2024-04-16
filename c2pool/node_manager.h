@@ -11,9 +11,9 @@
 #include <libcoind/jsonrpc/coindrpc.h>
 #include <libcoind/stratum/stratum_node.h>
 #include <web_interface/webserver.h>
-#include <libp2p/network_tree.h>
+#include <libp2p/workflow_tree.h>
 
-class NodeManager : private NetworkTree
+class NodeManager : private WorkflowTree
 {
 protected:
     NodeManager() {}
