@@ -10,7 +10,7 @@
 #include <libdevcore/logger.h>
 #include <libdevcore/timer.h>
 #include <libp2p/net_errors.h>
-#include <libp2p/network_tree_node.h>
+#include <libp2p/workflow_node.h>
 #include <libcoind/data.h>
 #include <libcoind/types.h>
 
@@ -22,9 +22,10 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = io::ip::tcp;
 
-class CoindRPC : public jsonrpccxx::IClientConnector, public NetworkTreeNode
+class CoindRPC : public jsonrpccxx::IClientConnector, public WorkflowNode
 {
 	const std::string id = "curltest";
+
 public:
 	struct rpc_auth_data
 	{
@@ -39,6 +40,7 @@ public:
 			
 		}
 	};
+
 protected:
     io::io_context* context;
 	c2pool::Timer reconnect_timer;
@@ -51,6 +53,26 @@ protected:
 	beast::tcp_stream stream;
     http::request<http::string_body> http_request;
 
+	void run_node() override
+    {
+		LOG_INFO << "CoindRPC running...";
+		try_connect();
+    }
+
+	void stop_node() override
+	{
+		LOG_INFO << "CoindRPC stopping...!";
+		beast::error_code ec;
+		reconnect_timer.stop();
+		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+		stream.close();
+	}
+
+	void disconnect_notify() override
+	{
+		LOG_INFO << "...CoindRPC stopped!";
+	}
+
 public:
 	void try_connect()
 	{
@@ -58,8 +80,10 @@ public:
 		boost::asio::ip::tcp::endpoint endpoint = *results; //(boost::asio::ip::make_address(auth.ip), auth.port);
 
         stream.async_connect(endpoint, 
-			[&](boost::system::error_code ec)
+			[&, PROCESS_DUPLICATE](boost::system::error_code ec)
 			{
+				WORKFLOW_PROCESS();
+
 				if (ec)
 				{
 					if (ec == boost::system::errc::operation_canceled)
@@ -72,6 +96,7 @@ public:
 					{
 						if (check())
 						{
+							WORKFLOW_PROCESS_FINISH();
 							connected();
 							LOG_INFO << "...CoindRPC connected!";
 							return;
@@ -84,26 +109,10 @@ public:
 				}
 				
 				LOG_INFO << "Retry after 15 seconds...";
-				reconnect_timer.start(15, [this] { try_connect(); });
+				reconnect_timer.start(15, [this, PROCESS_DUPLICATE] { WORKFLOW_PROCESS(); try_connect(); });
 				stream.close();
 			}
 		);
-	}
-
-    void run() override
-    {
-		LOG_INFO << "CoindRPC running...";
-		try_connect();
-    }
-
-	void stop() override
-	{
-		LOG_INFO << "CoindRPC stopping...!";
-		beast::error_code ec;
-		reconnect_timer.stop();
-		stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-		stream.close();
-		LOG_INFO << "...CoindRPC stopped!";
 	}
 
 public:
