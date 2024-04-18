@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include <libp2p/preset/p2p_socket_data.h>
+#include <libp2p/socket_data.h>
 #include <libp2p/socket.h>
 #include <libp2p/message.h>
 #include <networks/network.h>
@@ -13,16 +13,19 @@ typedef BaseSocket<DebugMessages> BaseCoindSocket;
 
 class CoindSocket : public BaseCoindSocket, public std::enable_shared_from_this<CoindSocket>
 {
+	template <typename PacketType>
+	using SocketPacket = SocketPacketType<CoindSocket, PacketType>;
+
 private:
 	std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 	coind::ParentNetwork* net;
 
-	void read_prefix(std::shared_ptr<ReadSocketData> msg);
-	void read_command(std::shared_ptr<ReadSocketData> msg);
-	void read_length(std::shared_ptr<ReadSocketData> msg);
-	void read_checksum(std::shared_ptr<ReadSocketData> msg);
-	void read_payload(std::shared_ptr<ReadSocketData> msg);
-	void final_read_message(std::shared_ptr<ReadSocketData> msg);
+	void read_prefix(SocketPacket<ReadPacket>::ptr_type packet);
+	void read_command(SocketPacket<ReadPacket>::ptr_type packet);
+	void read_length(SocketPacket<ReadPacket>::ptr_type packet);
+	void read_checksum(SocketPacket<ReadPacket>::ptr_type packet);
+	void read_payload(SocketPacket<ReadPacket>::ptr_type packet);
+	void final_read_message(SocketPacket<ReadPacket>::ptr_type packet);
     
 public:
     CoindSocket(auto socket_, auto net_, connection_type type_, error_handler_type error_handler_) 
@@ -33,26 +36,25 @@ public:
 
 	void write(std::shared_ptr<Message> msg) override
 	{
-        std::shared_ptr<P2PWriteSocketData> _msg = std::make_shared<P2PWriteSocketData>(msg, net->PREFIX, net->PREFIX_LENGTH);
-        LOG_DEBUG_COIND << "\tCoind socket write msg: " << msg->command << ", Message data: \n" << *_msg;
+        auto packet = SocketPacket<WritePacket>::make(shared_from_this(), msg, net->PREFIX, net->PREFIX_LENGTH);
+        LOG_DEBUG_COIND << "\tCoind socket write msg: " << msg->command << ", Message data: \n" << packet->value;
 
         event_send_message->happened(msg->command);
 
-		auto socket_ = shared_from_this();
-        boost::asio::async_write(*socket, boost::asio::buffer(_msg->data, _msg->len),
-            [socket_, cmd = msg->command](boost::system::error_code ec, std::size_t length)
+        boost::asio::async_write(*socket, boost::asio::buffer(packet->value.data, packet->value.len),
+            [this, packet, cmd = msg->command](boost::system::error_code ec, std::size_t length)
             {
                 if (ec)
                 {
                     if (ec != boost::system::errc::operation_canceled)
-						socket_->error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % ec % ec.message()).str());
+						error(libp2p::ASIO_ERROR, (boost::format("[socket] write error (%1%: %2%)") % ec % ec.message()).str());
 					else
 						LOG_DEBUG_COIND << "PoolSocket::write canceled";
 					return;
                 }
 
                 LOG_DEBUG_COIND << "[CoindSocket] peer receive message_" << cmd;
-                socket_->event_peer_receive->happened(cmd);
+                event_peer_receive->happened(cmd);
             }
         );
 	}
@@ -60,8 +62,8 @@ public:
 	// Read
 	void read() override
 	{
-		std::shared_ptr<ReadSocketData> msg = std::make_shared<ReadSocketData>(net->PREFIX_LENGTH);
-		read_prefix(msg);
+		auto packet = SocketPacket<ReadPacket>::make(shared_from_this(), net->PREFIX_LENGTH); // make_socket_data<SocketData<ReadSocketData>>(, net->PREFIX_LENGTH);
+		read_prefix(packet);
 	}
 
     void init_addr() override
