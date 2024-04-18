@@ -49,25 +49,6 @@ struct ReadPacket
     }
 };
 
-// struct WritePacket
-// {
-//     char *data;
-//     int32_t len;
-
-//     WritePacket() {}
-//     WritePacket(char *_data, int32_t _len) : 
-
-//     ~WritePacket()
-//     {
-//         if (data != nullptr)
-//         {
-//             delete []data;
-//         }
-//     }
-
-//     virtual void from_message(std::shared_ptr<Message> msg) = 0;
-// };
-
 struct WritePacket
 {
     int32_t len;

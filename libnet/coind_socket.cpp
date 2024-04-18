@@ -1,6 +1,6 @@
 #include "coind_socket.h"
 
-#include <libp2p/socket_data.h>
+#include <libp2p/socket_packet.h>
 #include <libdevcore/str.h>
 
 #include <boost/asio.hpp>
