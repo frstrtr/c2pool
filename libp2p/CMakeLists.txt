@@ -11,10 +11,6 @@ set(libp2p_source
         node.h
 )
 
-set(libp2ppreset_source
-        preset/p2p_socket_data.h
-)
-
 set(workflow_source workflow_tree.h workflow_thread.h workflow_task.h workflow_process.h workflow_node.h)
 
 # TODO: library to interface
