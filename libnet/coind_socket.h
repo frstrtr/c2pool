@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include <libp2p/socket_data.h>
+#include <libp2p/socket_packet.h>
 #include <libp2p/socket.h>
 #include <libp2p/message.h>
 #include <networks/network.h>
