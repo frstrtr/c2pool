@@ -63,6 +63,7 @@ void Disposables::dispose()
     {
         v->dispose();
     }
+    dis.clear();
 }
 
 template<typename... Args>
