@@ -26,9 +26,11 @@ Some technical details - https://bitcointalk.org/index.php?topic=457574
 
 </details>
 
-Discord:
+### Telegram
+https://t.me/c2pooldev
 
-### https://discord.gg/yb6ujsPRsv
+### Discord:
+https://discord.gg/yb6ujsPRsv
 
 # Install:
 ### [UNIX instruction](doc/build-unix.md)
