@@ -8,63 +8,13 @@
 
 #include "common.h"
 #include "deferred.h"
+#include "disposable.h"
 
 //Example:
 //Event<item_type> remove_special = make_event<item_type>();
 //remove_special.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special, this, _1);
 //void _handle_remove_special(item_type item);
 //remove_special.happened(item);
-
-class Disposable;
-
-class Disposables
-{
-public:
-    std::vector<std::unique_ptr<Disposable>> dis;
-
-    void attach(Disposable&& dispose);
-    void dispose();
-};
-
-class Disposable
-{
-    int _id;
-    std::function<void(int)> _dispose;
-public:
-
-    Disposable(int id, std::function<void(int)>&& dispose) : _id(id), _dispose(std::move(dispose))
-    {
-    }
-
-    operator int() const
-    {
-        return _id;
-    }
-
-    void attach(Disposables& dis)
-    {
-        dis.attach(std::move(*this));
-    }
-
-    void dispose()
-    {
-        _dispose(_id);
-    }
-};
-
-void Disposables::attach(Disposable&& value)
-{
-    dis.push_back(std::make_unique<Disposable>(std::move(value)));
-}
-
-void Disposables::dispose()
-{
-    for (auto& v : dis)
-    {
-        v->dispose();
-    }
-    dis.clear();
-}
 
 template<typename... Args>
 class _Event
@@ -91,24 +41,24 @@ private:
 public:
     //for std::function/lambda
     template<typename Lambda>
-    Disposable subscribe(Lambda _f)
+    EventDisposable subscribe(Lambda _f)
     {
         boost::signals2::connection bc = sig.connect(_f);
 
         auto id = get_id();
         unsub_by_id[id] = std::move(bc);
 
-        return Disposable(id, [&](int _id){ unsubscribe(_id); });
+        return EventDisposable(id, [&](int _id){ unsubscribe(_id); });
     }
 
-    Disposable subscribe(const std::function<void()>& _f)
+    EventDisposable subscribe(const std::function<void()>& _f)
     {
         boost::signals2::connection bc = sig_anon.connect(_f);
 
         auto id = get_id();
         unsub_by_id[id] = std::move(bc);
 
-        return Disposable(id, [&](int _id){ unsubscribe(_id); });
+        return EventDisposable(id, [&](int _id){ unsubscribe(_id); });
     }
 
     template<typename Lambda>
@@ -117,7 +67,7 @@ public:
         once.connect(_f);
     }
 
-    Disposable run_and_subscribe(std::function<void()> _f)
+    EventDisposable run_and_subscribe(std::function<void()> _f)
     {
         _f();
         return subscribe(_f);
@@ -233,10 +183,12 @@ public:
             return def;
         }
 
-        changed->subscribe_once([&, when_f = when_f, def = def](VarType _v)
-                                {
-                                        get_when_satisfies(when_f, def);
-                                });
+        changed->subscribe_once(
+            [&, when_f = when_f, def = def](VarType _v)
+            {
+                get_when_satisfies(when_f, def);
+            }
+        );
         return def;
     }
 
