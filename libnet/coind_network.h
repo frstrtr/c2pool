@@ -4,7 +4,7 @@
 #include "coind_protocol.h"
 #include "coind_node_data.h"
 
-#include <libp2p/network_tree_node.h>
+#include <libp2p/workflow_node.h>
 #include <libp2p/node.h>
 
 class CoindNodeClient : public Client<BaseCoindSocket>

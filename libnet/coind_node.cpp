@@ -8,24 +8,24 @@
 
 void CoindNode::start()
 {
-    c2pool::dev::debug_timestamp t0;
+    c2pool::dev::debug_timestamp t0; // -----------------
 	LOG_INFO << "\t\t CoindNode starting...";
 	//COIND:
 	coind_work->set(coind->getwork(txidcache));
-    c2pool::dev::debug_timestamp t1;
+    c2pool::dev::debug_timestamp t1; // ---------------- 17 seconds
     get_height_rel_highest.set_get_best_block_func([_coind_work = coind_work->value()](){return _coind_work.previous_block; });
-    c2pool::dev::debug_timestamp t2;
+    c2pool::dev::debug_timestamp t2; // -----------------
 	new_block->subscribe(
         [&](uint256 _value)
 	    {
 	    	//Если получаем новый блок, то обновляем таймер
             work_poller_t.restart();
 	    }
-    );
+    ).attach(dispose_events);
 
     work_poller_t.start(15, [&](){ work_poller(); });
     work_poller_t.happened();
-    c2pool::dev::debug_timestamp t3;
+    c2pool::dev::debug_timestamp t3; // ----------------- 15 seconds
 
 	//PEER:
 	coind_work->changed->subscribe(
@@ -33,7 +33,7 @@ void CoindNode::start()
         {
 		    this->poll_header();
 	    }
-    );
+    ).attach(dispose_events);
 	poll_header();
     c2pool::dev::debug_timestamp t4;
 
@@ -67,14 +67,14 @@ void CoindNode::start()
 
         mining_txs->set(new_mining_txs);
         known_txs->add(added_known_txs);
-	});
+	}).attach(dispose_events);
     c2pool::dev::debug_timestamp t6;
 
 	// add p2p transactions from bitcoind to known_txs
 	new_tx->subscribe([&](coind::data::tx_type _tx)
     {
 		known_txs->add(coind::data::hash256(pack<coind::data::stream::TransactionType_stream>(_tx)), _tx);
-	});
+	}).attach(dispose_events);
 
 	// forward transactions seen to bitcoind
     if (cur_share_version < 34)
@@ -98,7 +98,7 @@ void CoindNode::start()
                         LOG_DEBUG_COIND << "Protocol write message_tx with: " << tx_hash << ": " << *tx;
                         protocol->write(msg);
                     }
-                });
+                }).attach(dispose_events);
     }
     c2pool::dev::debug_timestamp t7;
 
@@ -149,7 +149,7 @@ void CoindNode::work_poller()
 
 void CoindNode::poll_header()
 {
-    if (!protocol || !is_connected())
+    if (!protocol || (get_state() != WorkflowState::connected))
         return;
 
 	protocol->get_block_header->yield(coind_work->value().previous_block, [&](coind::data::BlockHeaderType new_header){ handle_header(new_header); }, coind_work->value().previous_block);

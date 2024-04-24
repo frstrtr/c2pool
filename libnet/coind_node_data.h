@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include <libp2p/network_tree_node.h>
+#include <libp2p/workflow_node.h>
 #include <libcoind/height_tracker.h>
 #include <libcoind/jsonrpc/coindrpc.h>
 #include <sharechains/share_tracker.h>
@@ -14,7 +14,7 @@
 namespace io = boost::asio;
 namespace ip = io::ip;
 
-class CoindNodeData : public NetworkTreeNode
+class CoindNodeData : public WorkflowNode
 {
 public:
 	io::io_context* context;
@@ -99,6 +99,5 @@ public:
 	void clean_tracker();
 
 	void handle_header(coind::data::BlockHeaderType new_header);
-
     void submit_block(coind::data::types::BlockType &block, bool ignore_failure);
 };

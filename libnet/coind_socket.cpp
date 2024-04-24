@@ -21,9 +21,9 @@ void CoindSocket::read_prefix(SocketPacket<ReadPacket>::ptr_type packet)
 			}
 
 			if (c2pool::dev::compare_str(packet->value.prefix, net->PREFIX, length))
-                packet->socket->read_command(packet);
+                read_command(packet);
             else
-				packet->socket->error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
+				error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
 		}
 	);
 }
