@@ -57,24 +57,30 @@ public:
         CoindNodeClient::init<ConnectorType>(context, parent_net);
     }
 
-    void run() override
+protected:
+    void run_node() override
     {
         LOG_INFO << "CoindNode running...";
-
-        CoindNodeClient::start();
+        
         CoindNode::start();
+        CoindNodeClient::start();
+        
         connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
     }
 
-    void stop() override
+    void stop_node() override
     {
         LOG_INFO << "CoindNode stopping...!";
+        dispose_events.dispose();
         CoindNodeClient::stop();
+    }
+
+    void disconnect_notify() override
+    {
         LOG_INFO << "...CoindNode stopped!";
     }
 
 public:
-
     void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol);
     void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol);
     void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol);
@@ -91,7 +97,9 @@ public:
     void handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, CoindProtocol* protocol);
     void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol);
     void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol);
+
 private:
+    Disposables dispose_events;
     c2pool::Timer work_poller_t;
 	c2pool::Timer forget_old_txs_t;
 
