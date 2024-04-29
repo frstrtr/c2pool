@@ -16,12 +16,8 @@ Some technical details - https://bitcointalk.org/index.php?topic=457574
   
   <summary>Donations towards further development of с2pool implementation in C++</summary>
 
-  
-BTC:
 
-### 1C2PooLktmeKwx7Sp7aRoDiyUy3y7TMofw
-
-PayPal donation:
+### PayPal donation:
 
 [![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=9DF676HUWAHKY)
 
@@ -30,13 +26,11 @@ PayPal donation:
 
 </details>
 
-Telegram:
+### Telegram
+https://t.me/c2pooldev
 
-### https://t.me/c2pool
-
-Discord:
-
-### https://discord.gg/yb6ujsPRsv
+### Discord:
+https://discord.gg/yb6ujsPRsv
 
 # Install:
 ### [UNIX instruction](doc/build-unix.md)
