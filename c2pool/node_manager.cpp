@@ -94,7 +94,7 @@ void NodeManager::run()
 
     // Worker
     LOG_INFO << "\t\t" << " Worker initialization...";
-    worker = new Worker(net, pool_node, coind_node, tracker);
+    worker = new Worker(context, net, pool_node, coind_node, tracker);
     pool_node->add_next_network_layer(worker);
 
     // Stratum
