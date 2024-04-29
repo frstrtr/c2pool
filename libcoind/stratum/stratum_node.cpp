@@ -42,13 +42,9 @@ void StratumNode::miner_processing(ip::tcp::socket& _socket)
 void StratumNode::listen()
 {
     acceptor.async_accept(
-        [this](const boost::system::error_code &ec, ip::tcp::socket socket)
+        [this, PROCESS_DUPLICATE](const boost::system::error_code &ec, ip::tcp::socket socket)
         {
-            if (!is_connected())
-            {
-                LOG_DEBUG_STRATUM << "StratunNode::listen() stopped, because is not connected";
-                return;
-            }
+            WORKFLOW_PROCESS();
 
             if (ec)
             {
