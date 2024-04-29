@@ -594,7 +594,7 @@ void PoolNode::start()
     }
     //TODO: self.node.tracker.removed.watch_weakref(self, lambda self, share: self.shared_share_hashes.discard(share.hash))
 
-    //TODO: if DEBUG_MODE -- WANRING; else -- THROW!
+    //TODO: if DEBUG_MODE -- WARNING; else -- THROW!
     if (!coind_node)
     {
         LOG_WARNING << "PoolNode::download_shares -- coind_node == nullptr";
@@ -609,11 +609,11 @@ void PoolNode::start()
             auto _msg = std::make_shared<message_bestblock>(*header.get());
             _peer.second->write(_msg);
         }
-    });
+    }).attach(dispose_events);
 
     coind_node->best_share->changed->subscribe([&](uint256 _best_share){
         broadcast_share(_best_share);
-    });
+    }).attach(dispose_events);
 
     /* TODO
         @self.node.tracker.verified.added.watch

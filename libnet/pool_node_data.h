@@ -12,7 +12,7 @@
 #include <networks/network.h>
 #include <libdevcore/config.h>
 #include <libdevcore/addr_store.h>
-#include <libp2p/network_tree_node.h>
+#include <libp2p/workflow_node.h>
 #include <sharechains/share.h>
 #include <sharechains/share_tracker.h>
 #include <web_interface/metrics.hpp>
@@ -56,7 +56,7 @@ struct HandleSharesData
     }
 };
 
-class PoolNodeData : public NetworkTreeNode
+class PoolNodeData : public WorkflowNode
 {
 public:
 	c2pool::dev::coind_config* config;
@@ -127,7 +127,6 @@ public:
 	void handle_bestblock(coind::data::stream::BlockHeaderType_stream header);
 	void broadcast_share(uint256 share_hash);
 
-	//TODO: rename; NetworkTreeNode::is_connected
     virtual bool is_connected()
     {
         return !peers.empty();
