@@ -6,7 +6,7 @@
 #include <sharechains/share_tracker.h>
 #include <sharechains/share_types.h>
 #include <networks/network.h>
-#include <libp2p/network_tree_node.h>
+#include <libp2p/workflow_node.h>
 #include <libdevcore/events.h>
 #include <btclibs/uint256.h>
 #include <web_interface/metrics.hpp>
@@ -212,16 +212,18 @@ protected:
     virtual void init_web_metrics() = 0;
 };
 
-class Worker : WebWorker, public NetworkTreeNode
+class Worker : WebWorker, public WorkflowNode
 {
 public:
 	const int32_t COINBASE_NONCE_LENGTH = 8;
-public:
-    Worker(c2pool::Network* net, PoolNodeData* pool_node,
-           CoindNodeData* coind_node, ShareTracker* tracker);
 
-    void run() override;
-    void stop() override;
+protected:
+    void run_node() override;
+    void stop_node() override;
+    void disconnect_notify() override;
+public:
+    Worker(boost::asio::io_context* context, c2pool::Network* net, PoolNodeData* pool_node,
+           CoindNodeData* coind_node, ShareTracker* tracker);
 
     worker_get_work_result
     get_work(std::string pubkey_hash, uint256 desired_share_target, uint256 desired_pseudoshare_target);
@@ -256,6 +258,7 @@ private:
 protected:
     void init_web_metrics() override;
 public:
+    boost::asio::io_context* _context;
     c2pool::Network* _net;
     PoolNodeData* _pool_node;
     CoindNodeData* _coind_node;

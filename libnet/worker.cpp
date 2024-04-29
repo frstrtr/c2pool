@@ -59,8 +59,11 @@ bool Work::operator!=(const Work &value) const
     return !(*this == value);
 }
 
-Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node, CoindNodeData* coind_node, ShareTracker* tracker) 
-    : _net(net),
+Worker::Worker(boost::asio::io_context* context, c2pool::Network* net, PoolNodeData* pool_node,
+                 CoindNodeData* coind_node, ShareTracker* tracker) 
+    : 
+        _context(context),
+        _net(net),
         current_work(make_variable<Work>(Work{})),
         new_work(make_event()),
         share_received(make_event()),
@@ -222,20 +225,29 @@ Worker::Worker(c2pool::Network* net, PoolNodeData* pool_node, CoindNodeData* coi
     init_web_metrics();
 }
 
-void Worker::run()
+void Worker::run_node()
 {
-    LOG_INFO << "Worker running...";
+    boost::asio::dispatch(*_context,
+        [&, PROCESS_DUPLICATE]
+        {
+            LOG_INFO << "Worker running...";
     
-    compute_work();
-    //TODO:
-    connected();
-    LOG_INFO << "...Worker connected!";
+            compute_work();
+            //TODO:
+            connected();
+            LOG_INFO << "...Worker connected!";
+        }
+    );
 }
 
-void Worker::stop()
+void Worker::stop_node()
 {
     LOG_INFO << "Worker stopping...!";
     //TODO:
+}
+
+void Worker::disconnect_notify()
+{
     LOG_INFO << "...Worker stopped!";
 }
 
