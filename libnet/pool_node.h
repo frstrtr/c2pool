@@ -129,6 +129,7 @@ private:
     NodeMode mode {NodeMode::disable};
     uint64_t nonce; // node_id
 
+    Disposables dispose_events;
     DownloadShareManager download_share_manager;
 public:
 	PoolNode(io::io_context* context_) : PoolNodeData(context_),
@@ -174,70 +175,77 @@ public:
 
 	// Pool handlers
     void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, PoolProtocol* protocol);
-
     void handle_message_addrme(std::shared_ptr<pool::messages::message_addrme> msg, PoolProtocol* protocol);
-
     void handle_message_ping(std::shared_ptr<pool::messages::message_ping> msg, PoolProtocol* protocol);
-
     void handle_message_getaddrs(std::shared_ptr<pool::messages::message_getaddrs> msg, PoolProtocol* protocol);
-
     void handle_message_shares(std::shared_ptr<pool::messages::message_shares> msg, PoolProtocol* protocol);
-
     void handle_message_sharereq(std::shared_ptr<pool::messages::message_sharereq> msg, PoolProtocol* protocol);
-
     void handle_message_sharereply(std::shared_ptr<pool::messages::message_sharereply> msg, PoolProtocol* protocol);
-
     void handle_message_bestblock(std::shared_ptr<pool::messages::message_bestblock> msg, PoolProtocol* protocol);
-
     void handle_message_have_tx(std::shared_ptr<pool::messages::message_have_tx> msg, PoolProtocol* protocol);
-
     void handle_message_losing_tx(std::shared_ptr<pool::messages::message_losing_tx> msg, PoolProtocol* protocol);
-
     void handle_message_remember_tx(std::shared_ptr<pool::messages::message_remember_tx> msg, PoolProtocol* protocol);
-
     void handle_message_forget_tx(std::shared_ptr<pool::messages::message_forget_tx> msg, PoolProtocol* protocol);
+
 private:
     void start();
     void init_web_metrics() override;
 
-public:
-    void run() override
+protected:
+    void run_node() override
     {
-        LOG_INFO << "PoolNode running...";
-        if (mode & disable)
-        {
-            LOG_WARNING << "PoolNode mode = disable!";
-            return;
-        }
+        boost::asio::dispatch(*context,
+            [&, PROCESS_DUPLICATE]
+            {
+                LOG_INFO << "PoolNode running...";
+                if (mode & disable)
+                {
+                    LOG_WARNING << "PoolNode mode = disable!";
+                    return;
+                }
 
-        PoolNode::start();
+                PoolNode::start();
 		
-        if (mode & onlyServer)
-        {
-            PoolNodeServer::start();
-        }
+                if (mode & onlyServer)
+                {
+                    PoolNodeServer::start();
+                }
 
-		if (mode & onlyClient)
-		{
-            PoolNodeClient::start();
-		}
+		        if (mode & onlyClient)
+		        {
+                    PoolNodeClient::start();
+		        }
 
-        if (!net->PERSIST)
-        {
-            connected();
-            LOG_INFO << "...PoolNode[persist] connected!";
-        }
+                // if persist is true, call connected() after first connection
+                if (!net->PERSIST)
+                {
+                    connected();
+                    LOG_INFO << "...PoolNode[persist] connected!";
+                }
+            }
+        );
     }
 
-    void stop() override
+    void stop_node() override
     {
-        LOG_INFO << "PoolNode stopping...!";
-        //TODO: stop PoolNode::start()?
+        boost::asio::dispatch(*context,
+            [&, PROCESS_DUPLICATE]
+            {
+                LOG_INFO << "PoolNode stopping...!";
+                //TODO: stop PoolNode::start()?
 
-        PoolNodeServer::stop();
-        PoolNodeClient::stop();
+                dispose_events.dispose();
 
-        peers.clear();
+                PoolNodeServer::stop();
+                PoolNodeClient::stop();
+
+                peers.clear();
+            }
+        );
+    }
+
+    void disconnect_notify() override
+    {
         LOG_INFO << "...PoolNode stopped!";
     }
 };

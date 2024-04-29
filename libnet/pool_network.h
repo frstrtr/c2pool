@@ -3,10 +3,10 @@
 #include "pool_handshake.h"
 #include "pool_node_data.h"
 #include <libp2p/node.h>
-#include <libp2p/network_tree_node.h>
+#include <libp2p/workflow_node.h>
 
 template <typename CommunicationType>
-inline void base_pool_error(const libp2p::error& err, NetworkTreeNode* node, CommunicationType* communicator)
+inline void base_pool_error(const libp2p::error& err, WorkflowNode* node, CommunicationType* communicator)
 {
     switch (err.errc)
     {
@@ -45,7 +45,7 @@ class PoolNodeServer : public Server<BasePoolSocket>
         server_connections[addr] = protocol;
         server_attempts.erase(addr);
 
-        // Set PoolNode::NetworkTreeNode connected
+        // Set PoolNode::WorkflowNode connected
         if ((data->peers.size() == 1) && data->net->PERSIST)
         {
             data->connected();
@@ -177,7 +177,7 @@ class PoolNodeClient : public Client<BasePoolSocket>
         client_connections[addr] = protocol;
 	    client_attempts.erase(addr);
 
-        // Set PoolNode::NetworkTreeNode connected
+        // Set PoolNode::WorkflowNode connected
         if ((data->peers.size() == 1) && data->net->PERSIST)
         {
             data->connected();
