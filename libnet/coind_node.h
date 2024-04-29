@@ -60,19 +60,28 @@ public:
 protected:
     void run_node() override
     {
-        LOG_INFO << "CoindNode running...";
-        
-        CoindNode::start();
-        CoindNodeClient::start();
-        
-        connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
+        boost::asio::dispatch(*context, 
+            [&, PROCESS_DUPLICATE]
+            {
+                LOG_INFO << "CoindNode running...";
+                WORKFLOW_PROCESS();
+                CoindNode::start();
+                CoindNodeClient::start();
+                connect(NetAddress(parent_net->P2P_ADDRESS, parent_net->P2P_PORT));
+            }
+        );
     }
 
     void stop_node() override
     {
-        LOG_INFO << "CoindNode stopping...!";
-        dispose_events.dispose();
-        CoindNodeClient::stop();
+        boost::asio::dispatch(*context, 
+            [&, PROCESS_DUPLICATE]
+            {
+                LOG_INFO << "CoindNode stopping...!";
+                dispose_events.dispose();
+                CoindNodeClient::stop();
+            }
+        );
     }
 
     void disconnect_notify() override
