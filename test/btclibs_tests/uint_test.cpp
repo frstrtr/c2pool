@@ -200,6 +200,34 @@ TEST(Btclibs, UINT256_CONVERT_TEST2)
     uint288 ss = s;
 }
 
+class segf_data
+{
+public:
+    std::map<uint256, bool> data;
+
+    ~segf_data()
+    {
+        std::cout << "deleted" << std::endl;
+    }
+};
+
+TEST(Btclibs, UINT256_Compare_Segf)
+{
+    segf_data* d = new segf_data();
+    d->data[uint256S("ff")];
+
+    auto f = [&d](uint256 v){
+        auto vv = std::move(v);
+        if (d->data.find(v) != d->data.end())
+        {
+            std::cout << "ok" << std::endl;
+        } 
+    ;};
+    delete d;
+    auto v = uint256S("ff");
+    f(v);
+}
+
 //int COMPARE(const uint256& a, const uint256& b)
 //{
 //    for (int i = a.WIDTH - 1; i >= 0; i--)
