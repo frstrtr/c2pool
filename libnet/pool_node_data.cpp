@@ -244,7 +244,7 @@ void PoolNodeData::send_shares(PoolProtocol* peer, std::vector<uint256> share_ha
         // Calculate tx_size and generate hashes_to_send
         for (auto x: tx_hashes)
         {
-            if (!coind_node->mining_txs->exist(x) && known_txs->exist(x))
+            if (!mining_txs->exist(x) && known_txs->exist(x))
             {
                 // hashes_to_send
                 hashes_to_send.push_back(x);
