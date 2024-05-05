@@ -12,8 +12,9 @@
 #include <sharechains/share_tracker.h>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/post.hpp>
-#include <QtWidgets/QApplication>
-#include <QSettings>
+// #include <QtWidgets/QApplication>
+// #include <QtCore/QCoreApplication>
+// #include <QSettings>
 using namespace c2pool::dev;
 using namespace shares;
 
@@ -64,28 +65,30 @@ namespace c2pool::master
 
     std::vector<NodeManager*> make_nodes(boost::asio::thread_pool &thread_pool, WebServer* web)
     {
-        QSettings networks(QApplication::applicationDirPath() + "/networks.cfg", QSettings::IniFormat);
+        // QSettings networks(QApplication::applicationDirPath() + "/networks.cfg", QSettings::IniFormat);
 
-        if (networks.allKeys().empty())
-        {
-            LOG_ERROR << "Empty network list networks.cfg!";
-            std::exit(0);
-        }
+        // if (networks.allKeys().empty())
+        // {
+        //     LOG_ERROR << "Empty network list networks.cfg!";
+        //     std::exit(0);
+        // }
 
-        LOG_INFO << "\tStarting networks (name -> activated?): ";
+        // LOG_INFO << "\tStarting networks (name -> activated?): ";
         std::vector<NodeManager*> nodes;
-        for (auto net_name : networks.allKeys())
-        {
-            LOG_INFO << "\t\t" << net_name.toStdString() << " -> " << (networks.value(net_name).toBool() ? "true" : "false");
-        }
+        // for (auto net_name : networks.allKeys())
+        // {
+        //     LOG_INFO << "\t\t" << net_name.toStdString() << " -> " << (networks.value(net_name).toBool() ? "true" : "false");
+        // }
 
-        for (auto net_name : networks.allKeys())
-        {
-            if (networks.value(net_name).toBool())
-            {
-                nodes.push_back(make_node(thread_pool, net_name.toStdString(), web));
-            }
-        }
+        // for (auto net_name : networks.allKeys())
+        // {
+        //     if (networks.value(net_name).toBool())
+        //     {
+        //         nodes.push_back(make_node(thread_pool, net_name.toStdString(), web));
+        //     }
+        // }
+
+        nodes.push_back(make_node(thread_pool, "tLTC", web));
         return std::move(nodes);
     }
 
