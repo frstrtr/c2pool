@@ -10,6 +10,11 @@ set(devcore_sources ${devcore_sources} db.h)
 #from util
 set(devcore_sources ${devcore_sources} types.h disposable.h events.h timer.h stream.h stream_types.h math.h deferred.h types.cpp math.cpp expiring_dict.h)
 
+# find_library(leveldb NAMES leveldb)
+# find_path(LEVELDB_INCLUDE_DIR leveldb/db.h /us include)
+
+# hunter_add_package(leveldb)
+find_package(leveldb REQUIRED)
 
 add_library(libdevcore STATIC ${devcore_sources})
 target_link_libraries(libdevcore Boost::coroutine Boost::log Boost::log_setup)

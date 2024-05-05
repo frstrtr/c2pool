@@ -1,9 +1,11 @@
 #pragma once
 
+#ifdef enable_qt
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
 #include <QDebug>
+#endif
 
 namespace c2pool
 {
@@ -17,6 +19,7 @@ namespace c2pool
         return std::to_string(C2POOL_MAJOR) + "." + std::to_string(C2POOL_MINOR) + "." + std::to_string(C2POOL_PATCH);
     }
 
+#ifdef enable_qt
     inline void check_version()
     {
         QNetworkAccessManager manager;
@@ -66,4 +69,5 @@ namespace c2pool
             qInfo() << "The new version is already on GitHub. Now:" << c2pool::version_str().c_str() << "- actual:" << actual_str.c_str();
         }
     }
+#endif
 }

@@ -74,11 +74,11 @@ include_directories(${Boost_INCLUDE_DIRS})
 
 set (CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-find_package(Qt6 CONFIG REQUIRED Core Network)
-find_package(Qt6 CONFIG COMPONENTS Widgets Gui)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+# find_package(Qt6 CONFIG REQUIRED Core Network)
+# find_package(Qt6 CONFIG COMPONENTS Widgets Gui)
+# set(CMAKE_AUTOMOC ON)
+# set(CMAKE_AUTORCC ON)
+# set(CMAKE_AUTOUIC ON)
 #qt_standard_project_setup()
 
 ##hunter_add_package(crc32c)
@@ -90,7 +90,7 @@ set(CMAKE_AUTOUIC ON)
 set(JSON_Install OFF CACHE INTERNAL "")
 add_subdirectory(include/json)
 
-add_subdirectory(libs)
+# add_subdirectory(libs)
 #---------------
 include_directories(include)
 include_directories(${CMAKE_SOURCE_DIR})
@@ -107,4 +107,11 @@ add_subdirectory(libp2p)
 add_subdirectory(c2pool)
 
 #TESTS
-add_subdirectory(test)
+# add_subdirectory(test)
+
+include(InstallRequiredSystemLibraries)
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.md")
+set(CPACK_PACKAGE_VERSION_MAJOR ${ver_major})
+set(CPACK_PACKAGE_VERSION_MINOR ${ver_minor})
+set(CPACK_PACKAGE_VERSION_PATCH ${ver_patch})
+include(CPack)

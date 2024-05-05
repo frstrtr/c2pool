@@ -18,7 +18,7 @@ namespace po = boost::program_options;
 #include <QtWidgets/QApplication>
 #include "c2pool_main_menu.h"
 #else
-#include <QCoreApplication>
+// #include <QCoreApplication>
 #endif
 
 #include <libdevcore/config.h>
@@ -39,7 +39,7 @@ int main(int argc, char *argv[])
 #ifdef C2POOL_UI_USE
     QApplication app(argc, argv);
 #else
-    QCoreApplication app(argc, argv);
+    // QCoreApplication app(argc, argv);
 #endif
     c2pool_config::INIT();
     //========================================================================================================================
@@ -69,10 +69,10 @@ int main(int argc, char *argv[])
     po::store(parse_option, vm);
     po::notify(vm);
 
-    if (!vm.count("disable_check_version"))
-    {
-        c2pool::check_version();
-    }
+    // if (!vm.count("disable_check_version"))
+    // {
+    //     c2pool::check_version();
+    // }
 
     if (vm.count("ui_config"))
     {
