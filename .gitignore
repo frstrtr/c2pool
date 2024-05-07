@@ -33,6 +33,7 @@
 
 # CMake
 /cmake-build-debug
+CMakeUserPresets.json
 
 #other
 /.idea
@@ -40,6 +41,7 @@
 *.pyc
 /build
 /.vscode
+/*_build
 
 #Visual Studio
 /.vs
@@ -49,9 +51,10 @@ doc/concepts/TestIdeaProtocolWithMessages.pdb
 doc/concepts/TestIdeaProtocolWithMessages.ilk
 vc140.pdb
 
-#p2pool
+#c2pool
 /logs
 /data
+/legacy
 
 #private configs
 /test/coind_tests/pass.h
