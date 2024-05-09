@@ -1,9 +1,11 @@
 set(source 
-    pool_config.hpp pool_config.cpp 
-    network_config.hpp network_config.cpp
+    config_pool.hpp config_pool.cpp
+    config_coin.hpp config_coin.cpp 
     log.hpp log.cpp
-    filesystem.hpp filesystem.cpp
-    )
+    filesystem.hpp
+)
 
-add_library(core STATIC ${source})
-target_link_libraries(core boost::boost)
+find_package(yaml-cpp REQUIRED)
+
+add_library(core STATIC ${source} )
+target_link_libraries(core boost::boost yaml-cpp::yaml-cpp)

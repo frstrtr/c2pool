@@ -6,7 +6,6 @@
 #include <btclibs/uint256.h>
 #include <nlohmann/json.hpp>
 
-
 int main(int argc, char *argv[])
 {
     c2pool::log::Logger::init();
