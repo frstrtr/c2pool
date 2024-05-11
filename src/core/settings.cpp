@@ -10,7 +10,7 @@ std::string c2pool::settings::get_default()
 
     out << YAML::BeginMap;
     out << YAML::Key << "testnet" << YAML::Value << false;
-    out << YAML::Key << "networks" << YAML::BeginSeq << "<network_name>" << YAML::Comment("CHANGE IT!") << YAML::EndSeq;
+    out << YAML::Key << "networks" << YAML::BeginSeq << "default_network" << YAML::Comment("template network") << YAML::EndSeq;
     out << YAML::Key << "fee" << YAML::Value << 0;
     out << YAML::EndMap;
     // for (const auto& network : networks)
@@ -20,27 +20,25 @@ std::string c2pool::settings::get_default()
     return result;
 }
 
-#define PARSE_CONFIG(field, type)  \
-    if (data[#field])      \
-        result->m_##field = data[#field].as<type>();
 
-c2pool::settings* c2pool::settings::load()
+
+void c2pool::settings::load()
 {
-    YAML::Node data = YAML::LoadFile(filesystem::config_path() / default_filename);
-    c2pool::settings* result = new c2pool::settings();
-        
-    PARSE_CONFIG(testnet, bool);
-    PARSE_CONFIG(networks, std::vector<std::string>);
-    PARSE_CONFIG(fee, float);
+    YAML::Node node = YAML::LoadFile(filesystem::config_path() / default_filename);
+    
+    PARSE_CONFIG(node, testnet, bool);
+    PARSE_CONFIG(node, networks, std::vector<std::string>);
+    PARSE_CONFIG(node, fee, float);
 
-    return result;
-}
-#undef parse
-
-void c2pool::settings::parse_networks()
-{
-    for (const auto& net : m_networks)
+    for (const auto& network : m_networks)
     {
-        
+        parse_network_config(network, node);
     }
+}
+
+void c2pool::settings::parse_network_config(std::string name, YAML::Node& node)
+{
+    // auto net_node = node[network];
+    
+    // PARSE_CONFIG(net_node, arg, bool);
 }

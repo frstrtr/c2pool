@@ -1,5 +1,5 @@
 set(source 
-    config.hpp config.cpp 
+    fileconfig.hpp fileconfig.cpp
     settings.hpp settings.cpp
     log.hpp log.cpp
     filesystem.hpp
