@@ -4,6 +4,7 @@
 #include <string>
 #include <map>
 
+#include <core/config.hpp>
 #include <core/fileconfig.hpp>
 
 namespace YAML
@@ -14,7 +15,7 @@ namespace YAML
 namespace c2pool
 {
 
-class settings : public fileconfig
+class Settings : public Fileconfig
 {
     static constexpr const char* default_filename = "settings.yaml";
 
@@ -26,12 +27,14 @@ protected:
     void load() override;
 
 public:
-    settings() 
-        : c2pool::fileconfig(c2pool::filesystem::config_path() / default_filename)
+    Settings() 
+        : c2pool::Fileconfig(c2pool::filesystem::config_path() / default_filename)
     {
 
     }
 
+    std::map<std::string, c2pool::Config*> m_configs;
+    
     bool m_testnet;
     std::vector<std::string> m_networks;
     float m_fee;
