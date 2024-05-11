@@ -12,6 +12,13 @@ std::string c2pool::settings::get_default()
     out << YAML::Key << "testnet" << YAML::Value << false;
     out << YAML::Key << "networks" << YAML::BeginSeq << "default_network" << YAML::Comment("template network") << YAML::EndSeq;
     out << YAML::Key << "fee" << YAML::Value << 0;
+    
+    // default_network
+    {
+        out << YAML::BeginMap;
+        
+        out << YAML::EndMap;
+    }
     out << YAML::EndMap;
     // for (const auto& network : networks)
     //  << YAML::EndSeq;
