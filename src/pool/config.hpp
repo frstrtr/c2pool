@@ -3,12 +3,14 @@
 #include <string>
 #include <vector>
 
+#include <core/fileconfig.hpp>
+
 namespace c2pool
 {
 
 namespace pool
 {
-    class config
+    class config : c2pool::fileconfig
     {
         static constexpr const char* default_filename = "config.yaml";
 
@@ -25,7 +27,7 @@ namespace pool
 
 namespace coin
 {
-    class config
+    class config : c2pool::fileconfig
     {
         static constexpr const char* default_filename = "coin.yaml";
 
