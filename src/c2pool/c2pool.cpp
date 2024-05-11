@@ -20,7 +20,7 @@ int main(int argc, char *argv[])
     // fout << c2pool::pool::config::get_default();
     // fout.close();
 
-    auto settings = c2pool::fileconfig::load_file<c2pool::settings>();
+    auto settings = c2pool::Fileconfig::load_file<c2pool::Settings>();
 
     // std::map<std::string, c2pool::fileconfig*> configs;
     // for (const auto& net : settings->m_networks)
