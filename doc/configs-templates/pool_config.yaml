@@ -1,0 +1,9 @@
+# c2pool testnet
+testnet: false
+# coin networks
+networks:
+  - LTC
+  - BTC
+  - DGB
+# fee % [double]
+fee: 0

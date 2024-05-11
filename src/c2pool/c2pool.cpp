@@ -1,5 +1,9 @@
 #include <iostream>
 
+#include <core/settings.hpp>
+#include <core/config.hpp>
+#include <fstream>
+
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
 
@@ -9,14 +13,22 @@
 int main(int argc, char *argv[])
 {
     c2pool::log::Logger::init();
-    c2pool::log::Logger::add_category("all");
+    // c2pool::log::Logger::add_category("all");
 
-    std::cout << nlohmann::json::meta() << std::endl;
-    std::cout << uint256S("ff").GetHex() << std::endl;
-    std::cout << c2pool::filesystem::config_path() << std::endl;
-    std::cout << c2pool::filesystem::current_path() << std::endl;
-     
-    std::cout << c2pool::log::Logger::check_category(c2pool::log::COIND_RPC) << std::endl;
-    BOOST_LOG_TRIVIAL(info) << "hi";
-    LOG_DEBUG_POOL << "DEBUG DATA";
+    // std::ofstream fout(c2pool::filesystem::config_path() / "config.yaml");
+    // std::cout << c2pool::pool::config::get_default() << std::endl;
+    // fout << c2pool::pool::config::get_default();
+    // fout.close();
+
+    c2pool::settings* settings = c2pool::settings::load();
+
+    std::map<std::string, c2pool::config*> configs;
+    for (const auto& net : settings->m_networks)
+    {
+        c2pool::config* config = c2pool::config::load(net);
+        configs[net] = config;
+    }
+    // std::cout << cfg->m_fee << std::endl;
+    // for (const auto& net : cfg->m_networks)
+    //     std::cout << net << std::endl;
 }

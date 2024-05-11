@@ -1,6 +1,6 @@
 set(source 
-    config_pool.hpp config_pool.cpp
-    config_coin.hpp config_coin.cpp 
+    config.hpp config.cpp 
+    settings.hpp settings.cpp
     log.hpp log.cpp
     filesystem.hpp
 )
