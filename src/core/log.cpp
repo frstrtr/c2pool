@@ -86,7 +86,7 @@ void Logger::init()
         boost::log::keywords::rotation_size = 10 * 1024 * 1024,
         boost::log::keywords::min_free_space = 30 * 1024 * 1024,
         boost::log::keywords::open_mode = std::ios_base::app,
-        keywords::target = c2pool::filesystem::config_path()
+        keywords::target = c2pool::filesystem::config_path() / "logs"
     );
     fsSink->set_formatter(logFmt);
     fsSink->locked_backend()->auto_flush(true);
