@@ -16,40 +16,43 @@ namespace c2pool
     if (node[#field])      \
         PARSE_CONFIG(node, field, type)
 
-class fileconfig
+class Fileconfig
 {
-    std::filesystem::path m_filepath;
-
 protected:
+    std::filesystem::path m_filepath;
+    
     virtual std::string get_default() = 0;
     virtual void load() = 0;
     
+    inline void init()
+    {
+        // check for exist path + make default
+        if (!std::filesystem::exists(m_filepath))
+        {
+            std::filesystem::create_directory(m_filepath.parent_path());
+        
+            std::ofstream file(m_filepath);
+            file << get_default();
+            file.close();
+            LOG_WARNING << "Config (" << m_filepath << "): not found, created default.";
+        }
+        load();
+    }
+
 public:
-    fileconfig(std::filesystem::path filepath) : m_filepath(filepath)
+    Fileconfig(std::filesystem::path filepath) : m_filepath(filepath)
     {
 
     }
     
-    template <typename CONFIG_TYPE>
-    static CONFIG_TYPE* load_file()
+    template <typename CONFIG_TYPE, typename... Args>
+    static CONFIG_TYPE* load_file(Args... args)
     {
-        static_assert(std::is_base_of<fileconfig, CONFIG_TYPE>(), "CONFIG_TYPE in fileconfig::load_file not based from fileconfig");
+        static_assert(std::is_base_of<Fileconfig, CONFIG_TYPE>(), "CONFIG_TYPE in fileconfig::load_file not based from fileconfig");
         
-        fileconfig* config = new CONFIG_TYPE();
-
-        // check for exist path + make default
-        if (!std::filesystem::exists(config->m_filepath))
-        {
-            std::filesystem::create_directory(config->m_filepath.parent_path());
-        
-            std::ofstream file(config->m_filepath);
-            file << config->get_default();
-            file.close();
-            LOG_WARNING << "Config (" << config->m_filepath << "): not found, created default.";
-        }
-
+        Fileconfig* config = new CONFIG_TYPE(args...);
         // load from file
-        config->load();
+        config->init();
         
         return static_cast<CONFIG_TYPE*>(config);
     }
