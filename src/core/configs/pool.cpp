@@ -23,7 +23,7 @@ std::string Config::get_default()
 
 void Config::load()
 {
-    YAML::Node node = YAML::LoadFile(m_filepath);
+    YAML::Node node = YAML::LoadFile(m_filepath.string());
     
     PARSE_CONFIG(node, worker, std::string);
 }
