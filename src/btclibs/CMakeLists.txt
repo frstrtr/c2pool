@@ -32,4 +32,4 @@ set(sources
 
 add_library(btclibs STATIC ${sources}) #${SOURCE} ${HEADER})
 target_include_directories(btclibs PUBLIC util crypto compat)
-target_link_libraries(btclibs nlohmann_json::nlohmann_json)
+target_link_libraries(btclibs boost::boost nlohmann_json::nlohmann_json)
