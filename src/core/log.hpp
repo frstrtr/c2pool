@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <atomic>
+#include <optional>
+#include <vector>
+#include <map>
 #include <string>
 
 #include <boost/log/trivial.hpp>
@@ -70,3 +73,78 @@ public:
 } //namespace logger
 
 } //namespace c2pool
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, const std::optional<T> &data)
+{
+    stream << "({Opt}: ";
+    if (data.has_value())
+    {
+        stream << data.value();
+    } else
+    {
+        stream << "nullopt";
+    }
+    stream << ")";
+    return stream;
+}
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, std::vector<T> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << v << ", ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template<typename T>
+std::ostream &operator<<(std::ostream &stream, const std::vector<T> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << v << ", ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <>
+inline std::ostream &operator<<<unsigned char>(std::ostream &stream, std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << ", ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <>
+inline std::ostream &operator<<<unsigned char>(std::ostream &stream, const std::vector<unsigned char> &data)
+{
+    stream << "[ ";
+    for (auto v : data)
+    {
+        stream << (unsigned int) v << " ";
+    }
+    stream << "\b ]";
+    return stream;
+}
+
+template <typename T, typename K>
+inline std::ostream &operator<<(std::ostream &stream, std::map<T, K> &data)
+{
+    stream << "[ ";
+    for (auto [k, v] : data)
+    {
+        stream << "(" << k << ": " << v << ");";
+    }
+    stream << "\b ]";
+    return stream;
+}
