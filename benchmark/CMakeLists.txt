@@ -1,2 +1,5 @@
-add_executable(json_type_benchmark json_type_benchmark.cpp)
-target_link_libraries(json_type_benchmark core)
+add_executable(pack_benchmark pack_benchmark.cpp)
+target_link_libraries(pack_benchmark core)
+
+add_executable(visit_benchmark visit_benchmark.cpp)
+target_link_libraries(visit_benchmark core)
