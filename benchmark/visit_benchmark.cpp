@@ -91,14 +91,16 @@ int main()
     std::string name;
     // std::cin >> name;
     name = "T65";
+    CallTypeF* caller = new CallTypeF();
     auto begin = c2pool::debug_timestamp();
     for (int i = 0; i < 100'000; i++)
     {
         types a;
         make_type(a, name);
-        std::visit(CallTypeF{}, a);
+        std::visit(*caller, a);
     }
     auto finish = c2pool::debug_timestamp();
+
     std::cout << count << std::endl;
     std::cout << finish-begin << std::endl;
 }
