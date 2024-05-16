@@ -3,3 +3,6 @@ target_link_libraries(pack_benchmark core)
 
 add_executable(visit_benchmark visit_benchmark.cpp)
 target_link_libraries(visit_benchmark core)
+
+add_executable(map_func_benchmark map_func_benchmark.cpp)
+target_link_libraries(map_func_benchmark core)

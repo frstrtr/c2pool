@@ -93,7 +93,7 @@ int main()
     name = "T65";
     CallTypeF* caller = new CallTypeF();
     auto begin = c2pool::debug_timestamp();
-    for (int i = 0; i < 100'000; i++)
+    for (int i = 0; i < 1'000'000; i++)
     {
         types a;
         make_type(a, name);
