@@ -2,6 +2,7 @@ set(pool_source
     api.hpp
     node.hpp
     protocol.hpp
+    handler.hpp
 )
 
 # add_library(pool ${pool_source})
