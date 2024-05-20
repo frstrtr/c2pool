@@ -5,7 +5,6 @@
 
 #include <core/common.hpp>
 
-
 template <typename T>
 class Base 
 {
