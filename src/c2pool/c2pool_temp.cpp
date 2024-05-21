@@ -10,7 +10,7 @@
 #include <btclibs/uint256.h>
 #include <nlohmann/json.hpp>
 
-#include <pool_impl/ltc/protocol.hpp>
+#include <pool/impl/ltc/protocol.hpp>
 
 int main(int argc, char *argv[])
 {

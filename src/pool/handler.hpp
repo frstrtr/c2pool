@@ -19,10 +19,10 @@ protected:
     using callback_type = std::function<void(protocol_type*, PackStream&)>;
 
     template <typename MESSAGE_TYPE>
-    static std::unique_ptr<MESSAGE_TYPE> parse_message(const std::string& cmd, PackStream &stream)
+    static std::unique_ptr<MESSAGE_TYPE> parse_message(PackStream &stream)
     {
         static_assert(std::is_base_of<Message, MESSAGE_TYPE>());
-        auto msg = std::make_unique<MESSAGE_TYPE>(cmd);
+        auto msg = std::make_unique<MESSAGE_TYPE>();
         stream >> *msg;
         return std::move(msg);
     }
@@ -65,7 +65,7 @@ public:
         return getFunctionMapStatic();                                                                 \
     }
 
-#define ADD_MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) {#cmd, [&](protocol_type *protocol, PackStream& stream) { auto msg = parse_message<msg_type>(#cmd, stream); protocol->cmd(std::move(msg)); }},
+#define ADD_MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) {#cmd, [&](protocol_type *protocol, PackStream& stream) { auto msg = parse_message<msg_type>(stream); protocol->cmd(std::move(msg)); }},
 #define ADD_MESSAGE_CALLBACK(cmd) ADD_MESSAGE_CALLBACK_CUSTOM(cmd, message_##cmd)
 
 #define MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) void cmd(std::unique_ptr<msg_type> message)
