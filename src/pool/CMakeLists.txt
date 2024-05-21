@@ -3,7 +3,8 @@ set(pool_source
     node.hpp
     protocol.hpp
     handler.hpp
+    message.hpp
 )
 
-# add_library(pool ${pool_source})
-# target_link_libraries(pool STATIC core)
+add_library(pool ${pool_source})
+target_link_libraries(pool core)

@@ -1,8 +1,9 @@
 #include <iostream>
+#include <fstream>
 
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
-#include <fstream>
+#include <core/pack.hpp>
 
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
