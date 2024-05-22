@@ -50,12 +50,12 @@ public:
 
 } // namespace c2pool
 
-#define INIT_MESSAGE_HANDLER_BEGIN                                                                      \
+#define BEGIN_INIT_MESSAGE_HANDLER()                                                                    \
     static std::map<std::string, callback_type> &getFunctionMapStatic()                                 \
     {                                                                                                   \
         static std::map<std::string, callback_type> functionMap = {
 
-#define INIT_MESSAGE_HANDLER_FINISH                                                                    \
+#define END_INIT_MESSAGE_HANDLER()                                                                     \
         };                                                                                             \
         return functionMap;                                                                            \
     }                                                                                                  \
