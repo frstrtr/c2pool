@@ -6,11 +6,9 @@ namespace ltc
 
 class Protocol : public c2pool::pool::MessageHandler<ltc::Protocol>
 {
-    INIT_MESSAGE_HANDLER_BEGIN
-
-    ADD_MESSAGE_CALLBACK(ping)
-
-    INIT_MESSAGE_HANDLER_FINISH
+    BEGIN_INIT_MESSAGE_HANDLER()
+        ADD_MESSAGE_CALLBACK(ping)
+    END_INIT_MESSAGE_HANDLER()
 
 public:
     MESSAGE_CALLBACK(ping)
