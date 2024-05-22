@@ -1,6 +1,10 @@
 #pragma once
 
+#include <core/pack.hpp>
+#include <core/pack_types.hpp>
+
 #include <pool/message.hpp>
+#include <pool/message_macro.hpp>
 
 namespace ltc
 {
@@ -12,7 +16,12 @@ namespace ltc
 // };
 
 BEGIN_MESSAGE(ping)
-    
+    MESSAGE_FIELDS
+    (
+        (IntType(8), data),
+        (IntType(16), data2),
+        (IntType(32), data3)
+    )
 END_MESSAGE()
 
 // MAKE_MESSAGE(
