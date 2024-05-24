@@ -35,4 +35,6 @@ int main(int argc, char *argv[])
     // for (const auto& net : cfg->m_networks)
     //     std::cout << net << std::endl;
     ltc::Protocol* protocol;
+
+    ltc::message_ping ping = ltc::message_ping::make(1, 2, 3);
 }
