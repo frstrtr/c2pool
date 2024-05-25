@@ -18,7 +18,7 @@ namespace ltc
 BEGIN_MESSAGE(ping)
     MESSAGE_FIELDS
     (
-        (IntType(8), data),
+        (IntType(64), data),
         (IntType(16), data2),
         (IntType(32), data3)
     )

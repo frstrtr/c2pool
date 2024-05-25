@@ -12,6 +12,9 @@
 #define _MESSAGE_DATA_MAKE_ARGS(pack_type, field_name) pack_type::get_type _##field_name
 #define MESSAGE_DATA_MAKE_ARGS(data) _MESSAGE_DATA_MAKE_ARGS data
 
+#define _MESSAGE_DATA_INIT_ARGS(pack_type, field_name) result->m_##field_name = _##field_name;
+#define MESSAGE_DATA_INIT_ARGS(data) _MESSAGE_DATA_INIT_ARGS data
+
 #define BEGIN_MESSAGE(cmd)\
     class message_##cmd : public c2pool::pool::Message {\
     private:\
@@ -33,7 +36,9 @@
     \
     static std::unique_ptr<message_type> make(C2POOL_EXPAND(C2POOL_MULTIPLE_CALL_MACRO(ENUMERATE, MESSAGE_DATA_MAKE_ARGS, __VA_ARGS__)))\
     {\
-        return std::make_unique<message_type>();\
+        auto result = std::make_unique<message_type>();\
+        C2POOL_EXPAND(C2POOL_MULTIPLE_CALL_MACRO(PASTE, MESSAGE_DATA_INIT_ARGS, __VA_ARGS__));\
+        return result;\
     }\
 
 #define END_MESSAGE() };
