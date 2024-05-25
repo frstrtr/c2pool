@@ -37,4 +37,5 @@ int main(int argc, char *argv[])
     ltc::Protocol* protocol;
 
     auto ping = ltc::message_ping::make(1, 2, 3);
+    std::cout << ping->m_command << ": " << ping->m_data << " " << ping->m_data2 << " " << ping->m_data3 << std::endl;
 }
