@@ -12,6 +12,7 @@ set(source
     pack.hpp pack_types.hpp
     ${legacy_sources}
     common.hpp
+    macro.hpp
 )
 
 find_package(yaml-cpp REQUIRED)

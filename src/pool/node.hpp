@@ -19,9 +19,7 @@ public:
 
     }
 
-
-
-    // Client* make_connectiona
+    // Client* make_connection
 };
 
 } // namespace pool

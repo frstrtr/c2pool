@@ -22,7 +22,7 @@
 // #define MAKE_ARG5(x) MAKE_ARG4, x
 
 
-#define _make_args(TYPE, NAME) TYPE NAME
+#define _make_args(TYPE, NAME) TYPE _##NAME
 #define make_args(X) _make_args X
 
     //inline void name(MAKE_ARGS_EXPAND(MAKE_ARGS_PASTE(make_args, __VA_ARGS__)))
