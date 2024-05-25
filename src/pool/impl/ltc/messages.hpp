@@ -24,6 +24,7 @@ BEGIN_MESSAGE(ping)
     )
 END_MESSAGE()
 
+
 // MAKE_MESSAGE(
 //     version, 
 //     (int, version),

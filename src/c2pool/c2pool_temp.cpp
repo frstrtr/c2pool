@@ -36,5 +36,5 @@ int main(int argc, char *argv[])
     //     std::cout << net << std::endl;
     ltc::Protocol* protocol;
 
-    ltc::message_ping ping = ltc::message_ping::make(1, 2, 3);
+    auto ping = ltc::message_ping::make(1, 2, 3);
 }
