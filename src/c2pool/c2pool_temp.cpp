@@ -36,6 +36,13 @@ int main(int argc, char *argv[])
     //     std::cout << net << std::endl;
     ltc::Protocol* protocol;
 
-    auto ping = ltc::message_ping::make(1, 2, 3);
+    auto ping = ltc::message_ping::make(1, 2, 311);
     std::cout << ping->m_command << ": " << ping->m_data << " " << ping->m_data2 << " " << ping->m_data3 << std::endl;
+
+    PackStream stream;
+    stream << *ping;
+    std::cout << stream << std::endl;
+
+    auto ping2 = ltc::message_ping::make(stream);
+    std::cout << ping2->m_command << ": " << ping2->m_data << " " << ping2->m_data2 << " " << ping2->m_data3 << std::endl;
 }

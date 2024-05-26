@@ -22,15 +22,9 @@ public:
 
     Message(std::string command) : m_command(std::move(command)) {}
 
-    virtual PackStream &write(PackStream &stream)
-    { 
-        return stream; 
-    }
+    virtual PackStream &write(PackStream &stream) = 0;
 
-    virtual PackStream &read(PackStream &stream)
-    { 
-        return stream;
-    }
+    virtual PackStream &read(PackStream &stream) = 0;
 };
 
 class RawMessage : public Message
@@ -56,14 +50,3 @@ public:
 } // namespace pool
 
 } // namespace c2pool
-
-// #define BEGIN_MESSAGE(cmd)\
-//     struct message_##cmd : public c2pool::pool::Message {\
-//         message_##cmd() : c2pool::pool::Message(#cmd) {}\
-//         \
-//         struct _packed_type{\
-//             \
-//         };
-
-// #define END_MESSAGE() };
-

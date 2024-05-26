@@ -69,6 +69,13 @@
         return result;\
     }\
     \
+    static std::unique_ptr<message_type> make(PackStream& stream)\
+    {\
+        auto result = std::make_unique<message_type>();\
+        stream >> *result;\
+        return result;\
+    }\
+    \
     PackStream& write(PackStream& stream) override\
     {\
         packed_type packed;\
