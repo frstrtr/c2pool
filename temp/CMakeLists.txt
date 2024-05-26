@@ -5,3 +5,5 @@ add_executable(t4 t4.cpp)
 add_executable(make_dict make_dict.cpp)
 add_executable(other other.cpp)
 add_executable(def def.cpp def_macro.hpp new_macro.hpp)
+
+add_subdirectory(new_pack)
