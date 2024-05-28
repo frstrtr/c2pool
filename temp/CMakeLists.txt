@@ -6,5 +6,6 @@ add_executable(make_dict make_dict.cpp)
 add_executable(other other.cpp)
 add_executable(def def.cpp def_macro.hpp new_macro.hpp)
 add_executable(struct_for_struct struct_for_struct.cpp)
+add_executable(template_macro template_macro.cpp)
 
 add_subdirectory(new_pack)
