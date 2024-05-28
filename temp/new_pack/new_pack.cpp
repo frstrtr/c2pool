@@ -4,7 +4,6 @@
 #include <memory>
 #include <cstring>
 #include <iomanip>
-#include <bits/basic_string.h>
 #include <string>
 
 #include "packv2.hpp"
@@ -57,33 +56,44 @@ TEST(STRING)
     std::cout << "str2: [" << str2 << "]" << std::endl;
 END_TEST()
 
+struct custom
+{
+    int32_t m_i;
+    std::string m_str;
+    int64_t m_h;
+
+    custom(int32_t i, std::string str, int64_t h) 
+        : m_i(i), m_str(str), m_h(h)
+    {
+
+    }
+
+    SERIALIZE_METHODS(custom, obj) { READWRITE(obj.m_i, obj.m_str, obj.m_sh); }
+
+    // struct _custom : public PackType<custom>
+    // {
+    //     using i = IntType<32>;
+    //     using str = StrType;
+    //     using h = IntType<64>;
+
+    //     static void serialize(PackStream& os, const custom& v)
+    //     {
+    //         os << i::serialize(v.i) << str::serialize(v.str) << h::serialize(v.str);
+    //     }
+
+    //     // static void unserialize(PackStream& os, custom& v)
+    //     // {
+    //     //     os >> i(v.i) >> str(v.str) >> h(v.h);
+    //     // }
+    // };
+};
+
 TEST(CUSTOM_TYPE)
     PackStream stream;
 
-    struct custom
-    {
-        int32_t i;
-        std::string str;
-        int64_t h;
-
-        struct _custom : public PackType<custom>
-        {
-            using i = IntType<32>;
-            using str = StrType;
-            using h = IntType<64>;
-
-            static void serialize(PackStream& os, const custom& v)
-            {
-                os << i(v.i) << str(v.str) << h(v.str);
-            }
-
-            static void unserialize(PackStream& os, custom& v)
-            {
-                os >> i(v.i) >> str(v.str) >> h(v.h);
-            }
-        };
-    };
-    
+    custom value(100, "200", 300);
+    stream << value;
+    stream.print();
     
 END_TEST()
 
