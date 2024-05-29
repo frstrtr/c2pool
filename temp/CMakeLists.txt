@@ -9,3 +9,4 @@ add_executable(struct_for_struct struct_for_struct.cpp)
 add_executable(template_macro template_macro.cpp)
 
 add_subdirectory(new_pack)
+add_subdirectory(packv2)
