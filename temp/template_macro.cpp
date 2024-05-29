@@ -71,13 +71,22 @@ void inits(PackType type, ObjType& obj, args&&... v)
     inits(v...);
 }
 
-
-
 template <typename Type, typename T>
 static inline Wrapper<Type, T&> Using(T&& v)
 {
     return Wrapper<Type, T&>(v);
 };
+
+void func(int32_t&& n)
+{
+    std::cout << "32: " << n << std::endl;
+}
+
+void func(int16_t&& n)
+{
+    std::cout << "16: " << n << std::endl;
+    n += 1;
+}
 
 int main()
 {
@@ -93,4 +102,10 @@ int main()
     std::cout << "####" << std::endl;
     std::cout << i << std::endl;
     std::cout << f << std::endl;
+
+    int32_t n1 = 322;
+    int16_t n2 = 1337;
+    func(n1);
+    func(std::move(n2));
+    std::cout << "16+1: " << n2 << std::endl;
 }

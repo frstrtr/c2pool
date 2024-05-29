@@ -102,5 +102,6 @@ int main()
     test_INT();
     test_STRING();
     test_CUSTOM_TYPE();
+    
     return 0;
 }
