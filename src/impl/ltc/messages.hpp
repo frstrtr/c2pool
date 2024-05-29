@@ -16,12 +16,12 @@ namespace ltc
 // };
 
 BEGIN_MESSAGE(ping)
-    MESSAGE_FIELDS
-    (
-        (IntType(64), data),
-        (IntType(16), data2),
-        (IntType(32), data3)
-    )
+    // MESSAGE_FIELDS
+    // (
+    //     (IntType(64), data),
+    //     (IntType(16), data2),
+    //     (IntType(32), data3)
+    // )
 END_MESSAGE()
 
 

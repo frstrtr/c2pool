@@ -252,6 +252,13 @@ struct PackStream
         return *this;
     }
 
+    template <StreamObjType T>
+    PackStream &operator<<(T &val)
+    {
+        val.write(*this);
+        return *this;
+    }
+
     template <typename T>
     PackStream &operator<<(T &val)
     {
@@ -268,13 +275,6 @@ struct PackStream
         unsigned char *packed = reinterpret_cast<unsigned char *>(&val);
         int32_t len = sizeof(val) / sizeof(*packed);
         data.insert(data.end(), packed, packed + len);
-        return *this;
-    }
-
-    template <StreamObjType T>
-    PackStream &operator<<(T &val)
-    {
-        val.write(*this);
         return *this;
     }
 
