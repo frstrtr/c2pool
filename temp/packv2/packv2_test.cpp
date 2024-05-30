@@ -74,7 +74,7 @@ struct custom
 
     void print() const
     {
-        std::cout << m_i << " " << m_str << " " << m_h << std::endl;
+        std::cout << m_i << " <" << m_str << "> " << m_h << std::endl;
     }
 
     SERIALIZE_METHODS(custom) { READWRITE(obj.m_i, obj.m_str, obj.m_h); }
@@ -83,7 +83,7 @@ struct custom
 TEST(CUSTOM_TYPE)
     PackStream stream;
     
-    custom value1(100, "200", 300);
+    custom value1(100, "hello c2pool", 300);
     value1.print();
     stream << value1;
     stream.print();
