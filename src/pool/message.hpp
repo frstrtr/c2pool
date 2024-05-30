@@ -22,30 +22,30 @@ public:
 
     Message(std::string command) : m_command(std::move(command)) {}
 
-    virtual PackStream &write(PackStream &stream) = 0;
+    // virtual PackStream &write(PackStream &stream) = 0;
 
-    virtual PackStream &read(PackStream &stream) = 0;
+    // virtual PackStream &read(PackStream &stream) = 0;
 };
 
-class RawMessage : public Message
-{
-public:
-    PackStream value;
+// class RawMessage : public Message
+// {
+// public:
+//     PackStream value;
 
-    RawMessage(std::string _command) : Message(_command) { }
+//     RawMessage(std::string _command) : Message(_command) { }
 
-    PackStream &write(PackStream &stream) override
-    {
-        stream << value;
-        return stream;
-    }
+//     PackStream &write(PackStream &stream) override
+//     {
+//         stream << value;
+//         return stream;
+//     }
 
-    PackStream &read(PackStream &stream) override
-    {
-        stream >> value;
-        return stream;
-    }
-};
+//     PackStream &read(PackStream &stream) override
+//     {
+//         stream >> value;
+//         return stream;
+//     }
+// };
 
 } // namespace pool
 
