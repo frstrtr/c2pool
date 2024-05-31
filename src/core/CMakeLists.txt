@@ -1,6 +1,6 @@
 file(GLOB configs_source "configs/*.hpp" "configs/*.cpp")
 
-set(legacy_sources #[[packv1.hpp pack_typesv1.hpp]] math.hpp math.cpp)
+set(legacy_sources packv1.hpp pack_typesv1.hpp math.hpp math.cpp)
 
 set(source 
     fileconfig.hpp
@@ -13,6 +13,7 @@ set(source
     ${legacy_sources}
     common.hpp
     macro.hpp
+    netaddress.hpp
 )
 
 find_package(yaml-cpp REQUIRED)
