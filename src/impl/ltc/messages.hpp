@@ -3,6 +3,7 @@
 #include <string>
 
 #include <core/pack.hpp>
+#include <core/netaddress.hpp>
 
 #include <pool/message.hpp>
 #include <pool/message_macro.hpp>
@@ -16,15 +17,15 @@ BEGIN_MESSAGE(version)
     (
         (uint32_t, m_version),
         (uint64_t, m_services),
-        //TODO: address_type addr_to
-        //TODO: address_type addr_from
+        (NetAddr, m_addr_to),
+        (NetAddr, m_addr_from),
         (uint64_t, m_nonce),
         (std::string, m_subversion),
         (uint32_t, m_mode) //# always 1 for legacy compatibility
         //TODO: PossibleNoneType<IntType(256)> m_best_share;
     )
     {
-        READWRITE(obj.m_version, obj.m_services, /*m_addr_to, m_addr_from,*/ obj.m_nonce, obj.m_subversion, obj.m_mode/*, m_best_share*/);
+        READWRITE(obj.m_version, obj.m_services, obj.m_addr_to, obj.m_addr_from, obj.m_nonce, obj.m_subversion, obj.m_mode/*, m_best_share*/);
     }
 END_MESSAGE()
 
