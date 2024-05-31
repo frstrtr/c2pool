@@ -16,6 +16,9 @@
 // TODO: Rework for std::span (c++20) + std::bytes!
 // check btc-core/util/serialize
 
+namespace legacy
+{
+
 class PackStream;
 
 template <typename T>
@@ -660,3 +663,5 @@ typename StreamType::get_type unpack(std::vector<unsigned char> data)
     PackStream stream(std::move(data));
     return unpack<StreamType>(stream);
 }
+
+} // namespace legacy

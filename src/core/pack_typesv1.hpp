@@ -12,6 +12,9 @@
 #include "pack.hpp"
 #include "math.hpp"
 
+namespace legacy
+{
+
 struct VarIntType : public Maker<VarIntType, uint64_t>, public Getter<uint64_t>
 {
     typedef uint64_t value_type;
@@ -644,3 +647,5 @@ struct FloatingIntegerType : public CustomGetter<typename FloatingInteger::get_t
         return bits.get();
     }
 };
+
+} // namespace legacy
