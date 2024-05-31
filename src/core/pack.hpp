@@ -95,6 +95,19 @@ struct UnserializeFormatter
     }
 };
 
+template <class Out, class In>
+Out& AsBase(In& x)
+{
+    static_assert(std::is_base_of_v<Out, In>);
+    return x;
+}
+template <class Out, class In>
+const Out& AsBase(const In& x)
+{
+    static_assert(std::is_base_of_v<Out, In>);
+    return x;
+}
+
 #define READWRITE(...) formatter.action(stream, __VA_ARGS__)
 
 #define FORMAT_METHODS(TYPE)\
