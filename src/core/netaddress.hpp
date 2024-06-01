@@ -55,10 +55,10 @@ public:
         switch (m_type)
         {
         case NET_IPV4:
-            os << m_ip;
+            Write_IPV4(os);
             break;
         case NET_IPV6:
-            // TODO:
+            Write_IPV6(os);
             break;
         };
     }
@@ -68,16 +68,20 @@ public:
         switch (m_type)
         {
         case NET_IPV4:
-            is >> m_ip;
+            Read_IPV4(is);
             break;
         case NET_IPV6:
-            // TODO:
+            Read_IPV6(is);
             break;
         };
     }
 
 protected:
+    void Write_IPV4(PackStream& os) const;
+    void Read_IPV4(PackStream& is);
     
+    void Write_IPV6(PackStream& os) const;
+    void Read_IPV6(PackStream& is);
 };
 
 class NetService : public NetAddress

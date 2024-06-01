@@ -13,7 +13,7 @@ set(source
     ${legacy_sources}
     common.hpp
     macro.hpp
-    netaddress.hpp
+    netaddress.hpp netaddress.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
