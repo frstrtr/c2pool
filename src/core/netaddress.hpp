@@ -103,7 +103,7 @@ public:
 
     uint16_t port() const { return m_port; }
 
-    SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), obj.m_port); }
+    SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<uint16_t, true>>(obj.m_port)); }
 };
 
 // template <IsInteger int_type>
