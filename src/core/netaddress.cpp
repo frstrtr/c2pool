@@ -8,15 +8,16 @@
 
 void NetAddress::Write_IPV4(PackStream& os) const
 {
+    auto ip = m_ip;
     std::vector<uint8_t> data;
-    if (m_ip.find(':') < m_ip.size())
+    if (ip.find(':') < ip.size())
     {
-        boost::erase_all(m_ip, ":");
-        data = ParseHex(m_ip);
+        boost::erase_all(ip, ":");
+        data = ParseHex(ip);
     } else
     {
         std::vector<std::string> split_res;
-        boost::algorithm::split(split_res, m_ip, boost::is_any_of("."));
+        boost::algorithm::split(split_res, ip, boost::is_any_of("."));
         if (split_res.size() != 4)
         {
             throw (std::runtime_error("Invalid address in IPV6AddressType"));
@@ -44,12 +45,47 @@ void NetAddress::Write_IPV4(PackStream& os) const
     }
 
     assert(data.size() == 16);
-    // os << data;
+    os << Using<ArrayType<DefaultFormat, 16>>(data);
 }
 
 void NetAddress::Read_IPV4(PackStream& is)
 {
+    std::vector<unsigned char> hex_data{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+    // if (is.size() >= 16)
+    {
+        // std::vector<unsigned char> data{stream.data.begin(), stream.data.begin() + 16};
+        // stream.data.erase(stream.data.begin(), stream.data.begin() + 16);
+        std::vector<uint8_t> data;
+        is >> Using<ArrayType<DefaultFormat, 16>>(data);
+        bool ipv4 = true;
+        for (int i = 0; i < 12; i++)
+        {
+            if (data[i] != hex_data[i])
+            {
+                ipv4 = false;
+                break;
+            }
+        }
 
+        if (ipv4)
+        {
+            std::vector<std::string> nums;
+            for (int i = 12; i < 16; i++)
+            {
+                auto num = std::to_string((unsigned int) data[i]);
+                nums.push_back(num);
+            }
+            m_ip = boost::algorithm::join(nums, ".");
+        } else
+        {
+            //TODO: IPV6
+        }
+    //else
+    // {
+    //     throw std::runtime_error("Invalid address!");
+    // }
+    // return stream;
+    }
 }
     
 void NetAddress::Write_IPV6(PackStream& os) const
