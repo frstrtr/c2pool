@@ -57,10 +57,15 @@ public:
 
     void print() const
     {
-        std::cout << "{ ";
+        std::cout << "{ " << std::hex;
         for (auto const b : m_vch)
             std::cout << std::setw(2) << std::to_integer<int>(b) << ' ';
         std::cout << std::dec << "}\n";
+    }
+
+    void reverse()
+    {
+        std::reverse(m_vch.begin(), m_vch.end());
     }
 
     template <typename T>
@@ -75,6 +80,16 @@ public:
     {
         Unserialize(*this, value);
         return *this;
+    }
+
+    friend inline void Serialize(PackStream& to, const PackStream& from)
+    {
+        to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()), std::make_move_iterator(from.m_vch.end()));
+    }
+
+    friend inline void Unserialize(const PackStream& from, PackStream& to)
+    {
+        to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()), std::make_move_iterator(from.m_vch.end()));
     }
 };
 
@@ -165,7 +180,7 @@ inline int_type read_int(PackStream& is)
     return num;
 }
 
-void WriteCompactSize(PackStream& os, uint64_t nSize)
+inline void WriteCompactSize(PackStream& os, uint64_t nSize)
 {
     if (nSize < 253)
     {
@@ -189,7 +204,7 @@ void WriteCompactSize(PackStream& os, uint64_t nSize)
     return;
 }
 
-uint64_t ReadCompactSize(PackStream& is, bool range_check = true)
+inline uint64_t ReadCompactSize(PackStream& is, bool range_check = true)
 {
     uint8_t chSize = read_int<uint8_t>(is);
     
@@ -294,17 +309,58 @@ struct DefaultFormat
     static void Read(PackStream& s, T& t) { Unserialize(s, t); }
 };
 
-template <typename int_type>
+template <std::size_t Size>
+struct BigEndianFormat
+{
+    template<typename T>
+    static void Write(PackStream& s, const T& t) 
+    { 
+        PackStream reverse_stream;
+        reverse_stream << t;
+        reverse_stream.reverse();
+
+        s << reverse_stream;        
+    }
+
+    template<typename T>
+    static void Read(PackStream& s, T& t) 
+    {
+        std::as_writable_bytes(std::span{&value, 1})
+        std::span<std::byte> r;
+        s.write(r);
+
+        std::reverse(r.begin(), r.end());
+        PackStream reverse_stream;
+        reverse_stream.read(r);
+
+        reverse_stream >> t;
+    }
+};
+
+// BE -- Big Endian
+template <typename int_type, bool BE = false>
 struct IntType
 {
     static void Write(PackStream& os, const int_type& value)
     {
-        os << value;
+        if constexpr (BE)
+        {
+            os << Using<BigEndianFormat<4>>(value);
+        } else 
+        {
+            os << value;
+        }
     }
 
     static void Read(PackStream& is, int_type& value)
     {
-        is >> value;
+        if constexpr (BE)
+        {
+            is >> Using<BigEndianFormat<4>>(value);
+        } else 
+        {
+            is >> value;
+        }
     }
 };
 
@@ -312,11 +368,11 @@ template <typename PackFormat>
 struct ListType
 {
     template <typename V>
-    static void Write(PackStream& os, const typename V::value_type& values)
+    static void Write(PackStream& os, const V& values)
     {
         WriteCompactSize(os, values.size());
 
-        for(const auto& v : values)
+        for(const typename V::value_type& v : values)
         {
             PackFormat::Write(os, v);
         }
@@ -345,11 +401,36 @@ struct ListType
     }
 };
 
+template <typename PackFormat, size_t Size>
+struct ArrayType
+{
+    template <typename V>
+    static void Write(PackStream& os, const V& values)
+    {
+        for(const typename V::value_type& v : values)
+        {
+            PackFormat::Write(os, v);
+        }
+    }
+
+    template <typename V>
+    static void Read(PackStream& is, V& values)
+    {
+        values.clear();
+        values.reserve(Size);
+        for (int i = 0; i < Size; i++)
+        {
+            values.emplace_back();
+            PackFormat::Read(is, values.back());
+        }
+    }
+};
+
 /**
  * vector
  */
-template <typename Stream, typename T, typename A>
-void Serialize(Stream& os, const std::vector<T, A>& v)
+template <typename T>
+void Serialize(PackStream& os, const std::vector<T>& v)
 {
     /*  TODO:
     if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
@@ -368,8 +449,8 @@ void Serialize(Stream& os, const std::vector<T, A>& v)
     }
 }
 
-template <typename Stream, typename T, typename A>
-void Unserialize(Stream& is, std::vector<T, A>& v)
+template <typename T, typename A>
+void Unserialize(PackStream& is, std::vector<T, A>& v)
 {
     /* TODO:
     if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
