@@ -6,7 +6,7 @@
 #include <iomanip>
 #include <string>
 
-#include "pack.hpp"
+#include <core/pack.hpp>
 
 #define TEST(name)\
     void test_##name ()\
@@ -93,11 +93,29 @@ TEST(CUSTOM_TYPE)
     value2.print();
 END_TEST()
 
+TEST(VECTOR)
+    PackStream stream;
+
+    std::vector<uint32_t> nums1 {1, 22, 30, 55, 888};
+    for (const auto& n : nums1) std::cout << n << " ";
+    std::cout << std::endl;
+    stream << nums1;
+    stream.print();
+
+    std::vector<uint32_t> nums2;
+    stream >> nums2;
+    for (const auto& n : nums2) std::cout << n << " ";
+    std::cout << std::endl;
+    stream.print();
+END_TEST()
+
 int main()
 {
+
     test_INT();
     test_STRING();
     test_CUSTOM_TYPE();
+    test_VECTOR();
     
     return 0;
 }

@@ -126,41 +126,45 @@ public:
         ('address', pack.IPV6AddressType()),
         ('port', pack.IntType(16, 'big')),
      */
-    unsigned long long services;
+    // unsigned long long services;
     std::string address;
     int port;
 
-    address_type();
-    address_type(unsigned long long _services, std::string _address, int _port);
-	address_type(unsigned long long _services, std::string _address, std::string _port);
+    address_type() = default;
+    address_type(/*unsigned long long _services,*/ std::string _address, int _port) : address(_address), port(_port) {}
 
-    friend bool operator==(const address_type &first, const address_type &second);
-    friend bool operator!=(const address_type &first, const address_type &second);
+    void print(PackStream& stream) const
+    {
+        std::cout << address << ":" << port << " -> " << stream << std::endl;
+    }
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(address_type, services, address, port);
+    // friend bool operator==(const address_type &first, const address_type &second);
+    // friend bool operator!=(const address_type &first, const address_type &second);
+
+    // NLOHMANN_DEFINE_TYPE_INTRUSIVE(address_type, services, address, port);
 };
 
 struct address_type_stream
     {
-        IntType(64) services;
+        // IntType(64) services;
         IPV6AddressType address; //IPV6AddressType
         IntType<uint16_t, true> port;
 
         PackStream &write(PackStream &stream)
         {
-            stream << services << address << port;
+            stream /*<< services*/ << address << port;
             return stream;
         }
 
         PackStream &read(PackStream &stream)
         {
-            stream >> services >> address >> port;
+            stream /*>> services */ >> address >> port;
             return stream;
         }
 
         address_type_stream &operator=(const address_type &val)
         {
-            services = val.services;
+            // services = val.services;
             address = val.address;
             port = val.port;
             return *this;
@@ -168,32 +172,47 @@ struct address_type_stream
 
         address_type get()
         {
-            return address_type(services.get(), address.get(), port.get());
+            return address_type(/*services.get(),*/ address.get(), port.get());
         }
     };
 
 } // namespace legacy
 
+// void test_v1()
+// {
+//     std::cout << "TEST V1" << std::endl;
+//     legacy::PackStream stream;
+
+//     legacy::IPV6AddressType addr1("192.168.0.1");
+//     stream << addr1;
+//     std::cout << addr1.value << " -> " << stream << std::endl;
+
+//     legacy::IPV6AddressType addr2;
+//     stream >> addr2;
+//     std::cout << addr2.value << " -> " << stream << std::endl;
+// }
+
 void test_v1()
 {
+    std::cout << "TEST V1" << std::endl;
     legacy::PackStream stream;
 
-    legacy::IPV6AddressType addr1("192.168.0.1");
+    auto _addr1 = legacy::address_type{"46.19.137.74", 8333};
+    legacy::address_type_stream addr1; addr1 = _addr1;
     stream << addr1;
-    std::cout << addr1.value << " -> " << stream << std::endl;
+    addr1.get().print(stream);
 
-    legacy::IPV6AddressType addr2;
+    legacy::address_type_stream addr2;
     stream >> addr2;
-    std::cout << addr2.value << " -> " << stream << std::endl;
-
-
+    addr2.get().print(stream);
 }
 
 void test_v2()
 {
+    std::cout << "\nTEST V2" << std::endl;
     PackStream stream;
 
-    NetService service1("192.168.0.1", 2222);
+    NetService service1("46.19.137.74", 8333);
     stream << service1;
     std::cout << service1.address() << ":" << service1.port() << " -> "; stream.print();
 
