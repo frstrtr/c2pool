@@ -15,6 +15,9 @@
  */
 static constexpr uint64_t MAX_SIZE = 0x02000000;
 
+/** Maximum amount of memory (in bytes) to allocate at once when deserializing vectors. */
+static const unsigned int MAX_VECTOR_ALLOCATE = 5000000;
+
 template <typename RealType>
 struct PackType
 {
@@ -251,4 +254,136 @@ template <typename T> requires Unserializable<T>
 void Unserialize(PackStream& is, T&& a)
 {
     a.Unserialize(is);
+}
+
+template <typename PackFormat, typename T>
+class Wrapper
+{
+    static_assert(std::is_lvalue_reference<T>::value, "Wrapper needs an lvalue reference type T");
+protected:
+    T m_value;
+
+public:
+    Wrapper(T value) : m_value(value) { }
+
+    void Serialize(PackStream& os) const
+    {
+        PackFormat::Write(os, m_value);
+    }
+
+    void Unserialize(PackStream& is)
+    {
+        PackFormat::Read(is, m_value);
+    }
+};
+
+template <typename PackFormat, typename T>
+static inline Wrapper<PackFormat, T> Using(T&& value) { return Wrapper<PackFormat, T&>(value); }
+
+/** Default formatter. Serializes objects as themselves.
+ *
+ * The vector/prevector serialization code passes this to VectorFormatter
+ * to enable reusing that logic. It shouldn't be needed elsewhere.
+ */
+struct DefaultFormat
+{
+    template<typename T>
+    static void Write(PackStream& s, const T& t) { Serialize(s, t); }
+
+    template<typename T>
+    static void Read(PackStream& s, T& t) { Unserialize(s, t); }
+};
+
+template <typename int_type>
+struct IntType
+{
+    static void Write(PackStream& os, const int_type& value)
+    {
+        os << value;
+    }
+
+    static void Read(PackStream& is, int_type& value)
+    {
+        is >> value;
+    }
+};
+
+template <typename PackFormat>
+struct ListType
+{
+    template <typename V>
+    static void Write(PackStream& os, const typename V::value_type& values)
+    {
+        WriteCompactSize(os, values.size());
+
+        for(const auto& v : values)
+        {
+            PackFormat::Write(os, v);
+        }
+    }
+
+    template <typename V>
+    static void Read(PackStream& is, V& values)
+    {
+        values.clear();
+        auto nSize = ReadCompactSize(is);
+        size_t allocated = 0;
+        while (allocated < nSize) 
+        {
+            // For DoS prevention, do not blindly allocate as much as the stream claims to contain.
+            // Instead, allocate in 5MiB batches, so that an attacker actually needs to provide
+            // X MiB of data to make us allocate X+5 Mib.
+            static_assert(sizeof(typename V::value_type) <= MAX_VECTOR_ALLOCATE, "Vector element size too large");
+            allocated = std::min(nSize, allocated + MAX_VECTOR_ALLOCATE / sizeof(typename V::value_type));
+            values.reserve(allocated);
+            while (values.size() < allocated) 
+            {
+                values.emplace_back();
+                PackFormat::Read(is, values.back());
+            }
+        }
+    }
+};
+
+/**
+ * vector
+ */
+template <typename Stream, typename T, typename A>
+void Serialize(Stream& os, const std::vector<T, A>& v)
+{
+    /*  TODO:
+    if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
+        WriteCompactSize(os, v.size());
+        if (!v.empty()) os.write(MakeByteSpan(v));
+    } else if constexpr (std::is_same_v<T, bool>) {
+        // A special case for std::vector<bool>, as dereferencing
+        // std::vector<bool>::const_iterator does not result in a const bool&
+        // due to std::vector's special casing for bool arguments.
+        WriteCompactSize(os, v.size());
+        for (bool elem : v) {
+            Serialize(os, elem);
+        }
+    } else */ {
+        Serialize(os, Using<ListType<DefaultFormat>>(v));
+    }
+}
+
+template <typename Stream, typename T, typename A>
+void Unserialize(Stream& is, std::vector<T, A>& v)
+{
+    /* TODO:
+    if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
+        // Limit size per read so bogus size value won't cause out of memory
+        v.clear();
+        unsigned int nSize = ReadCompactSize(is);
+        unsigned int i = 0;
+        while (i < nSize) {
+            unsigned int blk = std::min(nSize - i, (unsigned int)(1 + 4999999 / sizeof(T)));
+            v.resize(i + blk);
+            is.read(AsWritableBytes(Span{&v[i], blk}));
+            i += blk;
+        }
+    } else */{
+        Unserialize(is, Using<ListType<DefaultFormat>>(v));
+    }
 }
