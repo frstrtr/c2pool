@@ -195,17 +195,17 @@ inline void WriteCompactSize(PackStream& os, uint64_t nSize)
     }
     else if (nSize <= std::numeric_limits<uint16_t>::max())
     {
-        write_int<uint8_t>(os, nSize);
+        write_int<uint8_t>(os, 253);
         write_int<uint16_t>(os, nSize);
     }
     else if (nSize <= std::numeric_limits<unsigned int>::max())
     {
-        write_int<uint8_t>(os, nSize);
+        write_int<uint8_t>(os, 254);
         write_int<uint32_t>(os, nSize);
     }
     else
     {
-        write_int<uint8_t>(os, nSize);
+        write_int<uint8_t>(os, 255);
         write_int<uint64_t>(os, nSize);
     }
     return;
