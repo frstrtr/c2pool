@@ -241,6 +241,20 @@ TEST(VAR_INT)
     #undef DEBUG_INT_TYPES
 END_TEST()
 
+TEST(ENUM_VAR_INT)
+    test_enum e1 = test_enum::h;
+
+    PackStream stream;
+    stream << Using<EnumType<CompactFormat>>(e1);
+
+    stream.print();
+
+    test_enum e2;
+    stream >> Using<EnumType<CompactFormat>>(e2);
+
+    std::cout << e1 << " -> " << e2 << std::endl;
+END_TEST()
+
 int main()
 {
     test_INT();
@@ -252,4 +266,5 @@ int main()
     test_ENUM();
     test_FIXED_STR();
     test_VAR_INT();
+    test_ENUM_VAR_INT();
 }
