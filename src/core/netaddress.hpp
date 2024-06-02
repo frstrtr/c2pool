@@ -1,6 +1,6 @@
 #pragma once
 
-#include <core/pack.hpp>
+#include <core/pack_types.hpp>
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio.hpp>
@@ -103,7 +103,7 @@ public:
 
     uint16_t port() const { return m_port; }
 
-    SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<uint16_t, true>>(obj.m_port)); }
+    SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<16, true>>(obj.m_port)); }
 };
 
 // template <IsInteger int_type>

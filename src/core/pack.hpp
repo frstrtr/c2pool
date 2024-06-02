@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <span>
+#include <array>
 #include <vector>
 #include <memory>
 #include <cstring>
@@ -31,6 +32,12 @@ protected:
     std::vector<std::byte>::size_type m_cursor{0};
 
 public:
+    explicit PackStream() {}
+    // explicit PackStream(std::span<const uint8_t> sp) { write(sp); }
+    explicit PackStream(std::span<const std::byte> sp) : m_vch(sp.data(), sp.data() + sp.size()) {}
+    template <size_t Size>
+    explicit PackStream(std::array<std::byte, Size> arr) : m_vch(arr.begin(), arr.end()) { }
+
     void write(std::span<const std::byte> value)
     {
         m_vch.insert(m_vch.end(), value.begin(), value.end());
@@ -309,60 +316,6 @@ struct DefaultFormat
     static void Read(PackStream& s, T& t) { Unserialize(s, t); }
 };
 
-template <std::size_t Size>
-struct BigEndianFormat
-{
-    template<typename T>
-    static void Write(PackStream& s, const T& t) 
-    { 
-        PackStream reverse_stream;
-        reverse_stream << t;
-        reverse_stream.reverse();
-
-        s << reverse_stream;        
-    }
-
-    template<typename T>
-    static void Read(PackStream& s, T& t) 
-    {
-        std::as_writable_bytes(std::span{&value, 1})
-        std::span<std::byte> r;
-        s.write(r);
-
-        std::reverse(r.begin(), r.end());
-        PackStream reverse_stream;
-        reverse_stream.read(r);
-
-        reverse_stream >> t;
-    }
-};
-
-// BE -- Big Endian
-template <typename int_type, bool BE = false>
-struct IntType
-{
-    static void Write(PackStream& os, const int_type& value)
-    {
-        if constexpr (BE)
-        {
-            os << Using<BigEndianFormat<4>>(value);
-        } else 
-        {
-            os << value;
-        }
-    }
-
-    static void Read(PackStream& is, int_type& value)
-    {
-        if constexpr (BE)
-        {
-            is >> Using<BigEndianFormat<4>>(value);
-        } else 
-        {
-            is >> value;
-        }
-    }
-};
 
 template <typename PackFormat>
 struct ListType
@@ -397,31 +350,6 @@ struct ListType
                 values.emplace_back();
                 PackFormat::Read(is, values.back());
             }
-        }
-    }
-};
-
-template <typename PackFormat, size_t Size>
-struct ArrayType
-{
-    template <typename V>
-    static void Write(PackStream& os, const V& values)
-    {
-        for(const typename V::value_type& v : values)
-        {
-            PackFormat::Write(os, v);
-        }
-    }
-
-    template <typename V>
-    static void Read(PackStream& is, V& values)
-    {
-        values.clear();
-        values.reserve(Size);
-        for (int i = 0; i < Size; i++)
-        {
-            values.emplace_back();
-            PackFormat::Read(is, values.back());
         }
     }
 };
