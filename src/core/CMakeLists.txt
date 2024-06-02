@@ -9,7 +9,7 @@ set(source
     ${configs_source}
     log.hpp log.cpp
     filesystem.hpp
-    pack.hpp
+    pack.hpp pack_types.hpp
     ${legacy_sources}
     common.hpp
     macro.hpp
