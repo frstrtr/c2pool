@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <array>
 
 #include "pack.hpp"
@@ -196,5 +197,32 @@ struct CompactFormat
     }
 };
 
+template <class T>
+concept OptionalTypeDefault = requires {
+    T::get();
+}; //(T a, PackStream& s) { a.Serialize(s); };
+
+template <OptionalTypeDefault Default>
+struct OptionalType
+{
+    template <typename T>
+    static void Write(PackStream& os, const std::optional<T>& opt)
+    {
+        if (opt)
+            os << *opt;
+        else
+            os << Default::get();
+    }
+
+    template <typename T>
+    static void Read(PackStream& os, std::optional<T>& opt)
+    {
+        T result;
+        os >> result;
+        opt = result;
+    }
+};
+
+#define Optional(obj, Default) Using<OptionalType<Default>>(obj)
 #define VarInt(obj) Using<CompactFormat>(obj)
 #define FixedString(obj,n) Using<FixedStrType<n>>(obj)
