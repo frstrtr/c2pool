@@ -1,9 +1,8 @@
 #pragma once
 
-#include <string>
+#include "types.hpp"
 
-#include <core/pack.hpp>
-#include <core/netaddress.hpp>
+#include <string>
 
 #include <pool/message.hpp>
 #include <pool/message_macro.hpp>
@@ -17,8 +16,8 @@ BEGIN_MESSAGE(version)
     (
         (uint32_t, m_version),
         (uint64_t, m_services),
-        (NetAddr, m_addr_to),
-        (NetAddr, m_addr_from),
+        (addr_type , m_addr_to),
+        (addr_type, m_addr_from),
         (uint64_t, m_nonce),
         (std::string, m_subversion),
         (uint32_t, m_mode) //# always 1 for legacy compatibility
@@ -56,16 +55,16 @@ BEGIN_MESSAGE(getaddrs)
     }
 END_MESSAGE()
 
-// TODO: message_addrs
-// BEGIN_MESSAGE(addrs)
-//     MESSAGE_FIELDS
-//     (
-//         //TODO: (std::vector<addr_type, m_addrs)
-//     )
-//     {
-//         READWRITE(obj.m_addrs);
-//     }
-// END_MESSAGE()
+// message_addrs
+BEGIN_MESSAGE(addrs)
+    MESSAGE_FIELDS
+    (
+        (std::vector<NetAddress>, m_addrs)
+    )
+    {
+        READWRITE(obj.m_addrs);
+    }
+END_MESSAGE()
 
 // TODO: message_shares
 // BEGIN_MESSAGE(shares)
@@ -78,32 +77,32 @@ END_MESSAGE()
 //     }
 // END_MESSAGE()
 
-// TODO: message_sharereq
-// BEGIN_MESSAGE(sharereq)
-//     MESSAGE_FIELDS
-//     (
-//         (uint256, m_id),
-//         (std::vector<uint256>, m_hashes),
-//         (VarIntType, m_parents),
-//         (std::vector<uint256> m_stops)
-//     )
-//     {
-//         READWRITE(obj.m_id, obj.m_hashes, obj.m_parents, obj.m_stops);
-//     }
-// END_MESSAGE()
+// message_sharereq
+BEGIN_MESSAGE(sharereq)
+    MESSAGE_FIELDS
+    (
+        (uint256, m_id),
+        (std::vector<uint256>, m_hashes),
+        // TODO: (VarIntType, m_parents),
+        (std::vector<uint256>, m_stops)
+    )
+    {
+        READWRITE(obj.m_id, obj.m_hashes/*, obj.m_parents*/, obj.m_stops);
+    }
+END_MESSAGE()
 
 // TODO: message_sharereply
-// BEGIN_MESSAGE(sharereply)
-//     MESSAGE_FIELDS
-//     (
-//         (uint256, m_id),
-//         (EnumType<ShareReplyResult, VarIntType>, m_result),
-//         (std::vector<PackedShareData>, m_shares)
-//     )
-//     {
-//         READWRITE(obj.m_id, obj.m_result, obj.m_shares);
-//     }
-// END_MESSAGE()
+BEGIN_MESSAGE(sharereply)
+    MESSAGE_FIELDS
+    (
+        (uint256, m_id)
+        // TODO: (EnumType<ShareReplyResult, VarIntType>, m_result),
+        // TODO: (std::vector<PackedShareData>, m_shares)
+    )
+    {
+        READWRITE(obj.m_id/*, obj.m_result, obj.m_shares*/);
+    }
+END_MESSAGE()
 
 // TODO: message_bestblock
 // BEGIN_MESSAGE(bestblock)
@@ -116,49 +115,49 @@ END_MESSAGE()
 //     }
 // END_MESSAGE()
 
-// TODO: message_have_tx
-// BEGIN_MESSAGE(have_tx)
-//     MESSAGE_FIELDS
-//     (
-//         (std::vector<uint256>, m_tx_hashes)
-//     )
-//     {
-//         READWRITE(obj.m_tx_hashes);
-//     }
-// END_MESSAGE()
+// message_have_tx
+BEGIN_MESSAGE(have_tx)
+    MESSAGE_FIELDS
+    (
+        (std::vector<uint256>, m_tx_hashes)
+    )
+    {
+        READWRITE(obj.m_tx_hashes);
+    }
+END_MESSAGE()
 
-// TODO: message_losing_tx
-// BEGIN_MESSAGE(losing_tx)
-//     MESSAGE_FIELDS
-//     (
-//         (std::vector<uint256>, m_tx_hashes)
-//     )
-//     {
-//         READWRITE(obj.m_tx_hashes);
-//     }
-// END_MESSAGE()
+// message_losing_tx
+BEGIN_MESSAGE(losing_tx)
+    MESSAGE_FIELDS
+    (
+        (std::vector<uint256>, m_tx_hashes)
+    )
+    {
+        READWRITE(obj.m_tx_hashes);
+    }
+END_MESSAGE()
 
-// TODO: message_forget_tx
-// BEGIN_MESSAGE(forget_tx)
-//     MESSAGE_FIELDS
-//     (
-//         (std::vector<uint256>, m_tx_hashes)
-//     )
-//     {
-//         READWRITE(obj.m_tx_hashes);
-//     }
-// END_MESSAGE()
+// message_forget_tx
+BEGIN_MESSAGE(forget_tx)
+    MESSAGE_FIELDS
+    (
+        (std::vector<uint256>, m_tx_hashes)
+    )
+    {
+        READWRITE(obj.m_tx_hashes);
+    }
+END_MESSAGE()
 
-// TODO: message_remember_tx
-// BEGIN_MESSAGE(remember_tx)
-//     MESSAGE_FIELDS
-//     (
-//         (std::vector<uint256>, m_tx_hashes),
-//         (std::vector<ltc::tx_type> m_txs)
-//     )
-//     {
-//         READWRITE(obj.m_tx_hashes, obj.m_txs);
-//     }
-// END_MESSAGE()
+// message_remember_tx
+BEGIN_MESSAGE(remember_tx)
+    MESSAGE_FIELDS
+    (
+        (std::vector<uint256>, m_tx_hashes)
+        // TODO: (std::vector<ltc::tx_type> m_txs)
+    )
+    {
+        READWRITE(obj.m_tx_hashes/*, obj.m_txs*/);
+    }
+END_MESSAGE()
 
 } // namespace ltc
