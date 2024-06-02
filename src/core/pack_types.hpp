@@ -181,13 +181,15 @@ struct FixedStrType
 
 struct CompactFormat
 {
-    template <IsInteger int_type>
+    using num_type = uint32_t;
+
+    template <typename int_type>
     static void Write(PackStream& os, const int_type& num)
     {
         WriteCompactSize(os, num);
     }
 
-    template <IsInteger int_type>
+    template <typename int_type>
     static void Read(PackStream& os, int_type& num)
     {
         num = ReadCompactSize(os, false);
