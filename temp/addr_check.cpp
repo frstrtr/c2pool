@@ -212,7 +212,7 @@ void test_v2()
     std::cout << "\nTEST V2" << std::endl;
     PackStream stream;
 
-    NetService service1("46.19.137.74", 8333);
+    NetService service1("46.19.137.74", 8333); // 127.0.0.1
     stream << service1;
     std::cout << service1.address() << ":" << service1.port() << " -> "; stream.print();
 
