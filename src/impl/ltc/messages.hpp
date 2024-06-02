@@ -10,7 +10,12 @@
 namespace ltc
 {
 
-// TODO: message_version
+struct DefaultBestShare
+{
+    static uint256 get() { return uint256(); }
+};
+
+// message_version
 BEGIN_MESSAGE(version)
     MESSAGE_FIELDS
     (
@@ -20,11 +25,11 @@ BEGIN_MESSAGE(version)
         (addr_type, m_addr_from),
         (uint64_t, m_nonce),
         (std::string, m_subversion),
-        (uint32_t, m_mode) //# always 1 for legacy compatibility
-        //TODO: PossibleNoneType<IntType(256)> m_best_share;
+        (uint32_t, m_mode), //# always 1 for legacy compatibility
+        (std::optional<uint256>, m_best_share)
     )
     {
-        READWRITE(obj.m_version, obj.m_services, obj.m_addr_to, obj.m_addr_from, obj.m_nonce, obj.m_subversion, obj.m_mode/*, m_best_share*/);
+        READWRITE(obj.m_version, obj.m_services, obj.m_addr_to, obj.m_addr_from, obj.m_nonce, obj.m_subversion, obj.m_mode, Optional(obj.m_best_share, DefaultBestShare));
     }
 END_MESSAGE()
 
