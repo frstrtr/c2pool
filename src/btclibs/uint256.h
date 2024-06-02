@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
+#include <span>
 
 #include <nlohmann/json.hpp>
 
@@ -38,7 +39,7 @@ class base_uint
 public:
     static_assert(BITS / 32 > 0 && BITS % 32 == 0, "Template parameter BITS must be a positive multiple of 32.");
     static constexpr int WIDTH = BITS / 32;
-    static constexpr int WIDTH_BYTES = BITS / 8; // old uint256.WIDTH
+    static constexpr int BYTES = BITS / 8; // old uint256.WIDTH
     uint32_t pn[WIDTH];
 
 #ifdef DEBUG_UINT
@@ -309,14 +310,15 @@ public:
     template<typename Stream>
     void Serialize(Stream& s) const
     {
-        s.write(MakeByteSpan(pn));
+        s.write(std::as_bytes(std::span{pn}));
     }
 
     template<typename Stream>
     void Unserialize(Stream& s)
     {
-        s.read(MakeWritableByteSpan(pn));
-        DEBUG_UINT_UPDATE();
+        s.read(std::as_writable_bytes(std::span{pn}));
+        // s.read(MakeWritableByteSpan(pn));
+        // DEBUG_UINT_UPDATE();
     }
 };
 
