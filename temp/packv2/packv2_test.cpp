@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iomanip>
 #include <string>
+#include <optional>
 
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
@@ -255,6 +256,96 @@ TEST(ENUM_VAR_INT)
     std::cout << e1 << " -> " << e2 << std::endl;
 END_TEST()
 
+struct DefaultUint32
+{
+    static uint32_t get() { return std::numeric_limits<uint32_t>::max(); }
+};
+
+TEST(OPTIONAL_TYPE)
+    std::optional<uint32_t> num1;
+
+    PackStream stream;
+    stream << Using<OptionalType<DefaultUint32>>(num1);
+    stream.print();
+    
+    std::optional<uint32_t> num2;
+    stream >> Using<OptionalType<DefaultUint32>>(num2);
+    std::cout << num2.value();
+END_TEST()
+
+struct DefaultCustom
+{
+    static custom get() { return custom{1, "hi", 16}; }
+};
+
+TEST(OPTIONAL_TYPE_FOR_CUSTOM)
+    std::optional<custom> c1;
+
+    PackStream stream;
+    stream << Optional(c1, DefaultCustom);
+    stream.print();
+    
+    std::optional<custom> c2;
+    stream >> Optional(c2, DefaultCustom);
+    c2->print();
+END_TEST()
+
+struct opt_custom
+{
+    std::optional<custom> m_c;
+
+    opt_custom() {}
+
+    opt_custom(int32_t i, std::string str, int64_t h) 
+        : m_c(std::make_optional<custom>(i, str, h))
+    {
+
+    }
+
+    void print() const
+    {
+        if (m_c)
+            m_c->print();
+        else
+            std::cout << "opt_custom is none!" << std::endl;
+    }
+
+    SERIALIZE_METHODS(opt_custom) 
+    { READWRITE(Optional(obj.m_c, DefaultCustom)); }
+    // { formatter.action(stream, Using<OptionalType<DefaultCustom>>(obj.m_c)); }
+    // { formatter.action(stream, *obj.m_c); }
+};
+
+TEST(OPTIONAL_FIELD)
+
+    opt_custom v1;
+    v1.print();
+
+    PackStream stream;
+    stream << v1;
+    stream.print();
+
+    opt_custom v2;
+    stream >> v2;
+    v2.print();
+
+END_TEST()
+
+TEST(OPTIONAL_FIELD2)
+
+    opt_custom v1(1, "hello", 788);
+    v1.print();
+
+    PackStream stream;
+    stream << v1;
+    stream.print();
+
+    opt_custom v2;
+    stream >> v2;
+    v2.print();
+
+END_TEST()
+
 int main()
 {
     test_INT();
@@ -267,4 +358,8 @@ int main()
     test_FIXED_STR();
     test_VAR_INT();
     test_ENUM_VAR_INT();
+    test_OPTIONAL_TYPE();
+    test_OPTIONAL_TYPE_FOR_CUSTOM();
+    test_OPTIONAL_FIELD();
+    test_OPTIONAL_FIELD2();
 }
