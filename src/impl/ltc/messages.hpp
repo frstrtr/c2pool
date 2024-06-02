@@ -83,24 +83,35 @@ BEGIN_MESSAGE(sharereq)
     (
         (uint256, m_id),
         (std::vector<uint256>, m_hashes),
-        // TODO: (VarIntType, m_parents),
+        (uint64_t, m_parents),
         (std::vector<uint256>, m_stops)
     )
     {
-        READWRITE(obj.m_id, obj.m_hashes/*, obj.m_parents*/, obj.m_stops);
+        READWRITE(obj.m_id, obj.m_hashes, VarInt(obj.m_parents), obj.m_stops);
     }
 END_MESSAGE()
+
+enum ShareReplyResult
+{
+    good = 0,
+    too_long = 1,
+    unk2 = 2,
+    unk3 = 3,
+    unk4 = 4,
+    unk5 = 5,
+    unk6 = 6
+};
 
 // TODO: message_sharereply
 BEGIN_MESSAGE(sharereply)
     MESSAGE_FIELDS
     (
-        (uint256, m_id)
-        // TODO: (EnumType<ShareReplyResult, VarIntType>, m_result),
+        (uint256, m_id),
+        (ShareReplyResult, m_result)
         // TODO: (std::vector<PackedShareData>, m_shares)
     )
     {
-        READWRITE(obj.m_id/*, obj.m_result, obj.m_shares*/);
+        READWRITE(obj.m_id, Using<EnumType<CompactFormat>>(obj.m_result)/*, obj.m_shares*/);
     }
 END_MESSAGE()
 
