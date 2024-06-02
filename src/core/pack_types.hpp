@@ -134,3 +134,24 @@ struct ArrayType
         }
     }
 };
+
+template <typename INT_PACK_TYPE>
+struct EnumType
+{
+    template <typename E>
+    static void Write(PackStream& os, const E& enum_value)
+    {
+        static_assert(std::is_enum<E>::value, "EnumType::Write needs for enum value");
+        os << Using<INT_PACK_TYPE>(enum_value);
+    }
+
+    template <typename E>
+    static void Read(PackStream& is, E& enum_value)
+    {
+        static_assert(std::is_enum<E>::value, "EnumType::Read needs for enum value");
+        typename INT_PACK_TYPE::num_type res;
+        is >> Using<INT_PACK_TYPE>(res);
+
+        enum_value = (E)res;
+    }
+};
