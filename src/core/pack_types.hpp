@@ -155,3 +155,44 @@ struct EnumType
         enum_value = (E)res;
     }
 };
+
+template <size_t Size>
+struct FixedStrType
+{
+    static void Write(PackStream& os, const std::string& str)
+    {
+        //TODO: check for size?
+        // std::string str_copy = str;
+        // if (str_copy.size() != Size)
+        //     str_copy.resize(Size);
+        os << str;
+    }
+
+    static void Read(PackStream& is, std::string& str)
+    {
+        auto nSize = ReadCompactSize(is);
+        if (nSize > Size)
+            throw std::ios_base::failure("FixedStrType length limit exceeded");
+        str.resize(nSize);
+        if (nSize > 0)
+            is.read(std::as_writable_bytes(std::span{&str[0], nSize}));
+    }
+};
+
+struct CompactFormat
+{
+    template <IsInteger int_type>
+    static void Write(PackStream& os, const int_type& num)
+    {
+        WriteCompactSize(os, num);
+    }
+
+    template <IsInteger int_type>
+    static void Read(PackStream& os, int_type& num)
+    {
+        num = ReadCompactSize(os, false);
+    }
+};
+
+#define VarInt(obj) Using<CompactFormat>(obj)
+#define FixedString(obj,n) Using<FixedStrType<n>>(obj)
