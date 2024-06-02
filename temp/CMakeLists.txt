@@ -7,6 +7,7 @@ add_executable(other other.cpp)
 add_executable(def def.cpp def_macro.hpp new_macro.hpp)
 add_executable(struct_for_struct struct_for_struct.cpp)
 add_executable(template_macro template_macro.cpp)
+add_executable(specificator_type specificator_type.cpp)
 add_executable(addr_check addr_check.cpp)
 target_link_libraries(addr_check core)
 

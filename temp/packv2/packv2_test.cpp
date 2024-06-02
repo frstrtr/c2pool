@@ -7,6 +7,7 @@
 #include <string>
 
 #include <core/pack.hpp>
+#include <core/pack_types.hpp>
 
 #define TEST(name)\
     void test_##name ()\
@@ -109,13 +110,82 @@ TEST(VECTOR)
     stream.print();
 END_TEST()
 
+
+TEST(INT_TYPES)
+    #define DEBUG_INT_TYPES(N) \
+        PackStream  i_pack##N; i_pack##N << Using<IntType<N>>(i##N); \
+        i_pack##N .print();\
+        IntType<N>::num_type i_unpacked##N; i_pack##N >> i_unpacked##N ;\
+        std::cout << i##N << " -> " << i_unpacked##N << std::endl; 
+    
+    uint8_t     i8{std::numeric_limits<uint8_t>::max()};
+    DEBUG_INT_TYPES(8);
+
+    uint16_t    i16{std::numeric_limits<uint16_t>::max()};
+    DEBUG_INT_TYPES(16);
+    
+    uint32_t    i32{std::numeric_limits<uint32_t>::max()};
+    DEBUG_INT_TYPES(32);
+    
+    uint64_t    i64{std::numeric_limits<uint64_t>::max()};
+    DEBUG_INT_TYPES(64);
+
+    uint128     i128{"ffffffffffffffffffffffffffffffff"};
+    DEBUG_INT_TYPES(128);
+
+    uint160     i160{"ffffffffffffffffffffffffffffffffffffffff"};
+    DEBUG_INT_TYPES(160);
+    
+    uint256     i256{"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+    DEBUG_INT_TYPES(256);
+    
+    uint288     i288{"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+    DEBUG_INT_TYPES(288);
+
+#undef DEBUG_INT_TYPES
+END_TEST()
+
+TEST(INT_TYPES_BIG_ENDIAN)
+    #define DEBUG_INT_TYPES(N) \
+        PackStream  i_pack##N; i_pack##N << Using<IntType<N, true>>(i##N); \
+        i_pack##N .print();\
+        IntType<N, true>::num_type i_unpacked##N(0); i_pack##N >> Using<IntType<N, true>>(i_unpacked##N);\
+        std::cout << i##N << " -> " << i_unpacked##N << std::endl; 
+    
+    uint8_t     i8{2};
+    DEBUG_INT_TYPES(8);
+
+    uint16_t    i16{2};
+    DEBUG_INT_TYPES(16);
+    
+    uint32_t    i32{2};
+    DEBUG_INT_TYPES(32);
+    
+    uint64_t    i64{2};
+    DEBUG_INT_TYPES(64);
+
+    uint128     i128{2};
+    DEBUG_INT_TYPES(128);
+
+    uint160     i160{2};
+    DEBUG_INT_TYPES(160);
+    
+    uint256     i256{2};
+    DEBUG_INT_TYPES(256);
+    
+    uint288     i288{2};
+    DEBUG_INT_TYPES(288);
+
+#undef DEBUG_INT_TYPES
+END_TEST()
+
 int main()
 {
-
     test_INT();
     test_STRING();
     test_CUSTOM_TYPE();
     test_VECTOR();
-    
+    test_INT_TYPES();
+    test_INT_TYPES_BIG_ENDIAN();
     return 0;
 }
