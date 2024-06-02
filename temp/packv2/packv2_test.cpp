@@ -202,6 +202,45 @@ TEST(ENUM)
     std::cout << e1 << " -> " << e2 << std::endl;
 END_TEST()
 
+TEST(FIXED_STR)
+    // legacy::FixedStrType<5> legacy_str1("12345");
+    // legacy::PackStream legacy_stream;
+    // legacy_stream << legacy_str1;
+    // std::cout << "legacy stream: " << legacy_stream << std::endl;
+
+    std::string str1 = "123456";
+
+    PackStream stream;
+    stream << FixedString(str1, 6);
+    stream.print();
+
+    std::string str2;
+    stream >> FixedString(str2, 6);
+    std::cout << str1 << " -> " <<  str2 << std::endl;
+END_TEST()
+
+TEST(VAR_INT)
+    #define DEBUG_INT_TYPES(N) \
+        PackStream  i_pack##N; i_pack##N << VarInt(i##N); \
+        i_pack##N .print();\
+        uint64_t i_unpacked##N; i_pack##N >> VarInt(i_unpacked##N) ;\
+        std::cout << (uint64_t)i##N << " -> " << i_unpacked##N << std::endl; 
+    
+    uint8_t     i8{250};
+    DEBUG_INT_TYPES(8);
+
+    uint16_t    i16{std::numeric_limits<uint16_t>::max()-1};
+    DEBUG_INT_TYPES(16);
+    
+    uint32_t    i32{std::numeric_limits<uint32_t>::max()-1};
+    DEBUG_INT_TYPES(32);
+    
+    uint64_t    i64{std::numeric_limits<uint64_t>::max()-1};
+    DEBUG_INT_TYPES(64);
+
+    #undef DEBUG_INT_TYPES
+END_TEST()
+
 int main()
 {
     test_INT();
@@ -211,5 +250,6 @@ int main()
     test_INT_TYPES();
     test_INT_TYPES_BIG_ENDIAN();
     test_ENUM();
-    return 0;
+    test_FIXED_STR();
+    test_VAR_INT();
 }
