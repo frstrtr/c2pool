@@ -9,6 +9,9 @@
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
 
+#include <core/packv1.hpp>
+#include <core/pack_typesv1.hpp>
+
 #define TEST(name)\
     void test_##name ()\
     {\
@@ -179,6 +182,26 @@ TEST(INT_TYPES_BIG_ENDIAN)
 #undef DEBUG_INT_TYPES
 END_TEST()
 
+enum test_enum
+{
+    i = 2,
+    h = 4
+};
+
+TEST(ENUM)
+    test_enum e1 = test_enum::h;
+
+    PackStream stream;
+    stream << Using<EnumType<IntType<16>>>(e1);
+
+    stream.print();
+
+    test_enum e2;
+    stream >> Using<EnumType<IntType<16 >>>(e2);
+
+    std::cout << e1 << " -> " << e2 << std::endl;
+END_TEST()
+
 int main()
 {
     test_INT();
@@ -187,5 +210,6 @@ int main()
     test_VECTOR();
     test_INT_TYPES();
     test_INT_TYPES_BIG_ENDIAN();
+    test_ENUM();
     return 0;
 }
