@@ -10,8 +10,8 @@
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
 
-#include <core/packv1.hpp>
-#include <core/pack_typesv1.hpp>
+#include <core/legacy/packv1.hpp>
+#include <core/legacy/pack_typesv1.hpp>
 
 #define TEST(name)\
     void test_##name ()\
