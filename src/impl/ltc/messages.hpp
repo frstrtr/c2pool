@@ -6,7 +6,7 @@
 
 #include <pool/message.hpp>
 #include <pool/message_macro.hpp>
-
+#include <sharechain/share.hpp>
 namespace ltc
 {
 
@@ -71,16 +71,16 @@ BEGIN_MESSAGE(addrs)
     }
 END_MESSAGE()
 
-// TODO: message_shares
-// BEGIN_MESSAGE(shares)
-//     MESSAGE_FIELDS
-//     (
-//         //TODO: (std::vector<PackedShareData, m_shares)
-//     )
-//     {
-//         READWRITE(obj.m_shares);
-//     }
-// END_MESSAGE()
+// message_shares
+BEGIN_MESSAGE(shares)
+    MESSAGE_FIELDS
+    (
+        (std::vector<c2pool::chain::RawShare>, m_shares)
+    )
+    {
+        READWRITE(obj.m_shares);
+    }
+END_MESSAGE()
 
 // message_sharereq
 BEGIN_MESSAGE(sharereq)
@@ -107,29 +107,29 @@ enum ShareReplyResult
     unk6 = 6
 };
 
-// TODO: message_sharereply
+// message_sharereply
 BEGIN_MESSAGE(sharereply)
     MESSAGE_FIELDS
     (
         (uint256, m_id),
         (ShareReplyResult, m_result)
-        // TODO: (std::vector<PackedShareData>, m_shares)
+        (std::vector<c2pool::chain::RawShare>, m_shares)
     )
     {
-        READWRITE(obj.m_id, Using<EnumType<CompactFormat>>(obj.m_result)/*, obj.m_shares*/);
+        READWRITE(obj.m_id, Using<EnumType<CompactFormat>>(obj.m_result), obj.m_shares);
     }
 END_MESSAGE()
 
-// TODO: message_bestblock
-// BEGIN_MESSAGE(bestblock)
-//     MESSAGE_FIELDS
-//     (
-//         (BlockHeaderType, m_header),
-//     )
-//     {
-//         READWRITE(obj.m_header);
-//     }
-// END_MESSAGE()
+// message_bestblock
+BEGIN_MESSAGE(bestblock)
+    MESSAGE_FIELDS
+    (
+        (ltc::BlockHeaderType, m_header),
+    )
+    {
+        READWRITE(obj.m_header);
+    }
+END_MESSAGE()
 
 // message_have_tx
 BEGIN_MESSAGE(have_tx)
