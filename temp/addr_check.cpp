@@ -1,8 +1,8 @@
 #include <iostream>
 #include <core/netaddress.hpp>
 #include <core/pack.hpp>
-#include <core/packv1.hpp>
-#include <core/pack_typesv1.hpp>
+#include <core/legacy/packv1.hpp>
+#include <core/legacy/pack_typesv1.hpp>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>

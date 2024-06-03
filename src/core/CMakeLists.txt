@@ -1,6 +1,6 @@
 file(GLOB configs_source "configs/*.hpp" "configs/*.cpp")
 
-set(legacy_sources packv1.hpp pack_typesv1.hpp math.hpp math.cpp)
+set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp)
 
 set(source 
     fileconfig.hpp
