@@ -10,11 +10,6 @@
 namespace ltc
 {
 
-struct DefaultBestShare
-{
-    static uint256 get() { return uint256(); }
-};
-
 // message_version
 BEGIN_MESSAGE(version)
     MESSAGE_FIELDS
@@ -26,10 +21,10 @@ BEGIN_MESSAGE(version)
         (uint64_t, m_nonce),
         (std::string, m_subversion),
         (uint32_t, m_mode), //# always 1 for legacy compatibility
-        (std::optional<uint256>, m_best_share)
+        (uint256, m_best_share)
     )
     {
-        READWRITE(obj.m_version, obj.m_services, obj.m_addr_to, obj.m_addr_from, obj.m_nonce, obj.m_subversion, obj.m_mode, Optional(obj.m_best_share, DefaultBestShare));
+        READWRITE(obj.m_version, obj.m_services, obj.m_addr_to, obj.m_addr_from, obj.m_nonce, obj.m_subversion, obj.m_mode, obj.m_best_share);
     }
 END_MESSAGE()
 
@@ -112,7 +107,7 @@ BEGIN_MESSAGE(sharereply)
     MESSAGE_FIELDS
     (
         (uint256, m_id),
-        (ShareReplyResult, m_result)
+        (ShareReplyResult, m_result),
         (std::vector<c2pool::chain::RawShare>, m_shares)
     )
     {
@@ -124,7 +119,7 @@ END_MESSAGE()
 BEGIN_MESSAGE(bestblock)
     MESSAGE_FIELDS
     (
-        (ltc::BlockHeaderType, m_header),
+        (ltc::BlockHeaderType, m_header)
     )
     {
         READWRITE(obj.m_header);
