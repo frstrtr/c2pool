@@ -9,8 +9,8 @@
 #include <btclibs/util/strencodings.h>
 #include <btclibs/uint256.h>
 
-#include "pack.hpp"
-#include "math.hpp"
+#include "packv1.hpp"
+#include <core/math.hpp>
 
 namespace legacy
 {
