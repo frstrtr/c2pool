@@ -198,7 +198,8 @@ struct CompactFormat
 };
 
 template <class T>
-concept OptionalTypeDefault = requires {
+concept OptionalTypeDefault = requires 
+{
     T::get();
 }; //(T a, PackStream& s) { a.Serialize(s); };
 
@@ -222,6 +223,29 @@ struct OptionalType
         opt = result;
     }
 };
+
+
+// template <class T>
+// concept OptionalCanBeNull = requires(T a)
+// {
+//     { a.SetNull() };
+//     { a.IsNull()  };
+// };
+
+// template <OptionalCanBeNull NullType>
+// struct OptionalType
+// {
+//     static void Write(PackStream& os, const NullType& opt)
+//     {
+//         os << opt;
+//     }
+
+//     template <typename T>
+//     static void Read(PackStream& os, NullType& opt)
+//     {
+//         os >> opt;
+//     }
+// };
 
 #define Optional(obj, Default) Using<OptionalType<Default>>(obj)
 #define VarInt(obj) Using<CompactFormat>(obj)
