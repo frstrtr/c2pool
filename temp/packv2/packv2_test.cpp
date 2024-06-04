@@ -346,6 +346,36 @@ TEST(OPTIONAL_FIELD2)
 
 END_TEST()
 
+TEST(UINT_CHECK1)
+    
+    uint256 n1;
+
+    PackStream stream;
+    stream << n1;
+    stream.print();
+
+    uint256 n2;
+    stream >> n2;
+
+    std::cout << n1 << " -> " << n2 << std::endl;
+
+END_TEST()
+
+TEST(UINT_CHECK2)
+    
+    uint256 n1; n1.SetNull();
+
+    PackStream stream;
+    stream << n1;
+    stream.print();
+
+    uint256 n2;
+    stream >> n2;
+
+    std::cout << n1 << " -> " << n2 << std::endl;
+
+END_TEST()
+
 int main()
 {
     test_INT();
@@ -362,4 +392,6 @@ int main()
     test_OPTIONAL_TYPE_FOR_CUSTOM();
     test_OPTIONAL_FIELD();
     test_OPTIONAL_FIELD2();
+    test_UINT_CHECK1();
+    test_UINT_CHECK2();
 }
