@@ -6,8 +6,11 @@
 #include <core/opscript.hpp>
 #include <btclibs/uint256.h>
 
+// struct ltc::MutableTransaction;
+
 namespace ltc
 {
+struct MutableTransaction;
 
 struct TxParams
 {
@@ -34,7 +37,7 @@ public:
     TxPrevOut prevout;
     OPScript scriptSig;
     uint32_t sequence;
-    OPScriptWitness scriptWitness; //!< Only serialized through CTransaction
+    OPScriptWitness scriptWitness; //!< Only serialized through Transaction
 
     SERIALIZE_METHODS(TxIn) { READWRITE(obj.prevout, obj.scriptSig, obj.sequence); }
 };
@@ -48,11 +51,10 @@ public:
     SERIALIZE_METHODS(TxOut) { READWRITE(obj.value, obj.scriptPubKey); }
 };
 
-struct MutableTransaction;
 class Transaction
 {
 public:
-        // Default transaction version.
+    // Default transaction version.
     static const int32_t CURRENT_VERSION = 2;
 
     std::vector<TxIn> vin;
@@ -63,10 +65,12 @@ public:
 private:
     bool m_has_witness;
 
+    bool ComputeHasWitness() const;
+
 public:
-    /** Convert a CMutableTransaction into a CTransaction. */
-    // explicit Transaction(const MutableTransaction& tx) ;
-    // explicit Transaction(MutableTransaction&& tx);
+    /** Convert a MutableTransaction into a Transaction. */
+    explicit Transaction(const MutableTransaction& tx) ;
+    explicit Transaction(MutableTransaction&& tx);
 
     template <typename StreamType>
     inline void Serialize(StreamType& os) const
@@ -77,7 +81,7 @@ public:
     bool HasWitness() const { return m_has_witness; }
 };
 
-/** A mutable version of CTransaction. */
+/** A mutable version of Transaction. */
 struct MutableTransaction
 {
     std::vector<TxIn> vin;
@@ -113,20 +117,20 @@ struct MutableTransaction
 
 /**
  * Basic transaction serialization format:
- * - int32_t nVersion
- * - std::vector<CTxIn> vin
- * - std::vector<CTxOut> vout
- * - uint32_t nLockTime
+ * - int32_t version
+ * - std::vector<TxIn> vin
+ * - std::vector<TxOut> vout
+ * - uint32_t locktime
  *
  * Extended transaction serialization format:
- * - int32_t nVersion
+ * - int32_t version
  * - unsigned char dummy = 0x00
  * - unsigned char flags (!= 0)
- * - std::vector<CTxIn> vin
- * - std::vector<CTxOut> vout
+ * - std::vector<TxIn> vin
+ * - std::vector<TxOut> vout
  * - if (flags & 1):
- *   - CScriptWitness scriptWitness; (deserialized into CTxIn)
- * - uint32_t nLockTime
+ *   - OPScriptWitness scriptWitness; (deserialized into TxIn)
+ * - uint32_t locktime
  */
 template<typename StreamType, typename TxType>
 void UnserializeTransaction(TxType& tx, StreamType& s, const TxParams& params)
