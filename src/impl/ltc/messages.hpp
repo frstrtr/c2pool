@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "transaction.hpp"
 
 #include <string>
 
@@ -163,11 +164,11 @@ END_MESSAGE()
 BEGIN_MESSAGE(remember_tx)
     MESSAGE_FIELDS
     (
-        (std::vector<uint256>, m_tx_hashes)
-        // TODO: (std::vector<ltc::tx_type> m_txs)
+        (std::vector<uint256>, m_tx_hashes),
+        (std::vector<ltc::MutableTransaction>, m_txs)
     )
     {
-        READWRITE(obj.m_tx_hashes/*, obj.m_txs*/);
+        READWRITE(obj.m_tx_hashes, ltc::TX_WITH_WITNESS(obj.m_txs));
     }
 END_MESSAGE()
 
