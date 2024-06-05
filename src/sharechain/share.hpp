@@ -15,6 +15,8 @@ struct RawShare
 
     SERIALIZE_METHODS(RawShare) { READWRITE(obj.type, obj.contents); }
 };
+
+
     
 
 } // namespace chain
