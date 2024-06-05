@@ -21,3 +21,5 @@ find_package(yaml-cpp REQUIRED)
 add_library(core STATIC ${source})
 target_link_libraries(core btclibs)
 target_link_libraries(core boost::boost yaml-cpp::yaml-cpp)
+
+add_subdirectory(test)
