@@ -2,6 +2,7 @@
 boost/1.78.0
 nlohmann_json/3.11.3
 yaml-cpp/0.8.0
+gtest/1.14.0
 
 [generators]
 CMakeDeps
