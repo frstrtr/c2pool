@@ -14,6 +14,7 @@ set(source
     common.hpp
     macro.hpp
     netaddress.hpp netaddress.cpp
+    opscript.hpp
 )
 
 find_package(yaml-cpp REQUIRED)
