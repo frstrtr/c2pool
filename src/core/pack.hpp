@@ -100,6 +100,35 @@ public:
     }
 };
 
+template <typename ParamsType, typename StreamType>
+struct ParamPackStream
+{
+    const ParamsType m_params;
+    StreamType& m_stream;
+
+public:
+    explicit ParamPackStream(const ParamsType& params, StreamType& stream) : m_params(params), m_stream(stream) { }
+
+    void write(std::span<const std::byte> value) { m_stream.write(value); }
+    void read(const std::span<std::byte>& data) { m_stream.read(data); }
+
+    template <typename T>
+    ParamPackStream& operator<<(const T& value)
+    {
+        Serialize(*this, value);
+        return *this;
+    }
+
+    template <typename T>
+    ParamPackStream& operator>>(T&& value)
+    {
+        Unserialize(*this, value);
+        return *this;
+    }
+    
+    const ParamsType& GetParams() const { return m_params; }
+};
+
 struct SerializeFormatter
 {
     template <typename StreamType, typename... Args>
@@ -293,7 +322,7 @@ protected:
     T m_value;
 
 public:
-    Wrapper(T value) : m_value(value) { }
+    explicit Wrapper(T value) : m_value(value) { }
 
     template <typename StreamType>
     void Serialize(StreamType& os) const
@@ -381,7 +410,8 @@ void Serialize(StreamType& os, const std::vector<T>& v)
         for (bool elem : v) {
             Serialize(os, elem);
         }
-    } else */ {
+    } else */ 
+    {
         Serialize(os, Using<ListType<DefaultFormat>>(v));
     }
 }
@@ -401,7 +431,39 @@ void Unserialize(StreamType& is, std::vector<T, A>& v)
             is.read(AsWritableBytes(Span{&v[i], blk}));
             i += blk;
         }
-    } else */{
+    } else */
+    {
         Unserialize(is, Using<ListType<DefaultFormat>>(v));
     }
 }
+
+template <typename ParamsType, typename T>
+class ParamsWrapper
+{
+    const ParamsType& m_params;
+    T& m_value;
+
+public:
+    explicit ParamsWrapper(const ParamsType& params, T& value) : m_params(params), m_value(value) { }
+
+    template <typename StreamType>
+    void Serialize(StreamType& os) const
+    {
+        ParamPackStream stream{m_params, os};
+        ::Serialize(stream, m_value);
+    }
+
+    template <typename StreamType>
+    void Unserialize(StreamType& is)
+    {
+        ParamPackStream stream{m_params, is};
+        ::Unserialize(stream, m_value);
+    }
+};
+
+#define SER_PARAMS_OPFUNC                                                                \
+    template <typename T>                                                                \
+    auto operator()(T&& t) const                                                         \
+    {                                                                                    \
+        return ParamsWrapper{*this, t};                                                  \
+    }
