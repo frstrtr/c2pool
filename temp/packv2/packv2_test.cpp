@@ -9,6 +9,7 @@
 
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
+#include <core/opscript.hpp>
 
 #include <core/legacy/packv1.hpp>
 #include <core/legacy/pack_typesv1.hpp>
@@ -376,6 +377,23 @@ TEST(UINT_CHECK2)
 
 END_TEST()
 
+TEST(OP_SCRIPT)
+    std::vector<unsigned char> vch{'a', 'c', 'o'};
+    OPScript script(vch.begin(), vch.end());
+
+    PackStream stream;
+    stream << script;
+
+    std::for_each(script.begin(), script.end(), [&](const auto& ch) { std::cout << ch << " "; });
+    std::cout << std::endl;
+    stream.print();
+
+    OPScript script2;
+    stream >> script2;
+    std::for_each(script.begin(), script.end(), [&](const auto& ch) { std::cout << ch << " "; });
+    std::cout << std::endl;
+END_TEST()
+
 int main()
 {
     test_INT();
@@ -394,4 +412,5 @@ int main()
     test_OPTIONAL_FIELD2();
     test_UINT_CHECK1();
     test_UINT_CHECK2();
+    test_OP_SCRIPT();
 }
