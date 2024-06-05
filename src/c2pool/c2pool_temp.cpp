@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <impl/ltc/protocol.hpp>
+#include <impl/ltc/transaction.hpp>
 
 int main(int argc, char *argv[])
 {
@@ -34,15 +35,21 @@ int main(int argc, char *argv[])
     // std::cout << cfg->m_fee << std::endl;
     // for (const auto& net : cfg->m_networks)
     //     std::cout << net << std::endl;
-    ltc::Protocol* protocol;
+    // std::cout << ping2->m_command << ": " << ping2->m_data << " " << ping2->m_data2 << " " << ping2->m_data3 << std::endl;
+    //
+    //
+    //
+    // ltc::Protocol* protocol;
 
-    auto ping = ltc::message_ping::make();
+    // auto ping = ltc::message_ping::make();
 
-    PackStream stream;
-    stream << *ping;
-    stream.print();
+    // PackStream stream;
+    // stream << *ping;
+    // stream.print();
 
     // auto ping2 = ltc::message_ping::make(stream);
-    auto ping2 = ltc::message_ping::make(stream);
-    // std::cout << ping2->m_command << ": " << ping2->m_data << " " << ping2->m_data2 << " " << ping2->m_data3 << std::endl;
+    //
+    //
+    //
+    auto p = ltc::TX_NO_WITNESS;
 }
