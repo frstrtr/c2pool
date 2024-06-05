@@ -102,8 +102,8 @@ public:
 
 struct SerializeFormatter
 {
-    template <typename... Args>
-    static void action(PackStream& stream, Args&&...args)
+    template <typename StreamType, typename... Args>
+    static void action(StreamType& stream, Args&&...args)
     {
         // SerializeAction(stream, args...);
         (Serialize(stream, args), ...);
@@ -112,8 +112,8 @@ struct SerializeFormatter
 
 struct UnserializeFormatter
 {
-    template <typename... Args>
-    static void action(PackStream& stream, Args&&...args)
+    template <typename StreamType, typename... Args>
+    static void action(StreamType& stream, Args&&...args)
     {
         // UnserializeAction(stream, args...);
         (Unserialize(stream, args), ...);
@@ -136,18 +136,22 @@ const Out& AsBase(const In& x)
 #define READWRITE(...) formatter.action(stream, __VA_ARGS__)
 
 #define FORMAT_METHODS(TYPE)\
-    static void Write(PackStream &stream, const TYPE &obj) { FormatAction(stream, obj, SerializeFormatter{}); }\
-    static void Read(PackStream &stream, TYPE &obj) { FormatAction(stream, obj, UnserializeFormatter{}); }\
-    template<typename Type, typename Formatter>\
-    static void FormatAction(PackStream &stream, Type &obj, Formatter formatter)
+    template<typename StreamType>\
+    static void Write(StreamType &stream, const TYPE &obj) { FormatAction(stream, obj, SerializeFormatter{}); }\
+    template<typename StreamType>\
+    static void Read(StreamType &stream, TYPE &obj) { FormatAction(stream, obj, UnserializeFormatter{}); }\
+    template<typename StreamType, typename Type, typename Formatter>\
+    static void FormatAction(StreamType &stream, Type &obj, Formatter formatter)
 
 #define BASE_SERIALIZE_METHODS(TYPE)\
-    void Serialize(PackStream& os) const\
+    template<typename StreamType>\
+    void Serialize(StreamType& os) const\
     {\
         static_assert(std::is_same_v<const TYPE&, decltype(*this)>, "Serialize " #TYPE " missmatch");\
         Write(os, *this);\
     }\
-    void Unserialize(PackStream& is)\
+    template<typename StreamType>\
+    void Unserialize(StreamType& is)\
     {\
         static_assert(std::is_same_v<TYPE&, decltype(*this)>, "Unserialize " #TYPE " missmatch");\
         Read(is, *this);\
@@ -161,33 +165,34 @@ const Out& AsBase(const In& x)
 template <typename T>
 concept IsInteger = std::numeric_limits<T>::is_integer;
 
-template <IsInteger int_type>
-inline void Serialize(PackStream& os, const int_type& value)
+template <typename StreamType, IsInteger int_type>
+inline void Serialize(StreamType& os, const int_type& value)
 {
     os.write(std::as_bytes(std::span{&value, 1}));
 }
 
-template <IsInteger int_type>
-inline void Unserialize(PackStream& is, int_type& value)
+template <typename StreamType, IsInteger int_type>
+inline void Unserialize(StreamType& is, int_type& value)
 {
     is.read(std::as_writable_bytes(std::span{&value, 1}));
 }
 
-template <IsInteger int_type>
-inline void write_int(PackStream& os, int_type num)
+template <IsInteger int_type, typename StreamType>
+inline void write_int(StreamType& os, int_type num)
 {
     Serialize(os, num);
 }
 
-template <IsInteger int_type>
-inline int_type read_int(PackStream& is)
+template <IsInteger int_type, typename StreamType>
+inline int_type read_int(StreamType& is)
 {
     int_type num;
     Unserialize(is, num);
     return num;
 }
 
-inline void WriteCompactSize(PackStream& os, uint64_t nSize)
+template <typename StreamType>
+inline void WriteCompactSize(StreamType& os, uint64_t nSize)
 {
     if (nSize < 253)
     {
@@ -211,7 +216,8 @@ inline void WriteCompactSize(PackStream& os, uint64_t nSize)
     return;
 }
 
-inline uint64_t ReadCompactSize(PackStream& is, bool range_check = true)
+template <typename StreamType>
+inline uint64_t ReadCompactSize(StreamType& is, bool range_check = true)
 {
     uint8_t chSize = read_int<uint8_t>(is);
     
@@ -245,14 +251,15 @@ inline uint64_t ReadCompactSize(PackStream& is, bool range_check = true)
 }
 
 // serialize string data
-
-inline void Serialize(PackStream& os, const std::string& value)
+template <typename StreamType>
+inline void Serialize(StreamType& os, const std::string& value)
 {
     WriteCompactSize(os, value.size());
     os.write(std::as_bytes(std::span{value}));
 }
 
-inline void Unserialize(PackStream& is, std::string& value)
+template <typename StreamType>
+inline void Unserialize(StreamType& is, std::string& value)
 {
     auto size = ReadCompactSize(is);
     value.resize(size);
@@ -262,18 +269,18 @@ inline void Unserialize(PackStream& is, std::string& value)
 /**
  * If none of the specialized versions above matched, default to calling member function.
  */
-template <class T>
-concept Serializable = requires(T a, PackStream& s) { a.Serialize(s); };
-template <typename T> requires Serializable<T>
-void Serialize(PackStream& os, const T& a)
+template <typename StreamType, class T>
+concept Serializable = requires(T a, StreamType& s) { a.Serialize(s); };
+template <typename StreamType, typename T> requires Serializable<StreamType, T>
+void Serialize(StreamType& os, const T& a)
 {
     a.Serialize(os);
 }
 
-template <class T>
-concept Unserializable = requires(T a, PackStream& s) { a.Unserialize(s); };
-template <typename T> requires Unserializable<T>
-void Unserialize(PackStream& is, T&& a)
+template <typename StreamType, class T>
+concept Unserializable = requires(T a, StreamType& s) { a.Unserialize(s); };
+template <typename StreamType, typename T> requires Unserializable<StreamType, T>
+void Unserialize(StreamType& is, T&& a)
 {
     a.Unserialize(is);
 }
@@ -288,12 +295,14 @@ protected:
 public:
     Wrapper(T value) : m_value(value) { }
 
-    void Serialize(PackStream& os) const
+    template <typename StreamType>
+    void Serialize(StreamType& os) const
     {
         PackFormat::Write(os, m_value);
     }
 
-    void Unserialize(PackStream& is)
+    template <typename StreamType>
+    void Unserialize(StreamType& is)
     {
         PackFormat::Read(is, m_value);
     }
@@ -309,19 +318,19 @@ static inline Wrapper<PackFormat, T> Using(T&& value) { return Wrapper<PackForma
  */
 struct DefaultFormat
 {
-    template<typename T>
-    static void Write(PackStream& s, const T& t) { Serialize(s, t); }
+    template<typename StreamType, typename T>
+    static void Write(StreamType& s, const T& t) { Serialize(s, t); }
 
-    template<typename T>
-    static void Read(PackStream& s, T& t) { Unserialize(s, t); }
+    template<typename StreamType, typename T>
+    static void Read(StreamType& s, T& t) { Unserialize(s, t); }
 };
 
 
 template <typename PackFormat>
 struct ListType
 {
-    template <typename V>
-    static void Write(PackStream& os, const V& values)
+    template <typename StreamType, typename V>
+    static void Write(StreamType& os, const V& values)
     {
         WriteCompactSize(os, values.size());
 
@@ -331,8 +340,8 @@ struct ListType
         }
     }
 
-    template <typename V>
-    static void Read(PackStream& is, V& values)
+    template <typename StreamType, typename V>
+    static void Read(StreamType& is, V& values)
     {
         values.clear();
         auto nSize = ReadCompactSize(is);
@@ -357,8 +366,8 @@ struct ListType
 /**
  * vector
  */
-template <typename T>
-void Serialize(PackStream& os, const std::vector<T>& v)
+template <typename StreamType, typename T>
+void Serialize(StreamType& os, const std::vector<T>& v)
 {
     /*  TODO:
     if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
@@ -377,8 +386,8 @@ void Serialize(PackStream& os, const std::vector<T>& v)
     }
 }
 
-template <typename T, typename A>
-void Unserialize(PackStream& is, std::vector<T, A>& v)
+template <typename StreamType, typename T, typename A>
+void Unserialize(StreamType& is, std::vector<T, A>& v)
 {
     /* TODO:
     if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes

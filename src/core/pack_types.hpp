@@ -9,34 +9,26 @@
 template <size_t Size>
 struct BigEndianFormat
 {
-    template<typename T>
-    static void Write(PackStream& s, const T& t) 
+    template<typename StreamType, typename T>
+    static void Write(StreamType& s, const T& t) 
     { 
         PackStream reverse_stream;
         reverse_stream << t;
         reverse_stream.reverse();
 
-        s << reverse_stream;        
+        s << reverse_stream;
     }
 
-    template<typename T>
-    static void Read(PackStream& s, T& t) 
+    template<typename StreamType, typename T>
+    static void Read(StreamType& s, T& t) 
     {
         std::array<std::byte, Size> arr;
         s.read(std::as_writable_bytes(std::span{arr}));
 
         PackStream reverse_stream(arr);
         reverse_stream.reverse();
-        // std::reverse(arr.begin(), arr.end());
 
         reverse_stream >> t;
-        // s.write(r);
-
-        // std::reverse(r.begin(), r.end());
-        // PackStream reverse_stream;
-        // reverse_stream.read(r);
-
-        // reverse_stream >> t;
     }
 };
 
@@ -44,7 +36,8 @@ struct BigEndianFormat
 template <typename int_type, bool BE = false>
 struct UIntType
 {
-    static void Write(PackStream& os, const int_type& value)
+    template <typename StreamType>
+    static void Write(StreamType& os, const int_type& value)
     {
         if constexpr (BE)
         {
@@ -55,7 +48,8 @@ struct UIntType
         }
     }
 
-    static void Read(PackStream& is, int_type& value)
+    template <typename StreamType>
+    static void Read(StreamType& is, int_type& value)
     {
         if constexpr (BE)
         {
@@ -71,7 +65,8 @@ template <typename long_type, bool BE = false>
 struct ULongType
 {
     // static_assert(std::is_base_of<base_uint<>, long_type>::value, "ULongType want for base_uint type!");
-    static void Write(PackStream& os, const long_type& value)
+    template <typename StreamType>
+    static void Write(StreamType& os, const long_type& value)
     {
         if constexpr (BE)
         {
@@ -82,7 +77,8 @@ struct ULongType
         }
     }
 
-    static void Read(PackStream& is, long_type& value)
+    template <typename StreamType>
+    static void Read(StreamType& is, long_type& value)
     {
         if constexpr (BE)
         {
@@ -114,8 +110,8 @@ INT_TYPE_SPEC(288, ULongType, uint288);
 template <typename PackFormat, size_t Size>
 struct ArrayType
 {
-    template <typename V>
-    static void Write(PackStream& os, const V& values)
+    template <typename StreamType, typename V>
+    static void Write(StreamType& os, const V& values)
     {
         for(const typename V::value_type& v : values)
         {
@@ -123,8 +119,8 @@ struct ArrayType
         }
     }
 
-    template <typename V>
-    static void Read(PackStream& is, V& values)
+    template <typename StreamType, typename V>
+    static void Read(StreamType& is, V& values)
     {
         values.clear();
         values.reserve(Size);
@@ -139,15 +135,15 @@ struct ArrayType
 template <typename INT_PACK_TYPE>
 struct EnumType
 {
-    template <typename E>
-    static void Write(PackStream& os, const E& enum_value)
+    template <typename StreamType, typename E>
+    static void Write(StreamType& os, const E& enum_value)
     {
         static_assert(std::is_enum<E>::value, "EnumType::Write needs for enum value");
         os << Using<INT_PACK_TYPE>(enum_value);
     }
 
-    template <typename E>
-    static void Read(PackStream& is, E& enum_value)
+    template <typename StreamType, typename E>
+    static void Read(StreamType& is, E& enum_value)
     {
         static_assert(std::is_enum<E>::value, "EnumType::Read needs for enum value");
         typename INT_PACK_TYPE::num_type res;
@@ -160,7 +156,8 @@ struct EnumType
 template <size_t Size>
 struct FixedStrType
 {
-    static void Write(PackStream& os, const std::string& str)
+    template <typename StreamType>
+    static void Write(StreamType& os, const std::string& str)
     {
         //TODO: check for size?
         // std::string str_copy = str;
@@ -169,7 +166,8 @@ struct FixedStrType
         os << str;
     }
 
-    static void Read(PackStream& is, std::string& str)
+    template <typename StreamType>
+    static void Read(StreamType& is, std::string& str)
     {
         auto nSize = ReadCompactSize(is);
         if (nSize > Size)
@@ -184,14 +182,14 @@ struct CompactFormat
 {
     using num_type = uint32_t;
 
-    template <typename int_type>
-    static void Write(PackStream& os, const int_type& num)
+    template <typename StreamType, typename int_type>
+    static void Write(StreamType& os, const int_type& num)
     {
         WriteCompactSize(os, num);
     }
 
-    template <typename int_type>
-    static void Read(PackStream& os, int_type& num)
+    template <typename StreamType, typename int_type>
+    static void Read(StreamType& os, int_type& num)
     {
         num = ReadCompactSize(os, false);
     }
@@ -206,8 +204,8 @@ concept OptionalTypeDefault = requires
 template <OptionalTypeDefault Default>
 struct OptionalType
 {
-    template <typename T>
-    static void Write(PackStream& os, const std::optional<T>& opt)
+    template <typename StreamType, typename T>
+    static void Write(StreamType& os, const std::optional<T>& opt)
     {
         if (opt)
             os << *opt;
@@ -215,8 +213,8 @@ struct OptionalType
             os << Default::get();
     }
 
-    template <typename T>
-    static void Read(PackStream& os, std::optional<T>& opt)
+    template <typename StreamType, typename T>
+    static void Read(StreamType& os, std::optional<T>& opt)
     {
         T result;
         os >> result;
