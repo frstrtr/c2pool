@@ -11,5 +11,10 @@ add_executable(specificator_type specificator_type.cpp)
 add_executable(addr_check addr_check.cpp)
 target_link_libraries(addr_check core)
 
+add_executable(constexpr_if constexpr_if.cpp)
+add_executable(constexpr_if2 constexpr_if2.cpp)
+add_executable(constexpr_if3 constexpr_if3.cpp)
+add_executable(constexpr_if4 constexpr_if4.cpp)
+
 add_subdirectory(new_pack)
 add_subdirectory(packv2)

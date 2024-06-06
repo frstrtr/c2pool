@@ -6,8 +6,6 @@
 #include <core/opscript.hpp>
 #include <btclibs/uint256.h>
 
-// struct ltc::MutableTransaction;
-
 namespace ltc
 {
 struct MutableTransaction;
