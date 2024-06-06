@@ -18,6 +18,9 @@ struct Base
     const int m_version;
 
     constexpr Base(int version) : m_version{version} { }
+
+    static constexpr int get_version() { return Base::m_version; }
+
 };
 
 template <int VERSION>
@@ -47,39 +50,14 @@ struct Version<1> { using type = A; };
 template <>
 struct Version<2> { using type = B; };
 
-// template <typename From, typename To>
-// constexpr To* f(From* v) 
-// { 
-//     return (To*) v; 
-// }
 
 template <typename T>
 typename Version<T::version>::type f(Base* v)
 {
-    using type = Version<Base::m_version>;
+    using type = Version<Base::get_version()>::type;
 }
 
 int main()
 {
 
-
-    // uint64_t* v = new uint64_t; std::cin >> *v;
-    // auto v2 = f<uint64_t, uint32_t>(v);
-
-    // std::cout << *v2 << std::endl;
-
-    // Base* value;
-
-    // switch (i)
-    // {
-    // case 0:
-    //     value = new A(111);
-    //     break;
-    // case 1:
-    //     value = new B(50);
-    //     break;
-    // default:
-    //     break;
-    // }
-    // std::cout << f(value) << std::endl;
 }
