@@ -15,6 +15,8 @@ add_executable(constexpr_if constexpr_if.cpp)
 add_executable(constexpr_if2 constexpr_if2.cpp)
 add_executable(constexpr_if3 constexpr_if3.cpp)
 add_executable(constexpr_if4 constexpr_if4.cpp)
+add_executable(constexpr_if5 constexpr_if5.cpp)
+add_executable(constexpr_if6 constexpr_if6.cpp)
 
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
