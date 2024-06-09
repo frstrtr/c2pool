@@ -6,5 +6,5 @@ set(pool_source
     message.hpp
 )
 
-add_library(pool ${pool_source})
+add_library(pool STATIC ${pool_source})
 target_link_libraries(pool core)
