@@ -50,7 +50,7 @@ struct ObjsWrapper : std::variant<Args...>
     }
 };
 
-#define CALL(func) call([](auto&& obj) { func (obj); })
+#define CALL(func) call([](auto& obj) { func (obj); })
 
 using ObjsRef = ObjsWrapper<A*, B*, C*>;
 
@@ -87,7 +87,7 @@ int main()
     {
         A* _a = new A{123};
         c2pool::debug_timestamp t1;
-        for (int i = 0; i < 10'000'001; i++)
+        for (int i = 0; i < 20'000'001; i++)
             f(_a);
         
         c2pool::debug_timestamp t2;
@@ -100,8 +100,8 @@ int main()
     {
         c2pool::debug_timestamp t1;
         for (int i = 0; i < 10'000'000; i++)
-            std::visit([](auto& obj) { f(obj);} , a);
-            // a2.CALL(f);
+            // std::visit([](auto& obj) { f(obj);} , a);
+            a2.CALL(f);
 
         c2pool::debug_timestamp t2;
         std::cout << std::get<A*>(a)->m_v << ": " << (t2-t1) << std::endl;

@@ -26,8 +26,9 @@ add_executable(constexpr_final_pointers constexpr_final_pointers.cpp)
 target_link_libraries(constexpr_final_pointers core)
 add_executable(finaloptz finaloptz.cpp)
 target_link_libraries(finaloptz core)
+add_executable(constexpr_if7 constexpr_if7.cpp)
+add_executable(constexpr_if8 constexpr_if8.cpp)
+add_executable(spec_templ_local spec_templ_local.cpp)
 
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
-
-message(${CMAKE_BUILD_TYPE})
