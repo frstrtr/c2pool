@@ -30,5 +30,7 @@ add_executable(constexpr_if7 constexpr_if7.cpp)
 add_executable(constexpr_if8 constexpr_if8.cpp)
 add_executable(spec_templ_local spec_templ_local.cpp)
 
+add_executable(static_assert_check_templ static_assert_check_templ.cpp)
+
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
