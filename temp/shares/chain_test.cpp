@@ -34,7 +34,9 @@ struct FakeChain : c2pool::core::Chain<FakeRule>
 int main()
 {
     FakeChain chain;
-
-    chain.add(FakeShareA{100});
+    
+    chain.add(FakeShareA(100));
     chain.add(FakeShareB(200.222));
+
+    
 }

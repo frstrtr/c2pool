@@ -32,9 +32,10 @@ protected:
 public:
     explicit Chain() {}
 
-    void add(value_type&& value)
+    template <typename T>
+    void add(T&& value)
     {
-        
+        values[uint256()]
     }
 
     void remove(const hash_type&& key)

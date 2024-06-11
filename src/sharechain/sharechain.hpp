@@ -1,6 +1,5 @@
 #pragma once
 
-#include <
 namespace c2pool
 {
 

@@ -3,7 +3,7 @@ file(GLOB legacy_tracker "legacy/*.hpp")
 
 set(SHARECHAIN_SOURCE
     share.hpp
-    sharechain.hpp
+    sharechain.cpp sharechain.hpp
     ${legacy_tracker}
 )
 
