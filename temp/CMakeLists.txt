@@ -34,3 +34,4 @@ add_executable(static_assert_check_templ static_assert_check_templ.cpp)
 
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
+add_subdirectory(shares)
