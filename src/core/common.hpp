@@ -4,9 +4,12 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <functional>
 
 namespace c2pool
 {
+
+inline std::function<int()> count_generator();
 
 struct debug_timestamp
 {

@@ -1,6 +1,10 @@
+
+file(GLOB legacy_tracker "legacy/*.hpp")
+
 set(SHARECHAIN_SOURCE
     share.hpp
     sharechain.hpp
+    ${legacy_tracker}
 )
 
 add_library(sharechain STATIC ${SHARECHAIN_SOURCE})

@@ -1,0 +1,2 @@
+add_executable(sharechain1 sharechain1.cpp)
+target_link_libraries(sharechain1 core sharechain)
