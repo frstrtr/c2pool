@@ -1,15 +1,16 @@
 #pragma once
 
-#include <sharechain/legacy/base_share_tracker.hpp>
-
+#include <
 namespace c2pool
 {
 
 namespace chain
 {
 
-class ShareChain : public 
+class ShareChain
 {
+
+
     
 };
 

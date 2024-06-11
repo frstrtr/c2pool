@@ -1,10 +1,9 @@
 #pragma once
 #include <map>
-// #include <unordered_map>
 #include <set>
 #include <vector>
 
-// TODO:
+#include <btclibs/uint256.h>
 
 namespace c2pool
 {
@@ -12,11 +11,10 @@ namespace c2pool
 namespace core
 {
 
-template <typename KeyT, typename ValueT>
-struct BaseChainRule
+template <typename SHARE_TYPE>
+struct ChainRule
 {
-    using key_type = KeyT;
-    using value_type = ValueT;
+    using value_type = SHARE_TYPE;
 
 };
 
@@ -25,11 +23,11 @@ class Chain
 {
 public:
     using rule_type = Rule;
-    using key_type = typename rule_type::key_type;
+    using hash_type = uint256; // typename rule_type::key_type;
     using value_type = typename rule_type::value_type;
     
 protected:
-    std::map<key_type, value_type> values;
+    std::map<hash_type, value_type> values;
     
 public:
     explicit Chain() {}
@@ -39,7 +37,7 @@ public:
         
     }
 
-    void remove(const key_type&& key)
+    void remove(const hash_type&& key)
     {
 
     }
