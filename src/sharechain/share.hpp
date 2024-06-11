@@ -27,9 +27,9 @@ template <typename T>
 concept is_share_type = std::is_base_of<BaseShare<T::version>, T>::value;
 
 template <typename...Args>
-struct ShareRefType : std::variant<Args...>
+struct ShareVariants : std::variant<Args...>
 {
-    static_assert((is_share_type<Args> && ...), "ShareRefType parameters must inherit from BaseShare");
+    static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
 
     // Use macros .INVOKE(<func>)
     template<typename F>

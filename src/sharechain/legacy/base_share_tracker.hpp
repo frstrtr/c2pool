@@ -1,9 +1,13 @@
 #pragma once
+
+#include <sharechain/share.hpp>
+
 #include "tracker.hpp"
 #include "rules.hpp"
 #include "prefsum_weights.hpp"
 
-class BaseTrackerElement : public BaseSumElement<ShareType, BaseTrackerElement, uint256>
+template <typename ShareRef>
+class BaseTrackerElement : public BaseSumElement<ShareRef, BaseTrackerElement, uint256>
 {
 public:
     value_type share;
