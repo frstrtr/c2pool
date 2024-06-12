@@ -26,6 +26,9 @@ struct BaseShare
 template <typename T>
 concept is_share_type = std::is_base_of<BaseShare<T::version>, T>::value;
 
+template <typename Correct, typename...Ts>
+concept is_correct_share = (std::is_same<Correct, Ts>::value || ...);
+
 template <typename...Args>
 struct ShareVariants : std::variant<Args...>
 {
