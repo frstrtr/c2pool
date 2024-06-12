@@ -21,7 +21,12 @@ struct FakeShareB : c2pool::chain::BaseShare<20>
 
 using ShareType = c2pool::chain::ShareVariants<FakeShareA, FakeShareB>;
 
-struct FakeRule : c2pool::core::ChainRule<ShareType>
+struct FakeRuleSum
+{
+
+};
+
+struct FakeRule : c2pool::core::ChainRule<int, ShareType, FakeRuleSum>
 {
 
 };
