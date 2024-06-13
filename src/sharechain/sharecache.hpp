@@ -1,27 +1,26 @@
 #pragma once
 
+#include <vector>
 #include <unordered_map>
+#include <list>
 
 namespace c2pool
 {
-
+    
 namespace chain
 {
 
 // Base for ShareIndexType
 template <typename HashType, typename ItemType, typename HasherType>
-class ShareIndex
+class IndexType
 {
 public:
     using hash_t = HashType;
     using item_t = ItemType;
     using hasher_t = HasherType;
 
-    hash_t m_hash;
-    int32_t m_height; 
-
-    ShareIndex* prev;
-
+protected:
+    const hash_t m_hash;
 
 public:
 
@@ -30,8 +29,22 @@ public:
     
 };
 
+// template <std::size_t Size, typename ShareIndexType>
+// class CacheChunk
+// {
+//     using index_t = ShareIndexType;
+//     using hash_t = typename index_t::hash_t;
+//     using item_t = typename index_t::item_t;
+
+// private:
+//     std::list<index_t> m_data;
+
+// public:
+
+// };
+
 template <typename ShareIndexType>
-class ShareChain
+class ShareChainCache
 {
     // using ChunkSize = std::integral_constant<std::size_t, ChunkSize>;
     using index_t = ShareIndexType;
@@ -43,10 +56,11 @@ class ShareChain
 private:
     std::unordered_map<hash_t, item_t, hasher_t> m_shares;
 
-public:    
-    
+public:
+
 };
+    
+} // namespace chain
 
-} // namespace sharechain
 
-}
+} // namespace c2pool
