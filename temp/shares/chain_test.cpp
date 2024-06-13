@@ -1,47 +1,67 @@
 #include <iostream>
 
 #include <sharechain/share.hpp>
-#include <core/chain.hpp>
+#include <sharechain/sharechain.hpp>
 
-struct FakeShareA : c2pool::chain::BaseShare<10>
+template <int64_t Version>
+struct BaseFakeShare : c2pool::chain::BaseShare<Version>
+{
+    int m_hash;
+    int m_prev_hash;
+
+    BaseFakeShare() { }
+    BaseFakeShare(int hash, int prev_hash) : m_hash(hash), m_prev_hash(prev_hash) { }
+};
+
+struct FakeShareA : BaseFakeShare<10>
 {
     int m_data1;
 
     FakeShareA() {}
-    FakeShareA(int data1) : m_data1{data1} {}
+    FakeShareA(int hash, int prev_hash, int data1) : BaseFakeShare<10>(hash, prev_hash), m_data1{data1} {}
 };
 
-struct FakeShareB : c2pool::chain::BaseShare<20>
+struct FakeShareB : BaseFakeShare<20>
 {
     double m_data2;
 
     FakeShareB() {}
-    FakeShareB(double data2) : m_data2{data2} {}
+    FakeShareB(int hash, int prev_hash, double data2) : BaseFakeShare<20>(hash, prev_hash), m_data2{data2} {}
 };
 
 using ShareType = c2pool::chain::ShareVariants<FakeShareA, FakeShareB>;
 
-struct FakeRuleSum
+class FakeIndex : public c2pool::chain::ShareIndex<int, ShareType, std::hash<int>>
 {
 
 };
 
-struct FakeRule : c2pool::core::ChainRule<int, ShareType, FakeRuleSum>
+struct FakeChain : c2pool::chain::ShareChain<FakeIndex>
 {
 
 };
 
-struct FakeChain : c2pool::core::Chain<FakeRule>
+template <typename share_t>
+void test_f(share_t* share)
 {
+    if (!share)
+        return;
 
-};
+    std::cout << "Share (" << share->m_prev_hash << " -> " << share->m_hash << "): ";
+
+    if constexpr (share_t::version == 10)
+        std::cout << share->m_data1 << std::endl;
+    if constexpr (share_t::check_version(20))
+        std::cout << share->m_data2 << std::endl;
+}
 
 int main()
 {
     FakeChain chain;
     
-    chain.add(FakeShareA(100));
-    chain.add(FakeShareB(200.222));
+    chain.add(new FakeShareA(11, 10, 100));
+    chain.add(new FakeShareB(12, 11, 200.222));
 
-    
+    auto share = chain.get_share(11);
+    share.INVOKE(test_f);
 }
