@@ -1,6 +1,7 @@
 #pragma once
 
 #include <variant>
+#include <type_traits>
 #include <core/pack.hpp>
 
 namespace c2pool
@@ -21,6 +22,11 @@ template <int64_t VERSION>
 struct BaseShare
 {
     constexpr static int32_t version = VERSION;
+
+    constexpr static bool check_version(int threshold_version)
+    {
+        return version >= threshold_version;
+    }
 };
 
 template <typename T>
@@ -30,7 +36,7 @@ template <typename Correct, typename...Ts>
 concept is_correct_share = (std::is_same<Correct, Ts>::value || ...);
 
 template <typename...Args>
-struct ShareVariants : std::variant<Args...>
+struct ShareVariants : std::variant<Args*...>
 {
     static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
 
@@ -40,9 +46,17 @@ struct ShareVariants : std::variant<Args...>
     {
         std::visit(func, *this);
     }
+
+    template <typename T>
+    ShareVariants& operator=(T* value)
+    {
+        static_assert((std::is_same_v<T, Args> || ...), "ShareVariants can be cast only to Args...");
+        std::variant<Args*...>::operator = (value);
+        return *this;
+    }
 };
 
-#define INVOKE(func) .invoke([](auto& obj) { ##func (obj);})
+#define INVOKE(func) invoke([](auto& obj) { func (obj);})
 
 } // namespace chain
 
