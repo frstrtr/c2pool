@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <set>
 #include <cstdint>
 #include <stdexcept>
 
@@ -21,23 +22,33 @@ public:
     using share_t = VarShareType;
     using hasher_t = HasherType;
 
-    hash_t m_hash;
-    int32_t m_height; 
+    hash_t hash;
+    int32_t height; 
 
     ShareIndex* prev {nullptr};
 
 public:
 
-    virtual hash_t hash() const = 0;
-    
+    ShareIndex() : hash{}, height{0} {}
+    template <typename ShareT> ShareIndex(ShareT* share) : hash{share->m_hash}, height{1} {}
+
+    void calculate_index()
+    {
+        if (!prev)
+            return;
+
+        height += prev->height;
+        calculate();
+    }
+
+protected:
+    virtual void calculate() = 0;
 };
 
 template <typename ShareIndexType>
 class ShareChain
 {
-    // using ChunkSize = std::integral_constant<std::size_t, ChunkSize>;
     using index_t = ShareIndexType;
-    // using chunk_t = CacheChunk<typename index_t>;
     using hash_t = typename index_t::hash_t;
     using share_t = typename index_t::share_t;
     using hasher_t = typename index_t::hasher_t;
@@ -47,29 +58,32 @@ class ShareChain
         index_t* index;
         share_t share;
 
-        chain_data(index_t* _index, share_t&& _share)
-            : index(_index), share(std::move(_share))
-        { }
+        chain_data() {}
+        chain_data(index_t* _index, share_t& _share) : index(_index), share(std::move(_share)) {}
     };
 
 private:
     std::unordered_map<hash_t, chain_data, hasher_t> m_shares;
+    std::unordered_map<hash_t, index_t*, hasher_t> heads;
+    std::unordered_map<hash_t, std::set<index_t*>, hasher_t> heads;
+    
 
 public:
     template <typename ShareT>
-    void add(ShareT* _share)
+    void add(ShareT* share)
     {
         static_assert(is_share_type<ShareT>, "In ShareChain can be added only BaseShare types!");
 
         // index
-        auto index = new index_t(_share);
+        auto index = new index_t(share);
+        if (m_shares.contains(share->m_prev_hash))
+            index->prev = m_shares[share->m_prev_hash].index;
+        index->calculate_index(); 
         
+        // share_variants
+        share_t share_var; share_var = share;
         
-        // share
-        share_t share = _share;
-        
-
-        m_shares[_share->m_hash] = {index, share};
+        m_shares[share->m_hash] = chain_data{index, share_var};
     }
 
     chain_data& get(hash_t&& hash)
@@ -82,7 +96,7 @@ public:
 
     share_t& get_share(hash_t&& hash)
     {
-        return get(hash).share;
+        return get(std::move(hash)).share;
     }
     
     bool contains(hash_t&& hash)

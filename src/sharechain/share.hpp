@@ -40,9 +40,9 @@ struct ShareVariants : std::variant<Args*...>
 {
     static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
 
-    // Use macros .INVOKE(<func>)
+    // Use macros .invoke(<func>)
     template<typename F>
-    void invoke(F&& func)
+    void call(F&& func)
     {
         std::visit(func, *this);
     }
@@ -56,7 +56,7 @@ struct ShareVariants : std::variant<Args*...>
     }
 };
 
-#define INVOKE(func) invoke([](auto& obj) { func (obj);})
+#define invoke(func) call([](auto& obj) { func (obj);})
 
 } // namespace chain
 

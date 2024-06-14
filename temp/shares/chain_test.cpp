@@ -33,7 +33,29 @@ using ShareType = c2pool::chain::ShareVariants<FakeShareA, FakeShareB>;
 
 class FakeIndex : public c2pool::chain::ShareIndex<int, ShareType, std::hash<int>>
 {
+private:
+    using base_index = c2pool::chain::ShareIndex<int, ShareType, std::hash<int>>;
+public:
 
+    int data1;
+    double data2;
+
+    FakeIndex() : base_index() {}
+    template <typename ShareT> FakeIndex(ShareT* share) : base_index(share)
+    {
+        if constexpr(ShareT::version == 10)
+            data1 = share->m_data1;
+        if constexpr(ShareT::version == 20)
+            data2 = share->m_data2;
+    }
+
+private:
+    void calculate() override
+    {
+        auto _prev = static_cast<FakeIndex*>(prev);
+        data1 += _prev->data1;
+        data2 += _prev->data2;
+    }
 };
 
 struct FakeChain : c2pool::chain::ShareChain<FakeIndex>
@@ -61,7 +83,13 @@ int main()
     
     chain.add(new FakeShareA(11, 10, 100));
     chain.add(new FakeShareB(12, 11, 200.222));
+    chain.add(new FakeShareB(13, 12, 10));
+    chain.add(new FakeShareA(14, 13, 50));
 
     auto share = chain.get_share(11);
-    share.INVOKE(test_f);
+    share.invoke(test_f);
+
+    auto& [index, data12] = chain.get(13);
+    std::cout << index->hash << "; " << index->height << std::endl;
+    std::cout << index->data1 << "; " << index->data2 << std::endl;
 }
