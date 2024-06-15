@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <cstdint>
 #include <stdexcept>
@@ -14,35 +15,38 @@ namespace chain
 {
 
 // Base for ShareIndexType
-template <typename HashType, typename VarShareType, typename HasherType>
+template <typename HashType, typename VarShareType, typename HasherType, typename HighIndex>
 class ShareIndex
 {
+protected:
+    using base_index = ShareIndex<HashType, VarShareType, HasherType, HighIndex>;
 public:
     using hash_t = HashType;
     using share_t = VarShareType;
     using hasher_t = HasherType;
+    using high_index_t = HighIndex;
 
     hash_t hash;
     int32_t height; 
 
-    ShareIndex* prev {nullptr};
+    high_index_t* prev {nullptr};
 
 public:
 
     ShareIndex() : hash{}, height{0} {}
     template <typename ShareT> ShareIndex(ShareT* share) : hash{share->m_hash}, height{1} {}
 
-    void calculate_index()
+    void calculate_index(high_index_t* index)
     {
-        if (!prev)
-            return;
+        if (!index)
+            throw std::invalid_argument("nullptr index");
 
-        height += prev->height;
-        calculate();
+        height += index->height;
+        calculate(index);
     }
 
 protected:
-    virtual void calculate() = 0;
+    virtual void calculate(high_index_t* index) = 0;
 };
 
 template <typename ShareIndexType>
@@ -64,9 +68,120 @@ class ShareChain
 
 private:
     std::unordered_map<hash_t, chain_data, hasher_t> m_shares;
-    std::unordered_map<hash_t, index_t*, hasher_t> heads;
-    std::unordered_map<hash_t, std::set<index_t*>, hasher_t> heads;
+
+    std::unordered_map<hash_t, hash_t, hasher_t> m_heads;
+    std::unordered_map<hash_t, std::set<index_t*>, hasher_t> m_tails;
     
+    void calculate_head_tail(hash_t hash, hash_t prev, index_t* index)
+    {
+        enum fork_state
+        {
+            new_fork = 0,
+            only_heads = 1,
+            only_tails = 1 << 1,
+            merge = only_heads | only_tails,
+
+            split = 1 << 2
+        };
+
+        int state = new_fork;
+        if (m_heads.contains(prev))
+            state |= only_heads;
+        if (m_tails.contains(hash))
+            state |= only_tails;
+
+        switch (state)
+        {
+        case new_fork:
+            // создание нового форка
+            {
+                m_heads[hash] = prev;    
+                m_tails[prev].insert(index);
+            }
+            break;
+        case merge:
+            // объединение двух форков на стыке нового элемента
+            {
+                // left
+                auto left_part = m_heads.extract(prev); // heads[t]
+                // left_part.key() = hash;
+
+                index->prev = m_shares[prev].index;
+                index->calculate_index(index->prev);
+
+                // right
+                std::unordered_set<index_t*> dirty_indexs;
+                auto right_parts = m_tails.extract(hash); // tails[h]
+                // right_parts.key() = left_part.key();
+                for (auto& part : right_parts.mapped())
+                {
+                    index_t* cur = part;
+                    while(cur)
+                    {
+                        if (dirty_indexs.contains(cur))
+                            break;
+                        
+                        dirty_indexs.insert(cur);
+                        cur->calculate_index(index);
+
+                        if (!cur->prev)
+                        {
+                            cur->prev = index;
+                            break;
+                        }
+
+                        cur = cur->prev;
+                    }
+                }
+                for (auto& head : right_parts.mapped())
+                {
+                    m_heads[head->hash] = left_part.mapped();
+                    m_tails[left_part.mapped()].insert(head);
+                }
+                // m_heads.insert(std::move(left_part));
+                // m_tails.insert(std::move(right_parts));
+            }
+            break;
+        case only_tails:
+            // элемент слева
+            {
+                std::unordered_set<index_t*> dirty_indexs;
+                auto right_parts = m_tails.extract(hash);
+                for (auto& part : right_parts.mapped())
+                {
+                    index_t* cur = part;
+                    while(cur)
+                    {
+                        if (dirty_indexs.contains(cur))
+                            break;
+                        
+                        dirty_indexs.insert(cur);
+                        cur->calculate_index(index);
+
+                        if (!cur->prev)
+                        {
+                            cur->prev = index;
+                            break;
+                        }
+
+                        cur = cur->prev;
+                    }
+                }
+            }
+            break;
+        case only_heads:
+            // элемент справа
+            {
+                auto left_part = m_heads.extract(prev);
+                left_part.key() = hash;
+
+                index->prev = m_shares[prev].index;
+                index->calculate_index(index->prev);
+                m_heads.insert(std::move(left_part));
+            }
+            break;
+        }
+    }
 
 public:
     template <typename ShareT>
@@ -76,12 +191,14 @@ public:
 
         // index
         auto index = new index_t(share);
-        if (m_shares.contains(share->m_prev_hash))
-            index->prev = m_shares[share->m_prev_hash].index;
-        index->calculate_index(); 
+        // if (m_shares.contains(share->m_prev_hash))
+        //     index->prev = m_shares[share->m_prev_hash].index;
+        // index->calculate_index(index->prev); 
         
         // share_variants
         share_t share_var; share_var = share;
+
+        calculate_head_tail(share->m_hash, share->m_prev_hash, index);
         
         m_shares[share->m_hash] = chain_data{index, share_var};
     }
@@ -102,6 +219,25 @@ public:
     bool contains(hash_t&& hash)
     {
         return m_shares.contains(hash);
+    }
+
+    void debug()
+    {
+        std::cout << "m_heads: \n";
+        for (auto& [hash, value] : m_heads)
+        {
+            std::cout << "\t" << hash << ":" << value << std::endl;
+        }
+
+        std::cout << "m_tails: \n";
+        for (auto& [hash, values] : m_tails)
+        {
+            std::cout << "\t" << hash << ": [ ";
+            for (auto& value : values)
+                std::cout << value->hash << " ";
+            std::cout << "]\n";
+        }
+        std::cout << "==============" << std::endl;
     }
 };
 
