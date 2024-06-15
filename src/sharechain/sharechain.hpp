@@ -102,18 +102,25 @@ private:
         case merge:
             // объединение двух форков на стыке нового элемента
             {
-                // left
-                auto left_part = m_heads.extract(prev); // heads[t]
-                // left_part.key() = hash;
+                auto left = m_heads.extract(prev); // heads[t]
+                auto& l_tail = left.mapped(); auto& l_head = left.key();
+                auto right = m_tails.extract(hash); // tails[h]
+                auto& r_tail = right.key(); auto& r_heads = right.mapped();
+
+                m_tails[l_tail].insert(r_heads.begin(), r_heads.end());
+                m_tails[l_tail].erase(m_shares[prev].index);
+
+                for (auto& i : m_tails[l_tail])
+                    m_heads[i->hash] = l_tail;
 
                 index->prev = m_shares[prev].index;
                 index->calculate_index(index->prev);
 
-                // right
+                // // right
                 std::unordered_set<index_t*> dirty_indexs;
-                auto right_parts = m_tails.extract(hash); // tails[h]
+                
                 // right_parts.key() = left_part.key();
-                for (auto& part : right_parts.mapped())
+                for (auto& part : right.mapped())
                 {
                     index_t* cur = part;
                     while(cur)
@@ -133,11 +140,11 @@ private:
                         cur = cur->prev;
                     }
                 }
-                for (auto& head : right_parts.mapped())
-                {
-                    m_heads[head->hash] = left_part.mapped();
-                    m_tails[left_part.mapped()].insert(head);
-                }
+                // for (auto& head : right_parts.mapped())
+                // {
+                //     m_heads[head->hash] = left_part.mapped();
+                //     m_tails[left_part.mapped()].insert(head);
+                // }
                 // m_heads.insert(std::move(left_part));
                 // m_tails.insert(std::move(right_parts));
             }
@@ -173,11 +180,14 @@ private:
             // элемент справа
             {
                 auto left_part = m_heads.extract(prev);
-                left_part.key() = hash;
+                // left_part.key() = hash;
 
                 index->prev = m_shares[prev].index;
                 index->calculate_index(index->prev);
-                m_heads.insert(std::move(left_part));
+                m_heads[hash] = left_part.mapped();
+                m_tails[left_part.mapped()].erase(m_shares[left_part.key()].index);
+                m_tails[left_part.mapped()].insert(index);
+                // m_heads.insert(std::move(left_part));
             }
             break;
         }
@@ -223,21 +233,21 @@ public:
 
     void debug()
     {
-        std::cout << "m_heads: \n";
+        std::cout << "m_heads: {";
         for (auto& [hash, value] : m_heads)
         {
-            std::cout << "\t" << hash << ":" << value << std::endl;
+            std::cout << " " << hash << ":" << value << "; ";
         }
 
-        std::cout << "m_tails: \n";
+        std::cout << "}, m_tails: {";
         for (auto& [hash, values] : m_tails)
         {
-            std::cout << "\t" << hash << ": [ ";
+            std::cout << " " << hash << ": [ ";
             for (auto& value : values)
                 std::cout << value->hash << " ";
-            std::cout << "]\n";
+            std::cout << "]; ";
         }
-        std::cout << "==============" << std::endl;
+        std::cout << "}\n";
     }
 };
 
