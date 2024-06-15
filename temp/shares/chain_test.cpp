@@ -37,8 +37,8 @@ private:
     using base_index = c2pool::chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>;
 public:
 
-    int data1;
-    double data2;
+    int data1{0};
+    double data2{0};
 
     FakeIndex() : base_index() {}
     template <typename ShareT> FakeIndex(ShareT* share) : base_index(share)
@@ -80,9 +80,9 @@ void debug_print(FakeChain& chain, FakeIndex::hash_t hash)
 {
     std::cout << "====================" << std::endl;
     std::cout << "Print for hash [" << hash << "]" << std::endl;
+    chain.debug();
     auto& [index, data] = chain.get(std::move(hash));
-    std::cout << index->hash << "; " << index->height << std::endl;
-    std::cout << index->data1 << "; " << index->data2 << std::endl;
+    std::cout << "data1 = " << index->data1 << "; data2 = " << index->data2 << "; height = " << index->height << std::endl;
     std::cout << "====================" << std::endl;
 }
 
@@ -108,9 +108,11 @@ int main()
     // chain.debug();
 
     chain.add(new FakeShareA(11, 10, 100));
-    chain.debug();
+    debug_print(chain, 11);
     chain.add(new FakeShareB(13, 12, 10));
-    chain.debug();
+    debug_print(chain, 13);
     chain.add(new FakeShareB(12, 11, 200.222));
-    chain.debug();
+    debug_print(chain, 13);
+    chain.add(new FakeShareB(14, 13, 10));
+    debug_print(chain, 14);
 }
