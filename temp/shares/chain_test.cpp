@@ -31,10 +31,10 @@ struct FakeShareB : BaseFakeShare<20>
 
 using ShareType = c2pool::chain::ShareVariants<FakeShareA, FakeShareB>;
 
-class FakeIndex : public c2pool::chain::ShareIndex<int, ShareType, std::hash<int>>
+class FakeIndex : public c2pool::chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>
 {
 private:
-    using base_index = c2pool::chain::ShareIndex<int, ShareType, std::hash<int>>;
+    using base_index = c2pool::chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>;
 public:
 
     int data1;
@@ -50,11 +50,10 @@ public:
     }
 
 private:
-    void calculate() override
+    void calculate(FakeIndex* index) override
     {
-        auto _prev = static_cast<FakeIndex*>(prev);
-        data1 += _prev->data1;
-        data2 += _prev->data2;
+        data1 += index->data1;
+        data2 += index->data2;
     }
 };
 
@@ -77,19 +76,41 @@ void test_f(share_t* share)
         std::cout << share->m_data2 << std::endl;
 }
 
+void debug_print(FakeChain& chain, FakeIndex::hash_t hash)
+{
+    std::cout << "====================" << std::endl;
+    std::cout << "Print for hash [" << hash << "]" << std::endl;
+    auto& [index, data] = chain.get(std::move(hash));
+    std::cout << index->hash << "; " << index->height << std::endl;
+    std::cout << index->data1 << "; " << index->data2 << std::endl;
+    std::cout << "====================" << std::endl;
+}
+
 int main()
 {
     FakeChain chain;
     
+    // chain.add(new FakeShareA(11, 10, 100));
+    // chain.add(new FakeShareB(12, 11, 200.222));
+
+    // auto share = chain.get_share(11);
+    // share.invoke(test_f);
+    // debug_print(chain, 12);
+
+    // chain.add(new FakeShareA(14, 13, 50));
+    // chain.add(new FakeShareA(15, 14, 20));
+    // debug_print(chain, 15);
+    // chain.debug();
+
+    // chain.add(new FakeShareB(13, 12, 10));
+    // debug_print(chain, 15);
+
+    // chain.debug();
+
     chain.add(new FakeShareA(11, 10, 100));
-    chain.add(new FakeShareB(12, 11, 200.222));
+    chain.debug();
     chain.add(new FakeShareB(13, 12, 10));
-    chain.add(new FakeShareA(14, 13, 50));
-
-    auto share = chain.get_share(11);
-    share.invoke(test_f);
-
-    auto& [index, data12] = chain.get(13);
-    std::cout << index->hash << "; " << index->height << std::endl;
-    std::cout << index->data1 << "; " << index->data2 << std::endl;
+    chain.debug();
+    chain.add(new FakeShareB(12, 11, 200.222));
+    chain.debug();
 }
