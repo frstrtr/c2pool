@@ -115,4 +115,7 @@ int main()
     debug_print(chain, 13);
     chain.add(new FakeShareB(14, 13, 10));
     debug_print(chain, 14);
+    chain.add(new FakeShareA(10, 9, 1000.20));
+    debug_print(chain, 14);
+
 }
