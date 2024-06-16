@@ -223,6 +223,68 @@ public:
         return m_shares.contains(hash);
     }
 
+    int32_t get_height(hash_t&& hash)
+    {
+        return get_index(std::move(hash))->height;
+    }
+
+    hash_t get_last(hash_t&& hash)
+    {
+        //todo: check exist?
+        return m_heads[hash];
+    }
+
+    struct height_and_last
+    {
+        int32_t height;
+        hash_t last;
+    };
+
+    height_and_last get_height_and_last(hash_t item)
+    {
+        return {get_height(item), get_last(item)};
+    }
+
+    hash_t get_nth_parent_key(hash_t&& hash, int32_t n) const
+    {
+        auto index = get_index(std::move(hash));
+        for (int i = 0; i < n; i++)
+        {
+            if (index->prev)
+                index = index->prev;
+            else
+                throw std::invalid_argument("get_nth_parent_key: m_shares not exis't hash");
+        }
+        return index->hash;
+    }
+
+    bool is_child_of(hash_t&& item, hash_t&& possible_child)
+    {
+        if (item == possible_child)
+            return true;
+        
+        auto [height, last] = get_height_and_last(item);
+        auto [child_height, child_last] = get_height_and_last(possible_child);
+
+        if (last != child_last)
+            return false;
+
+        auto height_up = child_height - height;
+        return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
+    }
+
+    // // last------(ancestor------item]--->best
+    // interval_t get_interval(hash_t item, hash_t ancestor)
+    // {
+    //     if (!is_child_of(ancestor, item))
+    //         throw std::invalid_argument("get_sum item[" + item.ToString() + "] not child for ancestor[" + ancestor.ToString() + "]");
+
+    //     auto [result, _head, _tail] = get_sum_to_last(item);
+    //     auto [ances, _head2, _tail2] = get_sum_to_last(ancestor);
+
+    //     return result.sub(ances);
+    // }
+
     void debug()
     {
         std::cout << "m_heads: {";
@@ -241,6 +303,20 @@ public:
         }
         std::cout << "}\n";
     }
+
+    /*
+    
+    [~]void remove(hash_t&& key);
+        [+]sum_to_last get_sum_to_last(hash_t hash);
+    [?]sum_element get_sum_for_element(const hash_t& hash);
+        [+]int32_t get_height(hash_t&& hash);
+        [+]hash_type get_last(hash_t&& hash);
+        [+]height_and_last get_height_and_last(hash_t&& item);
+        [+]bool is_child_of(hash_t&& item, hash_t&& possible_child);
+        [+]hash_type get_nth_parent_key(hash_t&& hash, int32_t n) const;
+    []std::function<bool(hash_type&)> get_chain(hash_t&& hash, uint64_t n)
+    []sum_element get_sum(hash_type item, hash_type ancestor)
+    */
 };
 
 } // namespace sharechain
