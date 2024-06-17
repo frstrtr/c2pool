@@ -49,11 +49,17 @@ public:
             data2 = share->m_data2;
     }
 
-private:
-    void calculate(FakeIndex* index) override
+protected:
+    void add(FakeIndex* index) override
     {
         data1 += index->data1;
         data2 += index->data2;
+    }
+
+    void sub(FakeIndex* index) override
+    {
+        data1 -= index->data1;
+        data2 -= index->data2;
     }
 };
 
@@ -118,4 +124,8 @@ int main()
     chain.add(new FakeShareA(10, 9, 1000.20));
     debug_print(chain, 14);
 
+
+    auto interval = chain.get_interval(14, 11); // [14, 13, 12]
+    std::cout << "interval: data1 = " << interval.data1 << "; data2 = " << interval.data2 << "; height = " << interval.height << std::endl;
+    debug_print(chain, 14);
 }
