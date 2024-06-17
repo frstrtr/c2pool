@@ -26,27 +26,51 @@ public:
     using hasher_t = HasherType;
     using high_index_t = HighIndex;
 
-    hash_t hash;
+    hash_t head;
+    hash_t tail;
     int32_t height; 
 
     high_index_t* prev {nullptr};
-
+    
 public:
-
-    ShareIndex() : hash{}, height{0} {}
-    template <typename ShareT> ShareIndex(ShareT* share) : hash{share->m_hash}, height{1} {}
+    ShareIndex() : head{}, height{0} {}
+    template <typename ShareT> 
+    ShareIndex(ShareT* share) : head{share->m_hash}, tail{share->m_prev_hash}, height{1} {}
 
     void calculate_index(high_index_t* index)
     {
         if (!index)
             throw std::invalid_argument("nullptr index");
 
-        height += index->height;
-        calculate(index);
+        operation(index, plus);
+    }
+
+    enum operation_type
+    {
+        plus,
+        minus
+    };
+
+    void operation(high_index_t* index, operation_type operation)
+    {
+        switch (operation)
+        {
+        case plus:
+            height += index->height;
+            add(index);
+            break;
+        case minus:
+            height -= index->height;
+            sub(index);
+            break;
+        default:
+            break;
+        }
     }
 
 protected:
-    virtual void calculate(high_index_t* index) = 0;
+    virtual void add(high_index_t* index) = 0;
+    virtual void sub(high_index_t* index) = 0;
 };
 
 template <typename ShareIndexType>
@@ -72,7 +96,7 @@ private:
     std::unordered_map<hash_t, hash_t, hasher_t> m_heads;
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
     
-    void calculate_head_tail(hash_t hash, hash_t prev, index_t* index)
+    void calculate_head_tail(hash_t head, hash_t tail, index_t* index)
     {
         enum fork_state
         {
@@ -83,9 +107,9 @@ private:
         };
 
         int state = new_fork;
-        if (m_heads.contains(prev))
+        if (m_heads.contains(tail))
             state |= only_heads;
-        if (m_tails.contains(hash))
+        if (m_tails.contains(head))
             state |= only_tails;
 
         switch (state)
@@ -93,25 +117,25 @@ private:
         case new_fork:
             // создание нового форка
             {
-                m_heads[hash] = prev;    
-                m_tails[prev].insert(hash);
+                m_heads[head] = tail;    
+                m_tails[tail].insert(head);
             }
             break;
         case merge:
             // объединение двух форков на стыке нового элемента
             {
-                auto left = m_heads.extract(prev); // heads[t]
+                auto left = m_heads.extract(tail); // heads[t]
                 auto& l_tail = left.mapped(); auto& l_head = left.key();
-                auto right = m_tails.extract(hash); // tails[h]
+                auto right = m_tails.extract(head); // tails[h]
                 auto& r_tail = right.key(); auto& r_heads = right.mapped();
 
                 m_tails[l_tail].insert(r_heads.begin(), r_heads.end());
-                m_tails[l_tail].erase(prev);
+                m_tails[l_tail].erase(tail);
 
                 for (auto& i : m_tails[l_tail])
                     m_heads[i] = l_tail;
 
-                index->prev = m_shares[prev].index;
+                index->prev = m_shares[tail].index;
                 index->calculate_index(index->prev);
 
                 std::unordered_set<hash_t> dirty_indexs;
@@ -120,10 +144,10 @@ private:
                     index_t* cur = m_shares[part].index;
                     while(cur)
                     {
-                        if (dirty_indexs.contains(cur->hash))
+                        if (dirty_indexs.contains(cur->head))
                             break;
                         
-                        dirty_indexs.insert(cur->hash);
+                        dirty_indexs.insert(cur->head);
                         cur->calculate_index(index);
 
                         if (!cur->prev)
@@ -141,16 +165,16 @@ private:
             // элемент слева
             {
                 std::unordered_set<hash_t> dirty_indexs;
-                auto right = m_tails.extract(hash);
+                auto right = m_tails.extract(head);
                 for (auto& part : right.mapped())
                 {
                     index_t* cur = m_shares[part].index;
                     while(cur)
                     {
-                        if (dirty_indexs.contains(cur->hash))
+                        if (dirty_indexs.contains(cur->head))
                             break;
                         
-                        dirty_indexs.insert(cur->hash);
+                        dirty_indexs.insert(cur->head);
                         cur->calculate_index(index);
 
                         if (!cur->prev)
@@ -164,22 +188,22 @@ private:
                 }
 
                 for (auto& v : right.mapped())
-                    m_heads[v] = prev;
-                right.key() = prev;
+                    m_heads[v] = tail;
+                right.key() = tail;
                 m_tails.insert(std::move(right));
             }
             break;
         case only_heads:
             // элемент справа
             {
-                auto left_part = m_heads.extract(prev);
+                auto left_part = m_heads.extract(tail);
 
-                index->prev = m_shares[prev].index;
+                index->prev = m_shares[tail].index;
                 index->calculate_index(index->prev);
 
-                m_heads[hash] = left_part.mapped();
+                m_heads[head] = left_part.mapped();
                 m_tails[left_part.mapped()].erase(left_part.key());
-                m_tails[left_part.mapped()].insert(hash);
+                m_tails[left_part.mapped()].insert(head);
             }
             break;
         }
@@ -200,7 +224,7 @@ public:
         m_shares[share->m_hash] = chain_data{index, share_var};
     }
 
-    chain_data& get(hash_t&& hash)
+    chain_data& get(const hash_t& hash)
     {
         if (m_shares.contains(hash))
             return m_shares[hash];
@@ -208,14 +232,14 @@ public:
             throw std::out_of_range("Hash out of chain!");
     }
 
-    index_t& get_index(hash_t&& hash)
+    index_t* get_index(const hash_t& hash)
     {
-        return get(std::move(hash)).index;
+        return get(hash).index;
     }
 
-    share_t& get_share(hash_t&& hash)
+    share_t& get_share(const hash_t& hash)
     {
-        return get(std::move(hash)).share;
+        return get(hash).share;
     }
     
     bool contains(hash_t&& hash)
@@ -223,15 +247,21 @@ public:
         return m_shares.contains(hash);
     }
 
-    int32_t get_height(hash_t&& hash)
+    int32_t get_height(const hash_t& hash)
     {
-        return get_index(std::move(hash))->height;
+        return get_index(hash)->height;
     }
 
-    hash_t get_last(hash_t&& hash)
+    hash_t get_last(const hash_t& hash)
     {
         //todo: check exist?
-        return m_heads[hash];
+        // return m_heads[hash];
+        auto index = m_shares[hash].index;
+        while (index->prev)
+        {
+            index = index->prev;
+        }
+        return index->tail;
     }
 
     struct height_and_last
@@ -240,14 +270,14 @@ public:
         hash_t last;
     };
 
-    height_and_last get_height_and_last(hash_t item)
+    height_and_last get_height_and_last(const hash_t& item)
     {
         return {get_height(item), get_last(item)};
     }
 
-    hash_t get_nth_parent_key(hash_t&& hash, int32_t n) const
+    hash_t get_nth_parent_key(const hash_t& hash, int32_t n)
     {
-        auto index = get_index(std::move(hash));
+        auto index = get_index(hash);
         for (int i = 0; i < n; i++)
         {
             if (index->prev)
@@ -255,10 +285,10 @@ public:
             else
                 throw std::invalid_argument("get_nth_parent_key: m_shares not exis't hash");
         }
-        return index->hash;
+        return index->head;
     }
 
-    bool is_child_of(hash_t&& item, hash_t&& possible_child)
+    bool is_child_of(const hash_t& item, const hash_t& possible_child)
     {
         if (item == possible_child)
             return true;
@@ -273,17 +303,20 @@ public:
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
-    // // last------(ancestor------item]--->best
-    // interval_t get_interval(hash_t item, hash_t ancestor)
-    // {
-    //     if (!is_child_of(ancestor, item))
-    //         throw std::invalid_argument("get_sum item[" + item.ToString() + "] not child for ancestor[" + ancestor.ToString() + "]");
+    // last------(ancestor------item]--->best
+    index_t get_interval(hash_t item, hash_t ancestor)
+    {
+        if (!is_child_of(ancestor, item))
+            throw std::invalid_argument("get interval: item not child for ancestor!");
+            // throw std::invalid_argument("get_sum item[" + item + "] not child for ancestor[" + ancestor + "]");
 
-    //     auto [result, _head, _tail] = get_sum_to_last(item);
-    //     auto [ances, _head2, _tail2] = get_sum_to_last(ancestor);
+        index_t result = *get_index(item);
+        index_t* ances = get_index(ancestor);
 
-    //     return result.sub(ances);
-    // }
+        result.operation(ances, index_t::operation_type::minus);
+
+        return result;
+    }
 
     void debug()
     {
