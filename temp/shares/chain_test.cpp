@@ -4,13 +4,10 @@
 #include <sharechain/sharechain.hpp>
 
 template <int64_t Version>
-struct BaseFakeShare : c2pool::chain::BaseShare<Version>
+struct BaseFakeShare : c2pool::chain::BaseShare<int, Version>
 {
-    int m_hash;
-    int m_prev_hash;
-
     BaseFakeShare() { }
-    BaseFakeShare(int hash, int prev_hash) : m_hash(hash), m_prev_hash(prev_hash) { }
+    BaseFakeShare(int hash, int prev_hash) : c2pool::chain::BaseShare<int, Version>(hash, prev_hash) { }
 };
 
 struct FakeShareA : BaseFakeShare<10>
