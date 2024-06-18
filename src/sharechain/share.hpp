@@ -18,19 +18,26 @@ struct RawShare
     SERIALIZE_METHODS(RawShare) { READWRITE(obj.type, obj.contents); }
 };
 
-template <int64_t VERSION>
+template <typename HashType, int64_t Version>
 struct BaseShare
 {
-    constexpr static int32_t version = VERSION;
+    using hash_t = HashType;
+    
+    constexpr static int32_t version = Version;
+    hash_t m_hash{};
+    hash_t m_prev_hash{};
 
     constexpr static bool check_version(int threshold_version)
     {
         return version >= threshold_version;
     }
+
+    BaseShare() {}
+    BaseShare(const hash_t& hash, const hash_t& prev_hash) : m_hash(hash), m_prev_hash(prev_hash) {}
 };
 
 template <typename T>
-concept is_share_type = std::is_base_of<BaseShare<T::version>, T>::value;
+concept is_share_type = std::is_base_of<BaseShare<typename T::hash_t, T::version>, T>::value;
 
 template <typename Correct, typename...Ts>
 concept is_correct_share = (std::is_same<Correct, Ts>::value || ...);
@@ -40,9 +47,9 @@ struct ShareVariants : std::variant<Args*...>
 {
     static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
 
-    // Use macros .invoke(<func>)
+    // Use macros .call(<func>)
     template<typename F>
-    void call(F&& func)
+    void call_func(F&& func)
     {
         std::visit(func, *this);
     }
@@ -56,8 +63,8 @@ struct ShareVariants : std::variant<Args*...>
     }
 };
 
-#define invoke(func) call([](auto& obj) { func (obj);})
-
 } // namespace chain
 
 } // namespace c2pool
+
+#define call(func) call_func([](auto& obj) { func (obj);})

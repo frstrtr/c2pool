@@ -13,6 +13,8 @@
 #include <impl/ltc/protocol.hpp>
 #include <impl/ltc/transaction.hpp>
 
+#include <impl/ltc/share.hpp>
+
 int main(int argc, char *argv[])
 {
     c2pool::log::Logger::init();
