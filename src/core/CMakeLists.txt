@@ -1,5 +1,4 @@
 file(GLOB configs_source "configs/*.hpp" "configs/*.cpp")
-# file(GLOB chain_source "chain/*.hpp" "chain/*.cpp")
 
 set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp events.hpp disposable.hpp)
 
@@ -16,7 +15,6 @@ set(source
     macro.hpp
     netaddress.hpp netaddress.cpp
     opscript.hpp
-    # ${chain_source}
 )
 
 find_package(yaml-cpp REQUIRED)
