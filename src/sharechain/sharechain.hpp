@@ -318,6 +318,18 @@ public:
         return result;
     }
 
+    //TODO:
+    // void get_chain(const hash_t& hash, uint64_t n, std::function<bool(chain_data&)>&& func)
+    // {
+    //     if (n > get_height(hash))
+    //     {
+    //         throw std::invalid_argument("n > height for this hash in get_chain!");
+    //     }
+
+    //     chain_data& data = m_shares[hash];
+    //     while ()
+    // }
+
     void debug()
     {
         std::cout << "m_heads: {";
@@ -341,14 +353,14 @@ public:
     
     [~]void remove(hash_t&& key);
         [+]sum_to_last get_sum_to_last(hash_t hash);
-    [?]sum_element get_sum_for_element(const hash_t& hash);
+        [-]sum_element get_sum_for_element(const hash_t& hash);
         [+]int32_t get_height(hash_t&& hash);
         [+]hash_type get_last(hash_t&& hash);
         [+]height_and_last get_height_and_last(hash_t&& item);
         [+]bool is_child_of(hash_t&& item, hash_t&& possible_child);
         [+]hash_type get_nth_parent_key(hash_t&& hash, int32_t n) const;
-    []std::function<bool(hash_type&)> get_chain(hash_t&& hash, uint64_t n)
-    []sum_element get_sum(hash_type item, hash_type ancestor)
+    [~]std::function<bool(hash_type&)> get_chain(hash_t&& hash, uint64_t n)
+        [+]sum_element get_sum(hash_type item, hash_type ancestor)
     */
 };
 
