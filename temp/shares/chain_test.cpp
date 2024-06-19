@@ -1,5 +1,6 @@
 #include <iostream>
 
+#include <core/pack.hpp>
 #include <sharechain/share.hpp>
 #include <sharechain/sharechain.hpp>
 
@@ -8,6 +9,8 @@ struct BaseFakeShare : c2pool::chain::BaseShare<int, Version>
 {
     BaseFakeShare() { }
     BaseFakeShare(int hash, int prev_hash) : c2pool::chain::BaseShare<int, Version>(hash, prev_hash) { }
+    
+    SERIALIZE_METHODS(BaseFakeShare<Version>) { READWRITE(obj.m_hash, obj.m_prev_hash); }
 };
 
 struct FakeShareA : BaseFakeShare<10>
@@ -16,6 +19,8 @@ struct FakeShareA : BaseFakeShare<10>
 
     FakeShareA() {}
     FakeShareA(int hash, int prev_hash, int data1) : BaseFakeShare<10>(hash, prev_hash), m_data1{data1} {}
+    
+    SERIALIZE_METHODS(FakeShareA) { READWRITE(AsBase<BaseFakeShare<10>>(obj), obj.m_data1); }
 };
 
 struct FakeShareB : BaseFakeShare<20>
@@ -24,6 +29,8 @@ struct FakeShareB : BaseFakeShare<20>
 
     FakeShareB() {}
     FakeShareB(int hash, int prev_hash, double data2) : BaseFakeShare<20>(hash, prev_hash), m_data2{data2} {}
+
+    SERIALIZE_METHODS(FakeShareB) { READWRITE(AsBase<BaseFakeShare<20>>(obj)/*, obj.m_data2*/); }
 };
 
 using ShareType = c2pool::chain::ShareVariants<FakeShareA, FakeShareB>;
@@ -125,4 +132,13 @@ int main()
     auto interval = chain.get_interval(14, 11); // [14, 13, 12]
     std::cout << "interval: data1 = " << interval.data1 << "; data2 = " << interval.data2 << "; height = " << interval.height << std::endl;
     debug_print(chain, 14);
+
+    PackStream stream;
+    // stream << chain.get_share(12);
+    chain.get_share(11).pack(stream);
+    // stream >> 
+    auto share = ShareType::load(FakeShareA::version, stream);
+    share.call(test_f);
+
+    // ShareType::LoadMethods[20]().call(test_f);
 }
