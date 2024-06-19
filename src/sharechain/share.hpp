@@ -1,6 +1,8 @@
 #pragma once
 
+#include <map>
 #include <variant>
+#include <functional>
 #include <type_traits>
 #include <core/pack.hpp>
 
@@ -47,6 +49,44 @@ struct ShareVariants : std::variant<Args*...>
 {
     static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
 
+private:
+    using load_map = std::map<int64_t, std::function<ShareVariants<Args...>()>>;
+    static load_map LoadMethods;
+
+    static load_map init_load_map()
+    {
+        load_map some_map;
+        ((some_map[Args::version] = []() { ShareVariants<Args...> result; result = new Args(); return result; }), ...);
+        return some_map;
+    }
+
+public:
+    template <typename StreamType>
+    static ShareVariants load(int64_t version, StreamType& is)
+    {
+        if (!LoadMethods.contains(version))
+            throw std::invalid_argument("ShareVariants::unpack -- version unsupported!");
+        
+        auto share = LoadMethods[version]();
+        share.unpack(is);
+
+        return share;
+    }
+
+    template <typename StreamType>
+    PackStream& pack(StreamType& os)
+    {
+        call_func([&](auto* share) { ::Serialize(os, *share); });
+        return os;
+    }
+
+    template <typename StreamType>
+    PackStream& unpack(StreamType& is)
+    {
+        call_func([&](auto* share) { ::Unserialize(is, *share); });
+        return is;
+    }
+
     // Use macros .call(<func>)
     template<typename F>
     void call_func(F&& func)
@@ -62,6 +102,9 @@ struct ShareVariants : std::variant<Args*...>
         return *this;
     }
 };
+
+template <typename... Args>
+typename ShareVariants<Args...>::load_map ShareVariants<Args...>::LoadMethods = ShareVariants<Args...>::init_load_map();
 
 } // namespace chain
 
