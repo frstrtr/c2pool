@@ -2,8 +2,7 @@ set(pool_source
     api.hpp
     node.hpp
     protocol.hpp
-    handler.hpp
-    message.hpp
+    handshake.hpp
 )
 
 add_library(pool STATIC ${pool_source})
