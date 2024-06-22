@@ -182,7 +182,7 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TxParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
 
-    s << tx.nVersion;
+    s << tx.version;
     unsigned char flags = 0;
     // Consistency check
     if (fAllowWitness) 
