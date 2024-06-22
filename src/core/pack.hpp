@@ -62,6 +62,23 @@ public:
         m_cursor = new_cursor_pos;
     }
 
+    std::vector<std::byte>::pointer data()
+    {
+        return m_vch.data();
+    }
+
+    // stored data size
+    size_t size() const
+    {
+        return m_vch.size();
+    }
+
+    // size from cursor
+    size_t cursor_size() const
+    {
+        return m_vch.size() - m_cursor;
+    }
+
     void print() const
     {
         std::cout << "{ " << std::hex;
