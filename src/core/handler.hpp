@@ -2,21 +2,27 @@
 
 #include <memory>
 
-#include <pool/message.hpp>
+#include <core/message.hpp>
 #include <core/pack.hpp>
 
 namespace c2pool
 {
 
-namespace pool
+struct IMessageHandler
 {
+    using message_error_type = std::string;
+
+    virtual void handle(std::string command, PackStream& stream) const = 0;
+    virtual void error(const message_error_type& err) = 0;
+};
 
 template <typename PROTOCOL_TYPE>
-class MessageHandler
+class MessageHandler : public IMessageHandler
 {
 protected:
     using protocol_type = PROTOCOL_TYPE;
     using callback_type = std::function<void(protocol_type*, PackStream&)>;
+    using message_error_type = std::string;
 
     template <typename MESSAGE_TYPE>
     static std::unique_ptr<MESSAGE_TYPE> parse_message(PackStream &stream)
@@ -30,7 +36,7 @@ protected:
 public:
     virtual const std::map<std::string, callback_type>& getFunctionMap() const = 0;
 
-    void invoke(std::string cmd, PackStream& msg) const
+    void handle(std::string cmd, PackStream& msg) const override
     {
         protocol_type* p = const_cast<protocol_type*>(static_cast<const protocol_type*>(this));
         
@@ -45,8 +51,6 @@ public:
         }
     }
 };
-
-} // namespace pool
 
 } // namespace c2pool
 
@@ -65,8 +69,8 @@ public:
         return getFunctionMapStatic();                                                                 \
     }
 
-#define ADD_MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) {#cmd, [&](protocol_type *protocol, PackStream& stream) { auto msg = parse_message<msg_type>(stream); protocol->cmd(std::move(msg)); }},
+#define ADD_MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) {#cmd, [&](protocol_type *protocol, PackStream& stream) { auto msg = parse_message<msg_type>(stream); protocol->handle_##cmd(std::move(msg)); }},
 #define ADD_MESSAGE_CALLBACK(cmd) ADD_MESSAGE_CALLBACK_CUSTOM(cmd, message_##cmd)
 
-#define MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) void cmd(std::unique_ptr<msg_type> message)
+#define MESSAGE_CALLBACK_CUSTOM(cmd, msg_type) void handle_##cmd(std::unique_ptr<msg_type> message)
 #define MESSAGE_CALLBACK(cmd) MESSAGE_CALLBACK_CUSTOM(cmd, message_##cmd)
