@@ -1,5 +1,4 @@
 add_library(pool_ltc 
-    messages.hpp 
     protocol.hpp 
     types.hpp 
     transaction.cpp transaction.hpp

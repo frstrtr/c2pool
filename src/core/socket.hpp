@@ -36,46 +36,33 @@ public:
     std::vector<std::byte> payload;
 
     // write
-    static std::vector<std::byte> from_message(const std::vector<std::byte>& node_prefix, std::unique_ptr<RawMessage>& msg)
+    static PackStream from_message(const std::vector<std::byte>& node_prefix, std::unique_ptr<RawMessage>& msg)
     {
+        PackStream result(node_prefix);
+
         // prefix
-        prefix = new std::byte[node_prefix.size()];
-        memcpy(prefix, &node_prefix[0], node_prefix.size());
+        // result = node_prefix;
 
         // command
-        command = msg->m_command;
+        msg->m_command.resize(12);
+        ArrayType<std::byte, 12>::Write(result, msg->m_command);
 
         // message_length
-        message_length = msg->m_data.size();
+        result << msg->m_data.size();
 
         // checksum
-        
+        // TODO:
 
         // payload
+        result << msg->m_data;
+
+        return result;
     }
 
     // read
     Packet(size_t prefix_length)
     {
-        prefix = new std::byte[prefix_length];
-    }
-
-    ~Packet()
-    {
-        if (prefix)
-            delete[] prefix;
-        if (payload)
-            delete[] payload;
-    }
-
-    std::vector<std::byte>::pointer data()
-    {
-        return m_data.data();
-    }
-
-    size_t size() const
-    {
-        return m_data.size();
+        prefix.resize(prefix_length);
     }
 };
 

@@ -2,6 +2,8 @@ file(GLOB configs_source "configs/*.hpp" "configs/*.cpp")
 
 set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp events.hpp disposable.hpp)
 
+set(network_sources message.hpp handler.hpp socket.hpp )
+
 set(source 
     fileconfig.hpp
     settings.hpp settings.cpp
@@ -12,6 +14,7 @@ set(source
     pack.hpp pack_types.hpp
     ${legacy_sources}
     common.hpp common.cpp
+    ${network_sources}
     macro.hpp
     netaddress.hpp netaddress.cpp
     opscript.hpp
