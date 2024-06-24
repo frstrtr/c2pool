@@ -1,10 +1,10 @@
 #pragma once
 #include "messages.hpp"
-#include <pool/handler.hpp>
+#include <core/handler.hpp>
 namespace ltc
 {
 
-class Protocol : public c2pool::pool::MessageHandler<ltc::Protocol>
+class Protocol : public c2pool::MessageHandler<ltc::Protocol>
 {
     BEGIN_INIT_MESSAGE_HANDLER()
         ADD_MESSAGE_CALLBACK(ping)

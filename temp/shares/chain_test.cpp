@@ -134,11 +134,7 @@ int main()
     debug_print(chain, 14);
 
     PackStream stream;
-    // stream << chain.get_share(12);
     chain.get_share(11).pack(stream);
-    // stream >> 
     auto share = ShareType::load(FakeShareA::version, stream);
     share.call(test_f);
-
-    // ShareType::LoadMethods[20]().call(test_f);
 }

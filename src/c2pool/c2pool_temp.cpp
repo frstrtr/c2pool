@@ -15,6 +15,9 @@
 
 #include <impl/ltc/share.hpp>
 
+#include <pool/handshake.hpp>
+#include <core/socket.hpp>
+
 int main(int argc, char *argv[])
 {
     c2pool::log::Logger::init();
@@ -33,7 +36,7 @@ int main(int argc, char *argv[])
     //     c2pool::config* config = c2pool::config::load(net);
     //     configs[net] = config;
     // }
-    
+
     // std::cout << cfg->m_fee << std::endl;
     // for (const auto& net : cfg->m_networks)
     //     std::cout << net << std::endl;
