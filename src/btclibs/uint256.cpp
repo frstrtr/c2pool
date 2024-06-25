@@ -2,187 +2,36 @@
 // Copyright (c) 2009-2019 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
-// Edited by Neels99 for C2Pool:
-// arith_uint256 -> old uint256 logic
-// added GetHex()/SetHex()
 
 #include "uint256.h"
-#include "util/strencodings.h"
-#include <btclibs/crypto/common.h>
+
+#include <btclibs/util/strencodings.h>
+
+#include <string.h>
+
+namespace legacy
+{
 
 template <unsigned int BITS>
-base_uint<BITS>::base_uint(const std::string& str)
+base_blob<BITS>::base_blob(const std::vector<unsigned char>& vch)
 {
-    static_assert(BITS/32 > 0 && BITS%32 == 0, "Template parameter BITS must be a positive multiple of 32.");
-
-    SetHex(str);
-    DEBUG_UINT_UPDATE();
+    assert(vch.size() == sizeof(m_data));
+    memcpy(m_data, vch.data(), sizeof(m_data));
 }
 
 template <unsigned int BITS>
-base_uint<BITS>::base_uint(const std::vector<unsigned char>& vch)
+std::string base_blob<BITS>::GetHex() const
 {
-    static_assert(BITS/32 > 0 && BITS%32 == 0, "Template parameter BITS must be a positive multiple of 32.");
-    assert(vch.size() == sizeof(pn));
-//    memcpy(m_data, vch.data(), sizeof(m_data));
-    for (int x = 0; x < this->WIDTH; ++x)
-    {
-        this->pn[x] = ReadLE32(vch.data() + x * 4);
-    }
-    DEBUG_UINT_UPDATE();
-}
-
-template <unsigned int BITS>
-base_uint<BITS>& base_uint<BITS>::operator<<=(unsigned int shift)
-{
-    base_uint<BITS> a(*this);
-    for (int i = 0; i < WIDTH; i++)
-        pn[i] = 0;
-    int k = shift / 32;
-    shift = shift % 32;
-    for (int i = 0; i < WIDTH; i++) {
-        if (i + k + 1 < WIDTH && shift != 0)
-            pn[i + k + 1] |= (a.pn[i] >> (32 - shift));
-        if (i + k < WIDTH)
-            pn[i + k] |= (a.pn[i] << shift);
-    }
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-template <unsigned int BITS>
-base_uint<BITS>& base_uint<BITS>::operator>>=(unsigned int shift)
-{
-    base_uint<BITS> a(*this);
-    for (int i = 0; i < WIDTH; i++)
-        pn[i] = 0;
-    int k = shift / 32;
-    shift = shift % 32;
-    for (int i = 0; i < WIDTH; i++) {
-        if (i - k - 1 >= 0 && shift != 0)
-            pn[i - k - 1] |= (a.pn[i] << (32 - shift));
-        if (i - k >= 0)
-            pn[i - k] |= (a.pn[i] >> shift);
-    }
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-template <unsigned int BITS>
-base_uint<BITS>& base_uint<BITS>::operator*=(uint32_t b32)
-{
-    uint64_t carry = 0;
-    for (int i = 0; i < WIDTH; i++) {
-        uint64_t n = carry + (uint64_t)b32 * pn[i];
-        pn[i] = n & 0xffffffff;
-        carry = n >> 32;
-    }
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-template <unsigned int BITS>
-base_uint<BITS>& base_uint<BITS>::operator*=(const base_uint& b)
-{
-    base_uint<BITS> a;
-    for (int j = 0; j < WIDTH; j++) {
-        uint64_t carry = 0;
-        for (int i = 0; i + j < WIDTH; i++) {
-            uint64_t n = carry + a.pn[i + j] + (uint64_t)pn[j] * b.pn[i];
-            a.pn[i + j] = n & 0xffffffff;
-            carry = n >> 32;
-        }
-    }
-    *this = a;
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-template <unsigned int BITS>
-base_uint<BITS>& base_uint<BITS>::operator/=(const base_uint& b)
-{
-    base_uint<BITS> div = b;     // make a copy, so we can shift.
-    base_uint<BITS> num = *this; // make a copy, so we can subtract.
-    *this = 0;                   // the quotient.
-    int num_bits = num.bits();
-    int div_bits = div.bits();
-    if (div_bits == 0)
-        throw uint_error("Division by zero");
-    if (div_bits > num_bits) // the result is certainly 0.
-        return *this;
-    int shift = num_bits - div_bits;
-    div <<= shift; // shift so that div and num align.
-    while (shift >= 0) {
-        if (num >= div) {
-            num -= div;
-            pn[shift / 32] |= (1U << (shift & 31)); // set a bit of the result.
-        }
-        div >>= 1; // shift back.
-        shift--;
-    }
-    // num now contains the remainder of the division.
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-template <unsigned int BITS>
-int base_uint<BITS>::CompareTo(const base_uint<BITS>& b) const
-{
-    for (int i = WIDTH - 1; i >= 0; i--) {
-        if (pn[i] < b.pn[i])
-            return -1;
-        if (pn[i] > b.pn[i])
-            return 1;
-    }
-    return 0;
-}
-
-template <unsigned int BITS>
-bool base_uint<BITS>::EqualTo(uint64_t b) const
-{
-    for (int i = WIDTH - 1; i >= 2; i--) {
-        if (pn[i])
-            return false;
-    }
-    if (pn[1] != (b >> 32))
-        return false;
-    if (pn[0] != (b & 0xfffffffful))
-        return false;
-    return true;
-}
-
-template <unsigned int BITS>
-double base_uint<BITS>::getdouble() const
-{
-    double ret = 0.0;
-    double fact = 1.0;
-    for (int i = 0; i < WIDTH; i++) {
-        ret += fact * pn[i];
-        fact *= 4294967296.0;
-    }
-    return ret;
-}
-
-template <unsigned int BITS>
-std::string base_uint<BITS>::GetHex() const
-{
-    uint8_t m_data_rev[BYTES];
-    for (int i = 0; i < this->WIDTH; ++i)
-    {
-        WriteBE32(m_data_rev + BYTES - 4 - i * 4, this->pn[i]);
+    uint8_t m_data_rev[WIDTH];
+    for (int i = 0; i < WIDTH; ++i) {
+        m_data_rev[i] = m_data[WIDTH - 1 - i];
     }
     return HexStr(m_data_rev);
 }
 
 template <unsigned int BITS>
-void base_uint<BITS>::SetHex(const char* psz)
+void base_blob<BITS>::SetHex(const char* psz)
 {
-//    base_blob<BITS> b;
-//    b.SetHex(psz);
-//    for (int x = 0; x < this->WIDTH; ++x) {
-//        this->pn[x] = ReadLE32(b.begin() + x*4);
-//    }
-    uint8_t m_data[BYTES];
     memset(m_data, 0, sizeof(m_data));
 
     // skip leading spaces
@@ -198,7 +47,7 @@ void base_uint<BITS>::SetHex(const char* psz)
     while (::HexDigit(psz[digits]) != -1)
         digits++;
     unsigned char* p1 = (unsigned char*)m_data;
-    unsigned char* pend = p1 + BYTES;
+    unsigned char* pend = p1 + WIDTH;
     while (digits > 0 && p1 < pend) {
         *p1 = ::HexDigit(psz[--digits]);
         if (digits > 0) {
@@ -206,260 +55,26 @@ void base_uint<BITS>::SetHex(const char* psz)
             p1++;
         }
     }
-
-    for (int x = 0; x < this->WIDTH; ++x)
-    {
-        this->pn[x] = ReadLE32(m_data + x * 4);
-    }
-    DEBUG_UINT_UPDATE();
 }
 
 template <unsigned int BITS>
-void base_uint<BITS>::SetHex(const std::string& str)
+void base_blob<BITS>::SetHex(const std::string& str)
 {
     SetHex(str.c_str());
 }
 
 template <unsigned int BITS>
-std::string base_uint<BITS>::ToString() const
+std::string base_blob<BITS>::ToString() const
 {
-    return GetHex();
+    return (GetHex());
 }
 
-template <unsigned int BITS>
-unsigned int base_uint<BITS>::bits() const
-{
-    for (int pos = WIDTH - 1; pos >= 0; pos--) {
-        if (pn[pos]) {
-            for (int nbits = 31; nbits > 0; nbits--) {
-                if (pn[pos] & 1U << nbits)
-                    return 32 * pos + nbits + 1;
-            }
-            return 32 * pos + 1;
-        }
-    }
-    return 0;
-}
-
-template <unsigned int BITS>
-std::vector<unsigned char> base_uint<BITS>::GetChars() const
-{
-    std::vector<unsigned char> result;
-    result.resize(BYTES);
-//    uint8_t m_data_rev[BYTES];
-    for (int i = 0; i < this->WIDTH; ++i)
-    {
-        WriteLE32((unsigned char *)&result[0] + i*4, this->pn[i]);
-    }
-    return result;
-
-//    base_blob<BITS> b;
-//    for (int x = 0; x < this->WIDTH; ++x) {
-//        WriteLE32(b.begin() + x*4, this->pn[x]);
-//    }
-//    return b.GetHex();
-}
-
-// Explicit instantiations for base_uint<128>
-template class base_uint<128>;
-
-// Explicit instantiations for base_uint<160>
-template class base_uint<160>;
-
-// Explicit instantiations for base_uint<256>
-template class base_uint<256>;
-
-// Explicit instantiations for base_uint<288>
-template class base_uint<288>;
-
-const uint256 uint256::ZERO(0);
-const uint256 uint256::ONE(1);
-
-// This implementation directly uses shifts instead of going
-// through an intermediate MPI representation.
-uint128& uint128::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverflow)
-{
-    int nSize = nCompact >> 24;
-    uint32_t nWord = nCompact & 0x007fffff;
-    if (nSize <= 3) {
-        nWord >>= 8 * (3 - nSize);
-        *this = nWord;
-    } else {
-        *this = nWord;
-        *this <<= 8 * (nSize - 3);
-    }
-    if (pfNegative)
-        *pfNegative = nWord != 0 && (nCompact & 0x00800000) != 0;
-    if (pfOverflow)
-        *pfOverflow = nWord != 0 && ((nSize > 34) ||
-                                     (nWord > 0xff && nSize > 33) ||
-                                     (nWord > 0xffff && nSize > 32));
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-uint32_t uint128::GetCompact(bool fNegative) const
-{
-    int nSize = (bits() + 7) / 8;
-    uint32_t nCompact = 0;
-    if (nSize <= 3) {
-        nCompact = GetLow64() << 8 * (3 - nSize);
-    } else {
-        uint128 bn = *this >> 8 * (nSize - 3);
-        nCompact = bn.GetLow64();
-    }
-    // The 0x00800000 bit denotes the sign.
-    // Thus, if it is already set, divide the mantissa by 256 and increase the exponent.
-    if (nCompact & 0x00800000) {
-        nCompact >>= 8;
-        nSize++;
-    }
-    assert((nCompact & ~0x007fffffU) == 0);
-    assert(nSize < 256);
-    nCompact |= nSize << 24;
-    nCompact |= (fNegative && (nCompact & 0x007fffff) ? 0x00800000 : 0);
-    return nCompact;
-}
-
-// This implementation directly uses shifts instead of going
-// through an intermediate MPI representation.
-uint160& uint160::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverflow)
-{
-    int nSize = nCompact >> 24;
-    uint32_t nWord = nCompact & 0x007fffff;
-    if (nSize <= 3) {
-        nWord >>= 8 * (3 - nSize);
-        *this = nWord;
-    } else {
-        *this = nWord;
-        *this <<= 8 * (nSize - 3);
-    }
-    if (pfNegative)
-        *pfNegative = nWord != 0 && (nCompact & 0x00800000) != 0;
-    if (pfOverflow)
-        *pfOverflow = nWord != 0 && ((nSize > 34) ||
-                                     (nWord > 0xff && nSize > 33) ||
-                                     (nWord > 0xffff && nSize > 32));
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-uint32_t uint160::GetCompact(bool fNegative) const
-{
-    int nSize = (bits() + 7) / 8;
-    uint32_t nCompact = 0;
-    if (nSize <= 3) {
-        nCompact = GetLow64() << 8 * (3 - nSize);
-    } else {
-        uint160 bn = *this >> 8 * (nSize - 3);
-        nCompact = bn.GetLow64();
-    }
-    // The 0x00800000 bit denotes the sign.
-    // Thus, if it is already set, divide the mantissa by 256 and increase the exponent.
-    if (nCompact & 0x00800000) {
-        nCompact >>= 8;
-        nSize++;
-    }
-    assert((nCompact & ~0x007fffffU) == 0);
-    assert(nSize < 256);
-    nCompact |= nSize << 24;
-    nCompact |= (fNegative && (nCompact & 0x007fffff) ? 0x00800000 : 0);
-    return nCompact;
-}
-
-// This implementation directly uses shifts instead of going
-// through an intermediate MPI representation.
-uint256& uint256::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverflow)
-{
-    int nSize = nCompact >> 24;
-    uint32_t nWord = nCompact & 0x007fffff;
-    if (nSize <= 3) {
-        nWord >>= 8 * (3 - nSize);
-        *this = nWord;
-    } else {
-        *this = nWord;
-        *this <<= 8 * (nSize - 3);
-    }
-    if (pfNegative)
-        *pfNegative = nWord != 0 && (nCompact & 0x00800000) != 0;
-    if (pfOverflow)
-        *pfOverflow = nWord != 0 && ((nSize > 34) ||
-                                     (nWord > 0xff && nSize > 33) ||
-                                     (nWord > 0xffff && nSize > 32));
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-uint32_t uint256::GetCompact(bool fNegative) const
-{
-    int nSize = (bits() + 7) / 8;
-    uint32_t nCompact = 0;
-    if (nSize <= 3) {
-        nCompact = GetLow64() << 8 * (3 - nSize);
-    } else {
-        uint256 bn = *this >> 8 * (nSize - 3);
-        nCompact = bn.GetLow64();
-    }
-    // The 0x00800000 bit denotes the sign.
-    // Thus, if it is already set, divide the mantissa by 256 and increase the exponent.
-    if (nCompact & 0x00800000) {
-        nCompact >>= 8;
-        nSize++;
-    }
-    assert((nCompact & ~0x007fffffU) == 0);
-    assert(nSize < 256);
-    nCompact |= nSize << 24;
-    nCompact |= (fNegative && (nCompact & 0x007fffff) ? 0x00800000 : 0);
-    return nCompact;
-}
-
-// This implementation directly uses shifts instead of going
-// through an intermediate MPI representation.
-uint288& uint288::SetCompact(uint32_t nCompact, bool* pfNegative, bool* pfOverflow)
-{
-    int nSize = nCompact >> 24;
-    uint32_t nWord = nCompact & 0x007fffff;
-    if (nSize <= 3) {
-        nWord >>= 8 * (3 - nSize);
-        *this = nWord;
-    } else {
-        *this = nWord;
-        *this <<= 8 * (nSize - 3);
-    }
-    if (pfNegative)
-        *pfNegative = nWord != 0 && (nCompact & 0x00800000) != 0;
-    if (pfOverflow)
-        *pfOverflow = nWord != 0 && ((nSize > 34) ||
-                                     (nWord > 0xff && nSize > 33) ||
-                                     (nWord > 0xffff && nSize > 32));
-    DEBUG_UINT_UPDATE();
-    return *this;
-}
-
-uint32_t uint288::GetCompact(bool fNegative) const
-{
-    int nSize = (bits() + 7) / 8;
-    uint32_t nCompact = 0;
-    if (nSize <= 3) {
-        nCompact = GetLow64() << 8 * (3 - nSize);
-    } else {
-        uint288 bn = *this >> 8 * (nSize - 3);
-        nCompact = bn.GetLow64();
-    }
-    // The 0x00800000 bit denotes the sign.
-    // Thus, if it is already set, divide the mantissa by 256 and increase the exponent.
-    if (nCompact & 0x00800000) {
-        nCompact >>= 8;
-        nSize++;
-    }
-    assert((nCompact & ~0x007fffffU) == 0);
-    assert(nSize < 256);
-    nCompact |= nSize << 24;
-    nCompact |= (fNegative && (nCompact & 0x007fffff) ? 0x00800000 : 0);
-    return nCompact;
-}
-
-// stream operations
+// Explicit instantiations for base_blob<128>
+template base_blob<128>::base_blob(const std::vector<unsigned char> &);
+template std::string base_blob<128>::GetHex() const;
+template std::string base_blob<128>::ToString() const;
+template void base_blob<128>::SetHex(const char *);
+template void base_blob<128>::SetHex(const std::string &);
 
 std::istream &operator>>(std::istream &is, uint128 &value)
 {
@@ -475,6 +90,13 @@ std::ostream &operator<<(std::ostream &os, const uint128 &value)
     return os;
 }
 
+// Explicit instantiations for base_blob<160>
+template base_blob<160>::base_blob(const std::vector<unsigned char> &);
+template std::string base_blob<160>::GetHex() const;
+template std::string base_blob<160>::ToString() const;
+template void base_blob<160>::SetHex(const char *);
+template void base_blob<160>::SetHex(const std::string &);
+
 std::istream &operator>>(std::istream &is, uint160 &value)
 {
     std::string Hex;
@@ -488,6 +110,34 @@ std::ostream &operator<<(std::ostream &os, const uint160 &value)
     os << value.GetHex();
     return os;
 }
+
+// Explicit instantiations for base_blob<288>
+template base_blob<288>::base_blob(const std::vector<unsigned char> &);
+template std::string base_blob<288>::GetHex() const;
+template std::string base_blob<288>::ToString() const;
+template void base_blob<288>::SetHex(const char *);
+template void base_blob<288>::SetHex(const std::string &);
+
+std::istream &operator>>(std::istream &is, uint288 &value)
+{
+    std::string Hex;
+    is >> Hex;
+    value.SetHex(Hex);
+    return is;
+}
+
+std::ostream &operator<<(std::ostream &os, const uint288 &value)
+{
+    os << value.GetHex();
+    return os;
+}
+
+// Explicit instantiations for base_blob<256>
+template base_blob<256>::base_blob(const std::vector<unsigned char> &);
+template std::string base_blob<256>::GetHex() const;
+template std::string base_blob<256>::ToString() const;
+template void base_blob<256>::SetHex(const char *);
+template void base_blob<256>::SetHex(const std::string &);
 
 std::istream &operator>>(std::istream &is, uint256 &value)
 {
@@ -503,16 +153,13 @@ std::ostream &operator<<(std::ostream &os, const uint256 &value)
     return os;
 }
 
-std::istream &operator>>(std::istream &is, uint288 &value)
+uint256 &UINT256_ONE()
 {
-    std::string Hex;
-    is >> Hex;
-    value.SetHex(Hex);
-    return is;
+    static uint256 *one = new uint256(uint256S("0000000000000000000000000000000000000000000000000000000000000001"));
+    return *one;
 }
 
-std::ostream &operator<<(std::ostream &os, const uint288 &value)
-{
-    os << value.GetHex();
-    return os;
-}
+const uint256 uint256::ZERO(0);
+const uint256 uint256::ONE(1);
+
+} // namespace legacy
