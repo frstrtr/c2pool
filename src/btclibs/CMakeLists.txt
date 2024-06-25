@@ -1,5 +1,6 @@
 file(GLOB crypto_sources "crypto/*.h" "crypto/*.cpp")
 
+
 set(sources
         uint256.h
         uint256.cpp
@@ -21,8 +22,8 @@ set(sources
         script/script.h
         script/script.cpp
         span.h
-        base58.h
-        base58.cpp
+        # base58.h
+        # base58.cpp
         serialize.h
         prevector.h
         core_read.cpp
