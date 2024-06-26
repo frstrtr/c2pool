@@ -12,7 +12,7 @@ namespace c2pool
 class Message
 {
 public:
-    const std::string m_command;
+    std::string m_command;
 
 public:
     Message(const char *command) : m_command(command) {}

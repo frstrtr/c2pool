@@ -40,9 +40,6 @@ public:
     {
         PackStream result(node_prefix);
 
-        // prefix
-        // result = node_prefix;
-
         // command
         msg->m_command.resize(12);
         ArrayType<std::byte, 12>::Write(result, msg->m_command);
