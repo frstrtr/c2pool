@@ -1,157 +1,103 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2019 The Bitcoin Core developers
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_UINT256_H
 #define BITCOIN_UINT256_H
 
-#include <span>
+#include <btclibs/crypto/common.h>
+#include <btclibs/span.h>
 
-#include <assert.h>
+#include <algorithm>
+#include <array>
+#include <cassert>
 #include <cstring>
 #include <stdint.h>
 #include <string>
-#include <vector>
-#include <nlohmann/json.hpp>
 
 namespace legacy{
 
 /** Template base class for fixed-sized opaque blobs. */
-template <unsigned int BITS>
+template<unsigned int BITS>
 class base_blob
 {
-public:
+protected:
     static constexpr int WIDTH = BITS / 8;
-public:
-    uint8_t m_data[WIDTH];
+    static_assert(BITS % 8 == 0, "base_blob currently only supports whole bytes.");
+    std::array<uint8_t, WIDTH> m_data;
+    static_assert(WIDTH == sizeof(m_data), "Sanity check");
 
 public:
     /* construct 0 value by default */
-    constexpr base_blob() : m_data()
-    {
-
-    }
+    constexpr base_blob() : m_data() {}
 
     /* constructor for constants between 1 and 255 */
-    constexpr explicit base_blob(uint8_t v) : m_data{v}
+    constexpr explicit base_blob(uint8_t v) : m_data{v} {}
+
+    constexpr explicit base_blob(Span<const unsigned char> vch)
     {
-
+        assert(vch.size() == WIDTH);
+        std::copy(vch.begin(), vch.end(), m_data.begin());
     }
 
-    explicit base_blob(const std::vector<unsigned char>& vch);
-
-    bool IsNull() const
+    constexpr bool IsNull() const
     {
-        for (int i = 0; i < WIDTH; i++)
-            if (m_data[i] != 0)
-                return false;
-        return true;
+        return std::all_of(m_data.begin(), m_data.end(), [](uint8_t val) {
+            return val == 0;
+        });
     }
 
-    void SetNull()
+    constexpr void SetNull()
     {
-        memset(m_data, 0, sizeof(m_data));
+        std::fill(m_data.begin(), m_data.end(), 0);
     }
 
-    inline int Compare(const base_blob& other) const {
-//        return memcmp(m_data, other.m_data, sizeof(m_data));
-        for (int i = WIDTH - 1; i >= 0; i--)
-        {
-            if (m_data[i] < other.m_data[i])
-                return -1;
-            if (m_data[i] > other.m_data[i])
-                return 1;
-        }
-        return 0;
-    }
+    constexpr int Compare(const base_blob& other) const { return std::memcmp(m_data.data(), other.m_data.data(), WIDTH); }
 
-    friend inline bool operator==(const base_blob& a, const base_blob& b) { return a.Compare(b) == 0; }
-    friend inline bool operator!=(const base_blob& a, const base_blob& b) { return a.Compare(b) != 0; }
-    friend inline bool operator<(const base_blob& a, const base_blob& b) { return a.Compare(b) < 0; }
-    friend inline bool operator>(const base_blob &a, const base_blob &b) { return a.Compare(b) > 0; }
+    friend constexpr bool operator==(const base_blob& a, const base_blob& b) { return a.Compare(b) == 0; }
+    friend constexpr bool operator!=(const base_blob& a, const base_blob& b) { return a.Compare(b) != 0; }
+    friend constexpr bool operator<(const base_blob& a, const base_blob& b) { return a.Compare(b) < 0; }
 
     std::string GetHex() const;
     void SetHex(const char* psz);
     void SetHex(const std::string& str);
     std::string ToString() const;
 
-    const unsigned char* data() const { return m_data; }
-    unsigned char* data() { return m_data; }
+    constexpr const unsigned char* data() const { return m_data.data(); }
+    constexpr unsigned char* data() { return m_data.data(); }
 
-    unsigned char* begin()
-    {
-        return &m_data[0];
-    }
+    constexpr unsigned char* begin() { return m_data.data(); }
+    constexpr unsigned char* end() { return m_data.data() + WIDTH; }
 
-    unsigned char* end()
-    {
-        return &m_data[WIDTH];
-    }
+    constexpr const unsigned char* begin() const { return m_data.data(); }
+    constexpr const unsigned char* end() const { return m_data.data() + WIDTH; }
 
-    const unsigned char* begin() const
-    {
-        return &m_data[0];
-    }
+    static constexpr unsigned int size() { return WIDTH; }
 
-    const unsigned char* end() const
-    {
-        return &m_data[WIDTH];
-    }
-
-    static constexpr unsigned int size()
-    {
-        return sizeof(m_data);
-    }
-
-    uint64_t GetUint64(int pos) const
-    {
-        const uint8_t* ptr = m_data + pos * 8;
-        return ((uint64_t)ptr[0]) | \
-               ((uint64_t)ptr[1]) << 8 | \
-               ((uint64_t)ptr[2]) << 16 | \
-               ((uint64_t)ptr[3]) << 24 | \
-               ((uint64_t)ptr[4]) << 32 | \
-               ((uint64_t)ptr[5]) << 40 | \
-               ((uint64_t)ptr[6]) << 48 | \
-               ((uint64_t)ptr[7]) << 56;
-    }
+    constexpr uint64_t GetUint64(int pos) const { return ReadLE64(m_data.data() + pos * 8); }
 
     template<typename Stream>
     void Serialize(Stream& s) const
     {
-        // s.write(MakeByteSpan(m_data));
+        s << Span(m_data);
     }
 
     template<typename Stream>
     void Unserialize(Stream& s)
     {
-        // s.read(MakeWritableByteSpan(m_data));
+        s.read(MakeWritableByteSpan(m_data));
     }
-};
-
-class uint128 : public base_blob<128>
-{
-public:
-    uint128() {}
-    explicit uint128(const std::vector<unsigned char> &vch) : base_blob<128>(vch) {}
-
-    friend std::istream &operator>>(std::istream &is, uint128 &value);
-    friend std::ostream &operator<<(std::ostream &os, const uint128 &value);
 };
 
 /** 160-bit opaque blob.
  * @note This type is called uint160 for historical reasons only. It is an opaque
  * blob of 160 bits and has no integer operations.
  */
-class uint160 : public base_blob<160>
-{
+class uint160 : public base_blob<160> {
 public:
-    constexpr uint160() {}
-    explicit uint160(const std::vector<unsigned char> &vch) : base_blob<160>(vch) {}
-
-    friend std::istream &operator>>(std::istream &is, uint160 &value);
-    friend std::ostream &operator<<(std::ostream &os, const uint160 &value);
+    constexpr uint160() = default;
+    constexpr explicit uint160(Span<const unsigned char> vch) : base_blob<160>(vch) {}
 };
 
 /** 256-bit opaque blob.
@@ -159,31 +105,13 @@ public:
  * opaque blob of 256 bits and has no integer operations. Use arith_uint256 if
  * those are required.
  */
-class uint256 : public base_blob<256>
-{
+class uint256 : public base_blob<256> {
 public:
-    constexpr uint256() {}
+    constexpr uint256() = default;
     constexpr explicit uint256(uint8_t v) : base_blob<256>(v) {}
-    explicit uint256(const std::vector<unsigned char>& vch) : base_blob<256>(vch) {}
+    constexpr explicit uint256(Span<const unsigned char> vch) : base_blob<256>(vch) {}
     static const uint256 ZERO;
     static const uint256 ONE;
-
-    friend std::istream &operator>>(std::istream &is, uint256 &value);
-    friend std::ostream &operator<<(std::ostream &os, const uint256 &value);
-};
-
-/** 288-bit opaque blob.
- * @note This type is called uint160 for historical reasons only. It is an opaque
- * blob of 288 bits and has no integer operations.
- */
-class uint288 : public base_blob<288>
-{
-public:
-    constexpr uint288() {}
-    explicit uint288(const std::vector<unsigned char> &vch) : base_blob<288>(vch) {}
-
-    friend std::istream &operator>>(std::istream &is, uint288 &value);
-    friend std::ostream &operator<<(std::ostream &os, const uint288 &value);
 };
 
 /* uint256 from const char *.
@@ -200,53 +128,11 @@ inline uint256 uint256S(const char *str)
  * This is a separate function because the constructor uint256(const std::string &str) can result
  * in dangerously catching uint256(0) via std::string(const char*).
  */
-inline uint256 uint256S(const std::string &str)
+inline uint256 uint256S(const std::string& str)
 {
     uint256 rv;
     rv.SetHex(str);
     return rv;
-}
-
-uint256 &UINT256_ONE();
-
-inline void to_json(nlohmann::json& j, const uint256& p)
-{
-    j = p.GetHex();
-}
-
-inline void from_json(const nlohmann::json& j, uint256& p)
-{
-    p.SetHex(j.get<std::string>());
-}
-
-inline void to_json(nlohmann::json& j, const uint288& p)
-{
-    j = p.GetHex();
-}
-
-inline void from_json(const nlohmann::json& j, uint288& p)
-{
-    p.SetHex(j.get<std::string>());
-}
-
-inline void to_json(nlohmann::json& j, const uint160& p)
-{
-    j = p.GetHex();
-}
-
-inline void from_json(const nlohmann::json& j, uint160& p)
-{
-    p.SetHex(j.get<std::string>());
-}
-
-inline void to_json(nlohmann::json& j, const uint128& p)
-{
-    j = p.GetHex();
-}
-
-inline void from_json(const nlohmann::json& j, uint128& p)
-{
-    p.SetHex(j.get<std::string>());
 }
 
 } // namespace legacy

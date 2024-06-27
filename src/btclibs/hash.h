@@ -6,6 +6,8 @@
 #ifndef BITCOIN_HASH_H
 #define BITCOIN_HASH_H
 
+#include <iostream>
+#include "util/strencodings.h"
 #include "attributes.h"
 #include "crypto/common.h"
 #include "crypto/ripemd160.h"
@@ -34,10 +36,14 @@ public:
         assert(output.size() == OUTPUT_SIZE);
         unsigned char buf[CSHA256::OUTPUT_SIZE];
         sha.Finalize(buf);
+        std::vector<unsigned char> v(std::begin(buf), std::end(buf));
+        std::cout << "buf = \n\t" << HexStr(v) << std::endl;
+        std::cout << "\t"; for (auto _v : buf) std::cout << (int) _v << " "; std::cout << std::endl;
         sha.Reset().Write(buf, CSHA256::OUTPUT_SIZE).Finalize(output.data());
     }
 
     CHash256& Write(Span<const unsigned char> input) {
+        std::cout << "input = "; for (auto v : input) std::cout << (int) v << " "; std::cout << std::endl;
         sha.Write(input.data(), input.size());
         return *this;
     }
@@ -78,7 +84,8 @@ template<typename T>
 inline uint256 Hash(const T& in1)
 {
     uint256 result;
-    CHash256().Write(MakeUCharSpan(in1)).Finalize(result);
+    auto temp = CHash256().Write(MakeUCharSpan(in1));
+    temp.Finalize(result);
     return result;
 }
 
@@ -109,6 +116,9 @@ public:
     void write(Span<const std::byte> src)
     {
         ctx.Write(UCharCast(src.data()), src.size());
+        std::cout << "Write for HashWriter: ";
+        for (auto it = src.begin(); it != src.end(); it++) std::cout << (int64_t)*it << " ";
+        std::cout << std::endl;
     }
 
     /** Compute the double-SHA256 hash of all data written to this object.
@@ -143,7 +153,7 @@ public:
     template <typename T>
     HashWriter& operator<<(const T& obj)
     {
-        ::Serialize(*this, obj);
+        ::legacy::Serialize(*this, obj);
         return *this;
     }
 };
@@ -177,7 +187,7 @@ public:
     template <typename T>
     HashVerifier<Source>& operator>>(T&& obj)
     {
-        ::Unserialize(*this, obj);
+        ::legacy::Unserialize(*this, obj);
         return *this;
     }
 };
@@ -201,7 +211,7 @@ public:
     template <typename T>
     HashedSourceWriter& operator<<(const T& obj)
     {
-        ::Serialize(*this, obj);
+        ::legacy::Serialize(*this, obj);
         return *this;
     }
 };

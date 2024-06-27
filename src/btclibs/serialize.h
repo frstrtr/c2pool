@@ -24,6 +24,8 @@
 #include "prevector.h"
 #include "span.h"
 
+namespace legacy{
+
 /**
  * The maximum size of a serialized object in bytes or number of elements
  * (for eg vectors) when the size is encoded as CompactSize.
@@ -137,10 +139,10 @@ enum
 template<typename X> X& ReadWriteAsHelper(X& x) { return x; }
 template<typename X> const X& ReadWriteAsHelper(const X& x) { return x; }
 
-#define READWRITE(...) (::SerReadWriteMany(s, ser_action, __VA_ARGS__))
-#define READWRITEAS(type, obj) (::SerReadWriteMany(s, ser_action, ReadWriteAsHelper<type>(obj)))
-#define SER_READ(obj, code) ::SerRead(s, ser_action, obj, [&](Stream& s, typename std::remove_const<Type>::type& obj) { code; })
-#define SER_WRITE(obj, code) ::SerWrite(s, ser_action, obj, [&](Stream& s, const Type& obj) { code; })
+#define READWRITE(...) (::legacy::SerReadWriteMany(s, ser_action, __VA_ARGS__))
+#define READWRITEAS(type, obj) (::legacy::SerReadWriteMany(s, ser_action, ReadWriteAsHelper<type>(obj)))
+#define SER_READ(obj, code) ::legacy::SerRead(s, ser_action, obj, [&](Stream& s, typename std::remove_const<Type>::type& obj) { code; })
+#define SER_WRITE(obj, code) ::legacy::SerWrite(s, ser_action, obj, [&](Stream& s, const Type& obj) { code; })
 
 /**
  * Implement the Ser and Unser methods needed for implementing a formatter (see Using below).
@@ -160,9 +162,9 @@ template<typename X> const X& ReadWriteAsHelper(const X& x) { return x; }
  */
 #define FORMATTER_METHODS(cls, obj) \
     template<typename Stream> \
-    static void Ser(Stream& s, const cls& obj) { SerializationOps(obj, s, CSerActionSerialize()); } \
+    static void Ser(Stream& s, const cls& obj) { SerializationOps(obj, s, legacy::CSerActionSerialize()); } \
     template<typename Stream> \
-    static void Unser(Stream& s, cls& obj) { SerializationOps(obj, s, CSerActionUnserialize()); } \
+    static void Unser(Stream& s, cls& obj) { SerializationOps(obj, s, legacy::CSerActionUnserialize()); } \
     template<typename Stream, typename Type, typename Operation> \
     static inline void SerializationOps(Type& obj, Stream& s, Operation ser_action) \
 
@@ -795,7 +797,7 @@ void Serialize_impl(Stream& os, const std::vector<T, A>& v, const bool&)
     // due to std::vector's special casing for bool arguments.
     WriteCompactSize(os, v.size());
     for (bool elem : v) {
-        ::Serialize(os, elem);
+        ::legacy::Serialize(os, elem);
     }
 }
 
@@ -1002,7 +1004,7 @@ public:
     template<typename T>
     CSizeComputer& operator<<(const T& obj)
     {
-        ::Serialize(*this, obj);
+        ::legacy::Serialize(*this, obj);
         return (*this);
     }
 
@@ -1021,8 +1023,8 @@ void SerializeMany(Stream& s)
 template<typename Stream, typename Arg, typename... Args>
 void SerializeMany(Stream& s, const Arg& arg, const Args&... args)
 {
-    ::Serialize(s, arg);
-    ::SerializeMany(s, args...);
+    ::legacy::Serialize(s, arg);
+    ::legacy::SerializeMany(s, args...);
 }
 
 template<typename Stream>
@@ -1033,20 +1035,20 @@ inline void UnserializeMany(Stream& s)
 template<typename Stream, typename Arg, typename... Args>
 inline void UnserializeMany(Stream& s, Arg&& arg, Args&&... args)
 {
-    ::Unserialize(s, arg);
-    ::UnserializeMany(s, args...);
+    ::legacy::Unserialize(s, arg);
+    ::legacy::UnserializeMany(s, args...);
 }
 
 template<typename Stream, typename... Args>
 inline void SerReadWriteMany(Stream& s, CSerActionSerialize ser_action, const Args&... args)
 {
-    ::SerializeMany(s, args...);
+    ::legacy::SerializeMany(s, args...);
 }
 
 template<typename Stream, typename... Args>
 inline void SerReadWriteMany(Stream& s, CSerActionUnserialize ser_action, Args&&... args)
 {
-    ::UnserializeMany(s, args...);
+    ::legacy::UnserializeMany(s, args...);
 }
 
 template<typename Stream, typename Type, typename Fn>
@@ -1095,5 +1097,7 @@ size_t GetSerializeSizeMany(int nVersion, const T&... t)
     SerializeMany(sc, t...);
     return sc.size();
 }
+
+} // namespace legacy
 
 #endif // BITCOIN_SERIALIZE_H
