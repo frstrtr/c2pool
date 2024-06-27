@@ -6,8 +6,7 @@
 // arith_uint256 -> old uint256 logic
 // added GetHex()/SetHex()
 
-#ifndef C2POOL_UINT256_H
-#define C2POOL_UINT256_H
+#pragma once
 
 #include <cstring>
 #include <limits>
@@ -288,6 +287,11 @@ public:
 
     std::vector<unsigned char> GetChars() const;
 
+    unsigned char* data() const
+    {
+        return (unsigned char*) pn;
+    }
+
     template<typename Stream>
     void Serialize(Stream& s) const
     {
@@ -474,5 +478,3 @@ ToUINT convert_uint(const FromUINT &value)
 
     return result;
 }
-
-#endif //C2POOL_UINT256_H
