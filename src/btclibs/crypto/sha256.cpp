@@ -702,6 +702,16 @@ void CSHA256::Finalize(unsigned char hash[OUTPUT_SIZE])
     WriteBE32(hash + 28, s[7]);
 }
 
+void CSHA256::Finalize(uint32_t hash[OUTPUT_SIZE / 4])
+{
+    static const unsigned char pad[64] = {0x80};
+    unsigned char sizedesc[8];
+    WriteBE64(sizedesc, bytes << 3);
+    Write(pad, 1 + ((119 - (bytes % 64)) % 64));
+    Write(sizedesc, 8);
+    memcpy(&hash[0], &s[0], OUTPUT_SIZE);
+}
+
 CSHA256& CSHA256::Reset()
 {
     bytes = 0;

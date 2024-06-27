@@ -25,6 +25,7 @@ public:
     CSHA256(uint32_t* custom_init, std::vector<unsigned char> _buf = {}, uint64_t _length = 0);
     CSHA256& Write(const unsigned char* data, size_t len);
     void Finalize(unsigned char hash[OUTPUT_SIZE]);
+    void Finalize(uint32_t hash[OUTPUT_SIZE / 4]);
     CSHA256& Reset();
 };
 
