@@ -1,6 +1,6 @@
 #pragma once
 
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 
 #include <core/pack_types.hpp>
 #include <core/netaddress.hpp>

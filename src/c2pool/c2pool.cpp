@@ -8,7 +8,7 @@
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
 
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 #include <nlohmann/json.hpp>
 
 int main(int argc, char *argv[])

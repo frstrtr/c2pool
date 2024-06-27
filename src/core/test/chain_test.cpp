@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 // #include <core/chain.hpp>
 
 // struct FakeBlock
