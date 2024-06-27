@@ -5,7 +5,7 @@
 #include <map>
 #include <string>
 #include <initializer_list>
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 #include <shared_mutex>
 #include <mutex>
 

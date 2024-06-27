@@ -4,7 +4,7 @@
 #include <array>
 
 #include "pack.hpp"
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 
 template <size_t Size>
 struct BigEndianFormat

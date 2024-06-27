@@ -4,7 +4,7 @@
 #include <vector>
 #include <set>
 
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 #include <core/fileconfig.hpp>
 
 #include <core/configs/pool.hpp>

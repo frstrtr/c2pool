@@ -33,7 +33,7 @@ add_executable(template_num template_num.cpp)
 add_executable(template_num2 template_num2.cpp)
 add_executable(check_node check_node.cpp)
 add_executable(test_uint_hasher test_uint_hasher.cpp)
-target_link_libraries(test_uint_hasher btclibs #[[core]])
+target_link_libraries(test_uint_hasher btclibs core)
 
 add_executable(static_assert_check_templ static_assert_check_templ.cpp)
 add_executable(get_chain_test get_chain_test.cpp)

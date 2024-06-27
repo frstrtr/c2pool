@@ -4,7 +4,7 @@
 
 #include <core/pack.hpp>
 #include <core/opscript.hpp>
-#include <btclibs/uint256.h>
+#include <core/uint256.hpp>
 
 namespace ltc
 {
