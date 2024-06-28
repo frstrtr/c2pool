@@ -41,6 +41,12 @@ public:
         return *this;
     }
 
+    CHash256& Write(std::span<const std::byte> input) 
+    {
+        sha.Write((const unsigned char*)input.data(), input.size());
+        return *this;
+    }
+
     CHash256& Reset() 
     {
         sha.Reset();
