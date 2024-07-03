@@ -1,4 +1,5 @@
 set(pool_source
+    pool_factory.hpp
     api.hpp
     node.hpp
     protocol.hpp
