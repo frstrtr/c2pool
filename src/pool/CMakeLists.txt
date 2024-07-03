@@ -1,5 +1,5 @@
 set(pool_source
-    pool_factory.hpp
+    factory.hpp factory.cpp
     api.hpp
     node.hpp
     protocol.hpp

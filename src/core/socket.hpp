@@ -7,8 +7,9 @@
 #include <boost/asio.hpp>
 
 #include <core/pack.hpp>
+#include <core/pack_types.hpp>
 #include <core/message.hpp>
-#include <core/handler.hpp>
+#include <core/node_interface.hpp>
 #include <core/hash.hpp>
 
 namespace c2pool
@@ -33,8 +34,7 @@ public:
     std::vector<std::byte> prefix;
     std::string command;
     uint32_t message_length;
-    // std::byte checksum[4];
-    uint32_t checksum;
+    uint32_t checksum; // std::byte checksum[4];
     std::vector<std::byte> payload;
 
     // write
@@ -65,26 +65,38 @@ public:
     {
         prefix.resize(prefix_length);
     }
+
+    std::unique_ptr<RawMessage> to_message()
+    {
+        return std::make_unique<RawMessage>(command, PackStream(payload));
+    }
 };
 
 class Socket
 {
-    IMessageHandler* m_handler {nullptr};
     std::unique_ptr<boost::asio::ip::tcp::socket> m_socket;
     connection_type m_conn_type {unknown};
-    std::vector<std::byte> m_prefix;
+    INode* m_node {nullptr};
+
 private:
 
-public:    
-    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, const std::vector<std::byte>& prefix) : m_socket(std::move(socket)), m_conn_type(conn_type), m_prefix(prefix)
+    void read()
     {
-       
+        auto packet = std::make_shared<Packet>(m_node->m_prefix.size());
+		read_prefix(packet);
     }
 
-    void set_handler(IMessageHandler* handler)
+    void read_prefix(std::shared_ptr<Packet> packet);
+	void read_command(std::shared_ptr<Packet> packet);
+	void read_length(std::shared_ptr<Packet> packet);
+	void read_checksum(std::shared_ptr<Packet> packet);
+	void read_payload(std::shared_ptr<Packet> packet);
+	void message_processing(std::shared_ptr<Packet> packet);
+
+public:    
+    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, INode* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
     {
-        if (handler)
-            m_handler = handler;
+        read(); // start for reading socket data
     }
 
     connection_type type()
@@ -92,14 +104,9 @@ public:
         return m_conn_type;
     }
 
-    void read()
-    {
-
-    }
-
     void write(std::unique_ptr<RawMessage> msg_data)
     {
-        auto packet = Packet::from_message(m_prefix, msg_data);
+        auto packet = Packet::from_message(m_node->m_prefix, msg_data);
         
         boost::asio::async_write(*m_socket, boost::asio::buffer(packet.data(), packet.size()),
             [this, packet](const boost::system::error_code& ec, std::size_t length)

@@ -1,6 +1,9 @@
 #pragma once
 #include <boost/asio.hpp>
 
+#include <core/socket.hpp>
+#include <core/node_interface.hpp>
+
 namespace c2pool
 {
 
@@ -10,18 +13,17 @@ namespace pool
 class Factory
 {
 private:
+	INode* m_node;
     boost::asio::io_context* m_context;
     boost::asio::ip::tcp::resolver m_resolver;
     boost::asio::ip::tcp::acceptor m_acceptor;
-
 
 private:
 
     void listen()
     {
         m_acceptor.async_accept(
-			[&]
-			(boost::system::error_code ec, boost::asio::ip::tcp::socket io_socket)
+			[this](boost::system::error_code ec, boost::asio::ip::tcp::socket io_socket)
 			{
 				if (ec)
 				{
@@ -32,10 +34,10 @@ private:
 					// return;
 				}
 
-				auto tcp_socket = std::make_shared<boost::asio::ip::tcp::socket>(std::move(io_socket));
-				auto socket = std::make_shared<PoolSocket>(tcp_socket, net, connection_type::incoming, [&](const libp2p::error& err){ error_handler(err); });
-				socket->init_addr();
-				socket_handler(socket);
+				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
+				auto socket = std::make_shared<c2pool::Socket>(tcp_socket, connection_type::incoming, m_node);
+				// socket->init_addr();
+				// socket_handler(socket);
 				
 				// continue accept connections
 				listen();
@@ -43,8 +45,13 @@ private:
 		);
     }
 
+	void read(c2pool::Socket* socket)
+	{
+
+	}
+
 public:
-    Factory(boost::asio::io_context* context) : m_context(context), m_resolver(*m_context), m_acceptor(*m_context)
+    Factory(boost::asio::io_context* context, INode* node) : m_context(context), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
     {
         
     }

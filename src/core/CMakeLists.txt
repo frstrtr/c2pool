@@ -2,7 +2,7 @@ file(GLOB configs_source "configs/*.hpp" "configs/*.cpp")
 
 set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp events.hpp disposable.hpp)
 
-set(network_sources message.hpp handler.hpp socket.hpp)
+set(network_sources message.hpp node_interface.hpp socket.cpp socket.hpp)
 
 set(btclib_sources hash.hpp hash.cpp uint256.hpp uint256.cpp)
 

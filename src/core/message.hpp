@@ -26,8 +26,8 @@ struct RawMessage : Message
 {
     PackStream m_data;
 
-    RawMessage(const char *command, PackStream& data) : Message(command), m_data(std::move(data)) {}
-    RawMessage(std::string command, PackStream& data) : Message(std::move(command)), m_data(std::move(data)) {}
+    RawMessage(const char *command, PackStream&& data) : Message(command), m_data(std::move(data)) {}
+    RawMessage(std::string command, PackStream&& data) : Message(std::move(command)), m_data(std::move(data)) {}
 };
 
 } // namespace c2pool
