@@ -32,6 +32,7 @@ add_executable(spec_templ_local spec_templ_local.cpp)
 add_executable(template_num template_num.cpp)
 add_executable(template_num2 template_num2.cpp)
 add_executable(check_node check_node.cpp)
+add_executable(base_node_check base_node_check.cpp)
 add_executable(test_uint_hasher test_uint_hasher.cpp)
 target_link_libraries(test_uint_hasher btclibs core)
 
