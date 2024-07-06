@@ -39,8 +39,6 @@ template <typename Base, typename Legacy, typename Actual>
 class BaseNode : public Legacy, public Actual, public Factory
 {
     static_assert(std::is_base_of_v<IProtocol<Base>, Legacy> && std::is_base_of_v<IProtocol<Base>, Actual>);
-protected:
-    // Factory factory;
 
 public:
     template <typename... Args>

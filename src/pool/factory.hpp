@@ -18,8 +18,7 @@ private:
     boost::asio::ip::tcp::resolver m_resolver;
     boost::asio::ip::tcp::acceptor m_acceptor;
 
-protected:
-
+private:
     void listen()
     {
         m_acceptor.async_accept(
@@ -44,11 +43,6 @@ protected:
 			}
 		);
     }
-
-	void read(c2pool::Socket* socket)
-	{
-
-	}
 
 public:
     Factory(boost::asio::io_context* context, INode* node) : m_context(context), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
