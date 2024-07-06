@@ -31,19 +31,19 @@ public:
     NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : INode(ctx, prefix) {}
 };
 
-class Legacy : public c2pool::pool::IProtocol<NodeImpl>
+class C2Pool : public c2pool::pool::IProtocol<NodeImpl>
 {
 public:
     void handle_message() override {}
 };
 
-class Actual : public c2pool::pool::IProtocol<NodeImpl>
+class P2Pool : public c2pool::pool::IProtocol<NodeImpl>
 {
 public:
     void handle_message() override {}
 };
 
-using Node = c2pool::pool::BaseNode<NodeImpl, Legacy, Actual>;
+using Node = c2pool::pool::BaseNode<NodeImpl, P2Pool, C2Pool>;
 
 
 int main(int argc, char *argv[])
