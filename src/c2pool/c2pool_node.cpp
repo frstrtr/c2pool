@@ -1,4 +1,5 @@
 #include <iostream>
+#include <memory>
 
 #include <core/log.hpp>
 #include <core/settings.hpp>
@@ -7,39 +8,54 @@
 #include <core/uint256.hpp>
 
 #include <pool/node.hpp>
+#include <core/message.hpp>
+#include <core/node_interface.hpp>
 
-class ILegacy
+
+class NodeImpl : public c2pool::INode
 {
-    virtual void handle_version() = 0;
+public:
+    void handle(std::unique_ptr<c2pool::RawMessage> msg) const override
+    {}
+
+    void error(const message_error_type& err) override
+    {}
+
+    void connected() override
+    {}
+
+    void disconnect() override
+    {}
+
+    NodeImpl() {}
+    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : INode(ctx, prefix) {}
 };
 
-class IActual
+class Legacy : public c2pool::pool::IProtocol<NodeImpl>
 {
-    virtual void handle_version() = 0;
+public:
+    void handle_message() override {}
 };
 
-class TestNode : c2pool::pool::Node<ILegacy, IActual>
+class Actual : public c2pool::pool::IProtocol<NodeImpl>
 {
-    int num;
-    // void Legacy::handle_version() override
-    // {
-
-    // }
-
-    // void Actual::handle_version() override
-    // {
-
-    // }
+public:
+    void handle_message() override {}
 };
 
+using Node = c2pool::pool::BaseNode<NodeImpl, Legacy, Actual>;
 
 
 int main(int argc, char *argv[])
 {
+    boost::asio::io_context* context = new boost::asio::io_context();
+    std::vector<std::byte> prefix = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
+
     c2pool::log::Logger::init();
     auto settings = c2pool::Fileconfig::load_file<c2pool::Settings>();
 
 
-
-    TestNode* node = new TestNode();
+    Node* node = new Node(context, prefix);
+    node->run(5555);
+    context->run();
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <pool/factory.hpp>
 #include <core/node_interface.hpp>
 
 namespace c2pool
@@ -28,21 +29,23 @@ namespace pool
 template <typename NodeType>
 class IProtocol : public virtual NodeType
 {
+    static_assert(std::is_base_of_v<INode, NodeType>);
 protected:
     virtual void handle_message() = 0;
 };
 
 // Legacy -- p2pool; Actual -- c2pool
 template <typename Base, typename Legacy, typename Actual>
-class BaseNode : public Legacy, public Actual
+class BaseNode : public Legacy, public Actual, public Factory
 {
     static_assert(std::is_base_of_v<IProtocol<Base>, Legacy> && std::is_base_of_v<IProtocol<Base>, Actual>);
+protected:
+    // Factory factory;
 
 public:
     template <typename... Args>
-    BaseNode(Args... args) : Base(args...) { }
-}
-
+    BaseNode(boost::asio::io_context* ctx, Args... args) : Base(ctx, args...), Factory(ctx, this) { }
+};
 
 
 } // namespace pool

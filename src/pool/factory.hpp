@@ -18,7 +18,7 @@ private:
     boost::asio::ip::tcp::resolver m_resolver;
     boost::asio::ip::tcp::acceptor m_acceptor;
 
-private:
+protected:
 
     void listen()
     {
@@ -35,7 +35,7 @@ private:
 				}
 
 				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
-				auto socket = std::make_shared<c2pool::Socket>(tcp_socket, connection_type::incoming, m_node);
+				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, m_node);
 				// socket->init_addr();
 				// socket_handler(socket);
 				
@@ -61,12 +61,12 @@ public:
         boost::asio::ip::tcp::endpoint listen_ep(boost::asio::ip::tcp::v4(), listen_port);
 
         m_acceptor.open(listen_ep.protocol());
-		m_acceptor.set_option(io::socket_base::reuse_address(true));
+		m_acceptor.set_option(boost::asio::socket_base::reuse_address(true));
 		m_acceptor.bind(listen_ep);
 		m_acceptor.listen();
+		listen();
 
-		async_loop();
-		LOG_INFO << "\t\t PoolListener started for port: " << listen_ep.port();
+		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
 };
 
