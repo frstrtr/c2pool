@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include <boost/asio/io_context.hpp>
 #include <core/message.hpp>
 #include <core/pack.hpp>
 
@@ -12,6 +13,7 @@ struct INode
 {
     using message_error_type = std::string;
 
+    boost::asio::io_context* m_ctx;
     std::vector<std::byte> m_prefix;
 
     virtual void handle(std::unique_ptr<RawMessage> msg) const = 0;
@@ -19,7 +21,8 @@ struct INode
     virtual void connected() = 0;
     virtual void disconnect() = 0;
 
-    INode(const std::vector<std::byte>& prefix) : m_prefix(prefix) {}
+    INode() {}
+    INode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : m_ctx(ctx), m_prefix(prefix) {}
 };
 
 // template <typename PROTOCOL_TYPE>
