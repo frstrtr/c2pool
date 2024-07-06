@@ -1,44 +1,50 @@
 #include <iostream>
 #include <memory>
-// struct ILegacy
-// {
-//     virtual void handle_version() = 0;
-// };
 
-// struct IActual
-// {
-//     virtual void handle_version() = 0;
-// };
-
-struct NodeImpl
+class NodeImpl
 {
+protected:
     int m_num;
-    Node() {}
-    Node(int n) : m_num(n) { std::cout << "hi!" << std::endl; }
+    int m_num2;
+
+public:
+    int m_num3;
+
+public:
+    NodeImpl() {}
+    NodeImpl(int n, int n2) : m_num(n), m_num2(n2) { std::cout << "hi!" << std::endl; }
 };
 
 template <typename Node>
-struct NodeProtocol : virtual 
+class NodeProtocol : public virtual Node
 {
+    virtual void handle_message() = 0;
+};
 
-}
-
-struct Legacy : virtual NodeImpl
+class Legacy : public NodeProtocol<NodeImpl>
 {
+public:
     // int l_v;
     // Legacy(int v) : l_v(v) { }
 
+    void handle_message() override { handle_version(); std::cout << m_num2 << std::endl; }
+
+private:
     void handle_version()
     {
         std::cout << "handle legacy version, num = " << m_num << std::endl;
     }
 };
 
-struct Actual : virtual NodeImpl
+class Actual : protected NodeProtocol<NodeImpl>
 {
+public:
     // int a_v;
     // Actual(int v) : a_v(v) { }
 
+    void handle_message() override { handle_version(); }
+
+private:
     void handle_version()
     {
         std::cout << "handle actual version, num = " << m_num << std::endl;
@@ -46,9 +52,12 @@ struct Actual : virtual NodeImpl
 };
 
 template <typename Base, typename ILegacy, typename IActual>
-struct BaseNode : ILegacy, IActual
+class BaseNode : public ILegacy, public IActual
 {
-    static_assert(std::is_base_of_v<Base, ILegacy> && std::is_base_of_v<Base, IActual>);
+public:
+    // static_assert(std::is_base_of_v<Base, ILegacy> && std::is_base_of_v<Base, IActual>);
+    static_assert(std::is_base_of_v<NodeProtocol<Base>, ILegacy> && std::is_base_of_v<NodeProtocol<Base>, IActual>);
+
     using base = Base;
 
     void handle(bool actual)
@@ -56,30 +65,24 @@ struct BaseNode : ILegacy, IActual
         if (actual)
         {
             IActual* n = this;
-            n->handle_version();
+            n->handle_message();
         } else
         {
             ILegacy* n = this;
-            n->handle_version();
-            std::make_unique
+            n->handle_message();
         }    
     }
 
-    BaseNode(int n) : Base(n) { std::cout << "1 " <<  n << std::endl;}
+    template <typename... Args>
+    BaseNode(Args... args) : Base(args...) { }
 };
 
-namespace pool
-{
-    // struct Node : BaseNode<::Node, Legacy, Actual>
-    // {
-    // public:
-    //     Node(int n) : base(n) { std::cout << "2 " <<  n << std::endl; }
-    // };
-    using Node = BaseNode<::Node, Legacy, Actual>;
-} // namespace pool
+using Node = BaseNode<::NodeImpl, Legacy, Actual>;
 
 int main(int argc, char *argv[])
 {
-    pool::Node* node = new pool::Node(100);
+    Node* node = new Node(1010, 10200);
     node->handle(false);
+    std::cout << node->m_num3 << std::endl;
+    
 }
