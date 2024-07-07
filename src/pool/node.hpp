@@ -1,6 +1,9 @@
 #pragma once
 
+#include <map>
+
 #include <pool/factory.hpp>
+#include <pool/peer.hpp>
 #include <core/node_interface.hpp>
 
 namespace c2pool
@@ -9,23 +12,6 @@ namespace c2pool
 namespace pool
 {
 
-// template <typename HandshakeType, typename P2PoolProtocol, typename C2PoolProtocol>
-// Legacy -- p2pool; Actual -- c2pool.
-// template <typename ILegacyProtocol, typename IActualProtocol>
-// class Node : public INode, ILegacyProtocol, IActualProtocol
-// {
-//     // using handshake_type = HandshakeType;
-//     // using p2pool_type = P2PoolProtocol;
-//     // using c2pool_type = C2PoolProtocol;
-
-// public:
-//     Node()
-//     {
-        
-//     }
-
-//     // Client* make_connection
-// };
 template <typename NodeType>
 class IProtocol : public virtual NodeType
 {
@@ -35,16 +21,25 @@ protected:
 };
 
 // Legacy -- p2pool; Actual -- c2pool
-template <typename Base, typename Legacy, typename Actual>
+template <typename Base, typename Legacy, typename Actual, typename PeerType>
 class BaseNode : public Legacy, public Actual, public Factory
 {
     static_assert(std::is_base_of_v<IProtocol<Base>, Legacy> && std::is_base_of_v<IProtocol<Base>, Actual>);
 
+    std::map<NetService, PeerType> peers;
+
 public:
     template <typename... Args>
     BaseNode(boost::asio::io_context* ctx, Args... args) : Base(ctx, args...), Factory(ctx, this) { }
+
+    void handle(std::unique_ptr<RawMessage> msg, const NetService& peer) override
+    {
+        
+    }
 };
 
+#define ADD_HANDLER(name, msg_type)\
+    
 
 } // namespace pool
 
