@@ -32,8 +32,8 @@ class Socket
 
     NetService m_addr;
     NetService m_addr_local;
-private:
 
+private:
     void read()
     {
         auto packet = std::make_shared<Packet>(m_node->m_prefix.size());
