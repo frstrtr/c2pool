@@ -1,9 +1,7 @@
 set(pool_source
     factory.hpp factory.cpp
-    api.hpp
     node.hpp
-    protocol.hpp
-    handshake.hpp
+    peer.hpp
 )
 
 add_library(pool STATIC ${pool_source})
