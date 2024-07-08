@@ -10,10 +10,16 @@ namespace c2pool
 namespace pool
 {
     
+struct INetwork
+{
+    virtual void connected(std::shared_ptr<Socket> socket) = 0;
+    virtual void disconnect() = 0;
+};
+
 class Factory
 {
 private:
-	INode* m_node;
+	INetwork* m_node;
     boost::asio::io_context* m_context;
     boost::asio::ip::tcp::resolver m_resolver;
     boost::asio::ip::tcp::acceptor m_acceptor;
@@ -45,7 +51,7 @@ private:
     }
 
 public:
-    Factory(boost::asio::io_context* context, INode* node) : m_context(context), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
+    Factory(boost::asio::io_context* context, INetwork* node) : m_context(context), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
     {
         
     }
