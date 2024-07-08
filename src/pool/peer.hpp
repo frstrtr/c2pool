@@ -27,6 +27,8 @@ protected:
 public:
     template <typename... Args>
     Peer(std::shared_ptr<Socket> socket, Args...) : m_socket(socket), Data(Args...) {}
+
+    PeerConnectionType type() const { return connection_type; }
 };
 
 } // namespace pool
