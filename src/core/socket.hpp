@@ -24,11 +24,24 @@ enum connection_type
     outgoing
 };
 
+// for handle message/error from network
+class Communicator
+{
+public:
+    using message_error_type = std::string;
+
+    boost::asio::io_context* m_ctx;
+    std::vector<std::byte> m_prefix;
+
+    virtual void error(const message_error_type& err) = 0;
+    virtual void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) const = 0;
+};
+
 class Socket
 {
     std::unique_ptr<boost::asio::ip::tcp::socket> m_socket;
     connection_type m_conn_type {unknown};
-    INode* m_node {nullptr};
+    Communicator* m_node {nullptr};
 
     NetService m_addr;
     NetService m_addr_local;
@@ -48,7 +61,7 @@ private:
 	void message_processing(std::shared_ptr<Packet> packet);
 
 public:    
-    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, INode* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
+    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, Communicator* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
     {
         read(); // start for reading socket data
     }
