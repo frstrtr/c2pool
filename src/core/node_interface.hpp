@@ -8,27 +8,6 @@
 
 namespace c2pool
 {
-
-class INode
-{
-public:
-    using message_error_type = std::string;
-
-    boost::asio::io_context* m_ctx;
-    std::vector<std::byte> m_prefix;
-
-    virtual void handle(std::unique_ptr<RawMessage> msg, const NetService& peer) const = 0;
-    virtual void error(const message_error_type& err) = 0;
-    virtual void connected() = 0;
-    virtual void disconnect() = 0;
-
-    INode() {}
-    INode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : m_ctx(ctx), m_prefix(prefix) {}
-
-protected:
-    virtual void handle_version(std::unique_ptr<RawMessage> msg, const NetService& peer) = 0;
-};
-
 // template <typename PROTOCOL_TYPE>
 // class MessageHandler : public IMessageHandler
 // {
