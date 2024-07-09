@@ -14,7 +14,7 @@ void Socket::read_prefix(std::shared_ptr<Packet> packet)
             }
 
             // if (c2pool::dev::compare_str(packet->value.prefix, net->PREFIX, length))
-            if (packet->prefix == m_node->m_prefix)
+            if (packet->prefix == m_node->get_prefix())
                 read_command(packet);
             else {}
 				// TODO: m_node->error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
