@@ -7,43 +7,44 @@
 
 #include <core/uint256.hpp>
 
+#include <pool/peer.hpp>
 #include <pool/node.hpp>
 #include <core/message.hpp>
 #include <core/node_interface.hpp>
 
+class PeerImpl
+{
+    int i;
+};
 
-class NodeImpl : public c2pool::INode
+class NodeImpl : public c2pool::pool::BaseNode<PeerImpl>
 {
 public:
-    void handle(std::unique_ptr<c2pool::RawMessage> msg) const override
-    {}
-
-    void error(const message_error_type& err) override
-    {}
-
-    void connected() override
-    {}
-
-    void disconnect() override
-    {}
+    //  Communicator:
+        void error(const message_error_type& err) override {}
+    //  INetwork:
+        void connected(std::shared_ptr<c2pool::Socket> socket) override { }
+        void disconnect() override { }
+    // BaseNode:
+        void handle_version(std::unique_ptr<c2pool::RawMessage> rmsg, const peer_t& peer) { }
 
     NodeImpl() {}
-    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : INode(ctx, prefix) {}
+    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : c2pool::pool::BaseNode<PeerImpl>(ctx, prefix) {}
 };
 
-class C2Pool : public c2pool::pool::IProtocol<NodeImpl>
+class C2Pool : public c2pool::pool::Protocol<NodeImpl>
 {
 public:
     void handle_message() override {}
 };
 
-class P2Pool : public c2pool::pool::IProtocol<NodeImpl>
+class P2Pool : public c2pool::pool::Protocol<NodeImpl>
 {
 public:
     void handle_message() override {}
 };
 
-using Node = c2pool::pool::BaseNode<NodeImpl, P2Pool, C2Pool>;
+using Node = c2pool::pool::NodeBridge<NodeImpl, P2Pool, C2Pool>;
 
 
 int main(int argc, char *argv[])
