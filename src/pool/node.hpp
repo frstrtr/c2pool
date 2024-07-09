@@ -4,7 +4,9 @@
 
 #include <pool/factory.hpp>
 #include <pool/peer.hpp>
+#include <pool/protocol.hpp>
 #include <core/socket.hpp>
+#include <core/message.hpp>
 
 namespace c2pool
 {
@@ -12,38 +14,47 @@ namespace c2pool
 namespace pool
 {
 
-class NodeInterface : public Communicator, public INetwork
+class NodeInterface : public ICommunicator, public INetwork
 {
-    
 };
 
-template <typename NodeType>
-class IProtocol : public virtual NodeType
+template <typename PeerData>
+class BaseNode : public NodeInterface, private Factory
 {
-    static_assert(std::is_base_of_v<NodeInterface, NodeType>);
-protected:
-    virtual void handle_message() = 0;
-};
-
-// Legacy -- p2pool; Actual -- c2pool
-template <typename Base, typename Legacy, typename Actual, typename PeerType>
-class BaseNode : public Legacy, public Actual, public Factory
-{
-    static_assert(std::is_base_of_v<IProtocol<Base>, Legacy> && std::is_base_of_v<IProtocol<Base>, Actual>);
-
     // For implementation override:
     //  Communicator:
     //      void error(const message_error_type& err)
-    //      void handle_version(std::unique_ptr<RawMessage> rmsg, const NetService& service)
     //  INetwork:
-    //      void connected(std::shared_ptr<Socket> socket) = 0;
-    //      void disconnect() = 0;
+    //      void connected(std::shared_ptr<Socket> socket)
+    //      void disconnect()
+    // BaseNode:
+    //      void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer)
+    std::vector<std::byte> m_prefix;
 
-    std::map<NetService, PeerType*> peers;
+public:
+    using peer_t = c2pool::pool::Peer<PeerData>;
+
+private:
+    std::map<NetService, peer_t*> peers;
+
+
+
+public:
+    BaseNode() : Factory(nullptr, this) {}
+    BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this) {}
+
+    virtual void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer) = 0;
+};
+
+// Legacy -- p2pool; Actual -- c2pool
+template <typename Base, typename Legacy, typename Actual>
+class NodeBridge : public Legacy, public Actual
+{
+    static_assert(std::is_base_of_v<Protocol<Base>, Legacy> && std::is_base_of_v<Protocol<Base>, Actual>);
 
 public:
     template <typename... Args>
-    BaseNode(boost::asio::io_context* ctx, Args... args) : Base(ctx, args...), Factory(ctx, this) { }
+    NodeBridge(boost::asio::io_context* ctx, Args... args) : Base(ctx, args...){ }
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
@@ -55,9 +66,7 @@ public:
                 //TODO: error, message wanna for be version 
                 {}
 
-
-
-            handle_version(std::move(rmsg), service);
+            handle_version(std::move(rmsg), peer);
         }
 
         IProtocol* protocol;
