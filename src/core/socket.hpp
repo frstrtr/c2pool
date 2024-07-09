@@ -25,23 +25,21 @@ enum connection_type
 };
 
 // for handle message/error from network
-class Communicator
+class ICommunicator
 {
 public:
     using message_error_type = std::string;
 
-    boost::asio::io_context* m_ctx;
-    std::vector<std::byte> m_prefix;
-
     virtual void error(const message_error_type& err) = 0;
     virtual void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) const = 0;
+    virtual const std::vector<std::byte>& get_prefix() const = 0;
 };
 
 class Socket
 {
     std::unique_ptr<boost::asio::ip::tcp::socket> m_socket;
     connection_type m_conn_type {unknown};
-    Communicator* m_node {nullptr};
+    ICommunicator* m_node {nullptr};
 
     NetService m_addr;
     NetService m_addr_local;
@@ -49,7 +47,7 @@ class Socket
 private:
     void read()
     {
-        auto packet = std::make_shared<Packet>(m_node->m_prefix.size());
+        auto packet = std::make_shared<Packet>(m_node->get_prefix().size());
 		read_prefix(packet);
     }
 
@@ -61,7 +59,7 @@ private:
 	void message_processing(std::shared_ptr<Packet> packet);
 
 public:    
-    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, Communicator* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
+    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, ICommunicator* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
     {
         read(); // start for reading socket data
     }
@@ -73,7 +71,7 @@ public:
 
     void write(std::unique_ptr<RawMessage> msg_data)
     {
-        auto packet = Packet::from_message(m_node->m_prefix, msg_data);
+        auto packet = Packet::from_message(m_node->get_prefix(), msg_data);
         
         boost::asio::async_write(*m_socket, boost::asio::buffer(packet.data(), packet.size()),
             [this, packet](const boost::system::error_code& ec, std::size_t length)
