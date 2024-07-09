@@ -2,6 +2,7 @@ set(pool_source
     factory.hpp factory.cpp
     node.hpp
     peer.hpp
+    protocol.hpp
 )
 
 add_library(pool STATIC ${pool_source})
