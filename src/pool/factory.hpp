@@ -40,7 +40,7 @@ private:
 				}
 
 				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
-				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, m_node);
+				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, dynamic_cast<ICommunicator*>(m_node));
 				// socket->init_addr();
 				// socket_handler(socket);
 				
