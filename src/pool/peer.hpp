@@ -26,7 +26,7 @@ protected:
 
 public:
     template <typename... Args>
-    Peer(std::shared_ptr<Socket> socket, Args...) : m_socket(socket), Data(Args...) {}
+    Peer(std::shared_ptr<Socket> socket, Args... args) : m_socket(socket), Data(args...) {}
 
     PeerConnectionType type() const { return connection_type; }
 };

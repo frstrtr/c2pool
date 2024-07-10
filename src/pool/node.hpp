@@ -34,21 +34,21 @@ class BaseNode : public NodeInterface, private Factory
 public:
     using peer_t = c2pool::pool::Peer<PeerData>;
 
-private:
+protected:
     std::map<NetService, peer_t*> peers;
-
-
 
 public:
     BaseNode() : Factory(nullptr, this) {}
     BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this) {}
 
-    virtual void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer) = 0;
+    const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
+
+    virtual void handle_version(std::unique_ptr<RawMessage> rmsg, peer_t* peer) = 0;
 };
 
 // Legacy -- p2pool; Actual -- c2pool
 template <typename Base, typename Legacy, typename Actual>
-class NodeBridge : public Legacy, public Actual
+class NodeBridge : public virtual Base, public Legacy, public Actual
 {
     static_assert(std::is_base_of_v<Protocol<Base>, Legacy> && std::is_base_of_v<Protocol<Base>, Actual>);
 
@@ -58,7 +58,7 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
-        auto peer = peers[service];
+        auto peer = Base::peers[service];
 
         if (peer->type() == PeerConnectionType::unknown)
         {
@@ -66,7 +66,7 @@ public:
                 //TODO: error, message wanna for be version 
                 {}
 
-            handle_version(std::move(rmsg), peer);
+            Base::handle_version(std::move(rmsg), peer);
         }
 
         IProtocol* protocol;
@@ -75,10 +75,10 @@ public:
         case PeerConnectionType::unknown:
             return;
         case PeerConnectionType::legacy:
-            protocol = static_cast<Legacy>(this);
+            protocol = static_cast<Legacy*>(this);
             break;
         case PeerConnectionType::actual:
-            protocol = static_cast<Actual>(this);
+            protocol = static_cast<Actual*>(this);
             break;
         default:
             // TODO: error

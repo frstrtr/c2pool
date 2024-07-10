@@ -40,9 +40,10 @@ private:
 				}
 
 				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
-				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, dynamic_cast<ICommunicator*>(m_node));
-				// socket->init_addr();
-				// socket_handler(socket);
+				auto communicator = dynamic_cast<ICommunicator*>(m_node);
+				assert(communicator && "INetwork can't be cast to ICommunicator!");
+				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, communicator);
+				m_node->connected(socket);
 				
 				// continue accept connections
 				listen();
