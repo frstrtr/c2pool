@@ -21,12 +21,12 @@ class NodeImpl : public c2pool::pool::BaseNode<PeerImpl>
 {
 public:
     //  Communicator:
-        void error(const message_error_type& err) override {}
+    void error(const message_error_type& err) override {}
     //  INetwork:
-        void connected(std::shared_ptr<c2pool::Socket> socket) override { }
-        void disconnect() override { }
+    void connected(std::shared_ptr<c2pool::Socket> socket) override { }
+    void disconnect() override { }
     // BaseNode:
-        void handle_version(std::unique_ptr<c2pool::RawMessage> rmsg, const peer_t& peer) { }
+    void handle_version(std::unique_ptr<c2pool::RawMessage> rmsg, peer_t* peer) { }
 
     NodeImpl() {}
     NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : c2pool::pool::BaseNode<PeerImpl>(ctx, prefix) {}
@@ -57,6 +57,6 @@ int main(int argc, char *argv[])
 
 
     Node* node = new Node(context, prefix);
-    node->run(5555);
+    // node->run(5555);
     context->run();
 }

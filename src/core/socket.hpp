@@ -31,7 +31,7 @@ public:
     using message_error_type = std::string;
 
     virtual void error(const message_error_type& err) = 0;
-    virtual void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) const = 0;
+    virtual void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) = 0;
     virtual const std::vector<std::byte>& get_prefix() const = 0;
 };
 
