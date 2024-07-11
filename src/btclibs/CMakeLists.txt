@@ -28,6 +28,7 @@ set(sources
         prevector.h
         core_read.cpp
         core_io.h
+        streams.h streams.cpp
         ${crypto_sources}
         )
 

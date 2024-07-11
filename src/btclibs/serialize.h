@@ -434,10 +434,10 @@ public:
 template<typename Formatter, typename T>
 static inline Wrapper<Formatter, T&> Using(T&& t) { return Wrapper<Formatter, T&>(t); }
 
-#define VARINT_MODE(obj, mode) Using<VarIntFormatter<mode>>(obj)
-#define VARINT(obj) Using<VarIntFormatter<VarIntMode::DEFAULT>>(obj)
-#define COMPACTSIZE(obj) Using<CompactSizeFormatter<true>>(obj)
-#define LIMITED_STRING(obj,n) Using<LimitedStringFormatter<n>>(obj)
+#define VARINT_MODE(obj, mode) Using<legacy::VarIntFormatter<mode>>(obj)
+#define VARINT(obj) Using<legacy::VarIntFormatter<legacy::VarIntMode::DEFAULT>>(obj)
+#define COMPACTSIZE(obj) Using<legacy::CompactSizeFormatter<true>>(obj)
+#define LIMITED_STRING(obj,n) Using<legacy::LimitedStringFormatter<n>>(obj)
 
 /** Serialization wrapper class for integers in VarInt format. */
 template<VarIntMode Mode>
