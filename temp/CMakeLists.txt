@@ -40,6 +40,9 @@ add_executable(static_assert_check_templ static_assert_check_templ.cpp)
 add_executable(get_chain_test get_chain_test.cpp)
 target_compile_features(get_chain_test PRIVATE cxx_std_20)
 
+add_executable(parse_bitcoin_index parse_bitcoin_index.cpp)
+target_link_libraries(parse_bitcoin_index btclibs)
+
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
 add_subdirectory(shares)
