@@ -69,6 +69,11 @@ public:
         return m_conn_type;
     }
 
+    const NetService& get_addr() const
+    {
+        return m_addr;
+    }
+
     void write(std::unique_ptr<RawMessage> msg_data)
     {
         auto packet = Packet::from_message(m_node->get_prefix(), msg_data);
