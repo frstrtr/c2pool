@@ -35,13 +35,13 @@ public:
 class C2Pool : public c2pool::pool::Protocol<NodeImpl>
 {
 public:
-    void handle_message() override {}
+    void handle_message(std::unique_ptr<c2pool::RawMessage> rmsg, c2pool::pool::Peer<PeerImpl>* peer) override {}
 };
 
 class P2Pool : public c2pool::pool::Protocol<NodeImpl>
 {
 public:
-    void handle_message() override {}
+    void handle_message(std::unique_ptr<c2pool::RawMessage> rmsg, c2pool::pool::Peer<PeerImpl>* peer) override {}
 };
 
 using Node = c2pool::pool::NodeBridge<NodeImpl, P2Pool, C2Pool>;
@@ -57,6 +57,6 @@ int main(int argc, char *argv[])
 
 
     Node* node = new Node(context, prefix);
-    // node->run(5555);
+    node->run(5555);
     context->run();
 }
