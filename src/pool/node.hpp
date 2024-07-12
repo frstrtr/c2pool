@@ -19,7 +19,7 @@ class NodeInterface : public ICommunicator, public INetwork
 };
 
 template <typename PeerData>
-class BaseNode : public NodeInterface, private Factory
+class BaseNode : public NodeInterface, public Factory
 {
     // For implementation override:
     //  Communicator:
@@ -39,7 +39,7 @@ protected:
 
 public:
     BaseNode() : Factory(nullptr, this) {}
-    BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this) {}
+    BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this), m_prefix(prefix) {}
 
     const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
 
@@ -69,23 +69,21 @@ public:
             Base::handle_version(std::move(rmsg), peer);
         }
 
-        IProtocol* protocol;
         switch (peer->type())
         {
         case PeerConnectionType::unknown:
             return;
         case PeerConnectionType::legacy:
-            protocol = static_cast<Legacy*>(this);
+            static_cast<Legacy*>(this)->handle_message(std::move(rmsg), peer);
             break;
         case PeerConnectionType::actual:
-            protocol = static_cast<Actual*>(this);
+            static_cast<Actual*>(this)->handle_message(std::move(rmsg), peer);
+            // protocol = static_cast<Actual*>(this);
             break;
         default:
             // TODO: error
             return;
         }
-
-        protocol->handle_message(rmsg, peer);
     }
 };
 
