@@ -5,18 +5,32 @@ namespace c2pool
 
 void Socket::read_prefix(std::shared_ptr<Packet> packet)
 {
+    packet->prefix.resize(10);
     boost::asio::async_read(*m_socket, boost::asio::buffer(&packet->prefix[0], packet->prefix.size()),
         [this, packet](const auto& ec, std::size_t len)
         {
+            std::cout << len << std::endl;
             if (ec)
             {
+                std::cout << ec << ec.message() << std::endl;
                 //TODO
             }
 
             // if (c2pool::dev::compare_str(packet->value.prefix, net->PREFIX, length))
-            if (packet->prefix == m_node->get_prefix())
+            // if (packet->prefix == m_node->get_prefix())
+            {
+                std::cout << "[" << packet->prefix.size() << "] ";
+                for (const auto& v : packet->prefix) std::cout << (int) v << " ";
+                std::cout << std::endl;
+
+                const auto& pref = m_node->get_prefix();
+                std::cout << "[" << pref.size() << "] ";
+                for (const auto& v : pref) std::cout << (int) v << " ";
+                std::cout << std::endl;
+
                 read_command(packet);
-            else {}
+            }
+            // else {}
 				// TODO: m_node->error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
         }
     );
