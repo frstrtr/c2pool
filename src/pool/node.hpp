@@ -22,8 +22,6 @@ template <typename PeerData>
 class BaseNode : public NodeInterface, public Factory
 {
     // For implementation override:
-    //  Communicator:
-    //      void error(const message_error_type& err)
     //  INetwork:
     //      void disconnect()
     // BaseNode:
@@ -42,6 +40,32 @@ public:
 
     const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
     void connected(std::shared_ptr<c2pool::Socket> socket) override { peers[socket->get_addr()] = new peer_t(socket); }
+
+    void error(const message_error_type& err, const NetService& service)
+    {
+        std::cout << "Error in node [" << service.to_string() << "]: " << err << std::endl;
+        if (peers.contains(service))
+        {
+            auto peer = peers.extract(service);
+            delete peer.mapped();
+        }
+        else
+        {
+            std::cout << "\tpeers not exist " << service.to_string() << std::endl;
+        }
+    }
+
+    void error(const message_error_type& err, const boost::system::error_code& ec, const NetService& service)
+    {
+        std::string error_message = err;
+        std::cout << "\t" << ec.value() << std::endl;
+        switch (ec.value())
+        {
+            
+        }
+
+        error(error_message, service);
+    }
 
     virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_t* peer) = 0;
 };
@@ -78,7 +102,6 @@ public:
             break;
         case PeerConnectionType::actual:
             static_cast<Actual*>(this)->handle_message(std::move(rmsg), peer);
-            // protocol = static_cast<Actual*>(this);
             break;
         default:
             // TODO: error
