@@ -1,4 +1,5 @@
 #include "socket.hpp"
+#include <source_location>
 #include <btclibs/util/strencodings.h>
 
 namespace c2pool
@@ -9,29 +10,16 @@ void Socket::read_prefix(std::shared_ptr<Packet> packet)
     boost::asio::async_read(*m_socket, boost::asio::buffer(&packet->prefix[0], packet->prefix.size()),
         [this, packet](const auto& ec, std::size_t len)
         {
-            std::cout << len << std::endl;
             if (ec)
             {
-                std::cout << ec << " " << ec.message() << std::endl;
+                m_node->error("Socket::read_prefix error: " + std::string(std::source_location::current().function_name()), get_addr());
                 return;
             }
 
-            // if (c2pool::dev::compare_str(packet->value.prefix, net->PREFIX, length))
             if (packet->prefix == m_node->get_prefix())
-            {
-                std::cout << "[" << packet->prefix.size() << "] ";
-                for (const auto& v : packet->prefix) std::cout << (int) v << " ";
-                std::cout << std::endl;
-
-                const auto& pref = m_node->get_prefix();
-                std::cout << "[" << pref.size() << "] ";
-                for (const auto& v : pref) std::cout << (int) v << " ";
-                std::cout << std::endl;
-
                 read_command(packet);
-            }
-            // else {}
-				// TODO: m_node->error(libp2p::BAD_PEER, "[socket] prefix doesn't match");
+            else
+                m_node->error("prefix doesn't match", m_addr);
         }
     );
 }
@@ -44,10 +32,10 @@ void Socket::read_command(std::shared_ptr<Packet> packet)
         {
             if (ec)
             {
-                std::cout << ec << " " << ec.message() << std::endl;
+                m_node->error("Socket::read_command error: " + ec.what(), get_addr());
                 return;
             }
-            std::cout << "command: " << packet->command << std::endl;
+            // std::cout << "command: " << packet->command << std::endl;
 
             read_length(packet);
         }
@@ -61,10 +49,10 @@ void Socket::read_length(std::shared_ptr<Packet> packet)
         {
             if (ec)
             {
-                std::cout << ec << " " << ec.message() << std::endl;
+                m_node->error("Socket::read_length error: " + ec.what(), get_addr());
                 return;
             }
-            std::cout << "message_length: " << packet->message_length << std::endl;
+            // std::cout << "message_length: " << packet->message_length << std::endl;
             packet->payload.resize(packet->message_length);
             read_checksum(packet);
         }
@@ -78,11 +66,11 @@ void Socket::read_checksum(std::shared_ptr<Packet> packet)
         {
             if (ec)
             {
-                std::cout << ec << " " << ec.message() << std::endl;
+                m_node->error("Socket::read_checksum error: " + ec.what(), get_addr());
                 return;
             }
 
-            std::cout << "checksum: " << packet->checksum << std::endl;
+            // std::cout << "checksum: " << packet->checksum << std::endl;
             read_payload(packet);
         }
     );
@@ -95,7 +83,7 @@ void Socket::read_payload(std::shared_ptr<Packet> packet)
         {
             if (ec)
             {
-                std::cout << ec << " " << ec.message() << std::endl;
+                m_node->error("Socket::read_checksum error: " + ec.what(), get_addr());
                 return;
             }
 
@@ -110,8 +98,8 @@ void Socket::message_processing(std::shared_ptr<Packet> packet)
     // checksum 
     uint256 hash_checksum = Hash(std::span<std::byte>(packet->payload.data(), packet->payload.size()));
     if (hash_checksum.pn[0] != packet->checksum)
-        std::cout << "ERROR CHECKSUM!: " << hash_checksum.pn[7] << "(" << hash_checksum.pn[0] << ") != " << packet->checksum  << std::endl;
-        //TODO: Error Checksum
+        m_node->error("Socket::message_processing missmatch checksum!", get_addr());
+        // std::cout << "ERROR CHECKSUM!: " << hash_checksum.pn[7] << "(" << hash_checksum.pn[0] << ") != " << packet->checksum  << std::endl;
     
     auto msg = packet->to_message();
     m_node->handle(std::move(msg), m_addr);

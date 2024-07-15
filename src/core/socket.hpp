@@ -25,12 +25,12 @@ enum connection_type
 };
 
 // for handle message/error from network
-class ICommunicator
+struct ICommunicator
 {
-public:
     using message_error_type = std::string;
 
-    virtual void error(const message_error_type& err) = 0;
+    virtual void error(const message_error_type& err, const NetService& service) = 0;
+    virtual void error(const message_error_type& err, const boost::system::error_code& ec, const NetService& service) = 0;
     virtual void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) = 0;
     virtual const std::vector<std::byte>& get_prefix() const = 0;
 };
@@ -61,7 +61,12 @@ private:
 public:    
     Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, ICommunicator* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
     {
-        read(); // start for reading socket data
+        // init addrs
+        m_addr_local = NetService(m_socket->local_endpoint());
+        m_addr = NetService(m_socket->remote_endpoint());
+
+        // start for reading socket data
+        read();
     }
 
     connection_type type()
@@ -83,7 +88,7 @@ public:
             {
                 if (ec)
                 {
-                    //TODO: error
+                    m_node->error("Socket::write error: " + ec.message(), get_addr());
                 }
 
                 // message received
