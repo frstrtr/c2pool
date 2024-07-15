@@ -108,29 +108,8 @@ void Socket::read_payload(std::shared_ptr<Packet> packet)
 void Socket::message_processing(std::shared_ptr<Packet> packet)
 {
     // checksum 
-    //TODO: check
-    std::cout << packet->payload.size() << "\n";
-    for (const auto& v : packet->payload)
-        std::cout << (int) v << " ";
-    std::cout << std::endl;
-            uint256 result;
-
-        std::vector<unsigned char> out1;
-        out1.resize(CSHA256::OUTPUT_SIZE);
-
-        std::vector<unsigned char> out2;
-        out2.resize(CSHA256::OUTPUT_SIZE);
-
-        CSHA256().Write((unsigned char *)packet->payload.data(), packet->payload.size()).Finalize(&out1[0]);
-        std::cout << "out1 " << HexStr(out1) << std::endl;
-        CSHA256().Write((unsigned char *)&out1[0], out1.size()).Finalize(&out2[0]);
-        std::reverse(out2.begin(), out2.end());
-        result.SetHex(HexStr(out2));
-    std::cout << "legacy: " << result.pn[7] << "(" << result.pn[0] << ") != " << packet->checksum  << std::endl;
-    std::cout << "legacy hex: " << HexStr(out2) << std::endl;
-
     uint256 hash_checksum = Hash(std::span<std::byte>(packet->payload.data(), packet->payload.size()));
-    if (hash_checksum.pn[7] != packet->checksum)
+    if (hash_checksum.pn[0] != packet->checksum)
         std::cout << "ERROR CHECKSUM!: " << hash_checksum.pn[7] << "(" << hash_checksum.pn[0] << ") != " << packet->checksum  << std::endl;
         //TODO: Error Checksum
     
