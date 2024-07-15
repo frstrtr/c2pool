@@ -25,7 +25,6 @@ class BaseNode : public NodeInterface, public Factory
     //  Communicator:
     //      void error(const message_error_type& err)
     //  INetwork:
-    //      void connected(std::shared_ptr<Socket> socket)
     //      void disconnect()
     // BaseNode:
     //      void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer)
@@ -42,8 +41,9 @@ public:
     BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this), m_prefix(prefix) {}
 
     const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
+    void connected(std::shared_ptr<c2pool::Socket> socket) override { peers[socket->get_addr()] = new peer_t(socket); }
 
-    virtual void handle_version(std::unique_ptr<RawMessage> rmsg, peer_t* peer) = 0;
+    virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_t* peer) = 0;
 };
 
 // Legacy -- p2pool; Actual -- c2pool
@@ -66,13 +66,13 @@ public:
                 //TODO: error, message wanna for be version 
                 {}
 
-            Base::handle_version(std::move(rmsg), peer);
+            auto peer_type = Base::handle_version(std::move(rmsg), peer);
+            peer->set_type(peer_type);
+            return;
         }
 
         switch (peer->type())
         {
-        case PeerConnectionType::unknown:
-            return;
         case PeerConnectionType::legacy:
             static_cast<Legacy*>(this)->handle_message(std::move(rmsg), peer);
             break;
