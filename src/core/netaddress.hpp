@@ -102,8 +102,27 @@ public:
     NetService(const boost::asio::ip::tcp::endpoint& ep) : NetAddress(ep.address()), m_port(ep.port()) { }
 
     uint16_t port() const { return m_port; }
+    std::string to_string() const { return m_ip + ":" + std::to_string(m_port); }
 
     SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<16, true>>(obj.m_port)); }
+
+    friend bool operator==(const NetService& l, const NetService& r)
+    { return (l.m_type == r.m_type) && (l.m_ip == r.m_ip) && (l.m_port == r.m_port); }
+
+    friend bool operator!=(const NetService& l, const NetService& r)
+    { return !(l == r); }
+
+    friend bool operator<(const NetService& l, const NetService& r)
+    { return std::tie(l.m_ip, l.m_port) < std::tie(r.m_ip, r.m_port); }
+
+    friend bool operator>(const NetService& l, const NetService& r)
+    { return r < l; }
+
+    friend bool operator<=(const NetService& l, const NetService& r)
+    { return !(r < l); }
+
+    friend bool operator>=(const NetService& l, const NetService& r)
+    { return !(l < r); }
 };
 
 // template <IsInteger int_type>
