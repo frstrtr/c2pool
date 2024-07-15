@@ -32,6 +32,7 @@ private:
 			{
 				if (ec)
 				{
+					std::cout << "listen error: " << ec << " " << ec.message() << std::endl;
 					// if (ec != boost::system::errc::operation_canceled)
 					// 	error(libp2p::ASIO_ERROR, "PoolListener::async_loop: " + ec.message(), NetAddress{socket_.remote_endpoint()});
 					// else
