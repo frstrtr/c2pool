@@ -20,8 +20,6 @@ class PeerImpl
 class NodeImpl : public c2pool::pool::BaseNode<PeerImpl>
 {
 public:
-    //  Communicator:
-    void error(const message_error_type& err) override {}
     //  INetwork:
     // void connected(std::shared_ptr<c2pool::Socket> socket) override { }
     void disconnect() override { }
@@ -53,8 +51,11 @@ using Node = c2pool::pool::NodeBridge<NodeImpl, P2Pool, C2Pool>;
 
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
     setlocale(LC_ALL, "Russian");
     SetConsoleOutputCP(866);
+#endif
+
     boost::asio::io_context* context = new boost::asio::io_context();
     std::vector<std::byte> prefix = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
 
