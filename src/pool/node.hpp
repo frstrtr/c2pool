@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <source_location>
 
 #include <pool/factory.hpp>
 #include <pool/peer.hpp>
@@ -13,6 +14,8 @@ namespace c2pool
 
 namespace pool
 {
+
+std::string parse_net_error(const boost::system::error_code& ec);
 
 class NodeInterface : public ICommunicator, public INetwork
 {
@@ -30,44 +33,45 @@ class BaseNode : public NodeInterface, public Factory
 
 public:
     using peer_t = c2pool::pool::Peer<PeerData>;
+    using peer_ptr = std::shared_ptr<peer_t>;
 
 protected:
-    std::map<NetService, peer_t*> peers;
+    std::map<NetService, peer_ptr> peers;
 
 public:
     BaseNode() : Factory(nullptr, this) {}
     BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this), m_prefix(prefix) {}
 
     const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
-    void connected(std::shared_ptr<c2pool::Socket> socket) override { peers[socket->get_addr()] = new peer_t(socket); }
+    void connected(std::shared_ptr<c2pool::Socket> socket) override 
+    { 
+        peers[socket->get_addr()] = std::make_shared<peer_t>(socket);
+        LOG_INFO << socket->get_addr().to_string() << " try to connect!";
+    }
 
-    void error(const message_error_type& err, const NetService& service)
+    void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        std::cout << "Error in node [" << service.to_string() << "]: " << err << std::endl;
+        LOG_ERROR << "PoolNode <NetName>[" << service.to_string() << "]:";
+        LOG_ERROR << "\terror: " << err;
+        LOG_ERROR << "\twhere: " << where.function_name();
         if (peers.contains(service))
         {
             auto peer = peers.extract(service);
-            delete peer.mapped();
+            peer.mapped()->cancel();
+            peer.mapped()->close();
         }
         else
         {
-            std::cout << "\tpeers not exist " << service.to_string() << std::endl;
+            LOG_ERROR << "\tpeers not exist " << service.to_string();
         }
     }
 
-    void error(const message_error_type& err, const boost::system::error_code& ec, const NetService& service)
+    void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        std::string error_message = err;
-        std::cout << "\t" << ec.value() << std::endl;
-        switch (ec.value())
-        {
-            
-        }
-
-        error(error_message, service);
+        error(parse_net_error(ec), service, where);
     }
 
-    virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_t* peer) = 0;
+    virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
 };
 
 // Legacy -- p2pool; Actual -- c2pool
@@ -86,9 +90,9 @@ public:
 
         if (peer->type() == PeerConnectionType::unknown)
         {
-            if (rmsg->m_command != "version")
-                //TODO: error, message wanna for be version 
-                {}
+            std::cout << "[" << rmsg->m_command << "] != \"version\"?: " << (rmsg->m_command.compare(0, 7, "version") != 0) << std::endl;
+            if (rmsg->m_command.compare(0, 7, "version") != 0)
+                return Base::error("message wanna for be version", service);
 
             auto peer_type = Base::handle_version(std::move(rmsg), peer);
             peer->set_type(peer_type);

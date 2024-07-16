@@ -1,6 +1,7 @@
 #pragma once
 #include <boost/asio.hpp>
 
+#include <core/log.hpp>
 #include <core/socket.hpp>
 #include <core/node_interface.hpp>
 
@@ -32,7 +33,8 @@ private:
 			{
 				if (ec)
 				{
-					std::cout << "listen error: " << ec << " " << ec.message() << std::endl;
+					LOG_ERROR << "listen error: " << ec.what();
+					return;
 					// if (ec != boost::system::errc::operation_canceled)
 					// 	error(libp2p::ASIO_ERROR, "PoolListener::async_loop: " + ec.message(), NetAddress{socket_.remote_endpoint()});
 					// else
@@ -43,7 +45,10 @@ private:
 				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
 				auto communicator = dynamic_cast<ICommunicator*>(m_node);
 				assert(communicator && "INetwork can't be cast to ICommunicator!");
+				
 				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, communicator);
+				socket->init();
+				
 				m_node->connected(socket);
 				
 				// continue accept connections
