@@ -1,25 +1,45 @@
 #include "socket.hpp"
-#include <source_location>
 #include <btclibs/util/strencodings.h>
 
 namespace c2pool
 {
 
+#define ASYNC_READ(buffer, handler)\
+    if (!m_status) return;\
+    boost::asio::async_read(*m_socket, buffer, [this, packet](const auto& ec, std::size_t len) handler)
+
 void Socket::read_prefix(std::shared_ptr<Packet> packet)
 {
-    boost::asio::async_read(*m_socket, boost::asio::buffer(&packet->prefix[0], packet->prefix.size()),
-        [this, packet](const auto& ec, std::size_t len)
+    // if (!m_status) return;
+    // // auto ptr = shared_from_this();
+    // boost::asio::async_read(*m_socket, boost::asio::buffer(&packet->prefix[0], packet->prefix.size()),
+    //     [this/*, ptr = ptr*/, packet](const auto& ec, std::size_t len)
+    //     {
+    //         if (ec)
+    //         {
+    //             m_node->error(ec, get_addr());
+    //             return;
+    //         }
+
+    //         if (packet->prefix == m_node->get_prefix())
+    //             read_command(packet);
+    //         else
+    //             m_node->error("prefix doesn't match", get_addr());
+    //     }
+    // );
+
+    ASYNC_READ(boost::asio::buffer(&packet->prefix[0], packet->prefix.size()),
         {
             if (ec)
             {
-                m_node->error("Socket::read_prefix error: " + std::string(std::source_location::current().function_name()), get_addr());
+                m_node->error(ec, get_addr());
                 return;
             }
 
             if (packet->prefix == m_node->get_prefix())
                 read_command(packet);
             else
-                m_node->error("prefix doesn't match", m_addr);
+                m_node->error("prefix doesn't match", get_addr());
         }
     );
 }
@@ -27,12 +47,11 @@ void Socket::read_prefix(std::shared_ptr<Packet> packet)
 void Socket::read_command(std::shared_ptr<Packet> packet)
 {
     packet->command.resize(12);
-    boost::asio::async_read(*m_socket, boost::asio::buffer(packet->command.data(), 12),
-        [this, packet](const auto& ec, std::size_t len)
+    ASYNC_READ(boost::asio::buffer(packet->command.data(), 12),
         {
             if (ec)
             {
-                m_node->error("Socket::read_command error: " + ec.what(), get_addr());
+                m_node->error(ec, get_addr());
                 return;
             }
             // std::cout << "command: " << packet->command << std::endl;
@@ -44,12 +63,11 @@ void Socket::read_command(std::shared_ptr<Packet> packet)
 
 void Socket::read_length(std::shared_ptr<Packet> packet)
 {
-    boost::asio::async_read(*m_socket, boost::asio::buffer(&packet->message_length, sizeof(packet->message_length)),
-        [this, packet](const auto& ec, std::size_t len)
+    ASYNC_READ(boost::asio::buffer(&packet->message_length, sizeof(packet->message_length)),
         {
             if (ec)
             {
-                m_node->error("Socket::read_length error: " + ec.what(), get_addr());
+                m_node->error(ec, get_addr());
                 return;
             }
             // std::cout << "message_length: " << packet->message_length << std::endl;
@@ -61,12 +79,11 @@ void Socket::read_length(std::shared_ptr<Packet> packet)
 
 void Socket::read_checksum(std::shared_ptr<Packet> packet)
 {
-    boost::asio::async_read(*m_socket, boost::asio::buffer(&packet->checksum, sizeof(packet->checksum)),
-        [this, packet](const auto& ec, std::size_t len)
+    ASYNC_READ(boost::asio::buffer(&packet->checksum, sizeof(packet->checksum)),
         {
             if (ec)
             {
-                m_node->error("Socket::read_checksum error: " + ec.what(), get_addr());
+                m_node->error(ec, get_addr());
                 return;
             }
 
@@ -78,12 +95,11 @@ void Socket::read_checksum(std::shared_ptr<Packet> packet)
 
 void Socket::read_payload(std::shared_ptr<Packet> packet)
 {
-    boost::asio::async_read(*m_socket, boost::asio::buffer(packet->payload.data(), packet->message_length),
-        [this, packet](const auto& ec, std::size_t len)
+    ASYNC_READ(boost::asio::buffer(packet->payload.data(), packet->message_length),
         {
             if (ec)
             {
-                m_node->error("Socket::read_checksum error: " + ec.what(), get_addr());
+                m_node->error(ec, get_addr());
                 return;
             }
 
@@ -92,6 +108,8 @@ void Socket::read_payload(std::shared_ptr<Packet> packet)
         }
     );
 }
+
+#undef ASYNC_READ
 
 void Socket::message_processing(std::shared_ptr<Packet> packet)
 {

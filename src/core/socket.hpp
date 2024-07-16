@@ -3,6 +3,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <source_location>
 
 #include <boost/asio.hpp>
 
@@ -29,17 +30,18 @@ struct ICommunicator
 {
     using message_error_type = std::string;
 
-    virtual void error(const message_error_type& err, const NetService& service) = 0;
-    virtual void error(const message_error_type& err, const boost::system::error_code& ec, const NetService& service) = 0;
+    virtual void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+    virtual void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
     virtual void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) = 0;
     virtual const std::vector<std::byte>& get_prefix() const = 0;
 };
 
-class Socket
+class Socket : public std::enable_shared_from_this<Socket>
 {
     std::unique_ptr<boost::asio::ip::tcp::socket> m_socket;
     connection_type m_conn_type {unknown};
     ICommunicator* m_node {nullptr};
+    bool m_status; // connected/disconnected
 
     NetService m_addr;
     NetService m_addr_local;
@@ -59,7 +61,11 @@ private:
 	void message_processing(std::shared_ptr<Packet> packet);
 
 public:    
-    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, ICommunicator* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node)
+    Socket(std::unique_ptr<boost::asio::ip::tcp::socket> socket, connection_type conn_type, ICommunicator* node) : m_socket(std::move(socket)), m_conn_type(conn_type), m_node(node), m_status(true)
+    {
+    }
+
+    void init()
     {
         // init addrs
         m_addr_local = NetService(m_socket->local_endpoint());
@@ -78,6 +84,25 @@ public:
     {
         return m_addr;
     }
+
+    bool status() const
+    {
+        return m_status;
+    }
+
+    // todo:
+    void cancel()
+    {
+        m_status = false;
+        m_socket->cancel();
+    }
+
+    void close()
+    {
+        m_status = false;
+        m_socket->close();
+    }
+    //=====================
 
     void write(std::unique_ptr<RawMessage> msg_data)
     {
