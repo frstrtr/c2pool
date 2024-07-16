@@ -24,7 +24,7 @@ public:
     // void connected(std::shared_ptr<c2pool::Socket> socket) override { }
     void disconnect() override { }
     // BaseNode:
-    c2pool::pool::PeerConnectionType handle_version(std::unique_ptr<c2pool::RawMessage> rmsg, peer_t* peer) 
+    c2pool::pool::PeerConnectionType handle_version(std::unique_ptr<c2pool::RawMessage> rmsg, peer_ptr peer) 
     { 
         std::cout << "version msg" << std::endl;
         return c2pool::pool::PeerConnectionType::legacy; 
@@ -37,13 +37,13 @@ public:
 class C2Pool : public c2pool::pool::Protocol<NodeImpl>
 {
 public:
-    void handle_message(std::unique_ptr<c2pool::RawMessage> rmsg, c2pool::pool::Peer<PeerImpl>* peer) override { std::cout << "c2pool msg " << rmsg->m_command << std::endl;}
+    void handle_message(std::unique_ptr<c2pool::RawMessage> rmsg, NodeImpl::peer_ptr peer) override { std::cout << "c2pool msg " << rmsg->m_command << std::endl;}
 };
 
 class P2Pool : public c2pool::pool::Protocol<NodeImpl>
 {
 public:
-    void handle_message(std::unique_ptr<c2pool::RawMessage> rmsg, c2pool::pool::Peer<PeerImpl>* peer) override { std::cout << "p2pool msg " << rmsg->m_command << std::endl; }
+    void handle_message(std::unique_ptr<c2pool::RawMessage> rmsg, NodeImpl::peer_ptr peer) override { std::cout << "p2pool msg " << rmsg->m_command << std::endl; }
 };
 
 using Node = c2pool::pool::NodeBridge<NodeImpl, P2Pool, C2Pool>;
@@ -59,7 +59,7 @@ int main(int argc, char *argv[])
     boost::asio::io_context* context = new boost::asio::io_context();
     std::vector<std::byte> prefix = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
 
-    // c2pool::log::Logger::init();
+    c2pool::log::Logger::init();
     // auto settings = c2pool::Fileconfig::load_file<c2pool::Settings>();
 
 
