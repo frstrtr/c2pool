@@ -32,6 +32,16 @@ public:
 
     PeerConnectionType type() const { return connection_type; }
     void set_type(PeerConnectionType _type) { connection_type = _type; }
+
+    void cancel()
+    {
+        m_socket->cancel();
+    }
+
+    void close()
+    {
+        m_socket->close();
+    }
 };
 
 } // namespace pool
