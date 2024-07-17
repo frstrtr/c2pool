@@ -22,14 +22,14 @@ namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
 
-namespace c2pool
+namespace core
 {
 namespace log
 {
 
 uint32_t Logger::m_categories = 0;
 
-const std::map<std::string, c2pool::log::flags> categories =
+const std::map<std::string, core::log::flags> categories =
 {
         {"0", NONE},
         {"none", NONE},
@@ -86,7 +86,7 @@ void Logger::init()
         boost::log::keywords::rotation_size = 10 * 1024 * 1024,
         boost::log::keywords::min_free_space = 30 * 1024 * 1024,
         boost::log::keywords::open_mode = std::ios_base::app,
-        keywords::target = c2pool::filesystem::config_path() / "logs"
+        keywords::target = core::filesystem::config_path() / "logs"
     );
     fsSink->set_formatter(logFmt);
     fsSink->locked_backend()->auto_flush(true);
@@ -120,7 +120,6 @@ void Logger::disable_trace()
             logging::trivial::severity >= logging::trivial::debug);
 }
 
-
 } // namespace logger
 
-} // namespace c2pool
+} // namespace core

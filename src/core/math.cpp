@@ -2,7 +2,7 @@
 
 #include <btclibs/util/strencodings.h>
 
-namespace c2pool
+namespace core
 {
 
 namespace math
@@ -24,4 +24,4 @@ namespace math
 
 } // namespace math
 
-} // namespace c2pool
+} // namespace core

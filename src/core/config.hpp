@@ -10,10 +10,10 @@
 #include <core/configs/pool.hpp>
 #include <core/configs/coin.hpp>
 
-namespace c2pool
+namespace core
 {
 
-class Config : public c2pool::pool::Config, public c2pool::coin::Config
+class Config : public pool::Config, public coin::Config
 {
 public:
     std::string m_name;
@@ -23,7 +23,7 @@ public:
 
     }
 
-    static c2pool::Config* load(const std::string& coin_name);
+    static core::Config* load(const std::string& coin_name);
 };
 
-} // namespace c2pool
+} // namespace core

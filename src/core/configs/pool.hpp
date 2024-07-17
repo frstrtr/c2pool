@@ -4,16 +4,13 @@
 
 #include <core/fileconfig.hpp>
 
-namespace c2pool
-{
-
-class Config;
+namespace core {class Config;}
 
 namespace pool
 {
-    class Config : protected c2pool::Fileconfig
+    class Config : protected core::Fileconfig
     {
-        friend class c2pool::Config;
+        friend class core::Config;
         static constexpr const char* default_filename = "pool.yaml";
 
     protected:
@@ -22,7 +19,7 @@ namespace pool
 
     public:
         Config(const std::string& coin_name) 
-            : c2pool::Fileconfig(c2pool::filesystem::config_path() / coin_name / default_filename)
+            : core::Fileconfig(core::filesystem::config_path() / coin_name / default_filename)
         {
 
         }
@@ -53,5 +50,3 @@ namespace pool
 
     };
 } // namespace pool
-
-}

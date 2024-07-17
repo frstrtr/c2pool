@@ -1,11 +1,11 @@
 #include "config.hpp"
 
-namespace c2pool
+namespace core
 {
 
 Config* Config::load(const std::string& coin_name)
 {
-    Config* config = new c2pool::Config(coin_name);
+    Config* config = new core::Config(coin_name);
     // pool
     pool::Config* pool = config;
     pool->init();
@@ -17,4 +17,4 @@ Config* Config::load(const std::string& coin_name)
     return config;
 }
 
-}
+} // namespace core

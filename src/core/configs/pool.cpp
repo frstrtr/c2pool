@@ -3,9 +3,6 @@
 #include <core/filesystem.hpp>
 #include <yaml-cpp/yaml.h>
 
-namespace c2pool
-{
-
 namespace pool
 {
 
@@ -29,5 +26,3 @@ void Config::load()
 }
 
 } // namespace pool
-
-} // namespace c2pool

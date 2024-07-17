@@ -12,7 +12,7 @@ namespace YAML
     class Node;
 }
 
-namespace c2pool
+namespace core
 {
 
 class Settings : public Fileconfig
@@ -28,12 +28,12 @@ protected:
 
 public:
     Settings() 
-        : c2pool::Fileconfig(c2pool::filesystem::config_path() / default_filename)
+        : core::Fileconfig(core::filesystem::config_path() / default_filename)
     {
 
     }
 
-    std::map<std::string, c2pool::Config*> m_configs;
+    std::map<std::string, core::Config*> m_configs;
     
     bool m_testnet;
     std::vector<std::string> m_networks;

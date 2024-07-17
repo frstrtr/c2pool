@@ -3,7 +3,7 @@
 #include <string>
 #include <filesystem>
 
-namespace c2pool
+namespace core
 {
 
 namespace filesystem
@@ -27,4 +27,4 @@ inline std::filesystem::path current_path()
 
 } // namespace filesystem
 
-} // namespace c2pool
+} // namespace core

@@ -4,7 +4,7 @@
 
 #include <yaml-cpp/yaml.h>
 
-namespace c2pool
+namespace core
 {
 
 std::string Settings::get_default()
@@ -38,7 +38,7 @@ void Settings::load()
 void Settings::parse_network_config(std::string name, YAML::Node& node)
 {
     auto net_node = node[name];
-    m_configs[name] = c2pool::Config::load(name);
+    m_configs[name] = core::Config::load(name);
 }
 
-} // namespace c2pool
+} // namespace core

@@ -6,7 +6,7 @@
 #include <iomanip>
 #include <functional>
 
-namespace c2pool
+namespace core
 {
 
 inline std::function<int()> count_generator();
@@ -36,4 +36,4 @@ struct debug_timestamp
     }
 };
 
-}
+} // namespace core
