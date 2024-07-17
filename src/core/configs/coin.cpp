@@ -2,9 +2,6 @@
 
 #include <yaml-cpp/yaml.h>
 
-namespace c2pool
-{
-
 namespace coin
 {
 
@@ -28,5 +25,3 @@ void Config::load()
 }
 
 } // namespace coin
-
-} // namespace c2pool

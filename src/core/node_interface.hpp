@@ -6,7 +6,7 @@
 #include <core/message.hpp>
 #include <core/pack.hpp>
 
-namespace c2pool
+namespace core
 {
 // template <typename PROTOCOL_TYPE>
 // class MessageHandler : public IMessageHandler
@@ -44,7 +44,7 @@ namespace c2pool
 //     }
 // };
 
-} // namespace c2pool
+} // namespace core
 
 // #define BEGIN_INIT_MESSAGE_HANDLER()                                                                    \
 //     static std::map<std::string, callback_type> &getFunctionMapStatic()                                 \

@@ -6,7 +6,7 @@
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
 
-namespace c2pool
+namespace core
 {
 
 #define PARSE_CONFIG(node, field, type) \
@@ -58,4 +58,4 @@ public:
     }
 };
     
-} // namespace c2pool
+} // namespace core

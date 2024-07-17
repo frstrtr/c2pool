@@ -1,7 +1,7 @@
 #include "socket.hpp"
 #include <btclibs/util/strencodings.h>
 
-namespace c2pool
+namespace core
 {
 
 #define ASYNC_READ(buffer, handler)\
@@ -124,4 +124,4 @@ void Socket::message_processing(std::shared_ptr<Packet> packet)
 }
 
 
-} // namespace c2pool
+} // namespace core

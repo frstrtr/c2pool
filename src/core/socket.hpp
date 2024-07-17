@@ -15,7 +15,7 @@
 #include <core/netaddress.hpp>
 #include <core/packet.hpp>
 
-namespace c2pool
+namespace core
 {
 
 enum connection_type
@@ -122,4 +122,4 @@ public:
     }
 };
 
-} // namespace c2pool
+} // namespace core

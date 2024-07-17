@@ -28,7 +28,7 @@
 //      - format_binomial_conf
 //      - weighted_choice
 
-namespace c2pool
+namespace core
 {
 
 namespace math
@@ -176,4 +176,4 @@ namespace math
 
 } // namespace math
 
-} // namespace c2pool
+} // namespace core

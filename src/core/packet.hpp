@@ -1,6 +1,6 @@
 #pragma once
 
-namespace c2pool
+namespace core
 {
 
 /* Message header:
@@ -53,4 +53,4 @@ public:
     }
 };
 
-} // namespace c2pool
+} // namespace core

@@ -1,6 +1,6 @@
 #include "common.hpp"
 
-namespace c2pool
+namespace core
 {
 
 std::function<int()> count_generator()
@@ -12,4 +12,4 @@ std::function<int()> count_generator()
     };
 }
 
-}
+} // namespace core

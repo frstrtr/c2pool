@@ -10,7 +10,7 @@
 #include <boost/log/trivial.hpp>
 #include <boost/log/attributes/named_scope.hpp>
 
-namespace c2pool
+namespace core
 {
 
 namespace log
@@ -44,7 +44,7 @@ public:
     static void enable_trace();
     static void disable_trace();
 
-    static inline bool check_category(c2pool::log::flags&& flag)
+    static inline bool check_category(core::log::flags&& flag)
     {
         return (m_categories & flag) != 0;
     }
@@ -58,7 +58,7 @@ public:
 
 // For Debug
 #define LOG_DEBUG(ctg) \
-    if (c2pool::log::Logger::check_category(c2pool::log::flags::ctg))                   \
+    if (core::log::Logger::check_category(core::log::flags::ctg))                   \
         BOOST_LOG_TRIVIAL(debug).stream() << "(" << #ctg << ") "
 
 #define LOG_DEBUG_POOL LOG_DEBUG(POOL)
@@ -72,7 +72,7 @@ public:
 
 } //namespace logger
 
-} //namespace c2pool
+} //namespace core
 
 template<typename T>
 std::ostream &operator<<(std::ostream &stream, const std::optional<T> &data)
