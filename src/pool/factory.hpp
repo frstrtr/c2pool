@@ -5,15 +5,12 @@
 #include <core/socket.hpp>
 #include <core/node_interface.hpp>
 
-namespace c2pool
-{
-
 namespace pool
 {
     
 struct INetwork
 {
-    virtual void connected(std::shared_ptr<Socket> socket) = 0;
+    virtual void connected(std::shared_ptr<core::Socket> socket) = 0;
     virtual void disconnect() = 0;
 };
 
@@ -43,10 +40,10 @@ private:
 				}
 
 				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
-				auto communicator = dynamic_cast<ICommunicator*>(m_node);
+				auto communicator = dynamic_cast<core::ICommunicator*>(m_node);
 				assert(communicator && "INetwork can't be cast to ICommunicator!");
 				
-				auto socket = std::make_shared<c2pool::Socket>(std::move(tcp_socket), connection_type::incoming, communicator);
+				auto socket = std::make_shared<core::Socket>(std::move(tcp_socket), core::connection_type::incoming, communicator);
 				socket->init();
 				
 				m_node->connected(socket);
@@ -78,5 +75,3 @@ public:
 };
 
 } // namespace pool
-
-} // namespace c2pool

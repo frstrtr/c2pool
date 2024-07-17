@@ -9,15 +9,12 @@
 #include <core/socket.hpp>
 #include <core/message.hpp>
 
-namespace c2pool
-{
-
 namespace pool
 {
 
 std::string parse_net_error(const boost::system::error_code& ec);
 
-class NodeInterface : public ICommunicator, public INetwork
+class NodeInterface : public core::ICommunicator, public INetwork
 {
 };
 
@@ -32,7 +29,7 @@ class BaseNode : public NodeInterface, public Factory
     std::vector<std::byte> m_prefix;
 
 public:
-    using peer_t = c2pool::pool::Peer<PeerData>;
+    using peer_t = pool::Peer<PeerData>;
     using peer_ptr = std::shared_ptr<peer_t>;
 
 protected:
@@ -43,7 +40,7 @@ public:
     BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this), m_prefix(prefix) {}
 
     const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
-    void connected(std::shared_ptr<c2pool::Socket> socket) override 
+    void connected(std::shared_ptr<core::Socket> socket) override 
     { 
         peers[socket->get_addr()] = std::make_shared<peer_t>(socket);
         LOG_INFO << socket->get_addr().to_string() << " try to connect!";
@@ -115,8 +112,5 @@ public:
 };
 
 // #define ADD_HANDLER(name, msg_type)\
-    
 
 } // namespace pool
-
-} // namespace c2pool

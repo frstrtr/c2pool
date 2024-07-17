@@ -1,8 +1,5 @@
 #include "node.hpp"
 
-namespace c2pool
-{
-
 namespace pool
 {
 
@@ -18,5 +15,3 @@ std::string parse_net_error(const boost::system::error_code& ec)
 }
 
 } // namespace pool
-
-} // namespace c2pool
