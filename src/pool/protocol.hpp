@@ -4,9 +4,6 @@
 #include <pool/peer.hpp>
 #include <core/message.hpp>
 
-namespace c2pool
-{
-
 namespace pool
 {
     
@@ -24,5 +21,3 @@ class Protocol : public virtual NodeType
 };
 
 } // namespace pool
-
-} // namespace c2pool

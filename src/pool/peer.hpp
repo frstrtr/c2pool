@@ -2,11 +2,6 @@
 
 #include <memory>
 #include <core/socket.hpp>
-
-
-namespace c2pool
-{
-    
 namespace pool
 {
 
@@ -22,13 +17,13 @@ class Peer : public Data
 {
 protected:
     PeerConnectionType connection_type {PeerConnectionType::unknown};
-    std::shared_ptr<Socket> m_socket;
+    std::shared_ptr<core::Socket> m_socket;
 
 public:
     // template <typename... Args>
     // Peer(std::shared_ptr<Socket> socket, Args... args) : m_socket(socket), Data(args...) {}
 
-    Peer(std::shared_ptr<Socket> socket) : m_socket(socket) {}
+    Peer(std::shared_ptr<core::Socket> socket) : m_socket(socket) {}
 
     PeerConnectionType type() const { return connection_type; }
     void set_type(PeerConnectionType _type) { connection_type = _type; }
@@ -45,5 +40,3 @@ public:
 };
 
 } // namespace pool
-
-} // namespace c2pool
