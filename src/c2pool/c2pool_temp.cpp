@@ -60,5 +60,5 @@ int main(int argc, char *argv[])
     //
     auto p = ltc::TX_NO_WITNESS;
 
-    c2pool::pool::Node* node;
+    pool::Node* node;
 }
