@@ -68,15 +68,15 @@ int main(int argc, char *argv[])
     context->run();
 }
 
-struct TestSocket
-{
-    std::unique_ptr<boost::asio::ip::tcp::socket> m_socket;
+// struct TestSocket
+// {
+//     std::unique_ptr<boost::asio::ip::tcp::socket> m_socket;
 
-    TestSocket(std::unique_ptr<boost::asio::ip::tcp::socket> socket) : m_socket(std::move(socket))
-    {
+//     TestSocket(std::unique_ptr<boost::asio::ip::tcp::socket> socket) : m_socket(std::move(socket))
+//     {
 
-    }
-};
+//     }
+// };
 
 // void listen(std::shared_ptr<TestSocket> m_socket, std::vector<std::byte>& prefix)
 // {
