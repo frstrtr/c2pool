@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <core/macro.hpp>
+#include <core/message.hpp>
 
 // fields
 #define _MESSAGE_DATA_FIELD(pack_type, field_name) pack_type field_name;
@@ -16,11 +17,11 @@
 
 
 #define BEGIN_MESSAGE(cmd)\
-    class message_##cmd : public c2pool::Message {\
+    class message_##cmd : public Message {\
     private:\
         using message_type = message_##cmd;\
     public:\
-        message_##cmd() : c2pool::Message(#cmd) {}\
+        message_##cmd() : Message(#cmd) {}\
         \
         // WRITE
 

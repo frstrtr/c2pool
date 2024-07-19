@@ -5,10 +5,10 @@
 #include <sharechain/sharechain.hpp>
 
 template <int64_t Version>
-struct BaseFakeShare : c2pool::chain::BaseShare<int, Version>
+struct BaseFakeShare : chain::BaseShare<int, Version>
 {
     BaseFakeShare() { }
-    BaseFakeShare(int hash, int prev_hash) : c2pool::chain::BaseShare<int, Version>(hash, prev_hash) { }
+    BaseFakeShare(int hash, int prev_hash) : chain::BaseShare<int, Version>(hash, prev_hash) { }
     
     SERIALIZE_METHODS(BaseFakeShare<Version>) { READWRITE(obj.m_hash, obj.m_prev_hash); }
 };
@@ -33,12 +33,12 @@ struct FakeShareB : BaseFakeShare<20>
     SERIALIZE_METHODS(FakeShareB) { READWRITE(AsBase<BaseFakeShare<20>>(obj)/*, obj.m_data2*/); }
 };
 
-using ShareType = c2pool::chain::ShareVariants<FakeShareA, FakeShareB>;
+using ShareType = chain::ShareVariants<FakeShareA, FakeShareB>;
 
-class FakeIndex : public c2pool::chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>
+class FakeIndex : public chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>
 {
 private:
-    using base_index = c2pool::chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>;
+    using base_index = chain::ShareIndex<int, ShareType, std::hash<int>, FakeIndex>;
 public:
 
     int data1{0};
@@ -67,7 +67,7 @@ protected:
     }
 };
 
-struct FakeChain : c2pool::chain::ShareChain<FakeIndex>
+struct FakeChain : chain::ShareChain<FakeIndex>
 {
 
 };

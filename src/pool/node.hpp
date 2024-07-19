@@ -111,6 +111,11 @@ public:
     }
 };
 
-// #define ADD_HANDLER(name, msg_type)\
+#define ADD_HANDLER(name, msg_type)\
+    void handle_ #name (std::unique_ptr<msg_type> msg, peer_ptr peer)
+
+#define HANDLER(protocol, name)\
+    void #protocol :: handle_ #name (auto msg, auto peer)
+
 
 } // namespace pool

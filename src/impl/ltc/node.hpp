@@ -1,10 +1,11 @@
 #pragma once
 
 #include "peer.hpp"
+#include "messages.hpp"
 
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
-
+#include <core/message.hpp>
 
 namespace ltc
 {
@@ -15,7 +16,7 @@ class NodeImpl : public pool::BaseNode<ltc::Peer>
     void disconnect() override { }
 
     // BaseNode:
-    auto handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
+    pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
     {
         std::cout << "version msg" << std::endl;
         return pool::PeerConnectionType::legacy; 
@@ -44,6 +45,8 @@ class Legacy : public pool::Protocol<NodeImpl>
 {
 public:
     void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
+
+    // ADD_HANDLER(addrs, ltc::)
 };
 
 class Actual : public pool::Protocol<NodeImpl>

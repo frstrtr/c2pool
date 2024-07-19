@@ -8,10 +8,10 @@ namespace ltc
 {
 
 template <int64_t Version>
-struct BaseShare : c2pool::chain::BaseShare<uint256, Version>
+struct BaseShare : chain::BaseShare<uint256, Version>
 {
     BaseShare() {}
-    BaseShare(const uint256& hash, const uint256& prev_hash) : c2pool::chain::BaseShare<uint256, Version>(hash, prev_hash) {}
+    BaseShare(const uint256& hash, const uint256& prev_hash) : chain::BaseShare<uint256, Version>(hash, prev_hash) {}
 };
 
 struct Share : BaseShare<17>
@@ -20,7 +20,7 @@ struct Share : BaseShare<17>
     Share(const uint256& hash, const uint256& prev_hash) : BaseShare<17>(hash, prev_hash) {}
 };
 
-using ShareType = c2pool::chain::ShareVariants<Share>;
+using ShareType = chain::ShareVariants<Share>;
 
 struct ShareHasher
 {
@@ -33,9 +33,9 @@ struct ShareHasher
     }
 };
 
-class ShareIndex : public c2pool::chain::ShareIndex<uint256, ShareType, ShareHasher, ShareIndex>
+class ShareIndex : public chain::ShareIndex<uint256, ShareType, ShareHasher, ShareIndex>
 {
-    using base_index = c2pool::chain::ShareIndex<uint256, ShareType, ShareHasher, ShareIndex>;
+    using base_index = chain::ShareIndex<uint256, ShareType, ShareHasher, ShareIndex>;
 
 public:
     ShareIndex() : base_index() {}
@@ -56,7 +56,7 @@ protected:
     }
 };
 
-struct ShareChain : c2pool::chain::ShareChain<ShareIndex>
+struct ShareChain : chain::ShareChain<ShareIndex>
 {
 
 };
