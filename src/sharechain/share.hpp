@@ -6,9 +6,6 @@
 #include <type_traits>
 #include <core/pack.hpp>
 
-namespace c2pool
-{
-
 namespace chain
 {
 
@@ -108,6 +105,4 @@ typename ShareVariants<Args...>::load_map ShareVariants<Args...>::LoadMethods = 
 
 } // namespace chain
 
-} // namespace c2pool
-
-#define call(func) call_func([](auto& obj) { func (obj);})
+#define CALL(func) call_func([](auto& obj) { func (obj);})

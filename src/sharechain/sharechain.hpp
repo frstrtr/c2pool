@@ -8,9 +8,6 @@
 
 #include <sharechain/share.hpp>
 
-namespace c2pool
-{
-
 namespace chain
 {
 
@@ -364,6 +361,4 @@ public:
     */
 };
 
-} // namespace sharechain
-
-}
+} // namespace chain

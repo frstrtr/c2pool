@@ -8,6 +8,7 @@
 #include <core/message.hpp>
 #include <pool/message_macro.hpp>
 #include <sharechain/share.hpp>
+
 namespace ltc
 {
 
@@ -71,7 +72,7 @@ END_MESSAGE()
 BEGIN_MESSAGE(shares)
     MESSAGE_FIELDS
     (
-        (std::vector<c2pool::chain::RawShare>, m_shares)
+        (std::vector<chain::RawShare>, m_shares)
     )
     {
         READWRITE(obj.m_shares);
@@ -109,7 +110,7 @@ BEGIN_MESSAGE(sharereply)
     (
         (uint256, m_id),
         (ShareReplyResult, m_result),
-        (std::vector<c2pool::chain::RawShare>, m_shares)
+        (std::vector<chain::RawShare>, m_shares)
     )
     {
         READWRITE(obj.m_id, Using<EnumType<CompactFormat>>(obj.m_result), obj.m_shares);
