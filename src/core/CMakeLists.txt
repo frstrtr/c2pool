@@ -21,6 +21,7 @@ set(source
     macro.hpp
     netaddress.hpp netaddress.cpp
     opscript.hpp
+    random.hpp random.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
