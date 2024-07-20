@@ -484,3 +484,11 @@ public:
     {                                                                                    \
         return ParamsWrapper{*this, t};                                                  \
     }
+
+template<typename T>
+PackStream pack(T& value)
+{
+    PackStream stream;
+    stream << value;
+    return stream;
+}
