@@ -36,4 +36,6 @@ struct debug_timestamp
     }
 };
 
+uint32_t timestamp();
+
 } // namespace core

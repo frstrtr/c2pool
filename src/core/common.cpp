@@ -1,5 +1,4 @@
 #include "common.hpp"
-
 namespace core
 {
 
@@ -10,6 +9,11 @@ std::function<int()> count_generator()
         i++;
         return i;
     };
+}
+
+uint32_t timestamp()
+{
+    return std::time(nullptr);
 }
 
 } // namespace core
