@@ -125,6 +125,22 @@ public:
     { return !(l < r); }
 };
 
+struct addr_t
+{
+    uint64_t m_services;
+    NetService m_endpoint;
+
+    SERIALIZE_METHODS(addr_t) { READWRITE(obj.m_services, obj.m_endpoint); }
+};
+
+struct addr_record_t : addr_t
+{
+    uint64_t m_timestamp;
+
+    SERIALIZE_METHODS(addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
+};
+
+
 // template <IsInteger int_type>
 // inline void Serialize(PackStream& os, const NetAddr& value)
 // {
