@@ -46,13 +46,37 @@ class Legacy : public pool::Protocol<NodeImpl>
 public:
     void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
 
-    // ADD_HANDLER(addrs, ltc::)
+    ADD_HANDLER(addrs, ltc::message_addrs);
+    ADD_HANDLER(addrme, ltc::message_addrme);
+    ADD_HANDLER(ping, ltc::message_ping);
+    ADD_HANDLER(getaddrs, ltc::message_getaddrs);
+    ADD_HANDLER(shares, ltc::message_shares);
+    ADD_HANDLER(sharereq, ltc::message_sharereq);
+    ADD_HANDLER(sharereply, ltc::message_sharereply);
+    ADD_HANDLER(bestblock, ltc::message_bestblock);
+    ADD_HANDLER(have_tx, ltc::message_have_tx);
+    ADD_HANDLER(losing_tx, ltc::message_losing_tx);
+    ADD_HANDLER(remember_tx, ltc::message_remember_tx);
+    ADD_HANDLER(forget_tx, ltc::message_forget_tx);
 };
 
 class Actual : public pool::Protocol<NodeImpl>
 {
 public:
     void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
+
+    ADD_HANDLER(addrs, ltc::message_addrs);
+    ADD_HANDLER(addrme, ltc::message_addrme);
+    ADD_HANDLER(ping, ltc::message_ping);
+    ADD_HANDLER(getaddrs, ltc::message_getaddrs);
+    ADD_HANDLER(shares, ltc::message_shares);
+    ADD_HANDLER(sharereq, ltc::message_sharereq);
+    ADD_HANDLER(sharereply, ltc::message_sharereply);
+    ADD_HANDLER(bestblock, ltc::message_bestblock);
+    ADD_HANDLER(have_tx, ltc::message_have_tx);
+    ADD_HANDLER(losing_tx, ltc::message_losing_tx);
+    ADD_HANDLER(remember_tx, ltc::message_remember_tx);
+    ADD_HANDLER(forget_tx, ltc::message_forget_tx);
 };
 
 using Node = pool::NodeBridge<NodeImpl, Legacy, Actual>;

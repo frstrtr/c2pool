@@ -18,8 +18,8 @@ BEGIN_MESSAGE(version)
     (
         (uint32_t, m_version),
         (uint64_t, m_services),
-        (addr_type , m_addr_to),
-        (addr_type, m_addr_from),
+        (addr_t , m_addr_to),
+        (addr_t, m_addr_from),
         (uint64_t, m_nonce),
         (std::string, m_subversion),
         (uint32_t, m_mode), //# always 1 for legacy compatibility
@@ -61,7 +61,7 @@ END_MESSAGE()
 BEGIN_MESSAGE(addrs)
     MESSAGE_FIELDS
     (
-        (std::vector<NetAddress>, m_addrs)
+        (std::vector<addr_record_t>, m_addrs)
     )
     {
         READWRITE(obj.m_addrs);
