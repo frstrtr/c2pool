@@ -38,10 +38,8 @@ public:
         m_socket->close();
     }
 
-    template <typename MsgType>
-    void write(std::shared_ptr<MsgType> msg)
+    void write(std::unique_ptr<RawMessage> rmsg)
     {
-        auto rmsg = std::make_unique<RawMessage>(msg->m_command, pack(*msg));
         m_socket->write(std::move(rmsg));
     }
 };

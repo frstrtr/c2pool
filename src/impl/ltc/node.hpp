@@ -12,6 +12,12 @@ namespace ltc
     
 class NodeImpl : public pool::BaseNode<ltc::Peer>
 {
+protected:
+    
+public:
+    NodeImpl() {}
+    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : pool::BaseNode<ltc::Peer>(ctx, prefix) {}
+
     // INetwork:
     void disconnect() override { }
 
@@ -21,9 +27,6 @@ class NodeImpl : public pool::BaseNode<ltc::Peer>
         std::cout << "version msg" << std::endl;
         return pool::PeerConnectionType::legacy; 
     }
-
-    NodeImpl() {}
-    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : pool::BaseNode<ltc::Peer>(ctx, prefix) {}
 };
 
 /*

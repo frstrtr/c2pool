@@ -34,8 +34,15 @@
     {\
         auto temp = std::make_unique<message_type>();\
         C2POOL_EXPAND(C2POOL_MULTIPLE_CALL_MACRO(PASTE, MESSAGE_DATA_INIT_ARGS, __VA_ARGS__));\
-        PackStream result;\
-        result << *temp;\
+        auto result = pack(*temp);\
+        return result;\
+    }\
+    \
+    static std::unique_ptr<RawMessage> make_raw(C2POOL_EXPAND(C2POOL_MULTIPLE_CALL_MACRO(ENUMERATE, MESSAGE_DATA_MAKE_ARGS, __VA_ARGS__)))\
+    {\
+        auto temp = std::make_unique<message_type>();\
+        C2POOL_EXPAND(C2POOL_MULTIPLE_CALL_MACRO(PASTE, MESSAGE_DATA_INIT_ARGS, __VA_ARGS__));\
+        auto result = std::make_unique<RawMessage>(temp->m_command, pack(*temp));\
         return result;\
     }\
     \
@@ -51,6 +58,13 @@
     static PackStream make()\
     {\
         return PackStream{};\
+    }\
+    \
+    static std::unique_ptr<RawMessage> make_raw()\
+    {\
+        auto temp = std::make_unique<message_type>();\
+        auto result = std::make_unique<RawMessage>(temp->m_command, pack(*temp));\
+        return result;\
     }\
     \
     static std::unique_ptr<message_type> make(PackStream& stream)\
