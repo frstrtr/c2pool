@@ -20,8 +20,8 @@ void Legacy::HANDLER(addrs)
         if ((core::random::RandomFloat(0, 1) < 0.8) && (!peers.empty()))
         {
             auto wpeer = core::random::RandomChoice(peers);
-            auto new_msg = std::make_shared<message_addrs>(addr);
-            wpeer->write(new_msg);
+            auto rmsg = message_addrs::make_raw({addr});
+            wpeer->write(std::move(rmsg));
         }
     }
 }
