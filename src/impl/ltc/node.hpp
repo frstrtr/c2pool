@@ -6,6 +6,7 @@
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
+#include <core/addr_store.hpp>
 
 namespace ltc
 {
@@ -13,7 +14,7 @@ namespace ltc
 class NodeImpl : public pool::BaseNode<ltc::Peer>
 {
 protected:
-    
+    core::AddrStore* addr_store;
     
 public:
     NodeImpl() {}
@@ -28,6 +29,9 @@ public:
         std::cout << "version msg" << std::endl;
         return pool::PeerConnectionType::legacy; 
     }
+
+    // ltc
+    
 };
 
 /*
