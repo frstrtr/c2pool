@@ -4,6 +4,7 @@
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio.hpp>
+#include <nlohmann/json.hpp>
 
 enum AddrType
 {
@@ -76,6 +77,8 @@ public:
         };
     }
 
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NetAddress, m_ip);
+
 protected:
     void Write_IPV4(PackStream& os) const;
     void Read_IPV4(PackStream& is);
@@ -123,6 +126,8 @@ public:
 
     friend bool operator>=(const NetService& l, const NetService& r)
     { return !(l < r); }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NetService, m_ip, m_port);
 };
 
 struct addr_t
