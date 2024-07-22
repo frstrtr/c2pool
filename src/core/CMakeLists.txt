@@ -22,6 +22,7 @@ set(source
     netaddress.hpp netaddress.cpp
     opscript.hpp
     random.hpp random.cpp
+    addr_store.hpp addr_store.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
