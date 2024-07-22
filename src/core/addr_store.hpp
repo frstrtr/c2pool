@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <fstream>
 
 #include <core/log.hpp>
 #include <core/filesystem.hpp>
@@ -34,35 +35,59 @@ struct AddrStorePair
 
 class AddrStore
 {
-    const std::string filePath = "";
+    static constexpr const char* default_filename = "addrs.json";
 
-    std::map<NetService, AddrValue> data;
+    std::map<NetService, AddrValue> m_data;
+    std::filesystem::path m_path;
 
 private:
-    nlohmann::json to_json() { return nlohmann::json{data}; }
+    nlohmann::json to_json() const { return nlohmann::json{m_data}; }
     void from_json(std::string j_str);
 
 public:
-    AddrStore() {}
+    AddrStore(const std::string& coin_name) : m_path(core::filesystem::config_path() / coin_name / default_filename)
+    {
+        // check for exist path + make default
+        if (std::filesystem::exists(m_path))
+        {
+            std::fstream file(m_path);
+            std::string j_str((std::istreambuf_iterator<char>(file)),
+                 std::istreambuf_iterator<char>());
+            from_json(j_str);
+            file.close();
+        }
+        else
+        {
+            std::filesystem::create_directory(m_path.parent_path());
+        
+            std::ofstream file(m_path);
+            file << nlohmann::json{}.dump();
+            file.close();
 
-    /**/void save() const;
-    bool check(const NetService& addr) const { return data.contains(addr); }
-    AddrValue get(const NetService& addr) const { return check(addr) ? data.at(addr) : AddrValue{}; }
+            LOG_WARNING << "Config (" << m_path << "): not found, created default.";
+        }
+    }
+
+    void save() const;
+    bool check(const NetService& addr) const { return m_data.contains(addr); }
+    AddrValue get(const NetService& addr) const { return check(addr) ? m_data.at(addr) : AddrValue{}; }
 
     void add(const NetService& addr, AddrValue value);
     void remove(const NetService& addr);
+    // for bootstrap
+    void load(const std::vector<NetService>& addrs);
 
     std::vector<AddrStorePair> get_all() const
     {
         std::vector<AddrStorePair> all;
-        for (auto kv : data)
+        for (auto kv : m_data)
         {
             all.emplace_back(kv);
         }
         return all;
     }
 
-    size_t len() const { return data.size(); }
+    size_t len() const { return m_data.size(); }
 };
 
 } // namespace core
