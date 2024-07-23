@@ -40,9 +40,8 @@ protected:
     }
 
 public:
-    Fileconfig(std::filesystem::path filepath) : m_filepath(filepath)
+    Fileconfig(const std::filesystem::path& filepath) : m_filepath(filepath)
     {
-
     }
     
     template <typename CONFIG_TYPE, typename... Args>

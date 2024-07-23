@@ -18,27 +18,29 @@ class Config : public Pool, public Coin
     static constexpr const char* coin_filename = "coin.yaml";
 
 public:
+    void init()
+    {
+        Pool::init();
+        Coin::init();
+    }
+
+public:
     std::string m_name;
     std::filesystem::path m_path;
 
     Config(const std::string& coin_name) 
         : m_name(coin_name), m_path(core::filesystem::config_path() / m_name),
-            Pool(m_path / pool_filename), Coin(m_path / coin_filename) 
+            Pool(core::filesystem::config_path() / coin_name / pool_filename), Coin(core::filesystem::config_path() / coin_name / coin_filename) 
     { 
-
     }
+
+    Pool* pool() { return (Pool*)this;}
+    Coin* coin() { return (Coin*)this;}
 
     static core::Config<Pool, Coin>* load(const std::string& coin_name)
     {
         auto* config = new core::Config<Pool, Coin>(coin_name);
-        // pool
-        Pool* pool = config;
-        pool->init();
-
-        // coin
-        Coin* coin = config;
-        coin->init();
-
+        config->init();
         return config;
     }
 };
