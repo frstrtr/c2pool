@@ -27,18 +27,11 @@ protected:
     void load() override;
 
 public:
-    Settings() 
-        : core::Fileconfig(core::filesystem::config_path() / default_filename)
-    {
-
-    }
-
-    std::map<std::string, core::Config*> m_configs;
-    
     bool m_testnet;
     std::vector<std::string> m_networks;
     float m_fee;
 
+    Settings() : core::Fileconfig(core::filesystem::config_path() / default_filename) { }
 };
 
 } // namespace c2pool
