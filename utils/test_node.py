@@ -7,7 +7,7 @@ import hashlib
 import struct
 import time
 
-prefix = b"\01\02\03\04"
+prefix = bytes.fromhex('ad9614f6466a39cf') #b"\01\02\03\04"
 
 class Protocol(protocol.Protocol):
     def __init__(self):
