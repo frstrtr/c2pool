@@ -56,6 +56,7 @@ enum class ByteUnit : uint64_t {
 */
 std::string SanitizeString(std::string_view str, int rule = SAFE_CHARS_DEFAULT);
 std::vector<unsigned char> ParseHex(std::string_view str);
+std::vector<std::byte> ParseHexBytes(std::string_view str); // c2pool update
 signed char HexDigit(char c);
 /* Returns true if each character in str is a hex character, and has an even
  * number of hex digits.*/
