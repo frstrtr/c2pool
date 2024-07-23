@@ -1,5 +1,6 @@
 add_library(pool_ltc 
-    node.hpp node.cpp
+    config.hpp config.cpp
+    node.hpp
     peer.hpp
     protocol_actual.cpp protocol_legacy.cpp
     transaction.hpp transaction.cpp
