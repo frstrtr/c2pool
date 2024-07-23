@@ -28,17 +28,6 @@ void Settings::load()
     PARSE_CONFIG(node, testnet, bool);
     PARSE_CONFIG(node, networks, std::vector<std::string>);
     PARSE_CONFIG(node, fee, float);
-
-    for (const auto& network : m_networks)
-    {
-        parse_network_config(network, node);
-    }
-}
-
-void Settings::parse_network_config(std::string name, YAML::Node& node)
-{
-    auto net_node = node[name];
-    m_configs[name] = core::Config::load(name);
 }
 
 } // namespace core
