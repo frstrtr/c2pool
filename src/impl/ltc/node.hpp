@@ -1,24 +1,25 @@
 #pragma once
 
+#include "config.hpp"
+#include "share.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
 
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
-#include <core/addr_store.hpp>
 
 namespace ltc
 {
     
-class NodeImpl : public pool::BaseNode<ltc::Peer>
+class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
 protected:
-    core::AddrStore* addr_store;
+
     
 public:
     NodeImpl() {}
-    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : pool::BaseNode<ltc::Peer>(ctx, prefix) {}
+    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Base(ctx, prefix) {}
 
     // INetwork:
     void disconnect() override { }
@@ -31,7 +32,7 @@ public:
     }
 
     // ltc
-    
+
 };
 
 /*
