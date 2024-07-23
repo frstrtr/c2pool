@@ -95,6 +95,25 @@ std::vector<unsigned char> ParseHex(std::string_view str)
     return vch;
 }
 
+// c2pool upd
+std::vector<std::byte> ParseHexBytes(std::string_view str)
+{
+    // convert hex dump to vector
+    std::vector<std::byte> vch;
+    auto it = str.begin();
+    while (it != str.end() && it + 1 != str.end()) {
+        if (IsSpace(*it)) {
+            ++it;
+            continue;
+        }
+        auto c1 = HexDigit(*(it++));
+        auto c2 = HexDigit(*(it++));
+        if (c1 < 0 || c2 < 0) break;
+        vch.push_back(std::byte(c1 << 4) | std::byte(c2));
+    }
+    return vch;
+}
+
 void SplitHostPort(std::string_view in, uint16_t& portOut, std::string& hostOut)
 {
     size_t colon = in.find_last_of(':');
