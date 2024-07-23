@@ -8,6 +8,8 @@
 #include <pool/protocol.hpp>
 #include <core/socket.hpp>
 #include <core/message.hpp>
+#include <core/config.hpp>
+#include <core/addr_store.hpp>
 
 namespace pool
 {
@@ -18,7 +20,7 @@ class NodeInterface : public core::ICommunicator, public INetwork
 {
 };
 
-template <typename PeerData>
+template <typename ConfigType, typename ShareChainType, typename PeerData>
 class BaseNode : public NodeInterface, public Factory
 {
     // For implementation override:
@@ -29,11 +31,15 @@ class BaseNode : public NodeInterface, public Factory
     std::vector<std::byte> m_prefix;
 
 public:
+    using Base = BaseNode<ConfigType, ShareChainType, PeerData>;
     using peer_t = pool::Peer<PeerData>;
     using peer_ptr = std::shared_ptr<peer_t>;
 
 protected:
+    ConfigType* config; // todo: init
+    ShareChainType* chain; // todo: init
     std::map<NetService, peer_ptr> peers;
+    std::unique_ptr<core::AddrStore> addr_store; //todo: init
 
 public:
     BaseNode() : Factory(nullptr, this) {}
