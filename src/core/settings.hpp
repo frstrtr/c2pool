@@ -4,7 +4,6 @@
 #include <string>
 #include <map>
 
-#include <core/config.hpp>
 #include <core/fileconfig.hpp>
 
 namespace YAML
