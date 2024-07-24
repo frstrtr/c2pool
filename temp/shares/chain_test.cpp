@@ -136,5 +136,5 @@ int main()
     PackStream stream;
     chain.get_share(11).pack(stream);
     auto share = ShareType::load(FakeShareA::version, stream);
-    share.call(test_f);
+    share.CALL(test_f);
 }
