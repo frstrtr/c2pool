@@ -19,7 +19,7 @@ protected:
     
 public:
     NodeImpl() {}
-    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Base(ctx, prefix) {}
+    NodeImpl(boost::asio::io_context* ctx, config_t* config) : base_t(ctx, config) {}
 
     // INetwork:
     void disconnect() override { }
