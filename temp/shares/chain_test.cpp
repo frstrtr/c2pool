@@ -86,21 +86,6 @@ void test_f(share_t* share)
         std::cout << share->m_data2 << std::endl;
 }
 
-template <typename share_t>
-void test_f2(share_t* share, int i, float f)
-{
-    std::cout << i << " " << f << std::endl;
-    if (!share)
-        return;
-
-    std::cout << "Share (" << share->m_prev_hash << " -> " << share->m_hash << "): ";
-
-    if constexpr (share_t::version == 10)
-        std::cout << share->m_data1 << std::endl;
-    if constexpr (share_t::check_version(20))
-        std::cout << share->m_data2 << std::endl;
-}
-
 void debug_print(FakeChain& chain, FakeIndex::hash_t hash)
 {
     std::cout << "====================" << std::endl;
@@ -152,31 +137,4 @@ int main()
     chain.get_share(11).pack(stream);
     auto share = ShareType::load(FakeShareA::version, stream);
     share.CALL(test_f);
-    float fl = 1020;
-    share.INVOKE(test_f2, 100, fl);
-    ACTION(share, 
-        { 
-            if constexpr (share_t::version == 10)
-                std::cout << "hi" << std::endl;
-        }
-    );
-
-    share.ACTION2(obj_t, 
-        {
-            if constexpr (obj_t::version == 10)
-                std::cout << "hi" << std::endl; 
-        }
-    );
-
-    // share.call_func(
-    //     [&](auto* obj) 
-    //     { 
-    //         using obj_t = std::remove_pointer_t<decltype(obj)>; 
-    //         { 
-    //             if constexpr (obj_t::version == 10) 
-    //                 std::cout << "hi" << std::endl; 
-    //         } 
-    //     }
-    // );
-    USE(share, test_f);
 }
