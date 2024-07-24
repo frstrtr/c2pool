@@ -3,11 +3,11 @@
 
 #include <core/log.hpp>
 #include <core/socket.hpp>
+#include <core/addr_store.hpp>
 #include <core/node_interface.hpp>
 
 namespace pool
 {
-    
 struct INetwork
 {
     virtual void connected(std::shared_ptr<core::Socket> socket) = 0;
@@ -17,10 +17,12 @@ struct INetwork
 class Factory
 {
 private:
+	boost::asio::io_context* m_context;
 	INetwork* m_node;
-    boost::asio::io_context* m_context;
     boost::asio::ip::tcp::resolver m_resolver;
     boost::asio::ip::tcp::acceptor m_acceptor;
+	
+	core::AddrStore m_addrs;
 
 private:
     void listen()
@@ -55,7 +57,7 @@ private:
     }
 
 public:
-    Factory(boost::asio::io_context* context, INetwork* node) : m_context(context), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
+    Factory(boost::asio::io_context* context, std::string coin_name, INetwork* node) : m_context(context), m_addrs(coin_name), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
     {
         
     }
@@ -72,6 +74,9 @@ public:
 
 		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
+
+	void got_addr(NetService addr, uint64_t services, uint64_t timestamp);
+	std::vector<core::AddrStorePair> get_good_peers(size_t max_count);
 };
 
 } // namespace pool
