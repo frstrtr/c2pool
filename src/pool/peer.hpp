@@ -42,6 +42,11 @@ public:
     {
         m_socket->write(std::move(rmsg));
     }
+
+    NetService addr() const
+    {
+        return m_socket->get_addr();
+    }
 };
 
 } // namespace pool

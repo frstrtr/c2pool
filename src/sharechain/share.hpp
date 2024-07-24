@@ -45,6 +45,7 @@ template <typename...Args>
 struct ShareVariants : std::variant<Args*...>
 {
     static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
+    static_assert((is_packstream_type<Args> && ...), "ShareVariant parameters must have implementations Serialize/Unserialize");
 
 private:
     using load_map = std::map<int64_t, std::function<ShareVariants<Args...>()>>;
@@ -105,4 +106,4 @@ typename ShareVariants<Args...>::load_map ShareVariants<Args...>::LoadMethods = 
 
 } // namespace chain
 
-#define CALL(func) call_func([](auto& obj) { func (obj);})
+#define CALL(func) call_func([&](auto& obj) { func (obj);})
