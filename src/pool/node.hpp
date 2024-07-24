@@ -9,7 +9,6 @@
 #include <core/socket.hpp>
 #include <core/message.hpp>
 #include <core/config.hpp>
-#include <core/addr_store.hpp>
 
 namespace pool
 {
@@ -28,27 +27,26 @@ class BaseNode : public NodeInterface, public Factory
     //      void disconnect()
     // BaseNode:
     //      void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer)
-    std::vector<std::byte> m_prefix;
 
 public:
-    using Base = BaseNode<ConfigType, ShareChainType, PeerData>;
+    using base_t = BaseNode<ConfigType, ShareChainType, PeerData>;
     using peer_t = pool::Peer<PeerData>;
     using peer_ptr = std::shared_ptr<peer_t>;
+    using config_t = ConfigType;
 
 protected:
-    ConfigType* config; // todo: init
-    ShareChainType* chain; // todo: init
-    std::map<NetService, peer_ptr> peers;
-    std::unique_ptr<core::AddrStore> addr_store; //todo: init
+    config_t* m_config; // todo: init
+    ShareChainType* m_chain; // todo: init
+    std::map<NetService, peer_ptr> m_peers;
 
 public:
-    BaseNode() : Factory(nullptr, this) {}
-    BaseNode(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : Factory(ctx, this), m_prefix(prefix) {}
+    BaseNode() : Factory(nullptr, "", this) {}
+    BaseNode(boost::asio::io_context* ctx, config_t* config) : Factory(ctx, config->m_name, this), m_config(config) {}
 
-    const std::vector<std::byte>& get_prefix() const override { return m_prefix; }
+    const std::vector<std::byte>& get_prefix() const override { return m_config->pool()->m_prefix; }
     void connected(std::shared_ptr<core::Socket> socket) override 
     { 
-        peers[socket->get_addr()] = std::make_shared<peer_t>(socket);
+        m_peers[socket->get_addr()] = std::make_shared<peer_t>(socket);
         LOG_INFO << socket->get_addr().to_string() << " try to connect!";
     }
 
@@ -57,9 +55,9 @@ public:
         LOG_ERROR << "PoolNode <NetName>[" << service.to_string() << "]:";
         LOG_ERROR << "\terror: " << err;
         LOG_ERROR << "\twhere: " << where.function_name();
-        if (peers.contains(service))
+        if (m_peers.contains(service))
         {
-            auto peer = peers.extract(service);
+            auto peer = m_peers.extract(service);
             peer.mapped()->cancel();
             peer.mapped()->close();
         }
@@ -85,11 +83,11 @@ class NodeBridge : public virtual Base, public Legacy, public Actual
 
 public:
     template <typename... Args>
-    NodeBridge(boost::asio::io_context* ctx, Args... args) : Base(ctx, args...){ }
+    NodeBridge(boost::asio::io_context* ctx, Base::config_t* config, Args... args) : Base(ctx, config, args...){ }
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
-        auto peer = Base::peers[service];
+        auto peer = Base::m_peers[service];
 
         if (peer->type() == PeerConnectionType::unknown)
         {
