@@ -8,10 +8,64 @@
 namespace ltc
 {
 
+// min_header [small_block_header_type]
+//
+// share_info_type:
+//   share_data:
+//      prev_hash
+//      coinbase
+//      nonce
+//      address[>=34] or pubkey_hash[<34]
+//      subsidy
+//      donation
+//      stale_info
+//      desired_version
+//      
+//      segwit_data [if segwit_activated]
+//      
+//      if version < 34:
+//           new_transaction_hashes
+//           transaction_hash_refs
+//       
+//      far_share_hash
+//      max_bits
+//      bits
+//      timestamp
+//      absheight
+//      abswork
+//
+// ref_merkle_link
+// last_txout_nonce
+// hash_link
+// merkle_link
+
+
 template <int64_t Version>
 struct BaseShare : chain::BaseShare<uint256, Version>
 {
     NetService peer_addr;
+    
+    // prev_hash
+    // coinbase
+    // nonce
+    // address[>=34] or pubkey_hash[<34]
+    // subsidy
+    // donation
+    // stale_info
+    // desired_version
+    //
+    // segwit_data [if segwit_activated]
+    //
+    // if version < 34:
+    //      new_transaction_hashes
+    //      transaction_hash_refs
+    // 
+    // far_share_hash
+    // max_bits
+    // bits
+    // timestamp
+    // absheight
+    // abswork
 
     BaseShare() {}
     BaseShare(const uint256& hash, const uint256& prev_hash) : chain::BaseShare<uint256, Version>(hash, prev_hash) {}
@@ -25,10 +79,25 @@ struct Share : BaseShare<17>
     Share() {}
     Share(const uint256& hash, const uint256& prev_hash) : BaseShare<17>(hash, prev_hash) {}
 
-    SERIALIZE_METHODS(Share) { /*READWRITE(AsBase<BaseShare<17>>(obj));*/READWRITE(obj.m_hash, obj.m_prev_hash, obj.peer_addr); }
+    // SERIALIZE_METHODS(Share) { /*READWRITE(AsBase<BaseShare<17>>(obj));*/READWRITE(obj.m_hash, obj.m_prev_hash, obj.peer_addr); }
 };
 
-using ShareType = chain::ShareVariants<Share>;
+struct Formatter
+{
+    template <typename StreamType, typename ShareT>
+    static PackStream& pack_share(StreamType& os, ShareT* share)
+    {
+        return os;
+    }
+
+    template <typename StreamType, typename ShareT>
+    static PackStream& unpack_share(StreamType& is, ShareT* share)
+    {
+        return is;
+    }
+};
+
+using ShareType = chain::ShareVariants<Formatter, Share>;
 
 template <typename StreamType>
 inline ShareType load(int64_t version, StreamType& is, NetService peer_addr)

@@ -41,20 +41,20 @@ concept is_share_type = std::is_base_of<BaseShare<typename T::hash_t, T::version
 template <typename Correct, typename...Ts>
 concept is_correct_share = (std::is_same<Correct, Ts>::value || ...);
 
-template <typename...Args>
+template <typename Formatter, typename...Args>
 struct ShareVariants : std::variant<Args*...>
 {
     static_assert((is_share_type<Args> && ...), "ShareVariants parameters must inherit from BaseShare");
-    static_assert((is_packstream_type<Args> && ...), "ShareVariant parameters must have implementations Serialize/Unserialize");
+    // static_assert((is_packstream_type<Args> && ...), "ShareVariant parameters must have implementations Serialize/Unserialize");
 
 private:
-    using load_map = std::map<int64_t, std::function<ShareVariants<Args...>()>>;
+    using load_map = std::map<int64_t, std::function<ShareVariants<Formatter, Args...>()>>;
     static load_map LoadMethods;
 
     static load_map init_load_map()
     {
         load_map some_map;
-        ((some_map[Args::version] = []() { ShareVariants<Args...> result; result = new Args(); return result; }), ...);
+        ((some_map[Args::version] = []() { ShareVariants<Formatter, Args...> result; result = new Args(); return result; }), ...);
         return some_map;
     }
 
@@ -71,25 +71,11 @@ public:
         return share;
     }
 
-    template <typename StreamType>
-    PackStream& pack(StreamType& os)
-    {
-        invoke([&](auto* share) { ::Serialize(os, *share); });
-        return os;
-    }
-
-    template <typename StreamType>
-    PackStream& unpack(StreamType& is)
-    {
-        invoke([&](auto* share) { ::Unserialize(is, *share); });
-        return is;
-    }
-
     // Use macros .call(<func>)
     template<typename F>
-    void invoke(F&& func)
+    auto invoke(F&& func)
     {
-        std::visit(func, *this);
+        return std::visit(func, *this);
     }
 
     template <typename T>
@@ -109,10 +95,24 @@ public:
     {
         return std::visit([&](auto* share){ return share->m_prev_hash; }, *this);
     }
+
+    template <typename StreamType>
+    PackStream& pack(StreamType& os)
+    {
+        return invoke([&](auto* share) { return Formatter::pack_share(os, share); });
+    }
+
+    template <typename StreamType>
+    PackStream& unpack(StreamType& is)
+    {
+        // StreamType* s = &is;
+        return invoke([&](auto* share) { return Formatter::pack_share(is, share); });
+        // return is;
+    }
 };
 
-template <typename... Args>
-typename ShareVariants<Args...>::load_map ShareVariants<Args...>::LoadMethods = ShareVariants<Args...>::init_load_map();
+template <typename Formatter, typename... Args>
+typename ShareVariants<Formatter, Args...>::load_map ShareVariants<Formatter, Args...>::LoadMethods = ShareVariants<Formatter, Args...>::init_load_map();
 
 } // namespace chain
 
