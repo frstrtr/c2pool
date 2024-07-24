@@ -86,6 +86,21 @@ void test_f(share_t* share)
         std::cout << share->m_data2 << std::endl;
 }
 
+template <typename share_t>
+void test_f2(share_t* share, int i, float f)
+{
+    std::cout << i << " " << f << std::endl;
+    if (!share)
+        return;
+
+    std::cout << "Share (" << share->m_prev_hash << " -> " << share->m_hash << "): ";
+
+    if constexpr (share_t::version == 10)
+        std::cout << share->m_data1 << std::endl;
+    if constexpr (share_t::check_version(20))
+        std::cout << share->m_data2 << std::endl;
+}
+
 void debug_print(FakeChain& chain, FakeIndex::hash_t hash)
 {
     std::cout << "====================" << std::endl;
@@ -136,5 +151,21 @@ int main()
     PackStream stream;
     chain.get_share(11).pack(stream);
     auto share = ShareType::load(FakeShareA::version, stream);
-    share.CALL(test_f);
+    auto share_copy = share;
+
+    share.INVOKE(test_f2, 10, 2.2);
+
+    share_copy.ACTION(
+        {
+            if constexpr (share_t::version == 10)
+            {
+                std::cout << "! -> " << obj->m_data1 << std::endl;
+                obj->m_data1 += 322;
+            }
+        }
+    );
+
+    share.USE(test_f);
+
+    std::cout << share.hash() << " <--- " << share.prev_hash() << std::endl;
 }
