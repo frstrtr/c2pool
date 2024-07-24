@@ -1,6 +1,7 @@
 #include "node.hpp"
 #include "share.hpp"
 
+#include <core/uint256.hpp>
 #include <core/random.hpp>
 #include <core/common.hpp>
 
@@ -52,8 +53,22 @@ void Legacy::HANDLER(getaddrs)
     peer->write(std::move(rmsg));
 }
 
+struct HandleSharesData
+{
+    std::vector<ShareType> m_items;
+    std::map<uint256, std::vector<ltc::MutableTransaction>> m_txs;
+
+    void add(const ShareType& share, std::vector<ltc::MutableTransaction> txs)
+    {
+        m_items.push_back(share);
+        m_txs[share.hash()] = std::move(txs);
+    }
+};
+
 void Legacy::HANDLER(shares)
 {
+    HandleSharesData result; //share, txs
+
     for (auto wrappedshare : msg->m_shares)
     {
         ltc::ShareType share;
@@ -66,7 +81,11 @@ void Legacy::HANDLER(shares)
             continue;
         }
         
-        // for (auto tx_hash : share->new_transaction_hashes)
+        std::vector<ltc::MutableTransaction> txs;
+        share.ACTION({
+            // for (auto tx_hash : obj->new_transaction_hashes)
+        });
+        
         
     }
 }

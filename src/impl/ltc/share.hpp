@@ -34,7 +34,7 @@ template <typename StreamType>
 inline ShareType load(int64_t version, StreamType& is, NetService peer_addr)
 {
     auto share = ShareType::load(version, is);
-    share.CALL([addr = peer_addr](auto* share){ share->peer_addr = addr; });
+    share.ACTION({ obj->peer_addr = peer_addr; });
     return share;
 }
 
