@@ -2,6 +2,7 @@
 
 #include <sharechain/sharechain.hpp>
 #include <sharechain/share.hpp>
+#include <core/netaddress.hpp>
 #include <core/uint256.hpp>
 
 namespace ltc
@@ -10,17 +11,32 @@ namespace ltc
 template <int64_t Version>
 struct BaseShare : chain::BaseShare<uint256, Version>
 {
+    NetService peer_addr;
+
     BaseShare() {}
     BaseShare(const uint256& hash, const uint256& prev_hash) : chain::BaseShare<uint256, Version>(hash, prev_hash) {}
+
+// protected:
+//     SERIALIZE_METHODS(BaseShare<Version>) { READWRITE(obj.m_hash, obj.m_prev_hash, obj.peer_addr); }
 };
 
 struct Share : BaseShare<17>
 {
     Share() {}
     Share(const uint256& hash, const uint256& prev_hash) : BaseShare<17>(hash, prev_hash) {}
+
+    SERIALIZE_METHODS(Share) { /*READWRITE(AsBase<BaseShare<17>>(obj));*/READWRITE(obj.m_hash, obj.m_prev_hash, obj.peer_addr); }
 };
 
 using ShareType = chain::ShareVariants<Share>;
+
+template <typename StreamType>
+inline ShareType load(int64_t version, StreamType& is, NetService peer_addr)
+{
+    auto share = ShareType::load(version, is);
+    share.CALL([addr = peer_addr](auto* share){ share->peer_addr = addr; });
+    return share;
+}
 
 struct ShareHasher
 {
