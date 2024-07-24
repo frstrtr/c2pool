@@ -331,6 +331,9 @@ void Unserialize(StreamType& is, T&& a)
     a.Unserialize(is);
 }
 
+template <typename T>
+concept is_packstream_type = Serializable<PackStream, T> && Unserializable<PackStream, T>;
+
 template <typename PackFormat, typename T>
 class Wrapper
 {
