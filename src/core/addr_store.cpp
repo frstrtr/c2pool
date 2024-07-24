@@ -24,7 +24,8 @@ void AddrStore::from_json(std::string j_str)
         LOG_WARNING << "AddrStore::FromJSON " << e.what() << ", j_str = " << j_str;
         return;
     }
-    m_data = j.get<std::map<NetService, AddrValue>>();
+    if (!j.is_null())
+        m_data = j.get<std::map<NetService, AddrValue>>();
 }
 
 void AddrStore::add(const NetService& addr, AddrValue value)
@@ -42,6 +43,12 @@ void AddrStore::remove(const NetService& addr)
         return;
     
     m_data.erase(addr);
+    save();
+}
+
+void AddrStore::update(const NetService& addr, AddrValue new_value)
+{
+    m_data[addr] = new_value;
     save();
 }
 
