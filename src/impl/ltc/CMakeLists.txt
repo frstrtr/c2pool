@@ -6,7 +6,7 @@ add_library(pool_ltc
     transaction.hpp transaction.cpp
     types.hpp
     messages.hpp
-    share.hpp
+    share_types.hpp share.hpp
 )
 
 target_link_libraries(pool_ltc core pool sharechain)
