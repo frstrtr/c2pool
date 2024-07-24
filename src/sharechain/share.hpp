@@ -92,6 +92,18 @@ public:
         std::visit(func, *this);
     }
 
+    template <typename F, typename...ARG>
+    void call_test(auto& f)
+    {
+        // call_func([&](auto& obj) { func (obj);});
+    }
+
+    template<typename F, typename...FuncArgs>
+    void call_func(F&& func, FuncArgs... func_args)
+    {
+        std::visit(func, *this, func_args...);
+    }
+
     template <typename T>
     ShareVariants& operator=(T* value)
     {
@@ -106,4 +118,9 @@ typename ShareVariants<Args...>::load_map ShareVariants<Args...>::LoadMethods = 
 
 } // namespace chain
 
+#define USE(share, func) share.call_func([&](auto& obj) { func (obj); })
+// share_t -- real share type
+#define ACTION(share, action) share.call_func([&](auto* obj) { using share_t = std::remove_pointer_t<decltype(obj)>;  action })
+#define ACTION2(type, action) call_func([&](auto* obj) { using type = std::remove_pointer_t<decltype(obj)>;  action })
 #define CALL(func) call_func([&](auto& obj) { func (obj);})
+#define INVOKE(func, Args...) call_func([&](auto& obj) { func (obj, Args);})
