@@ -1,4 +1,6 @@
 #include "node.hpp"
+#include "share.hpp"
+
 #include <core/random.hpp>
 #include <core/common.hpp>
 
@@ -28,7 +30,7 @@ void Legacy::HANDLER(addrs)
 
 void Legacy::HANDLER(addrme)
 {
-
+    // TODO:
 }
 
 void Legacy::HANDLER(ping)
@@ -52,7 +54,21 @@ void Legacy::HANDLER(getaddrs)
 
 void Legacy::HANDLER(shares)
 {
-
+    for (auto wrappedshare : msg->m_shares)
+    {
+        ltc::ShareType share;
+        try
+        {
+            share = ltc::load(wrappedshare.type, wrappedshare.contents, peer->addr());
+        }
+        catch(const std::invalid_argument& e)
+        {
+            continue;
+        }
+        
+        // for (auto tx_hash : share->new_transaction_hashes)
+        
+    }
 }
 
 void Legacy::HANDLER(sharereq)
