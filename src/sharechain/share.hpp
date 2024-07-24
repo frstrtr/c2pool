@@ -74,20 +74,20 @@ public:
     template <typename StreamType>
     PackStream& pack(StreamType& os)
     {
-        call_func([&](auto* share) { ::Serialize(os, *share); });
+        invoke([&](auto* share) { ::Serialize(os, *share); });
         return os;
     }
 
     template <typename StreamType>
     PackStream& unpack(StreamType& is)
     {
-        call_func([&](auto* share) { ::Unserialize(is, *share); });
+        invoke([&](auto* share) { ::Unserialize(is, *share); });
         return is;
     }
 
     // Use macros .call(<func>)
     template<typename F>
-    void call_func(F&& func)
+    void invoke(F&& func)
     {
         std::visit(func, *this);
     }
@@ -99,6 +99,16 @@ public:
         std::variant<Args*...>::operator = (value);
         return *this;
     }
+
+    auto hash() const
+    {
+        return std::visit([&](auto* share){ return share->m_hash; }, *this);
+    }
+
+    auto prev_hash() const
+    {
+        return std::visit([&](auto* share){ return share->m_prev_hash; }, *this);
+    }
 };
 
 template <typename... Args>
@@ -106,4 +116,12 @@ typename ShareVariants<Args...>::load_map ShareVariants<Args...>::LoadMethods = 
 
 } // namespace chain
 
-#define CALL(func) call_func([&](auto& obj) { func (obj);})
+// For actions, example: share.ACTION({...});
+// obj -- parsed share; share_t -- share type
+#define ACTION(action) invoke([&](auto obj) { using share_t = std::remove_pointer_t<decltype(obj)>; action })
+
+// For func with arguments, example: share.INVOKE(func, a, b, c, d, ...);
+#define INVOKE(func, ...) invoke([&](auto& obj) { func (obj, __VA_ARGS__); })
+
+// For func without arguments, example: share.USE(func);
+#define USE(func) invoke([&](auto& obj) { func (obj); })
