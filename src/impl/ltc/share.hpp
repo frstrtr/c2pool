@@ -85,13 +85,13 @@ struct Share : BaseShare<17>
 struct Formatter
 {
     template <typename StreamType, typename ShareT>
-    static PackStream& pack_share(StreamType& os, ShareT* share)
+    static StreamType& pack_share(StreamType& os, ShareT* share)
     {
         return os;
     }
 
     template <typename StreamType, typename ShareT>
-    static PackStream& unpack_share(StreamType& is, ShareT* share)
+    static StreamType& unpack_share(StreamType& is, ShareT* share)
     {
         return is;
     }
