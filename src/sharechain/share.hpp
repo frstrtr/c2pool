@@ -41,6 +41,22 @@ concept is_share_type = std::is_base_of<BaseShare<typename T::hash_t, T::version
 template <typename Correct, typename...Ts>
 concept is_correct_share = (std::is_same<Correct, Ts>::value || ...);
 
+// Formatter template:
+// struct Formatter
+// {
+//     template <typename StreamType, typename ShareT>
+//     static StreamType& pack_share(StreamType& os, ShareT* share)
+//     {
+//         return os;
+//     }
+
+//     template <typename StreamType, typename ShareT>
+//     static StreamType& unpack_share(StreamType& is, ShareT* share)
+//     {
+//         return is;
+//     }
+// };
+
 template <typename Formatter, typename...Args>
 struct ShareVariants : std::variant<Args*...>
 {
@@ -96,17 +112,33 @@ public:
         return std::visit([&](auto* share){ return share->m_prev_hash; }, *this);
     }
 
-    template <typename StreamType>
-    PackStream& pack(StreamType& os)
+    template <typename StreamType, typename Func>
+    struct Wrapper
     {
-        return invoke([&](auto* share) { return Formatter::pack_share(os, share); });
+        StreamType& m_stream;
+        Func m_func;
+
+        Wrapper(StreamType& stream, Func&& func) : m_stream(stream), m_func(func) { }
+
+        template <typename ShareType>
+        Wrapper operator()(ShareType* share)
+        {
+            m_func(m_stream, share);
+            return *this;    
+        }
+    };
+
+    template <typename StreamType>
+    StreamType& pack(StreamType& os)
+    {
+        return invoke(Wrapper(os, [](auto& stream, auto* share) { Formatter::pack_share(stream, share); })).m_stream;
     }
 
     template <typename StreamType>
-    PackStream& unpack(StreamType& is)
+    StreamType& unpack(StreamType& is)
     {
         // StreamType* s = &is;
-        return invoke([&](auto* share) { return Formatter::pack_share(is, share); });
+        return invoke(Wrapper(is, [](auto& stream, auto* share) { Formatter::unpack_share(stream, share); })).m_stream;
         // return is;
     }
 };
@@ -120,8 +152,8 @@ typename ShareVariants<Formatter, Args...>::load_map ShareVariants<Formatter, Ar
 // obj -- parsed share; share_t -- share type
 #define ACTION(action) invoke([&](auto obj) { using share_t = std::remove_pointer_t<decltype(obj)>; action })
 
-// For func with arguments, example: share.INVOKE(func, a, b, c, d, ...);
-#define INVOKE(func, ...) invoke([&](auto& obj) { func (obj, __VA_ARGS__); })
+// For func with arguments, example: share.CALL(func, a, b, c, d, ...);
+#define CALL(func, ...) invoke([&](auto& obj) { func (obj, __VA_ARGS__); })
 
 // For func without arguments, example: share.USE(func);
 #define USE(func) invoke([&](auto& obj) { func (obj); })
