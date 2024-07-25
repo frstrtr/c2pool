@@ -22,7 +22,7 @@ struct BaseShare
 {
     using hash_t = HashType;
     
-    constexpr static int32_t version = Version;
+    constexpr static int64_t version = Version;
     hash_t m_hash{};
     hash_t m_prev_hash{};
 
@@ -41,21 +41,21 @@ concept is_share_type = std::is_base_of<BaseShare<typename T::hash_t, T::version
 template <typename Correct, typename...Ts>
 concept is_correct_share = (std::is_same<Correct, Ts>::value || ...);
 
-// Formatter template:
-// struct Formatter
-// {
-//     template <typename StreamType, typename ShareT>
-//     static StreamType& pack_share(StreamType& os, ShareT* share)
-//     {
-//         return os;
-//     }
+template <typename StreamType, typename Func>
+struct Wrapper
+{
+    StreamType& m_stream;
+    Func m_func;
 
-//     template <typename StreamType, typename ShareT>
-//     static StreamType& unpack_share(StreamType& is, ShareT* share)
-//     {
-//         return is;
-//     }
-// };
+    Wrapper(StreamType& stream, Func&& func) : m_stream(stream), m_func(func) { }
+
+    template <typename ShareType>
+    Wrapper operator()(ShareType* share)
+    {
+        m_func(m_stream, share);
+        return *this;    
+    }
+};
 
 template <typename Formatter, typename...Args>
 struct ShareVariants : std::variant<Args*...>
@@ -112,34 +112,18 @@ public:
         return std::visit([&](auto* share){ return share->m_prev_hash; }, *this);
     }
 
-    template <typename StreamType, typename Func>
-    struct Wrapper
-    {
-        StreamType& m_stream;
-        Func m_func;
-
-        Wrapper(StreamType& stream, Func&& func) : m_stream(stream), m_func(func) { }
-
-        template <typename ShareType>
-        Wrapper operator()(ShareType* share)
-        {
-            m_func(m_stream, share);
-            return *this;    
-        }
-    };
-
     template <typename StreamType>
     StreamType& pack(StreamType& os)
     {
-        return invoke(Wrapper(os, [](auto& stream, auto* share) { Formatter::pack_share(stream, share); })).m_stream;
+        return invoke(chain::Wrapper(os, [](auto& stream, const auto* share) { Formatter::Write(stream, share); })).m_stream;
+        // return invoke(chain::Wrapper(os, [](auto& stream, auto* share) { Formatter::pack_share(stream, share); })).m_stream;
     }
 
     template <typename StreamType>
     StreamType& unpack(StreamType& is)
     {
-        // StreamType* s = &is;
-        return invoke(Wrapper(is, [](auto& stream, auto* share) { Formatter::unpack_share(stream, share); })).m_stream;
-        // return is;
+        return invoke(chain::Wrapper(is, [](auto& stream, auto* share) { Formatter::Read(stream, share); })).m_stream;
+        // return invoke(chain::Wrapper(is, [](auto& stream, auto* share) { Formatter::unpack_share(stream, share); })).m_stream;
     }
 };
 
@@ -157,3 +141,12 @@ typename ShareVariants<Formatter, Args...>::load_map ShareVariants<Formatter, Ar
 
 // For func without arguments, example: share.USE(func);
 #define USE(func) invoke([&](auto& obj) { func (obj); })
+
+#define SHARE_FORMATTER()\
+    template<typename StreamType, typename ShareT>\
+    static void Write(StreamType &stream, const ShareT* obj) { FormatAction<ShareT::version>(stream, obj, SerializeFormatter{}); }\
+    template<typename StreamType, typename ShareT>\
+    static void Read(StreamType &stream, ShareT* obj) { FormatAction<ShareT::version>(stream, obj, UnserializeFormatter{}); }\
+    template<int64_t version, typename StreamType, typename ShareT, typename StreamFormatter>\
+    static void FormatAction(StreamType &stream, ShareT* obj, StreamFormatter formatter)
+
