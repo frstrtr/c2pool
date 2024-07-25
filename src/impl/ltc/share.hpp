@@ -84,16 +84,10 @@ struct Share : BaseShare<17>
 
 struct Formatter
 {
-    template <typename StreamType, typename ShareT>
-    static StreamType& pack_share(StreamType& os, ShareT* share)
+    SHARE_FORMATTER()
     {
-        return os;
-    }
-
-    template <typename StreamType, typename ShareT>
-    static StreamType& unpack_share(StreamType& is, ShareT* share)
-    {
-        return is;
+        if constexpr (version < 100)
+            std::cout << "hi" << std::endl;
     }
 };
 
