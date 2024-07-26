@@ -177,8 +177,8 @@ void UnserializeTransaction(TxType& tx, StreamType& s, const TxParams& params)
     s >> tx.locktime;
 }
 
-template<typename Stream, typename TxType>
-void SerializeTransaction(const TxType& tx, Stream& s, const TxParams& params)
+template<typename StreamType, typename TxType>
+void SerializeTransaction(const TxType& tx, StreamType& s, const TxParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
 

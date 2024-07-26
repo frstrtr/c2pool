@@ -63,6 +63,15 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     uint32_t m_absheight; // absheight
     uint128 m_abswork; // abswork
 
+    // ref_merkle_link
+    MerkleLink m_ref_merkle_link;
+    // last_txout_nonce
+    uint64_t m_last_txout_nonce;
+    // hash_link
+    HashLinkType m_hash_link;
+    // merkle_link
+    MerkleLink m_merkle_link;
+
     NetService peer_addr; // WHERE?
 
     BaseShare() {}
@@ -85,7 +94,7 @@ struct Formatter
 {
     SHARE_FORMATTER()
     {
-        // share_info_type:
+    // share_info_type:
         READWRITE(
             obj->m_prev_hash,
             obj->m_coinbase,
@@ -124,6 +133,19 @@ struct Formatter
             obj->m_timestamp,
             obj->m_absheight,
             obj->m_abswork
+        );
+
+    // ref_merkle_link
+        READWRITE(
+            MERKLE_LINK_SMALL(obj->m_ref_merkle_link)
+        );
+    // last_txout_nonce
+        READWRITE(obj->m_last_txout_nonce);
+    // hash_link
+        READWRITE(obj->m_hash_link);
+    // merkle_link
+        READWRITE(
+            MERKLE_LINK_SMALL(obj->m_merkle_link)
         );
     }
 };
