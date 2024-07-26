@@ -21,6 +21,16 @@ enum StaleInfo
     doa = 254
 };
 
+struct MerkleLinkParams
+{
+    const bool allow_index;
+
+    SER_PARAMS_OPFUNC
+};
+
+constexpr static MerkleLinkParams MERKLE_LINK_SMALL {.allow_index = false};
+constexpr static MerkleLinkParams MERKLE_LINK_FULL  {.allow_index = true};
+
 struct MerkleLink
 {
     std::vector<uint256> m_branch;
@@ -28,7 +38,33 @@ struct MerkleLink
 
     MerkleLink() { }
 
-    SERIALIZE_METHODS(MerkleLink) { READWRITE(obj.m_branch, obj.m_index); }
+    template<typename StreamType>
+    void UnserializeMerkleLink(MerkleLink& link, StreamType& s, const MerkleLinkParams& params)
+    {
+        s >> link;
+        if (params.allow_index)
+            s >> link;
+    }
+
+    template<typename Stream>
+    void SerializeMerkleLink(const MerkleLink& link, Stream& s, const MerkleLinkParams& params)
+    {
+        s << link;
+        if (params.allow_index)
+            s << link;
+    }
+
+    template <typename StreamType>
+    inline void Serialize(StreamType& os) const
+    {
+        SerializeMerkleLink(*this, os, os.GetParams());
+    }
+
+    template <typename StreamType>
+    inline void Unserialize(StreamType& os)
+    {
+        UnserializeMerkleLink(*this, os, os.GetParams());
+    }
 };
 
 struct SegwitData
@@ -39,7 +75,7 @@ struct SegwitData
     SegwitData() {}
     SegwitData(MerkleLink txid_merkle_link, uint256 wtxid) : m_txid_merkle_link(txid_merkle_link), m_wtxid_merkle_root(wtxid) { }
 
-    SERIALIZE_METHODS(SegwitData) { READWRITE(obj.m_txid_merkle_link, obj.m_wtxid_merkle_root); }
+    SERIALIZE_METHODS(SegwitData) { READWRITE(MERKLE_LINK_SMALL(obj.m_txid_merkle_link), obj.m_wtxid_merkle_root); }
 };
 
 struct SegwitDataDefault
@@ -72,6 +108,15 @@ struct ShareTxInfo
         : m_new_transaction_hashes(new_tx_hashes), m_transaction_hash_refs(tx_hash_refs) { }
 
     SERIALIZE_METHODS(ShareTxInfo) { READWRITE(obj.m_new_transaction_hashes, obj.m_transaction_hash_refs); }
+};
+
+struct HashLinkType
+{
+    std::vector<unsigned char> m_state;      //pack.FixedStrType(32)
+    std::string m_extra_data;                //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
+    uint64_t m_length;                       //pack.VarIntType()
+
+    SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, FixedString(obj.m_extra_data, 0), VarInt(obj.m_length)); }
 };
 
 } // namespace ltc
