@@ -48,13 +48,13 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     // prev_hash
     std::vector<unsigned char> m_coinbase; // coinbase
     uint32_t m_nonce; // nonce
-    // address[>=34] or pubkey_hash[<34]
+    // [ ]address[>=34] or [x]pubkey_hash[<34]
     uint64_t m_subsidy; // subsidy
     uint16_t m_donation; // donation
     ltc::StaleInfo m_stale_info; // stale_info
     uint64_t m_desired_version; // desired_version
     //
-    // segwit_data [if segwit_activated]
+    // [ ] segwit_data [if segwit_activated]
     //
     // if version < 34:
     //      new_transaction_hashes
@@ -76,6 +76,8 @@ struct BaseShare : chain::BaseShare<uint256, Version>
 
 struct Share : BaseShare<17>
 {
+    uint160 m_pubkey_hash;
+    ltc::ShareTxInfo m_tx_info; // new_transaction_hashes; transaction_hash_refs
 
     Share() {}
     Share(const uint256& hash, const uint256& prev_hash) : BaseShare<17>(hash, prev_hash) {}
@@ -93,7 +95,13 @@ struct Formatter
             obj->m_nonce
         );
         
-        //TODO: addr/pub_key
+        if constexpr (version >= 34)
+        {
+            // TODO: address
+        } else
+        {
+            READWRITE(obj->m_pubkey_hash); // pubkey_hash
+        }
 
         READWRITE(
             obj->m_subsidy,
@@ -102,9 +110,15 @@ struct Formatter
             VarInt(obj->m_desired_version)
         );
 
-        //TODO: segwit_data
+        if constexpr (is_segwit_activated(version))
+        {
+            READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+        }
 
-        // TODO: new_transaction_hashes/transaction_hash_refs
+        if constexpr (version < 34)
+        {
+            READWRITE(obj->m_tx_info);
+        }
 
         READWRITE(
             obj->m_far_share_hash,
