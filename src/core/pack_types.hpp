@@ -132,6 +132,7 @@ struct ArrayType
     }
 };
 
+// example using: Using<EnumType<IntType<8>>>(obj->m_stale_info)
 template <typename INT_PACK_TYPE>
 struct EnumType
 {

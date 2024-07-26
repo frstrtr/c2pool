@@ -1,7 +1,10 @@
 #pragma once
 
+#include "share_types.hpp"
+
 #include <sharechain/sharechain.hpp>
 #include <sharechain/share.hpp>
+#include <core/pack_types.hpp>
 #include <core/netaddress.hpp>
 #include <core/uint256.hpp>
 
@@ -39,20 +42,17 @@ namespace ltc
 // hash_link
 // merkle_link
 
-
 template <int64_t Version>
 struct BaseShare : chain::BaseShare<uint256, Version>
 {
-    NetService peer_addr;
-    
     // prev_hash
-    // coinbase
-    // nonce
+    std::vector<unsigned char> m_coinbase; // coinbase
+    uint32_t m_nonce; // nonce
     // address[>=34] or pubkey_hash[<34]
-    // subsidy
-    // donation
-    // stale_info
-    // desired_version
+    uint64_t m_subsidy; // subsidy
+    uint16_t m_donation; // donation
+    ltc::StaleInfo m_stale_info; // stale_info
+    uint64_t m_desired_version; // desired_version
     //
     // segwit_data [if segwit_activated]
     //
@@ -60,34 +60,60 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     //      new_transaction_hashes
     //      transaction_hash_refs
     // 
-    // far_share_hash
+    uint256 m_far_share_hash; // far_share_hash
     // max_bits
     // bits
-    // timestamp
-    // absheight
-    // abswork
+    uint32_t m_timestamp; // timestamp
+    uint32_t m_absheight; // absheight
+    uint128 m_abswork; // abswork
+
+    NetService peer_addr; // WHERE?
 
     BaseShare() {}
     BaseShare(const uint256& hash, const uint256& prev_hash) : chain::BaseShare<uint256, Version>(hash, prev_hash) {}
 
-// protected:
-//     SERIALIZE_METHODS(BaseShare<Version>) { READWRITE(obj.m_hash, obj.m_prev_hash, obj.peer_addr); }
 };
 
 struct Share : BaseShare<17>
 {
+
     Share() {}
     Share(const uint256& hash, const uint256& prev_hash) : BaseShare<17>(hash, prev_hash) {}
 
-    // SERIALIZE_METHODS(Share) { /*READWRITE(AsBase<BaseShare<17>>(obj));*/READWRITE(obj.m_hash, obj.m_prev_hash, obj.peer_addr); }
 };
 
 struct Formatter
 {
     SHARE_FORMATTER()
     {
-        if constexpr (version < 100)
-            std::cout << "hi" << std::endl;
+        // share_info_type:
+        READWRITE(
+            obj->m_prev_hash,
+            obj->m_coinbase,
+            obj->m_nonce
+        );
+        
+        //TODO: addr/pub_key
+
+        READWRITE(
+            obj->m_subsidy,
+            obj->m_donation,
+            Using<EnumType<IntType<8>>>(obj->m_stale_info),
+            VarInt(obj->m_desired_version)
+        );
+
+        //TODO: segwit_data
+
+        // TODO: new_transaction_hashes/transaction_hash_refs
+
+        READWRITE(
+            obj->m_far_share_hash,
+            // max_bits
+            // bits
+            obj->m_timestamp,
+            obj->m_absheight,
+            obj->m_abswork
+        );
     }
 };
 
