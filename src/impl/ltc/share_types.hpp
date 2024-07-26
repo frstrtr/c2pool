@@ -7,7 +7,7 @@
 namespace ltc
 {
 
-const uint64_t SEGWIT_ACTIVATION_VERSION = 40;
+const uint64_t SEGWIT_ACTIVATION_VERSION = 17;
 
 constexpr bool is_segwit_activated(uint64_t version)
 {

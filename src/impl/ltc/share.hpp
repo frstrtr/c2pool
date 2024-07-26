@@ -56,13 +56,9 @@ struct BaseShare : chain::BaseShare<uint256, Version>
     //
     // [ ] segwit_data [if segwit_activated]
     //
-    // if version < 34:
-    //      new_transaction_hashes
-    //      transaction_hash_refs
-    // 
     uint256 m_far_share_hash; // far_share_hash
-    // max_bits
-    // bits
+    uint32_t m_max_bits;// max_bits;   bitcoin_data.FloatingIntegerType()
+    uint32_t m_bits;    // bits;       bitcoin_data.FloatingIntegerType()
     uint32_t m_timestamp; // timestamp
     uint32_t m_absheight; // absheight
     uint128 m_abswork; // abswork
@@ -77,6 +73,7 @@ struct BaseShare : chain::BaseShare<uint256, Version>
 struct Share : BaseShare<17>
 {
     uint160 m_pubkey_hash;
+    std::optional<SegwitData> m_segwit_data;
     ltc::ShareTxInfo m_tx_info; // new_transaction_hashes; transaction_hash_refs
 
     Share() {}
@@ -122,8 +119,8 @@ struct Formatter
 
         READWRITE(
             obj->m_far_share_hash,
-            // max_bits
-            // bits
+            obj->m_max_bits,
+            obj->m_bits,
             obj->m_timestamp,
             obj->m_absheight,
             obj->m_abswork
