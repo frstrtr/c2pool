@@ -351,7 +351,7 @@ public:
         ShareChain& m_chain;
         hash_t m_start;
         size_t m_count;
-        
+
     public:
         ChainView(ShareChain& chain, hash_t start, size_t n) : m_chain(chain), m_start(start), m_count(n) { }
 
@@ -413,7 +413,7 @@ public:
         [+]height_and_last get_height_and_last(hash_t&& item);
         [+]bool is_child_of(hash_t&& item, hash_t&& possible_child);
         [+]hash_type get_nth_parent_key(hash_t&& hash, int32_t n) const;
-    [~]std::function<bool(hash_type&)> get_chain(hash_t&& hash, uint64_t n)
+        [+]std::function<bool(hash_type&)> get_chain(hash_t&& hash, uint64_t n)
         [+]sum_element get_sum(hash_type item, hash_type ancestor)
     */
 };
