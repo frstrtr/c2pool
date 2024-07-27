@@ -315,17 +315,74 @@ public:
         return result;
     }
 
-    //TODO:
-    // void get_chain(const hash_t& hash, uint64_t n, std::function<bool(chain_data&)>&& func)
-    // {
-    //     if (n > get_height(hash))
-    //     {
-    //         throw std::invalid_argument("n > height for this hash in get_chain!");
-    //     }
+    
+    class Iterator
+    {
+        using data_t = std::unordered_map<hash_t, chain_data, hasher_t>;
+    private:
+        typename data_t::iterator m_it;
+        ShareChain& m_chain;
 
-    //     chain_data& data = m_shares[hash];
-    //     while ()
-    // }
+    public:
+        auto& operator*() 
+        {
+            return *m_it;
+        }
+
+        Iterator& operator++() 
+        {
+            m_it = m_chain.m_shares.find(m_it->second.index->tail);
+            return *this;
+        }
+
+        bool operator!=(const Iterator& other) const 
+        {
+            return m_it != other.m_it;
+        }
+
+        Iterator(ShareChain& chain, typename data_t::iterator it) : m_chain(chain), m_it(it) { }
+    };
+
+    class ChainView
+    {
+    private:
+        using data_t = std::unordered_map<hash_t, chain_data, hasher_t>;
+
+        ShareChain& m_chain;
+        hash_t m_start;
+        size_t m_count;
+        
+    public:
+        ChainView(ShareChain& chain, hash_t start, size_t n) : m_chain(chain), m_start(start), m_count(n) { }
+
+        Iterator begin()
+        {
+            return Iterator(m_chain, m_chain.m_shares.find(m_start));
+        }
+
+        Iterator end()
+        {
+            typename data_t::iterator it = m_chain.m_shares.find(m_start);
+            for (int i = 0; i < m_count; i++)
+            {
+                if (m_chain.m_shares.contains(it->second.index->tail))
+                    it = m_chain.m_shares.find(it->second.index->tail);
+                else
+                    it = m_chain.m_shares.end();
+            }
+            return Iterator(m_chain, it);
+        }
+    };
+
+    ChainView get_chain(const hash_t& hash, uint64_t n)
+    {
+        if (n > get_height(hash))
+        {
+            throw std::invalid_argument("n > height for this hash in get_chain!");
+        }
+
+        return ChainView(*this, hash, n);
+    }
 
     void debug()
     {
