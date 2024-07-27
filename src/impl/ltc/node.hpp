@@ -32,7 +32,7 @@ public:
     }
 
     // ltc
-
+    std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 };
 
 /*

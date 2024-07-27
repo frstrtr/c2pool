@@ -80,24 +80,93 @@ void Legacy::HANDLER(shares)
         {
             continue;
         }
-        
+
         std::vector<ltc::MutableTransaction> txs;
-        share.ACTION({
-            // for (auto tx_hash : obj->new_transaction_hashes)
+        share.ACTION
+        ({
+            if constexpr (share_t::version < 13 && share_t::version >= 34) 
+                return;
+            else for (auto tx_hash : obj->m_tx_info.m_new_transaction_hashes)
+            {
+                /* TODO:
+                
+                coind::data::tx_type tx;
+                if (known_txs->value().find(tx_hash) != known_txs->value().end())
+                {
+                    tx = known_txs->value()[tx_hash];
+                } else
+                {
+                    bool flag = true;
+                    for (const auto& cache : protocol->known_txs_cache)
+                    {
+                        if (cache.second.find(tx_hash) != cache.second.end())
+                        {
+                            tx = cache.second.at(tx_hash);
+                            LOG_INFO << boost::format("Transaction %1% rescued from peer latency cache!") % tx_hash.GetHex();
+                            flag = false;
+                            break;
+                        }
+                    }
+                    if (flag)
+                    {
+                        std::string reason = (boost::format("Peer referenced unknown transaction %1%, disconnecting") % tx_hash.GetHex()).str();
+                        protocol->error(libp2p::BAD_PEER, reason);
+                        return;
+                    }
+                }
+                txs.push_back(tx);
+                
+                */
+            }
         });
         
-        
+        result.add(share, txs);
     }
+
+    //TODO: handle_shares(result, protocol->get_addr());
 }
 
 void Legacy::HANDLER(sharereq)
 {
+    auto shares = handle_get_share(msg->m_hashes, msg->m_parents, msg->m_stops, peer->addr());
+    std::vector<chain::RawShare> rshares;
 
+    try
+    {
+        for (auto& share : shares)
+        {
+            share.ACTION({
+                rshares.emplace_back(share_t::version, pack(share));
+            });
+        }
+        auto reply_msg = message_sharereply::make_raw(msg->m_id, ltc::ShareReplyResult::good, rshares);
+        peer->write(std::move(reply_msg));
+    }
+    catch (const std::invalid_argument &e)
+    {
+		// TODO: check for too_long
+        auto reply_msg = message_sharereply::make_raw(msg->m_id, ltc::ShareReplyResult::too_long, {});
+        peer->write(std::move(reply_msg));
+        LOG_INFO << "second try";
+    }
+    
 }
 
 void Legacy::HANDLER(sharereply)
 {
-
+    std::vector<ltc::ShareType> result;
+    if (msg->m_result == ShareReplyResult::good)
+    {
+        for (auto& rshare : msg->m_shares)
+        {
+            auto share = ltc::load(rshare.type, rshare.contents, peer->addr());
+            result.push_back(share);
+        }
+    } else 
+    {
+        //TODO: res = failure.Failure(self.ShareReplyError(result))
+    }
+    //TODO: protocol->get_shares.got_response(msg->id.get(), res);
 }
 
 void Legacy::HANDLER(bestblock)
