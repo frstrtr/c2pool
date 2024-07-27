@@ -82,7 +82,7 @@ public:
             throw std::invalid_argument("ShareVariants::unpack -- version unsupported!");
         
         auto share = LoadMethods[version]();
-        share.unpack(is);
+        share.Unserialize(is);
 
         return share;
     }
@@ -94,12 +94,23 @@ public:
         return std::visit(func, *this);
     }
 
+    template<typename F>
+    auto invoke_const(F&& func) const
+    {
+        return std::visit(func, *this);
+    }
+
     template <typename T>
     ShareVariants& operator=(T* value)
     {
         static_assert((std::is_same_v<T, Args> || ...), "ShareVariants can be cast only to Args...");
         std::variant<Args*...>::operator = (value);
         return *this;
+    }
+
+    auto version() const
+    {
+        return std::visit([&](auto* share){ return share->version; }, *this);
     }
 
     auto hash() const
@@ -113,17 +124,15 @@ public:
     }
 
     template <typename StreamType>
-    StreamType& pack(StreamType& os)
+    StreamType& Serialize(StreamType& os) const
     {
-        return invoke(chain::Wrapper(os, [](auto& stream, const auto* share) { Formatter::Write(stream, share); })).m_stream;
-        // return invoke(chain::Wrapper(os, [](auto& stream, auto* share) { Formatter::pack_share(stream, share); })).m_stream;
+        return invoke_const(chain::Wrapper(os, [](auto& stream, const auto* share) { Formatter::Write(stream, share); })).m_stream;
     }
 
     template <typename StreamType>
-    StreamType& unpack(StreamType& is)
+    StreamType& Unserialize(StreamType& is)
     {
         return invoke(chain::Wrapper(is, [](auto& stream, auto* share) { Formatter::Read(stream, share); })).m_stream;
-        // return invoke(chain::Wrapper(is, [](auto& stream, auto* share) { Formatter::unpack_share(stream, share); })).m_stream;
     }
 };
 
