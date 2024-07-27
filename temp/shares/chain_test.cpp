@@ -172,5 +172,10 @@ int main()
 
     std::cout << share.hash() << " <--- " << share.prev_hash() << std::endl;
 
-    
+    debug_print(chain, 11);
+
+    for (auto& share : chain.get_chain(14, 5))
+    {
+        std::cout << share.first << ": " << share.second.index->data1 << std::endl;
+    }
 }
