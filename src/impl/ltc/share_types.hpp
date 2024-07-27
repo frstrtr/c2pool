@@ -39,31 +39,31 @@ struct MerkleLink
     MerkleLink() { }
 
     template<typename StreamType>
-    void UnserializeMerkleLink(MerkleLink& link, StreamType& s, const MerkleLinkParams& params)
+    void UnserializeMerkleLink(StreamType& s, const MerkleLinkParams& params)
     {
-        s >> link;
+        s >> m_branch;
         if (params.allow_index)
-            s >> link;
+            s >> m_index;
     }
 
-    template<typename Stream>
-    void SerializeMerkleLink(const MerkleLink& link, Stream& s, const MerkleLinkParams& params)
+    template<typename StreamType>
+    void SerializeMerkleLink(StreamType& s, const MerkleLinkParams& params) const
     {
-        s << link;
+        s << m_branch;
         if (params.allow_index)
-            s << link;
+            s << m_index;
     }
 
     template <typename StreamType>
     inline void Serialize(StreamType& os) const
     {
-        SerializeMerkleLink(*this, os, os.GetParams());
+        SerializeMerkleLink(os, os.GetParams());
     }
 
     template <typename StreamType>
-    inline void Unserialize(StreamType& os)
+    inline void Unserialize(StreamType& is)
     {
-        UnserializeMerkleLink(*this, os, os.GetParams());
+        UnserializeMerkleLink(is, is.GetParams());
     }
 };
 
