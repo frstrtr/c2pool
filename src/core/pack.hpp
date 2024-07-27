@@ -489,7 +489,7 @@ public:
     }
 
 template<typename T>
-PackStream pack(T& value)
+PackStream pack(const T& value)
 {
     PackStream stream;
     stream << value;
