@@ -4,6 +4,7 @@ file(GLOB legacy_tracker "legacy/*.hpp")
 set(SHARECHAIN_SOURCE
     share.hpp
     sharechain.cpp sharechain.hpp
+    prepared_list.hpp
     ${legacy_tracker}
 )
 

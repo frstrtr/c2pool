@@ -8,10 +8,12 @@
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
+#include <sharechain/prepared_list.hpp>
 
 namespace ltc
 {
-    
+struct HandleSharesData;
+
 class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
 protected:
@@ -32,8 +34,23 @@ public:
     }
 
     // ltc
+    void handle_shares(HandleSharesData& data, NetService addr);
     std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
+
 };
+
+struct HandleSharesData
+{
+    std::vector<ShareType> m_items;
+    std::map<uint256, std::vector<ltc::MutableTransaction>> m_txs;
+
+    void add(const ShareType& share, std::vector<ltc::MutableTransaction> txs)
+    {
+        m_items.push_back(share);
+        m_txs[share.hash()] = std::move(txs);
+    }
+};
+
 
 /*
     void handle_message_addrs(std::shared_ptr<pool::messages::message_addrs> msg, PoolProtocol* protocol);
