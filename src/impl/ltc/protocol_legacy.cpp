@@ -53,21 +53,9 @@ void Legacy::HANDLER(getaddrs)
     peer->write(std::move(rmsg));
 }
 
-struct HandleSharesData
-{
-    std::vector<ShareType> m_items;
-    std::map<uint256, std::vector<ltc::MutableTransaction>> m_txs;
-
-    void add(const ShareType& share, std::vector<ltc::MutableTransaction> txs)
-    {
-        m_items.push_back(share);
-        m_txs[share.hash()] = std::move(txs);
-    }
-};
-
 void Legacy::HANDLER(shares)
 {
-    HandleSharesData result; //share, txs
+    ltc::HandleSharesData result; //share, txs
 
     for (auto wrappedshare : msg->m_shares)
     {
@@ -135,9 +123,7 @@ void Legacy::HANDLER(sharereq)
     {
         for (auto& share : shares)
         {
-            share.ACTION({
-                rshares.emplace_back(share_t::version, pack(share));
-            });
+            rshares.emplace_back(share.version(), pack(share));
         }
         auto reply_msg = message_sharereply::make_raw(msg->m_id, ltc::ShareReplyResult::good, rshares);
         peer->write(std::move(reply_msg));
