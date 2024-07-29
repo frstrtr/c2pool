@@ -14,7 +14,7 @@
 #include <core/opscript.hpp>
 
 #include <core/legacy/packv1.hpp>
-#include <core/legacy/pack_typesv1.hpp>
+// #include <core/legacy/pack_typesv1.hpp>
 
 TEST(Pack, INT)
 {
@@ -220,16 +220,16 @@ TEST(Pack, FIXED_STR)
     // legacy_stream << legacy_str1;
     // std::cout << "legacy stream: " << legacy_stream << std::endl;
 
-    std::string str1 = "123456";
+    FixedStrType<6> str1("123456");
 
     PackStream stream;
-    stream << FixedString(str1, 6);
+    stream << str1;
     stream.print();
 
-    std::string str2;
-    stream >> FixedString(str2, 6);
-    std::cout << str1 << " -> " <<  str2 << std::endl;
-    ASSERT_EQ(str1, str2);
+    FixedStrType<6> str2;
+    stream >> str2;
+    std::cout << str1.ToString() << " -> " <<  str2.ToString() << std::endl;
+    ASSERT_EQ(str1.ToString(), str2.ToString());
 }
 
 TEST(Pack, VAR_INT)
@@ -415,15 +415,15 @@ TEST(Pack, OP_SCRIPT)
     PackStream stream;
     stream << script;
 
-    std::for_each(script.begin(), script.end(), [&](const auto& ch) { std::cout << ch << " "; });
+    std::for_each(script.m_data.begin(), script.m_data.end(), [&](const auto& ch) { std::cout << ch << " "; });
     std::cout << std::endl;
     stream.print();
 
     OPScript script2;
     stream >> script2;
-    std::for_each(script.begin(), script.end(), [&](const auto& ch) { std::cout << ch << " "; });
+    std::for_each(script.m_data.begin(), script.m_data.end(), [&](const auto& ch) { std::cout << ch << " "; });
     std::cout << std::endl;
 
     ASSERT_EQ(script, script2);
-    ASSERT_TRUE(script == vch && script2 == vch);
+    ASSERT_TRUE(script.m_data == vch && script2.m_data == vch);
 }
