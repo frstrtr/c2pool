@@ -112,11 +112,11 @@ struct ShareTxInfo
 
 struct HashLinkType
 {
-    std::vector<unsigned char> m_state;      //pack.FixedStrType(32)
-    std::string m_extra_data;                //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
-    uint64_t m_length;                       //pack.VarIntType()
+    FixedStrType<32> m_state;      //pack.FixedStrType(32)
+    // FixedStrType<0> m_extra_data; //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
+    uint64_t m_length;        //pack.VarIntType()
 
-    SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, FixedString(obj.m_extra_data, 0), VarInt(obj.m_length)); }
+    SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, /*obj.m_extra_data,*/ VarInt(obj.m_length)); }
 };
 
 } // namespace ltc
