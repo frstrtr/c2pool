@@ -3,8 +3,7 @@
 #include <vector>
 
 #include <core/pack.hpp>
-
-using BaseScript = std::vector<unsigned char>;
+#include <core/pack_types.hpp>
 
 class OPScript : public BaseScript
 {
@@ -12,6 +11,9 @@ public:
     OPScript() {}
     OPScript(const_iterator pbegin, const_iterator pend) : BaseScript(pbegin, pend) { }
     OPScript(const unsigned char* pbegin, const unsigned char* pend) : BaseScript(pbegin, pend) { }
+
+    friend bool operator==(const OPScript& l, const OPScript& r) { return l.m_data == r.m_data; }
+    friend bool operator!=(const OPScript& l, const OPScript& r) { return !(l==r); }
 
     SERIALIZE_METHODS(OPScript) { READWRITE(AsBase<BaseScript>(obj)); }
 };
