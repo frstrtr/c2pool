@@ -1,5 +1,6 @@
 #pragma once
 
+#include "types.hpp"
 #include "share_types.hpp"
 
 #include <sharechain/sharechain.hpp>
@@ -45,10 +46,11 @@ namespace ltc
 template <int64_t Version>
 struct BaseShare : chain::BaseShare<uint256, Version>
 {
+    ltc::SmallBlockHeaderType m_min_header;
     // prev_hash
-    std::vector<unsigned char> m_coinbase; // coinbase
+    BaseScript m_coinbase; // coinbase
     uint32_t m_nonce; // nonce
-    // [ ]address[>=34] or [x]pubkey_hash[<34]
+    // [x]address[>=34] or [x]pubkey_hash[<34]
     uint64_t m_subsidy; // subsidy
     uint16_t m_donation; // donation
     ltc::StaleInfo m_stale_info; // stale_info
@@ -90,10 +92,46 @@ struct Share : BaseShare<17>
 
 };
 
+struct NewShare : BaseShare<33>
+{
+    uint160 m_pubkey_hash;
+    std::optional<SegwitData> m_segwit_data;
+    ltc::ShareTxInfo m_tx_info; // new_transaction_hashes; transaction_hash_refs
+
+    NewShare() {}
+    NewShare(const uint256& hash, const uint256& prev_hash) : BaseShare<33>(hash, prev_hash) {}
+};
+
+namespace types
+{
+
+struct DataSegwitShare
+{
+    BaseScript m_address; // Todo (check): VarStrType
+    std::optional<SegwitData> m_segwit_data;
+};
+
+} // namespace types
+
+struct SegwitMiningShare : BaseShare<34>, types::DataSegwitShare
+{
+
+    SegwitMiningShare() {}
+    SegwitMiningShare(const uint256& hash, const uint256& prev_hash) : BaseShare<34>(hash, prev_hash) {}
+};
+
+struct PaddingBugfixShare : BaseShare<35>, types::DataSegwitShare
+{
+    PaddingBugfixShare() {}
+    PaddingBugfixShare(const uint256& hash, const uint256& prev_hash) : BaseShare<35>(hash, prev_hash) {}
+};
+
 struct Formatter
 {
     SHARE_FORMATTER()
     {
+    // small_block_header_type:
+        READWRITE(obj->m_min_header);
     // share_info_type:
         READWRITE(
             obj->m_prev_hash,
@@ -101,9 +139,11 @@ struct Formatter
             obj->m_nonce
         );
         
+        std::cout << obj->m_prev_hash.ToString() << " " << obj->m_coinbase.size() << " " << obj->m_nonce << std::endl;
+
         if constexpr (version >= 34)
         {
-            // TODO: address
+            READWRITE(obj->m_address);
         } else
         {
             READWRITE(obj->m_pubkey_hash); // pubkey_hash
@@ -150,7 +190,15 @@ struct Formatter
     }
 };
 
-using ShareType = chain::ShareVariants<Formatter, Share>;
+using ShareType = chain::ShareVariants<Formatter, Share, NewShare, SegwitMiningShare, PaddingBugfixShare>;
+
+inline ShareType load(chain::RawShare& rshare, NetService peer_addr)
+{
+    auto stream = rshare.contents.as_stream();
+    auto share = ShareType::load(rshare.type, stream);
+    share.ACTION({ obj->peer_addr = peer_addr; });
+    return share;
+}
 
 template <typename StreamType>
 inline ShareType load(int64_t version, StreamType& is, NetService peer_addr)
