@@ -5,6 +5,7 @@
 #include <functional>
 #include <type_traits>
 #include <core/pack.hpp>
+#include <core/pack_types.hpp>
 
 namespace chain
 {
@@ -12,9 +13,9 @@ namespace chain
 struct RawShare
 {
     uint64_t type;
-    PackStream contents;
+    BaseScript contents;
 
-    SERIALIZE_METHODS(RawShare) { READWRITE(obj.type, obj.contents); }
+    SERIALIZE_METHODS(RawShare) { READWRITE(VarInt(obj.type), obj.contents); }
 };
 
 template <typename HashType, int64_t Version>

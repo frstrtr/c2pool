@@ -221,6 +221,16 @@ public:
         m_shares[share->m_hash] = chain_data{index, share_var};
     }
 
+    // void add(share_t share)
+    // {
+    //     share.ACTION
+    //     ({
+    //         auto index = new index_t(obj);
+    //         calculate_head_tail(obj->m_hash, obj->m_prev_hash, index);
+    //         m_shares[obj->m_hash] = chain_data(index, share);
+    //     });
+    // }
+
     chain_data& get(const hash_t& hash)
     {
         if (m_shares.contains(hash))
