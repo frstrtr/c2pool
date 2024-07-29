@@ -154,30 +154,30 @@ struct EnumType
     }
 };
 
-template <size_t Size>
-struct FixedStrType
-{
-    template <typename StreamType>
-    static void Write(StreamType& os, const std::string& str)
-    {
-        //TODO: check for size?
-        // std::string str_copy = str;
-        // if (str_copy.size() != Size)
-        //     str_copy.resize(Size);
-        os << str;
-    }
+// template <size_t Size>
+// struct FixedStrType
+// {
+//     template <typename StreamType>
+//     static void Write(StreamType& os, const std::string& str)
+//     {
+//         //TODO: check for size?
+//         // std::string str_copy = str;
+//         // if (str_copy.size() != Size)
+//         //     str_copy.resize(Size);
+//         os << str;
+//     }
 
-    template <typename StreamType>
-    static void Read(StreamType& is, std::string& str)
-    {
-        auto nSize = ReadCompactSize(is);
-        if (nSize > Size)
-            throw std::ios_base::failure("FixedStrType length limit exceeded");
-        str.resize(nSize);
-        if (nSize > 0)
-            is.read(std::as_writable_bytes(std::span{&str[0], nSize}));
-    }
-};
+//     template <typename StreamType>
+//     static void Read(StreamType& is, std::string& str)
+//     {
+//         auto nSize = ReadCompactSize(is);
+//         if (nSize > Size)
+//             throw std::ios_base::failure("FixedStrType length limit exceeded");
+//         str.resize(nSize);
+//         if (nSize > 0)
+//             is.read(std::as_writable_bytes(std::span{&str[0], nSize}));
+//     }
+// };
 
 struct CompactFormat
 {
@@ -223,29 +223,69 @@ struct OptionalType
     }
 };
 
+struct BaseScript
+{
+    using data_t = std::vector<unsigned char>;
+    using const_iterator = data_t::const_iterator;
+    std::vector<unsigned char> m_data;
 
-// template <class T>
-// concept OptionalCanBeNull = requires(T a)
-// {
-//     { a.SetNull() };
-//     { a.IsNull()  };
-// };
+    BaseScript() : m_data() { }
+    BaseScript(data_t data) : m_data(data) { }
+    BaseScript(std::string str) : m_data(str.begin(), str.end()) { }
+    BaseScript(const_iterator pbegin, const_iterator pend) : m_data(pbegin, pend) { }
+    BaseScript(const unsigned char* pbegin, const unsigned char* pend) : m_data(pbegin, pend) { }
 
-// template <OptionalCanBeNull NullType>
-// struct OptionalType
-// {
-//     static void Write(PackStream& os, const NullType& opt)
-//     {
-//         os << opt;
-//     }
+    PackStream as_stream()
+    {
+        return PackStream(m_data);
+    }
 
-//     template <typename T>
-//     static void Read(PackStream& os, NullType& opt)
-//     {
-//         os >> opt;
-//     }
-// };
+    size_t size() const
+    {
+        return m_data.size();
+    }
+
+    friend bool operator==(const BaseScript& l, const BaseScript& r) { return l.m_data == r.m_data; }
+    friend bool operator!=(const BaseScript& l, const BaseScript& r) { return !(l==r); }
+
+    SERIALIZE_METHODS(BaseScript) { READWRITE(obj.m_data); }
+};
+
+template <size_t Size>
+struct FixedStrType : BaseScript
+{
+    static constexpr int fixed_size = Size;
+
+    FixedStrType() : BaseScript() { }
+    FixedStrType(std::string str) : BaseScript(str) { } //BaseScript((const unsigned char*)str.data(), (const unsigned char*)str.data() + str.size()) { }
+
+    std::string ToString()
+    {
+        return std::string(m_data.begin(), m_data.end());
+    }
+
+    friend bool operator==(const FixedStrType<Size>& l, const FixedStrType<Size>& r) { return l.m_data == r.m_data; }
+    friend bool operator!=(const FixedStrType<Size>& l, const FixedStrType<Size>& r) { return !(l==r); }
+
+    template <typename StreamType>
+    void Serialize(StreamType &os) const
+    {
+        static_assert(std::is_same_v<const FixedStrType<Size> &, decltype(*this)>, "Serialize FixedStrType<Size> missmatch");
+        for (auto &chr : m_data)
+            os << chr;
+    }
+
+    template <typename StreamType>
+    void Unserialize(StreamType &is)
+    {
+        static_assert(std::is_same_v<FixedStrType<Size> &, decltype(*this)>, "Unserialize FixedStrType<Size> missmatch");
+        
+        m_data.resize(Size);
+        for (auto &chr : m_data)
+            is >> chr;
+    }
+};
 
 #define Optional(obj, Default) Using<OptionalType<Default>>(obj)
 #define VarInt(obj) Using<CompactFormat>(obj)
-#define FixedString(obj,n) Using<FixedStrType<n>>(obj)
+// #define FixedString(obj,n) Using<FixedStrType<n>>(obj)
