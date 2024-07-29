@@ -10,3 +10,5 @@ add_library(pool_ltc
 )
 
 target_link_libraries(pool_ltc core pool sharechain)
+
+add_subdirectory(test)

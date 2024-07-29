@@ -1,8 +1,48 @@
 #include "node.hpp"
 
+#include <core/common.hpp>
+#include <core/hash.hpp>
+#include <sharechain/prepared_list.hpp>
+
 namespace ltc
 {
     
+void NodeImpl::handle_shares(HandleSharesData& data, NetService addr)
+{
+    // auto t1 = core::debug_timestamp();
+    chain::PreparedList<uint256, ShareType> prepare_shares(data.m_items);
+    std::vector<ShareType> shares = prepare_shares.build_list();
+
+    if (shares.size() > 5)
+    {
+        LOG_INFO << "Processing " << shares.size() << " shares from " << addr.to_string() << "...";
+    }
+
+    int32_t new_count = 0;
+	std::map<uint256, ltc::MutableTransaction> all_new_txs;
+	for (auto& share : shares)
+	{
+        auto& new_txs = data.m_txs[share.hash()];
+		if (!new_txs.empty())
+		{
+			for (auto& new_tx : new_txs)
+			{
+                PackStream packed_tx = pack(ltc::TX_WITH_WITNESS(new_tx)); //TODO: WITH_WITNESS?
+				all_new_txs[Hash(packed_tx.get_span())] = new_tx;
+			}
+		}
+
+		if (m_chain->contains(share.hash()))
+		{
+            LOG_WARNING << "Got duplicate share, ignoring. Hash: " << share.hash().ToString();
+			continue;
+		}
+
+		new_count++;
+		// m_chain->add(share);
+	}
+}
+
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
     parents = std::min(parents, (uint64_t)1000/hashes.size());
