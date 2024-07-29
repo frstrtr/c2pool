@@ -10,6 +10,8 @@
 #include <string>
 #include <limits>
 
+#include <btclibs/util/strencodings.h>
+
 /**
  * The maximum size of a serialized object in bytes or number of elements
  * (for eg vectors) when the size is encoded as CompactSize.
@@ -34,6 +36,7 @@ protected:
 public:
     explicit PackStream() {}
     // explicit PackStream(std::span<const uint8_t> sp) { write(sp); }
+    explicit PackStream(const std::vector<unsigned char>& vec) : m_vch((std::byte*)vec.data(), (std::byte*)vec.data() + vec.size()) {}
     explicit PackStream(std::span<const std::byte> sp) : m_vch(sp.data(), sp.data() + sp.size()) {}
     template <size_t Size>
     explicit PackStream(std::array<std::byte, Size> arr) : m_vch(arr.begin(), arr.end()) { }
@@ -73,6 +76,18 @@ public:
         return m_vch.size();
     }
 
+    void from_hex(const std::string &hexData)
+    {
+        write(ParseHexBytes(hexData));
+    }
+
+    std::span<std::byte> get_span()
+    {
+        // return std::as_writable_bytes(std::span{m_vch});
+        std::span<std::byte> span(m_vch.data(), m_vch.size());
+        return span;
+    }
+
     // size from cursor
     size_t cursor_size() const
     {
@@ -106,14 +121,25 @@ public:
         return *this;
     }
 
+    // copy full stream data:
+    // friend inline void Serialize(PackStream& to, const PackStream& from)
+    // {
+    //     to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()), std::make_move_iterator(from.m_vch.end()));
+    // }
+
+    // friend inline void Unserialize(const PackStream& from, PackStream& to)
+    // {
+    //     to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()), std::make_move_iterator(from.m_vch.end()));
+    // }
+
     friend inline void Serialize(PackStream& to, const PackStream& from)
     {
-        to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()), std::make_move_iterator(from.m_vch.end()));
+        to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()+from.m_cursor), std::make_move_iterator(from.m_vch.end()));
     }
 
     friend inline void Unserialize(const PackStream& from, PackStream& to)
     {
-        to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()), std::make_move_iterator(from.m_vch.end()));
+        to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()+from.m_cursor), std::make_move_iterator(from.m_vch.end()));
     }
 };
 
