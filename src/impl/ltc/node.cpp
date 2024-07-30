@@ -11,15 +11,7 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 {
     LOG_DEBUG_POOL << "handle message_version";
 	std::unique_ptr<ltc::message_version> msg;
-	try
-	{
-		msg = ltc::message_version::make(rmsg->m_data);
-	}
-	catch(const std::exception& e)
-	{
-		error(e.what(), peer->addr());
-		return pool::PeerConnectionType::unknown;
-	}
+	msg = ltc::message_version::make(rmsg->m_data);
 	
 	LOG_INFO << "Peer "
 		 << msg->m_addr_from.m_endpoint.to_string()
