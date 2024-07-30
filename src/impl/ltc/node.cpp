@@ -7,7 +7,7 @@
 namespace ltc
 {
     
-void NodeImpl::handle_shares(HandleSharesData& data, NetService addr)
+void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
     // auto t1 = core::debug_timestamp();
     chain::PreparedList<uint256, ShareType> prepare_shares(data.m_items);

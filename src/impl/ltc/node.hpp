@@ -34,7 +34,7 @@ public:
     }
 
     // ltc
-    void handle_shares(HandleSharesData& data, NetService addr);
+    void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
     std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 
 };
