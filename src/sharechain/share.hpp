@@ -15,6 +15,10 @@ struct RawShare
     uint64_t type;
     BaseScript contents;
 
+    RawShare() {}
+    RawShare(uint64_t version, BaseScript script) : type(version), contents(script) { }
+    RawShare(uint64_t version, PackStream stream) : type(version), contents(stream) { }
+
     SERIALIZE_METHODS(RawShare) { READWRITE(VarInt(obj.type), obj.contents); }
 };
 
