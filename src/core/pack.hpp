@@ -141,6 +141,9 @@ public:
     {
         to.m_vch.insert(to.m_vch.end(), std::make_move_iterator(from.m_vch.begin()+from.m_cursor), std::make_move_iterator(from.m_vch.end()));
     }
+
+    inline auto begin() { return m_vch.begin(); }
+    inline auto end() { return m_vch.end(); }
 };
 
 template <typename ParamsType, typename StreamType>
