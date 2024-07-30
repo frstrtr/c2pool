@@ -28,6 +28,9 @@ class BaseNode : public NodeInterface, public Factory
     // BaseNode:
     //      void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer)
 
+    const time_t NEW_PEER_TIMEOUT_TIME = 10;
+    const time_t PEER_TIMEOUT_TIME = 100;
+
 public:
     using base_t = BaseNode<ConfigType, ShareChainType, PeerData>;
     using peer_t = pool::Peer<PeerData>;
@@ -44,12 +47,19 @@ protected:
 
 public:
     BaseNode() : Factory(nullptr, "", this) {}
-    BaseNode(boost::asio::io_context* ctx, config_t* config) : Factory(ctx, config->m_name, this), m_config(config) {}
+    BaseNode(boost::asio::io_context* context, config_t* config) : Factory(context, config->m_name, this), m_config(config) {}
 
     const std::vector<std::byte>& get_prefix() const override { return m_config->pool()->m_prefix; }
     void connected(std::shared_ptr<core::Socket> socket) override 
-    { 
-        m_connections[socket->get_addr()] = std::make_shared<peer_t>(socket);
+    {
+        // make peer
+        auto peer = std::make_shared<peer_t>(socket);
+        // move peer to m_connections
+        m_connections[socket->get_addr()] = peer;
+        // configure peer timeout timer
+        peer->m_timeout = std::make_unique<core::Timer>(Factory::m_context, true);
+        peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, peer = peer](){ timeout(peer); });
+
         LOG_INFO << socket->get_addr().to_string() << " try to connect!";
     }
 
@@ -75,6 +85,11 @@ public:
         error(parse_net_error(ec), service, where);
     }
 
+    void timeout(peer_ptr peer)
+    {
+        error("peer timeout!", peer->addr());
+    }
+
     virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
 };
 
@@ -91,6 +106,7 @@ public:
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
         auto peer = Base::m_connections[service];
+        peer->m_timeout->restart();
 
         if (peer->type() == PeerConnectionType::unknown)
         {
@@ -100,6 +116,7 @@ public:
 
             auto peer_type = Base::handle_version(std::move(rmsg), peer);
             peer->set_type(peer_type);
+            peer->m_timeout->restart(PEER_TIMEOUT_TIME); // change timeout 10s -> 100s
             return;
         }
 

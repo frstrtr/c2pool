@@ -16,8 +16,10 @@ struct INetwork
 
 class Factory
 {
-private:
+protected:
 	boost::asio::io_context* m_context;
+	
+private:
 	INetwork* m_node;
     boost::asio::ip::tcp::resolver m_resolver;
     boost::asio::ip::tcp::acceptor m_acceptor;
