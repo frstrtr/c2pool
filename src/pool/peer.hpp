@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <core/timer.hpp>
 #include <core/socket.hpp>
 namespace pool
 {
@@ -20,6 +21,8 @@ protected:
     std::shared_ptr<core::Socket> m_socket;
 
 public:
+    std::unique_ptr<core::Timer> m_timeout;
+
     // template <typename... Args>
     // Peer(std::shared_ptr<Socket> socket, Args... args) : m_socket(socket), Data(args...) {}
 
