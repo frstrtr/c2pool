@@ -48,22 +48,22 @@ struct BaseShare : chain::BaseShare<uint256, Version>
 {
     ltc::SmallBlockHeaderType m_min_header;
     // prev_hash
-    BaseScript m_coinbase; // coinbase
-    uint32_t m_nonce; // nonce
+    BaseScript m_coinbase;              // coinbase
+    uint32_t m_nonce;                   // nonce
     // [x]address[>=34] or [x]pubkey_hash[<34]
-    uint64_t m_subsidy; // subsidy
-    uint16_t m_donation; // donation
-    ltc::StaleInfo m_stale_info; // stale_info
-    uint64_t m_desired_version; // desired_version
+    uint64_t m_subsidy;                 // subsidy
+    uint16_t m_donation;                // donation
+    ltc::StaleInfo m_stale_info;        // stale_info
+    uint64_t m_desired_version;         // desired_version
     //
-    // [ ] segwit_data [if segwit_activated]
+    // [x] segwit_data [if segwit_activated]
     //
-    uint256 m_far_share_hash; // far_share_hash
-    uint32_t m_max_bits;// max_bits;   bitcoin_data.FloatingIntegerType()
-    uint32_t m_bits;    // bits;       bitcoin_data.FloatingIntegerType()
-    uint32_t m_timestamp; // timestamp
-    uint32_t m_absheight; // absheight
-    uint128 m_abswork; // abswork
+    uint256 m_far_share_hash;           // far_share_hash
+    uint32_t m_max_bits;                // max_bits;   bitcoin_data.FloatingIntegerType()
+    uint32_t m_bits;                    // bits;       bitcoin_data.FloatingIntegerType()
+    uint32_t m_timestamp;               // timestamp
+    uint32_t m_absheight;               // absheight
+    uint128 m_abswork;                  // abswork
 
     // ref_merkle_link
     MerkleLink m_ref_merkle_link;
@@ -115,7 +115,6 @@ struct DataSegwitShare
 
 struct SegwitMiningShare : BaseShare<34>, types::DataSegwitShare
 {
-
     SegwitMiningShare() {}
     SegwitMiningShare(const uint256& hash, const uint256& prev_hash) : BaseShare<34>(hash, prev_hash) {}
 };
