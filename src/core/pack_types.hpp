@@ -154,31 +154,6 @@ struct EnumType
     }
 };
 
-// template <size_t Size>
-// struct FixedStrType
-// {
-//     template <typename StreamType>
-//     static void Write(StreamType& os, const std::string& str)
-//     {
-//         //TODO: check for size?
-//         // std::string str_copy = str;
-//         // if (str_copy.size() != Size)
-//         //     str_copy.resize(Size);
-//         os << str;
-//     }
-
-//     template <typename StreamType>
-//     static void Read(StreamType& is, std::string& str)
-//     {
-//         auto nSize = ReadCompactSize(is);
-//         if (nSize > Size)
-//             throw std::ios_base::failure("FixedStrType length limit exceeded");
-//         str.resize(nSize);
-//         if (nSize > 0)
-//             is.read(std::as_writable_bytes(std::span{&str[0], nSize}));
-//     }
-// };
-
 struct CompactFormat
 {
     using num_type = uint32_t;
@@ -234,6 +209,7 @@ struct BaseScript
     BaseScript(std::string str) : m_data(str.begin(), str.end()) { }
     BaseScript(const_iterator pbegin, const_iterator pend) : m_data(pbegin, pend) { }
     BaseScript(const unsigned char* pbegin, const unsigned char* pend) : m_data(pbegin, pend) { }
+    BaseScript(PackStream& stream) : m_data((unsigned char*)*stream.begin(), (unsigned char*)*stream.end()) { }
 
     PackStream as_stream()
     {
@@ -288,4 +264,3 @@ struct FixedStrType : BaseScript
 
 #define Optional(obj, Default) Using<OptionalType<Default>>(obj)
 #define VarInt(obj) Using<CompactFormat>(obj)
-// #define FixedString(obj,n) Using<FixedStrType<n>>(obj)
