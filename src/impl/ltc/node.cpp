@@ -39,7 +39,7 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 		}
 
 		new_count++;
-		// m_chain->add(share);
+		m_chain->add(share);
 	}
 }
 
