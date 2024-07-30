@@ -15,14 +15,14 @@ void Legacy::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 
 void Legacy::HANDLER(addrs) 
 {
-    for (auto addr : msg->m_addrs)
+    for (auto& addr : msg->m_addrs)
     {
         addr.m_timestamp = std::min((uint64_t) core::timestamp(), addr.m_timestamp);
         got_addr(addr.m_endpoint, addr.m_services, addr.m_timestamp);
 
-        if ((core::random::RandomFloat(0, 1) < 0.8) && (!m_peers.empty()))
+        if ((core::random::RandomFloat(0, 1) < 0.8) && (!m_connections.empty()))
         {
-            auto wpeer = core::random::RandomChoice(m_peers);
+            auto wpeer = core::random::RandomChoice(m_connections);
             auto rmsg = message_addrs::make_raw({addr});
             wpeer->write(std::move(rmsg));
         }
