@@ -27,11 +27,7 @@ public:
     void disconnect() override { }
 
     // BaseNode:
-    pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
-    {
-        std::cout << "version msg" << std::endl;
-        return pool::PeerConnectionType::legacy; 
-    }
+    pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer);
 
     // ltc
     void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
