@@ -37,7 +37,10 @@ public:
 protected:
     config_t* m_config; // todo: init
     ShareChainType* m_chain; // todo: init
-    std::map<NetService, peer_ptr> m_peers;
+
+    uint64_t m_nonce; // node_id todo: init
+    std::map<NetService, peer_ptr> m_connections;
+    std::set<int> m_peers; // values = peers nonce
 
 public:
     BaseNode() : Factory(nullptr, "", this) {}
@@ -46,7 +49,7 @@ public:
     const std::vector<std::byte>& get_prefix() const override { return m_config->pool()->m_prefix; }
     void connected(std::shared_ptr<core::Socket> socket) override 
     { 
-        m_peers[socket->get_addr()] = std::make_shared<peer_t>(socket);
+        m_connections[socket->get_addr()] = std::make_shared<peer_t>(socket);
         LOG_INFO << socket->get_addr().to_string() << " try to connect!";
     }
 
@@ -55,9 +58,9 @@ public:
         LOG_ERROR << "PoolNode <NetName>[" << service.to_string() << "]:";
         LOG_ERROR << "\terror: " << err;
         LOG_ERROR << "\twhere: " << where.function_name();
-        if (m_peers.contains(service))
+        if (m_connections.contains(service))
         {
-            auto peer = m_peers.extract(service);
+            auto peer = m_connections.extract(service);
             peer.mapped()->cancel();
             peer.mapped()->close();
         }
@@ -87,7 +90,7 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
-        auto peer = Base::m_peers[service];
+        auto peer = Base::m_connections[service];
 
         if (peer->type() == PeerConnectionType::unknown)
         {
