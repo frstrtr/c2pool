@@ -27,7 +27,7 @@ class BaseNode : public NodeInterface, public Factory
     //      void disconnect()
     // BaseNode:
     //      void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer)
-
+protected:
     const time_t NEW_PEER_TIMEOUT_TIME = 10;
     const time_t PEER_TIMEOUT_TIME = 100;
 
@@ -58,7 +58,7 @@ public:
         m_connections[socket->get_addr()] = peer;
         // configure peer timeout timer
         peer->m_timeout = std::make_unique<core::Timer>(Factory::m_context, true);
-        peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, peer = peer](){ timeout(peer); });
+        peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, addr = peer->addr()](){ timeout(addr); });
 
         LOG_INFO << socket->get_addr().to_string() << " try to connect!";
     }
@@ -70,9 +70,12 @@ public:
         LOG_ERROR << "\twhere: " << where.function_name();
         if (m_connections.contains(service))
         {
+            std::cout << m_connections.size() << std::endl;
             auto peer = m_connections.extract(service);
+            peer.mapped()->m_timeout->stop(); // for case: peer stored somewhere (or leak)
             peer.mapped()->cancel();
             peer.mapped()->close();
+            std::cout << m_connections.size() << std::endl;
         }
         else
         {
@@ -85,9 +88,9 @@ public:
         error(parse_net_error(ec), service, where);
     }
 
-    void timeout(peer_ptr peer)
+    void timeout(const NetService& service)
     {
-        error("peer timeout!", peer->addr());
+        error("peer timeout!", service);
     }
 
     virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
@@ -115,8 +118,11 @@ public:
                 return Base::error("message wanna for be version", service);
 
             auto peer_type = Base::handle_version(std::move(rmsg), peer);
-            peer->set_type(peer_type);
-            peer->m_timeout->restart(PEER_TIMEOUT_TIME); // change timeout 10s -> 100s
+            if (peer_type != PeerConnectionType::unknown)
+            {
+                peer->set_type(peer_type);
+                peer->m_timeout->restart(Base::PEER_TIMEOUT_TIME); // change timeout 10s -> 100s
+            }
             return;
         }
 

@@ -17,7 +17,8 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 	}
 	catch(const std::exception& e)
 	{
-		std::cerr << e.what() << '\n';
+		error(e.what(), peer->addr());
+		return pool::PeerConnectionType::unknown;
 	}
 	
 	LOG_INFO << "Peer "
@@ -57,7 +58,7 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 	}
 
 	peer->m_nonce = msg->m_nonce;
-	
+
 
     return pool::PeerConnectionType::legacy; 
 }
