@@ -6,6 +6,61 @@
 
 namespace ltc
 {
+
+pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
+{
+    LOG_DEBUG_POOL << "handle message_version";
+	std::unique_ptr<ltc::message_version> msg;
+	try
+	{
+		msg = ltc::message_version::make(rmsg->m_data);
+	}
+	catch(const std::exception& e)
+	{
+		std::cerr << e.what() << '\n';
+	}
+	
+	LOG_INFO << "Peer "
+		 << msg->m_addr_from.m_endpoint.to_string()
+		 << " says protocol version is "
+		 << msg->m_version
+		 << ", client version "
+		 << msg->m_subversion;
+
+	if (peer->m_other_version.has_value())
+	{
+        LOG_DEBUG_POOL << "more than one version message";
+		throw std::runtime_error("more than one version message"); // TODO:
+	}
+	// TODO: 
+	// if (msg->version.get() < net->MINIMUM_PROTOCOL_VERSION)
+	// {
+    //     LOG_DEBUG_POOL << "peer too old";
+	// }
+
+	peer->m_other_version = msg->m_version;
+	peer->m_other_subversion = msg->m_subversion;
+	peer->m_other_services = msg->m_services;
+
+	if (m_nonce == msg->m_nonce)
+	{
+		LOG_WARNING << "was connected to self";
+		throw std::runtime_error("was connected to self"); //TODO:
+	}
+
+	if (m_peers.contains(msg->m_nonce))
+	{
+		std::string reason = "[handle_message_version] Detected duplicate connection, disconnecting from " + peer->addr().to_string();
+		LOG_ERROR << reason;
+		throw std::runtime_error(reason);
+        // TODO: handshake->error(libp2p::BAD_PEER, reason);
+	}
+
+	peer->m_nonce = msg->m_nonce;
+	
+
+    return pool::PeerConnectionType::legacy; 
+}
     
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
