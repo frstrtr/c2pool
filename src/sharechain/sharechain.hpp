@@ -135,7 +135,7 @@ private:
                 index->prev = m_shares[tail].index;
                 index->calculate_index(index->prev);
 
-                std::unordered_set<hash_t> dirty_indexs;
+                std::unordered_set<hash_t, hasher_t> dirty_indexs;
                 for (auto& part : right.mapped())
                 {
                     index_t* cur = m_shares[part].index;
@@ -161,7 +161,7 @@ private:
         case only_tails:
             // элемент слева
             {
-                std::unordered_set<hash_t> dirty_indexs;
+                std::unordered_set<hash_t, hasher_t> dirty_indexs;
                 auto right = m_tails.extract(head);
                 for (auto& part : right.mapped())
                 {
@@ -221,15 +221,10 @@ public:
         m_shares[share->m_hash] = chain_data{index, share_var};
     }
 
-    // void add(share_t share)
-    // {
-    //     share.ACTION
-    //     ({
-    //         auto index = new index_t(obj);
-    //         calculate_head_tail(obj->m_hash, obj->m_prev_hash, index);
-    //         m_shares[obj->m_hash] = chain_data(index, share);
-    //     });
-    // }
+    void add(share_t share)
+    {
+        share.USE(add);
+    }
 
     chain_data& get(const hash_t& hash)
     {
