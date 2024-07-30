@@ -70,12 +70,10 @@ public:
         LOG_ERROR << "\twhere: " << where.function_name();
         if (m_connections.contains(service))
         {
-            std::cout << m_connections.size() << std::endl;
             auto peer = m_connections.extract(service);
             peer.mapped()->m_timeout->stop(); // for case: peer stored somewhere (or leak)
             peer.mapped()->cancel();
             peer.mapped()->close();
-            std::cout << m_connections.size() << std::endl;
         }
         else
         {
@@ -117,12 +115,18 @@ public:
             if (rmsg->m_command.compare(0, 7, "version") != 0)
                 return Base::error("message wanna for be version", service);
 
-            auto peer_type = Base::handle_version(std::move(rmsg), peer);
-            if (peer_type != PeerConnectionType::unknown)
+            PeerConnectionType peer_type = unknown;
+            try
             {
-                peer->set_type(peer_type);
-                peer->m_timeout->restart(Base::PEER_TIMEOUT_TIME); // change timeout 10s -> 100s
+                peer_type = Base::handle_version(std::move(rmsg), peer);
+            } catch (const std::exception& ex)
+            {
+                Base::error(ex.what(), service);
+                return;
             }
+            assert(peer_type != PeerConnectionType::unknown); // peer_type is "unknown" after message_version!
+            peer->set_type(peer_type);
+            peer->m_timeout->restart(Base::PEER_TIMEOUT_TIME); // change timeout 10s -> 100s
             return;
         }
 
