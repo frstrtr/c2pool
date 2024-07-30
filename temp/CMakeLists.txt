@@ -37,6 +37,9 @@ add_executable(base_node_check base_node_check.cpp)
 add_executable(test_uint_hasher test_uint_hasher.cpp)
 target_link_libraries(test_uint_hasher btclibs core)
 
+add_executable(check_hash_uint256 check_hash_uint256.cpp)
+target_link_libraries(check_hash_uint256 btclibs core)
+
 add_executable(static_assert_check_templ static_assert_check_templ.cpp)
 add_executable(get_chain_test get_chain_test.cpp)
 target_compile_features(get_chain_test PRIVATE cxx_std_20)
