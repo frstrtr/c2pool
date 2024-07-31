@@ -56,6 +56,7 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 	}
 
 	peer->m_nonce = msg->m_nonce;
+	m_peers[peer->m_nonce] = peer;
 
 	//TODO: if (p2p_node->advertise_ip):
 	//TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
