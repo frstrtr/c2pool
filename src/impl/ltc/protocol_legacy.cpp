@@ -80,7 +80,7 @@ void Legacy::HANDLER(shares)
         ltc::ShareType share;
         try
         {
-            share = ltc::load(wrappedshare, peer->addr());
+            share = ltc::load_share(wrappedshare, peer->addr());
         }
         catch(const std::invalid_argument& e)
         {
@@ -152,7 +152,6 @@ void Legacy::HANDLER(sharereq)
         peer->write(std::move(reply_msg));
         LOG_INFO << "second try";
     }
-    
 }
 
 void Legacy::HANDLER(sharereply)
@@ -162,7 +161,7 @@ void Legacy::HANDLER(sharereply)
     {
         for (auto& rshare : msg->m_shares)
         {
-            auto share = ltc::load(rshare, peer->addr());
+            auto share = ltc::load_share(rshare, peer->addr());
             result.push_back(share);
         }
     } else 

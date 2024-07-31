@@ -191,7 +191,7 @@ struct Formatter
 
 using ShareType = chain::ShareVariants<Formatter, Share, NewShare, SegwitMiningShare, PaddingBugfixShare>;
 
-inline ShareType load(chain::RawShare& rshare, NetService peer_addr)
+inline ShareType load_share(chain::RawShare& rshare, NetService peer_addr)
 {
     auto stream = rshare.contents.as_stream();
     auto share = ShareType::load(rshare.type, stream);
@@ -200,7 +200,7 @@ inline ShareType load(chain::RawShare& rshare, NetService peer_addr)
 }
 
 template <typename StreamType>
-inline ShareType load(int64_t version, StreamType& is, NetService peer_addr)
+inline ShareType load_share(int64_t version, StreamType& is, NetService peer_addr)
 {
     auto share = ShareType::load(version, is);
     share.ACTION({ obj->peer_addr = peer_addr; });
