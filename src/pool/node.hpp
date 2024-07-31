@@ -45,7 +45,7 @@ protected:
 
     uint64_t m_nonce; // node_id todo: init
     std::map<NetService, peer_ptr> m_connections;
-    std::set<int> m_peers; // values = peers nonce
+    std::map<int, peer_ptr> m_peers; // key = peers nonce
 
     std::unique_ptr<core::Timer> m_ping_timer;
 
@@ -59,7 +59,7 @@ public:
         m_ping_timer->start(PING_DELAY, 
             [&]()
             {
-                for (auto& [addr, peer] : m_connections)
+                for (auto& [nonce, peer] : m_peers)
                 {
                     if (m_peers.contains(peer->m_nonce))
                         send_ping(peer);

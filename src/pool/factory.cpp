@@ -29,7 +29,7 @@ std::vector<core::AddrStorePair> Factory::get_good_peers(size_t max_count)
 	{
 		values.push_back(
 				std::make_pair(
-						-log(std::max(uint64_t(3600), pair.value.m_last_seen - pair.value.m_first_seen)) / log(std::max(uint64_t(3600), t - pair.value.m_last_seen)) * core::random::Expovariate(1),
+						-log(std::max(uint64_t(3600), pair.value.m_last_seen - pair.value.m_first_seen)) / log(std::max(uint64_t(3600), t - pair.value.m_last_seen)) * core::random::expovariate(1),
 						pair)
         );
 	}
