@@ -7,6 +7,12 @@
 namespace ltc
 {
 
+void NodeImpl::send_ping(peer_ptr peer)
+{
+	auto rmsg = ltc::message_ping::make_raw();
+	peer->write(std::move(rmsg));
+};
+
 pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 {
     LOG_DEBUG_POOL << "handle message_version";
@@ -51,7 +57,22 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 
 	peer->m_nonce = msg->m_nonce;
 
+	//TODO: if (p2p_node->advertise_ip):
+	//TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
 
+	if (!msg->m_best_share.IsNull())
+	{
+		LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string() << " = " << msg->m_best_share.ToString();
+		// TODO: handle_share_hashes({best_hash}, handshake, handshake->get_addr());
+	}
+
+	// TODO: for what?
+	// if (coind_node->cur_share_version >= 34)
+    //     return;
+
+	// TODO: more events; send have_tx; etc...
+
+	// TODO: add rule for legacy/actual protocol
     return pool::PeerConnectionType::legacy; 
 }
     
