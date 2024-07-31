@@ -26,10 +26,12 @@ class BaseNode : public NodeInterface, public Factory
     //  INetwork:
     //      void disconnect()
     // BaseNode:
-    //      void handle_version(std::unique_ptr<RawMessage> rmsg, const peer_t& peer)
+    //      void handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
+    //      void send_ping(peer_ptr peer);
 protected:
     const time_t NEW_PEER_TIMEOUT_TIME = 10;
     const time_t PEER_TIMEOUT_TIME = 100;
+    const time_t PING_DELAY = 60;
 
 public:
     using base_t = BaseNode<ConfigType, ShareChainType, PeerData>;
@@ -45,9 +47,26 @@ protected:
     std::map<NetService, peer_ptr> m_connections;
     std::set<int> m_peers; // values = peers nonce
 
+    std::unique_ptr<core::Timer> m_ping_timer;
+
 public:
     BaseNode() : Factory(nullptr, "", this) {}
-    BaseNode(boost::asio::io_context* context, config_t* config) : Factory(context, config->m_name, this), m_config(config) {}
+    BaseNode(boost::asio::io_context* context, config_t* config) 
+        : Factory(context, config->m_name, this), m_config(config) 
+    {
+        // ping timer for all peers
+        m_ping_timer = std::make_unique<core::Timer>(Factory::m_context, true);
+        m_ping_timer->start(PING_DELAY, 
+            [&]()
+            {
+                for (auto& [addr, peer] : m_connections)
+                {
+                    if (m_peers.contains(peer->m_nonce))
+                        send_ping(peer);
+                }
+            }
+        );
+    }
 
     const std::vector<std::byte>& get_prefix() const override { return m_config->pool()->m_prefix; }
     void connected(std::shared_ptr<core::Socket> socket) override 
@@ -91,6 +110,7 @@ public:
         error("peer timeout!", service);
     }
 
+    virtual void send_ping(peer_ptr peer) = 0;
     virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
 };
 
