@@ -10,7 +10,7 @@ namespace core::random
     boost::random::mt19937 generator(std::time(nullptr));
 
     ///[min, max)
-    int RandomInt(int min, int max)
+    int random_int(int min, int max)
     {
         if (min == max)
             return min;
@@ -19,7 +19,7 @@ namespace core::random
     }
 
     ///[min, max]
-    float RandomFloat(float min, float max)
+    float random_float(float min, float max)
     {
         float Min = float(min), Max = float(max);
         boost::random::uniform_int_distribution<> rnd(Min, Max);
@@ -36,27 +36,27 @@ namespace core::random
 
         for (int i = 0; i < length; i++)
         {
-            bytes.emplace_back(core::random::RandomInt(0, 256));
+            bytes.emplace_back(core::random::random_int(0, 256));
         }
 		return bytes;
     }
 
 	uint256 random_uint256()
 	{
-		auto bytes = random_bytes(32);
+		auto bytes = core::random::random_bytes(32);
 		uint256 result(bytes);
 		return result;
 	}
 
     ///l = <среднее желаемое число>
-    double Expovariate(double l)
+    double expovariate(double l)
     {
         boost::random::exponential_distribution<double> rnd(l);
         return rnd(generator);
 //        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1 / l);
     }
 
-    unsigned long long randomNonce()
+    unsigned long long random_nonce()
     {
         boost::random::uniform_int_distribution<unsigned long long> rnd(0, 0xFFFFFFFFFFFFFFFF);
         return rnd(generator);

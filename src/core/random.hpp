@@ -6,51 +6,51 @@
 
 namespace core::random
 {
-    ///[min, max)
-    int RandomInt(int min, int max);
+    // [min, max)
+    int random_int(int min, int max);
 
-    ///[min, max]
-    float RandomFloat(float min, float max);
+    // [min, max]
+    float random_float(float min, float max);
 
     std::vector<unsigned char> random_bytes(int32_t length);
 
 	uint256 random_uint256();
 
     template <typename T>
-    T RandomChoice(std::vector<T> &list)
+    T random_choice(std::vector<T> &list)
     {
-        int pos = RandomInt(0, list.size());
+        int pos = core::random::random_int(0, list.size());
         return list[pos];
     }
 
     template <typename T>
-    T RandomChoice(const std::vector<T> &list)
+    T random_choice(const std::vector<T> &list)
     {
-        int pos = RandomInt(0, list.size());
+        int pos = core::random::random_int(0, list.size());
         return list[pos];
     }
 
 
     template <typename Key, typename Value>
-    Value RandomChoice(std::map<Key, Value> _map)
+    Value random_choice(std::map<Key, Value> _map)
     {
-        int pos = RandomInt(0, _map.size());
+        int pos = core::random::random_int(0, _map.size());
         auto item = _map.begin();
         std::advance(item, pos);
         return item->second;
     }
 
     template <typename Value>
-    Value RandomChoice(std::list<Value> _list)
+    Value random_choice(std::list<Value> _list)
     {
-        int pos = RandomInt(0, _list.size());
+        int pos = core::random::random_int(0, _list.size());
         auto item = _list.begin();
         std::advance(item, pos);
         return *item;
     }
 
     ///l = <среднее желаемое число>
-    double Expovariate(double l);
+    double expovariate(double l);
 
-    unsigned long long randomNonce();
+    unsigned long long random_nonce();
 } // namespace core::random
