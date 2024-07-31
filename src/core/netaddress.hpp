@@ -132,15 +132,22 @@ public:
 
 struct addr_t
 {
-    uint64_t m_services;
+    uint64_t m_services { };
     NetService m_endpoint;
+
+    addr_t() { }
+    addr_t(uint64_t services, NetService endpoint) : m_services(services), m_endpoint(endpoint) { }
 
     SERIALIZE_METHODS(addr_t) { READWRITE(obj.m_services, obj.m_endpoint); }
 };
 
 struct addr_record_t : addr_t
 {
-    uint64_t m_timestamp;
+    uint64_t m_timestamp{};
+
+    addr_record_t() : addr_t() {}
+    addr_record_t(addr_t addr, uint64_t timestamp) : addr_t(addr), m_timestamp(timestamp) { }
+    addr_record_t(uint64_t services, NetService endpoint, uint64_t timestamp) : addr_t(services, endpoint), m_timestamp(timestamp) {}
 
     SERIALIZE_METHODS(addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
 };
