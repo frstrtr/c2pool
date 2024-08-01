@@ -18,6 +18,7 @@ find_package(Boost REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 include(CTest)
+include_directories(include)
 include_directories(src)
 
 add_subdirectory(src)
