@@ -1,4 +1,6 @@
-add_library(pool_ltc 
+add_subdirectory(coin)
+
+add_library(ltc_impl 
     config.hpp config.cpp
     node.hpp node.cpp
     peer.hpp
@@ -9,6 +11,6 @@ add_library(pool_ltc
     share_types.hpp share.hpp
 )
 
-target_link_libraries(pool_ltc core pool sharechain)
+target_link_libraries(ltc_impl core pool sharechain)
 
 add_subdirectory(test)
