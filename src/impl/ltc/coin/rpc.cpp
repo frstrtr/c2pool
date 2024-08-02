@@ -6,7 +6,42 @@ namespace ltc
 
 namespace coin
 {
-    
+
+RPCNode::RPCNode(io::io_context* context, RPCAuthData auth, const char* login)
+    : m_context(context), m_resolver(*context), m_stream(*context),
+    m_client(*this, RPC_VER), m_auth(std::make_unique<RPCAuthData>(auth))
+{
+    m_http_request = {http::verb::post, "/", 11};
+
+    m_auth->host = new char[strlen(m_auth->ip) + strlen(m_auth->port) + 2];
+    sprintf(m_auth->host, "%s:%s", m_auth->ip, m_auth->port);
+    m_http_request.set(http::field::host, m_auth->host);
+
+    m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    m_http_request.set(http::field::content_type, "application/json");
+
+    char *encoded_login = new char[32];
+    boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
+    m_auth->authorization = new char[6 + strlen(encoded_login) + 1];
+    sprintf(m_auth->authorization, "Basic %s", encoded_login);
+    m_http_request.set(http::field::authorization, m_auth->authorization);
+    delete[] encoded_login;
+}
+
+RPCNode::~RPCNode()
+{
+    beast::error_code ec;
+	m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+	if (ec)
+	{
+		//TODO:
+	}
+
+	delete[] m_auth->host;
+	delete[] m_auth->authorization;
+}
+
+
 nlohmann::json RPCNode::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
 {
 	try
@@ -15,6 +50,7 @@ nlohmann::json RPCNode::CallAPIMethod(const std::string& method, const jsonrpccx
 	}
 	catch (const jsonrpccxx::JsonRpcException& ex)
 	{
+		throw std::runtime_error("CallAPIMethod error: " + std::string(ex.what()));
         // TODO:
 		// throw libp2p::node_exception("CallAPIMethod error: " + std::string(ex.what()), this);
 	}
