@@ -1,6 +1,6 @@
 #pragma once
 
-#include "coin/types.hpp"
+#include "coin/block.hpp"
 #include "share_types.hpp"
 
 #include <sharechain/sharechain.hpp>

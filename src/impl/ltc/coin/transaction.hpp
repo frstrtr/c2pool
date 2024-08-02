@@ -6,6 +6,10 @@
 
 namespace ltc
 {
+
+namespace coin
+{
+
 struct MutableTransaction;
 
 struct TxParams
@@ -210,5 +214,6 @@ void SerializeTransaction(const TxType& tx, StreamType& s, const TxParams& param
     s << tx.locktime;
 }
 
+} // namespace coin
 
 } // namespace ltc

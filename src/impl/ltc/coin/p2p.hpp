@@ -18,7 +18,7 @@ private:
 
 public:
     P2PNode(io::io_context* context) : m_context(context), m_resolver(*context) { }
-
+    
 };
 
 } // namespace node

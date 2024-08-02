@@ -89,7 +89,7 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
     }
 
     int32_t new_count = 0;
-	std::map<uint256, ltc::MutableTransaction> all_new_txs;
+	std::map<uint256, coin::MutableTransaction> all_new_txs;
 	for (auto& share : shares)
 	{
         auto& new_txs = data.m_txs[share.hash()];
@@ -97,7 +97,7 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 		{
 			for (auto& new_tx : new_txs)
 			{
-                PackStream packed_tx = pack(ltc::TX_WITH_WITNESS(new_tx)); //TODO: WITH_WITNESS?
+                PackStream packed_tx = pack(coin::TX_WITH_WITNESS(new_tx)); //TODO: WITH_WITNESS?
 				all_new_txs[Hash(packed_tx.get_span())] = new_tx;
 			}
 		}
