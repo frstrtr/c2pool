@@ -1,7 +1,5 @@
 #pragma once
 
-#include "coin/types.hpp"
-
 #include <core/pack.hpp>
 #include <core/opscript.hpp>
 #include <core/uint256.hpp>

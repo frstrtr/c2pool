@@ -1,5 +1,7 @@
 #pragma once
 
+#include "block.hpp"
+
 #include <iostream>
 
 #include <core/uint256.hpp>
@@ -8,8 +10,6 @@
 #include <boost/beast.hpp>
 #include <nlohmann/json.hpp>
 #include <jsonrpccxx/client.hpp>
-
-#include "types.hpp"
 
 namespace io = boost::asio;
 namespace beast = boost::beast;
@@ -45,9 +45,8 @@ public:
     // TODO: update for async (maybe c++20 coroutines)
     bool check();
     bool check_blockheader(uint256 header);
-    // void getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
-    // void submit_block();
-    // void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
+    // TODO: void getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
+    void submit_block(BlockType& block); //TODO: p2p node; void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
     // RPC Methods
     nlohmann::json getblocktemplate(std::vector<std::string> rules);

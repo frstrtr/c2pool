@@ -1,7 +1,8 @@
 #pragma once
 
-#include <core/uint256.hpp>
+#include "transaction.hpp"
 
+#include <core/uint256.hpp>
 #include <core/pack_types.hpp>
 #include <core/netaddress.hpp>
 
@@ -58,6 +59,25 @@ struct BlockHeaderType : SmallBlockHeaderType
         return (m_bits == 0);
     }
 
+};
+
+struct BlockType : BlockHeaderType
+{
+	std::vector<MutableTransaction> m_txs;
+
+    SERIALIZE_METHODS(BlockType) { READWRITE(AsBase<BlockHeaderType>(obj), obj.m_txs); }
+
+    BlockType() : BlockHeaderType() { }
+
+    void SetNull()
+    {
+        BlockHeaderType::SetNull();
+    }
+
+    bool IsNull() const
+    {
+        return BlockHeaderType::IsNull();
+    }
 };
 
 } // namespace coin
