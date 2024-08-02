@@ -6,11 +6,10 @@ add_library(ltc_impl
     peer.hpp
     protocol_actual.cpp protocol_legacy.cpp
     transaction.hpp transaction.cpp
-    types.hpp
     messages.hpp
     share_types.hpp share.hpp
 )
 
-target_link_libraries(ltc_impl core pool sharechain)
+target_link_libraries(ltc_impl core pool sharechain ltc_coin_impl)
 
 add_subdirectory(test)

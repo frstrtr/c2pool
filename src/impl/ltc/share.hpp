@@ -1,6 +1,6 @@
 #pragma once
 
-#include "types.hpp"
+#include "coin/types.hpp"
 #include "share_types.hpp"
 
 #include <sharechain/sharechain.hpp>
@@ -46,7 +46,7 @@ namespace ltc
 template <int64_t Version>
 struct BaseShare : chain::BaseShare<uint256, Version>
 {
-    ltc::SmallBlockHeaderType m_min_header;
+    coin::SmallBlockHeaderType m_min_header;
     // prev_hash
     BaseScript m_coinbase;              // coinbase
     uint32_t m_nonce;                   // nonce
