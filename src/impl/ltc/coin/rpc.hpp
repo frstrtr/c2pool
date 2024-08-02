@@ -72,8 +72,13 @@ public:
 		delete[] m_auth.authorization;
     }
 
-    // RPC Methods
+    // TODO: update for async (maybe c++20 coroutines)
+    bool check();
+    bool check_blockheader(uint256 header);
+    // void getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
+    // void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
+    // RPC Methods
     nlohmann::json getblocktemplate(std::vector<std::string> rules);
     nlohmann::json getnetworkinfo();
 	nlohmann::json getblockchaininfo();
