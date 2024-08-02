@@ -16,9 +16,6 @@ struct HandleSharesData;
 
 class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
-protected:
-
-    
 public:
     NodeImpl() {}
     NodeImpl(boost::asio::io_context* ctx, config_t* config) : base_t(ctx, config) {}
@@ -30,9 +27,9 @@ public:
     void send_ping(peer_ptr peer) override;
     pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
     
-
     // ltc
     void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
+    // TODO: rename to processing_get_share
     std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 
 };

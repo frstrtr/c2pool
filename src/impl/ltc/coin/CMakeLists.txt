@@ -1,6 +1,16 @@
-add_library(ltc_coin_impl 
-    p2p.hpp
+
+set(ltc_coin_impl 
     rpc.hpp rpc.cpp
+    p2p.hpp
+    
 )
 
-target_link_libraries(ltc_coin_impl core nlohmann_json::nlohmann_json)
+set(ltc_coin_interface
+    block.hpp
+    transaction.hpp transaction.cpp
+)
+
+
+add_library(ltc_coin ${ltc_coin_interface} ${ltc_coin_impl})
+
+target_link_libraries(ltc_coin core nlohmann_json::nlohmann_json)

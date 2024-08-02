@@ -37,6 +37,7 @@ RPCNode::~RPCNode()
 		//TODO:
 	}
 
+	// move to RPCAuthData
 	delete[] m_auth->host;
 	delete[] m_auth->authorization;
 }
@@ -131,6 +132,11 @@ bool RPCNode::check_blockheader(uint256 header)
     {
         return false;
     }
+}
+
+void RPCNode::submit_block(BlockType& block)
+{
+	
 }
 
 // RPC Methods
