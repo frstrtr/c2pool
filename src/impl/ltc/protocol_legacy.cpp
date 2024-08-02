@@ -87,7 +87,7 @@ void Legacy::HANDLER(shares)
             continue;
         }
 
-        std::vector<ltc::MutableTransaction> txs;
+        std::vector<coin::MutableTransaction> txs;
         share.ACTION
         ({
             if constexpr (share_t::version >= 13 && share_t::version < 34) 
@@ -246,7 +246,7 @@ void Legacy::HANDLER(remember_tx)
         */
     }
 
-    std::map<uint256, ltc::Transaction> added_known_txs;
+    std::map<uint256, coin::Transaction> added_known_txs;
     bool warned = false;
     for (auto tx : msg->m_txs)
 	{

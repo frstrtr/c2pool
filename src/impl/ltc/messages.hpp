@@ -1,7 +1,7 @@
 #pragma once
 
-#include "coin/types.hpp"
-#include "transaction.hpp"
+#include "coin/block.hpp"
+#include "coin/transaction.hpp"
 
 #include <string>
 
@@ -166,10 +166,10 @@ BEGIN_MESSAGE(remember_tx)
     MESSAGE_FIELDS
     (
         (std::vector<uint256>, m_tx_hashes),
-        (std::vector<ltc::MutableTransaction>, m_txs)
+        (std::vector<coin::MutableTransaction>, m_txs)
     )
     {
-        READWRITE(obj.m_tx_hashes, ltc::TX_WITH_WITNESS(obj.m_txs));
+        READWRITE(obj.m_tx_hashes, coin::TX_WITH_WITNESS(obj.m_txs));
     }
 END_MESSAGE()
 

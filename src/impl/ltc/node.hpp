@@ -37,9 +37,9 @@ public:
 struct HandleSharesData
 {
     std::vector<ShareType> m_items;
-    std::map<uint256, std::vector<ltc::MutableTransaction>> m_txs;
+    std::map<uint256, std::vector<coin::MutableTransaction>> m_txs;
 
-    void add(const ShareType& share, std::vector<ltc::MutableTransaction> txs)
+    void add(const ShareType& share, std::vector<coin::MutableTransaction> txs)
     {
         m_items.push_back(share);
         m_txs[share.hash()] = std::move(txs);
