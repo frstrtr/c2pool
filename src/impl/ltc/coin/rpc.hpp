@@ -21,6 +21,7 @@ namespace ltc
 namespace coin
 {
 
+struct RPCAuthData;
 class RPCNode : public jsonrpccxx::IClientConnector
 {
     const std::string ID = "curltest";
@@ -32,50 +33,20 @@ private:
     boost::asio::ip::tcp::resolver m_resolver;
     http::request<http::string_body> m_http_request; 
 
-    RPCAuthData m_auth;
+    std::unique_ptr<RPCAuthData> m_auth;
     jsonrpccxx::JsonRpcClient m_client;
 
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    RPCNode(io::io_context* context, RPCAuthData auth, const char* login)
-        : m_context(context), m_resolver(*context), m_stream(*context),
-        m_client(*this, RPC_VER), m_auth(auth)
-    {
-        m_http_request = {http::verb::post, "/", 11};
-
-        m_auth.host = new char[strlen(m_auth.ip) + strlen(m_auth.port) + 2];
-        sprintf(m_auth.host, "%s:%s", m_auth.ip, m_auth.port);
-        m_http_request.set(http::field::host, m_auth.host);
-
-        m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-        m_http_request.set(http::field::content_type, "application/json");
-
-        char *encoded_login = new char[32];
-        boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
-        m_auth.authorization = new char[6 + strlen(encoded_login) + 1];
-        sprintf(m_auth.authorization, "Basic %s", encoded_login);
-        m_http_request.set(http::field::authorization, m_auth.authorization);
-        delete[] encoded_login;
-    }
-
-    ~RPCNode()
-    {
-        beast::error_code ec;
-		m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
-		if (ec)
-		{
-			//TODO:
-		}
-
-		delete[] m_auth.host;
-		delete[] m_auth.authorization;
-    }
+    RPCNode(io::io_context* context, RPCAuthData auth, const char* login);
+    ~RPCNode();
 
     // TODO: update for async (maybe c++20 coroutines)
     bool check();
     bool check_blockheader(uint256 header);
     // void getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
+    // void submit_block();
     // void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
     // RPC Methods
@@ -88,6 +59,20 @@ public:
 	// verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
 	nlohmann::json getblock(uint256 blockhash, int verbosity = 1);
 	
+};
+
+struct RPCAuthData
+{
+	const char *ip;
+	const char *port;
+	char *authorization; //TODO: char* -> std::string?
+	char *host;          //TODO: char* -> std::string?
+
+	RPCAuthData() = default;
+	RPCAuthData(const char *_ip, const char *_port) : ip(_ip), port(_port)
+	{
+		
+	}
 };
 
 } // namespace coin
