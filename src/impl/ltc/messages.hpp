@@ -1,6 +1,6 @@
 #pragma once
 
-#include "types.hpp"
+#include "coin/types.hpp"
 #include "transaction.hpp"
 
 #include <string>
@@ -121,7 +121,7 @@ END_MESSAGE()
 BEGIN_MESSAGE(bestblock)
     MESSAGE_FIELDS
     (
-        (ltc::BlockHeaderType, m_header)
+        (coin::BlockHeaderType, m_header)
     )
     {
         READWRITE(obj.m_header);

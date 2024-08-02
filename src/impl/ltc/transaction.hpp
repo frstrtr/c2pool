@@ -1,6 +1,6 @@
 #pragma once
 
-#include "types.hpp"
+#include "coin/types.hpp"
 
 #include <core/pack.hpp>
 #include <core/opscript.hpp>
