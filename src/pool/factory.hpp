@@ -6,6 +6,8 @@
 #include <core/addr_store.hpp>
 #include <core/node_interface.hpp>
 
+namespace io = boost::asio;
+
 namespace pool
 {
 struct INetwork
@@ -14,23 +16,17 @@ struct INetwork
     virtual void disconnect() = 0;
 };
 
-class Factory
+class Server
 {
-protected:
-	boost::asio::io_context* m_context;
-	
 private:
 	INetwork* m_node;
-    boost::asio::ip::tcp::resolver m_resolver;
-    boost::asio::ip::tcp::acceptor m_acceptor;
-	
-	core::AddrStore m_addrs;
+	io::ip::tcp::acceptor m_acceptor;
 
-private:
-    void listen()
+protected:
+	void listen()
     {
         m_acceptor.async_accept(
-			[this](boost::system::error_code ec, boost::asio::ip::tcp::socket io_socket)
+			[this](boost::system::error_code ec, io::ip::tcp::socket io_socket)
 			{
 				if (ec)
 				{
@@ -43,7 +39,7 @@ private:
 					// return;
 				}
 
-				auto tcp_socket = std::make_unique<boost::asio::ip::tcp::socket>(std::move(io_socket));
+				auto tcp_socket = std::make_unique<io::ip::tcp::socket>(std::move(io_socket));
 				auto communicator = dynamic_cast<core::ICommunicator*>(m_node);
 				assert(communicator && "INetwork can't be cast to ICommunicator!");
 				
@@ -58,18 +54,12 @@ private:
 		);
     }
 
-public:
-    Factory(boost::asio::io_context* context, std::string coin_name, INetwork* node) : m_context(context), m_addrs(coin_name), m_node(node), m_resolver(*m_context), m_acceptor(*m_context)
+	void run(auto listen_port)
     {
-        
-    }
-
-    void run(auto listen_port)
-    {
-        boost::asio::ip::tcp::endpoint listen_ep(boost::asio::ip::tcp::v4(), listen_port);
+        io::ip::tcp::endpoint listen_ep(io::ip::tcp::v4(), listen_port);
 
         m_acceptor.open(listen_ep.protocol());
-		m_acceptor.set_option(boost::asio::socket_base::reuse_address(true));
+		m_acceptor.set_option(io::socket_base::reuse_address(true));
 		m_acceptor.bind(listen_ep);
 		m_acceptor.listen();
 		listen();
@@ -77,8 +67,47 @@ public:
 		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
 
-	void got_addr(NetService addr, uint64_t services, uint64_t timestamp);
-	std::vector<core::AddrStorePair> get_good_peers(size_t max_count);
+public:
+	Server(io::io_context* context, INetwork* node) : m_acceptor(*context)
+	{
+
+	}
+};
+
+class Client
+{
+private:
+	INetwork* m_node;
+    io::ip::tcp::resolver m_resolver;
+
+public:
+	Client(io::io_context* context, INetwork* node) : m_resolver(*context), m_node(node)
+	{
+
+	}
+};
+
+template<typename T>
+concept FactoryComponent = std::is_same_v<Server, T> || std::is_same_v<Client, T>;
+
+template <FactoryComponent...Components> 
+class Factory : public Components...
+{
+	io::io_context* m_context;
+	INetwork* m_node;
+	
+
+public:
+
+	Factory(io::io_context* context, INetwork* node) : m_context(context), m_node(node) 
+	{
+
+	}
+
+    void run()
+    {
+
+    }
 };
 
 } // namespace pool

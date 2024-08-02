@@ -6,9 +6,12 @@
 #include <pool/factory.hpp>
 #include <pool/peer.hpp>
 #include <pool/protocol.hpp>
+#include <core/common.hpp>
 #include <core/socket.hpp>
 #include <core/message.hpp>
 #include <core/config.hpp>
+#include <core/random.hpp>
+#include <core/addr_store.hpp>
 
 namespace pool
 {
@@ -20,7 +23,7 @@ class NodeInterface : public core::ICommunicator, public INetwork
 };
 
 template <typename ConfigType, typename ShareChainType, typename PeerData>
-class BaseNode : public NodeInterface, public Factory
+class BaseNode : public NodeInterface, public Factory<Server, Client>
 {
     // For implementation override:
     //  INetwork:
@@ -40,8 +43,10 @@ public:
     using config_t = ConfigType;
 
 protected:
+    boost::asio::io_context* m_context;
     config_t* m_config; // todo: init
     ShareChainType* m_chain; // todo: init
+    core::AddrStore m_addrs;
 
     uint64_t m_nonce; // node_id todo: init
     std::map<NetService, peer_ptr> m_connections;
@@ -50,12 +55,12 @@ protected:
     std::unique_ptr<core::Timer> m_ping_timer;
 
 public:
-    BaseNode() : Factory(nullptr, "", this) {}
+    BaseNode() : Factory<Server, Client>(nullptr, this), m_addrs("") {}
     BaseNode(boost::asio::io_context* context, config_t* config) 
-        : Factory(context, config->m_name, this), m_config(config) 
+        : Factory<Server, Client>(context, this), m_context(context), m_addrs(config->m_name), m_config(config) 
     {
         // ping timer for all peers
-        m_ping_timer = std::make_unique<core::Timer>(Factory::m_context, true);
+        m_ping_timer = std::make_unique<core::Timer>(m_context, true);
         m_ping_timer->start(PING_DELAY, 
             [&]()
             {
@@ -76,7 +81,7 @@ public:
         // move peer to m_connections
         m_connections[socket->get_addr()] = peer;
         // configure peer timeout timer
-        peer->m_timeout = std::make_unique<core::Timer>(Factory::m_context, true);
+        peer->m_timeout = std::make_unique<core::Timer>(m_context, true);
         peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, addr = peer->addr()](){ timeout(addr); });
 
         LOG_INFO << socket->get_addr().to_string() << " try to connect!";
@@ -108,6 +113,46 @@ public:
     void timeout(const NetService& service)
     {
         error("peer timeout!", service);
+    }
+
+    void got_addr(NetService addr, uint64_t services, uint64_t timestamp)
+    {
+    	if (m_addrs.check(addr))
+    	{
+    		auto old = m_addrs.get(addr);
+    		m_addrs.update(addr, {services, old.m_first_seen, std::max(old.m_last_seen, timestamp)});
+    	}
+    	else
+    	{
+    		if (m_addrs.len() < 10000)
+    			m_addrs.add(addr, {services, timestamp, timestamp});
+    	}
+    }
+
+	std::vector<core::AddrStorePair> get_good_peers(size_t max_count)
+    {
+	    auto t = core::timestamp();
+
+        std::vector<std::pair<float, core::AddrStorePair>> values;
+	    for (auto pair : m_addrs.get_all())
+	    {
+	    	values.push_back(
+	    			std::make_pair(
+	    					-log(std::max(uint64_t(3600), pair.value.m_last_seen - pair.value.m_first_seen)) / log(std::max(uint64_t(3600), t - pair.value.m_last_seen)) * core::random::expovariate(1),
+	    					pair)
+            );
+	    }
+
+	    std::sort(values.begin(), values.end(), [](const auto& a, auto b)
+	    { return a.first < b.first; });
+
+	    values.resize(std::min(values.size(), max_count));
+	    std::vector<core::AddrStorePair> result;
+	    for (const auto& v : values)
+	    {
+	    	result.push_back(v.second);
+	    }
+	    return result;
     }
 
     virtual void send_ping(peer_ptr peer) = 0;
