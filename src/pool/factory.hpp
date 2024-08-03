@@ -54,6 +54,12 @@ protected:
 		);
     }
 
+public:
+	Server(io::io_context* context, INetwork* node) : m_acceptor(*context), m_node(node)
+	{
+
+	}
+
 	void run(auto listen_port)
     {
         io::ip::tcp::endpoint listen_ep(io::ip::tcp::v4(), listen_port);
@@ -66,12 +72,6 @@ protected:
 
 		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
-
-public:
-	Server(io::io_context* context, INetwork* node) : m_acceptor(*context)
-	{
-
-	}
 };
 
 class Client
@@ -96,18 +96,16 @@ class Factory : public Components...
 	io::io_context* m_context;
 	INetwork* m_node;
 	
-
 public:
-
-	Factory(io::io_context* context, INetwork* node) : m_context(context), m_node(node) 
+	Factory(io::io_context* context, INetwork* node) : m_context(context), m_node(node), Components(context, node)...
 	{
 
 	}
 
-    void run()
-    {
+    // void run()
+    // {
 
-    }
+    // }
 };
 
 } // namespace pool
