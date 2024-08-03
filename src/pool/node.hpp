@@ -3,10 +3,10 @@
 #include <map>
 #include <source_location>
 
-#include <pool/factory.hpp>
 #include <pool/peer.hpp>
 #include <pool/protocol.hpp>
 #include <core/common.hpp>
+#include <core/factory.hpp>
 #include <core/socket.hpp>
 #include <core/message.hpp>
 #include <core/config.hpp>
@@ -18,12 +18,21 @@ namespace pool
 
 std::string parse_net_error(const boost::system::error_code& ec);
 
-class NodeInterface : public core::ICommunicator, public INetwork
+class NodeInterfaces : public core::ICommunicator, public core::INetwork
 {
+    //-core::ICommmunicator:
+    // void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+    // void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) = 0;
+    // void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) = 0;
+    // const std::vector<std::byte>& get_prefix() const = 0;
+    //
+    //-core::INetwork:
+    // void connected(std::shared_ptr<core::Socket> socket) = 0;
+    // void disconnect() = 0;
 };
 
 template <typename ConfigType, typename ShareChainType, typename PeerData>
-class BaseNode : public NodeInterface, public Factory<Server, Client>
+class BaseNode : public NodeInterfaces, public core::Factory<core::Server, core::Client>
 {
     // For implementation override:
     //  INetwork:
