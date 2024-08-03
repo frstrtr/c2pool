@@ -8,7 +8,7 @@
 
 namespace io = boost::asio;
 
-namespace pool
+namespace core
 {
 struct INetwork
 {
@@ -149,11 +149,6 @@ public:
 	{
 
 	}
-
-    // void run()
-    // {
-
-    // }
 };
 
-} // namespace pool
+} // namespace core

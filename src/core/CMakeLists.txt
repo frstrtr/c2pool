@@ -2,7 +2,7 @@
 
 set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp events.hpp disposable.hpp)
 
-set(network_sources message.hpp socket.cpp socket.hpp)
+set(network_sources message.hpp socket.cpp socket.hpp factory.hpp)
 
 set(btclib_sources hash.hpp hash.cpp uint256.hpp uint256.cpp)
 
