@@ -65,7 +65,7 @@ struct BlockType : BlockHeaderType
 {
 	std::vector<MutableTransaction> m_txs;
 
-    SERIALIZE_METHODS(BlockType) { READWRITE(AsBase<BlockHeaderType>(obj), obj.m_txs); }
+    SERIALIZE_METHODS(BlockType) { READWRITE(AsBase<BlockHeaderType>(obj), TX_WITH_WITNESS(obj.m_txs)); }
 
     BlockType() : BlockHeaderType() { }
 

@@ -6,7 +6,7 @@
 #include <string>
 
 #include <core/message.hpp>
-#include <pool/message_macro.hpp>
+#include <core/message_macro.hpp>
 #include <sharechain/share.hpp>
 
 namespace ltc

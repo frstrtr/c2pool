@@ -1,4 +1,4 @@
-#include "p2p.hpp"
+#include "p2p_node.hpp"
 
 namespace ltc
 {
