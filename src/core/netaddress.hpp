@@ -105,7 +105,8 @@ public:
     NetService(const boost::asio::ip::tcp::endpoint& ep) : NetAddress(ep.address()), m_port(ep.port()) { }
 
     uint16_t port() const { return m_port; }
-    std::string to_string() const { return m_ip + ":" + std::to_string(m_port); }
+    std::string port_str() const { return std::to_string(m_port); }
+    std::string to_string() const { return m_ip + ":" + port_str(); }
 
     SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<16, true>>(obj.m_port)); }
 
