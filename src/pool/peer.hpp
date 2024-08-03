@@ -46,6 +46,12 @@ public:
         m_socket->write(std::move(rmsg));
     }
 
+    void stable(PeerConnectionType type, time_t new_timeout_time)
+    {
+        set_type(type);
+        m_timeout->restart(new_timeout_time); // change timeout, example: 10s -> 100s
+    }
+
     NetService addr() const
     {
         return m_socket->get_addr();
