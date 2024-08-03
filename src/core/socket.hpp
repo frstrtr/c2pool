@@ -102,6 +102,11 @@ public:
         m_status = false;
         m_socket->close();
     }
+
+    auto raw()
+    {
+        return m_socket.get();
+    }
     //=====================
 
     void write(std::unique_ptr<RawMessage> msg_data)
@@ -121,5 +126,14 @@ public:
         );
     }
 };
+
+template <typename CommunicatorNode>
+std::shared_ptr<core::Socket> make_socket(std::unique_ptr<boost::asio::ip::tcp::socket> tcp_socket, core::connection_type type, CommunicatorNode* node)
+{
+	auto communicator = dynamic_cast<core::ICommunicator*>(node);
+	assert(communicator && "INetwork can't be cast to ICommunicator!");
+	auto socket = std::make_shared<core::Socket>(std::move(tcp_socket), type, communicator);
+    return socket;
+}
 
 } // namespace core
