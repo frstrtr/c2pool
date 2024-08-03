@@ -199,8 +199,7 @@ public:
                 return;
             }
             assert(peer_type != PeerConnectionType::unknown); // peer_type is "unknown" after message_version!
-            peer->set_type(peer_type);
-            peer->m_timeout->restart(Base::PEER_TIMEOUT_TIME); // change timeout 10s -> 100s
+            peer->stable(peer_type, Base::PEER_TIMEOUT_TIME); // after message_version a stable connection is established.
             return;
         }
 

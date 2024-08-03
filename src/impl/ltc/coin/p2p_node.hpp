@@ -1,5 +1,9 @@
 #pragma once
 
+#include "p2p_messages.hpp"
+
+#include <memory>
+
 #include <boost/asio.hpp>
 
 #include <core/config.hpp>
@@ -7,9 +11,14 @@
 
 namespace io = boost::asio;
 
+#define ADD_HANDLER(name)\
+    void handle_ ##name (std::unique_ptr<ltc::coin::p2p::message_##name> msg)
 namespace ltc
 {
 namespace coin
+{
+
+namespace p2p
 {
 
 std::string parse_net_error(const boost::system::error_code& ec);
@@ -92,7 +101,107 @@ public:
     {
         return m_config->coin()->m_prefix;
     }
+
+    //[x][x][x]  void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
+    //[x][x][ ] void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, CoindProtocol* protocol); //
+    //[x][x][x] void handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, CoindProtocol* protocol); // 
+    //[x][x][x] void handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, CoindProtocol* protocol); //
+    //[x][x][ ] void handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, CoindProtocol* protocol); //
+    //[x][x][ ] void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol); //
+    //[x][x][ ] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
+
+private:
+    ADD_HANDLER(version)
+    {
+        auto verack_msg = message_verack::make_raw();
+        m_socket->write(verack_msg);
+    }
+
+    ADD_HANDLER(verack)
+    {
+        // TODO:
+        // self.get_block = deferral.ReplyMatcher(lambda hash: self.send_getdata(requests=[dict(type='block', hash=hash)]))
+        // self.get_block_header = deferral.ReplyMatcher(lambda hash: self.send_getheaders(version=1, have=[], last=hash))
+
+        // connected()
+    }
+
+    ADD_HANDLER(ping)
+    {
+        auto msg_pong = message_pong::make_raw(msg->m_nonce);
+        m_socket->write(msg_pong);
+    }
+    
+    ADD_HANDLER(pong)
+    {
+        // just handled pong
+    }
+
+    ADD_HANDLER(alert)
+    {
+        LOG_WARNING << "Handled message_alert signature: " << msg->m_signature;
+    }
+
+    ADD_HANDLER(inv)
+    {
+        std::vector<inventory_type> vinv;
+        
+        for (auto& inv : msg->m_invs)
+        {
+            switch (inv.m_type)
+            {
+            case inventory_type::tx:
+                vinv.push_back(inv);
+                break;
+            case inventory_type::block:
+                //TODO: new_block->happened(inv.hash);
+            default:
+                LOG_WARNING << "Unknown inv type";
+                break;
+            }
+        }
+
+        if (!vinv.empty())
+        {
+            auto msg_getdata = message_getdata::make_raw(vinv);
+            m_socket->write(msg_getdata);
+        }
+    }
+
+    ADD_HANDLER(tx)
+    {
+        // new_tx->happened(msg->m_tx);
+    }
+
+    ADD_HANDLER(block)
+    {
+        // TODO: 
+        // auto packed_header = pack(msg->m_block);
+        // auto blockhash = Hash(packed_header.get_span()); // block_type -> block_header_type
+        // get_block.got_response(blockhash, block);
+        // get_block.got_response(block_hash, block['header']);
+    }
+
+    ADD_HANDLER(headers)
+    {
+        std::vector<BlockHeaderType> vheaders;
+
+        for (auto block : msg->m_headers)
+        {
+            // auto packed_header = pack(block);
+            // auto blockhash = Hash(packed_header.get_span()); // block_type -> block_header_type
+            // self.get_block_header.got_response(bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header)), header)
+        }
+
+        // new_headers->happened(vheaders);
+    }
+
+    #undef ADD_HANDLER
 };
+
+} // namespace p2p
 
 } // namespace node
 

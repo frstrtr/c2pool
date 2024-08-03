@@ -15,6 +15,9 @@ namespace ltc
 namespace coin
 {
 
+namespace p2p
+{
+
 //[+] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
 //[+] void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol); //
 //[+] void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol); //
@@ -102,6 +105,16 @@ BEGIN_MESSAGE(inv)
     }
 END_MESSAGE()
 
+BEGIN_MESSAGE(getdata)
+    MESSAGE_FIELDS
+    (
+        (std::vector<inventory_type>, m_requests)
+    )
+    {
+        READWRITE(obj.m_requests);
+    }
+END_MESSAGE()
+
 BEGIN_MESSAGE(tx)
     MESSAGE_FIELDS
     (
@@ -132,6 +145,7 @@ BEGIN_MESSAGE(headers)
     }
 END_MESSAGE()
 
+} // namespace p2p
 
 } // namespace coin
 
