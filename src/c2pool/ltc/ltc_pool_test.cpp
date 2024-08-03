@@ -27,7 +27,7 @@ int main(int argc, char *argv[])
     LOG_INFO << "Prefix: " << HexStr(config->m_prefix);
 
     auto* node = new ltc::Node(context, config);
-    node->run(5555);
+    node->listen(5555);
     // Node* node = new Node(context, prefix);
     // node->run(5555);
     context->run();
