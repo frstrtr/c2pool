@@ -23,7 +23,7 @@ private:
 	io::ip::tcp::acceptor m_acceptor;
 
 protected:
-	void listen()
+	void accept()
     {
         m_acceptor.async_accept(
 			[this](boost::system::error_code ec, io::ip::tcp::socket io_socket)
@@ -40,16 +40,13 @@ protected:
 				}
 
 				auto tcp_socket = std::make_unique<io::ip::tcp::socket>(std::move(io_socket));
-				auto communicator = dynamic_cast<core::ICommunicator*>(m_node);
-				assert(communicator && "INetwork can't be cast to ICommunicator!");
-				
-				auto socket = std::make_shared<core::Socket>(std::move(tcp_socket), core::connection_type::incoming, communicator);
+				auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::incoming, m_node);
 				socket->init();
 				
 				m_node->connected(socket);
 				
 				// continue accept connections
-				listen();
+				accept();
 			}
 		);
     }
@@ -60,7 +57,7 @@ public:
 
 	}
 
-	void run(auto listen_port)
+	void listen(auto listen_port)
     {
         io::ip::tcp::endpoint listen_ep(io::ip::tcp::v4(), listen_port);
 
@@ -68,7 +65,7 @@ public:
 		m_acceptor.set_option(io::socket_base::reuse_address(true));
 		m_acceptor.bind(listen_ep);
 		m_acceptor.listen();
-		listen();
+		accept();
 
 		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
@@ -78,12 +75,63 @@ class Client
 {
 private:
 	INetwork* m_node;
+	io::io_context* m_context;
     io::ip::tcp::resolver m_resolver;
 
-public:
-	Client(io::io_context* context, INetwork* node) : m_resolver(*context), m_node(node)
+	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
+		auto tcp_socket = std::make_unique<io::ip::tcp::socket>(*m_context);
+		auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::outgoing, m_node);
+		
+		io::async_connect(*socket->raw(), endpoints, 
+			[&, socket = std::move(socket)]
+			(const auto& ec, boost::asio::ip::tcp::endpoint ep)
+			{
+				if (ec)
+				{
+					if (ec != boost::system::errc::operation_canceled)
+						{}//TODO: error(libp2p::ASIO_ERROR, "CoindConnector::connect_socket: " + ec.message(), NetAddress{ep});
+					else
+						LOG_DEBUG_COIND << "Factory::Client::connect_socket canceled";
+					return;
+				}
 
+				LOG_INFO << "Factory::Client::connect_socket try handshake with " << ep.address() << ":" << ep.port();
+				socket->init();
+
+				m_node->connected(socket);
+			}
+		);
+	}
+
+	void resolve(const NetService& addr)
+	{
+		m_resolver.async_resolve(addr.address(), addr.port_str(), 
+			[&, addr = addr](const auto& ec, auto endpoints)
+			{
+				if (ec)
+				{
+					if (ec != boost::system::errc::operation_canceled)
+						{}//TODO: error(libp2p::ASIO_ERROR, "CoindConnector::try_connect: " + ec.message(), address);
+					else
+						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";
+					return;
+				}
+
+				connect_socket(endpoints);
+			}
+		);
+	}
+
+public:
+	Client(io::io_context* context, INetwork* node) : m_context(context), m_resolver(*context), m_node(node)
+	{
+	}
+
+	void connect(NetService addr)
+	{
+		LOG_DEBUG_OTHER << "Factory::Client try to resolve: " << addr.to_string();
+		resolve(addr);
 	}
 };
 
