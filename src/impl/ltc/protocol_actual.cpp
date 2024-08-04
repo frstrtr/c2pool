@@ -4,7 +4,19 @@ namespace ltc
 {
     
 void Actual::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
-{ 
+{
+    ltc::Handler::result_t result;
+    try 
+    {
+        result = m_handler.parse(rmsg);
+    } catch (const std::runtime_error& ec)
+    {
+        // todo: error
+        return;
+    }
+
+    std::visit([&](auto& msg){ handle(std::move(msg), peer); }, result);
+
     std::cout << "c2pool msg " << rmsg->m_command << std::endl;
 }
 

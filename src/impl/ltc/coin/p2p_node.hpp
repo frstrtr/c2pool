@@ -12,7 +12,7 @@
 namespace io = boost::asio;
 
 #define ADD_HANDLER(name)\
-    void handle_ ##name (std::unique_ptr<ltc::coin::p2p::message_##name> msg)
+    void handle(std::unique_ptr<ltc::coin::p2p::message_##name> msg)
 namespace ltc
 {
 namespace coin
@@ -44,6 +44,7 @@ class P2PNode : public NodeInterfaces, private core::Factory<core::Client>
 private:
     io::io_context* m_context;
     config_t* m_config;
+    p2p::Handler m_handler;
 
     std::shared_ptr<core::Socket> m_socket;
 
@@ -94,7 +95,17 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
+        p2p::Handler::result_t result;
+        try 
+        {
+            result = m_handler.parse(rmsg);
+        } catch (const std::runtime_error& ec)
+        {
+            // todo: error
+            return;
+        }
 
+        std::visit([&](auto& msg){ handle(std::move(msg)); }, result);
     }
 
     const std::vector<std::byte>& get_prefix() const override

@@ -173,4 +173,19 @@ BEGIN_MESSAGE(remember_tx)
     }
 END_MESSAGE()
 
+using Handler = MessageHandler<
+    message_ping,
+    message_addrme,
+    message_getaddrs,
+    message_addrs,
+    message_shares,
+    message_sharereq,
+    message_sharereply,
+    message_bestblock,
+    message_have_tx,
+    message_losing_tx,
+    message_forget_tx,
+    message_remember_tx
+>;
+
 } // namespace ltc
