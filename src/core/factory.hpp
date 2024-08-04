@@ -84,7 +84,7 @@ private:
 		auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::outgoing, m_node);
 		
 		io::async_connect(*socket->raw(), endpoints, 
-			[&, socket = std::move(socket)]
+			[&, socket = socket]
 			(const auto& ec, boost::asio::ip::tcp::endpoint ep)
 			{
 				if (ec)
@@ -111,6 +111,7 @@ private:
 			{
 				if (ec)
 				{
+					
 					if (ec != boost::system::errc::operation_canceled)
 						{}//TODO: error(libp2p::ASIO_ERROR, "CoindConnector::try_connect: " + ec.message(), address);
 					else
