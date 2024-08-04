@@ -36,6 +36,7 @@ add_executable(check_node check_node.cpp)
 add_executable(condition_cl condition_cl.cpp)
 add_executable(message_parser message_parser.cpp)
 add_executable(base_node_check base_node_check.cpp)
+add_executable(type_creator type_creator.cpp)
 add_executable(test_uint_hasher test_uint_hasher.cpp)
 target_link_libraries(test_uint_hasher btclibs core)
 
@@ -48,6 +49,9 @@ target_compile_features(get_chain_test PRIVATE cxx_std_20)
 
 add_executable(parse_bitcoin_index parse_bitcoin_index.cpp)
 target_link_libraries(parse_bitcoin_index btclibs)
+
+add_executable(reply_matcher_test reply_matcher_test.cpp)
+target_link_libraries(reply_matcher_test core)
 
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
