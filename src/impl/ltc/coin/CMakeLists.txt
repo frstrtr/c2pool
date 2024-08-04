@@ -1,11 +1,13 @@
 
 set(ltc_coin_impl 
     rpc.hpp rpc.cpp
-    p2p_node.hpp p2p_node.cpp
+    p2p_connection.hpp p2p_connection.cpp
+    p2p_node.cpp p2p_node.hpp 
     p2p_messages.hpp
 )
 
 set(ltc_coin_interface
+    node_interface.hpp
     block.hpp
     transaction.hpp transaction.cpp
 )
