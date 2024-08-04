@@ -219,9 +219,9 @@ public:
 };
 
 #define ADD_HANDLER(name, msg_type)\
-    void handle_ ##name (std::unique_ptr<msg_type> msg, peer_ptr peer)
+    void handle (std::unique_ptr<msg_type> msg, peer_ptr peer)
 
 #define HANDLER(name)\
-    handle_ ##name (std::unique_ptr<message_ ##name> msg, peer_ptr peer)
+    handle (std::unique_ptr<message_ ##name> msg, peer_ptr peer)
 
 } // namespace pool
