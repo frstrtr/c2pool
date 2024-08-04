@@ -5,6 +5,9 @@ namespace ltc
 namespace coin
 {
 
+namespace p2p
+{
+
 std::string parse_net_error(const boost::system::error_code& ec)
 {
     switch (ec.value())
@@ -15,6 +18,8 @@ std::string parse_net_error(const boost::system::error_code& ec)
         return "???";
     }
 }
+
+} // p2p
 
 } // namespace coin
 
