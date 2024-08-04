@@ -1,6 +1,7 @@
 #include <iostream>
 #include <memory>
 
+#include <core/events.hpp>
 #include <core/log.hpp>
 #include <core/settings.hpp>
 #include <btclibs/util/strencodings.h>
