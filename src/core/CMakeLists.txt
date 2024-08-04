@@ -1,6 +1,6 @@
 # file(GLOB configs_source "configs/*.hpp" "configs/*.cpp")
 
-set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp events.hpp disposable.hpp)
+set(legacy_sources legacy/packv1.hpp legacy/pack_typesv1.hpp math.hpp math.cpp)
 
 set(network_sources message_macro.hpp message.hpp socket.cpp socket.hpp factory.hpp)
 
@@ -17,6 +17,9 @@ set(source
     filesystem.hpp
     pack.hpp pack_types.hpp
     ${btclib_sources}
+    reply_matcher.hpp 
+    events.hpp 
+    disposable.hpp
     ${legacy_sources}
     common.hpp common.cpp
     ${network_sources}
