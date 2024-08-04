@@ -92,6 +92,9 @@ struct inventory_type
     inv_type m_type;
     uint256 m_hash;
 
+    inventory_type() { }
+    inventory_type(inv_type type, uint256 hash) : m_type(type), m_hash(hash) { }
+
     SERIALIZE_METHODS(inventory_type) {READWRITE(Using<EnumType<IntType<32>>>(obj.m_type), obj.m_hash);}
 };
 
@@ -112,6 +115,30 @@ BEGIN_MESSAGE(getdata)
     )
     {
         READWRITE(obj.m_requests);
+    }
+END_MESSAGE()
+
+BEGIN_MESSAGE(getblocks)
+    MESSAGE_FIELDS
+    (
+        (uint32_t, m_version),
+        (std::vector<uint256>, m_have),
+        (uint256, m_last)
+    )
+    {
+        READWRITE(obj.m_version, obj.m_have, obj.m_last);
+    }
+END_MESSAGE()
+
+BEGIN_MESSAGE(getheaders)
+    MESSAGE_FIELDS
+    (
+        (uint32_t, m_version),
+        (std::vector<uint256>, m_have),
+        (uint256, m_last)
+    )
+    {
+        READWRITE(obj.m_version, obj.m_have, obj.m_last);
     }
 END_MESSAGE()
 
