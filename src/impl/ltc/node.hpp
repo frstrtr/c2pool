@@ -16,6 +16,9 @@ struct HandleSharesData;
 
 class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
+protected:
+    ltc::Handler m_handler;
+    
 public:
     NodeImpl() {}
     NodeImpl(boost::asio::io_context* ctx, config_t* config) : base_t(ctx, config) {}

@@ -145,6 +145,18 @@ BEGIN_MESSAGE(headers)
     }
 END_MESSAGE()
 
+using Handler = MessageHandler<
+    message_version,
+    message_verack,
+    message_ping,
+    message_pong,
+    message_alert,
+    message_inv,
+    message_tx,
+    message_block,
+    message_headers
+>;
+
 } // namespace p2p
 
 } // namespace coin
