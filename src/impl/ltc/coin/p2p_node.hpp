@@ -67,7 +67,7 @@ public:
 
     void disconnect() override
     {
-
+        
     }
 
     // ICommmunicator

@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <vector>
+#include <functional>
 
 class Disposables;
 class IDisposable
@@ -13,69 +14,43 @@ public:
 
 class Disposables
 {
-public:
-    std::vector<std::unique_ptr<IDisposable>> dis;
+    std::vector<std::shared_ptr<IDisposable>> m_disposables;
 
-    void attach(std::unique_ptr<IDisposable> value)
+public:
+    void attach(std::shared_ptr<IDisposable> value)
     {
-        dis.push_back(std::move(value));
+        if (value)
+            m_disposables.push_back(std::move(value));
     };
 
     void dispose()
     {
-        for (auto& v : dis)
+        for (auto& v : m_disposables)
         {
             v->dispose();
         }
-        dis.clear();
+        m_disposables.clear();
     }
 };
 
-class BasicDisposable : public IDisposable
-{
-    std::function<void()> _dispose;
+// class BasicDisposable : public IDisposable
+// {
+//     std::function<void()> m_dispose;
 
-public:
-    BasicDisposable(std::function<void()>&& dispose_func)
-        : _dispose(std::move(dispose_func))
-    {
+// public:
+//     BasicDisposable(std::function<void()>&& dispose_func)
+//         : m_dispose(std::move(dispose_func))
+//     {
 
-    }
+//     }
 
-    void attach(Disposables& dis) override
-    {
-        dis.attach(std::make_unique<BasicDisposable>(*this));
-    }
+//     void attach(Disposables& dis) override
+//     {
+//         dis.attach(std::make_unique<BasicDisposable>(*this));
+//     }
 
-    void dispose() override
-    {
-        _dispose();
-    }
-};
-
-class EventDisposable : public IDisposable
-{
-    int _id;
-    std::function<void(int)> _dispose;
-
-public:
-    EventDisposable(int id, std::function<void(int)>&& dispose_func) 
-        : _id(id), _dispose(std::move(dispose_func))
-    {
-    }
-
-    operator int() const
-    {
-        return _id;
-    }
-
-    void attach(Disposables& dis) override
-    {
-        dis.attach(std::make_unique<EventDisposable>(*this));
-    }
-
-    void dispose() override
-    {
-        _dispose(_id);
-    }
-};
+//     void dispose() override
+//     {
+//         _dispose();
+//     }
+// };

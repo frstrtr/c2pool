@@ -9,7 +9,18 @@
 namespace core
 {
 
-inline std::function<int()> count_generator();
+class Counter
+{
+private:
+    int m_count = 0;
+
+public:
+    int operator()()
+    {
+        m_count++;
+        return m_count;
+    }
+};
 
 struct debug_timestamp
 {

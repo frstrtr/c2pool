@@ -12,6 +12,7 @@ set(source
     config.hpp
     # ${configs_source}
     log.hpp log.cpp
+    events.hpp
     timer.hpp
     filesystem.hpp
     pack.hpp pack_types.hpp

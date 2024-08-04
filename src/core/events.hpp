@@ -1,366 +1,212 @@
 #pragma once
 
-#include <boost/signals2.hpp>
 #include <map>
-#include <vector>
-#include <functional>
 #include <memory>
 
 #include <core/common.hpp>
-// #include "deferred.h"
-#include "disposable.hpp"
+#include <core/disposable.hpp>
 
-//Example:
-//Event<item_type> remove_special = make_event<item_type>();
-//remove_special.subscribe(&Tracker<delta_type, item_type>::_handle_remove_special, this, _1);
-//void _handle_remove_special(item_type item);
-//remove_special.happened(item);
+#include <boost/signals2.hpp>
 
-template<typename... Args>
-class _Event
+class EventDisposable : public IDisposable, public std::enable_shared_from_this<EventDisposable>
 {
-    boost::signals2::signal<void(Args...)> sig;
-    boost::signals2::signal<void()> sig_anon; //For subs without arguments;
-    int times;
-
-    boost::signals2::signal<void(Args...)> once;
-
-    std::function<int()> get_id;
-    std::map<int, boost::signals2::connection> unsub_by_id;
-
-private:
-    _Event()
-    {
-        get_id = c2pool::count_generator();
-        sig = boost::signals2::signal<void(Args...)>();
-        sig_anon = boost::signals2::signal<void()>();
-        once = boost::signals2::signal<void(Args...)>();
-        times = 0;
-    }
+    int m_id;
+    std::function<void(int)> m_dispose_func;
 
 public:
-    //for std::function/lambda
-    template<typename Lambda>
-    EventDisposable subscribe(Lambda _f)
+    EventDisposable(int id, std::function<void(int)> dispose_func) 
+        : m_id(id), m_dispose_func(std::move(dispose_func))
     {
-        boost::signals2::connection bc = sig.connect(_f);
-
-        auto id = get_id();
-        unsub_by_id[id] = std::move(bc);
-
-        return EventDisposable(id, [&](int _id){ unsubscribe(_id); });
     }
 
-    EventDisposable subscribe(const std::function<void()>& _f)
+    operator int() const
     {
-        boost::signals2::connection bc = sig_anon.connect(_f);
-
-        auto id = get_id();
-        unsub_by_id[id] = std::move(bc);
-
-        return EventDisposable(id, [&](int _id){ unsubscribe(_id); });
+        return m_id;
     }
 
-    template<typename Lambda>
-    void subscribe_once(Lambda _f)
+    void attach(Disposables& dis) override
     {
-        once.connect(_f);
+        auto shared_this = shared_from_this();
+        dis.attach(shared_this);
     }
 
-    EventDisposable run_and_subscribe(std::function<void()> _f)
+    void dispose() override
     {
-        _f();
-        return subscribe(_f);
+        m_dispose_func(m_id);
     }
 
-	void unsubscribe(int id)
+    static std::shared_ptr<EventDisposable> make(int id, std::function<void(int)> dispose_func)
+    {
+        auto result = std::make_shared<EventDisposable>(id, dispose_func);
+        return result;
+    }
+};
+
+template <typename...Args>
+class EventData
+{
+    // TODO: add subscribe_once?
+private:
+    core::Counter m_idcounter;
+    uint32_t m_times;
+
+public:
+    boost::signals2::signal<void(Args...)> m_sig;
+    boost::signals2::signal<void()> m_sig_anon; // For subs without args
+    
+    
+    std::map<int, boost::signals2::connection> m_subs;
+
+    auto get_id()
+    {
+        return m_idcounter();
+    }
+
+    auto get_times() const
+    {
+        return m_times;
+    }
+
+    void disconnect(int id)
 	{
-//        //Дисконнект устроен по принципу:
-//        //signals2::connection bc = w.Signal.connect(bind(&Object::doSomething, o));
-//        //bc.disconnect();
-//        //return bc;
-        if (unsub_by_id.find(id) != unsub_by_id.end())
+        //Дисконнект устроен по принципу:
+        //signals2::connection bc = w.Signal.connect(bind(&Object::doSomething, o));
+        //bc.disconnect();
+        //return bc;
+        if (m_subs.contains(id))
         {
-            unsub_by_id[id].disconnect();
+            m_subs[id].disconnect();
         }
 	}
 
-    void happened(const Args & ... args)
+    template <typename Handler, typename DisposeFunc>
+    auto connect(Handler func, DisposeFunc dispose_func)
     {
-        times += 1;
+        auto id = get_id();
+        m_subs[id] = m_sig.connect(func);
 
-        if (!sig.empty())
-            sig(args...);
-        if (!sig_anon.empty())
-            sig_anon();
-        if(!once.empty())
-        {
-            once(args...);
-            once.disconnect_all_slots();
-        }
+        return EventDisposable::make(id, [this](int id) { disconnect(id); });
     }
 
-    int get_times() const
+    auto connect(std::function<void()> func)
     {
-        return times;
+        auto id = get_id();
+        m_subs[id] = m_sig_anon.connect(func);
+
+        return EventDisposable::make(id, [this](int id) { disconnect(id); });
     }
 
-    template<typename... Args2>
-    friend _Event<Args2...>* make_event();
+    void call(const Args&... args)
+    {
+        m_times += 1;
+
+        if (!m_sig.empty())
+            m_sig(args...);
+        if (!m_sig_anon.empty())
+            m_sig_anon();
+        // if(!once.empty())
+        // {
+        //     once(args...);
+        //     once.disconnect_all_slots();
+        // }
+    }
 };
 
-template<typename... Args>
-inline _Event<Args...>* make_event()
+template <typename...Args>
+class Event
 {
-    return new _Event<Args...>();
-}
+    using data_t = EventData<Args...>;
+private:
+    std::shared_ptr<data_t> m_data;
 
-template<typename VarType>
-class _Variable
+    void check_data()
+    {
+        if (!m_data)
+            m_data = std::make_shared<data_t>();
+    }
+
+public:
+    Event() { }
+
+    template <typename Lambda>
+    auto subscribe(Lambda func)
+    {
+        check_data();
+
+        return m_data->connect(func);
+    }
+
+    auto subscribe(std::function<void()> func)
+    {
+        check_data();
+
+        return m_data->connect(func);
+    }
+
+    auto run_subscribe(std::function<void()> func)
+    {
+        check_data();
+
+        func();
+        return m_data->connect(func);
+    }
+
+    void happened(Args... args)
+    {
+        check_data();
+
+        m_data->call(args...);
+    }
+
+    int get_times()
+    {
+        check_data();
+
+        return m_data->get_times();
+    }
+};
+
+template <typename VarType>
+class Variable
 {
 protected:
-    VarType* _value = nullptr;
+    std::shared_ptr<VarType> m_value;
+
 public:
-    _Event<VarType>* changed;
-    _Event<VarType, VarType>* transitioned;
+    Event<VarType> changed;
+    Event<VarType> transitioned;
 
-protected:
-    _Variable()
+    explicit Variable(const VarType& value)
     {
-        changed = make_event<VarType>();
-        transitioned = make_event<VarType, VarType>();
+        m_value = std::make_shared<VarType>(value);
     }
 
-    explicit _Variable(const VarType& data)
+    explicit Variable(VarType&& value)
     {
-        _value = new VarType(data);
-
-        changed = make_event<VarType>();
-        transitioned = make_event<VarType, VarType>();
+        m_value = std::make_shared<VarType>(value);
     }
 
-    explicit _Variable(VarType&& data)
+    Variable<VarType>& set(VarType value)
     {
-        _value = new VarType(data);
+        if (!m_value)
+            m_value = std::make_shared<VarType>();
 
-        changed = make_event<VarType>();
-        transitioned = make_event<VarType, VarType>();
-    }
-public:
-    VarType& value()
-    {
-        return *_value;
-    }
-
-    bool isNull() const
-    {
-        return _value == nullptr;
-    }
-
-    _Variable<VarType> &set(VarType value)
-    {
-        if (!_value)
-            _value = new VarType();
-
-        if (*_value != value)
+        if (*m_value != value)
         {
-            auto oldvalue = *_value;
-            *_value = value;
-            changed->happened(*_value);
-            transitioned->happened(oldvalue, *_value);
+            auto oldvalue = *m_value;
+            *m_value = value;
+            
+            changed->happened(*m_value);
+            transitioned->happened(oldvalue, *m_value);
         }
         return *this;
     }
 
-    // c2pool::deferred::shared_deferred<VarType> get_when_satisfies(std::function<bool(VarType)> when_f, c2pool::deferred::shared_deferred<VarType> def = nullptr)
-    // {
-    //     if (!def)
-    //         def = c2pool::deferred::make_deferred<VarType>();
+    auto get_value()
+    {
+        return *m_value;
+    }
 
-    //     if (_value && when_f(*_value))
-    //     {
-    //         def->result.set_value(*_value);
-    //         return def;
-    //     }
+    bool is_null() const { return m_value; }
 
-    //     changed->subscribe_once(
-    //         [&, when_f = when_f, def = def](VarType _v)
-    //         {
-    //             get_when_satisfies(when_f, def);
-    //         }
-    //     );
-    //     return def;
-    // }
-
-    template<typename T>
-    friend _Variable<T>* make_variable();
-
-    template<typename T>
-    friend _Variable<T>* make_variable(T&& data);
-
-    template<typename T>
-    friend _Variable<T>* make_variable(const T& data);
 };
-
-template<typename T>
-inline _Variable<T>* make_variable()
-{
-    return new _Variable<T>();
-}
-
-template<typename T>
-inline _Variable<T>* make_variable(T&& data)
-{
-    return new _Variable<T>(std::forward<T>(data));
-}
-
-template<typename T>
-inline _Variable<T>* make_variable(const T& data)
-{
-    return new _Variable<T>(data);
-}
-
-template<typename KeyType, typename VarType>
-class _VariableDict : public _Variable<std::map<KeyType, VarType>>
-{
-public:
-    typedef std::map<KeyType, VarType> MapType;
-
-public:
-    _Event<MapType>* added;
-    _Event<MapType>* removed;
-private:
-
-    _VariableDict() : _Variable<std::map<KeyType, VarType>>()
-    {
-        added = make_event<MapType>();
-        removed = make_event<MapType>();
-    }
-
-    explicit _VariableDict(const MapType& data) : _Variable<MapType>(data)
-    {
-        added = make_event<MapType>();
-        removed = make_event<MapType>();
-    }
-
-    explicit _VariableDict(MapType&& data) : _Variable<MapType>(std::forward(data))
-    {
-        added = make_event<MapType>();
-        removed = make_event<MapType>();
-    }
-
-public:
-    void add(const MapType &_values)
-    {
-        if (_values.empty())
-            return;
-
-        if (!this->_value)
-            this->_value = new MapType();
-
-        MapType old_value = *this->_value;
-
-        MapType new_items;
-        for (auto item: _values)
-        {
-            if ((this->_value->find(item.first) == this->_value->end()) || ((*this->_value)[item.first] != item.second))
-            {
-                new_items[item.first] = item.second;
-                (*this->_value)[item.first] = item.second;
-            }
-        }
-
-        if (!new_items.empty())
-        {
-            added->happened(new_items);
-            //TODO: because todo in p2pool
-//            this->changed->happened(*this->_value);
-//            this->transitioned->happened(old_value, *this->_value);
-        }
-    }
-
-    void add(const KeyType &_key, const VarType &_value)
-    {
-        MapType new_items;
-        new_items[_key] = _value;
-        add(new_items);
-    }
-
-    void remove(std::vector<KeyType> _keys)
-    {
-        if (_keys.empty())
-            return;
-
-        MapType old_value = *this->_value;
-
-        MapType gone_items;
-        for (auto key: _keys)
-        {
-            if (this->_value->find(key) != this->_value->end())
-            {
-                gone_items[key] = (*this->_value)[key];
-                this->_value->erase(key);
-            }
-        }
-
-        if (!gone_items.empty())
-        {
-            removed->happened(gone_items);
-            //TODO: because todo in p2pool
-//            this->changed->happened(*this->_value);
-//            this->transitioned->happened(old_value, *this->_value);
-        }
-    }
-
-    void remove(KeyType _key)
-    {
-        std::vector<KeyType> keys = {_key};
-        remove(keys);
-    }
-
-	bool exist(KeyType key)
-	{
-		if (!this->isNull())
-		{
-			if (this->_value->find(key) != this->_value->end())
-				return true;
-		}
-		return false;
-	}
-
-    template<typename K, typename T>
-    friend _VariableDict<K, T>* make_vardict();
-
-    template<typename K, typename T>
-    friend _VariableDict<K, T>* make_vardict(std::map<K, T>&& data);
-
-    template<typename K, typename T>
-    friend _VariableDict<K, T>* make_vardict(const std::map<K, T>& data);
-};
-
-template<typename K, typename T>
-inline _VariableDict<K, T>* make_vardict()
-{
-    return new _VariableDict<K, T>();
-}
-
-template<typename K, typename T>
-inline _VariableDict<K, T>* make_vardict(std::map<K, T>&& data)
-{
-    return new _VariableDict<K, T>(data);
-}
-
-template<typename K, typename T>
-inline _VariableDict<K, T>* make_vardict(const std::map<K, T>& data)
-{
-    return new _VariableDict<K, T>(data);
-}
-
-template<typename... Args>
-using Event = _Event<Args...>*;
-
-template <typename T>
-using Variable = _Variable<T>*;
-
-template<typename KeyType, typename VarType>
-using VariableDict = _VariableDict<KeyType, VarType>*;
