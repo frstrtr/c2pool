@@ -59,6 +59,8 @@ public:
     }
 
 public:
+    std::vector<std::byte> m_prefix;
+
     int m_share_period;
     // std::string symbol;
     // std::string coin_prefix; //TODO: const unsigned char*? + int identifier lenght
