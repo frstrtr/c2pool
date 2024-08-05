@@ -22,6 +22,30 @@ public:
         
     }
 
+    ~ResponseWrapper()
+    {
+        if (m_timer)
+            m_timer->stop();
+    }
+
+    ResponseWrapper(ResponseWrapper&& other) : m_func(std::move(other.m_func)), m_timer(std::move(other.m_timer))
+    {
+
+    }
+
+    ResponseWrapper& operator=(ResponseWrapper&& other) noexcept
+    {
+        if (this != &other)
+        {
+            m_func = std::move(other.m_func);
+            m_timer = std::move(other.m_timer);
+        }
+        return *this;
+    }
+
+    ResponseWrapper(const ResponseWrapper&) = delete;
+    ResponseWrapper& operator=(const ResponseWrapper&) = delete;
+
     template <typename T>
     void operator()(T result)
     {
@@ -57,6 +81,7 @@ struct Matcher
             auto timer = std::make_unique<core::Timer>(m_context);
             timer->start(TIMEOUT, [&, id = id](){ m_watchers.erase(id); });
 
+            // auto wrapper = wrapper_type(resp, std::move(timer));
             m_watchers[id] = wrapper_type(resp, std::move(timer));
 
             m_req(args...);
