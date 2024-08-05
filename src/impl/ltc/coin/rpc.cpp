@@ -7,7 +7,7 @@ namespace ltc
 namespace coin
 {
 
-RPCNode::RPCNode(io::io_context* context, RPCAuthData auth, const char* login)
+NodeRPC::NodeRPC(io::io_context* context, RPCAuthData auth, const char* login)
     : m_context(context), m_resolver(*context), m_stream(*context),
     m_client(*this, RPC_VER), m_auth(std::make_unique<RPCAuthData>(auth))
 {
@@ -28,7 +28,7 @@ RPCNode::RPCNode(io::io_context* context, RPCAuthData auth, const char* login)
     delete[] encoded_login;
 }
 
-RPCNode::~RPCNode()
+NodeRPC::~NodeRPC()
 {
     beast::error_code ec;
 	m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
@@ -43,7 +43,7 @@ RPCNode::~RPCNode()
 }
 
 
-nlohmann::json RPCNode::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
+nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
 {
 	try
 	{
@@ -57,7 +57,7 @@ nlohmann::json RPCNode::CallAPIMethod(const std::string& method, const jsonrpccx
 	}
 }
 
-bool RPCNode::check()
+bool NodeRPC::check()
 {
 	bool has_block = check_blockheader(uint256S("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"));
 	bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
@@ -79,7 +79,7 @@ bool RPCNode::check()
 		}
 	} catch (const jsonrpccxx::JsonRpcException& ex)
     {
-        LOG_WARNING << "RPCNode::check() exception: " << ex.what();
+        LOG_WARNING << "NodeRPC::check() exception: " << ex.what();
 		return false;
     }
 
@@ -122,7 +122,7 @@ bool RPCNode::check()
 	return true;
 }
 
-bool RPCNode::check_blockheader(uint256 header)
+bool NodeRPC::check_blockheader(uint256 header)
 {
     try 
     {
@@ -134,42 +134,42 @@ bool RPCNode::check_blockheader(uint256 header)
     }
 }
 
-void RPCNode::submit_block(BlockType& block)
+void NodeRPC::submit_block(BlockType& block)
 {
 	
 }
 
 // RPC Methods
 
-nlohmann::json RPCNode::getblocktemplate(std::vector<std::string> rules)
+nlohmann::json NodeRPC::getblocktemplate(std::vector<std::string> rules)
 {
 	nlohmann::json j = nlohmann::json::object({{"rules", rules}});
 	return CallAPIMethod("getblocktemplate", {j});
 }
 
-nlohmann::json RPCNode::getnetworkinfo()
+nlohmann::json NodeRPC::getnetworkinfo()
 {
 	return CallAPIMethod("getnetworkinfo");
 }
 
-nlohmann::json RPCNode::getblockchaininfo()
+nlohmann::json NodeRPC::getblockchaininfo()
 {
 	return CallAPIMethod("getblockchaininfo");
 }
 
-nlohmann::json RPCNode::getmininginfo()
+nlohmann::json NodeRPC::getmininginfo()
 {
 	return CallAPIMethod("getmininginfo");
 }
 
 // verbose: true -- json result, false -- hex-encode result;
-nlohmann::json RPCNode::getblockheader(uint256 header, bool verbose)
+nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
 {
 	return CallAPIMethod("getblockheader", {header, verbose});
 }
 
 // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
-nlohmann::json RPCNode::getblock(uint256 blockhash, int verbosity)
+nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
 {
 	return CallAPIMethod("getblock", {blockhash, verbosity});
 }

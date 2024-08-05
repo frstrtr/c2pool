@@ -54,7 +54,8 @@ void Logger::init()
     );
     // set trace log filter
     boost::log::core::get()->set_filter(
-        boost::log::trivial::severity >= logging::trivial::debug
+        // boost::log::trivial::severity >= logging::trivial::debug
+        boost::log::trivial::severity >= logging::trivial::trace
     );
     
     /* log formatter:
