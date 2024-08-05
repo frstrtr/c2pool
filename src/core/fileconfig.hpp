@@ -21,7 +21,7 @@ class Fileconfig
 protected:
     std::filesystem::path m_filepath;
     
-    virtual std::string get_default() = 0;
+    virtual std::ofstream& get_default(std::ofstream& file) = 0;
     virtual void load() = 0;
     
     inline void init()
@@ -32,7 +32,7 @@ protected:
             std::filesystem::create_directory(m_filepath.parent_path());
         
             std::ofstream file(m_filepath);
-            file << get_default();
+            get_default(file);
             file.close();
             LOG_WARNING << "Config (" << m_filepath << "): not found, created default.";
         }
