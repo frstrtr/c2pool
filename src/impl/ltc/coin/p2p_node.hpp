@@ -9,6 +9,7 @@
 #include <boost/asio.hpp>
 
 #include <core/config.hpp>
+#include <core/random.hpp>
 #include <core/factory.hpp>
 #include <core/reply_matcher.hpp>
 
@@ -59,6 +60,52 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
 
+        // TODO: LEGACY REWORK!
+
+        /*
+            version=70002,
+            services=1,
+            time=1723920793,
+            addr_to=dict(
+                services=1,
+                address="192.168.0.1",
+                port=2222,
+            ),
+            addr_from=dict(
+                services=1,
+                address="192.168.0.1",
+                port=2222,
+            ),
+            nonce=1,
+            sub_version_num='c2pool',
+            start_height=0
+        */
+
+        auto msg_version = message_version::make_raw(
+            70002,
+            1,
+            1723920793,
+            addr_t{1, NetService{"192.168.0.1", 2222}}, 
+            addr_t{1, NetService{"192.168.0.1", 2222}},
+            1,
+            "c2pool",
+            0
+        );
+
+        // auto msg_version = message_version::make_raw(
+        //     70017,
+        //     1,
+        //     core::timestamp(),
+        //     addr_t{1, m_peer->get_addr()}, 
+        //     addr_t{1, NetService{"192.168.0.1", 12024}},
+        //     core::random::random_nonce(),
+        //     "c2pool",
+        //     0
+        // );
+
+        m_peer->write(msg_version);
+        //=======================
+
         // // configure peer timeout timer
         // peer->m_timeout = std::make_unique<core::Timer>(m_context, true);
         // peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, addr = peer->addr()](){ timeout(addr); });
@@ -95,6 +142,7 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
+        LOG_INFO << "HANDLE: " << rmsg->m_command;
         p2p::Handler::result_t result;
         try 
         {
@@ -103,6 +151,10 @@ public:
         {
             LOG_ERROR << "P2PNode handle: " << ec.what();
             // todo: error
+            return;
+        } catch (const std::out_of_range& ec)
+        {
+            LOG_ERROR << "P2PNode: " << ec.what();
             return;
         }
 
@@ -127,6 +179,7 @@ public:
 private:
     ADD_HANDLER(version)
     {
+        LOG_INFO << "version is?: " << msg->m_command;
         auto verack_msg = message_verack::make_raw();
         m_peer->write(verack_msg);
     }
