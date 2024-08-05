@@ -35,9 +35,10 @@ public:
     void run()
     {
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, m_config);
-        m_p2p->connect(NetService("217.72.4.157", 19335)); // 9333
+        std::cout << m_config->coin()->m_p2p.address.to_string() << std::endl;
+        m_p2p->connect(m_config->coin()->m_p2p.address); // 9333
 
-        
+        // m_rpc = std::make_unique<NodeRPC>(context, );
     }
 };
     
