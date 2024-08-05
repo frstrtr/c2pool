@@ -19,6 +19,7 @@ namespace config
     struct RPCData
     {
         NetService address;
+        std::string userpass;
     };
 
 } // config
@@ -52,12 +53,14 @@ template<> struct convert<ltc::config::RPCData>
     {
         Node node;
         node["address"] = rhs.address;
+        node["userpass"] = rhs.userpass;
         return node;
     }
 
     static bool decode(const Node& node, ltc::config::RPCData& rhs)
     {
         rhs.address = node["address"].as<NetService>();
+        rhs.userpass = node["userpass"].as<std::string>();
         return true;
     } 
 };

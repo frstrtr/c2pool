@@ -7,25 +7,39 @@ namespace ltc
 namespace coin
 {
 
-NodeRPC::NodeRPC(io::io_context* context, RPCAuthData auth, const char* login)
-    : m_context(context), m_resolver(*context), m_stream(*context),
-    m_client(*this, RPC_VER), m_auth(std::make_unique<RPCAuthData>(auth))
+NodeRPC::NodeRPC(io::io_context* context, NetService address, std::string userpass)
+    : m_context(context), m_resolver(*context), m_stream(*context), 
+	  m_client(*this, RPC_VER), m_auth(std::make_unique<RPCAuthData>())
 {
-    m_http_request = {http::verb::post, "/", 11};
+    // m_http_request = {http::verb::post, "/", 11};
 
-    m_auth->host = new char[strlen(m_auth->ip) + strlen(m_auth->port) + 2];
-    sprintf(m_auth->host, "%s:%s", m_auth->ip, m_auth->port);
+    // m_auth->host = new char[strlen(m_auth->ip) + strlen(m_auth->port) + 2];
+    // sprintf(m_auth->host, "%s:%s", m_auth->ip, m_auth->port);
+    // m_http_request.set(http::field::host, m_auth->host);
+
+    // m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    // m_http_request.set(http::field::content_type, "application/json");
+
+    // char *encoded_login = new char[32];
+    // boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
+    // m_auth->authorization = new char[6 + strlen(encoded_login) + 1];
+    // sprintf(m_auth->authorization, "Basic %s", encoded_login);
+    // m_http_request.set(http::field::authorization, m_auth->authorization);
+    // delete[] encoded_login;
+
+	m_http_request = {http::verb::post, "/", 11};
+
+    m_auth->host = address.to_string();
     m_http_request.set(http::field::host, m_auth->host);
 
     m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     m_http_request.set(http::field::content_type, "application/json");
 
-    char *encoded_login = new char[32];
-    boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
-    m_auth->authorization = new char[6 + strlen(encoded_login) + 1];
-    sprintf(m_auth->authorization, "Basic %s", encoded_login);
+    std::string encoded_login; 
+	encoded_login.resize(32);
+    boost::beast::detail::base64::encode(encoded_login.data(), userpass.c_str(), userpass.size());
+    m_auth->authorization = "Basic " + encoded_login;
     m_http_request.set(http::field::authorization, m_auth->authorization);
-    delete[] encoded_login;
 }
 
 NodeRPC::~NodeRPC()
@@ -36,12 +50,40 @@ NodeRPC::~NodeRPC()
 	{
 		//TODO:
 	}
-
-	// move to RPCAuthData
-	delete[] m_auth->host;
-	delete[] m_auth->authorization;
 }
 
+std::string NodeRPC::Send(const std::string &request)
+{
+	//TODO:
+	// http_request.body() = request;
+	// http_request.prepare_payload();
+	// try
+	// {
+	// 	http::write(stream, http_request);	
+	// }
+	// catch(const std::exception& e)
+	// {
+	// 	throw libp2p::node_exception("error when try to send message in CoindRPC -> " + std::string(e.what()), this);
+	// }
+
+	// beast::flat_buffer buffer;
+	// boost::beast::http::response<boost::beast::http::dynamic_body> response;
+
+	// try
+    // {
+    // 	boost::beast::http::read(stream, buffer, response);
+    // }
+    // catch (const std::exception& ex)
+    // {
+    // 	throw libp2p::node_exception("error when try to read response -> " + std::string(ex.what()), this);
+    // }
+
+	// std::string json_result = boost::beast::buffers_to_string(response.body().data());
+    // LOG_DEBUG_COIND_RPC << "json_result: " << json_result;
+
+	// return json_result;
+	return std::string("");
+}
 
 nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
 {

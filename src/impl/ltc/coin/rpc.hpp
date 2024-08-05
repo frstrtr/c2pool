@@ -36,10 +36,12 @@ private:
     std::unique_ptr<RPCAuthData> m_auth;
     jsonrpccxx::JsonRpcClient m_client;
 
+    // TODO:
+    std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    NodeRPC(io::io_context* context, RPCAuthData auth, const char* login);
+    NodeRPC(io::io_context* context, NetService address, std::string userpass);
     ~NodeRPC();
 
     // TODO: update for async (maybe c++20 coroutines)
@@ -62,16 +64,8 @@ public:
 
 struct RPCAuthData
 {
-	const char *ip;
-	const char *port;
-	char *authorization; //TODO: char* -> std::string?
-	char *host;          //TODO: char* -> std::string?
-
-	RPCAuthData() = default;
-	RPCAuthData(const char *_ip, const char *_port) : ip(_ip), port(_port)
-	{
-		
-	}
+	std::string authorization;
+	std::string host;
 };
 
 } // namespace coin
