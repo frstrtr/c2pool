@@ -7,7 +7,20 @@
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/config.hpp>
 #include <impl/ltc/coin/node.hpp>
-#include <impl/ltc/coin/p2p_messages.hpp> // todo: remove
+
+void check_config(ltc::Config *cfg)
+{
+    // coin
+    
+    std::cout << cfg->coin()->m_p2p.address.to_string() << std::endl;
+    std::cout << HexStr(cfg->coin()->m_p2p.prefix) << std::endl;
+    std::cout << cfg->coin()->m_rpc.address.to_string() << std::endl;
+    std::cout << cfg->coin()->m_share_period << std::endl;
+
+    // pool
+    std::cout << HexStr(cfg->pool()->m_prefix) << std::endl;
+    std::cout << cfg->pool()->m_worker << std::endl;
+}
 
 int main()
 {
@@ -17,9 +30,6 @@ int main()
     
     auto settings = core::Fileconfig::load_file<core::Settings>();
     auto config = ltc::Config::load(*settings->m_networks.begin());
-    
-    // auto* node = new ltc::coin::p2p::NodeP2P<ltc::Config>(context, config);
-    // boost::asio::post(*context, [&]{ node->connect(NetService("217.72.4.157", 19335)); }); // 9333
 
     auto* node = new ltc::coin::Node<ltc::Config>(context, config);
     // boost::asio::post(*context, [&]{
