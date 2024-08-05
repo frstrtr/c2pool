@@ -36,6 +36,7 @@ std::string CoinConfig::get_default()
     YAML::Emitter out;
     out << YAML::BeginMap;
     {
+        out << YAML::Key << "prefix" << YAML::Value << HexStr(m_prefix);
         out << YAML::Key << "share_period" << YAML::Value << m_share_period;
     }
     out << YAML::EndMap;
@@ -46,6 +47,10 @@ std::string CoinConfig::get_default()
 void CoinConfig::load()
 {
     YAML::Node node = YAML::LoadFile(m_filepath.string());
+    
+    // prefix
+    auto prefix = ParseHexBytes(node["prefix"].as<std::string>());
+    m_prefix.insert(m_prefix.begin(), prefix.begin(), prefix.end());
     
     PARSE_CONFIG(node, share_period, int);
 }
