@@ -2,9 +2,13 @@
 
 #include <core/pack_types.hpp>
 
+#include <boost/spirit/home/x3.hpp>
+#include <boost/fusion/adapted/std_tuple.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio.hpp>
+
 #include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 
 enum AddrType
 {
@@ -15,6 +19,20 @@ enum AddrType
 static const std::array<uint8_t, 12> IPV4_IN_IPV6_PREFIX
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF};
 
+inline auto parse_address(std::string_view address_spec, std::string_view default_service = "https")
+{
+    using namespace boost::spirit::x3;
+    auto service = ':' >> +~char_(":") >> eoi;
+    auto host    = '[' >> *~char_(']') >> ']' // e.g. for IPV6
+        | raw[*("::" | (char_ - service))];
+
+    std::tuple<std::string, std::string> result;
+    parse(begin(address_spec), end(address_spec),
+          expect[host >> (service | attr(default_service))], result);
+
+    return result;
+}
+
 class NetAddress
 {
 protected:
@@ -23,7 +41,7 @@ protected:
     std::string m_ip;
 
 public:
-    NetAddress() = default;
+    NetAddress() : m_ip("localhost") { }
 
     NetAddress(const std::string& ip) : m_ip(ip) { }
     NetAddress(std::string&& ip) : m_ip(ip) { }
@@ -31,6 +49,7 @@ public:
     NetAddress(const boost::asio::ip::address& boost_addr) : m_ip(boost_addr.to_string()) { if (boost_addr.is_v6()) m_type = {NET_IPV6}; } 
     NetAddress(const boost::asio::ip::tcp::endpoint& ep) : NetAddress(ep.address()) { }
 
+    void set_address(std::string ip) { m_ip = ip; }
     auto address() const { return m_ip; }
 
     friend bool operator==(const NetAddress& l, const NetAddress& r)
@@ -90,17 +109,22 @@ protected:
 class NetService : public NetAddress
 {
 protected:
-    uint16_t m_port;
+    uint16_t m_port{};
 
 public:
 
     NetService() = default;
 
-    // NetAddress(const std::string& addr) :  { }
-    NetService(const std::string& ip, uint16_t port) : NetAddress(ip), m_port(port) { }
+    NetService(std::string addr) 
+    { 
+        auto [ip, port] = parse_address(addr);
 
-    NetService(const boost::asio::ip::address& boost_addr, uint16_t port) 
-        : NetAddress(boost_addr), m_port(port) 
+        set_address(ip);
+        m_port = std::stoi(port);
+    }
+    NetService(std::string addr, std::string port) : NetAddress(addr), m_port(std::stoi(port)) { }
+    NetService(const std::string& ip, uint16_t port) : NetAddress(ip), m_port(port) { }
+    NetService(const boost::asio::ip::address& boost_addr, uint16_t port) : NetAddress(boost_addr), m_port(port) 
     { if (boost_addr.is_v6()) m_type = {NET_IPV6}; } 
     NetService(const boost::asio::ip::tcp::endpoint& ep) : NetAddress(ep.address()), m_port(ep.port()) { }
 
@@ -130,6 +154,24 @@ public:
 
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(NetService, m_ip, m_port);
 };
+
+namespace YAML {
+template<>
+struct convert<NetService> {
+    static Node encode(const NetService& rhs) 
+    {
+        Node node;
+        node = rhs.to_string();
+        return node;
+    }
+
+    static bool decode(const Node& node, NetService& rhs) 
+    {
+        rhs = NetService(node.as<std::string>());
+        return true;
+    }
+};
+}
 
 struct addr_t
 {
