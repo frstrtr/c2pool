@@ -22,7 +22,7 @@ namespace coin
 {
 
 struct RPCAuthData;
-class RPCNode : public jsonrpccxx::IClientConnector
+class NodeRPC : public jsonrpccxx::IClientConnector
 {
     const std::string ID = "curltest";
     const jsonrpccxx::version RPC_VER = jsonrpccxx::version::v2;
@@ -39,8 +39,8 @@ private:
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    RPCNode(io::io_context* context, RPCAuthData auth, const char* login);
-    ~RPCNode();
+    NodeRPC(io::io_context* context, RPCAuthData auth, const char* login);
+    ~NodeRPC();
 
     // TODO: update for async (maybe c++20 coroutines)
     bool check();

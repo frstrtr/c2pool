@@ -38,7 +38,7 @@ std::string parse_net_error(const boost::system::error_code& ec);
 // void disconnect() = 0;
 
 template <typename ConfigType>
-class P2PNode : public core::ICommunicator, public core::INetwork, public interfaces::Node, public core::Factory<core::Client>
+class NodeP2P : public core::ICommunicator, public core::INetwork, public interfaces::Node, public core::Factory<core::Client>
 {
     using config_t = ConfigType;
 
@@ -50,7 +50,7 @@ private:
     std::unique_ptr<Connection> m_peer; // TODO: add ping
 
 public:
-    P2PNode(io::io_context* context, config_t* config) : core::Factory<core::Client>(context, this), m_context(context), m_config(config) 
+    NodeP2P(io::io_context* context, config_t* config) : core::Factory<core::Client>(context, this), m_context(context), m_config(config) 
     {
         
     }
@@ -81,27 +81,27 @@ public:
             start_height=0
         */
 
-        auto msg_version = message_version::make_raw(
-            70002,
-            1,
-            1723920793,
-            addr_t{1, NetService{"192.168.0.1", 2222}}, 
-            addr_t{1, NetService{"192.168.0.1", 2222}},
-            1,
-            "c2pool",
-            0
-        );
-
         // auto msg_version = message_version::make_raw(
-        //     70017,
+        //     70002,
         //     1,
-        //     core::timestamp(),
-        //     addr_t{1, m_peer->get_addr()}, 
-        //     addr_t{1, NetService{"192.168.0.1", 12024}},
-        //     core::random::random_nonce(),
+        //     1723920793,
+        //     addr_t{1, NetService{"192.168.0.1", 2222}}, 
+        //     addr_t{1, NetService{"192.168.0.1", 2222}},
+        //     1,
         //     "c2pool",
         //     0
         // );
+
+        auto msg_version = message_version::make_raw(
+            70017,
+            1,
+            core::timestamp(),
+            addr_t{1, m_peer->get_addr()}, 
+            addr_t{1, NetService{"192.168.0.1", 12024}},
+            core::random::random_nonce(),
+            "c2pool",
+            0
+        );
 
         m_peer->write(msg_version);
         //=======================
@@ -149,12 +149,12 @@ public:
             result = m_handler.parse(rmsg);
         } catch (const std::runtime_error& ec)
         {
-            LOG_ERROR << "P2PNode handle: " << ec.what();
+            LOG_ERROR << "NodeP2P handle: " << ec.what();
             // todo: error
             return;
         } catch (const std::out_of_range& ec)
         {
-            LOG_ERROR << "P2PNode: " << ec.what();
+            LOG_ERROR << "NodeP2P: " << ec.what();
             return;
         }
 

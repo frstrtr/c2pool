@@ -21,6 +21,7 @@ class Connection
 // TODO: add timeout
     using get_block_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockType>::REQUEST<uint256>;
     using get_header_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockHeaderType>::REQUEST<uint256>;
+    
 private:
     boost::asio::io_context* m_context{};
     std::shared_ptr<core::Socket> m_socket;
