@@ -19,7 +19,6 @@ int main(int argc, char *argv[])
 #endif
 
     boost::asio::io_context* context = new boost::asio::io_context();
-    // std::vector<std::byte> prefix = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
 
     core::log::Logger::init();
     auto settings = core::Fileconfig::load_file<core::Settings>();
