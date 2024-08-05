@@ -81,27 +81,27 @@ public:
             start_height=0
         */
 
-        // auto msg_version = message_version::make_raw(
-        //     70002,
-        //     1,
-        //     1723920793,
-        //     addr_t{1, NetService{"192.168.0.1", 2222}}, 
-        //     addr_t{1, NetService{"192.168.0.1", 2222}},
-        //     1,
-        //     "c2pool",
-        //     0
-        // );
-
         auto msg_version = message_version::make_raw(
-            70017,
+            70002,
             1,
-            core::timestamp(),
-            addr_t{1, m_peer->get_addr()}, 
-            addr_t{1, NetService{"192.168.0.1", 12024}},
-            core::random::random_nonce(),
+            1723920793,
+            addr_t{1, NetService{"192.168.0.1", 2222}}, 
+            addr_t{1, NetService{"192.168.0.1", 2222}},
+            1,
             "c2pool",
             0
         );
+
+        // auto msg_version = message_version::make_raw(
+        //     70017,
+        //     1,
+        //     core::timestamp(),
+        //     addr_t{1, m_peer->get_addr()}, 
+        //     addr_t{1, NetService{"192.168.0.1", 12024}},
+        //     core::random::random_nonce(),
+        //     "c2pool",
+        //     0
+        // );
 
         m_peer->write(msg_version);
         //=======================
@@ -121,7 +121,7 @@ public:
     // ICommmunicator
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        LOG_ERROR << "PoolNode <NetName>[" << service.to_string() << "]:";
+        LOG_ERROR << "CoinNode <NetName>[" << service.to_string() << "]:";
         LOG_ERROR << "\terror: " << err;
         LOG_ERROR << "\twhere: " << where.function_name();
         if (m_peer)
@@ -163,7 +163,7 @@ public:
 
     const std::vector<std::byte>& get_prefix() const override
     {
-        return m_config->coin()->m_prefix;
+        return m_config->coin()->m_p2p.prefix;
     }
 
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
@@ -233,8 +233,9 @@ private:
                 break;
             case inventory_type::block:
                 m_new_block.happened(inv.m_hash);
+                break;
             default:
-                LOG_WARNING << "Unknown inv type";
+                LOG_WARNING << "Unknown inv type " << (int)inv.m_type;
                 break;
             }
         }
