@@ -2,6 +2,7 @@
 
 #include "block.hpp"
 
+#include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/socket.hpp>
 #include <core/reply_matcher.hpp>
@@ -21,11 +22,11 @@ class Connection
     using get_block_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockType>::REQUEST<uint256>;
     using get_header_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockHeaderType>::REQUEST<uint256>;
 private:
-    boost::asio::io_context* m_context;
+    boost::asio::io_context* m_context{};
     std::shared_ptr<core::Socket> m_socket;
 
-    get_block_t* m_get_block;
-    get_header_t* m_get_header;
+    get_block_t* m_get_block{};
+    get_header_t* m_get_header{};
 
 public:
 
@@ -62,7 +63,16 @@ public:
 
     void write(std::unique_ptr<RawMessage>& rmsg)
     {
+        LOG_TRACE << "connection writed " << rmsg->m_command;
         m_socket->write(std::move(rmsg));
+    }
+
+    auto get_addr() const
+    {
+        if (m_socket)
+            return m_socket->get_addr();
+        else
+            return NetService{};
     }
 };
 
