@@ -25,7 +25,7 @@ int main(int argc, char *argv[])
     auto settings = core::Fileconfig::load_file<core::Settings>();
     auto config = ltc::Config::load(*settings->m_networks.begin());
 
-    LOG_INFO << "Prefix: " << HexStr(config->m_prefix);
+    LOG_INFO << "Prefix: " << HexStr(config->pool()->m_prefix);
 
     auto* node = new ltc::Node(context, config);
     node->listen(5555);
