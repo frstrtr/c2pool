@@ -51,9 +51,20 @@ private:
         return handlers;
     }
 
+    void remove_zeros(std::string& command)
+    {
+        size_t pos = command.find('\0');
+        if (pos != std::string::npos)
+        {
+            command = command.substr(0, pos);
+        }
+    }
+
 public:
     result_t parse(std::unique_ptr<RawMessage>& rmsg)
     {
+        remove_zeros(rmsg->m_command);
+
         if (m_handlers.contains(rmsg->m_command))
             return m_handlers[rmsg->m_command](rmsg);
         else
