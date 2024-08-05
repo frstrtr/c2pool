@@ -19,12 +19,13 @@ int main()
     auto config = ltc::Config::load(*settings->m_networks.begin());
     
     auto* node = new ltc::coin::p2p::P2PNode<ltc::Config>(context, config);
-    node->connect(NetService("217.72.4.157", 12024));
+    // boost::asio::post(*context, [&]{ node->connect(NetService("217.72.4.157", 12024)); }); // 9333
+    boost::asio::post(*context, [&]{ node->connect(NetService("217.72.4.157", 19335)); }); // 9333
     // ltc::coin::RPC* rpc = new ltc::coin::RPC();
     // std::cout << rpc->Send("asdasd") << std::endl;
 
-    boost::asio::steady_timer timer(*context, std::chrono::seconds(10));
-    timer.async_wait([](const auto& ec) { std::cout << "timer end!" << std::endl; });
+    // boost::asio::steady_timer timer(*context, std::chrono::seconds(10));
+    // timer.async_wait([](const auto& ec) { std::cout << "timer end!" << std::endl; });
 
     context->run();
 }
