@@ -112,7 +112,9 @@ public:
     void write(std::unique_ptr<RawMessage> msg_data)
     {
         auto packet = Packet::from_message(m_node->get_prefix(), msg_data);
-        
+        // for (auto it = packet.begin(); it != packet.end(); it++)
+        //     std::cout << (int) *it << " ";
+        // std::cout << std::endl;
         boost::asio::async_write(*m_socket, boost::asio::buffer(packet.data(), packet.size()),
             [this, packet](const boost::system::error_code& ec, std::size_t length)
             {
