@@ -1,7 +1,7 @@
 add_subdirectory(coin)
 
 add_library(ltc
-    config.hpp config.cpp
+    config_coin.hpp config_coin.cpp config_pool.hpp config_pool.cpp config.hpp
     node.hpp node.cpp
     peer.hpp
     protocol_actual.cpp protocol_legacy.cpp
