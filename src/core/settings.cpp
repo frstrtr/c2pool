@@ -7,18 +7,16 @@
 namespace core
 {
 
-std::string Settings::get_default()
+std::ofstream& Settings::get_default(std::ofstream& file)
 {
-    YAML::Emitter out;
-    out << YAML::BeginMap;
-    {
-        out << YAML::Key << "testnet" << YAML::Value << false;
-        out << YAML::Key << "networks" << YAML::BeginSeq << "default_network" << YAML::Comment("template network") << YAML::EndSeq;
-        out << YAML::Key << "fee" << YAML::Value << 0;
-    }
-    out << YAML::EndMap;
+    YAML::Node out;
+    
+    out["testnet"] = false;
+    out["networks"] = std::vector<std::string>{"default_network"};
+    out["fee"] = 0;
 
-    return std::string(out.c_str());
+    file << out;
+    return file;
 }
 
 void Settings::load()
