@@ -22,7 +22,7 @@ private:
     void parse_network_config(std::string name, YAML::Node& node);
 
 protected:
-    std::string get_default() override;
+    std::ofstream& get_default(std::ofstream& file) override;
     void load() override;
 
 public:
