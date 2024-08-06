@@ -35,13 +35,13 @@ public:
     void run()
     {
         // P2P
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, m_config);
-        std::cout << m_config->coin()->m_p2p.address.to_string() << std::endl;
-        m_p2p->connect(m_config->coin()->m_p2p.address); // 9333
+        // m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, m_config);
+        // std::cout << m_config->coin()->m_p2p.address.to_string() << std::endl;
+        // m_p2p->connect(m_config->coin()->m_p2p.address); // 9333
 
         // RPC
-        m_rpc = std::make_unique<NodeRPC>(m_context, m_config->m_rpc.address, m_config->m_rpc.userpass);
-        m_rpc->check();
+        m_rpc = std::make_unique<NodeRPC>(m_context, m_config->m_rpc.address, m_config->m_rpc.userpass, m_config->m_testnet);
+        m_rpc->connect();
     }
 };
     

@@ -87,8 +87,9 @@ public:
     config::P2PData m_p2p;
     config::RPCData m_rpc;
 
+    std::string m_symbol;
     int m_share_period{};
-    // std::string symbol;
+    bool m_testnet {false};
     // std::string coin_prefix; //TODO: const unsigned char*? + int identifier lenght
     // int32_t block_period;
     // std::string p2p_address;
