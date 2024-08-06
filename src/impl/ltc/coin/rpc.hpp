@@ -27,6 +27,7 @@ class NodeRPC : public jsonrpccxx::IClientConnector
     const std::string ID = "curltest";
     const jsonrpccxx::version RPC_VER = jsonrpccxx::version::v2;
 
+    const bool IS_TESTNET;
 private:
     io::io_context* m_context;
     beast::tcp_stream m_stream;
@@ -36,14 +37,14 @@ private:
     std::unique_ptr<RPCAuthData> m_auth;
     jsonrpccxx::JsonRpcClient m_client;
 
-    // TODO:
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    NodeRPC(io::io_context* context, NetService address, std::string userpass);
+    NodeRPC(io::io_context* context, NetService address, std::string userpass, bool testnet);
     ~NodeRPC();
 
+    void connect();
     // TODO: update for async (maybe c++20 coroutines)
     bool check();
     bool check_blockheader(uint256 header);

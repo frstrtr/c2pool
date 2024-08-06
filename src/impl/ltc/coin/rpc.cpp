@@ -7,26 +7,10 @@ namespace ltc
 namespace coin
 {
 
-NodeRPC::NodeRPC(io::io_context* context, NetService address, std::string userpass)
-    : m_context(context), m_resolver(*context), m_stream(*context), 
+NodeRPC::NodeRPC(io::io_context* context, NetService address, std::string userpass, bool testnet)
+    : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context), 
 	  m_client(*this, RPC_VER), m_auth(std::make_unique<RPCAuthData>())
 {
-    // m_http_request = {http::verb::post, "/", 11};
-
-    // m_auth->host = new char[strlen(m_auth->ip) + strlen(m_auth->port) + 2];
-    // sprintf(m_auth->host, "%s:%s", m_auth->ip, m_auth->port);
-    // m_http_request.set(http::field::host, m_auth->host);
-
-    // m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-    // m_http_request.set(http::field::content_type, "application/json");
-
-    // char *encoded_login = new char[32];
-    // boost::beast::detail::base64::encode(encoded_login, login, strlen(login));
-    // m_auth->authorization = new char[6 + strlen(encoded_login) + 1];
-    // sprintf(m_auth->authorization, "Basic %s", encoded_login);
-    // m_http_request.set(http::field::authorization, m_auth->authorization);
-    // delete[] encoded_login;
-
 	m_http_request = {http::verb::post, "/", 11};
 
     m_auth->host = address.to_string();
@@ -35,11 +19,55 @@ NodeRPC::NodeRPC(io::io_context* context, NetService address, std::string userpa
     m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     m_http_request.set(http::field::content_type, "application/json");
 
-    std::string encoded_login; 
-	encoded_login.resize(32);
-    boost::beast::detail::base64::encode(encoded_login.data(), userpass.c_str(), userpass.size());
-    m_auth->authorization = "Basic " + encoded_login;
+	char *encoded_login2 = new char[32];
+    boost::beast::detail::base64::encode(encoded_login2, userpass.c_str(), strlen(userpass.c_str()));
+	m_auth->authorization = "Basic " + std::string(encoded_login2, strlen(encoded_login2));
     m_http_request.set(http::field::authorization, m_auth->authorization);
+	delete[] encoded_login2;
+}
+
+void NodeRPC::connect()
+{
+	NetService addr(m_auth->host);
+    auto const results = m_resolver.resolve(addr.address(), addr.port_str());
+	boost::asio::ip::tcp::endpoint endpoint = *results;
+
+    m_stream.async_connect(endpoint, 
+		[&](boost::system::error_code ec)
+		{
+			if (ec)
+			{
+				if (ec == boost::system::errc::operation_canceled)
+					return;
+				
+				LOG_ERROR << "CoindRPC error when try connect: [" << ec.message() << "].";
+			} else 
+			{
+				try
+				{
+					if (check())
+					{
+						// connected();
+						LOG_INFO << "...CoindRPC connected!";
+						return;
+					}
+				}
+				catch(const std::runtime_error& ec)
+				{
+					LOG_ERROR << "Error when try check CoindRPC: " << ec.what();
+				}
+				// }
+				// catch(const libp2p::node_exception& e)
+				// {
+				// 	LOG_ERROR << "Error when try check CoindRPC: " << e.what();
+				// }
+			}
+			
+			LOG_INFO << "Retry after 15 seconds...";
+			// reconnect_timer.start(15, [this, PROCESS_DUPLICATE] { WORKFLOW_PROCESS(); try_connect(); });
+			m_stream.close();
+		}
+	);
 }
 
 NodeRPC::~NodeRPC()
@@ -55,48 +83,42 @@ NodeRPC::~NodeRPC()
 std::string NodeRPC::Send(const std::string &request)
 {
 	//TODO:
-	// http_request.body() = request;
-	// http_request.prepare_payload();
-	// try
-	// {
-	// 	http::write(stream, http_request);	
-	// }
-	// catch(const std::exception& e)
-	// {
-	// 	throw libp2p::node_exception("error when try to send message in CoindRPC -> " + std::string(e.what()), this);
-	// }
+	m_http_request.body() = request;
+	m_http_request.prepare_payload();
+	try
+	{
+		// LOG_DEBUG_COIND_RPC << m_http_request.body();
+		http::write(m_stream, m_http_request);	
+	}
+	catch(const std::exception& e)
+	{
+		LOG_WARNING << "error when try to send message in CoindRPC -> " << e.what();
+		// throw libp2p::node_exception("error when try to send message in CoindRPC -> " + std::string(), this);
+	}
 
-	// beast::flat_buffer buffer;
-	// boost::beast::http::response<boost::beast::http::dynamic_body> response;
+	beast::flat_buffer buffer;
+	boost::beast::http::response<boost::beast::http::dynamic_body> response;
 
-	// try
-    // {
-    // 	boost::beast::http::read(stream, buffer, response);
-    // }
-    // catch (const std::exception& ex)
-    // {
-    // 	throw libp2p::node_exception("error when try to read response -> " + std::string(ex.what()), this);
-    // }
+	try
+    {
+    	boost::beast::http::read(m_stream, buffer, response);
+    }
+    catch (const std::exception& ex)
+    {
+		LOG_WARNING << "error when try to read response -> " << ex.what();
+    	// throw libp2p::node_exception("error when try to read response -> " + std::string(ex.what()), this);
+    }
 
-	// std::string json_result = boost::beast::buffers_to_string(response.body().data());
-    // LOG_DEBUG_COIND_RPC << "json_result: " << json_result;
+	std::string json_result = boost::beast::buffers_to_string(response.body().data());
+    LOG_DEBUG_COIND_RPC << "json_result: " << json_result;
 
-	// return json_result;
-	return std::string("");
+	return json_result;
+	// return std::string("");
 }
 
 nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
 {
-	try
-	{
-		return m_client.CallMethod<nlohmann::json>(ID, method, params);
-	}
-	catch (const jsonrpccxx::JsonRpcException& ex)
-	{
-		throw std::runtime_error("CallAPIMethod error: " + std::string(ex.what()));
-        // TODO:
-		// throw libp2p::node_exception("CallAPIMethod error: " + std::string(ex.what()), this);
-	}
+	return m_client.CallMethod<nlohmann::json>(ID, method, params);
 }
 
 bool NodeRPC::check()
@@ -104,7 +126,7 @@ bool NodeRPC::check()
 	bool has_block = check_blockheader(uint256S("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"));
 	bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
 
-	if (!(has_block && is_main_chain))
+	if (is_main_chain && !has_block )
 	{
 		LOG_ERROR << "Check failed! Make sure that you're connected to the right bitcoind with --bitcoind-rpc-port, and that it has finished syncing!" << std::endl;
 		return false;
@@ -113,7 +135,7 @@ bool NodeRPC::check()
 	try
     {
 		auto networkinfo = getnetworkinfo();
-		bool version_check_result = (100400 <= networkinfo.get<int>());
+		bool version_check_result = (100400 <= networkinfo["version"].get<int>());
 		if (!version_check_result)
 		{
 			LOG_ERROR << "Coin daemon too old! Upgrade!";
@@ -168,7 +190,7 @@ bool NodeRPC::check_blockheader(uint256 header)
 {
     try 
     {
-        getblockheader(header);
+		getblockheader(header);
         return true;
     } catch (const jsonrpccxx::JsonRpcException& ex) 
     {
