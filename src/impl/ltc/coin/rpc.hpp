@@ -41,10 +41,10 @@ private:
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    NodeRPC(io::io_context* context, NetService address, std::string userpass, bool testnet);
+    NodeRPC(io::io_context* context, bool testnet);
     ~NodeRPC();
 
-    void connect();
+    void connect(NetService address, std::string userpass);
     // TODO: update for async (maybe c++20 coroutines)
     bool check();
     bool check_blockheader(uint256 header);
