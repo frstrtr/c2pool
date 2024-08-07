@@ -7,10 +7,15 @@ namespace ltc
 namespace coin
 {
 
-NodeRPC::NodeRPC(io::io_context* context, NetService address, std::string userpass, bool testnet)
+NodeRPC::NodeRPC(io::io_context* context, bool testnet)
     : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context), 
-	  m_client(*this, RPC_VER), m_auth(std::make_unique<RPCAuthData>())
+	  m_client(*this, RPC_VER)
 {
+}
+
+void NodeRPC::connect(NetService address, std::string userpass)
+{
+	m_auth = std::make_unique<RPCAuthData>();
 	m_http_request = {http::verb::post, "/", 11};
 
     m_auth->host = address.to_string();
@@ -24,12 +29,8 @@ NodeRPC::NodeRPC(io::io_context* context, NetService address, std::string userpa
 	m_auth->authorization = "Basic " + std::string(encoded_login2, strlen(encoded_login2));
     m_http_request.set(http::field::authorization, m_auth->authorization);
 	delete[] encoded_login2;
-}
 
-void NodeRPC::connect()
-{
-	NetService addr(m_auth->host);
-    auto const results = m_resolver.resolve(addr.address(), addr.port_str());
+    auto const results = m_resolver.resolve(address.address(), address.port_str());
 	boost::asio::ip::tcp::endpoint endpoint = *results;
 
     m_stream.async_connect(endpoint, 
@@ -126,7 +127,7 @@ bool NodeRPC::check()
 	bool has_block = check_blockheader(uint256S("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"));
 	bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
 
-	if (is_main_chain && !has_block )
+	if (is_main_chain && !has_block)
 	{
 		LOG_ERROR << "Check failed! Make sure that you're connected to the right bitcoind with --bitcoind-rpc-port, and that it has finished syncing!" << std::endl;
 		return false;
