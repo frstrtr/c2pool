@@ -50,20 +50,21 @@ private:
     core::Counter m_idcounter;
     uint32_t m_times;
 
-public:
-    boost::signals2::signal<void(Args...)> m_sig;
-    boost::signals2::signal<void()> m_sig_anon; // For subs without args
-    
-    
-    std::map<int, boost::signals2::connection> m_subs;
-
     auto get_id()
     {
         return m_idcounter();
     }
 
+public:
+    mutable std::mutex m_mutex;
+    boost::signals2::signal<void(Args...)> m_sig;
+    boost::signals2::signal<void()> m_sig_anon; // For subs without args
+    
+    std::map<int, boost::signals2::connection> m_subs;
+
     auto get_times() const
     {
+        std::lock_guard lock(m_mutex);
         return m_times;
     }
 
@@ -73,15 +74,17 @@ public:
         //signals2::connection bc = w.Signal.connect(bind(&Object::doSomething, o));
         //bc.disconnect();
         //return bc;
+        std::lock_guard lock(m_mutex);
         if (m_subs.contains(id))
         {
             m_subs[id].disconnect();
         }
 	}
 
-    template <typename Handler, typename DisposeFunc>
-    auto connect(Handler func, DisposeFunc dispose_func)
+    template <typename Handler>//, typename DisposeFunc>
+    auto connect(const Handler& func)//, DisposeFunc dispose_func)
     {
+        std::lock_guard lock(m_mutex);
         auto id = get_id();
         m_subs[id] = m_sig.connect(func);
 
@@ -90,6 +93,7 @@ public:
 
     auto connect(std::function<void()> func)
     {
+        std::lock_guard lock(m_mutex);
         auto id = get_id();
         m_subs[id] = m_sig_anon.connect(func);
 
@@ -129,7 +133,7 @@ public:
     Event() { }
 
     template <typename Lambda>
-    auto subscribe(Lambda func)
+    auto subscribe(const Lambda& func)
     {
         check_data();
 
@@ -167,46 +171,66 @@ public:
 };
 
 template <typename VarType>
+struct VarWrapper
+{
+    VarType m_value;
+    std::mutex m_mutex;
+
+    VarWrapper(const VarType& value) : m_value(value) { }
+};
+
+// todo: check for: VarType have operator==()
+template <typename VarType>
 class Variable
 {
+    using var_t = VarType;
+    using wrap_t = VarWrapper<var_t>;
 protected:
-    std::shared_ptr<VarType> m_value;
+    std::shared_ptr<wrap_t> m_wrapper;
 
 public:
-    Event<VarType> changed;
-    Event<VarType> transitioned;
+    Event<var_t> changed;
+    Event<var_t, var_t> transitioned;
 
-    explicit Variable(const VarType& value)
+    explicit Variable(const var_t& value)
     {
-        m_value = std::make_shared<VarType>(value);
+        m_wrapper = std::make_shared<wrap_t>(value);
     }
 
-    explicit Variable(VarType&& value)
+    explicit Variable(var_t&& value)
     {
-        m_value = std::make_shared<VarType>(value);
+        m_wrapper = std::make_shared<wrap_t>(value);
     }
 
-    Variable<VarType>& set(VarType value)
+    void set(VarType value)
     {
-        if (!m_value)
-            m_value = std::make_shared<VarType>();
-
-        if (*m_value != value)
+        std::unique_ptr<VarType> oldvalue;
+        // thread-safe change value
         {
-            auto oldvalue = *m_value;
-            *m_value = value;
-            
-            changed->happened(*m_value);
-            transitioned->happened(oldvalue, *m_value);
+            std::lock_guard lock(m_wrapper->m_mutex);
+
+            if (m_wrapper->m_value == value)
+            {
+                return;
+            } else 
+            {
+                oldvalue = std::make_unique<VarType>(m_wrapper->m_value);
+                m_wrapper->m_value = value;
+            }
         }
-        return *this;
+                        
+        changed.happened(value);
+        transitioned.happened(*oldvalue, value);
     }
 
-    auto get_value()
+    auto value()
     {
-        return *m_value;
+        if (!m_wrapper)
+            throw std::runtime_error("Variable wrapper is null!");
+        std::lock_guard lock(m_wrapper->m_mutex);
+        return m_wrapper->m_value;
     }
 
-    bool is_null() const { return m_value; }
+    bool is_null() const { return m_wrapper; } //TODO: add constexpr check for methods VarType::[isNull()/is_null()/IsNull()]
 
 };
