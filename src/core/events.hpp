@@ -6,6 +6,7 @@
 #include <core/common.hpp>
 #include <core/disposable.hpp>
 
+#include <boost/asio.hpp>
 #include <boost/signals2.hpp>
 
 class EventDisposable : public IDisposable, public std::enable_shared_from_this<EventDisposable>
@@ -39,6 +40,26 @@ public:
     {
         auto result = std::make_shared<EventDisposable>(id, dispose_func);
         return result;
+    }
+};
+
+template <typename Handler, typename...Args>
+class AsyncEventWrapper
+{
+    boost::asio::io_context* m_context;
+    Handler m_handler;
+
+public:
+    AsyncEventWrapper(boost::asio::io_context* context, const Handler& func) : m_context(context), m_handler(func)
+    {
+        
+    }
+
+    void operator()(Args... args)
+    {
+        boost::asio::dispatch(*m_context, 
+            [=, *this]{ m_handler(args...); }
+        );
     }
 };
 
@@ -91,6 +112,16 @@ public:
         return EventDisposable::make(id, [this](int id) { disconnect(id); });
     }
 
+    template <typename Handler>
+    auto async_connect(boost::asio::io_context* context, const Handler& func)
+    {
+        std::lock_guard lock(m_mutex);
+        auto id = get_id();
+        m_subs[id] = m_sig.connect(AsyncEventWrapper<Handler, Args...>(context, func));
+
+        return EventDisposable::make(id, [this](int id) { disconnect(id); });
+    }
+
     auto connect(std::function<void()> func)
     {
         std::lock_guard lock(m_mutex);
@@ -138,6 +169,14 @@ public:
         check_data();
 
         return m_data->connect(func);
+    }
+
+    template <typename Lambda>
+    auto async_subscribe(boost::asio::io_context* context, const Lambda& func)
+    {
+        check_data();
+
+        return m_data->async_connect(context, func);
     }
 
     auto subscribe(std::function<void()> func)

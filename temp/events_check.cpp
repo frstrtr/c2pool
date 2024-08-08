@@ -4,61 +4,90 @@
 
 int main()
 {
-    Variable<int> var(0);
+    Event<int> event;
 
     std::thread th1{
-        [&]
+    [&]{
+        std::cout << "happened thread: \t" << std::this_thread::get_id() << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        event.happened(112);
+    }};
+
+    boost::asio::io_context* context = new boost::asio::io_context();
+
+    event.async_subscribe(context, 
+        [](int value)
         {
-            auto dis = var.changed.subscribe([&](int v)
-                { 
-                    if ((v % 10) == 0)
-                    {
-                        std::cout << "%" << v << " or " << var.value() << std::endl;
-                        var.set(v + 1);
-                    }
-                }
-            );
+            std::cout << "subscriber thread: \t" << std::this_thread::get_id() << std::endl;
+            std::cout << value << std::endl;
+        });
 
-            while (var.value() < 10000)
-            {}
+    boost::asio::steady_timer t1(*context, std::chrono::seconds(4));
+    t1.async_wait([](const auto& ec){});
+    
 
-            dis->dispose();
-        }
-    };
-
-    std::thread th2{
-        [&]
-        {
-            auto dis = var.transitioned.subscribe(
-                [&](int old, int v)
-                {
-                    if (((v % 10) == 5) && ((old % 10) == 4))
-                    {
-                        std::cout << "!%" << v << " or " << var.value() << ", for old = " << old << std::endl;
-                        var.set(v + 1);
-                    }
-                }
-            );
-
-            while (var.value() < 11000)
-            {}
-            dis->dispose();
-        }
-    };
-
-    while (var.value() < 12000)
-    {
-        var.set(var.value() + 1);
-    }
+    context->run();
 
     if (th1.joinable())
         th1.join();
-    if (th2.joinable())
-        th2.join();
 }
 
 
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// {
+//     Variable<int> var(0);
+
+//     std::thread th1{
+//         [&]
+//         {
+//             auto dis = var.changed.subscribe([&](int v)
+//                 { 
+//                     if ((v % 10) == 0)
+//                     {
+//                         std::cout << "%" << v << " or " << var.value() << std::endl;
+//                         var.set(v + 1);
+//                     }
+//                 }
+//             );
+
+//             while (var.value() < 10000)
+//             {}
+
+//             dis->dispose();
+//         }
+//     };
+
+//     std::thread th2{
+//         [&]
+//         {
+//             auto dis = var.transitioned.subscribe(
+//                 [&](int old, int v)
+//                 {
+//                     if (((v % 10) == 5) && ((old % 10) == 4))
+//                     {
+//                         std::cout << "!%" << v << " or " << var.value() << ", for old = " << old << std::endl;
+//                         var.set(v + 1);
+//                     }
+//                 }
+//             );
+
+//             while (var.value() < 11000)
+//             {}
+//             dis->dispose();
+//         }
+//     };
+
+//     while (var.value() < 12000)
+//     {
+//         var.set(var.value() + 1);
+//     }
+
+//     if (th1.joinable())
+//         th1.join();
+//     if (th2.joinable())
+//         th2.join();
+// }
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
