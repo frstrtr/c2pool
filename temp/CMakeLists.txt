@@ -53,6 +53,9 @@ target_link_libraries(parse_bitcoin_index btclibs)
 add_executable(reply_matcher_test reply_matcher_test.cpp)
 target_link_libraries(reply_matcher_test core)
 
+add_executable(events_check events_check.cpp)
+target_link_libraries(events_check core)
+
 add_subdirectory(new_pack)
 add_subdirectory(packv2)
 add_subdirectory(shares)
