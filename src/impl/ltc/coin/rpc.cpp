@@ -7,9 +7,9 @@ namespace ltc
 namespace coin
 {
 
-NodeRPC::NodeRPC(io::io_context* context, bool testnet)
+NodeRPC::NodeRPC(io::io_context* context, ltc::interfaces::Node* coin, bool testnet)
     : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context), 
-	  m_client(*this, RPC_VER)
+	  m_client(*this, RPC_VER), m_coin(coin)
 {
 }
 
@@ -197,6 +197,18 @@ bool NodeRPC::check_blockheader(uint256 header)
     {
         return false;
     }
+}
+
+void NodeRPC::getwork()
+{
+	auto start = core::timestamp();
+	auto work = getblocktemplate({"segwit", "mweb"}); // mweb for ltc
+	auto end = core::timestamp();
+
+	// if (!txidcache.is_started())
+	// {
+
+	// }
 }
 
 void NodeRPC::submit_block(BlockType& block)

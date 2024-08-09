@@ -1,6 +1,7 @@
 #pragma once
 
 #include "block.hpp"
+#include "node_interface.hpp"
 
 #include <iostream>
 
@@ -29,6 +30,8 @@ class NodeRPC : public jsonrpccxx::IClientConnector
 
     const bool IS_TESTNET;
 private:
+    ltc::interfaces::Node* m_coin;
+
     io::io_context* m_context;
     beast::tcp_stream m_stream;
     boost::asio::ip::tcp::resolver m_resolver;
@@ -41,14 +44,14 @@ private:
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    NodeRPC(io::io_context* context, bool testnet);
+    NodeRPC(io::io_context* context, ltc::interfaces::Node* coin, bool testnet);
     ~NodeRPC();
 
     void connect(NetService address, std::string userpass);
     // TODO: update for async (maybe c++20 coroutines)
     bool check();
     bool check_blockheader(uint256 header);
-    // TODO: void getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
+    void getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
     void submit_block(BlockType& block); //TODO: p2p node; void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
 
     // RPC Methods

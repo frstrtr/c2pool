@@ -8,6 +8,7 @@ set(ltc_coin_impl
 )
 
 set(ltc_coin_interface
+    txidcache.hpp
     node_interface.hpp
     block.hpp
     transaction.hpp transaction.cpp
