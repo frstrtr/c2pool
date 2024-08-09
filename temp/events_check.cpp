@@ -24,7 +24,6 @@ int main()
 
     boost::asio::steady_timer t1(*context, std::chrono::seconds(4));
     t1.async_wait([](const auto& ec){});
-    
 
     context->run();
 

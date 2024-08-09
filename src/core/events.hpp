@@ -231,6 +231,8 @@ public:
     Event<var_t> changed;
     Event<var_t, var_t> transitioned;
 
+    explicit Variable() {}
+
     explicit Variable(const var_t& value)
     {
         m_wrapper = std::make_shared<wrap_t>(value);

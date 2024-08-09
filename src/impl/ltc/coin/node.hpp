@@ -39,7 +39,7 @@ class Node : public ltc::interfaces::Node
         m_rpc->connect(m_config->m_rpc.address, m_config->m_rpc.userpass);
 
         // work
-        work.set(m_rpc->getwork());
+        // work.set(m_rpc->getwork());
     }
 
 public:

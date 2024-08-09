@@ -36,6 +36,13 @@ int main()
         node->run();
     // });   
 
+    std::thread th_debug{
+        [&]
+        {
+            
+        }
+    };
+
 
     // ltc::coin::RPC* rpc = new ltc::coin::RPC();
     // std::cout << rpc->Send("asdasd") << std::endl;
