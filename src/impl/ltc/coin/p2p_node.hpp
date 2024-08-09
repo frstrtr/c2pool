@@ -38,11 +38,12 @@ std::string parse_net_error(const boost::system::error_code& ec);
 // void disconnect() = 0;
 
 template <typename ConfigType>
-class NodeP2P : public core::ICommunicator, public core::INetwork, public interfaces::Node, public core::Factory<core::Client>
+class NodeP2P : public core::ICommunicator, public core::INetwork, public core::Factory<core::Client>
 {
     using config_t = ConfigType;
 
 private:
+    ltc::interfaces::Node* m_coin;
     io::io_context* m_context;
     config_t* m_config;
     p2p::Handler m_handler;
@@ -50,7 +51,8 @@ private:
     std::unique_ptr<Connection> m_peer; // TODO: add ping
 
 public:
-    NodeP2P(io::io_context* context, config_t* config) : core::Factory<core::Client>(context, this), m_context(context), m_config(config) 
+    NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config) 
+        : core::Factory<core::Client>(context, this), m_context(context), m_coin(coin), m_config(config) 
     {
         
     }
@@ -81,27 +83,27 @@ public:
             start_height=0
         */
 
-        auto msg_version = message_version::make_raw(
-            70002,
-            1,
-            1723920793,
-            addr_t{1, NetService{"192.168.0.1", 2222}}, 
-            addr_t{1, NetService{"192.168.0.1", 2222}},
-            1,
-            "c2pool",
-            0
-        );
-
         // auto msg_version = message_version::make_raw(
-        //     70017,
+        //     70002,
         //     1,
-        //     core::timestamp(),
-        //     addr_t{1, m_peer->get_addr()}, 
-        //     addr_t{1, NetService{"192.168.0.1", 12024}},
-        //     core::random::random_nonce(),
+        //     1723920793,
+        //     addr_t{1, NetService{"192.168.0.1", 2222}}, 
+        //     addr_t{1, NetService{"192.168.0.1", 2222}},
+        //     1,
         //     "c2pool",
         //     0
         // );
+
+        auto msg_version = message_version::make_raw(
+            70017,
+            1,
+            core::timestamp(),
+            addr_t{1, m_peer->get_addr()}, 
+            addr_t{1, NetService{"192.168.0.1", 12024}},
+            core::random::random_nonce(),
+            "c2pool",
+            0
+        );
 
         m_peer->write(msg_version);
         //=======================
@@ -232,7 +234,7 @@ private:
                 vinv.push_back(inv);
                 break;
             case inventory_type::block:
-                m_new_block.happened(inv.m_hash);
+                m_coin->new_block.happened(inv.m_hash);
                 break;
             default:
                 LOG_WARNING << "Unknown inv type " << (int)inv.m_type;
@@ -249,7 +251,7 @@ private:
 
     ADD_HANDLER(tx)
     {
-        m_new_tx.happened(Transaction(msg->m_tx));
+        m_coin->new_tx.happened(Transaction(msg->m_tx));
     }
 
     ADD_HANDLER(block)
@@ -275,7 +277,7 @@ private:
             m_peer->get_header(blockhash, header);
         }
 
-        m_new_headers.happened(vheaders);
+        m_coin->new_headers.happened(vheaders);
     }
 
     #undef ADD_HANDLER
