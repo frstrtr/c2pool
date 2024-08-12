@@ -1,6 +1,7 @@
 #include "rpc.hpp"
 
 #include <core/log.hpp>
+#include <core/hash.hpp>
 namespace ltc
 {
 
@@ -24,11 +25,13 @@ void NodeRPC::connect(NetService address, std::string userpass)
     m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     m_http_request.set(http::field::content_type, "application/json");
 
-	char *encoded_login2 = new char[32];
-    boost::beast::detail::base64::encode(encoded_login2, userpass.c_str(), strlen(userpass.c_str()));
-	m_auth->authorization = "Basic " + std::string(encoded_login2, strlen(encoded_login2));
+	std::string encoded_login2;
+    encoded_login2.resize(boost::beast::detail::base64::encoded_size(userpass.size()));
+    const auto result = boost::beast::detail::base64::encode(&encoded_login2[0], userpass.data(), userpass.size());
+    encoded_login2.resize(result);
+	m_auth->authorization = "Basic " + encoded_login2;
+
     m_http_request.set(http::field::authorization, m_auth->authorization);
-	delete[] encoded_login2;
 
     auto const results = m_resolver.resolve(address.address(), address.port_str());
 	boost::asio::ip::tcp::endpoint endpoint = *results;
@@ -83,7 +86,6 @@ NodeRPC::~NodeRPC()
 
 std::string NodeRPC::Send(const std::string &request)
 {
-	//TODO:
 	m_http_request.body() = request;
 	m_http_request.prepare_payload();
 	try
@@ -111,10 +113,8 @@ std::string NodeRPC::Send(const std::string &request)
     }
 
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
-    LOG_DEBUG_COIND_RPC << "json_result: " << json_result;
 
 	return json_result;
-	// return std::string("");
 }
 
 nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
@@ -199,27 +199,116 @@ bool NodeRPC::check_blockheader(uint256 header)
     }
 }
 
-void NodeRPC::getwork()
+rpc::WorkData NodeRPC::getwork()
 {
 	auto start = core::timestamp();
 	auto work = getblocktemplate({"segwit", "mweb"}); // mweb for ltc
 	auto end = core::timestamp();
 
-	// if (!txidcache.is_started())
-	// {
+	if (!m_coin->txidcache.is_started())
+		m_coin->txidcache.start();
 
-	// }
+// TODO: legacy part:
+	std::vector<uint256> txhashes;
+	std::vector<ltc::coin::Transaction> unpacked_transactions;
+    for (auto& packed_tx : work["transactions"])
+    {
+        PackStream ps_tx;
+
+        uint256 txid;
+		std::string x;
+
+        if (packed_tx.contains("data"))
+            x = packed_tx["data"].get<std::string>();
+        else
+            x = packed_tx.get<std::string>();
+
+        if (m_coin->txidcache.exist(x))
+        {
+            txid = m_coin->txidcache.get(x);
+            txhashes.push_back(txid);
+        } else 
+        {
+            ps_tx = PackStream(ParseHex(x));
+            txid = Hash(ps_tx.get_span()); // TODO: CHECK!
+			std::cout << txid.ToString() << std::endl;
+			m_coin->txidcache.add(x, txid);
+			txhashes.push_back(txid);
+        }
+
+        ltc::coin::MutableTransaction unpacked_tx;
+        if (m_coin->known_txs.contains(txid))
+        {
+			unpacked_tx = ltc::coin::MutableTransaction(m_coin->known_txs.at(txid));
+        } else
+        {
+            if (ps_tx.empty())
+                ps_tx = PackStream(ParseHex(x));
+            UnserializeTransaction(unpacked_tx, ps_tx, TX_WITH_WITNESS);
+        }
+        unpacked_transactions.push_back(ltc::coin::Transaction(unpacked_tx));
+    }
+
+	if ((core::timestamp() - m_coin->txidcache.time()) > 1800)
+    {
+        std::map<std::string, uint256> keepers;
+        for (int i = 0; i < txhashes.size(); i++)
+        {
+            auto x = work["transactions"].at(i);
+            std::string keep;
+            if (x.contains("data"))
+                keep = x["data"].get<std::string>();
+            else
+                keep = x.get<std::string>();
+            uint256 txid = txhashes[i];
+            keepers[keep] = txid;
+        }
+        m_coin->txidcache.clear();
+        m_coin->txidcache.add(keepers);
+    }
+
+	if (!work.contains("height"))
+    {
+        uint256 previous_block_hash = work["previousblockhash"].get<uint256>();
+        work["height"] = getblock(previous_block_hash)["height"].get<int>() + 1;
+    }
+
+    return rpc::WorkData{work, unpacked_transactions, txhashes, end - start};
 }
 
-void NodeRPC::submit_block(BlockType& block)
+void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failure)
 {
+	// TODO:
+	// segwit_rules = set(['!segwit', 'segwit'])
+    // segwit_activated = len(segwit_rules - set(bitcoind_work.value['rules'])) < len(segwit_rules)
+	bool segwit_activated = false;
+	if (m_coin->work.value().contains("rules"))
+	{
+		std::vector<std::string> rules = m_coin->work.value()["rules"].get<std::vector<std::string>>();
+    	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "segwit";});
+    	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "!segwit";});
+	}
 	
+	//TODO: (stripped_block for blocks without segwit?)
+	// result = yield bitcoind.rpc_submitblock((bitcoin_data.block_type if segwit_activated else bitcoin_data.stripped_block_type).pack(block).encode('hex') + bitcoind_work.value['mweb'])
+
+	PackStream packed_block = pack<ltc::coin::BlockType>(block);
+	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span()) + mweb});
+	bool success = result.is_null();
+	
+	auto block_header = pack<ltc::coin::BlockHeaderType>(block); // cast to header?
+	auto success_expected = true; // TODO:
+
+	if ((!success && success_expected && !ignore_failure) || (success && !success_expected))
+    	LOG_ERROR << "Block submittal result: " << success << "(" << result.dump() << ") Expected: " << success_expected;
 }
 
 // RPC Methods
 
 nlohmann::json NodeRPC::getblocktemplate(std::vector<std::string> rules)
 {
+	for (auto r : rules)
+		std::cout << r << std::endl;
 	nlohmann::json j = nlohmann::json::object({{"rules", rules}});
 	return CallAPIMethod("getblocktemplate", {j});
 }

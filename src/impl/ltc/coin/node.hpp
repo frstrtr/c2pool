@@ -52,9 +52,11 @@ public:
     {
         // RPC
         init_rpc();
+        auto res = m_rpc->getwork();
+        std::cout << res.m_data.dump() << std::endl;
 
         // P2P
-        init_p2p();
+        // init_p2p();
     }
 };
     
