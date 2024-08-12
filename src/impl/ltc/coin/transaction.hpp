@@ -136,6 +136,7 @@ template<typename StreamType, typename TxType>
 void UnserializeTransaction(TxType& tx, StreamType& s, const TxParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
+    const bool fAllowMWEB = true;
 
     s >> tx.version;
     unsigned char flags = 0;
@@ -171,6 +172,26 @@ void UnserializeTransaction(TxType& tx, StreamType& s, const TxParams& params)
             throw std::ios_base::failure("Superfluous witness record");
         }
     }
+
+    if ((flags & 8) && fAllowMWEB) 
+    {
+        /* The MWEB flag is present, and we support MWEB. */
+        flags ^= 8;
+
+        // s >> tx.mweb_tx;
+        // if (tx.mweb_tx.IsNull()) 
+        // {
+        //     if (tx.vout.empty()) 
+        //     {
+        //         /* It's illegal to include a HogEx with no outputs. */
+        //         throw std::ios_base::failure("Missing HogEx output");
+        //     }
+
+        //     /* If the MWEB flag is set, but there are no MWEB txs, assume HogEx txn. */
+        //     tx.m_hogEx = true;
+        // }
+    }
+
     if (flags) 
     {
         /* Unknown flag in the serialization */
