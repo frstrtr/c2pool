@@ -76,6 +76,11 @@ public:
         return m_vch.size();
     }
 
+    bool empty() const
+    {   // TODO: нужно ли проверять ещё и положение курсора, на случай, если данные имеются? может сделать аргументом метода empty(check_cursor)?
+        return m_vch.empty();
+    }
+
     void from_hex(const std::string &hexData)
     {
         write(ParseHexBytes(hexData));
