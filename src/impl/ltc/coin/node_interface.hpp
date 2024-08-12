@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <vector>
 
 #include "block.hpp"
@@ -24,7 +25,8 @@ struct Node
 	Event<coin::Transaction> new_tx;						//bitcoin_data.tx_type
 	Event<std::vector<coin::BlockHeaderType>> new_headers;	//bitcoin_data.block_header_type
 
-	coin::TXIDCache txid_cache;
+	coin::TXIDCache txidcache;
+	std::map<uint256, coin::Transaction> known_txs; // TODO: move to other?
 };
 
 } // namespace interfaces

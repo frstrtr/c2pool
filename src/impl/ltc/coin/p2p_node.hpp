@@ -168,6 +168,21 @@ public:
         return m_config->coin()->m_p2p.prefix;
     }
 
+    void submit_block(BlockType& block)
+    {
+        if (m_peer)
+        {
+            auto rmsg = ltc::coin::p2p::message_block::make_raw(block);
+            m_peer->write(rmsg);
+        } else
+        {
+            //TODO: add net.PARENT.BLOCK_EXPLORER_URL_PREFIX
+            LOG_ERROR << "No bitcoind connection when block submittal attempted!"; //<< /*net.PARENT.BLOCK_EXPLORER_URL_PREFIX <<*/ /*bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header'])))*/
+            // TODO: raise deferral.RetrySilentlyException()
+            throw std::runtime_error("No bitcoind connection in submit_block");
+        }
+    }
+
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
     //[x][x][x] void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol); //
     //[x][x][x] void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol); //
