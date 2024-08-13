@@ -29,6 +29,9 @@ struct WorkData
 
     }
 
+    bool operator==(const WorkData& rhs) const { return m_data == rhs.m_data; }
+    bool operator!=(const WorkData& rhs) const { return !(*this == rhs); }
+
 /*
 
             

@@ -27,6 +27,8 @@ class Node : public ltc::interfaces::Node
     std::unique_ptr<NodeRPC> m_rpc;
     std::unique_ptr<NodeP2P<config_t>> m_p2p;
 
+    //TODO for async: std::thread m_thread_rpc;
+
     void init_p2p()
     {
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
@@ -35,10 +37,27 @@ class Node : public ltc::interfaces::Node
 
     void init_rpc()
     {
+        // m_thread_rpc = std::thread
+        // (
+        //     [&]
+        //     {
+        //         auto* rpc_context = new boost::asio::io_context();
+        //         m_rpc = std::make_unique<NodeRPC>(rpc_context, this, m_config->m_testnet);
+        //         m_rpc->connect(m_config->m_rpc.address, m_config->m_rpc.userpass);
+        //         // for test:
+        //         boost::asio::post(*rpc_context, [&]{
+        //             auto res = m_rpc->getwork();
+        //             std::cout << res.m_data.dump() << std::endl;
+        //         });
+        //         rpc_context->run();
+        //     }
+        // );
+
         m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->m_testnet);
         m_rpc->connect(m_config->m_rpc.address, m_config->m_rpc.userpass);
 
         // work
+        work.set(m_rpc->getwork());
         // work.set(m_rpc->getwork());
     }
 
@@ -52,8 +71,6 @@ public:
     {
         // RPC
         init_rpc();
-        auto res = m_rpc->getwork();
-        std::cout << res.m_data.dump() << std::endl;
 
         // P2P
         // init_p2p();
