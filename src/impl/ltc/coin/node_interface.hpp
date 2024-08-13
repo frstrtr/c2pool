@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "block.hpp"
+#include "rpc_data.hpp"
 #include "transaction.hpp"
 #include "txidcache.hpp"
 
@@ -20,7 +21,7 @@ namespace interfaces
 
 struct Node
 {
-	Variable<nlohmann::json> work;							//get_work result
+	Variable<ltc::coin::rpc::WorkData> work;							//get_work result
     Event<uint256> new_block;								//block_hash
 	Event<coin::Transaction> new_tx;						//bitcoin_data.tx_type
 	Event<std::vector<coin::BlockHeaderType>> new_headers;	//bitcoin_data.block_header_type

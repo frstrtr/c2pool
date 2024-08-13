@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <atomic>
 #include <memory>
 
 #include <core/common.hpp>
@@ -226,6 +227,7 @@ class Variable
     using wrap_t = VarWrapper<var_t>;
 protected:
     std::shared_ptr<wrap_t> m_wrapper;
+    std::atomic_bool m_has_value {false}; // todo: atomic_bool -> atomic_flag?
 
 public:
     Event<var_t> changed;
@@ -236,15 +238,20 @@ public:
     explicit Variable(const var_t& value)
     {
         m_wrapper = std::make_shared<wrap_t>(value);
+        m_has_value.store(true);
     }
 
     explicit Variable(var_t&& value)
     {
         m_wrapper = std::make_shared<wrap_t>(value);
+        m_has_value.store(true);
     }
 
     void set(VarType value)
     {
+        if (m_has_value.load())
+            
+
         std::unique_ptr<VarType> oldvalue;
         // thread-safe change value
         {
@@ -265,6 +272,14 @@ public:
     }
 
     auto value()
+    {
+        if (!m_wrapper)
+            throw std::runtime_error("Variable wrapper is null!");
+        std::lock_guard lock(m_wrapper->m_mutex);
+        return m_wrapper->m_value;
+    }
+
+    auto operator*() const
     {
         if (!m_wrapper)
             throw std::runtime_error("Variable wrapper is null!");

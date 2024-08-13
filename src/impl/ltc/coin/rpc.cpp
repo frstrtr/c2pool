@@ -282,9 +282,11 @@ void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failu
 	// segwit_rules = set(['!segwit', 'segwit'])
     // segwit_activated = len(segwit_rules - set(bitcoind_work.value['rules'])) < len(segwit_rules)
 	bool segwit_activated = false;
-	if (m_coin->work.value().contains("rules"))
+	auto work = *m_coin->work;
+	if (work.m_data.contains("rules"))
+	// if (  m_coin->work->m_data.contains("rules"))
 	{
-		std::vector<std::string> rules = m_coin->work.value()["rules"].get<std::vector<std::string>>();
+		std::vector<std::string> rules = work.m_data["rules"].get<std::vector<std::string>>();
     	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "segwit";});
     	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "!segwit";});
 	}

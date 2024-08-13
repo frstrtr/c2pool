@@ -36,19 +36,19 @@ int main()
         node->run();
     // });   
 
-    std::thread th_debug{
-        [&]
-        {
+    // std::thread th_debug{
+    //     [&]
+    //     {
             
-        }
-    };
+    //     }
+    // };
 
 
     // ltc::coin::RPC* rpc = new ltc::coin::RPC();
     // std::cout << rpc->Send("asdasd") << std::endl;
 
-    // boost::asio::steady_timer timer(*context, std::chrono::seconds(10));
-    // timer.async_wait([](const auto& ec) { std::cout << "timer end!" << std::endl; });
+    boost::asio::steady_timer timer(*context, std::chrono::seconds(10));
+    timer.async_wait([](const auto& ec) { std::cout << "timer end!" << std::endl; });
 
     context->run();
 }
