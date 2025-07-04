@@ -12,6 +12,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <boost/process.hpp>
 #include <nlohmann/json.hpp>
 #include <jsonrpccxx/server.hpp>
 
@@ -28,6 +29,30 @@ using tcp = net::ip::tcp;
 // Forward declarations
 class MiningInterface;
 class StratumServer;
+class LitecoinRpcClient;
+
+/// Litecoin Core RPC client for blockchain sync status
+class LitecoinRpcClient
+{
+public:
+    LitecoinRpcClient(bool testnet = true);
+    
+    struct SyncStatus {
+        bool is_synced;
+        double progress;
+        uint64_t current_blocks;
+        uint64_t total_headers;
+        bool initial_block_download;
+        std::string error_message;
+    };
+    
+    SyncStatus get_sync_status();
+    bool is_connected();
+    
+private:
+    bool testnet_;
+    std::string execute_cli_command(const std::string& command);
+};
 
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
@@ -72,6 +97,10 @@ public:
 
     // Address validation
     bool is_valid_address(const std::string& address) const;
+    
+    // Sync status checking
+    bool is_blockchain_synced() const;
+    void log_sync_progress() const;
 
 private:
     void setup_methods();
@@ -79,6 +108,7 @@ private:
     // Internal state
     uint64_t m_work_id_counter;
     std::map<std::string, nlohmann::json> m_active_work;
+    std::unique_ptr<LitecoinRpcClient> m_rpc_client;
     
     // TODO: Add connections to actual mining node and coin interface
     // std::shared_ptr<Node> m_node;
@@ -104,6 +134,11 @@ public:
     // Start/stop the server
     bool start();
     void stop();
+    
+    // Stratum server control
+    bool start_stratum_server();
+    void stop_stratum_server();
+    bool is_stratum_running() const;
     
     // Server info
     std::string get_bind_address() const { return bind_address_; }

@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <sstream>
 #include <ctime>
+#include <boost/process.hpp>
+#include <boost/algorithm/string.hpp>
 
 namespace core {
 
@@ -119,6 +121,7 @@ void HttpSession::handle_error(beast::error_code ec, char const* what)
 /// MiningInterface Implementation
 MiningInterface::MiningInterface()
     : m_work_id_counter(1)
+    , m_rpc_client(std::make_unique<LitecoinRpcClient>(true)) // true for testnet
 {
     setup_methods();
 }
@@ -511,6 +514,17 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
     
     LOG_INFO << "Stratum mining.authorize for user: " << username << " (session: " << subscription_id_ << ")";
     
+    // Check if blockchain is synchronized before allowing mining
+    if (!mining_interface_->is_blockchain_synced()) {
+        mining_interface_->log_sync_progress();
+        LOG_WARNING << "Rejecting mining.authorize - blockchain not synchronized";
+        return {
+            {"id", request_id},
+            {"result", false},
+            {"error", {{"code", -2}, {"message", "Pool not ready - blockchain synchronizing"}}}
+        };
+    }
+    
     // Validate Litecoin address (username should be LTC address)
     if (!mining_interface_->is_valid_address(username)) {
         LOG_WARNING << "Invalid Litecoin address in mining.authorize: " << username;
@@ -762,11 +776,8 @@ bool WebServer::start()
         accept_connections();
         running_ = true;
         
-        // Start Stratum server
-        if (!stratum_server_->start()) {
-            LOG_ERROR << "Failed to start Stratum server";
-            return false;
-        }
+        // Don't start Stratum server automatically - wait for blockchain sync
+        LOG_INFO << "Stratum server will start once blockchain is synchronized";
         
         return true;
         
@@ -799,6 +810,40 @@ void WebServer::stop()
     }
 }
 
+bool WebServer::start_stratum_server()
+{
+    if (!stratum_server_) {
+        LOG_ERROR << "Stratum server not initialized";
+        return false;
+    }
+    
+    if (stratum_server_->is_running()) {
+        LOG_INFO << "Stratum server is already running";
+        return true;
+    }
+    
+    if (!stratum_server_->start()) {
+        LOG_ERROR << "Failed to start Stratum server";
+        return false;
+    }
+    
+    LOG_INFO << "Stratum server started successfully on " << bind_address_ << ":" << (port_ + 1);
+    return true;
+}
+
+void WebServer::stop_stratum_server()
+{
+    if (stratum_server_ && stratum_server_->is_running()) {
+        LOG_INFO << "Stopping Stratum server...";
+        stratum_server_->stop();
+    }
+}
+
+bool WebServer::is_stratum_running() const
+{
+    return stratum_server_ && stratum_server_->is_running();
+}
+
 void WebServer::accept_connections()
 {
     acceptor_.async_accept(
@@ -822,6 +867,126 @@ void WebServer::handle_accept(beast::error_code ec, tcp::socket socket)
     
     // Continue accepting connections
     accept_connections();
+}
+
+/// LitecoinRpcClient Implementation
+LitecoinRpcClient::LitecoinRpcClient(bool testnet) : testnet_(testnet)
+{
+}
+
+std::string LitecoinRpcClient::execute_cli_command(const std::string& command)
+{
+    try {
+        namespace bp = boost::process;
+        
+        std::string full_command = "litecoin-cli";
+        if (testnet_) {
+            full_command += " -testnet";
+        }
+        full_command += " " + command;
+        
+        bp::ipstream pipe_stream;
+        bp::child c(full_command, bp::std_out > pipe_stream);
+        
+        std::string result;
+        std::string line;
+        while (pipe_stream && std::getline(pipe_stream, line) && !line.empty()) {
+            result += line + "\n";
+        }
+        
+        c.wait();
+        
+        if (c.exit_code() != 0) {
+            return "";
+        }
+        
+        return result;
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to execute litecoin-cli command: " << e.what();
+        return "";
+    }
+}
+
+LitecoinRpcClient::SyncStatus LitecoinRpcClient::get_sync_status()
+{
+    SyncStatus status;
+    status.is_synced = false;
+    status.progress = 0.0;
+    status.current_blocks = 0;
+    status.total_headers = 0;
+    status.initial_block_download = true;
+    
+    try {
+        std::string response = execute_cli_command("getblockchaininfo");
+        if (response.empty()) {
+            status.error_message = "Failed to connect to Litecoin Core";
+            return status;
+        }
+        
+        nlohmann::json info = nlohmann::json::parse(response);
+        
+        status.current_blocks = info.value("blocks", 0);
+        status.total_headers = info.value("headers", 0);
+        status.progress = info.value("verificationprogress", 0.0);
+        status.initial_block_download = info.value("initialblockdownload", true);
+        
+        // Consider synced if:
+        // 1. Not in initial block download
+        // 2. Verification progress > 99.9%
+        // 3. Blocks are close to headers (within 2 blocks)
+        status.is_synced = !status.initial_block_download && 
+                          status.progress > 0.999 && 
+                          (status.total_headers - status.current_blocks) <= 2;
+        
+    } catch (const std::exception& e) {
+        status.error_message = "Failed to parse blockchain info: " + std::string(e.what());
+    }
+    
+    return status;
+}
+
+bool LitecoinRpcClient::is_connected()
+{
+    std::string response = execute_cli_command("getnetworkinfo");
+    return !response.empty();
+}
+
+bool MiningInterface::is_blockchain_synced() const
+{
+    if (!m_rpc_client) {
+        return false;
+    }
+    
+    auto status = m_rpc_client->get_sync_status();
+    return status.is_synced;
+}
+
+void MiningInterface::log_sync_progress() const
+{
+    if (!m_rpc_client) {
+        LOG_WARNING << "No RPC client available for sync status";
+        return;
+    }
+    
+    auto status = m_rpc_client->get_sync_status();
+    
+    if (!status.error_message.empty()) {
+        LOG_ERROR << "Sync status error: " << status.error_message;
+        return;
+    }
+    
+    if (status.is_synced) {
+        LOG_INFO << "Blockchain is fully synchronized - Ready for mining!";
+    } else {
+        double progress_percent = status.progress * 100.0;
+        LOG_INFO << "Blockchain sync progress: " << std::fixed << std::setprecision(2) 
+                 << progress_percent << "% (" << status.current_blocks << "/" 
+                 << status.total_headers << " blocks)";
+        
+        if (status.initial_block_download) {
+            LOG_INFO << "Initial block download in progress...";
+        }
+    }
 }
 
 } // namespace core
