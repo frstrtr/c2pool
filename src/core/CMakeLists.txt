@@ -34,6 +34,6 @@ find_package(yaml-cpp REQUIRED)
 
 add_library(core STATIC ${source})
 target_link_libraries(core btclibs)
-target_link_libraries(core boost::boost yaml-cpp::yaml-cpp nlohmann_json::nlohmann_json)
+target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json)
 
 add_subdirectory(test)

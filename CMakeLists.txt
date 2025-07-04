@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 
 find_package(GTest REQUIRED)
-find_package(Boost REQUIRED)
+find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem system)
 find_package(nlohmann_json REQUIRED)
 
 include(CTest)
