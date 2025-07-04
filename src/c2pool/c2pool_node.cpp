@@ -12,18 +12,39 @@
 #include <core/message.hpp>
 #include <core/node_interface.hpp>
 
-class PeerImpl
+// Simple types for demonstration
+struct SimpleConfig
 {
-    int i;
+    std::string m_name = "c2pool_test";
+    
+    struct PoolConfig {
+        std::vector<std::byte> m_prefix = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
+    } m_pool_config;
+    
+    PoolConfig* pool() { return &m_pool_config; }
 };
 
-class NodeImpl : public pool::BaseNode<PeerImpl>
+struct SimpleShareChain
+{
+    // Minimal sharechain implementation
+};
+
+struct SimplePeer
+{
+    uint64_t m_nonce = 0;
+};
+
+class NodeImpl : public pool::BaseNode<SimpleConfig, SimpleShareChain, SimplePeer>
 {
 public:
     //  INetwork:
-    // void connected(std::shared_ptr<c2pool::Socket> socket) override { }
     void disconnect() override { }
+    
     // BaseNode:
+    void send_ping(peer_ptr peer) override {
+        std::cout << "send ping to peer" << std::endl;
+    }
+    
     pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) 
     { 
         std::cout << "version msg" << std::endl;
@@ -31,7 +52,7 @@ public:
     }
 
     NodeImpl() {}
-    NodeImpl(boost::asio::io_context* ctx, const std::vector<std::byte>& prefix) : pool::BaseNode<PeerImpl>(ctx, prefix) {}
+    NodeImpl(boost::asio::io_context* ctx, config_t* config) : base_t(ctx, config) {}
 };
 
 class C2Pool : public pool::Protocol<NodeImpl>
@@ -57,15 +78,23 @@ int main(int argc, char *argv[])
 #endif
 
     boost::asio::io_context* context = new boost::asio::io_context();
-    std::vector<std::byte> prefix = {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
+    SimpleConfig* config = new SimpleConfig();
 
     core::log::Logger::init();
     // auto settings = c2pool::Fileconfig::load_file<c2pool::Settings>();
 
-
-    Node* node = new Node(context, prefix);
-    node->run(5555);
+    Node* node = new Node(context, config);
+    // node->run(5555); // This method doesn't exist in NodeBridge
+    
+    // Start the context instead
+    std::cout << "Starting c2pool node..." << std::endl;
     context->run();
+    
+    delete node;
+    delete config;
+    delete context;
+    
+    return 0;
 }
 
 // struct TestSocket
