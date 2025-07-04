@@ -6,6 +6,9 @@
 
 namespace core {
 
+/// Static member definition
+std::atomic<uint64_t> StratumSession::job_counter_{0};
+
 /// HttpSession Implementation
 HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
     : socket_(std::move(socket))
@@ -323,6 +326,408 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
     return true;
 }
 
+bool MiningInterface::is_valid_address(const std::string& address) const
+{
+    // Basic Litecoin address validation for both mainnet and testnet
+    // This is a simplified implementation - in production, use proper Bitcoin/Litecoin libraries
+    
+    if (address.empty() || address.length() < 26 || address.length() > 62) {
+        return false;
+    }
+    
+    // Legacy addresses
+    // Mainnet: L (P2PKH), M (P2SH), 3 (P2SH)
+    // Testnet: m, n (P2PKH), 2 (P2SH)
+    if (address[0] == 'L' || address[0] == 'M' || address[0] == '3' || 
+        address[0] == 'm' || address[0] == 'n' || address[0] == '2') {
+        // Basic Base58 character check - Base58 excludes 0, O, I, l
+        for (char c : address) {
+            if (!std::isalnum(c) || c == '0' || c == 'O' || c == 'I' || c == 'l') {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    // Bech32 addresses
+    // Mainnet: ltc1
+    // Testnet: tltc1, rltc1 (regtest)
+    if (address.substr(0, 4) == "ltc1" || address.substr(0, 5) == "tltc1" || address.substr(0, 6) == "rltc1") {
+        // Basic bech32 character check
+        for (size_t i = 0; i < address.length(); ++i) {
+            char c = address[i];
+            if (!(std::islower(c) || std::isdigit(c))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    return false;
+}
+
+/// StratumSession Implementation
+StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
+    : socket_(std::move(socket))
+    , mining_interface_(mining_interface)
+    , subscription_id_(generate_subscription_id())
+{
+}
+
+void StratumSession::start()
+{
+    read_message();
+}
+
+std::string StratumSession::generate_subscription_id()
+{
+    static std::atomic<uint64_t> counter{0};
+    return "sub_" + std::to_string(++counter);
+}
+
+void StratumSession::read_message()
+{
+    auto self = shared_from_this();
+    
+    net::async_read_until(socket_, buffer_, "\n",
+        [self](beast::error_code ec, std::size_t bytes_transferred)
+        {
+            if (ec) {
+                if (ec != net::error::eof && ec != net::error::operation_aborted) {
+                    LOG_ERROR << "Stratum read error: " << ec.message();
+                }
+                return;
+            }
+            
+            self->process_message(bytes_transferred);
+        });
+}
+
+void StratumSession::process_message(std::size_t bytes_read)
+{
+    try {
+        std::istream is(&buffer_);
+        std::string line;
+        std::getline(is, line);
+        
+        // Remove carriage return if present
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        
+        if (line.empty()) {
+            read_message(); // Continue reading
+            return;
+        }
+        
+        LOG_INFO << "Stratum received: " << line;
+        
+        // Parse JSON message
+        nlohmann::json request = nlohmann::json::parse(line);
+        
+        // Validate message format
+        if (!request.contains("id") || !request.contains("method")) {
+            send_error(-32600, "Invalid Request", request.value("id", nullptr));
+            read_message();
+            return;
+        }
+        
+        std::string method = request["method"];
+        nlohmann::json params = request.value("params", nlohmann::json::array());
+        auto request_id = request["id"];
+        
+        // Route message to appropriate handler
+        nlohmann::json response;
+        
+        if (method == "mining.subscribe") {
+            response = handle_subscribe(params, request_id);
+        } else if (method == "mining.authorize") {
+            response = handle_authorize(params, request_id);
+        } else if (method == "mining.submit") {
+            response = handle_submit(params, request_id);
+        } else {
+            send_error(-32601, "Method not found", request_id);
+            read_message();
+            return;
+        }
+        
+        send_response(response);
+        read_message(); // Continue reading
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Stratum message processing error: " << e.what();
+        send_error(-32700, "Parse error", nullptr);
+        read_message();
+    }
+}
+
+nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    std::string user_agent = "unknown";
+    if (params.is_array() && !params.empty() && params[0].is_string()) {
+        user_agent = params[0];
+    }
+    
+    LOG_INFO << "Stratum mining.subscribe from: " << user_agent << " (session: " << subscription_id_ << ")";
+    
+    // Generate subscription details
+    nlohmann::json subscriptions = nlohmann::json::array({
+        nlohmann::json::array({"mining.set_difficulty", subscription_id_}),
+        nlohmann::json::array({"mining.notify", subscription_id_})
+    });
+    
+    std::string extranonce1 = generate_extranonce1();
+    int extranonce2_size = 4;
+    
+    nlohmann::json result = nlohmann::json::array({
+        subscriptions,
+        extranonce1,
+        extranonce2_size
+    });
+    
+    // Store session info
+    extranonce1_ = extranonce1;
+    subscribed_ = true;
+    
+    return {
+        {"id", request_id},
+        {"result", result},
+        {"error", nullptr}
+    };
+}
+
+nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    if (!params.is_array() || params.size() < 2) {
+        return {
+            {"id", request_id},
+            {"result", nullptr},
+            {"error", {{"code", -1}, {"message", "Invalid params"}}}
+        };
+    }
+    
+    std::string username = params[0];
+    std::string password = params[1];
+    
+    LOG_INFO << "Stratum mining.authorize for user: " << username << " (session: " << subscription_id_ << ")";
+    
+    // Validate Litecoin address (username should be LTC address)
+    if (!mining_interface_->is_valid_address(username)) {
+        LOG_WARNING << "Invalid Litecoin address in mining.authorize: " << username;
+        return {
+            {"id", request_id},
+            {"result", false},
+            {"error", {{"code", -1}, {"message", "Invalid Litecoin address"}}}
+        };
+    }
+    
+    // Store authorized user
+    authorized_ = true;
+    username_ = username;
+    
+    // Send initial difficulty and work
+    send_set_difficulty(1.0);
+    send_notify_work();
+    
+    return {
+        {"id", request_id},
+        {"result", true},
+        {"error", nullptr}
+    };
+}
+
+nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    if (!authorized_) {
+        return {
+            {"id", request_id},
+            {"result", false},
+            {"error", {{"code", -1}, {"message", "Not authorized"}}}
+        };
+    }
+    
+    if (!params.is_array() || params.size() < 5) {
+        return {
+            {"id", request_id},
+            {"result", false},
+            {"error", {{"code", -1}, {"message", "Invalid params"}}}
+        };
+    }
+    
+    std::string username = params[0];
+    std::string job_id = params[1];
+    std::string extranonce2 = params[2];
+    std::string ntime = params[3];
+    std::string nonce = params[4];
+    
+    LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id 
+             << " (session: " << subscription_id_ << ")";
+    
+    // Validate submission via mining interface
+    bool accepted = mining_interface_->mining_submit(username, job_id, extranonce2, ntime, nonce, "stratum").get<bool>();
+    
+    return {
+        {"id", request_id},
+        {"result", accepted},
+        {"error", nullptr}
+    };
+}
+
+void StratumSession::send_response(const nlohmann::json& response)
+{
+    std::string message = response.dump() + "\n";
+    
+    auto self = shared_from_this();
+    net::async_write(socket_, net::buffer(message),
+        [self, message](beast::error_code ec, std::size_t)
+        {
+            if (ec) {
+                LOG_ERROR << "Stratum write error: " << ec.message();
+            }
+        });
+}
+
+void StratumSession::send_error(int code, const std::string& message, const nlohmann::json& request_id)
+{
+    nlohmann::json error_response = {
+        {"id", request_id},
+        {"result", nullptr},
+        {"error", {{"code", code}, {"message", message}}}
+    };
+    
+    send_response(error_response);
+}
+
+void StratumSession::send_set_difficulty(double difficulty)
+{
+    nlohmann::json notification = {
+        {"id", nullptr},
+        {"method", "mining.set_difficulty"},
+        {"params", nlohmann::json::array({difficulty})}
+    };
+    
+    send_response(notification);
+}
+
+void StratumSession::send_notify_work()
+{
+    // Generate work notification
+    std::string job_id = "job_" + std::to_string(++job_counter_);
+    std::string prevhash = "00000000000000000000000000000000000000000000000000000000000000000";
+    std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
+    std::string coinb2 = "ffffffff0100f2052a010000001976a914"; // TODO: Add actual payout address
+    std::string version = "00000001";
+    std::string nbits = "1d00ffff";
+    std::string ntime = std::to_string(static_cast<uint32_t>(std::time(nullptr)));
+    bool clean_jobs = true;
+    
+    nlohmann::json notification = {
+        {"id", nullptr},
+        {"method", "mining.notify"},
+        {"params", nlohmann::json::array({
+            job_id,
+            prevhash,
+            coinb1,
+            coinb2,
+            nlohmann::json::array(), // merkle_branch
+            version,
+            nbits,
+            ntime,
+            clean_jobs
+        })}
+    };
+    
+    send_response(notification);
+}
+
+std::string StratumSession::generate_extranonce1()
+{
+    static std::atomic<uint32_t> counter{0};
+    uint32_t value = ++counter;
+    
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0') << std::setw(8) << value;
+    return ss.str();
+}
+
+/// StratumServer Implementation
+StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface)
+    : ioc_(ioc)
+    , acceptor_(ioc)
+    , bind_address_(address)
+    , port_(port)
+    , mining_interface_(mining_interface)
+    , running_(false)
+{
+}
+
+StratumServer::~StratumServer()
+{
+    stop();
+}
+
+bool StratumServer::start()
+{
+    try {
+        tcp::endpoint endpoint{net::ip::make_address(bind_address_), port_};
+        
+        acceptor_.open(endpoint.protocol());
+        acceptor_.set_option(net::socket_base::reuse_address(true));
+        acceptor_.bind(endpoint);
+        acceptor_.listen(net::socket_base::max_listen_connections);
+        
+        LOG_INFO << "Stratum server listening on " << bind_address_ << ":" << port_;
+        
+        accept_connections();
+        running_ = true;
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to start Stratum server: " << e.what();
+        return false;
+    }
+}
+
+void StratumServer::stop()
+{
+    if (running_) {
+        LOG_INFO << "Stopping Stratum server...";
+        
+        beast::error_code ec;
+        acceptor_.close(ec);
+        
+        running_ = false;
+        
+        LOG_INFO << "Stratum server stopped";
+    }
+}
+
+void StratumServer::accept_connections()
+{
+    acceptor_.async_accept(
+        [this](beast::error_code ec, tcp::socket socket)
+        {
+            handle_accept(ec, std::move(socket));
+        });
+}
+
+void StratumServer::handle_accept(beast::error_code ec, tcp::socket socket)
+{
+    if (ec) {
+        if (ec != net::error::operation_aborted) {
+            LOG_ERROR << "Stratum accept error: " << ec.message();
+        }
+        return;
+    }
+    
+    // Create and start Stratum session
+    std::make_shared<StratumSession>(std::move(socket), mining_interface_)->start();
+    
+    // Continue accepting connections
+    accept_connections();
+}
+
 /// WebServer Implementation
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port)
     : ioc_(ioc)
@@ -332,6 +737,9 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , running_(false)
 {
     mining_interface_ = std::make_shared<MiningInterface>();
+    
+    // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
+    stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
 }
 
 WebServer::~WebServer()
@@ -354,6 +762,12 @@ bool WebServer::start()
         accept_connections();
         running_ = true;
         
+        // Start Stratum server
+        if (!stratum_server_->start()) {
+            LOG_ERROR << "Failed to start Stratum server";
+            return false;
+        }
+        
         return true;
         
     } catch (const std::exception& e) {
@@ -366,6 +780,11 @@ void WebServer::stop()
 {
     if (running_) {
         LOG_INFO << "Stopping web server...";
+        
+        // Stop Stratum server first
+        if (stratum_server_) {
+            stratum_server_->stop();
+        }
         
         beast::error_code ec;
         acceptor_.close(ec);

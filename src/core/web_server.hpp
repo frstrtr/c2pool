@@ -4,6 +4,11 @@
 #include <string>
 #include <functional>
 #include <thread>
+#include <atomic>
+#include <unordered_map>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -22,6 +27,7 @@ using tcp = net::ip::tcp;
 
 // Forward declarations
 class MiningInterface;
+class StratumServer;
 
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
@@ -64,6 +70,9 @@ public:
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
     nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "");
 
+    // Address validation
+    bool is_valid_address(const std::string& address) const;
+
 private:
     void setup_methods();
     
@@ -86,6 +95,7 @@ class WebServer
     uint16_t port_;
     bool running_;
     std::thread server_thread_;
+    std::unique_ptr<StratumServer> stratum_server_;
 
 public:
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port);
@@ -103,6 +113,66 @@ public:
 private:
     void accept_connections();
     void handle_accept(beast::error_code ec, tcp::socket socket);
+};
+
+/// Stratum Session handler for native Stratum protocol (TCP + line-delimited JSON)
+class StratumSession : public std::enable_shared_from_this<StratumSession>
+{
+    tcp::socket socket_;
+    boost::asio::streambuf buffer_;
+    std::shared_ptr<MiningInterface> mining_interface_;
+    std::string subscription_id_;
+    std::string extranonce1_;
+    std::string username_;
+    bool subscribed_ = false;
+    bool authorized_ = false;
+    static std::atomic<uint64_t> job_counter_;
+
+public:
+    explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
+    void start();
+
+private:
+    std::string generate_subscription_id();
+    void read_message();
+    void process_message(std::size_t bytes_read);
+    
+    nlohmann::json handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id);
+    nlohmann::json handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id);
+    nlohmann::json handle_submit(const nlohmann::json& params, const nlohmann::json& request_id);
+    
+    void send_response(const nlohmann::json& response);
+    void send_error(int code, const std::string& message, const nlohmann::json& request_id);
+    void send_set_difficulty(double difficulty);
+    void send_notify_work();
+    
+    std::string generate_extranonce1();
+};
+
+/// Stratum Server for native mining protocol (separate from HTTP)
+class StratumServer
+{
+    net::io_context& ioc_;
+    tcp::acceptor acceptor_;
+    std::shared_ptr<MiningInterface> mining_interface_;
+    std::string bind_address_;
+    uint16_t port_;
+    bool running_;
+
+public:
+    StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface);
+    ~StratumServer();
+
+    bool start();
+    void stop();
+    
+    std::string get_bind_address() const { return bind_address_; }
+    uint16_t get_port() const { return port_; }
+    bool is_running() const { return running_; }
+
+private:
+    void accept_connections();
+    void handle_accept(boost::system::error_code ec, tcp::socket socket);
 };
 
 } // namespace core
