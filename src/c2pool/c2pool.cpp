@@ -4,6 +4,7 @@
 #include <map>
 #include <thread>
 #include <chrono>
+#include <csignal>
 
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
@@ -11,7 +12,9 @@
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/web_server.hpp>
 
+#include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 
 void print_usage(const char* program_name) {
@@ -19,6 +22,10 @@ void print_usage(const char* program_name) {
               << "Options:\n"
               << "  --help                 Show this help message\n"
               << "  --web_server=IP:PORT   Start web server on IP:PORT (e.g., 0.0.0.0:8083)\n"
+              << "                         Provides HTTP/JSON-RPC mining interface for miners\n"
+              << "                         Supported methods: getwork, submitwork, getblocktemplate,\n"
+              << "                         submitblock, getinfo, getstats, mining.subscribe,\n"
+              << "                         mining.authorize, mining.submit\n"
               << "  --ui_config            Show UI configuration interface\n"
               << "  --testnet              Enable testnet mode\n"
               << "  --fee=VALUE            Set fee percentage (0.0-100.0)\n"
@@ -126,14 +133,35 @@ int main(int argc, char *argv[])
         try {
             int port = std::stoi(port_str);
             
-            LOG_INFO << "Web server would start on " << ip << ":" << port;
-            LOG_INFO << "Web server functionality not yet implemented in this build";
-            LOG_INFO << "Node is running. Press Ctrl+C to stop.";
+            // Create boost::asio context
+            boost::asio::io_context ioc;
             
-            // Simulate server running
-            while (true) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Create and start web server
+            core::WebServer web_server(ioc, ip, static_cast<uint16_t>(port));
+            
+            if (!web_server.start()) {
+                LOG_ERROR << "Failed to start web server on " << ip << ":" << port;
+                return 1;
             }
+            
+            LOG_INFO << "Web server started successfully on " << ip << ":" << port;
+            LOG_INFO << "Mining interface available at http://" << ip << ":" << port;
+            LOG_INFO << "Supported methods: getwork, submitwork, getblocktemplate, submitblock, getinfo, getstats";
+            LOG_INFO << "Press Ctrl+C to stop.";
+            
+            // Install signal handler for graceful shutdown
+            boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+            signals.async_wait([&](const boost::system::error_code&, int) {
+                LOG_INFO << "Shutdown signal received, stopping web server...";
+                web_server.stop();
+                ioc.stop();
+            });
+            
+            // Run the I/O context
+            ioc.run();
+            
+            LOG_INFO << "Web server shutdown complete";
+            return 0;
             
         } catch (...) {
             LOG_ERROR << "Invalid port number: " << port_str;
