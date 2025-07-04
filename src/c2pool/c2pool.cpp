@@ -147,6 +147,48 @@ int main(int argc, char *argv[])
             LOG_INFO << "Web server started successfully on " << ip << ":" << port;
             LOG_INFO << "Mining interface available at http://" << ip << ":" << port;
             LOG_INFO << "Supported methods: getwork, submitwork, getblocktemplate, submitblock, getinfo, getstats";
+            
+            // Create a MiningInterface to check sync status
+            auto mining_interface = std::make_shared<core::MiningInterface>();
+            
+            // Check and log initial sync status
+            LOG_INFO << "Checking Litecoin Core synchronization status...";
+            mining_interface->log_sync_progress();
+            
+            bool stratum_started = false;
+            if (!mining_interface->is_blockchain_synced()) {
+                LOG_WARNING << "Blockchain is not synchronized - Stratum server will start when sync completes";
+                LOG_INFO << "HTTP interface is available, but mining will be rejected until synchronized";
+            } else {
+                LOG_INFO << "Blockchain is synchronized - Starting Stratum server for mining!";
+                if (web_server.start_stratum_server()) {
+                    stratum_started = true;
+                }
+            }
+            
+            // Set up periodic sync status logging and Stratum server management
+            boost::asio::steady_timer sync_timer(ioc);
+            std::function<void()> check_sync_status = [&]() {
+                bool is_synced = mining_interface->is_blockchain_synced();
+                
+                if (!is_synced) {
+                    mining_interface->log_sync_progress();
+                } else if (!stratum_started) {
+                    // Blockchain just became synced - start Stratum server
+                    LOG_INFO << "Blockchain sync complete! Starting Stratum server...";
+                    if (web_server.start_stratum_server()) {
+                        stratum_started = true;
+                        LOG_INFO << "Pool is now ready for mining!";
+                    }
+                }
+                
+                sync_timer.expires_after(std::chrono::seconds(10)); // Check every 10 seconds during sync
+                sync_timer.async_wait([&](const boost::system::error_code&) {
+                    check_sync_status();
+                });
+            };
+            check_sync_status();
+            
             LOG_INFO << "Press Ctrl+C to stop.";
             
             // Install signal handler for graceful shutdown
