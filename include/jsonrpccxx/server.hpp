@@ -107,7 +107,6 @@ namespace jsonrpccxx {
           return json();
         }
       } else {
-        request["params"].push_back(std::to_string(request["id"].get<int>())); // C2POOL UPDATE!
         return {{"jsonrpc", "2.0"}, {"id", request["id"]}, {"result", dispatcher.InvokeMethod(request["method"], request["params"])}};
       }
     }

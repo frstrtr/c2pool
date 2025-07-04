@@ -28,6 +28,7 @@ set(source
     opscript.hpp
     random.hpp random.cpp
     addr_store.hpp addr_store.cpp
+    web_server.hpp web_server.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
