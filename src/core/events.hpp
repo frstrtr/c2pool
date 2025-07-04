@@ -249,8 +249,8 @@ public:
 
     void set(VarType value)
     {
-        if (m_has_value.load())
-            
+        if (!m_has_value.load())
+            m_has_value.store(true);
 
         std::unique_ptr<VarType> oldvalue;
         // thread-safe change value

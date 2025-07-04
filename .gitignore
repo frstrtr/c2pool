@@ -63,3 +63,4 @@ vc140.pdb
 libs/secp256k1/*
 /cmake-build-debug-coverage/
 /cmake-build-release
+*.log
