@@ -145,6 +145,42 @@ def show_recent_blocks(count=5):
                 print(f"  TXs: {block_details['tx_count']}, Size: {block_details['size']:,} bytes")
                 print()
 
+def get_hashrate_info():
+    """Get network and local hashrate information"""
+    mining_info = run_litecoin_cli("getmininginfo")
+    if not mining_info:
+        return None
+    
+    network_hashrate = mining_info.get('networkhashps', 0)
+    difficulty = mining_info.get('difficulty', 0)
+    
+    # Estimate local hashrate (if available from pool)
+    # For now, we'll use a fixed estimate for 3x Antrouter L1-LTC
+    local_hashrate_estimate = 3.9e6  # 3.9 MH/s for 3 Antrouters
+    
+    return {
+        'network_hashrate': network_hashrate,
+        'network_hashrate_gh': network_hashrate / 1e9,
+        'difficulty': difficulty,
+        'local_hashrate': local_hashrate_estimate,
+        'local_hashrate_mh': local_hashrate_estimate / 1e6,
+        'network_share': (local_hashrate_estimate / network_hashrate * 100) if network_hashrate > 0 else 0,
+        'estimated_time_hours': (150 / (local_hashrate_estimate / network_hashrate)) / 3600 if network_hashrate > 0 else 0
+    }
+
+def format_hashrate(hashrate):
+    """Format hashrate with appropriate units"""
+    if hashrate >= 1e12:
+        return f"{hashrate/1e12:.2f} TH/s"
+    elif hashrate >= 1e9:
+        return f"{hashrate/1e9:.2f} GH/s"
+    elif hashrate >= 1e6:
+        return f"{hashrate/1e6:.2f} MH/s"
+    elif hashrate >= 1e3:
+        return f"{hashrate/1e3:.2f} KH/s"
+    else:
+        return f"{hashrate:.0f} H/s"
+
 def monitor_mining():
     """Monitor for new blocks and display mining info"""
     print("🔍 Monitoring Litecoin testnet mining activity...")
@@ -154,6 +190,7 @@ def monitor_mining():
     show_recent_blocks(3)
     
     last_block_count = None
+    last_hashrate_display = time.time()
     
     try:
         while True:
@@ -165,11 +202,21 @@ def monitor_mining():
                 
             current_blocks = info['blocks']
             
+            # Get hashrate information
+            hashrate_info = get_hashrate_info()
+            
             if last_block_count is None:
                 last_block_count = current_blocks
                 print(f"Current block height: {current_blocks}")
                 print(f"Difficulty: {info['difficulty']:.2f}")
                 print(f"Sync progress: {info['verificationprogress']*100:.2f}%")
+                
+                if hashrate_info:
+                    print(f"Network hashrate: {format_hashrate(hashrate_info['network_hashrate'])}")
+                    print(f"Your hashrate: {format_hashrate(hashrate_info['local_hashrate'])}")
+                    print(f"Network share: {hashrate_info['network_share']:.6f}%")
+                    print(f"Est. time to block: {hashrate_info['estimated_time_hours']:.1f} hours")
+                
                 print("Waiting for new blocks...\n")
             elif current_blocks > last_block_count:
                 # New block(s) found!
@@ -195,6 +242,12 @@ def monitor_mining():
                             print(f"   Size: {block_details['size']:,} bytes")
                             print(f"   Hash: {block_details['hash']}")
                             
+                            # Add network context
+                            if hashrate_info:
+                                print(f"   Network Hashrate: {format_hashrate(hashrate_info['network_hashrate'])}")
+                                if block_details['is_local_mine']:
+                                    print(f"   Your Share: {hashrate_info['network_share']:.6f}% of network")
+                            
                             if block_details['is_local_mine']:
                                 print("   💰 THIS BLOCK WAS MINED BY OUR POOL! 💰")
                                 print("   ⭐ Congratulations! ⭐")
@@ -211,6 +264,16 @@ def monitor_mining():
                     print(f"💰 Immature balance: {wallet_info['immature_balance']} LTC (coinbase maturing)")
                 if wallet_info['balance'] > 0:
                     print(f"💎 Mature balance: {wallet_info['balance']} LTC")
+            
+            # Display hashrate update every minute (6 cycles of 10 seconds)
+            current_time = time.time()
+            if (current_time - last_hashrate_display) >= 60:
+                if hashrate_info:
+                    print(f"⚡ Network: {format_hashrate(hashrate_info['network_hashrate'])} | "
+                          f"Your: {format_hashrate(hashrate_info['local_hashrate'])} | "
+                          f"Share: {hashrate_info['network_share']:.6f}% | "
+                          f"Est: {hashrate_info['estimated_time_hours']:.1f}h to block")
+                last_hashrate_display = current_time
             
             time.sleep(10)  # Check every 10 seconds
             
