@@ -32,4 +32,5 @@ https://discord.gg/yb6ujsPRsv
 
 # Install:
 ### [UNIX instruction](doc/build-unix.md)
+### [FreeBSD specific guide](doc/build-freebsd.md)
 ### [Windows instruction](doc/build-windows.md)
