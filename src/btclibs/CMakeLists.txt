@@ -34,4 +34,13 @@ set(sources
 
 add_library(btclibs STATIC ${sources}) #${SOURCE} ${HEADER})
 target_include_directories(btclibs PUBLIC util crypto compat)
-target_link_libraries(btclibs Boost::headers nlohmann_json::nlohmann_json)
+
+# Use Boost target names that work with both old and new CMake/Boost versions
+if(TARGET Boost::headers)
+    target_link_libraries(btclibs Boost::headers nlohmann_json::nlohmann_json)
+elseif(TARGET Boost::boost)
+    target_link_libraries(btclibs Boost::boost nlohmann_json::nlohmann_json)
+else()
+    target_link_libraries(btclibs ${Boost_LIBRARIES} nlohmann_json::nlohmann_json)
+    target_include_directories(btclibs PRIVATE ${Boost_INCLUDE_DIRS})
+endif()

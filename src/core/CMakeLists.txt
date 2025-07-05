@@ -35,6 +35,15 @@ find_package(yaml-cpp REQUIRED)
 
 add_library(core STATIC ${source})
 target_link_libraries(core btclibs)
-target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json)
+
+# Use Boost target names that work with both old and new CMake/Boost versions
+if(TARGET Boost::headers)
+    target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json)
+elseif(TARGET Boost::boost)
+    target_link_libraries(core Boost::boost Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json)
+else()
+    target_link_libraries(core ${Boost_LIBRARIES} yaml-cpp nlohmann_json::nlohmann_json)
+    target_include_directories(core PRIVATE ${Boost_INCLUDE_DIRS})
+endif()
 
 add_subdirectory(test)
