@@ -1,4 +1,4 @@
-if (BUILD_TESTING)
+if (BUILD_TESTING AND GTest_FOUND)
     add_executable(share_test share_test.cpp)
     target_link_libraries(share_test PRIVATE GTest::gtest_main core sharechain GTest::gtest)
 
