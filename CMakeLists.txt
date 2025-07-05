@@ -18,14 +18,22 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-find_package(GTest REQUIRED)
+# Find optional GTest for testing
+find_package(GTest QUIET)
 
 # Try modern BoostConfig first, fallback to FindBoost for older systems
 find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem system)
 
 find_package(nlohmann_json REQUIRED)
 
-include(CTest)
+# Enable testing only if GTest is found
+if(GTest_FOUND OR GTEST_FOUND)
+    enable_testing()
+    include(CTest)
+    message(STATUS "GTest found - testing enabled")
+else()
+    message(STATUS "GTest not found - testing disabled")
+endif()
 include_directories(include)
 include_directories(src)
 

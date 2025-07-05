@@ -1,4 +1,4 @@
-if (BUILD_TESTING)
+if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp)
     target_link_libraries(core_test PRIVATE GTest::gtest_main core GTest::gtest)
 
@@ -6,4 +6,6 @@ if (BUILD_TESTING)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     # add_test(NAME pack_test COMMAND pack_test)
     gtest_add_tests(core_test "" AUTO)
+else()
+    message(STATUS "Skipping core tests - GTest not found")
 endif()

@@ -13,6 +13,7 @@
 ### Fixed
 - CMake build system compatibility with newer CMake versions (3.30+)
 - Boost library linking issues on FreeBSD and modern systems
+- GTest made optional for main builds (tests only build if GTest available)
 - Cross-platform build dependencies and documentation
 
 ### Changed
