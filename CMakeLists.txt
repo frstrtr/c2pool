@@ -13,8 +13,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # set(CMAKE_CXX_FLAGS_DEBUG "-g")
 # set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 
+# Handle CMake 3.30+ policy for FindBoost removal
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
+
 find_package(GTest REQUIRED)
+
+# Try modern BoostConfig first, fallback to FindBoost for older systems
 find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem system)
+
 find_package(nlohmann_json REQUIRED)
 
 include(CTest)
