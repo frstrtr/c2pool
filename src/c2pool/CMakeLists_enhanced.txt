@@ -1,5 +1,10 @@
 # Enhanced C2Pool Components
 
+# Add include directory for the new modular structure
+target_include_directories(btclibs PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 # Hashrate Tracker Library
 add_library(c2pool_hashrate
     hashrate/tracker.cpp
@@ -7,7 +12,6 @@ add_library(c2pool_hashrate
 target_include_directories(c2pool_hashrate PUBLIC .)
 target_link_libraries(c2pool_hashrate 
     btclibs
-    core
     nlohmann_json::nlohmann_json
 )
 
@@ -18,7 +22,6 @@ add_library(c2pool_difficulty
 target_include_directories(c2pool_difficulty PUBLIC .)
 target_link_libraries(c2pool_difficulty 
     btclibs
-    core
     nlohmann_json::nlohmann_json
 )
 
@@ -30,47 +33,56 @@ target_include_directories(c2pool_storage PUBLIC .)
 target_link_libraries(c2pool_storage 
     core
     btclibs
+    boost::boost
+)
+
+# Legacy Bridge Library
+add_library(c2pool_bridge
+    bridge/legacy_tracker_bridge.cpp
+)
+target_include_directories(c2pool_bridge PUBLIC .)
+target_link_libraries(c2pool_bridge 
+    sharechain
+    c2pool_hashrate
+    c2pool_difficulty
+    nlohmann_json::nlohmann_json
 )
 
 # Enhanced Node Library
-add_library(c2pool_node_enhanced
+add_library(c2pool_node
     node/enhanced_node.cpp
 )
-target_include_directories(c2pool_node_enhanced PUBLIC .)
-target_link_libraries(c2pool_node_enhanced 
+target_include_directories(c2pool_node PUBLIC .)
+target_link_libraries(c2pool_node 
     ltc
     core
     c2pool_hashrate
     c2pool_difficulty
     c2pool_storage
+    c2pool_bridge
     nlohmann_json::nlohmann_json
 )
 
 # Main refactored application
 add_executable(c2pool_enhanced c2pool_refactored.cpp)
 target_link_libraries(c2pool_enhanced 
-    c2pool_node_enhanced
+    c2pool_node
+    c2pool_hashrate
+    c2pool_difficulty
+    c2pool_storage
+    c2pool_bridge
     core
     ltc
+    boost::boost
     nlohmann_json::nlohmann_json
-    ${Boost_LIBRARIES}
 )
 
-# Original applications (kept for compatibility)
+# Keep original for compatibility
 add_executable(c2pool_main c2pool.cpp)
-target_link_libraries(c2pool_main core btclibs pool ltc sharechain)
-target_link_libraries(c2pool_main nlohmann_json::nlohmann_json)
-
-add_executable(test_ltc_node test_ltc_node.cpp)
-target_link_libraries(test_ltc_node core btclibs pool ltc)
-target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
-
-# add_executable(c2pool_temp c2pool_temp.cpp)
-# target_link_libraries(c2pool_temp core btclibs pool ltc)
-# target_link_libraries(c2pool_temp nlohmann_json::nlohmann_json)
-
-add_executable(c2pool_node c2pool_node.cpp)
-target_link_libraries(c2pool_node core btclibs pool ltc)
-target_link_libraries(c2pool_node nlohmann_json::nlohmann_json)
-
-add_subdirectory(ltc)
+target_link_libraries(c2pool_main 
+    core
+    ltc
+    sharechain
+    boost::boost
+    nlohmann_json::nlohmann_json
+)

@@ -9,6 +9,60 @@ Bitcointalk forum thread - https://bitcointalk.org/index.php?topic=18313
 
 Some technical details - https://bitcointalk.org/index.php?topic=457574
 
+## 🎯 **Enhanced C2Pool - Modular Architecture**
+
+C2Pool has been **refactored into a modular architecture** with enhanced features:
+
+### ✨ **New Features**
+- **Automatic Difficulty Adjustment (VARDIFF)** - Dynamic mining difficulty
+- **Real-time Hashrate Tracking** - Accurate performance monitoring  
+- **Persistent Storage** - LevelDB-based sharechain persistence
+- **Web Interface** - JSON-RPC mining interface with monitoring
+- **Legacy Compatibility** - Full backward compatibility maintained
+
+### 🏗️ **Modular Components**
+- **`hashrate/`** - Real-time hashrate tracking and statistics
+- **`difficulty/`** - Automatic difficulty adjustment engine
+- **`storage/`** - Persistent LevelDB sharechain storage
+- **`bridge/`** - Legacy compatibility layer
+- **`node/`** - Enhanced C2Pool node implementation
+
+### 🚀 **Quick Start**
+
+#### Build Enhanced C2Pool
+```bash
+mkdir -p build && cd build
+cmake ..
+make c2pool_enhanced -j4
+```
+
+#### Run Mining Pool with Web Interface
+```bash
+./src/c2pool/c2pool_enhanced --testnet --integrated 0.0.0.0:8083
+```
+Access web interface at: http://localhost:8083
+
+#### Run Enhanced Sharechain Node
+```bash
+./src/c2pool/c2pool_enhanced --testnet --sharechain
+```
+
+#### Available Options
+```bash
+./src/c2pool/c2pool_enhanced --help
+```
+
+### 📊 **Features**
+- ✅ Automatic difficulty adjustment (VARDIFF)
+- ✅ Real-time hashrate tracking
+- ✅ Legacy share tracker compatibility
+- ✅ LevelDB persistent storage
+- ✅ JSON-RPC mining interface
+- ✅ WebUI for monitoring
+
+See [REFACTORING_SUMMARY.md](REFACTORING_SUMMARY.md) for detailed technical information.
+
+---
 
 <details>
   
