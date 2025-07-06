@@ -26,6 +26,15 @@ find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem system)
 
 find_package(nlohmann_json REQUIRED)
 
+# Find LevelDB for persistent storage
+find_library(LEVELDB_LIBRARIES leveldb)
+find_path(LEVELDB_INCLUDE_DIRS leveldb/db.h)
+if(NOT LEVELDB_LIBRARIES OR NOT LEVELDB_INCLUDE_DIRS)
+    message(FATAL_ERROR "LevelDB not found. Please install leveldb development package.")
+endif()
+message(STATUS "LevelDB found: ${LEVELDB_LIBRARIES}")
+message(STATUS "LevelDB includes: ${LEVELDB_INCLUDE_DIRS}")
+
 # Enable testing only if GTest is found
 if(GTest_FOUND OR GTEST_FOUND)
     enable_testing()
