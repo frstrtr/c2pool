@@ -23,5 +23,5 @@ TEST(LTC_share_test, Init)
 
     std::cout << rshare.type << std::endl;
 
-    auto share = ltc::load(rshare, NetService{"0.0.0.0", 0});
+    auto share = ltc::load_share(rshare, NetService{"0.0.0.0", 0});
 }
