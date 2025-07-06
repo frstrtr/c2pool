@@ -29,6 +29,7 @@ set(source
     random.hpp random.cpp
     addr_store.hpp addr_store.cpp
     web_server.hpp web_server.cpp
+    leveldb_store.hpp leveldb_store.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
@@ -38,12 +39,15 @@ target_link_libraries(core btclibs)
 
 # Use Boost target names that work with both old and new CMake/Boost versions
 if(TARGET Boost::headers)
-    target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json)
+    target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
 elseif(TARGET Boost::boost)
-    target_link_libraries(core Boost::boost Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json)
+    target_link_libraries(core Boost::boost Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
 else()
-    target_link_libraries(core ${Boost_LIBRARIES} yaml-cpp nlohmann_json::nlohmann_json)
+    target_link_libraries(core ${Boost_LIBRARIES} yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
     target_include_directories(core PRIVATE ${Boost_INCLUDE_DIRS})
 endif()
+
+# Add LevelDB include directories
+target_include_directories(core PRIVATE ${LEVELDB_INCLUDE_DIRS})
 
 add_subdirectory(test)

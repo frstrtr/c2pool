@@ -54,12 +54,12 @@ int main()
 
     auto& functionMapA = a.getFunctionMap();
 
-    auto begin = c2pool::debug_timestamp();
+    auto begin = core::debug_timestamp();
     for (int i = 0; i < 100'000; i++)
     {
         a.invoke("task1");
     }
-    auto finish = c2pool::debug_timestamp();
+    auto finish = core::debug_timestamp();
     std::cout << finish-begin << std::endl;
 
     std::cout << a.i << std::endl;
