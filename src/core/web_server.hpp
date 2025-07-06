@@ -18,6 +18,7 @@
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/mining_node_interface.hpp>
 
 namespace core {
 
@@ -77,7 +78,7 @@ private:
 class MiningInterface : public jsonrpccxx::JsonRpc2Server
 {
 public:
-    MiningInterface(bool testnet = false);
+    MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr);
 
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
@@ -110,6 +111,7 @@ private:
     std::map<std::string, nlohmann::json> m_active_work;
     std::unique_ptr<LitecoinRpcClient> m_rpc_client;
     bool m_testnet;  // Store testnet flag
+    std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     
     // TODO: Add connections to actual mining node and coin interface
     // std::shared_ptr<Node> m_node;
@@ -130,6 +132,7 @@ class WebServer
 
 public:
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
+    WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node);
     ~WebServer();
 
     // Start/stop the server
