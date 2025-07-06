@@ -119,10 +119,11 @@ void HttpSession::handle_error(beast::error_code ec, char const* what)
 }
 
 /// MiningInterface Implementation
-MiningInterface::MiningInterface(bool testnet)
+MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node)
     : m_work_id_counter(1)
     , m_rpc_client(std::make_unique<LitecoinRpcClient>(testnet))
     , m_testnet(testnet)
+    , m_node(node)
 {
     setup_methods();
 }
@@ -191,20 +192,46 @@ nlohmann::json MiningInterface::getwork(const std::string& request_id)
 {
     LOG_INFO << "getwork request received";
     
+    // Get current difficulty from the c2pool node
+    double current_difficulty = 1.0; // Default fallback
+    std::string target_hex = "00000000ffff0000000000000000000000000000000000000000000000000000";
+    
+    if (m_node) {
+        // Get current session difficulty and global pool difficulty
+        auto difficulty_stats = m_node->get_difficulty_stats();
+        if (difficulty_stats.contains("global_pool_difficulty")) {
+            current_difficulty = difficulty_stats["global_pool_difficulty"];
+        }
+        
+        // Calculate target from difficulty
+        // Target = max_target / difficulty
+        // max_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+        uint256 max_target;
+        max_target.SetHex("00000000FFFF0000000000000000000000000000000000000000000000000000");
+        
+        uint256 work_target = max_target / static_cast<uint64_t>(current_difficulty * 1000000); // Scale for precision
+        target_hex = work_target.GetHex();
+        
+        LOG_INFO << "Using pool difficulty: " << current_difficulty << ", target: " << target_hex.substr(0, 16) << "...";
+    } else {
+        LOG_WARNING << "No c2pool node connected, using default difficulty: " << current_difficulty;
+    }
+    
     // TODO: Get actual work from mining node
-    // For now, return a stub response
+    // For now, return a stub response with dynamic difficulty
     nlohmann::json work = {
         {"data", "00000001c570c4764025cf068f3f3fba04bde26fb7b449e0bf12523666e49cbdf6aa8b8f00000000"},
-        {"target", "00000000ffff0000000000000000000000000000000000000000000000000000"},
+        {"target", target_hex},
         {"hash1", "00000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000010000"},
-        {"midstate", "5f796c4974b00d64ffc22c9a72e96f9b23c57d7d83d0e7d6a34c4e1f5b4c4b8f"}
+        {"midstate", "5f796c4974b00d64ffc22c9a72e96f9b23c57d7d83d0e7d6a34c4e1f5b4c4b8f"},
+        {"difficulty", current_difficulty}
     };
     
     // Store work for later validation
     std::string work_id = std::to_string(m_work_id_counter++);
     m_active_work[work_id] = work;
     
-    LOG_INFO << "Provided work to miner, work_id=" << work_id;
+    LOG_INFO << "Provided work to miner, work_id=" << work_id << ", difficulty=" << current_difficulty;
     return work;
 }
 
@@ -212,11 +239,34 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
 {
     LOG_INFO << "Work submission received - nonce: " << nonce << ", header: " << header.substr(0, 32) << "...";
     
-    // TODO: Validate and submit work to mining node
-    // For now, always return true (accepted)
+    // Validate the submitted work
+    bool work_valid = true; // TODO: Implement actual validation
     
-    LOG_INFO << "Work submission accepted";
-    return true;
+    if (work_valid && m_node) {
+        // Track the share submission for difficulty adjustment
+        std::string session_id = "miner_" + std::to_string(m_work_id_counter); // TODO: Use actual session ID
+        m_node->track_share_submission(session_id, 1.0); // TODO: Use actual difficulty
+        
+        // Create a new share and add to the sharechain
+        uint256 share_hash;
+        share_hash.SetHex(header); // Simplified - would need proper hash calculation
+        
+        uint256 prev_hash = uint256::ZERO; // TODO: Get from actual previous share
+        uint256 target;
+        target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000"); // TODO: Use actual target
+        
+        m_node->add_local_share(share_hash, prev_hash, target);
+        
+        LOG_INFO << "Share submitted and added to sharechain: " << share_hash.ToString().substr(0, 16) << "...";
+        LOG_INFO << "Work submission accepted";
+        return true;
+    } else if (work_valid) {
+        LOG_INFO << "Work submission accepted (no node connected for tracking)";
+        return true;
+    } else {
+        LOG_WARNING << "Work submission rejected - invalid work";
+        return false;
+    }
 }
 
 nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, const std::string& request_id)
@@ -258,14 +308,36 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
 
 nlohmann::json MiningInterface::getinfo(const std::string& request_id)
 {
+    double current_difficulty = 1.0;
+    double pool_hashrate = 0.0;
+    uint64_t total_shares = 0;
+    uint64_t connections = 0;
+    
+    // Get stats from c2pool node if available
+    if (m_node) {
+        auto difficulty_stats = m_node->get_difficulty_stats();
+        if (difficulty_stats.contains("global_pool_difficulty")) {
+            current_difficulty = difficulty_stats["global_pool_difficulty"];
+        }
+        
+        auto hashrate_stats = m_node->get_hashrate_stats();
+        if (hashrate_stats.contains("global_hashrate")) {
+            pool_hashrate = hashrate_stats["global_hashrate"];
+        }
+        
+        total_shares = m_node->get_total_shares();
+        connections = m_node->get_connected_peers_count();
+    }
+    
     return {
         {"version", "c2pool/1.0.0"},
         {"protocolversion", 70015},
         {"blocks", 1}, // TODO: Get from actual chain
-        {"connections", 0}, // TODO: Get from peer count
-        {"difficulty", 1.0},
-        {"networkhashps", 0},
-        {"poolhashps", 0},
+        {"connections", connections},
+        {"difficulty", current_difficulty},
+        {"networkhashps", 0}, // TODO: Get from coin node
+        {"poolhashps", pool_hashrate},
+        {"poolshares", total_shares},
         {"generate", true},
         {"genproclimit", -1},
         {"testnet", m_testnet}, // Use stored testnet flag
@@ -752,6 +824,19 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , running_(false)
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet);
+    
+    // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
+    stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
+}
+
+WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node)
+    : ioc_(ioc)
+    , acceptor_(ioc)
+    , bind_address_(address)
+    , port_(port)
+    , running_(false)
+{
+    mining_interface_ = std::make_shared<MiningInterface>(testnet, node);
     
     // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
     stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
