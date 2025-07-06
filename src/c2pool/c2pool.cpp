@@ -137,7 +137,7 @@ int main(int argc, char *argv[])
             boost::asio::io_context ioc;
             
             // Create and start web server
-            core::WebServer web_server(ioc, ip, static_cast<uint16_t>(port));
+            core::WebServer web_server(ioc, ip, static_cast<uint16_t>(port), settings->m_testnet);
             
             if (!web_server.start()) {
                 LOG_ERROR << "Failed to start web server on " << ip << ":" << port;
@@ -149,7 +149,7 @@ int main(int argc, char *argv[])
             LOG_INFO << "Supported methods: getwork, submitwork, getblocktemplate, submitblock, getinfo, getstats";
             
             // Create a MiningInterface to check sync status
-            auto mining_interface = std::make_shared<core::MiningInterface>();
+            auto mining_interface = std::make_shared<core::MiningInterface>(settings->m_testnet);
             
             // Check and log initial sync status
             LOG_INFO << "Checking Litecoin Core synchronization status...";

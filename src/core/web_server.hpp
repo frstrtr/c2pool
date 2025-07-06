@@ -77,7 +77,7 @@ private:
 class MiningInterface : public jsonrpccxx::JsonRpc2Server
 {
 public:
-    MiningInterface();
+    MiningInterface(bool testnet = false);
 
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
@@ -109,6 +109,7 @@ private:
     uint64_t m_work_id_counter;
     std::map<std::string, nlohmann::json> m_active_work;
     std::unique_ptr<LitecoinRpcClient> m_rpc_client;
+    bool m_testnet;  // Store testnet flag
     
     // TODO: Add connections to actual mining node and coin interface
     // std::shared_ptr<Node> m_node;
@@ -128,7 +129,7 @@ class WebServer
     std::unique_ptr<StratumServer> stratum_server_;
 
 public:
-    WebServer(net::io_context& ioc, const std::string& address, uint16_t port);
+    WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
     ~WebServer();
 
     // Start/stop the server
