@@ -119,9 +119,10 @@ void HttpSession::handle_error(beast::error_code ec, char const* what)
 }
 
 /// MiningInterface Implementation
-MiningInterface::MiningInterface()
+MiningInterface::MiningInterface(bool testnet)
     : m_work_id_counter(1)
-    , m_rpc_client(std::make_unique<LitecoinRpcClient>(true)) // true for testnet
+    , m_rpc_client(std::make_unique<LitecoinRpcClient>(testnet))
+    , m_testnet(testnet)
 {
     setup_methods();
 }
@@ -267,7 +268,7 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         {"poolhashps", 0},
         {"generate", true},
         {"genproclimit", -1},
-        {"testnet", false}, // TODO: Get from config
+        {"testnet", m_testnet}, // Use stored testnet flag
         {"paytxfee", 0.0},
         {"errors", ""}
     };
@@ -743,14 +744,14 @@ void StratumServer::handle_accept(beast::error_code ec, tcp::socket socket)
 }
 
 /// WebServer Implementation
-WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port)
+WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet)
     : ioc_(ioc)
     , acceptor_(ioc)
     , bind_address_(address)
     , port_(port)
     , running_(false)
 {
-    mining_interface_ = std::make_shared<MiningInterface>();
+    mining_interface_ = std::make_shared<MiningInterface>(testnet);
     
     // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
     stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
