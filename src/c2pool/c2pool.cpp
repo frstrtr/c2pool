@@ -269,29 +269,45 @@ public:
     {
         auto timer = std::make_shared<boost::asio::steady_timer>(ioc);
         
-        std::function<void()> save_task = [&, timer, interval_seconds]() {
-            if (m_leveldb_store) {
+        // Create a safe capture by copying what we need
+        auto leveldb_store_ptr = m_leveldb_store.get(); // Raw pointer for safety check
+        
+        // Use a shared_ptr to hold the recursive callback
+        auto save_task = std::make_shared<std::function<void()>>();
+        *save_task = [leveldb_store_ptr, timer, interval_seconds, save_task]() {
+            if (leveldb_store_ptr) {
                 LOG_INFO << "Periodic LevelDB storage maintenance";
-                log_storage_stats();
                 
-                // Periodic compaction (every hour)
-                static int compact_counter = 0;
-                if (++compact_counter >= (3600 / interval_seconds)) {
-                    compact();
-                    compact_counter = 0;
+                try {
+                    uint64_t share_count = leveldb_store_ptr->get_share_count();
+                    uint64_t best_height = leveldb_store_ptr->get_best_height();
+                    
+                    LOG_INFO << "LevelDB Storage Stats:";
+                    LOG_INFO << "  Total shares: " << share_count;
+                    LOG_INFO << "  Best height: " << best_height;
+                    
+                    // Periodic compaction (every hour)
+                    static int compact_counter = 0;
+                    if (++compact_counter >= (3600 / interval_seconds)) {
+                        LOG_INFO << "Compacting LevelDB sharechain storage...";
+                        leveldb_store_ptr->compact();
+                        compact_counter = 0;
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "Error in periodic LevelDB maintenance: " << e.what();
                 }
             }
             
             timer->expires_after(std::chrono::seconds(interval_seconds));
             timer->async_wait([save_task](const boost::system::error_code&) {
-                save_task();
+                if (save_task) (*save_task)();
             });
         };
         
         // Start after initial delay
         timer->expires_after(std::chrono::seconds(30));
         timer->async_wait([save_task](const boost::system::error_code&) {
-            save_task();
+            if (save_task) (*save_task)();
         });
     }
 };
@@ -964,6 +980,29 @@ int main(int argc, char *argv[])
             
             // Set up periodic sync status logging and Stratum server management
             boost::asio::steady_timer sync_timer(ioc);
+            
+            // Add periodic miner stats logging
+            boost::asio::steady_timer stats_timer(ioc);
+            
+            std::function<void()> log_miner_stats = [&]() {
+                // This would show connected miners - need to access WebServer's stratum connections
+                LOG_INFO << "=== Mining Pool Stats ===";
+                LOG_INFO << "Server running on: " << ip << ":" << port;
+                LOG_INFO << "Stratum server: " << (stratum_started ? "Active" : "Waiting for sync");
+                LOG_INFO << "Check individual miner submissions in logs above";
+                
+                stats_timer.expires_after(std::chrono::seconds(30)); // Stats every 30 seconds
+                stats_timer.async_wait([&](const boost::system::error_code&) {
+                    log_miner_stats();
+                });
+            };
+            
+            // Start stats logging
+            stats_timer.expires_after(std::chrono::seconds(10));
+            stats_timer.async_wait([&](const boost::system::error_code&) {
+                log_miner_stats();
+            });
+            
             std::function<void()> check_sync_status = [&]() {
                 bool is_synced = mining_interface->is_blockchain_synced();
                 
@@ -1003,7 +1042,8 @@ int main(int argc, char *argv[])
             
         } catch (...) {
             LOG_ERROR << "Invalid port number: " << port_str;
-            return 1;        }
+            return 1;
+        }
     }
     
     if (args.find("p2p_port") != args.end()) {

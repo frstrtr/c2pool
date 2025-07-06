@@ -48,5 +48,5 @@ include_directories(src)
 
 add_subdirectory(src)
 add_subdirectory(test)
-add_subdirectory(benchmark)
-add_subdirectory(temp)
+# add_subdirectory(benchmark)
+# add_subdirectory(temp)

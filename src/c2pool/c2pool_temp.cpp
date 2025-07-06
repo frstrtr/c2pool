@@ -10,12 +10,8 @@
 #include <core/uint256.hpp>
 #include <nlohmann/json.hpp>
 
-#include <impl/ltc/protocol.hpp>
-#include <impl/ltc/transaction.hpp>
-
 #include <impl/ltc/share.hpp>
 
-#include <pool/handshake.hpp>
 #include <core/socket.hpp>
 
 #include <pool/node.hpp>
