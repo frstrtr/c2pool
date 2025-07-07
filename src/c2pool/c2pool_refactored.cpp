@@ -72,38 +72,114 @@ struct C2PoolConfig {
 };
 
 void print_help() {
-    std::cout << "c2pool - P2Pool rebirth in C++ with enhanced difficulty adjustment\n\n";
-    std::cout << "Usage:\n";
-    std::cout << "  c2pool [options]\n\n";
-    std::cout << "Options:\n";
-    std::cout << "  --help                    Show this help message\n";
+    std::cout << "╔══════════════════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║                    C2Pool - P2Pool Rebirth in C++                           ║\n";
+    std::cout << "║            A modern, high-performance decentralized mining pool             ║\n";
+    std::cout << "╚══════════════════════════════════════════════════════════════════════════════╝\n\n";
+    
+    std::cout << "USAGE:\n";
+    std::cout << "  c2pool [MODE] [OPTIONS]\n\n";
+    
+    std::cout << "OPERATION MODES:\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    
+    std::cout << "🏊 INTEGRATED MODE (--integrated) - RECOMMENDED FOR POOL OPERATORS\n";
+    std::cout << "   Complete mining pool solution with all features enabled:\n";
+    std::cout << "   ✅ HTTP/JSON-RPC API Server (monitoring & stats)\n";
+    std::cout << "   ✅ Stratum Mining Server (miner connections)\n";
+    std::cout << "   ✅ Enhanced Sharechain Processing (persistent storage)\n";
+    std::cout << "   ✅ Real-time Payout Tracking & Management\n";
+    std::cout << "   ✅ Variable Difficulty (VARDIFF) Adjustment\n";
+    std::cout << "   ✅ Multi-blockchain Support (LTC, BTC, ETH, XMR, ZEC, DOGE)\n";
+    std::cout << "   ✅ Web Interface for Pool Monitoring\n";
+    std::cout << "   ✅ Per-miner Statistics & Contribution Tracking\n";
+    std::cout << "   ✅ Address Validation for All Blockchain Types\n\n";
+    
+    std::cout << "🔗 SHARECHAIN MODE (--sharechain) - P2POOL NETWORK PARTICIPANT\n";
+    std::cout << "   Dedicated P2P sharechain node for network participation:\n";
+    std::cout << "   ✅ Enhanced Sharechain Processing\n";
+    std::cout << "   ✅ LevelDB Persistent Storage\n";
+    std::cout << "   ✅ P2P Network Communication\n";
+    std::cout << "   ✅ Real-time Difficulty Tracking\n";
+    std::cout << "   ✅ Protocol Compatibility (LTC-based)\n";
+    std::cout << "   ✅ Share Validation & Network Consensus\n\n";
+    
+    std::cout << "⚡ BASIC MODE (default) - DEVELOPMENT & TESTING\n";
+    std::cout << "   Minimal C2Pool node for development:\n";
+    std::cout << "   ✅ Basic P2P Functionality\n";
+    std::cout << "   ✅ Lightweight Operation\n";
+    std::cout << "   ✅ Core Protocol Features\n\n";
+    
+    std::cout << "COMMAND LINE OPTIONS:\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "  --help, -h                Show this help message and exit\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
-    std::cout << "  --p2p-port PORT           Set P2P port (default: 9333)\n";
-    std::cout << "  --http-port PORT          Set HTTP/JSON-RPC API port (default: 8083)\n";
-    std::cout << "  --stratum-port PORT       Set Stratum mining port (default: 8080)\n";
-    std::cout << "  --http-host HOST          Set HTTP server host (default: 0.0.0.0)\n";
-    std::cout << "  --integrated              Run integrated mining pool with web server\n";
-    std::cout << "  --blockchain BLOCKCHAIN   Set blockchain type (ltc, btc, eth, xmr, zec, doge)\n";
-    std::cout << "                            Default: ltc (Litecoin)\n";
-    std::cout << "  --sharechain              Run enhanced sharechain node with persistence\n";
-    std::cout << "  --config FILE             Load configuration from file\n";
-    std::cout << "\nFeatures:\n";
-    std::cout << "  ✓ Blockchain-specific address validation\n";
-    std::cout << "  ✓ Automatic difficulty adjustment (VARDIFF)\n";
-    std::cout << "  ✓ Real-time hashrate tracking\n";
-    std::cout << "  ✓ Legacy share tracker compatibility\n";
-    std::cout << "  ✓ LevelDB persistent storage\n";
-    std::cout << "  ✓ JSON-RPC mining interface\n";
-    std::cout << "  ✓ WebUI for monitoring\n";
-    std::cout << "\nDefault Ports:\n";
-    std::cout << "  P2P (sharechain):         9333\n";
-    std::cout << "  HTTP API (JSON-RPC):      8083\n";
-    std::cout << "  Stratum (mining):         8084 (configurable, standard is 8080)\n";
-    std::cout << "\nExamples:\n";
-    std::cout << "  c2pool --testnet --p2p-port 9333\n";
-    std::cout << "  c2pool --integrated --blockchain ltc --testnet\n";
-    std::cout << "  c2pool --integrated --http-port 8083 --stratum-port 8084\n";
-    std::cout << "  c2pool --sharechain --blockchain btc\n";
+    std::cout << "  --integrated              Enable integrated mode (full mining pool)\n";
+    std::cout << "  --sharechain              Enable sharechain mode (P2P node)\n";
+    std::cout << "  --blockchain CHAIN        Blockchain type: ltc, btc, eth, xmr, zec, doge\n";
+    std::cout << "                            (default: ltc - Litecoin)\n";
+    std::cout << "  --config FILE             Load configuration from YAML file\n\n";
+    
+    std::cout << "PORT CONFIGURATION:\n";
+    std::cout << "  --p2p-port PORT           P2P sharechain port (default: 9333)\n";
+    std::cout << "  --http-port PORT          HTTP/JSON-RPC API port (default: 8083)\n";
+    std::cout << "  --stratum-port PORT       Stratum mining port (default: 8084)\n";
+    std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
+    
+    std::cout << "BLOCKCHAIN SUPPORT:\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "  Litecoin (LTC)    ✅ Full support with testnet\n";
+    std::cout << "  Bitcoin (BTC)     ✅ Protocol compatibility\n";
+    std::cout << "  Ethereum (ETH)    🔧 In development\n";
+    std::cout << "  Monero (XMR)      🔧 In development\n";
+    std::cout << "  Zcash (ZEC)       🔧 In development\n";
+    std::cout << "  Dogecoin (DOGE)   🔧 In development\n\n";
+    
+    std::cout << "FEATURES & CAPABILITIES:\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "  ✅ Variable Difficulty (VARDIFF) - Automatic per-miner adjustment\n";
+    std::cout << "  ✅ Real-time Hashrate Tracking - Live monitoring and statistics\n";
+    std::cout << "  ✅ Payout Management System - Per-miner contribution tracking\n";
+    std::cout << "  ✅ Address Validation - All address types (legacy, P2SH, bech32)\n";
+    std::cout << "  ✅ LevelDB Storage - Persistent sharechain and miner data\n";
+    std::cout << "  ✅ JSON-RPC API - Complete monitoring interface\n";
+    std::cout << "  ✅ Stratum Protocol - Standard mining protocol support\n";
+    std::cout << "  ✅ Multi-miner Support - Concurrent connections\n";
+    std::cout << "  ✅ Web Interface - Real-time pool monitoring\n\n";
+    
+    std::cout << "DEFAULT NETWORK PORTS:\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "  P2P Sharechain:           9333  (for P2Pool network communication)\n";
+    std::cout << "  HTTP API (JSON-RPC):      8083  (for monitoring and statistics)\n";
+    std::cout << "  Stratum Mining:           8084  (for miner connections)\n\n";
+    
+    std::cout << "USAGE EXAMPLES:\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "  🏊 POOL OPERATOR (Integrated Mode):\n";
+    std::cout << "     c2pool --integrated --blockchain ltc --testnet\n";
+    std::cout << "     c2pool --integrated --http-port 8083 --stratum-port 8084\n";
+    std::cout << "     c2pool --integrated --blockchain btc --http-host 127.0.0.1\n\n";
+    
+    std::cout << "  🔗 NETWORK PARTICIPANT (Sharechain Mode):\n";
+    std::cout << "     c2pool --sharechain --blockchain ltc --testnet\n";
+    std::cout << "     c2pool --sharechain --blockchain btc --p2p-port 9333\n";
+    std::cout << "     c2pool --sharechain --config pool_config.yaml\n\n";
+    
+    std::cout << "  ⚡ DEVELOPMENT (Basic Mode):\n";
+    std::cout << "     c2pool --testnet --blockchain ltc\n";
+    std::cout << "     c2pool --blockchain ltc --p2p-port 9333\n";
+    std::cout << "     c2pool --config custom_config.yaml\n\n";
+    
+    std::cout << "API ENDPOINTS (Integrated Mode):\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "  GET  /api/stats          Pool statistics and hashrate\n";
+    std::cout << "  POST /api/getinfo        Pool information and status\n";
+    std::cout << "  POST /api/getminerstats  Per-miner statistics\n";
+    std::cout << "  POST /api/getpayoutinfo  Payout information and balances\n";
+    std::cout << "  Stratum: stratum+tcp://HOST:PORT (for miners)\n\n";
+    
+    std::cout << "For detailed documentation, visit: https://github.com/frstrtr/c2pool\n";
+    std::cout << "Report issues at: https://github.com/frstrtr/c2pool/issues\n";
 }
 
 int main(int argc, char* argv[]) {
