@@ -6,7 +6,7 @@ network: litecoin_testnet
 testnet: true
 port: 9333                    # P2P port for sharechain communication
 stratum_port: 8084            # Stratum port for physical miners
-http_port: 8080               # HTTP/JSON-RPC port for monitoring
+http_port: 8083               # HTTP/JSON-RPC port for monitoring
 
 # Litecoin Node Connection
 ltc_rpc_host: 127.0.0.1

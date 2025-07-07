@@ -129,6 +129,7 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
     , m_blockchain(blockchain)
     , m_node(node)
     , m_address_validator(blockchain, testnet ? Network::TESTNET : Network::MAINNET)
+    , m_payout_manager(std::make_unique<c2pool::payout::PayoutManager>(1.0, 86400)) // 1% fee, 24h window
 {
     setup_methods();
 }
@@ -190,6 +191,15 @@ void MiningInterface::setup_methods()
             throw jsonrpccxx::JsonRpcException(-1, "mining.submit requires 5 parameters");
         }
         return mining_submit(params[0], params[1], params[2], params[3], params[4]);
+    }));
+    
+    // Payout-related methods
+    Add("getpayoutinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getpayoutinfo("");
+    }));
+    
+    Add("getminerstats", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getminerstats("");
     }));
 }
 
@@ -495,7 +505,14 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         LOG_INFO << "Mining share accepted from " << username << " (no node connected for storage)";
     }
     
-    return true;
+    // Always record share contribution for payout calculation (regardless of node connection)
+    if (m_payout_manager) {
+        double share_difficulty = calculate_share_difficulty(job_id, extranonce2, ntime, nonce);
+        m_payout_manager->record_share_contribution(username, share_difficulty);
+        LOG_INFO << "Share contribution recorded for payout: " << username << " (difficulty: " << share_difficulty << ")";
+    }
+    
+    return nlohmann::json{{"result", true}};
 }
 
 bool MiningInterface::is_valid_address(const std::string& address) const
@@ -792,7 +809,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     update_hashrate_estimate(current_difficulty_);
     
     // Validate submission via mining interface
-    bool accepted = mining_interface_->mining_submit(username, job_id, extranonce2, ntime, nonce, "stratum").get<bool>();
+    bool accepted = mining_interface_->mining_submit(username, job_id, extranonce2, ntime, nonce, "stratum")["result"].get<bool>();
     
     // Check if VARDIFF adjustment is needed
     check_vardiff_adjustment();
@@ -855,7 +872,24 @@ void StratumSession::send_notify_work()
     std::string job_id = "job_" + std::to_string(++job_counter_);
     std::string prevhash = "00000000000000000000000000000000000000000000000000000000000000000";
     std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
-    std::string coinb2 = "ffffffff0100f2052a010000001976a914"; // TODO: Add actual payout address
+    
+    // Build coinbase output with proper payout address
+    std::string coinb2;
+    if (mining_interface_ && mining_interface_->get_payout_manager()) {
+        // Use payout manager to build coinbase with proper reward distribution
+        uint64_t block_reward = 5000000000ULL; // 50 LTC in satoshis (testnet)
+        coinb2 = mining_interface_->get_payout_manager()->build_coinbase_output(block_reward, username_);
+    } else {
+        // Fallback to simple coinbase with miner's address if available
+        coinb2 = "ffffffff0100f2052a010000001976a914";
+        if (!username_.empty()) {
+            // In a real implementation, would decode the address to get the hash160
+            // For now, use placeholder but log the intended payout address
+            LOG_INFO << "Building coinbase for payout address: " << username_;
+        }
+        coinb2 += "89abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac"; // Placeholder hash + script end
+    }
+    
     std::string version = "00000001";
     std::string nbits = "1d00ffff";
     std::string ntime = std::to_string(static_cast<uint32_t>(std::time(nullptr)));
@@ -1359,6 +1393,63 @@ void MiningInterface::log_sync_progress() const
         if (status.initial_block_download) {
             LOG_INFO << "Initial block download in progress...";
         }
+    }
+}
+
+// Payout-related API methods
+nlohmann::json MiningInterface::getpayoutinfo(const std::string& request_id)
+{
+    LOG_INFO << "getpayoutinfo request received";
+    
+    if (!m_payout_manager) {
+        return nlohmann::json{
+            {"error", "Payout manager not initialized"},
+            {"pool_fee_percent", 0.0},
+            {"active_miners", 0},
+            {"total_difficulty", 0.0}
+        };
+    }
+    
+    auto stats = m_payout_manager->get_payout_statistics();
+    stats["method"] = "getpayoutinfo";
+    return stats;
+}
+
+nlohmann::json MiningInterface::getminerstats(const std::string& request_id)
+{
+    LOG_INFO << "getminerstats request received";
+    
+    if (!m_payout_manager) {
+        return nlohmann::json{
+            {"error", "Payout manager not initialized"},
+            {"miners", nlohmann::json::array()}
+        };
+    }
+    
+    auto stats = m_payout_manager->get_payout_statistics();
+    
+    nlohmann::json result;
+    result["method"] = "getminerstats";
+    result["active_miners"] = stats["active_miners"];
+    result["miners"] = stats["miners"];
+    result["pool_fee_percent"] = stats["pool_fee_percent"];
+    
+    return result;
+}
+
+void MiningInterface::set_pool_payout_address(const std::string& address)
+{
+    if (m_payout_manager) {
+        m_payout_manager->set_primary_pool_address(address);
+        LOG_INFO << "Pool payout address set to: " << address;
+    }
+}
+
+void MiningInterface::set_pool_fee_percent(double fee_percent)
+{
+    if (m_payout_manager) {
+        m_payout_manager->set_pool_fee_percent(fee_percent);
+        LOG_INFO << "Pool fee percent set to: " << fee_percent << "%";
     }
 }
 

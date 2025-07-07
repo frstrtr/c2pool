@@ -77,3 +77,4 @@ target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 # - c2pool_temp_legacy.cpp (original c2pool_temp.cpp)
 
 add_subdirectory(ltc)
+add_subdirectory(payout)
