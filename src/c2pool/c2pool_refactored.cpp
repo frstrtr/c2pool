@@ -78,9 +78,11 @@ void print_help() {
     std::cout << "Options:\n";
     std::cout << "  --help                    Show this help message\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
-    std::cout << "  --port PORT               Set P2P port (default: 9333)\n";
-    std::cout << "  --integrated WEB_SERVER   Run integrated mining pool with web server\n";
-    std::cout << "                            Format: IP:PORT (e.g., 0.0.0.0:8083)\n";
+    std::cout << "  --p2p-port PORT           Set P2P port (default: 9333)\n";
+    std::cout << "  --http-port PORT          Set HTTP/JSON-RPC API port (default: 8083)\n";
+    std::cout << "  --stratum-port PORT       Set Stratum mining port (default: 8080)\n";
+    std::cout << "  --http-host HOST          Set HTTP server host (default: 0.0.0.0)\n";
+    std::cout << "  --integrated              Run integrated mining pool with web server\n";
     std::cout << "  --blockchain BLOCKCHAIN   Set blockchain type (ltc, btc, eth, xmr, zec, doge)\n";
     std::cout << "                            Default: ltc (Litecoin)\n";
     std::cout << "  --sharechain              Run enhanced sharechain node with persistence\n";
@@ -93,9 +95,14 @@ void print_help() {
     std::cout << "  ✓ LevelDB persistent storage\n";
     std::cout << "  ✓ JSON-RPC mining interface\n";
     std::cout << "  ✓ WebUI for monitoring\n";
+    std::cout << "\nDefault Ports:\n";
+    std::cout << "  P2P (sharechain):         9333\n";
+    std::cout << "  HTTP API (JSON-RPC):      8083\n";
+    std::cout << "  Stratum (mining):         8084 (configurable, standard is 8080)\n";
     std::cout << "\nExamples:\n";
-    std::cout << "  c2pool --testnet --port 9333\n";
-    std::cout << "  c2pool --integrated 0.0.0.0:8083 --blockchain ltc --testnet\n";
+    std::cout << "  c2pool --testnet --p2p-port 9333\n";
+    std::cout << "  c2pool --integrated --blockchain ltc --testnet\n";
+    std::cout << "  c2pool --integrated --http-port 8083 --stratum-port 8084\n";
     std::cout << "  c2pool --sharechain --blockchain btc\n";
 }
 
@@ -113,9 +120,13 @@ int main(int argc, char* argv[]) {
     auto settings = std::make_unique<core::Settings>();
     settings->m_testnet = false;
     
-    int port = 9333;
+    // Port configuration with C2Pool standard defaults
+    int p2p_port = 9333;           // P2P sharechain port
+    int http_port = 8083;          // HTTP/JSON-RPC API port
+    int stratum_port = 8084;       // Stratum mining port (temporarily 8084 for current miners)
+    std::string http_host = "0.0.0.0";  // HTTP server host
+    
     std::string config_file;
-    std::string web_server_addr;
     bool integrated_mode = false;
     bool sharechain_mode = false;
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
@@ -145,11 +156,19 @@ int main(int argc, char* argv[]) {
         else if (arg == "--testnet") {
             settings->m_testnet = true;
         }
-        else if (arg == "--port" && i + 1 < argc) {
-            port = std::stoi(argv[++i]);
+        else if (arg == "--p2p-port" && i + 1 < argc) {
+            p2p_port = std::stoi(argv[++i]);
         }
-        else if (arg == "--integrated" && i + 1 < argc) {
-            web_server_addr = argv[++i];
+        else if (arg == "--http-port" && i + 1 < argc) {
+            http_port = std::stoi(argv[++i]);
+        }
+        else if (arg == "--stratum-port" && i + 1 < argc) {
+            stratum_port = std::stoi(argv[++i]);
+        }
+        else if (arg == "--http-host" && i + 1 < argc) {
+            http_host = argv[++i];
+        }
+        else if (arg == "--integrated") {
             integrated_mode = true;
         }
         else if (arg == "--sharechain") {
@@ -160,6 +179,11 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--blockchain" && i + 1 < argc) {
             blockchain = parse_blockchain(argv[++i]);
+        }
+        // Legacy support for old --port option (maps to p2p-port)
+        else if (arg == "--port" && i + 1 < argc) {
+            p2p_port = std::stoi(argv[++i]);
+            LOG_WARNING << "--port is deprecated, use --p2p-port instead";
         }
         else {
             LOG_ERROR << "Unknown argument: " << arg;
@@ -183,25 +207,21 @@ int main(int argc, char* argv[]) {
             
             LOG_INFO << "Starting integrated C2Pool mining pool for " << blockchain_name 
                     << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
+            LOG_INFO << "Port configuration:";
+            LOG_INFO << "  HTTP API (JSON-RPC): " << http_host << ":" << http_port;
+            LOG_INFO << "  Stratum (mining):    " << http_host << ":" << stratum_port;
+            LOG_INFO << "  P2P (sharechain):    " << p2p_port;
             LOG_INFO << "Features: automatic difficulty adjustment, blockchain-specific address validation";
-            
-            // Parse web server address
-            size_t colon_pos = web_server_addr.find(':');
-            if (colon_pos == std::string::npos) {
-                LOG_ERROR << "Invalid web_server format. Use IP:PORT (e.g., 0.0.0.0:8083)";
-                return 1;
-            }
-            
-            std::string ip = web_server_addr.substr(0, colon_pos);
-            std::string web_port_str = web_server_addr.substr(colon_pos + 1);
-            int web_port = std::stoi(web_port_str);
             
             // Create enhanced node with default constructor to avoid nullptr issues
             auto enhanced_node = std::make_shared<c2pool::node::EnhancedC2PoolNode>();
             
-            // Create web server with blockchain configuration
-            core::WebServer web_server(ioc, ip, static_cast<uint16_t>(web_port), 
+            // Create web server with explicit port configuration
+            core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, nullptr, blockchain);
+            
+            // Set custom Stratum port if different from default
+            web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
             
             if (!web_server.start()) {
                 LOG_ERROR << "Failed to start integrated mining pool";
@@ -210,7 +230,8 @@ int main(int argc, char* argv[]) {
             
             LOG_INFO << "Integrated C2Pool Mining Pool started successfully!";
             LOG_INFO << "Blockchain: " << blockchain_name << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
-            LOG_INFO << "Mining interface: http://" << ip << ":" << web_port;
+            LOG_INFO << "Mining interface: http://" << http_host << ":" << http_port;
+            LOG_INFO << "Stratum interface: stratum+tcp://" << http_host << ":" << stratum_port;
             LOG_INFO << "Features enabled:";
             LOG_INFO << "  ✓ Blockchain-specific address validation";
             LOG_INFO << "  ✓ Automatic difficulty adjustment";
@@ -239,9 +260,9 @@ int main(int argc, char* argv[]) {
             
             // Create and start Enhanced C2Pool node
             auto enhanced_node = std::make_unique<c2pool::node::EnhancedC2PoolNode>(&ioc, config.get());
-            enhanced_node->listen(port);
+            enhanced_node->listen(p2p_port);
             
-            LOG_INFO << "Enhanced C2Pool sharechain node started successfully on port " << port;
+            LOG_INFO << "Enhanced C2Pool sharechain node started successfully on port " << p2p_port;
             LOG_INFO << "Features enabled:";
             LOG_INFO << "  ✓ Automatic difficulty adjustment";
             LOG_INFO << "  ✓ Real-time hashrate tracking";
@@ -260,7 +281,7 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Starting c2pool node...";
             LOG_INFO << "Configuration:";
             LOG_INFO << "  Testnet: " << (settings->m_testnet ? "Yes" : "No");
-            LOG_INFO << "  Port: " << port;
+            LOG_INFO << "  P2P Port: " << p2p_port;
             LOG_INFO << "  Features: Basic mode";
             LOG_INFO << "c2pool node initialized successfully";
             LOG_INFO << "Use --help for available options";
