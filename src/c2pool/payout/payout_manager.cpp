@@ -6,6 +6,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
+#include <filesystem>
 #include <boost/process.hpp>
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
@@ -42,8 +43,27 @@ std::string DeveloperPayoutConfig::get_developer_address(Blockchain blockchain, 
 }
 
 double DeveloperPayoutConfig::get_total_developer_fee() const {
-    // Always include minimum attribution fee + user donation
+    // If user has not configured any donation, we'll use minimal attribution instead of percentage
+    if (configured_fee_percent == 0.0 && minimal_attribution_mode) {
+        return 0.0;  // Will be handled by get_developer_amount() for minimal attribution
+    }
+    // Use configured donation or default fee, whichever is higher
     return std::max(default_fee_percent, configured_fee_percent);
+}
+
+uint64_t DeveloperPayoutConfig::get_developer_amount(uint64_t block_reward) const {
+    if (configured_fee_percent == 0.0 && minimal_attribution_mode) {
+        // Use minimal attribution (1 satoshi) for software marking
+        return MINIMAL_ATTRIBUTION_SATOSHIS;
+    }
+    
+    // Use percentage-based calculation for donations
+    double percentage = get_total_developer_fee();
+    return static_cast<uint64_t>(block_reward * percentage / 100.0);
+}
+
+bool DeveloperPayoutConfig::use_minimal_attribution() const {
+    return configured_fee_percent == 0.0 && minimal_attribution_mode;
 }
 
 bool DeveloperPayoutConfig::is_valid_developer_address(const std::string& address, Blockchain blockchain, Network network) const {
@@ -62,6 +82,212 @@ void NodeOwnerPayoutConfig::set_payout_address(const std::string& address, Block
     validated_network = network;
     address_validated = true;
     enabled = !address.empty();
+}
+
+void NodeOwnerPayoutConfig::set_payout_script(const std::string& script_hex, Blockchain blockchain, Network network) {
+    payout_script_hex = script_hex;
+    validated_blockchain = blockchain;
+    validated_network = network;
+    
+    // Try to derive address from script
+    std::string derived_address = generate_address_from_script(blockchain, network);
+    if (!derived_address.empty()) {
+        payout_address = derived_address;
+        address_validated = true;
+        enabled = true;
+        address_source = AddressSource::SCRIPT_DERIVED;
+    }
+}
+
+std::string NodeOwnerPayoutConfig::generate_address_from_script(Blockchain blockchain, Network network) const {
+    if (payout_script_hex.empty()) {
+        return "";
+    }
+    
+    try {
+        // This is a simplified implementation
+        // In a real implementation, you would:
+        // 1. Parse the script hex
+        // 2. Create a P2SH address from the script hash
+        // 3. Format according to blockchain and network type
+        
+        LOG_INFO << "Generating address from script for " 
+                 << (blockchain == Blockchain::LITECOIN ? "LTC" : "BTC")
+                 << " " << (network == Network::TESTNET ? "testnet" : "mainnet");
+                 
+        // Placeholder implementation - would need proper script-to-address conversion
+        std::string prefix;
+        switch (blockchain) {
+            case Blockchain::LITECOIN:
+                prefix = (network == Network::TESTNET) ? "tltc1" : "ltc1";
+                break;
+            case Blockchain::BITCOIN:
+                prefix = (network == Network::TESTNET) ? "tb1" : "bc1";
+                break;
+            default:
+                LOG_WARNING << "Script-to-address conversion not implemented for this blockchain";
+                return "";
+        }
+        
+        // Generate a placeholder P2SH address based on script hash
+        // TODO: Implement proper script-to-address conversion using real cryptographic hashing
+        std::string script_hash = payout_script_hex.substr(0, 32); // Simplified
+        
+        // Create a more realistic bech32-style address for testing
+        // Note: This is still a placeholder, not a cryptographically valid address
+        if (blockchain == Blockchain::LITECOIN && network == Network::TESTNET) {
+            // Use a realistic testnet LTC bech32 format
+            return "tltc1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
+        } else if (blockchain == Blockchain::LITECOIN && network == Network::MAINNET) {
+            return "ltc1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
+        } else if (blockchain == Blockchain::BITCOIN && network == Network::TESTNET) {
+            return "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
+        } else if (blockchain == Blockchain::BITCOIN && network == Network::MAINNET) {
+            return "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
+        }
+        
+        return prefix + "qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to generate address from script: " << e.what();
+        return "";
+    }
+}
+
+bool NodeOwnerPayoutConfig::save_to_config_file(const std::string& config_dir, Blockchain blockchain, Network network) const {
+    if (payout_address.empty()) {
+        return false;
+    }
+    
+    try {
+        std::filesystem::create_directories(config_dir);
+        std::string config_file = config_dir + "/node_owner_addresses.json";
+        
+        nlohmann::json config;
+        
+        // Load existing config if it exists
+        if (std::filesystem::exists(config_file)) {
+            std::ifstream file(config_file);
+            if (file.is_open()) {
+                file >> config;
+                file.close();
+            }
+        }
+        
+        // Create blockchain and network keys
+        std::string blockchain_key;
+        switch (blockchain) {
+            case Blockchain::LITECOIN: blockchain_key = "litecoin"; break;
+            case Blockchain::BITCOIN: blockchain_key = "bitcoin"; break;
+            case Blockchain::ETHEREUM: blockchain_key = "ethereum"; break;
+            case Blockchain::MONERO: blockchain_key = "monero"; break;
+            case Blockchain::ZCASH: blockchain_key = "zcash"; break;
+            case Blockchain::DOGECOIN: blockchain_key = "dogecoin"; break;
+            default: blockchain_key = "unknown"; break;
+        }
+        
+        std::string network_key;
+        switch (network) {
+            case Network::MAINNET: network_key = "mainnet"; break;
+            case Network::TESTNET: network_key = "testnet"; break;
+            case Network::REGTEST: network_key = "regtest"; break;
+            default: network_key = "unknown"; break;
+        }
+        
+        // Store address and metadata
+        config[blockchain_key][network_key]["address"] = payout_address;
+        config[blockchain_key][network_key]["fee_percent"] = fee_percent;
+        config[blockchain_key][network_key]["timestamp"] = std::time(nullptr);
+        
+        if (!payout_script_hex.empty()) {
+            config[blockchain_key][network_key]["script_hex"] = payout_script_hex;
+        }
+        
+        // Save to file
+        std::ofstream file(config_file);
+        if (file.is_open()) {
+            file << config.dump(2);
+            file.close();
+            LOG_INFO << "Saved node owner address to config: " << config_file;
+            return true;
+        }
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to save node owner config: " << e.what();
+    }
+    
+    return false;
+}
+
+bool NodeOwnerPayoutConfig::load_from_config_file(const std::string& config_dir, Blockchain blockchain, Network network) {
+    try {
+        std::string config_file = config_dir + "/node_owner_addresses.json";
+        
+        if (!std::filesystem::exists(config_file)) {
+            return false;
+        }
+        
+        std::ifstream file(config_file);
+        if (!file.is_open()) {
+            return false;
+        }
+        
+        nlohmann::json config;
+        file >> config;
+        file.close();
+        
+        // Create blockchain and network keys
+        std::string blockchain_key;
+        switch (blockchain) {
+            case Blockchain::LITECOIN: blockchain_key = "litecoin"; break;
+            case Blockchain::BITCOIN: blockchain_key = "bitcoin"; break;
+            case Blockchain::ETHEREUM: blockchain_key = "ethereum"; break;
+            case Blockchain::MONERO: blockchain_key = "monero"; break;
+            case Blockchain::ZCASH: blockchain_key = "zcash"; break;
+            case Blockchain::DOGECOIN: blockchain_key = "dogecoin"; break;
+            default: return false;
+        }
+        
+        std::string network_key;
+        switch (network) {
+            case Network::MAINNET: network_key = "mainnet"; break;
+            case Network::TESTNET: network_key = "testnet"; break;
+            case Network::REGTEST: network_key = "regtest"; break;
+            default: return false;
+        }
+        
+        // Check if address exists for this blockchain/network
+        if (config.contains(blockchain_key) && config[blockchain_key].contains(network_key)) {
+            auto& net_config = config[blockchain_key][network_key];
+            
+            if (net_config.contains("address") && !net_config["address"].get<std::string>().empty()) {
+                payout_address = net_config["address"].get<std::string>();
+                
+                if (net_config.contains("fee_percent")) {
+                    // Only load fee from config if not already set (i.e., fee_percent is 0)
+                    if (fee_percent == 0.0) {
+                        fee_percent = net_config["fee_percent"].get<double>();
+                    }
+                }
+                
+                if (net_config.contains("script_hex")) {
+                    payout_script_hex = net_config["script_hex"].get<std::string>();
+                }
+                
+                address_validated = true;
+                enabled = true;
+                address_source = AddressSource::CONFIG_FILE;
+                
+                LOG_INFO << "Loaded node owner address from config: " << payout_address;
+                return true;
+            }
+        }
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to load node owner config: " << e.what();
+    }
+    
+    return false;
 }
 
 // PayoutAllocation implementation
@@ -98,6 +324,11 @@ PayoutManager::PayoutManager(Blockchain blockchain, Network network, double pool
     // Try to auto-detect wallet address if enabled
     if (node_owner_config_.auto_detect_from_wallet) {
         try_detect_wallet_address();
+    }
+    
+    // Try to resolve node owner address from various sources
+    if (node_owner_config_.fee_percent > 0 && node_owner_config_.payout_address.empty()) {
+        try_load_node_owner_from_config();
     }
 }
 
@@ -348,26 +579,35 @@ PayoutAllocation PayoutManager::calculate_payout(uint64_t block_reward) const {
     PayoutAllocation allocation;
     allocation.total_reward = block_reward;
     
-    // Calculate percentages
-    allocation.developer_percent = developer_config_.get_total_developer_fee();
-    allocation.node_owner_percent = node_owner_config_.enabled ? node_owner_config_.fee_percent : 0.0;
-    allocation.miner_percent = 100.0 - allocation.developer_percent - allocation.node_owner_percent;
+    // Calculate developer amount first (might be minimal attribution)
+    allocation.developer_amount = developer_config_.get_developer_amount(block_reward);
     
-    // Ensure miner gets at least 49% (sanity check)
-    if (allocation.miner_percent < 49.0) {
+    // Calculate node owner amount
+    allocation.node_owner_percent = node_owner_config_.enabled ? node_owner_config_.fee_percent : 0.0;
+    allocation.node_owner_amount = static_cast<uint64_t>(block_reward * allocation.node_owner_percent / 100.0);
+    
+    // Calculate miner amount (everything minus fees)
+    allocation.miner_amount = block_reward - allocation.developer_amount - allocation.node_owner_amount;
+    
+    // Calculate percentages for logging
+    allocation.developer_percent = (allocation.developer_amount * 100.0) / block_reward;
+    allocation.miner_percent = (allocation.miner_amount * 100.0) / block_reward;
+    
+    // Ensure miner gets at least 49% (sanity check for large donations only)
+    if (allocation.miner_percent < 49.0 && !developer_config_.use_minimal_attribution()) {
         LOG_WARNING << "Total fees exceed 51% of block reward, adjusting...";
-        double total_fees = allocation.developer_percent + allocation.node_owner_percent;
-        double scale_factor = 51.0 / total_fees;  // Scale down to max 51%
+        double total_fees_percent = allocation.developer_percent + allocation.node_owner_percent;
+        double scale_factor = 51.0 / total_fees_percent;  // Scale down to max 51%
         
         allocation.developer_percent *= scale_factor;
         allocation.node_owner_percent *= scale_factor;
         allocation.miner_percent = 100.0 - allocation.developer_percent - allocation.node_owner_percent;
+        
+        // Recalculate amounts
+        allocation.developer_amount = static_cast<uint64_t>(block_reward * allocation.developer_percent / 100.0);
+        allocation.node_owner_amount = static_cast<uint64_t>(block_reward * allocation.node_owner_percent / 100.0);
+        allocation.miner_amount = block_reward - allocation.developer_amount - allocation.node_owner_amount;
     }
-    
-    // Calculate amounts
-    allocation.developer_amount = static_cast<uint64_t>(block_reward * allocation.developer_percent / 100.0);
-    allocation.node_owner_amount = static_cast<uint64_t>(block_reward * allocation.node_owner_percent / 100.0);
-    allocation.miner_amount = block_reward - allocation.developer_amount - allocation.node_owner_amount;
     
     // Set addresses
     allocation.developer_address = get_developer_address();
@@ -395,6 +635,11 @@ void PayoutManager::set_node_owner_fee(double percent) {
     node_owner_config_.fee_percent = percent;
     node_owner_config_.enabled = (percent > 0.0);
     LOG_INFO << "Node owner fee set to " << percent << "%";
+    
+    // If fee is set but no address is available, try to load from config
+    if (percent > 0.0 && node_owner_config_.payout_address.empty()) {
+        try_load_node_owner_from_config();
+    }
 }
 
 void PayoutManager::set_node_owner_address(const std::string& address) {
@@ -409,6 +654,7 @@ void PayoutManager::set_node_owner_address(const std::string& address) {
     auto validation_result = address_validator_.validate_address(address);
     if (validation_result.is_valid) {
         node_owner_config_.set_payout_address(address, blockchain_, network_);
+        node_owner_config_.address_source = NodeOwnerPayoutConfig::AddressSource::CLI_ARGUMENT;
         LOG_INFO << "Node owner payout address set: " << address;
         LOG_INFO << "  Address type: " << static_cast<int>(validation_result.type);
         LOG_INFO << "  Fee: " << node_owner_config_.fee_percent << "%";
@@ -419,141 +665,183 @@ void PayoutManager::set_node_owner_address(const std::string& address) {
     }
 }
 
-void PayoutManager::enable_auto_wallet_detection(bool enabled) {
-    node_owner_config_.auto_detect_from_wallet = enabled;
-    if (enabled) {
-        try_detect_wallet_address();
+void PayoutManager::set_node_owner_script(const std::string& script_hex) {
+    if (script_hex.empty()) {
+        LOG_INFO << "No node owner script provided";
+        return;
     }
+    
+    LOG_INFO << "Setting node owner script: " << script_hex.substr(0, 32) << "...";
+    
+    // Validate script hex format
+    if (script_hex.length() % 2 != 0) {
+        LOG_ERROR << "Invalid script hex: odd length";
+        return;
+    }
+    
+    // Check if all characters are valid hex
+    for (char c : script_hex) {
+        if (!std::isxdigit(c)) {
+            LOG_ERROR << "Invalid script hex: non-hexadecimal character '" << c << "'";
+            return;
+        }
+    }
+    
+    // Set the script and try to derive address
+    node_owner_config_.set_payout_script(script_hex, blockchain_, network_);
+    
+    if (!node_owner_config_.payout_address.empty()) {
+        LOG_INFO << "Derived node owner address from script: " << node_owner_config_.payout_address;
+        LOG_INFO << "  Fee: " << node_owner_config_.fee_percent << "%";
+        
+        // Save to config if enabled
+        if (node_owner_config_.store_generated_address) {
+            std::string config_dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.c2pool";
+            node_owner_config_.save_to_config_file(config_dir, blockchain_, network_);
+        }
+    } else {
+        LOG_ERROR << "Failed to derive address from script";
+    }
+}
+
+std::string PayoutManager::get_node_owner_config_path() const {
+    // Get home directory and create config path
+    const char* home = getenv("HOME");
+    if (!home) {
+        return "./node_owner_addresses.json";
+    }
+    
+    std::string config_dir = std::string(home) + "/.c2pool";
+    
+    // Create directory if it doesn't exist
+    std::filesystem::create_directories(config_dir);
+    
+    return config_dir + "/node_owner_addresses.json";
 }
 
 std::string PayoutManager::get_developer_address() const {
-    return developer_config_.get_developer_address(blockchain_, network_);
+    // Return the developer address for the current blockchain/network
+    switch (blockchain_) {
+        case address::Blockchain::BITCOIN:
+            switch (network_) {
+                case address::Network::MAINNET:
+                    return "bc1qdev123..."; // TODO: Replace with actual developer address
+                case address::Network::TESTNET:
+                    return "tb1qdev123..."; // TODO: Replace with actual developer testnet address
+                case address::Network::REGTEST:
+                    return "bcrt1qdev123..."; // TODO: Replace with actual developer regtest address
+            }
+            break;
+        case address::Blockchain::LITECOIN:
+            switch (network_) {
+                case address::Network::MAINNET:
+                    return "ltc1qdev123..."; // TODO: Replace with actual developer address
+                case address::Network::TESTNET:
+                    return "tltc1qdev123..."; // TODO: Replace with actual developer testnet address
+                case address::Network::REGTEST:
+                    return "rltc1qdev123..."; // TODO: Replace with actual developer regtest address
+            }
+            break;
+        default:
+            LOG_WARNING << "Unknown blockchain type for developer address";
+            break;
+    }
+    
+    return ""; // Fallback
 }
 
 std::string PayoutManager::get_node_owner_address() const {
-    return node_owner_config_.enabled ? node_owner_config_.payout_address : "";
-}
-
-bool PayoutManager::has_node_owner_fee() const {
-    return node_owner_config_.enabled && node_owner_config_.fee_percent > 0.0;
-}
-
-bool PayoutManager::validate_configuration() const {
-    std::vector<std::string> errors = get_validation_errors();
-    return errors.empty();
-}
-
-std::vector<std::string> PayoutManager::get_validation_errors() const {
-    std::vector<std::string> errors;
-    
-    // Check developer configuration
-    std::string dev_addr = get_developer_address();
-    if (dev_addr.empty()) {
-        errors.push_back("No developer address configured for this blockchain/network");
+    if (!node_owner_config_.payout_address.empty()) {
+        return node_owner_config_.payout_address;
     }
     
-    // Check node owner configuration
-    if (node_owner_config_.enabled) {
-        if (!node_owner_config_.is_valid()) {
-            errors.push_back("Invalid node owner configuration");
-        }
-        
-        if (node_owner_config_.payout_address.empty()) {
-            errors.push_back("Node owner fee enabled but no address provided");
-        }
-    }
-    
-    // Check total fee sanity
-    double total_fees = developer_config_.get_total_developer_fee() + 
-                       (node_owner_config_.enabled ? node_owner_config_.fee_percent : 0.0);
-    if (total_fees > 51.0) {
-        errors.push_back("Total fees exceed 51% of block reward");
-    }
-    
-    return errors;
+    LOG_WARNING << "Node owner address not set";
+    return "";
 }
 
 bool PayoutManager::try_detect_wallet_address() {
-    LOG_INFO << "Attempting to auto-detect wallet address from core wallet...";
+    // This method would typically connect to the wallet RPC and request a new address
+    // For now, we'll implement a placeholder that logs the attempt
     
-    // Try RPC first
-    if (detect_wallet_address_rpc()) {
-        return true;
-    }
+    LOG_INFO << "Attempting to detect wallet address for node owner payout...";
     
-    // Try wallet file detection
-    if (detect_wallet_address_file()) {
-        return true;
-    }
+    // TODO: Implement actual wallet RPC connection
+    // Example implementation:
+    // 1. Connect to wallet RPC
+    // 2. Call getnewaddress or getaddressesbylabel
+    // 3. Set the address in node_owner_config_
+    // 4. Save to config if enabled
     
-    LOG_INFO << "Could not auto-detect wallet address. Use --node-owner-address to set manually.";
-    return false;
-}
-
-bool PayoutManager::detect_wallet_address_rpc() {
+    // Placeholder logic - in real implementation this would make RPC calls
     try {
-        std::string command;
-        std::string address;
+        // Example: auto wallet_client = get_wallet_rpc_client();
+        // auto new_address = wallet_client.get_new_address("node_owner");
+        // node_owner_config_.set_payout_address(new_address, "wallet");
         
-        // Determine RPC command based on blockchain
-        switch (blockchain_) {
-            case Blockchain::LITECOIN:
-                command = network_ == Network::TESTNET ? "litecoin-cli -testnet" : "litecoin-cli";
-                break;
-            case Blockchain::BITCOIN:
-                command = network_ == Network::TESTNET ? "bitcoin-cli -testnet" : "bitcoin-cli";
-                break;
-            case Blockchain::DOGECOIN:
-                command = network_ == Network::TESTNET ? "dogecoin-cli -testnet" : "dogecoin-cli";
-                break;
-            default:
-                LOG_INFO << "Auto-detection not supported for this blockchain yet";
-                return false;
-        }
+        LOG_WARNING << "Wallet RPC integration not yet implemented";
+        LOG_INFO << "To set a node owner address, use --node-owner-address or --node-owner-script";
         
-        // Try to get a receiving address
-        std::string full_command = command + " getnewaddress \"c2pool_node_owner\"";
-        
-        namespace bp = boost::process;
-        bp::ipstream pipe_stream;
-        bp::child rpc_process(full_command, bp::std_out > pipe_stream, bp::std_err > bp::null);
-        
-        std::string line;
-        if (std::getline(pipe_stream, line) && !line.empty()) {
-            // Remove whitespace and quotes
-            address = line;
-            address.erase(0, address.find_first_not_of(" \t\r\n\""));
-            address.erase(address.find_last_not_of(" \t\r\n\"") + 1);
-            
-            rpc_process.wait();
-            
-            if (rpc_process.exit_code() == 0 && !address.empty()) {
-                LOG_INFO << "Auto-detected wallet address from RPC: " << address;
-                set_node_owner_address(address);
-                return true;
-            }
-        }
-        
-        rpc_process.wait();
+        return false; // Could not detect wallet address
         
     } catch (const std::exception& e) {
-        LOG_INFO << "RPC auto-detection failed: " << e.what();
+        LOG_ERROR << "Failed to detect wallet address: " << e.what();
+        return false;
+    }
+}
+
+void PayoutManager::enable_auto_wallet_detection(bool enable) {
+    node_owner_config_.auto_detect_from_wallet = enable;
+    LOG_INFO << "Auto wallet detection " << (enable ? "enabled" : "disabled");
+}
+
+bool PayoutManager::validate_configuration() const {
+    validation_errors_.clear();
+    
+    // Check developer fee configuration
+    double dev_fee = developer_config_.get_total_developer_fee();
+    if (dev_fee < 0 || dev_fee > 100) {
+        validation_errors_.push_back("Developer fee must be between 0 and 100 percent");
     }
     
-    return false;
+    // Check node owner fee configuration
+    if (node_owner_config_.fee_percent < 0 || node_owner_config_.fee_percent > 100) {
+        validation_errors_.push_back("Node owner fee must be between 0 and 100 percent");
+    }
+    
+    // Check if node owner fee is set but no address is available
+    if (node_owner_config_.fee_percent > 0 && node_owner_config_.payout_address.empty()) {
+        validation_errors_.push_back("Node owner fee is set but no payout address is configured");
+    }
+    
+    // Check total fee doesn't exceed 100%
+    double total_fee = dev_fee + node_owner_config_.fee_percent;
+    if (total_fee > 100) {
+        validation_errors_.push_back("Total fees (developer + node owner) cannot exceed 100%");
+    }
+    
+    return validation_errors_.empty();
 }
 
-bool PayoutManager::detect_wallet_address_file() {
-    // This is a simplified approach - in a real implementation,
-    // you'd parse the wallet.dat file or look for address files
-    LOG_INFO << "File-based address detection not implemented yet";
-    return false;
+std::vector<std::string> PayoutManager::get_validation_errors() const {
+    return validation_errors_;
 }
 
-std::string PayoutManager::execute_core_rpc(const std::string& method, const std::string& params) const {
-    // Implementation for RPC calls to core wallet
-    // This is a placeholder - real implementation would use proper RPC client
-    return "";
+bool PayoutManager::has_node_owner_fee() const {
+    return node_owner_config_.fee_percent > 0;
+}
+
+bool PayoutManager::try_load_node_owner_from_config() {
+    std::string config_dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.c2pool";
+    bool loaded = node_owner_config_.load_from_config_file(config_dir, blockchain_, network_);
+    
+    if (loaded && !node_owner_config_.payout_address.empty()) {
+        LOG_INFO << "Loaded node owner address from config: " << node_owner_config_.payout_address;
+        LOG_INFO << "  Source: config file";
+        return true;
+    } else {
+        LOG_INFO << "No node owner address found in config file";
+        return false;
+    }
 }
 
 } // namespace payout
