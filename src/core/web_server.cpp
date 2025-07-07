@@ -262,21 +262,21 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
     bool work_valid = true; // TODO: Implement actual validation
     
     if (work_valid && m_node) {
-        // Track the share submission for difficulty adjustment
+        // Track the mining_share submission for difficulty adjustment
         std::string session_id = "miner_" + std::to_string(m_work_id_counter); // TODO: Use actual session ID
-        m_node->track_share_submission(session_id, 1.0); // TODO: Use actual difficulty
+        m_node->track_mining_share_submission(session_id, 1.0); // TODO: Use actual difficulty
         
-        // Create a new share and add to the sharechain
+        // Create a new mining_share and add to the sharechain
         uint256 share_hash;
         share_hash.SetHex(header); // Simplified - would need proper hash calculation
         
-        uint256 prev_hash = uint256::ZERO; // TODO: Get from actual previous share
+        uint256 prev_hash = uint256::ZERO; // TODO: Get from actual previous mining_share
         uint256 target;
         target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000"); // TODO: Use actual target
         
-        m_node->add_local_share(share_hash, prev_hash, target);
+        m_node->add_local_mining_share(share_hash, prev_hash, target);
         
-        LOG_INFO << "Share submitted and added to sharechain: " << share_hash.ToString().substr(0, 16) << "...";
+        LOG_INFO << "Mining share submitted and added to sharechain: " << share_hash.ToString().substr(0, 16) << "...";
         LOG_INFO << "Work submission accepted";
         return true;
     } else if (work_valid) {
@@ -344,7 +344,7 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
             pool_hashrate = hashrate_stats["global_hashrate"];
         }
         
-        total_shares = m_node->get_total_shares();
+        total_shares = m_node->get_total_mining_shares();
         connections = m_node->get_connected_peers_count();
     }
     
@@ -356,7 +356,7 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         {"difficulty", current_difficulty},
         {"networkhashps", 0}, // TODO: Get from coin node
         {"poolhashps", pool_hashrate},
-        {"poolshares", total_shares},
+        {"poolshares", total_shares}, // Mining shares from physical miners
         {"generate", true},
         {"genproclimit", -1},
         {"testnet", m_testnet}, // Use stored testnet flag
@@ -369,11 +369,17 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
 {
     return {
         {"pool_statistics", {
-            {"shares", {
+            {"mining_shares", {  // Shares from physical miners
                 {"total", 0},
                 {"valid", 0},
                 {"invalid", 0},
                 {"stale", 0}
+            }},
+            {"p2p_shares", {  // Shares from cross-node communication
+                {"total", 0},
+                {"received", 0},
+                {"verified", 0},
+                {"forwarded", 0}
             }},
             {"pool_hashrate", "0 H/s"},
             {"network_hashrate", "0 H/s"},
@@ -460,31 +466,31 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         return false;
     }
     
-    // Track share submission for statistics
+    // Track mining_share submission for statistics
     if (m_node) {
-        // Calculate share difficulty (simplified for now)
-        double share_difficulty = 1.0; // TODO: Calculate actual share difficulty
+        // Calculate mining_share difficulty (simplified for now)
+        double share_difficulty = 1.0; // TODO: Calculate actual mining_share difficulty
         
-        // Track the share submission
-        m_node->track_share_submission(username, share_difficulty);
+        // Track the mining_share submission
+        m_node->track_mining_share_submission(username, share_difficulty);
         
-        // Create share hash for storage (simplified)
+        // Create mining_share hash for storage (simplified)
         uint256 share_hash;
         std::string hash_input = job_id + extranonce2 + ntime + nonce;
         share_hash.SetHex(hash_input.substr(0, 64)); // Take first 64 chars as hash
         
-        LOG_INFO << "Share accepted from " << username << " - hash: " << share_hash.ToString().substr(0, 16) << "...";
+        LOG_INFO << "Mining share accepted from " << username << " - hash: " << share_hash.ToString().substr(0, 16) << "...";
         
-        // Store share in enhanced node (this will go to LevelDB)
-        uint256 prev_hash = uint256::ZERO; // TODO: Get actual previous share hash
+        // Store mining_share in enhanced node (this will go to LevelDB)
+        uint256 prev_hash = uint256::ZERO; // TODO: Get actual previous mining_share hash
         uint256 target;
         target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
         
-        m_node->add_local_share(share_hash, prev_hash, target);
+        m_node->add_local_mining_share(share_hash, prev_hash, target);
         
-        LOG_INFO << "Share stored in sharechain database";
+        LOG_INFO << "Mining share stored in sharechain database";
     } else {
-        LOG_INFO << "Share accepted from " << username << " (no node connected for storage)";
+        LOG_INFO << "Mining share accepted from " << username << " (no node connected for storage)";
     }
     
     return true;

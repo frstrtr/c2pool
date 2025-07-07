@@ -15,8 +15,8 @@ namespace c2pool {
 namespace c2pool {
 namespace difficulty {
 
-void DifficultyAdjustmentEngine::process_new_share(const c2pool::C2PoolShare& share) {
-    shares_since_last_adjustment_++;
+void DifficultyAdjustmentEngine::process_new_p2p_share(const c2pool::C2PoolShare& share) {
+    mining_shares_since_last_adjustment_++;
     
     uint64_t now = static_cast<uint64_t>(std::time(nullptr));
     
@@ -27,12 +27,12 @@ void DifficultyAdjustmentEngine::process_new_share(const c2pool::C2PoolShare& sh
     }
     
     // Check if we should adjust pool difficulty
-    if (shares_since_last_adjustment_ >= target_shares_per_adjustment_ ||
+    if (mining_shares_since_last_adjustment_ >= target_mining_shares_per_adjustment_ ||
         (now - last_adjustment_time_) > 300) { // Also adjust every 5 minutes
         
         adjust_pool_difficulty();
         last_adjustment_time_ = now;
-        shares_since_last_adjustment_ = 0;
+        mining_shares_since_last_adjustment_ = 0;
     }
 }
 
@@ -81,8 +81,8 @@ nlohmann::json DifficultyAdjustmentEngine::get_difficulty_stats() const {
     return {
         {"pool_difficulty", current_pool_difficulty_},
         {"network_difficulty", network_difficulty_},
-        {"shares_since_adjustment", shares_since_last_adjustment_},
-        {"target_shares_per_adjustment", target_shares_per_adjustment_},
+        {"shares_since_adjustment", mining_shares_since_last_adjustment_},
+        {"target_shares_per_adjustment", target_mining_shares_per_adjustment_},
         {"pool_target", get_pool_target().ToString()},
         {"network_target", network_target_.ToString()},
         {"target_block_time", target_block_time_},
@@ -91,7 +91,7 @@ nlohmann::json DifficultyAdjustmentEngine::get_difficulty_stats() const {
 }
 
 void DifficultyAdjustmentEngine::set_adjustment_parameters(uint64_t target_shares, double target_time) {
-    target_shares_per_adjustment_ = target_shares;
+    target_mining_shares_per_adjustment_ = target_shares;
     target_block_time_ = target_time;
     LOG_INFO << "Difficulty adjustment parameters updated: " 
              << target_shares << " shares, " << target_time << "s target time";
@@ -123,7 +123,7 @@ void DifficultyAdjustmentEngine::update_network_difficulty() {
 }
 
 void DifficultyAdjustmentEngine::adjust_pool_difficulty() {
-    if (shares_since_last_adjustment_ == 0) return;
+    if (mining_shares_since_last_adjustment_ == 0) return;
     
     uint64_t now = static_cast<uint64_t>(std::time(nullptr));
     uint64_t time_elapsed = now - last_adjustment_time_;
@@ -131,8 +131,8 @@ void DifficultyAdjustmentEngine::adjust_pool_difficulty() {
     if (time_elapsed == 0) time_elapsed = 1; // Prevent division by zero
     
     // Calculate actual vs target rate
-    double actual_rate = (double)shares_since_last_adjustment_ / time_elapsed;
-    double target_rate = target_shares_per_adjustment_ / target_block_time_;
+    double actual_rate = (double)mining_shares_since_last_adjustment_ / time_elapsed;
+    double target_rate = target_mining_shares_per_adjustment_ / target_block_time_;
     
     if (actual_rate > 0) {
         double adjustment_factor = target_rate / actual_rate;

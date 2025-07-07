@@ -98,10 +98,10 @@ void node::EnhancedC2PoolNode::log_sharechain_stats()
     if (!m_chain) return;
     
     // Get stats using available LTC sharechain methods
-    uint64_t total_shares = get_total_shares();
+    uint64_t total_mining_shares = get_total_mining_shares();
     
     LOG_INFO << "Enhanced C2Pool Sharechain stats:";
-    LOG_INFO << "  Total shares: " << total_shares;
+    LOG_INFO << "  Total mining_shares: " << total_mining_shares;
     LOG_INFO << "  Connected peers: " << get_connected_peers_count();
     LOG_INFO << "  Storage: " << (m_storage && m_storage->is_available() ? "enabled" : "disabled");
     
@@ -110,8 +110,8 @@ void node::EnhancedC2PoolNode::log_sharechain_stats()
         auto stats = m_hashrate_tracker->get_statistics();
         LOG_INFO << "  Current difficulty: " << stats["current_difficulty"];
         LOG_INFO << "  Current hashrate: " << stats["current_hashrate"] << " H/s";
-        LOG_INFO << "  Total shares submitted: " << stats["total_shares_submitted"];
-        LOG_INFO << "  Total shares accepted: " << stats["total_shares_accepted"];
+        LOG_INFO << "  Total mining_shares submitted: " << stats["total_shares_submitted"];
+        LOG_INFO << "  Total mining_shares accepted: " << stats["total_shares_accepted"];
         LOG_INFO << "  Acceptance rate (last hour): " << stats["acceptance_rate_1h"] << "%";
     }
     
@@ -120,16 +120,16 @@ void node::EnhancedC2PoolNode::log_sharechain_stats()
     auto diff_stats = m_difficulty_adjustment_engine.get_difficulty_stats();
     LOG_INFO << "    Pool difficulty: " << diff_stats["pool_difficulty"];
     LOG_INFO << "    Network difficulty: " << diff_stats["network_difficulty"];
-    LOG_INFO << "    Shares since adjustment: " << diff_stats["shares_since_adjustment"];
-    LOG_INFO << "    Target shares per adjustment: " << diff_stats["target_shares_per_adjustment"];
+    LOG_INFO << "    Mining_shares since adjustment: " << diff_stats["shares_since_adjustment"];
+    LOG_INFO << "    Target mining_shares per adjustment: " << diff_stats["target_shares_per_adjustment"];
 }
 
-void node::EnhancedC2PoolNode::track_share_submission(const std::string& session_id, double difficulty) {
+void node::EnhancedC2PoolNode::track_mining_share_submission(const std::string& session_id, double difficulty) {
     if (m_hashrate_tracker) {
         m_hashrate_tracker->record_share_submission(difficulty, true); // Assume accepted for now
     }
     
-    LOG_DEBUG_OTHER << "Tracked share submission for session " << session_id 
+    LOG_DEBUG_OTHER << "Tracked mining_share submission for session " << session_id 
               << " with difficulty " << difficulty;
 }
 
@@ -144,7 +144,7 @@ nlohmann::json node::EnhancedC2PoolNode::get_hashrate_stats() const {
     return nlohmann::json{{"global_hashrate", 0.0}};
 }
 
-uint64_t node::EnhancedC2PoolNode::get_total_shares() const {
+uint64_t node::EnhancedC2PoolNode::get_total_mining_shares() const {
     return m_chain ? 1000 : 0; // Placeholder - would need proper implementation with LTC chain
 }
 
@@ -192,8 +192,8 @@ nlohmann::json node::EnhancedC2PoolNode::get_mining_stats() {
     // Combine all statistics
     stats["hashrate"] = get_hashrate_stats();
     stats["difficulty"] = get_difficulty_stats();
-    stats["shares"] = {
-        {"total", get_total_shares()},
+    stats["mining_shares"] = {
+        {"total", get_total_mining_shares()},
         {"since_save", m_shares_since_save}
     };
     stats["network"] = {

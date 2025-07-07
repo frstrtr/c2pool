@@ -14,14 +14,14 @@ class IMiningNode {
 public:
     virtual ~IMiningNode() = default;
     
-    // Difficulty and hashrate tracking
-    virtual void track_share_submission(const std::string& session_id, double difficulty) = 0;
+    // Difficulty and hashrate tracking  
+    virtual void track_mining_share_submission(const std::string& session_id, double difficulty) = 0;
     virtual nlohmann::json get_difficulty_stats() const = 0;
     virtual nlohmann::json get_hashrate_stats() const = 0;
     
-    // Share management
-    virtual void add_local_share(const uint256& hash, const uint256& prev_hash, const uint256& target) = 0;
-    virtual uint64_t get_total_shares() const = 0;
+    // Mining share management
+    virtual void add_local_mining_share(const uint256& hash, const uint256& prev_hash, const uint256& target) = 0;
+    virtual uint64_t get_total_mining_shares() const = 0;
     
     // Network info
     virtual size_t get_connected_peers_count() const = 0;

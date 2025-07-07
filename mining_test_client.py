@@ -103,7 +103,7 @@ def simulate_mining_activity():
                 difficulty = data.get('difficulty', 1)
                 miners = data.get('connected_miners', 0)
                 
-                print(f"   Check {i+1}: Shares={shares}, Hashrate={hashrate:.2f} H/s, "
+                print(f"   Check {i+1}: MiningShares={shares}, Hashrate={hashrate:.2f} H/s, "
                       f"Difficulty={difficulty}, Miners={miners}")
                 
                 if shares > 0:
@@ -145,11 +145,11 @@ def monitor_miners():
                     activity = "📈" if share_delta > 0 else "📊"
                     
                     print(f"{status} [{i+1:2d}/30] Miners: {miners:2d} | "
-                          f"Shares: {shares:4d} (+{share_delta}) | "
+                          f"MiningShares: {shares:4d} (+{share_delta}) | "
                           f"Hashrate: {hashrate:8.2f} H/s {activity}")
                     
                     if share_delta > 0:
-                        print(f"    🎯 New shares found! Pool is actively mining.")
+                        print(f"    🎯 New mining shares found! Pool is actively mining.")
                     
                     if miners > 0 and i == 0:
                         print(f"    ✅ Physical miners detected and connected!")

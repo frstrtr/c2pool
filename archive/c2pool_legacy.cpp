@@ -45,10 +45,24 @@
 #include <sharechain/legacy/tracker.hpp>
 #include <sharechain/legacy/base_share_tracker.hpp>
 
-// Forward declarations
+// Forward declarations for our enhanced types
 namespace c2pool {
-    struct C2PoolShare;
+    struct MiningShare;      // Shares from physical miners 
+    struct P2PShare;         // Shares from P2Pool cross-node communication
+    
+    namespace hashrate {
+        class HashrateTracker;
+    }
+    
+    namespace difficulty {
+        class DifficultyAdjustmentEngine;
+    }
 }
+
+// Include our enhanced share trackers
+#include <c2pool/share_types.hpp>
+#include <c2pool/mining_share_tracker.hpp>
+#include <c2pool/p2p_share_tracker.hpp>
 
 // Modern LevelDB-based Sharechain Storage Manager
 class SharechainStorage
@@ -70,7 +84,7 @@ public:
         } else {
             LOG_INFO << "LevelDB sharechain storage opened successfully";
             LOG_INFO << "  Network: " << network_name;
-            LOG_INFO << "  Existing shares: " << m_leveldb_store->get_share_count();
+            LOG_INFO << "  Existing mining_shares: " << m_leveldb_store->get_share_count();
             LOG_INFO << "  Best height: " << m_leveldb_store->get_best_height();
         }
     }
@@ -79,7 +93,7 @@ public:
     {
         if (m_leveldb_store) {
             LOG_INFO << "Closing LevelDB sharechain storage";
-            LOG_INFO << "  Final share count: " << m_leveldb_store->get_share_count();
+            LOG_INFO << "  Final mining_share count: " << m_leveldb_store->get_share_count();
             m_leveldb_store->close();
         }
     }
@@ -99,9 +113,9 @@ public:
 
         try {
             // For now, log that we would save (full integration needs sharechain API)
-            LOG_INFO << "LevelDB sharechain storage is ready for persistent share storage";
+            LOG_INFO << "LevelDB sharechain storage is ready for persistent mining_share storage";
             LOG_INFO << "  Network: " << m_network_name;
-            LOG_INFO << "  Current stored shares: " << m_leveldb_store->get_share_count();
+            LOG_INFO << "  Current stored mining_shares: " << m_leveldb_store->get_share_count();
             LOG_INFO << "  Storage path: " << m_leveldb_store->get_base_path() << "/" << m_network_name << "/sharechain_leveldb";
             
         } catch (const std::exception& e) {
@@ -119,23 +133,23 @@ public:
         }
 
         try {
-            uint64_t stored_shares = m_leveldb_store->get_share_count();
-            if (stored_shares == 0) {
-                LOG_INFO << "No shares found in LevelDB storage, starting fresh";
+            uint64_t stored_mining_shares = m_leveldb_store->get_share_count();
+            if (stored_mining_shares == 0) {
+                LOG_INFO << "No mining_shares found in LevelDB storage, starting fresh";
                 return false;
             }
             
             uint256 best_hash = m_leveldb_store->get_best_hash();
             uint64_t best_height = m_leveldb_store->get_best_height();
             
-            LOG_INFO << "LevelDB sharechain storage contains " << stored_shares << " shares";
+            LOG_INFO << "LevelDB sharechain storage contains " << stored_mining_shares << " mining_shares";
             LOG_INFO << "  Best height: " << best_height;
             LOG_INFO << "  Best hash: " << best_hash.ToString().substr(0, 16) << "...";
             
             // For now, just report availability - full integration needs sharechain API
-            LOG_INFO << "LevelDB storage is ready for share loading and recovery";
+            LOG_INFO << "LevelDB storage is ready for mining_share loading and recovery";
             
-            return stored_shares > 0;
+            return stored_mining_shares > 0;
             
         } catch (const std::exception& e) {
             LOG_ERROR << "Error loading from LevelDB sharechain storage: " << e.what();
@@ -143,8 +157,8 @@ public:
         }
     }
     
-    // Store a specific share in LevelDB
-    bool store_share(const uint256& hash, const std::vector<uint8_t>& serialized_data, 
+    // Store a specific mining_share in LevelDB
+    bool store_mining_share(const uint256& hash, const std::vector<uint8_t>& serialized_data, 
                      const uint256& prev_hash, uint64_t height, uint64_t timestamp,
                      const uint256& work, const uint256& target, bool is_orphan = false)
     {
@@ -163,7 +177,7 @@ public:
             
             bool success = m_leveldb_store->store_share(hash, serialized_data, metadata);
             if (success) {
-                LOG_INFO << "Stored share in LevelDB: " << hash.ToString().substr(0, 16) 
+                LOG_INFO << "Stored mining_share in LevelDB: " << hash.ToString().substr(0, 16) 
                          << "... (height: " << height << ")";
             }
             return success;
@@ -174,8 +188,8 @@ public:
         }
     }
     
-    // Load a specific share from LevelDB
-    bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
+    // Load a specific mining_share from LevelDB
+    bool load_mining_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
                     uint256& prev_hash, uint64_t& height, uint64_t& timestamp,
                     uint256& work, uint256& target, bool& is_orphan)
     {
@@ -195,7 +209,7 @@ public:
                 target = metadata.target;
                 is_orphan = metadata.is_orphan;
                 
-                LOG_DEBUG_DB << "Loaded share from LevelDB: " << hash.ToString().substr(0, 16)
+                LOG_DEBUG_DB << "Loaded mining_share from LevelDB: " << hash.ToString().substr(0, 16)
                              << "... (height: " << height << ")";
             }
             
@@ -207,8 +221,8 @@ public:
         }
     }
     
-    // Check if a share exists in LevelDB
-    bool has_share(const uint256& hash)
+    // Check if a mining_share exists in LevelDB
+    bool has_mining_share(const uint256& hash)
     {
         if (!m_leveldb_store) {
             return false;
@@ -231,7 +245,7 @@ public:
             uint256 best_hash = m_leveldb_store->get_best_hash();
             
             LOG_INFO << "LevelDB Storage Stats:";
-            LOG_INFO << "  Total shares: " << share_count;
+            LOG_INFO << "  Total mining_shares: " << share_count;
             LOG_INFO << "  Best height: " << best_height;
             if (best_hash != uint256::ZERO) {
                 LOG_INFO << "  Best hash: " << best_hash.ToString().substr(0, 16) << "...";
@@ -262,8 +276,8 @@ public:
         return m_leveldb_store->get_chain_hashes(start_hash, max_count, forward);
     }
     
-    // Get shares by height range
-    std::vector<uint256> get_shares_by_height_range(uint64_t start_height, uint64_t end_height)
+    // Get mining_shares by height range
+    std::vector<uint256> get_mining_shares_by_height_range(uint64_t start_height, uint64_t end_height)
     {
         if (!m_leveldb_store) {
             return {};
@@ -321,17 +335,61 @@ public:
     }
 };
 
-// Hashrate and difficulty management
-class HashrateTracker {
+// Enhanced share tracking with separation between mining and P2P shares
+namespace c2pool {
+    // Mining share from physical miners
+    struct MiningShare {
+        uint256 m_hash;
+        uint256 m_prev_hash;
+        uint256 m_difficulty;
+        uint64_t m_submit_time;
+        std::string m_miner_address;  // Physical miner payout address
+        std::string m_miner_session_id;
+        uint64_t m_height;
+        uint256 m_work;
+        uint256 m_target;
+        bool m_accepted;
+        
+        MiningShare() = default;
+        MiningShare(const uint256& hash, const uint256& prev_hash, const uint256& difficulty, 
+                   uint64_t submit_time, const std::string& miner_address)
+            : m_hash(hash), m_prev_hash(prev_hash), m_difficulty(difficulty), 
+              m_submit_time(submit_time), m_miner_address(miner_address), m_accepted(false) {}
+    };
+    
+    // P2P share from cross-node communication
+    struct P2PShare {
+        uint256 m_hash;
+        uint256 m_prev_hash;
+        uint256 m_difficulty;
+        uint64_t m_submit_time;
+        std::string m_peer_address;   // P2Pool peer address
+        std::string m_network_id;     // Network identifier
+        uint64_t m_height;
+        uint256 m_work;
+        uint256 m_target;
+        bool m_verified;
+        
+        P2PShare() = default;
+        P2PShare(const uint256& hash, const uint256& prev_hash, const uint256& difficulty, 
+                uint64_t submit_time, const std::string& peer_address)
+            : m_hash(hash), m_prev_hash(prev_hash), m_difficulty(difficulty), 
+              m_submit_time(submit_time), m_peer_address(peer_address), m_verified(false) {}
+    };
+}
+
+// Mining Share Tracker for Physical Miners
+class MiningShareTracker {
 private:
-    struct ShareSubmission {
+    struct MiningShareSubmission {
         uint64_t timestamp;
         double difficulty;
         bool accepted;
+        std::string miner_address;  // Physical miner address
     };
     
-    std::deque<ShareSubmission> recent_shares_;
-    mutable std::mutex shares_mutex_;
+    std::deque<MiningShareSubmission> recent_mining_shares_;
+    mutable std::mutex mining_shares_mutex_;
     double current_difficulty_ = 1.0;
     double target_time_per_share_ = 30.0; // Target 30 seconds per share
     uint64_t difficulty_adjustment_interval_ = 300; // 5 minutes
@@ -342,49 +400,49 @@ private:
     double max_difficulty_ = 1000000.0;
     
     // Statistics
-    uint64_t total_shares_submitted_ = 0;
-    uint64_t total_shares_accepted_ = 0;
+    uint64_t total_mining_shares_submitted_ = 0;
+    uint64_t total_mining_shares_accepted_ = 0;
     double total_work_done_ = 0.0;
     
 public:
-    void record_share_submission(double difficulty, bool accepted) {
-        std::lock_guard<std::mutex> lock(shares_mutex_);
+    void record_mining_share_submission(double difficulty, bool accepted, const std::string& miner_address = "") {
+        std::lock_guard<std::mutex> lock(mining_shares_mutex_);
         
         uint64_t now = static_cast<uint64_t>(std::time(nullptr));
-        recent_shares_.push_back({now, difficulty, accepted});
+        recent_mining_shares_.push_back({now, difficulty, accepted, miner_address});
         
         // Keep only shares from last hour
-        while (!recent_shares_.empty() && 
-               recent_shares_.front().timestamp < now - 3600) {
-            recent_shares_.pop_front();
+        while (!recent_mining_shares_.empty() && 
+               recent_mining_shares_.front().timestamp < now - 3600) {
+            recent_mining_shares_.pop_front();
         }
         
-        total_shares_submitted_++;
+        total_mining_shares_submitted_++;
         if (accepted) {
-            total_shares_accepted_++;
+            total_mining_shares_accepted_++;
             total_work_done_ += difficulty;
         }
         
         // Check if we should adjust difficulty
         if (now - last_difficulty_adjustment_ > difficulty_adjustment_interval_) {
-            adjust_difficulty();
+            adjust_mining_difficulty();
             last_difficulty_adjustment_ = now;
         }
     }
     
     double get_current_difficulty() const {
-        std::lock_guard<std::mutex> lock(shares_mutex_);
+        std::lock_guard<std::mutex> lock(mining_shares_mutex_);
         return current_difficulty_;
     }
     
     double get_current_hashrate() const {
-        std::lock_guard<std::mutex> lock(shares_mutex_);
+        std::lock_guard<std::mutex> lock(mining_shares_mutex_);
         
         uint64_t now = static_cast<uint64_t>(std::time(nullptr));
         double work_done = 0.0;
         uint64_t time_window = 600; // 10 minutes
         
-        for (const auto& share : recent_shares_) {
+        for (const auto& share : recent_mining_shares_) {
             if (share.accepted && share.timestamp > now - time_window) {
                 work_done += share.difficulty;
             }
@@ -398,8 +456,8 @@ public:
         return 0.0;
     }
     
-    nlohmann::json get_statistics() const {
-        std::lock_guard<std::mutex> lock(shares_mutex_);
+    nlohmann::json get_mining_statistics() const {
+        std::lock_guard<std::mutex> lock(mining_shares_mutex_);
         
         uint64_t now = static_cast<uint64_t>(std::time(nullptr));
         
@@ -407,7 +465,7 @@ public:
         uint64_t recent_submitted = 0;
         uint64_t recent_accepted = 0;
         
-        for (const auto& share : recent_shares_) {
+        for (const auto& share : recent_mining_shares_) {
             if (share.timestamp > now - 3600) { // Last hour
                 recent_submitted++;
                 if (share.accepted) recent_accepted++;
@@ -420,18 +478,18 @@ public:
         return {
             {"current_difficulty", current_difficulty_},
             {"current_hashrate", get_current_hashrate()},
-            {"total_shares_submitted", total_shares_submitted_},
-            {"total_shares_accepted", total_shares_accepted_},
+            {"total_mining_shares_submitted", total_mining_shares_submitted_},
+            {"total_mining_shares_accepted", total_mining_shares_accepted_},
             {"total_work_done", total_work_done_},
             {"acceptance_rate_1h", acceptance_rate},
-            {"recent_shares_count", recent_shares_.size()},
+            {"recent_shares_count", recent_mining_shares_.size()},
             {"target_time_per_share", target_time_per_share_}
         };
     }
     
 private:
-    void adjust_difficulty() {
-        if (recent_shares_.size() < 3) {
+    void adjust_mining_difficulty() {
+        if (recent_mining_shares_.size() < 3) {
             return; // Need minimum shares for adjustment
         }
         
@@ -439,7 +497,7 @@ private:
         
         // Calculate average time between accepted shares in last 5 minutes
         std::vector<uint64_t> accepted_times;
-        for (const auto& share : recent_shares_) {
+        for (const auto& share : recent_mining_shares_) {
             if (share.accepted && share.timestamp > now - 300) { // Last 5 minutes
                 accepted_times.push_back(share.timestamp);
             }
@@ -467,11 +525,97 @@ private:
         new_difficulty = std::max(min_difficulty_, std::min(max_difficulty_, new_difficulty));
         
         if (std::abs(new_difficulty - current_difficulty_) / current_difficulty_ > 0.1) { // >10% change
-            LOG_INFO << "Difficulty adjustment: " << current_difficulty_ << " -> " << new_difficulty
+            LOG_INFO << "Mining difficulty adjustment: " << current_difficulty_ << " -> " << new_difficulty
                      << " (avg time: " << avg_time_per_share << "s, target: " << target_time_per_share_ << "s)"
                      << " (factor: " << adjustment_factor << ")";
             current_difficulty_ = new_difficulty;
         }
+    }
+};
+
+// P2P Share Tracker for Cross-Node Communication
+class P2PShareTracker {
+private:
+    struct P2PShareSubmission {
+        uint64_t timestamp;
+        double difficulty;
+        bool verified;
+        std::string peer_address;
+    };
+    
+    std::deque<P2PShareSubmission> recent_p2p_shares_;
+    mutable std::mutex p2p_shares_mutex_;
+    
+    // Statistics
+    uint64_t total_p2p_shares_received_ = 0;
+    uint64_t total_p2p_shares_verified_ = 0;
+    uint64_t total_p2p_shares_forwarded_ = 0;
+    
+public:
+    void record_p2p_share_reception(double difficulty, bool verified, const std::string& peer_address = "") {
+        std::lock_guard<std::mutex> lock(p2p_shares_mutex_);
+        
+        uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+        recent_p2p_shares_.push_back({now, difficulty, verified, peer_address});
+        
+        // Keep only shares from last hour
+        while (!recent_p2p_shares_.empty() && 
+               recent_p2p_shares_.front().timestamp < now - 3600) {
+            recent_p2p_shares_.pop_front();
+        }
+        
+        total_p2p_shares_received_++;
+        if (verified) {
+            total_p2p_shares_verified_++;
+        }
+    }
+    
+    void record_p2p_share_forward() {
+        std::lock_guard<std::mutex> lock(p2p_shares_mutex_);
+        total_p2p_shares_forwarded_++;
+    }
+    
+    nlohmann::json get_p2p_statistics() const {
+        std::lock_guard<std::mutex> lock(p2p_shares_mutex_);
+        
+        uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+        
+        // Calculate verification rate for last hour
+        uint64_t recent_received = 0;
+        uint64_t recent_verified = 0;
+        
+        for (const auto& share : recent_p2p_shares_) {
+            if (share.timestamp > now - 3600) { // Last hour
+                recent_received++;
+                if (share.verified) recent_verified++;
+            }
+        }
+        
+        double verification_rate = recent_received > 0 ? 
+            (double)recent_verified / recent_received * 100.0 : 0.0;
+        
+        return {
+            {"total_p2p_shares_received", total_p2p_shares_received_},
+            {"total_p2p_shares_verified", total_p2p_shares_verified_},
+            {"total_p2p_shares_forwarded", total_p2p_shares_forwarded_},
+            {"verification_rate_1h", verification_rate},
+            {"recent_p2p_shares_count", recent_p2p_shares_.size()}
+        };
+    }
+    
+    std::vector<std::string> get_active_peers() const {
+        std::lock_guard<std::mutex> lock(p2p_shares_mutex_);
+        
+        uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+        std::set<std::string> active_peers;
+        
+        for (const auto& share : recent_p2p_shares_) {
+            if (share.timestamp > now - 600 && !share.peer_address.empty()) { // Last 10 minutes
+                active_peers.insert(share.peer_address);
+            }
+        }
+        
+        return std::vector<std::string>(active_peers.begin(), active_peers.end());
     }
 };
 

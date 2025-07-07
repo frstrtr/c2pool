@@ -84,11 +84,11 @@ public:
     void log_sharechain_stats();
     
     /**
-     * @brief Track share submission for mining interface
+     * @brief Track mining_share submission for mining interface
      * @param session_id Session identifier
-     * @param difficulty Share difficulty
+     * @param difficulty MiningShare difficulty
      */
-    void track_share_submission(const std::string& session_id, double difficulty);
+    void track_mining_share_submission(const std::string& session_id, double difficulty);
     
     /**
      * @brief Get difficulty statistics
@@ -103,10 +103,10 @@ public:
     nlohmann::json get_hashrate_stats() const;
     
     /**
-     * @brief Get total number of shares in chain
-     * @return Share count
+     * @brief Get total number of mining_shares in chain
+     * @return MiningShare count
      */
-    uint64_t get_total_shares() const;
+    uint64_t get_total_mining_shares() const;
     
     /**
      * @brief Get number of connected peers

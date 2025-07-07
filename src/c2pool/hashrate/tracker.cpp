@@ -5,21 +5,21 @@
 namespace c2pool {
 namespace hashrate {
 
-void HashrateTracker::record_share_submission(double difficulty, bool accepted) {
+void HashrateTracker::record_mining_share_submission(double difficulty, bool accepted) {
     std::lock_guard<std::mutex> lock(shares_mutex_);
     
     uint64_t now = static_cast<uint64_t>(std::time(nullptr));
-    recent_shares_.push_back({now, difficulty, accepted});
+    recent_mining_shares_.push_back({now, difficulty, accepted});
     
     // Keep only shares from last hour
-    while (!recent_shares_.empty() && 
-           recent_shares_.front().timestamp < now - 3600) {
-        recent_shares_.pop_front();
+    while (!recent_mining_shares_.empty() && 
+           recent_mining_shares_.front().timestamp < now - 3600) {
+        recent_mining_shares_.pop_front();
     }
     
-    total_shares_submitted_++;
+    total_mining_shares_submitted_++;
     if (accepted) {
-        total_shares_accepted_++;
+        total_mining_shares_accepted_++;
         total_work_done_ += difficulty;
     }
     
@@ -30,8 +30,8 @@ void HashrateTracker::record_share_submission(double difficulty, bool accepted) 
     }
 }
 
-void HashrateTracker::record_share(const uint256& hash, uint64_t difficulty, uint64_t timestamp) {
-    record_share_submission(static_cast<double>(difficulty), true);
+void HashrateTracker::record_mining_share(const uint256& hash, uint64_t difficulty, uint64_t timestamp) {
+    record_mining_share_submission(static_cast<double>(difficulty), true);
 }
 
 double HashrateTracker::get_current_difficulty() const {
@@ -46,7 +46,7 @@ double HashrateTracker::get_current_hashrate() const {
     double work_done = 0.0;
     uint64_t time_window = 600; // 10 minutes
     
-    for (const auto& share : recent_shares_) {
+    for (const auto& share : recent_mining_shares_) {
         if (share.accepted && share.timestamp > now - time_window) {
             work_done += share.difficulty;
         }
@@ -69,7 +69,7 @@ nlohmann::json HashrateTracker::get_statistics() const {
     uint64_t recent_submitted = 0;
     uint64_t recent_accepted = 0;
     
-    for (const auto& share : recent_shares_) {
+    for (const auto& share : recent_mining_shares_) {
         if (share.timestamp > now - 3600) { // Last hour
             recent_submitted++;
             if (share.accepted) recent_accepted++;
@@ -82,12 +82,12 @@ nlohmann::json HashrateTracker::get_statistics() const {
     return {
         {"current_difficulty", current_difficulty_},
         {"current_hashrate", get_current_hashrate()},
-        {"total_shares_submitted", total_shares_submitted_},
-        {"total_shares_accepted", total_shares_accepted_},
+        {"total_mining_shares_submitted", total_mining_shares_submitted_},
+        {"total_mining_shares_accepted", total_mining_shares_accepted_},
         {"total_work_done", total_work_done_},
         {"acceptance_rate_1h", acceptance_rate},
-        {"recent_shares_count", recent_shares_.size()},
-        {"target_time_per_share", target_time_per_share_},
+        {"recent_mining_shares_count", recent_mining_shares_.size()},
+        {"target_time_per_mining_share", target_time_per_mining_share_},
         {"min_difficulty", min_difficulty_},
         {"max_difficulty", max_difficulty_}
     };
@@ -99,13 +99,13 @@ void HashrateTracker::set_difficulty_bounds(double min_difficulty, double max_di
     max_difficulty_ = max_difficulty;
 }
 
-void HashrateTracker::set_target_time_per_share(double target_seconds) {
+void HashrateTracker::set_target_time_per_mining_share(double target_seconds) {
     std::lock_guard<std::mutex> lock(shares_mutex_);
-    target_time_per_share_ = target_seconds;
+    target_time_per_mining_share_ = target_seconds;
 }
 
 void HashrateTracker::adjust_difficulty() {
-    if (recent_shares_.size() < 3) {
+    if (recent_mining_shares_.size() < 3) {
         return; // Need minimum shares for adjustment
     }
     
@@ -113,7 +113,7 @@ void HashrateTracker::adjust_difficulty() {
     
     // Calculate average time between accepted shares in last 5 minutes
     std::vector<uint64_t> accepted_times;
-    for (const auto& share : recent_shares_) {
+    for (const auto& share : recent_mining_shares_) {
         if (share.accepted && share.timestamp > now - 300) { // Last 5 minutes
             accepted_times.push_back(share.timestamp);
         }
@@ -130,7 +130,7 @@ void HashrateTracker::adjust_difficulty() {
     double avg_time_per_share = total_time / (accepted_times.size() - 1);
     
     // Calculate adjustment factor
-    double adjustment_factor = target_time_per_share_ / avg_time_per_share;
+    double adjustment_factor = target_time_per_mining_share_ / avg_time_per_share;
     
     // Limit adjustment to prevent oscillation
     adjustment_factor = std::max(0.5, std::min(2.0, adjustment_factor));
@@ -142,7 +142,7 @@ void HashrateTracker::adjust_difficulty() {
     
     if (std::abs(new_difficulty - current_difficulty_) / current_difficulty_ > 0.1) { // >10% change
         LOG_INFO << "Difficulty adjustment: " << current_difficulty_ << " -> " << new_difficulty
-                 << " (avg time: " << avg_time_per_share << "s, target: " << target_time_per_share_ << "s)"
+                 << " (avg time: " << avg_time_per_share << "s, target: " << target_time_per_mining_share_ << "s)"
                  << " (factor: " << adjustment_factor << ")";
         current_difficulty_ = new_difficulty;
     }
