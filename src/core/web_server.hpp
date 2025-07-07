@@ -20,6 +20,7 @@
 #include <core/uint256.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
+#include <c2pool/payout/payout_manager.hpp>
 
 // Bring the address validation types into the core namespace for convenience
 using Blockchain = c2pool::address::Blockchain;
@@ -113,6 +114,9 @@ public:
     // Access to address validator (for Stratum sessions)
     const BlockchainAddressValidator& get_address_validator() const { return m_address_validator; }
     
+    // Access to payout manager (for Stratum sessions)
+    c2pool::payout::PayoutManager* get_payout_manager() const { return m_payout_manager.get(); }
+    
     // Sync status checking
     bool is_blockchain_synced() const;
     void log_sync_progress() const;
@@ -120,6 +124,12 @@ public:
     // Difficulty calculation utilities
     double calculate_share_difficulty(const std::string& job_id, const std::string& extranonce2, 
                                      const std::string& ntime, const std::string& nonce) const;
+    
+    // Payout management methods
+    nlohmann::json getpayoutinfo(const std::string& request_id = "");
+    nlohmann::json getminerstats(const std::string& request_id = "");
+    void set_pool_payout_address(const std::string& address);
+    void set_pool_fee_percent(double fee_percent);
 
 private:
     void setup_methods();
@@ -132,6 +142,7 @@ private:
     Blockchain m_blockchain;  // Store blockchain type
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
+    std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
     
     // TODO: Add connections to actual mining node and coin interface
     // std::shared_ptr<Node> m_node;
