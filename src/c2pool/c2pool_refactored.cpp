@@ -34,6 +34,7 @@
 #include <c2pool/hashrate/tracker.hpp>
 #include <c2pool/difficulty/adjustment_engine.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
+#include <c2pool/payout/payout_manager.hpp>
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
@@ -125,6 +126,13 @@ void print_help() {
     std::cout << "  --config FILE             Load configuration from YAML file\n";
     std::cout << "  --solo-address ADDRESS    Solo mining payout address (for solo mode)\n\n";
     
+    std::cout << "PAYOUT & FEE CONFIGURATION:\n";
+    std::cout << "  --dev-donation PERCENT    Developer donation (0-50%, default: 0%)\n";
+    std::cout << "                            Note: 0.5% attribution fee always included\n";
+    std::cout << "  --node-owner-fee PERCENT  Node owner fee (0-50%, default: 0%)\n";
+    std::cout << "  --node-owner-address ADDR Node owner payout address\n";
+    std::cout << "  --auto-detect-wallet      Auto-detect wallet address from core client\n\n";
+    
     std::cout << "PORT CONFIGURATION:\n";
     std::cout << "  --p2p-port PORT           P2P sharechain port (default: 9333)\n";
     std::cout << "  --http-port PORT          HTTP/JSON-RPC API port (default: 8083)\n";
@@ -173,7 +181,8 @@ void print_help() {
     std::cout << "  ⚡ SOLO MINING (Basic/Solo Mode):\n";
     std::cout << "     c2pool --testnet --blockchain ltc --stratum-port 8084\n";
     std::cout << "     c2pool --blockchain ltc --solo-address YOUR_ADDRESS\n";
-    std::cout << "     c2pool --config solo_config.yaml\n\n";
+    std::cout << "     c2pool --config solo_config.yaml\n";
+    std::cout << "     c2pool --dev-donation 2.5 --node-owner-fee 1.0\n\n";
     
     std::cout << "API ENDPOINTS (Integrated Mode):\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -209,6 +218,10 @@ int main(int argc, char* argv[]) {
     
     std::string config_file;
     std::string solo_address;
+    std::string node_owner_address;
+    double dev_donation = 0.0;          // Developer donation percentage
+    double node_owner_fee = 0.0;        // Node owner fee percentage
+    bool auto_detect_wallet = true;     // Auto-detect wallet address
     bool integrated_mode = false;
     bool sharechain_mode = false;
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
@@ -265,6 +278,21 @@ int main(int argc, char* argv[]) {
         else if (arg == "--solo-address" && i + 1 < argc) {
             solo_address = argv[++i];
         }
+        else if (arg == "--dev-donation" && i + 1 < argc) {
+            dev_donation = std::stod(argv[++i]);
+        }
+        else if (arg == "--node-owner-fee" && i + 1 < argc) {
+            node_owner_fee = std::stod(argv[++i]);
+        }
+        else if (arg == "--node-owner-address" && i + 1 < argc) {
+            node_owner_address = argv[++i];
+        }
+        else if (arg == "--auto-detect-wallet") {
+            auto_detect_wallet = true;
+        }
+        else if (arg == "--no-auto-detect-wallet") {
+            auto_detect_wallet = false;
+        }
         // Legacy support for old --port option (maps to p2p-port)
         else if (arg == "--port" && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
@@ -278,6 +306,43 @@ int main(int argc, char* argv[]) {
     
     try {
         boost::asio::io_context ioc;
+        
+        // Initialize payout manager for all modes
+        auto network = settings->m_testnet ? Network::TESTNET : Network::MAINNET;
+        auto payout_manager = std::make_unique<c2pool::payout::PayoutManager>(blockchain, network);
+        
+        // Configure payout system
+        if (dev_donation > 0.0) {
+            payout_manager->set_developer_donation(dev_donation);
+        }
+        
+        if (node_owner_fee > 0.0) {
+            payout_manager->set_node_owner_fee(node_owner_fee);
+        }
+        
+        if (!node_owner_address.empty()) {
+            payout_manager->set_node_owner_address(node_owner_address);
+        }
+        
+        payout_manager->enable_auto_wallet_detection(auto_detect_wallet);
+        
+        // Validate payout configuration
+        if (!payout_manager->validate_configuration()) {
+            LOG_ERROR << "Invalid payout configuration:";
+            for (const auto& error : payout_manager->get_validation_errors()) {
+                LOG_ERROR << "  - " << error;
+            }
+            return 1;
+        }
+        
+        // Log payout configuration
+        LOG_INFO << "C2Pool Payout Configuration:";
+        LOG_INFO << "  Developer fee: " << payout_manager->get_developer_config().get_total_developer_fee() << "%";
+        LOG_INFO << "  Developer address: " << payout_manager->get_developer_address();
+        if (payout_manager->has_node_owner_fee()) {
+            LOG_INFO << "  Node owner fee: " << payout_manager->get_node_owner_config().fee_percent << "%";
+            LOG_INFO << "  Node owner address: " << payout_manager->get_node_owner_address();
+        }
         
         if (integrated_mode) {
             std::string blockchain_name = "Unknown";
@@ -304,6 +369,9 @@ int main(int argc, char* argv[]) {
             // Create web server with explicit port configuration
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, nullptr, blockchain);
+            
+            // Configure payout system for web server
+            web_server.set_payout_manager(payout_manager.get());
             
             // Set custom Stratum port if different from default
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
@@ -388,6 +456,9 @@ int main(int argc, char* argv[]) {
             // Create a minimal web server for solo mining (Stratum only)
             core::WebServer solo_server(ioc, http_host, 8083,  // Use default HTTP port since HTTP won't be used
                                        settings->m_testnet, nullptr, blockchain);
+            
+            // Configure payout system for solo server
+            solo_server.set_payout_manager(payout_manager.get());
             
             // Configure for solo mining mode
             solo_server.set_solo_mode(true);

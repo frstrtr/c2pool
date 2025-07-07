@@ -488,13 +488,31 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         LOG_INFO << "Solo mining share from " << username << " (difficulty: " << share_difficulty << ")";
         
         // In solo mode, check if share meets network difficulty for block submission
-        // For now, accept all shares and log them for solo mining
         std::string payout_address = m_solo_address.empty() ? username : m_solo_address;
         
-        LOG_INFO << "Solo mining share accepted - payout address: " << payout_address;
+        // Calculate payout allocation if we have a payout manager
+        if (m_payout_manager_ptr) {
+            // Simulate block reward for calculation (25 LTC = 2500000000 satoshis)
+            uint64_t block_reward = 2500000000; // 25 LTC in satoshis
+            auto allocation = m_payout_manager_ptr->calculate_payout(block_reward);
+            
+            if (allocation.is_valid()) {
+                LOG_INFO << "Solo mining payout allocation:";
+                LOG_INFO << "  Miner (" << payout_address << "): " << allocation.miner_percent << "% = " << allocation.miner_amount << " satoshis";
+                LOG_INFO << "  Developer: " << allocation.developer_percent << "% = " << allocation.developer_amount << " satoshis (" << allocation.developer_address << ")";
+                if (allocation.node_owner_amount > 0) {
+                    LOG_INFO << "  Node owner: " << allocation.node_owner_percent << "% = " << allocation.node_owner_amount << " satoshis (" << allocation.node_owner_address << ")";
+                }
+                
+                // TODO: When we find a block, use this allocation to create the coinbase transaction
+                // TODO: Include developer fee and node owner fee in the coinbase outputs
+            }
+        }
+        
+        LOG_INFO << "Solo mining share accepted - primary payout address: " << payout_address;
         
         // TODO: Check if share meets network difficulty and submit block to blockchain
-        // TODO: Implement block template generation with payout to solo address
+        // TODO: Implement block template generation with multi-output coinbase (miner + dev + node owner)
         
         return nlohmann::json{{"result", true}};
     } else {
@@ -528,6 +546,22 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         if (m_payout_manager) {
             m_payout_manager->record_share_contribution(username, share_difficulty);
             LOG_INFO << "Share contribution recorded for payout: " << username << " (difficulty: " << share_difficulty << ")";
+        }
+        
+        // Calculate developer and node owner payouts for pool mode
+        if (m_payout_manager_ptr) {
+            // Log payout allocation for this share (informational)
+            uint64_t simulated_reward = 2500000000; // 25 LTC for calculation
+            auto allocation = m_payout_manager_ptr->calculate_payout(simulated_reward);
+            
+            if (allocation.is_valid()) {
+                LOG_INFO << "Pool payout allocation (per block):";
+                LOG_INFO << "  Pool miners: " << allocation.miner_percent << "%";
+                LOG_INFO << "  Developer fee: " << allocation.developer_percent << "% -> " << allocation.developer_address;
+                if (allocation.node_owner_amount > 0) {
+                    LOG_INFO << "  Node owner fee: " << allocation.node_owner_percent << "% -> " << allocation.node_owner_address;
+                }
+            }
         }
         
         return nlohmann::json{{"result", true}};
@@ -1206,6 +1240,9 @@ bool WebServer::start_solo()
         
         // Enable solo mode on the mining interface
         mining_interface_->set_solo_mode(true);
+        if (payout_manager_ptr_) {
+            mining_interface_->set_payout_manager(payout_manager_ptr_);
+        }
         if (!solo_address_.empty()) {
             mining_interface_->set_solo_address(solo_address_);
             LOG_INFO << "Solo mining configured with payout address: " << solo_address_;

@@ -6,9 +6,53 @@
 #include <mutex>
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <core/address_validator.hpp>
+
+// Bring address validation types into scope
+using Blockchain = c2pool::address::Blockchain;
+using Network = c2pool::address::Network;
+using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
 
 namespace c2pool {
 namespace payout {
+
+/// Developer payout configuration for C2Pool attribution
+struct DeveloperPayoutConfig {
+    // C2Pool developer addresses for different blockchains
+    std::map<Blockchain, std::string> mainnet_addresses;
+    std::map<Blockchain, std::string> testnet_addresses;
+    
+    // Default developer fee (0.5% minimum for attribution)
+    double default_fee_percent = 0.5;  // 0.5% minimum attribution fee
+    double configured_fee_percent = 0.0;  // User-configured donation
+    
+    // Enabled/disabled state
+    bool enabled = true;
+    bool attribution_required = true;  // Always add developer attribution
+    
+    DeveloperPayoutConfig();
+    
+    std::string get_developer_address(Blockchain blockchain, Network network) const;
+    double get_total_developer_fee() const;
+    bool is_valid_developer_address(const std::string& address, Blockchain blockchain, Network network) const;
+};
+
+/// Node owner payout configuration
+struct NodeOwnerPayoutConfig {
+    std::string payout_address;
+    double fee_percent = 0.0;  // Default 0% node owner fee
+    bool enabled = false;
+    bool auto_detect_from_wallet = true;  // Try to get address from core wallet
+    
+    // Validation
+    bool is_valid() const;
+    void set_payout_address(const std::string& address, Blockchain blockchain, Network network);
+    
+private:
+    bool address_validated = false;
+    Blockchain validated_blockchain;
+    Network validated_network;
+};
 
 /**
  * @brief Structure to track miner contributions for payout calculation
@@ -28,12 +72,31 @@ struct MinerContribution {
           last_share_time(0), estimated_hashrate(0.0) {}
 };
 
+/// Combined payout allocation structure
+struct PayoutAllocation {
+    double miner_percent;
+    double developer_percent;
+    double node_owner_percent;
+    
+    std::string developer_address;
+    std::string node_owner_address;
+    
+    // Calculated amounts (in satoshis/smallest unit)
+    uint64_t total_reward;
+    uint64_t miner_amount;
+    uint64_t developer_amount;
+    uint64_t node_owner_amount;
+    
+    bool is_valid() const;
+};
+
 /**
  * @brief Manages payout calculations and coinbase construction
  */
 class PayoutManager {
 public:
     PayoutManager(double pool_fee_percent = 1.0, uint64_t payout_window_seconds = 86400);
+    PayoutManager(Blockchain blockchain, Network network, double pool_fee_percent = 1.0, uint64_t payout_window_seconds = 86400);
     ~PayoutManager() = default;
     
     // Mining share tracking
@@ -43,11 +106,34 @@ public:
     std::string build_coinbase_output(uint64_t block_reward_satoshis, const std::string& primary_address = "");
     std::vector<std::pair<std::string, uint64_t>> calculate_payout_distribution(uint64_t total_reward_satoshis);
     
+    // Developer payout system
+    PayoutAllocation calculate_payout(uint64_t block_reward) const;
+    void set_developer_donation(double percent);
+    void set_node_owner_fee(double percent);
+    void set_node_owner_address(const std::string& address);
+    void enable_auto_wallet_detection(bool enabled);
+    
+    // Address management
+    std::string get_developer_address() const;
+    std::string get_node_owner_address() const;
+    bool has_node_owner_fee() const;
+    
+    // Validation
+    bool validate_configuration() const;
+    std::vector<std::string> get_validation_errors() const;
+    
+    // Auto-detection from core wallet
+    bool try_detect_wallet_address();
+    
     // Payout management
     void set_pool_fee_percent(double fee_percent);
     void set_primary_pool_address(const std::string& address);
     double get_miner_contribution_percent(const std::string& address);
     nlohmann::json get_payout_statistics();
+    
+    // Configuration getters
+    const DeveloperPayoutConfig& get_developer_config() const { return developer_config_; }
+    const NodeOwnerPayoutConfig& get_node_owner_config() const { return node_owner_config_; }
     
     // Cleanup and maintenance
     void cleanup_old_contributions(uint64_t cutoff_time);
@@ -61,10 +147,23 @@ private:
     std::string primary_pool_address_;     // Primary pool payout address
     uint64_t payout_window_seconds_;       // Time window for contribution calculation
     
+    // Developer payout system
+    Blockchain blockchain_;
+    Network network_;
+    BlockchainAddressValidator address_validator_;
+    
+    DeveloperPayoutConfig developer_config_;
+    NodeOwnerPayoutConfig node_owner_config_;
+    
     // Helper methods
     double calculate_total_difficulty() const;
     std::string address_to_script_hex(const std::string& address) const;
     uint64_t get_current_timestamp() const;
+    
+    // Core wallet integration
+    bool detect_wallet_address_rpc();
+    bool detect_wallet_address_file();
+    std::string execute_core_rpc(const std::string& method, const std::string& params = "") const;
     
     // Constants
     static constexpr uint64_t MINIMUM_PAYOUT_SATOSHIS = 100000; // 0.001 LTC
