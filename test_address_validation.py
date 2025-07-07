@@ -65,7 +65,7 @@ def main():
         # Valid Litecoin testnet addresses
         ("tltc1qea8gdr057k9gyjnurk7v3d9enha8qgds58ajt0", "Litecoin testnet bech32 (native SegWit)"),
         ("2N2JD6wb56AfK4tfmM6PwdVmoYk2dCKf4Br", "Litecoin testnet P2SH (wrapped SegWit)"),
-        ("mzBc4XEFSdzCDcTxAgf6EZXgsZWpztR", "Litecoin testnet legacy P2PKH"),
+        ("mzgiTxxwqsFLuP1Mc7SFfRFfbDZbCvrKWL", "Litecoin testnet legacy P2PKH"),
         
         # Valid mainnet addresses (should be rejected on testnet)
         ("ltc1qw508d6qejxtdg4y5r3zarvary0c5xw7kgmn4n9", "Litecoin mainnet bech32"),
@@ -120,7 +120,7 @@ def main():
     # Expected results for testnet
     expected_valid = ["tltc1qea8gdr057k9gyjnurk7v3d9enha8qgds58ajt0", 
                       "2N2JD6wb56AfK4tfmM6PwdVmoYk2dCKf4Br", 
-                      "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztR"]
+                      "mzgiTxxwqsFLuP1Mc7SFfRFfbDZbCvrKWL"]
     
     print(f"\nExpected valid on testnet: {len(expected_valid)} addresses")
     print("Expected: Only Litecoin testnet addresses should be accepted")
