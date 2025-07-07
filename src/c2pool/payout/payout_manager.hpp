@@ -22,9 +22,14 @@ struct DeveloperPayoutConfig {
     std::map<Blockchain, std::string> mainnet_addresses;
     std::map<Blockchain, std::string> testnet_addresses;
     
-    // Default developer fee (0.5% minimum for attribution)
-    double default_fee_percent = 0.5;  // 0.5% minimum attribution fee
+    // Default developer fee (minimal attribution when no donation)
+    double default_fee_percent = 0.5;  // 0.5% default attribution fee
     double configured_fee_percent = 0.0;  // User-configured donation
+    bool minimal_attribution_mode = true;  // Use minimal satoshi amount when donation is 0
+    
+    // Minimal attribution amounts (in satoshis/smallest units)
+    static constexpr uint64_t MINIMAL_ATTRIBUTION_SATOSHIS = 1;  // 1 satoshi for attribution
+    static constexpr uint64_t MINIMAL_ATTRIBUTION_THRESHOLD = 1000000000;  // 10 LTC threshold for minimal mode
     
     // Enabled/disabled state
     bool enabled = true;
@@ -34,19 +39,41 @@ struct DeveloperPayoutConfig {
     
     std::string get_developer_address(Blockchain blockchain, Network network) const;
     double get_total_developer_fee() const;
+    uint64_t get_developer_amount(uint64_t block_reward) const;
+    bool use_minimal_attribution() const;
     bool is_valid_developer_address(const std::string& address, Blockchain blockchain, Network network) const;
 };
 
 /// Node owner payout configuration
 struct NodeOwnerPayoutConfig {
     std::string payout_address;
-    double fee_percent = 0.0;  // Default 0% node owner fee
+    std::string payout_script_hex;      // Optional: P2SH script for address generation
+    double fee_percent = 0.0;           // Default 0% node owner fee
     bool enabled = false;
     bool auto_detect_from_wallet = true;  // Try to get address from core wallet
+    bool auto_generate_if_missing = true; // Generate new address if none found
+    bool store_generated_address = true;  // Store generated addresses to config file
     
-    // Validation
+    // Address sources (priority order)
+    enum class AddressSource {
+        CLI_ARGUMENT,      // --node-owner-address
+        CONFIG_FILE,       // node_owner_addresses.json
+        WALLET_RPC,        // Core wallet RPC
+        GENERATED_NEW,     // Newly generated
+        SCRIPT_DERIVED     // Derived from payout_script_hex
+    };
+    
+    AddressSource address_source = AddressSource::CLI_ARGUMENT;
+    
+    // Validation and setup
     bool is_valid() const;
     void set_payout_address(const std::string& address, Blockchain blockchain, Network network);
+    void set_payout_script(const std::string& script_hex, Blockchain blockchain, Network network);
+    
+    // Address generation and management
+    std::string generate_address_from_script(Blockchain blockchain, Network network) const;
+    bool save_to_config_file(const std::string& config_dir, Blockchain blockchain, Network network) const;
+    bool load_from_config_file(const std::string& config_dir, Blockchain blockchain, Network network);
     
 private:
     bool address_validated = false;
@@ -111,6 +138,7 @@ public:
     void set_developer_donation(double percent);
     void set_node_owner_fee(double percent);
     void set_node_owner_address(const std::string& address);
+    void set_node_owner_script(const std::string& script_hex);
     void enable_auto_wallet_detection(bool enabled);
     
     // Address management
@@ -124,6 +152,14 @@ public:
     
     // Auto-detection from core wallet
     bool try_detect_wallet_address();
+    
+    // Enhanced node owner address management
+    bool resolve_node_owner_address();
+    bool try_load_node_owner_from_config();
+    bool try_generate_node_owner_address();
+    bool try_derive_address_from_script();
+    std::string get_node_owner_config_path() const;
+    bool prompt_user_for_node_owner_address();
     
     // Payout management
     void set_pool_fee_percent(double fee_percent);
@@ -154,6 +190,9 @@ private:
     
     DeveloperPayoutConfig developer_config_;
     NodeOwnerPayoutConfig node_owner_config_;
+    
+    // Validation
+    mutable std::vector<std::string> validation_errors_;
     
     // Helper methods
     double calculate_total_difficulty() const;

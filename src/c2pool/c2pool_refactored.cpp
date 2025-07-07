@@ -42,6 +42,7 @@
 // Bring the address validation types into scope
 using Blockchain = c2pool::address::Blockchain;
 using Network = c2pool::address::Network;
+using NodeOwnerAddressSource = c2pool::payout::NodeOwnerPayoutConfig::AddressSource;
 
 // Global signal handling
 static bool g_shutdown_requested = false;
@@ -128,10 +129,12 @@ void print_help() {
     
     std::cout << "PAYOUT & FEE CONFIGURATION:\n";
     std::cout << "  --dev-donation PERCENT    Developer donation (0-50%, default: 0%)\n";
-    std::cout << "                            Note: 0.5% attribution fee always included\n";
+    std::cout << "                            Note: When 0%, only 1 satoshi used for marking\n";
     std::cout << "  --node-owner-fee PERCENT  Node owner fee (0-50%, default: 0%)\n";
     std::cout << "  --node-owner-address ADDR Node owner payout address\n";
-    std::cout << "  --auto-detect-wallet      Auto-detect wallet address from core client\n\n";
+    std::cout << "  --node-owner-script HEX   Node owner P2SH script (generates address)\n";
+    std::cout << "  --auto-detect-wallet      Auto-detect wallet address from core client\n";
+    std::cout << "  --no-auto-detect-wallet   Disable wallet auto-detection\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
     std::cout << "  --p2p-port PORT           P2P sharechain port (default: 9333)\n";
@@ -219,6 +222,7 @@ int main(int argc, char* argv[]) {
     std::string config_file;
     std::string solo_address;
     std::string node_owner_address;
+    std::string node_owner_script;         // Node owner script hex
     double dev_donation = 0.0;          // Developer donation percentage
     double node_owner_fee = 0.0;        // Node owner fee percentage
     bool auto_detect_wallet = true;     // Auto-detect wallet address
@@ -287,6 +291,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--node-owner-address" && i + 1 < argc) {
             node_owner_address = argv[++i];
         }
+        else if (arg == "--node-owner-script" && i + 1 < argc) {
+            node_owner_script = argv[++i];
+        }
         else if (arg == "--auto-detect-wallet") {
             auto_detect_wallet = true;
         }
@@ -324,6 +331,11 @@ int main(int argc, char* argv[]) {
             payout_manager->set_node_owner_address(node_owner_address);
         }
         
+        // Set node owner script if provided
+        if (!node_owner_script.empty()) {
+            payout_manager->set_node_owner_script(node_owner_script);
+        }
+        
         payout_manager->enable_auto_wallet_detection(auto_detect_wallet);
         
         // Validate payout configuration
@@ -340,8 +352,40 @@ int main(int argc, char* argv[]) {
         LOG_INFO << "  Developer fee: " << payout_manager->get_developer_config().get_total_developer_fee() << "%";
         LOG_INFO << "  Developer address: " << payout_manager->get_developer_address();
         if (payout_manager->has_node_owner_fee()) {
-            LOG_INFO << "  Node owner fee: " << payout_manager->get_node_owner_config().fee_percent << "%";
+            const auto& node_config = payout_manager->get_node_owner_config();
+            LOG_INFO << "  Node owner fee: " << node_config.fee_percent << "%";
             LOG_INFO << "  Node owner address: " << payout_manager->get_node_owner_address();
+            
+            // Show address source
+            std::string source_description;
+            switch (node_config.address_source) {
+                case NodeOwnerAddressSource::CLI_ARGUMENT:
+                    source_description = "CLI argument";
+                    break;
+                case NodeOwnerAddressSource::CONFIG_FILE:
+                    source_description = "config file";
+                    break;
+                case NodeOwnerAddressSource::WALLET_RPC:
+                    source_description = "wallet RPC";
+                    break;
+                case NodeOwnerAddressSource::GENERATED_NEW:
+                    source_description = "newly generated";
+                    break;
+                case NodeOwnerAddressSource::SCRIPT_DERIVED:
+                    source_description = "derived from script";
+                    break;
+                default:
+                    source_description = "unknown";
+                    break;
+            }
+            LOG_INFO << "  Address source: " << source_description;
+            
+            if (!node_config.payout_script_hex.empty()) {
+                LOG_INFO << "  Script hex: " << node_config.payout_script_hex.substr(0, 32) << "...";
+            }
+        } else if (node_owner_fee > 0.0) {
+            LOG_WARNING << "Node owner fee was set to " << node_owner_fee << "% but address resolution failed";
+            LOG_WARNING << "Node owner payouts are disabled";
         }
         
         if (integrated_mode) {
