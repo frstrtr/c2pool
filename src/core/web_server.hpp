@@ -157,6 +157,7 @@ class WebServer
     std::shared_ptr<MiningInterface> mining_interface_;
     std::string bind_address_;
     uint16_t port_;
+    uint16_t stratum_port_;  // Explicit Stratum port configuration
     bool running_;
     bool testnet_;
     Blockchain blockchain_;
@@ -177,10 +178,12 @@ public:
     bool start_stratum_server();
     void stop_stratum_server();
     bool is_stratum_running() const;
+    void set_stratum_port(uint16_t port);  // Set custom Stratum port
     
     // Server info
     std::string get_bind_address() const { return bind_address_; }
     uint16_t get_port() const { return port_; }
+    uint16_t get_stratum_port() const { return stratum_port_; }
     bool is_running() const { return running_; }
 
 private:

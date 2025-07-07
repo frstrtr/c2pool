@@ -1093,14 +1093,15 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , acceptor_(ioc)
     , bind_address_(address)
     , port_(port)
+    , stratum_port_(8080)  // Default C2Pool Stratum port
     , running_(false)
     , testnet_(testnet)
     , blockchain_(Blockchain::LITECOIN)  // Default to Litecoin for backward compatibility
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, nullptr, blockchain_);
     
-    // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
-    stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
+    // Create Stratum server with explicit port configuration
+    stratum_server_ = std::make_unique<StratumServer>(ioc, address, stratum_port_, mining_interface_);
 }
 
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node)
@@ -1108,14 +1109,15 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , acceptor_(ioc)
     , bind_address_(address)
     , port_(port)
+    , stratum_port_(8080)  // Default C2Pool Stratum port
     , running_(false)
     , testnet_(testnet)
     , blockchain_(Blockchain::LITECOIN)  // Default to Litecoin for backward compatibility
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain_);
     
-    // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
-    stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
+    // Create Stratum server with explicit port configuration
+    stratum_server_ = std::make_unique<StratumServer>(ioc, address, stratum_port_, mining_interface_);
 }
 
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
@@ -1123,14 +1125,15 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , acceptor_(ioc)
     , bind_address_(address)
     , port_(port)
+    , stratum_port_(8080)  // Default C2Pool Stratum port
     , running_(false)
     , testnet_(testnet)
     , blockchain_(blockchain)
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain);
     
-    // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
-    stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
+    // Create Stratum server with explicit port configuration
+    stratum_server_ = std::make_unique<StratumServer>(ioc, address, stratum_port_, mining_interface_);
 }
 
 WebServer::~WebServer()
@@ -1211,7 +1214,7 @@ bool WebServer::start_stratum_server()
         return false;
     }
     
-    LOG_INFO << "Stratum server started successfully on " << bind_address_ << ":" << (port_ + 1);
+    LOG_INFO << "Stratum server started successfully on " << bind_address_ << ":" << stratum_port_;
     return true;
 }
 
@@ -1226,6 +1229,22 @@ void WebServer::stop_stratum_server()
 bool WebServer::is_stratum_running() const
 {
     return stratum_server_ && stratum_server_->is_running();
+}
+
+void WebServer::set_stratum_port(uint16_t port)
+{
+    stratum_port_ = port;
+    // Recreate the Stratum server with the new port
+    if (stratum_server_) {
+        bool was_running = stratum_server_->is_running();
+        if (was_running) {
+            stratum_server_->stop();
+        }
+        stratum_server_ = std::make_unique<StratumServer>(ioc_, bind_address_, stratum_port_, mining_interface_);
+        if (was_running) {
+            stratum_server_->start();
+        }
+    }
 }
 
 void WebServer::accept_connections()
