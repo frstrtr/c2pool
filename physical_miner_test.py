@@ -21,11 +21,11 @@ class StratumMiner:
         self.miner_id = miner_id
         # Use valid Litecoin testnet addresses from the test validation file
         ltc_testnet_addresses = [
-            "tltc1qea8gdr057k9gyjnurk7v3d9enha8qgds58ajt0",  # Native SegWit
-            "2N2JD6wb56AfK4tfmM6PwdVmoYk2dCKf4Br",            # P2SH (wrapped SegWit) 
-            "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztR",               # Legacy P2PKH
-            "tltc1qg42g5wql6x09v5s0tg4j8klrhfw0zhtxsnzmmy",   # Additional bech32
-            "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc"             # Additional P2SH
+            "mzgiTxxwqsFLuP1Mc7SFfRFfbDZbCvrKWL",  # Valid LTC testnet P2PKH
+            "mtxCphuGjESaYCNmRYHREz7KAM8koeMv7m",  # Valid LTC testnet P2PKH
+            "mjE3Kz9o3UCPcu8wXY8jEf5BqAkETBTZ6G",  # Valid LTC testnet P2PKH
+            "2N12LqSKC6yJar1sGomDZ13BT3cM6a1u72a",     # Valid LTC testnet P2SH
+            "2MznMcJQUchG5U2YXpM48Xf99djMHY5V3Xw"      # Valid LTC testnet P2SH
         ]
         self.worker_name = ltc_testnet_addresses[miner_id % len(ltc_testnet_addresses)]
         self.socket = None

@@ -317,14 +317,15 @@ AddressValidationResult BlockchainAddressValidator::validate_address_multi(const
 bool BlockchainAddressValidator::validate_base58check(const std::string& address, const BlockchainConfig& config, AddressValidationResult& result) const {
     std::vector<unsigned char> decoded;
     
-    // Use the existing DecodeBase58Check function
-    if (!DecodeBase58Check(address, decoded, 25)) {
+    // Use the existing DecodeBase58Check function with a more reasonable max length
+    // Standard addresses are 25 bytes after decoding (1 version + 20 hash + 4 checksum removed by DecodeBase58Check)
+    if (!DecodeBase58Check(address, decoded, 50)) {  // Increased max length to handle longer addresses
         result.error_message = "Invalid Base58Check encoding";
         return false;
     }
     
     if (decoded.size() != 21) {
-        result.error_message = "Invalid address payload length";
+        result.error_message = "Invalid address payload length: expected 21 bytes, got " + std::to_string(decoded.size());
         return false;
     }
     
