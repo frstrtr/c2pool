@@ -38,6 +38,10 @@
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 
+// Bring the address validation types into scope
+using Blockchain = c2pool::address::Blockchain;
+using Network = c2pool::address::Network;
+
 // Global signal handling
 static bool g_shutdown_requested = false;
 
@@ -77,9 +81,12 @@ void print_help() {
     std::cout << "  --port PORT               Set P2P port (default: 9333)\n";
     std::cout << "  --integrated WEB_SERVER   Run integrated mining pool with web server\n";
     std::cout << "                            Format: IP:PORT (e.g., 0.0.0.0:8083)\n";
+    std::cout << "  --blockchain BLOCKCHAIN   Set blockchain type (ltc, btc, eth, xmr, zec, doge)\n";
+    std::cout << "                            Default: ltc (Litecoin)\n";
     std::cout << "  --sharechain              Run enhanced sharechain node with persistence\n";
     std::cout << "  --config FILE             Load configuration from file\n";
     std::cout << "\nFeatures:\n";
+    std::cout << "  ✓ Blockchain-specific address validation\n";
     std::cout << "  ✓ Automatic difficulty adjustment (VARDIFF)\n";
     std::cout << "  ✓ Real-time hashrate tracking\n";
     std::cout << "  ✓ Legacy share tracker compatibility\n";
@@ -88,8 +95,8 @@ void print_help() {
     std::cout << "  ✓ WebUI for monitoring\n";
     std::cout << "\nExamples:\n";
     std::cout << "  c2pool --testnet --port 9333\n";
-    std::cout << "  c2pool --integrated 0.0.0.0:8083 --port 9333\n";
-    std::cout << "  c2pool --sharechain --testnet\n";
+    std::cout << "  c2pool --integrated 0.0.0.0:8083 --blockchain ltc --testnet\n";
+    std::cout << "  c2pool --sharechain --blockchain btc\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -111,6 +118,21 @@ int main(int argc, char* argv[]) {
     std::string web_server_addr;
     bool integrated_mode = false;
     bool sharechain_mode = false;
+    Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
+    
+    // Helper function to parse blockchain string
+    auto parse_blockchain = [](const std::string& blockchain_str) -> Blockchain {
+        if (blockchain_str == "ltc" || blockchain_str == "litecoin") return Blockchain::LITECOIN;
+        if (blockchain_str == "btc" || blockchain_str == "bitcoin") return Blockchain::BITCOIN;
+        if (blockchain_str == "eth" || blockchain_str == "ethereum") return Blockchain::ETHEREUM;
+        if (blockchain_str == "xmr" || blockchain_str == "monero") return Blockchain::MONERO;
+        if (blockchain_str == "zec" || blockchain_str == "zcash") return Blockchain::ZCASH;
+        if (blockchain_str == "doge" || blockchain_str == "dogecoin") return Blockchain::DOGECOIN;
+        
+        LOG_ERROR << "Unknown blockchain: " << blockchain_str;
+        LOG_INFO << "Supported blockchains: ltc, btc, eth, xmr, zec, doge";
+        throw std::invalid_argument("Unknown blockchain type");
+    };
     
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -136,6 +158,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
         }
+        else if (arg == "--blockchain" && i + 1 < argc) {
+            blockchain = parse_blockchain(argv[++i]);
+        }
         else {
             LOG_ERROR << "Unknown argument: " << arg;
             return 1;
@@ -146,7 +171,19 @@ int main(int argc, char* argv[]) {
         boost::asio::io_context ioc;
         
         if (integrated_mode) {
-            LOG_INFO << "Starting integrated C2Pool mining pool with automatic difficulty adjustment...";
+            std::string blockchain_name = "Unknown";
+            switch (blockchain) {
+                case Blockchain::LITECOIN: blockchain_name = "Litecoin"; break;
+                case Blockchain::BITCOIN: blockchain_name = "Bitcoin"; break;
+                case Blockchain::ETHEREUM: blockchain_name = "Ethereum"; break;
+                case Blockchain::MONERO: blockchain_name = "Monero"; break;
+                case Blockchain::ZCASH: blockchain_name = "Zcash"; break;
+                case Blockchain::DOGECOIN: blockchain_name = "Dogecoin"; break;
+            }
+            
+            LOG_INFO << "Starting integrated C2Pool mining pool for " << blockchain_name 
+                    << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
+            LOG_INFO << "Features: automatic difficulty adjustment, blockchain-specific address validation";
             
             // Parse web server address
             size_t colon_pos = web_server_addr.find(':');
@@ -162,9 +199,9 @@ int main(int argc, char* argv[]) {
             // Create enhanced node with default constructor to avoid nullptr issues
             auto enhanced_node = std::make_shared<c2pool::node::EnhancedC2PoolNode>();
             
-            // Create web server 
+            // Create web server with blockchain configuration
             core::WebServer web_server(ioc, ip, static_cast<uint16_t>(web_port), 
-                                     settings->m_testnet);
+                                     settings->m_testnet, nullptr, blockchain);
             
             if (!web_server.start()) {
                 LOG_ERROR << "Failed to start integrated mining pool";
@@ -172,8 +209,10 @@ int main(int argc, char* argv[]) {
             }
             
             LOG_INFO << "Integrated C2Pool Mining Pool started successfully!";
+            LOG_INFO << "Blockchain: " << blockchain_name << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
             LOG_INFO << "Mining interface: http://" << ip << ":" << web_port;
             LOG_INFO << "Features enabled:";
+            LOG_INFO << "  ✓ Blockchain-specific address validation";
             LOG_INFO << "  ✓ Automatic difficulty adjustment";
             LOG_INFO << "  ✓ Real-time hashrate tracking";
             LOG_INFO << "  ✓ Persistent storage";

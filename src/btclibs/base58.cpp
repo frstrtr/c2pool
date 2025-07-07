@@ -136,7 +136,7 @@ std::string EncodeBase58Check(Span<const unsigned char> input)
 {
     // add 4-byte hash check to the end
     std::vector<unsigned char> vch(input.begin(), input.end());
-    uint256 hash = Hash(vch);
+    legacy::uint256 hash = legacy::Hash(vch);
     vch.insert(vch.end(), (unsigned char*)&hash, (unsigned char*)&hash + 4);
     return EncodeBase58(vch);
 }
@@ -149,7 +149,8 @@ std::string EncodeBase58Check(Span<const unsigned char> input)
         return false;
     }
     // re-calculate the checksum, ensure it matches the included 4-byte checksum
-    uint256 hash = Hash(Span{vchRet}.first(vchRet.size() - 4));
+    std::vector<unsigned char> hash_input(vchRet.begin(), vchRet.end() - 4);
+    legacy::uint256 hash = legacy::Hash(hash_input);
     if (memcmp(&hash, &vchRet[vchRet.size() - 4], 4) != 0) {
         vchRet.clear();
         return false;

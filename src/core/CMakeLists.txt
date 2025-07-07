@@ -30,6 +30,7 @@ set(source
     addr_store.hpp addr_store.cpp
     web_server.hpp web_server.cpp
     leveldb_store.hpp leveldb_store.cpp
+    address_validator.hpp address_validator.cpp
 )
 
 find_package(yaml-cpp REQUIRED)

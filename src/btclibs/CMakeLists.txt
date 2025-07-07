@@ -22,8 +22,8 @@ set(sources
         script/script.h
         script/script.cpp
         span.h
-        # base58.h
-        # base58.cpp
+        base58.h
+        base58.cpp
         serialize.h
         prevector.h
         core_read.cpp

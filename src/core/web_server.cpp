@@ -5,6 +5,7 @@
 #include <ctime>
 #include <boost/process.hpp>
 #include <boost/algorithm/string.hpp>
+#include "btclibs/base58.h"
 
 namespace core {
 
@@ -119,11 +120,13 @@ void HttpSession::handle_error(beast::error_code ec, char const* what)
 }
 
 /// MiningInterface Implementation
-MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node)
+MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
     : m_work_id_counter(1)
     , m_rpc_client(std::make_unique<LitecoinRpcClient>(testnet))
     , m_testnet(testnet)
+    , m_blockchain(blockchain)
     , m_node(node)
+    , m_address_validator(blockchain, testnet ? Network::TESTNET : Network::MAINNET)
 {
     setup_methods();
 }
@@ -217,13 +220,29 @@ nlohmann::json MiningInterface::getwork(const std::string& request_id)
         LOG_WARNING << "No c2pool node connected, using default difficulty: " << current_difficulty;
     }
     
-    // TODO: Get actual work from mining node
-    // For now, return a stub response with dynamic difficulty
+    // Try to get actual work from Litecoin testnet node
+    std::string actual_work_data = "00000001c570c4764025cf068f3f3fba04bde26fb7b449e0bf12523666e49cbdf6aa8b8f00000000";
+    std::string actual_midstate = "5f796c4974b00d64ffc22c9a72e96f9b23c57d7d83d0e7d6a34c4e1f5b4c4b8f";
+    
+    if (m_rpc_client && m_rpc_client->is_connected()) {
+        // Try to get block template from Litecoin Core
+        try {
+            std::string template_response = m_rpc_client->execute_cli_command("getblocktemplate");
+            if (!template_response.empty()) {
+                LOG_INFO << "Retrieved block template from Litecoin Core (testnet)";
+                // TODO: Parse template and create proper work data
+                // For now, use static data but log that we have connection
+            }
+        } catch (const std::exception& e) {
+            LOG_WARNING << "Failed to get block template: " << e.what();
+        }
+    }
+    
     nlohmann::json work = {
-        {"data", "00000001c570c4764025cf068f3f3fba04bde26fb7b449e0bf12523666e49cbdf6aa8b8f00000000"},
+        {"data", actual_work_data},
         {"target", target_hex},
         {"hash1", "00000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000010000"},
-        {"midstate", "5f796c4974b00d64ffc22c9a72e96f9b23c57d7d83d0e7d6a34c4e1f5b4c4b8f"},
+        {"midstate", actual_midstate},
         {"difficulty", current_difficulty}
     };
     
@@ -388,58 +407,105 @@ nlohmann::json MiningInterface::mining_authorize(const std::string& username, co
 {
     LOG_INFO << "Stratum mining.authorize for user: " << username;
     
-    // TODO: Validate username/password
-    // For now, authorize everyone
+    // Validate the username as a payout address for the configured blockchain/network
+    if (!is_valid_address(username)) {
+        std::string blockchain_name = m_address_validator.get_blockchain_name(m_blockchain);
+        LOG_WARNING << "Authorization failed: Invalid address for " 
+                   << blockchain_name << " " 
+                   << (m_testnet ? "testnet" : "mainnet") << ": " << username;
+        
+        nlohmann::json error_response;
+        error_response["result"] = false;
+        error_response["error"] = {
+            {"code", -1},
+            {"message", "Invalid payout address for " + blockchain_name + 
+                       " " + (m_testnet ? "testnet" : "mainnet")}
+        };
+        return error_response;
+    }
+    
+    LOG_INFO << "Authorization successful for address: " << username;
     return true;
 }
 
 nlohmann::json MiningInterface::mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id)
 {
-    LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id;
+    LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id 
+             << " - nonce: " << nonce << ", extranonce2: " << extranonce2 << ", ntime: " << ntime;
     
-    // TODO: Validate and submit share
-    // For now, accept all shares
+    // Basic share validation
+    bool share_valid = true;
+    
+    // Validate hex parameters
+    if (extranonce2.empty() || ntime.empty() || nonce.empty()) {
+        LOG_WARNING << "Invalid share parameters from " << username;
+        return false;
+    }
+    
+    // Validate nonce format (should be 8 hex chars)
+    if (nonce.length() != 8) {
+        LOG_WARNING << "Invalid nonce length from " << username << ": " << nonce;
+        return false;
+    }
+    
+    // Validate extranonce2 format
+    if (extranonce2.length() != 8) {
+        LOG_WARNING << "Invalid extranonce2 length from " << username << ": " << extranonce2;
+        return false;
+    }
+    
+    // Validate timestamp format (should be 8 hex chars)
+    if (ntime.length() != 8) {
+        LOG_WARNING << "Invalid ntime length from " << username << ": " << ntime;
+        return false;
+    }
+    
+    // Track share submission for statistics
+    if (m_node) {
+        // Calculate share difficulty (simplified for now)
+        double share_difficulty = 1.0; // TODO: Calculate actual share difficulty
+        
+        // Track the share submission
+        m_node->track_share_submission(username, share_difficulty);
+        
+        // Create share hash for storage (simplified)
+        uint256 share_hash;
+        std::string hash_input = job_id + extranonce2 + ntime + nonce;
+        share_hash.SetHex(hash_input.substr(0, 64)); // Take first 64 chars as hash
+        
+        LOG_INFO << "Share accepted from " << username << " - hash: " << share_hash.ToString().substr(0, 16) << "...";
+        
+        // Store share in enhanced node (this will go to LevelDB)
+        uint256 prev_hash = uint256::ZERO; // TODO: Get actual previous share hash
+        uint256 target;
+        target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+        
+        m_node->add_local_share(share_hash, prev_hash, target);
+        
+        LOG_INFO << "Share stored in sharechain database";
+    } else {
+        LOG_INFO << "Share accepted from " << username << " (no node connected for storage)";
+    }
+    
     return true;
 }
 
 bool MiningInterface::is_valid_address(const std::string& address) const
 {
-    // Basic Litecoin address validation for both mainnet and testnet
-    // This is a simplified implementation - in production, use proper Bitcoin/Litecoin libraries
+    // Use the new blockchain-specific address validator
+    AddressValidationResult result = m_address_validator.validate_address_strict(address);
     
-    if (address.empty() || address.length() < 26 || address.length() > 62) {
+    if (result.is_valid) {
+        LOG_INFO << "Address validation successful: " << address 
+                 << " (blockchain: " << static_cast<int>(result.blockchain)
+                 << ", network: " << static_cast<int>(result.network)
+                 << ", type: " << static_cast<int>(result.type) << ")";
+        return true;
+    } else {
+        LOG_WARNING << "Address validation failed: " << address 
+                   << " - " << result.error_message;
         return false;
     }
-    
-    // Legacy addresses
-    // Mainnet: L (P2PKH), M (P2SH), 3 (P2SH)
-    // Testnet: m, n (P2PKH), 2 (P2SH)
-    if (address[0] == 'L' || address[0] == 'M' || address[0] == '3' || 
-        address[0] == 'm' || address[0] == 'n' || address[0] == '2') {
-        // Basic Base58 character check - Base58 excludes 0, O, I, l
-        for (char c : address) {
-            if (!std::isalnum(c) || c == '0' || c == 'O' || c == 'I' || c == 'l') {
-                return false;
-            }
-        }
-        return true;
-    }
-    
-    // Bech32 addresses
-    // Mainnet: ltc1
-    // Testnet: tltc1, rltc1 (regtest)
-    if (address.substr(0, 4) == "ltc1" || address.substr(0, 5) == "tltc1" || address.substr(0, 6) == "rltc1") {
-        // Basic bech32 character check
-        for (size_t i = 0; i < address.length(); ++i) {
-            char c = address[i];
-            if (!(std::islower(c) || std::isdigit(c))) {
-                return false;
-            }
-        }
-        return true;
-    }
-    
-    return false;
 }
 
 /// StratumSession Implementation
@@ -598,13 +664,27 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         };
     }
     
-    // Validate Litecoin address (username should be LTC address)
-    if (!mining_interface_->is_valid_address(username)) {
-        LOG_WARNING << "Invalid Litecoin address in mining.authorize: " << username;
+    // Validate address for the configured blockchain
+    AddressValidationResult validation_result = mining_interface_->get_address_validator().validate_address_strict(username);
+    if (!validation_result.is_valid) {
+        std::string blockchain_name = "Unknown";
+        switch (mining_interface_->get_blockchain()) {
+            case Blockchain::LITECOIN: blockchain_name = "Litecoin"; break;
+            case Blockchain::BITCOIN: blockchain_name = "Bitcoin"; break;
+            case Blockchain::ETHEREUM: blockchain_name = "Ethereum"; break;
+            case Blockchain::MONERO: blockchain_name = "Monero"; break;
+            case Blockchain::ZCASH: blockchain_name = "Zcash"; break;
+            case Blockchain::DOGECOIN: blockchain_name = "Dogecoin"; break;
+        }
+        
+        std::string network_name = mining_interface_->get_network() == Network::TESTNET ? "testnet" : "mainnet";
+        
+        LOG_WARNING << "Invalid " << blockchain_name << " address in mining.authorize: " << username 
+                   << " - " << validation_result.error_message;
         return {
             {"id", request_id},
             {"result", false},
-            {"error", {{"code", -1}, {"message", "Invalid Litecoin address"}}}
+            {"error", {{"code", -1}, {"message", "Invalid " + blockchain_name + " " + network_name + " address: " + validation_result.error_message}}}
         };
     }
     
@@ -612,15 +692,18 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
     authorized_ = true;
     username_ = username;
     
-    // Send initial difficulty and work
-    send_set_difficulty(1.0);
-    send_notify_work();
-    
-    return {
+    // Return success response first
+    nlohmann::json success_response = {
         {"id", request_id},
         {"result", true},
         {"error", nullptr}
     };
+    
+    // Queue initial difficulty and work to be sent after this response
+    // Note: These will be sent by the session handler after sending this response
+    need_initial_setup_ = true;
+    
+    return success_response;
 }
 
 nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const nlohmann::json& request_id)
@@ -670,6 +753,15 @@ void StratumSession::send_response(const nlohmann::json& response)
         {
             if (ec) {
                 LOG_ERROR << "Stratum write error: " << ec.message();
+                return;
+            }
+            
+            // After successfully sending the authorization response,
+            // send initial setup if needed
+            if (self->need_initial_setup_) {
+                self->need_initial_setup_ = false;
+                self->send_set_difficulty(1.0);
+                self->send_notify_work();
             }
         });
 }
@@ -822,8 +914,10 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , bind_address_(address)
     , port_(port)
     , running_(false)
+    , testnet_(testnet)
+    , blockchain_(Blockchain::LITECOIN)  // Default to Litecoin for backward compatibility
 {
-    mining_interface_ = std::make_shared<MiningInterface>(testnet);
+    mining_interface_ = std::make_shared<MiningInterface>(testnet, nullptr, blockchain_);
     
     // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
     stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
@@ -835,8 +929,25 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , bind_address_(address)
     , port_(port)
     , running_(false)
+    , testnet_(testnet)
+    , blockchain_(Blockchain::LITECOIN)  // Default to Litecoin for backward compatibility
 {
-    mining_interface_ = std::make_shared<MiningInterface>(testnet, node);
+    mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain_);
+    
+    // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
+    stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
+}
+
+WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
+    : ioc_(ioc)
+    , acceptor_(ioc)
+    , bind_address_(address)
+    , port_(port)
+    , running_(false)
+    , testnet_(testnet)
+    , blockchain_(blockchain)
+{
+    mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain);
     
     // Create Stratum server on port + 1 (e.g., HTTP on 8332, Stratum on 8333)
     stratum_server_ = std::make_unique<StratumServer>(ioc, address, port + 1, mining_interface_);
@@ -862,8 +973,15 @@ bool WebServer::start()
         accept_connections();
         running_ = true;
         
-        // Don't start Stratum server automatically - wait for blockchain sync
-        LOG_INFO << "Stratum server will start once blockchain is synchronized";
+        // Start Stratum server if blockchain is synced
+        if (mining_interface_->is_blockchain_synced()) {
+            LOG_INFO << "Blockchain is synced, starting Stratum server";
+            if (!start_stratum_server()) {
+                LOG_WARNING << "Failed to start Stratum server";
+            }
+        } else {
+            LOG_INFO << "Stratum server will start once blockchain is synchronized";
+        }
         
         return true;
         
@@ -1040,11 +1158,34 @@ bool LitecoinRpcClient::is_connected()
 bool MiningInterface::is_blockchain_synced() const
 {
     if (!m_rpc_client) {
+        LOG_WARNING << "No RPC client available for sync check";
+        return false;
+    }
+    
+    // First check if we can connect to the node
+    if (!m_rpc_client->is_connected()) {
+        LOG_WARNING << "Cannot connect to Litecoin Core";
         return false;
     }
     
     auto status = m_rpc_client->get_sync_status();
-    return status.is_synced;
+    
+    if (!status.error_message.empty()) {
+        LOG_WARNING << "Sync status check failed: " << status.error_message;
+        return false;
+    }
+    
+    if (status.is_synced) {
+        LOG_INFO << "Blockchain is fully synced (blocks: " << status.current_blocks 
+                 << ", headers: " << status.total_headers 
+                 << ", progress: " << (status.progress * 100.0) << "%)";
+        return true;
+    } else {
+        LOG_INFO << "Blockchain is still syncing (blocks: " << status.current_blocks 
+                 << "/" << status.total_headers 
+                 << ", progress: " << (status.progress * 100.0) << "%)";
+        return false;
+    }
 }
 
 void MiningInterface::log_sync_progress() const

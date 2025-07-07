@@ -19,6 +19,13 @@
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/mining_node_interface.hpp>
+#include <core/address_validator.hpp>
+
+// Bring the address validation types into the core namespace for convenience
+using Blockchain = c2pool::address::Blockchain;
+using Network = c2pool::address::Network;
+using AddressValidationResult = c2pool::address::AddressValidationResult;
+using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
 
 namespace core {
 
@@ -49,10 +56,10 @@ public:
     
     SyncStatus get_sync_status();
     bool is_connected();
+    std::string execute_cli_command(const std::string& command);
     
 private:
     bool testnet_;
-    std::string execute_cli_command(const std::string& command);
 };
 
 /// HTTP Session handler for incoming connections
@@ -78,7 +85,7 @@ private:
 class MiningInterface : public jsonrpccxx::JsonRpc2Server
 {
 public:
-    MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr);
+    MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
 
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
@@ -99,6 +106,13 @@ public:
     // Address validation
     bool is_valid_address(const std::string& address) const;
     
+    // Get current blockchain and network configuration
+    Blockchain get_blockchain() const { return m_blockchain; }
+    Network get_network() const { return m_testnet ? Network::TESTNET : Network::MAINNET; }
+    
+    // Access to address validator (for Stratum sessions)
+    const BlockchainAddressValidator& get_address_validator() const { return m_address_validator; }
+    
     // Sync status checking
     bool is_blockchain_synced() const;
     void log_sync_progress() const;
@@ -111,7 +125,9 @@ private:
     std::map<std::string, nlohmann::json> m_active_work;
     std::unique_ptr<LitecoinRpcClient> m_rpc_client;
     bool m_testnet;  // Store testnet flag
+    Blockchain m_blockchain;  // Store blockchain type
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
+    BlockchainAddressValidator m_address_validator;  // New address validator
     
     // TODO: Add connections to actual mining node and coin interface
     // std::shared_ptr<Node> m_node;
@@ -127,12 +143,15 @@ class WebServer
     std::string bind_address_;
     uint16_t port_;
     bool running_;
+    bool testnet_;
+    Blockchain blockchain_;
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
 
 public:
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node);
+    WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain);
     ~WebServer();
 
     // Start/stop the server
@@ -165,6 +184,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     std::string username_;
     bool subscribed_ = false;
     bool authorized_ = false;
+    bool need_initial_setup_ = false;
     static std::atomic<uint64_t> job_counter_;
 
 public:
