@@ -46,7 +46,17 @@ target_link_libraries(c2pool_node_enhanced
     nlohmann_json::nlohmann_json
 )
 
-# Main refactored application
+# Main C2Pool Enhanced Application (refactored with mining_shares/p2p_shares separation)
+add_executable(c2pool c2pool_refactored.cpp)
+target_link_libraries(c2pool 
+    c2pool_node_enhanced
+    core
+    ltc
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
+# Enhanced version with explicit name (for backward compatibility)
 add_executable(c2pool_enhanced c2pool_refactored.cpp)
 target_link_libraries(c2pool_enhanced 
     c2pool_node_enhanced
@@ -56,21 +66,14 @@ target_link_libraries(c2pool_enhanced
     ${Boost_LIBRARIES}
 )
 
-# Original applications (kept for compatibility)
-add_executable(c2pool_main c2pool.cpp)
-target_link_libraries(c2pool_main core btclibs pool ltc sharechain)
-target_link_libraries(c2pool_main nlohmann_json::nlohmann_json)
-
+# Test applications
 add_executable(test_ltc_node test_ltc_node.cpp)
 target_link_libraries(test_ltc_node core btclibs pool ltc)
 target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
-# add_executable(c2pool_temp c2pool_temp.cpp)
-# target_link_libraries(c2pool_temp core btclibs pool ltc)
-# target_link_libraries(c2pool_temp nlohmann_json::nlohmann_json)
-
-add_executable(c2pool_node c2pool_node.cpp)
-target_link_libraries(c2pool_node core btclibs pool ltc)
-target_link_libraries(c2pool_node nlohmann_json::nlohmann_json)
+# Legacy applications have been archived to ../../archive/
+# - c2pool_legacy.cpp (original c2pool.cpp)
+# - c2pool_node_legacy.cpp (original c2pool_node.cpp)
+# - c2pool_temp_legacy.cpp (original c2pool_temp.cpp)
 
 add_subdirectory(ltc)

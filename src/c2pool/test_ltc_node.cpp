@@ -44,8 +44,8 @@ struct C2PoolConfig : public ltc::Config
 class C2PoolLTCNodeImpl : public ltc::NodeImpl
 {
 private:
-    uint64_t m_local_shares_count = 0;
-    uint64_t m_foreign_shares_count = 0;
+    uint64_t m_local_mining_shares_count = 0;
+    uint64_t m_foreign_p2p_shares_count = 0;
     
 public:
     using config_t = C2PoolConfig;
@@ -64,8 +64,8 @@ public:
     // Log sharechain statistics using LTC infrastructure
     void log_sharechain_stats() {
         LOG_INFO << "Sharechain stats:";
-        LOG_INFO << "  Local shares added: " << m_local_shares_count;
-        LOG_INFO << "  Foreign shares received: " << m_foreign_shares_count;
+        LOG_INFO << "  Local mining_shares added: " << m_local_mining_shares_count;
+        LOG_INFO << "  Foreign p2p_shares received: " << m_foreign_p2p_shares_count;
         
         if (m_chain) {
             LOG_INFO << "  Sharechain initialized and ready";
@@ -82,9 +82,9 @@ public:
         }
     }
     
-    // Add a real LTC share for testing
+    // Add a real LTC mining_share for testing
     void add_real_ltc_share(int index) {
-        LOG_INFO << "Adding real LTC share #" << index;
+        LOG_INFO << "Adding real LTC mining_share #" << index;
         
         try {
             // Create a real LTC Share object
@@ -97,30 +97,29 @@ public:
             } else {
                 prev_hash.SetHex(std::string(64 - std::to_string(999 + index).length(), '0') + std::to_string(999 + index));
             }
-            
-            // Create an LTC Share
+             // Create an LTC MiningShare
             auto share = new ltc::Share(hash, prev_hash);
-            
-            // Fill in some basic share data
+
+            // Fill in some basic mining_share data
             share->m_timestamp = static_cast<uint32_t>(std::time(nullptr)) - (index * 60);
             share->m_subsidy = 25 * 100000000ULL; // 25 LTC in satoshis
             share->m_bits = 0x1d00ffff; // Easy difficulty for testing
             share->m_nonce = 123456 + index;
             share->m_donation = 50; // 0.5% donation (in basis points)
-            share->m_desired_version = 17; // LTC share version
-            share->peer_addr = NetService{}; // Local share
+            share->m_desired_version = 17; // LTC mining_share version
+            share->peer_addr = NetService{}; // Local mining_share
             
             // Fill in some required fields
             share->m_absheight = 100000 + index;
             share->m_abswork = uint128{static_cast<uint64_t>(1000 + index)}; // Simple work value
             
-            LOG_INFO << "  Created LTC share with hash: " << hash.ToString().substr(0, 16) << "...";
-            LOG_INFO << "  Share timestamp: " << share->m_timestamp;
-            LOG_INFO << "  Share subsidy: " << share->m_subsidy << " satoshis";
-            LOG_INFO << "  Share difficulty bits: 0x" << std::hex << share->m_bits << std::dec;
+            LOG_INFO << "  Created LTC mining_share with hash: " << hash.ToString().substr(0, 16) << "...";
+            LOG_INFO << "  MiningShare timestamp: " << share->m_timestamp;
+            LOG_INFO << "  MiningShare subsidy: " << share->m_subsidy << " satoshis";
+            LOG_INFO << "  MiningShare difficulty bits: 0x" << std::hex << share->m_bits << std::dec;
             
             // For now, just track that we created it
-            m_local_shares_count++;
+            m_local_mining_shares_count++;
             
             // In a real implementation, we would add this to the sharechain:
             // if (m_chain) {

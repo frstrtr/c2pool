@@ -21,8 +21,8 @@ namespace difficulty {
 class DifficultyAdjustmentEngine {
 private:
     double current_pool_difficulty_ = 1.0;
-    uint64_t shares_since_last_adjustment_ = 0;
-    uint64_t target_shares_per_adjustment_ = 100;
+    uint64_t mining_shares_since_last_adjustment_ = 0;
+    uint64_t target_mining_shares_per_adjustment_ = 100;
     double target_block_time_ = 150.0; // 2.5 minutes for Litecoin
     uint64_t last_adjustment_time_ = 0;
     
@@ -33,10 +33,10 @@ private:
     
 public:
     /**
-     * @brief Process a new share for difficulty adjustment
-     * @param share The C2Pool share to process
+     * @brief Process a new p2p_share for difficulty adjustment
+     * @param share The C2Pool p2p_share to process
      */
-    void process_new_share(const c2pool::C2PoolShare& share);
+    void process_new_p2p_share(const c2pool::C2PoolShare& share);
     
     /**
      * @brief Calculate new difficulty based on hashrate and timing
@@ -73,10 +73,10 @@ public:
     
     /**
      * @brief Set target parameters for difficulty adjustment
-     * @param target_shares Number of shares per adjustment period
+     * @param target_mining_shares Number of mining_shares per adjustment period
      * @param target_time Target time per block/adjustment
      */
-    void set_adjustment_parameters(uint64_t target_shares, double target_time);
+    void set_adjustment_parameters(uint64_t target_mining_shares, double target_time);
     
     /**
      * @brief Force a difficulty update from network
@@ -93,6 +93,11 @@ private:
      * @brief Adjust pool difficulty based on recent performance
      */
     void adjust_pool_difficulty();
+    
+    // Backward compatibility method - delegate to new p2p_share method
+    void process_new_share(const c2pool::C2PoolShare& share) {
+        process_new_p2p_share(share);
+    }
 };
 
 } // namespace difficulty

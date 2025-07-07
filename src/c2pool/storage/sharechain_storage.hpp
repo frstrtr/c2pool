@@ -12,10 +12,12 @@
 namespace c2pool {
 namespace storage {
 
-/**
- * @brief Modern LevelDB-based sharechain storage manager
- * 
+/** * @brief Modern LevelDB-based sharechain storage manager
+ *
  * Provides persistent storage for sharechain data with automatic
+ * distinction between mining_shares (from physical miners) and
+ * p2p_shares (from cross-node communication). Both types are stored
+ * in the same chain but can be tracked separately for statistics.
  * maintenance, compaction, and recovery capabilities.
  */
 class SharechainStorage {

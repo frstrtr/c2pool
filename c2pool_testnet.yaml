@@ -1,0 +1,66 @@
+# C2Pool Litecoin Testnet Configuration
+# For testing with physical miners via Stratum on port 8084
+
+# Network Configuration
+network: litecoin_testnet
+testnet: true
+port: 9333                    # P2P port for sharechain communication
+stratum_port: 8084            # Stratum port for physical miners
+http_port: 8080               # HTTP/JSON-RPC port for monitoring
+
+# Litecoin Node Connection
+ltc_rpc_host: 127.0.0.1
+ltc_rpc_port: 19332          # Litecoin testnet RPC port
+ltc_rpc_user: ltctest
+ltc_rpc_password: ltctest123
+ltc_rpc_timeout: 30
+
+# Mining Configuration
+difficulty_target: 30.0       # Target 30 seconds per share for testing
+min_difficulty: 0.001         # Minimum difficulty for testing
+max_difficulty: 1000.0        # Maximum difficulty
+vardiff_enabled: true         # Enable variable difficulty
+vardiff_interval: 120         # Adjust difficulty every 2 minutes
+
+# Storage Configuration
+data_dir: ./data/testnet
+leveldb_enabled: true
+leveldb_cache_size: 64        # MB
+save_interval: 100            # Save every 100 shares
+
+# Monitoring & Logging
+log_level: INFO
+log_file: c2pool_testnet.log
+log_shares: true              # Log share submissions
+log_mining_shares: true       # Log mining_shares specifically
+log_p2p_shares: true          # Log p2p_shares specifically
+
+# Pool Configuration
+pool_name: "C2Pool Testnet"
+pool_description: "C2Pool Litecoin Testnet with Mining/P2P Share Separation"
+pool_website: "http://localhost:8080"
+donation_percentage: 0.0      # No donation for testing
+
+# Performance Tuning
+max_connections: 50
+worker_threads: 4
+io_threads: 2
+share_cache_size: 1000
+
+# Security (relaxed for testing)
+allow_local_miners: true
+require_worker_auth: false
+ban_threshold: 1000           # High threshold for testing
+ban_duration: 300             # 5 minutes
+
+# Features
+enable_getwork: false         # Only Stratum for testing
+enable_stratum: true
+enable_http_api: true
+enable_web_interface: true
+
+# Debug Features for Testing
+debug_mode: true
+verbose_logging: true
+track_share_sources: true     # Track mining_shares vs p2p_shares separately
+detailed_statistics: true

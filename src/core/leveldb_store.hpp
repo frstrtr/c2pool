@@ -74,6 +74,7 @@ public:
 
 /**
  * Share metadata for indexing and chain traversal
+ * Used for both mining_shares (from miners) and p2p_shares (from nodes)
  */
 struct ShareMetadata {
     uint256 prev_hash = uint256::ZERO;
@@ -89,7 +90,7 @@ struct ShareMetadata {
  */
 struct ChainMetadata {
     uint32_t version = 1;
-    uint64_t total_shares = 0;
+    uint64_t total_shares = 0;  // Total share count (mining_shares + p2p_shares)
     uint64_t max_height = 0;
     uint256 best_hash = uint256::ZERO;
     uint64_t created_timestamp = 0;
