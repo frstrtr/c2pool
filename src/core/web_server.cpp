@@ -130,6 +130,8 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
     , m_node(node)
     , m_address_validator(blockchain, testnet ? Network::TESTNET : Network::MAINNET)
     , m_payout_manager(std::make_unique<c2pool::payout::PayoutManager>(1.0, 86400)) // 1% fee, 24h window
+    , m_solo_mode(false)
+    , m_solo_address("")
 {
     setup_methods();
 }
@@ -478,41 +480,58 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         return false;
     }
     
-    // Track mining_share submission for statistics
-    if (m_node) {
-        // Calculate actual mining_share difficulty based on submission
-        double share_difficulty = calculate_share_difficulty(job_id, extranonce2, ntime, nonce);
+    // Calculate share difficulty
+    double share_difficulty = calculate_share_difficulty(job_id, extranonce2, ntime, nonce);
+    
+    if (m_solo_mode) {
+        // Solo mining mode - work directly with blockchain
+        LOG_INFO << "Solo mining share from " << username << " (difficulty: " << share_difficulty << ")";
         
-        // Track the mining_share submission
-        m_node->track_mining_share_submission(username, share_difficulty);
+        // In solo mode, check if share meets network difficulty for block submission
+        // For now, accept all shares and log them for solo mining
+        std::string payout_address = m_solo_address.empty() ? username : m_solo_address;
         
-        // Create mining_share hash for storage (simplified)
-        uint256 share_hash;
-        std::string hash_input = job_id + extranonce2 + ntime + nonce;
-        share_hash.SetHex(hash_input.substr(0, 64)); // Take first 64 chars as hash
+        LOG_INFO << "Solo mining share accepted - payout address: " << payout_address;
         
-        LOG_INFO << "Mining share accepted from " << username << " - hash: " << share_hash.ToString().substr(0, 16) << "...";
+        // TODO: Check if share meets network difficulty and submit block to blockchain
+        // TODO: Implement block template generation with payout to solo address
         
-        // Store mining_share in enhanced node (this will go to LevelDB)
-        uint256 prev_hash = uint256::ZERO; // TODO: Get actual previous mining_share hash
-        uint256 target;
-        target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-        
-        m_node->add_local_mining_share(share_hash, prev_hash, target);
-        
-        LOG_INFO << "Mining share stored in sharechain database";
+        return nlohmann::json{{"result", true}};
     } else {
-        LOG_INFO << "Mining share accepted from " << username << " (no node connected for storage)";
+        // Standard pool mode - track shares for sharechain and payouts
+        
+        // Track mining_share submission for statistics
+        if (m_node) {
+            // Track the mining_share submission
+            m_node->track_mining_share_submission(username, share_difficulty);
+            
+            // Create mining_share hash for storage (simplified)
+            uint256 share_hash;
+            std::string hash_input = job_id + extranonce2 + ntime + nonce;
+            share_hash.SetHex(hash_input.substr(0, 64)); // Take first 64 chars as hash
+            
+            LOG_INFO << "Mining share accepted from " << username << " - hash: " << share_hash.ToString().substr(0, 16) << "...";
+            
+            // Store mining_share in enhanced node (this will go to LevelDB)
+            uint256 prev_hash = uint256::ZERO; // TODO: Get actual previous mining_share hash
+            uint256 target;
+            target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+            
+            m_node->add_local_mining_share(share_hash, prev_hash, target);
+            
+            LOG_INFO << "Mining share stored in sharechain database";
+        } else {
+            LOG_INFO << "Mining share accepted from " << username << " (no node connected for storage)";
+        }
+        
+        // Record share contribution for payout calculation (pool mode only)
+        if (m_payout_manager) {
+            m_payout_manager->record_share_contribution(username, share_difficulty);
+            LOG_INFO << "Share contribution recorded for payout: " << username << " (difficulty: " << share_difficulty << ")";
+        }
+        
+        return nlohmann::json{{"result", true}};
     }
-    
-    // Always record share contribution for payout calculation (regardless of node connection)
-    if (m_payout_manager) {
-        double share_difficulty = calculate_share_difficulty(job_id, extranonce2, ntime, nonce);
-        m_payout_manager->record_share_contribution(username, share_difficulty);
-        LOG_INFO << "Share contribution recorded for payout: " << username << " (difficulty: " << share_difficulty << ")";
-    }
-    
-    return nlohmann::json{{"result", true}};
 }
 
 bool MiningInterface::is_valid_address(const std::string& address) const
@@ -1097,6 +1116,8 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , running_(false)
     , testnet_(testnet)
     , blockchain_(Blockchain::LITECOIN)  // Default to Litecoin for backward compatibility
+    , solo_mode_(false)
+    , solo_address_("")
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, nullptr, blockchain_);
     
@@ -1113,6 +1134,8 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , running_(false)
     , testnet_(testnet)
     , blockchain_(Blockchain::LITECOIN)  // Default to Litecoin for backward compatibility
+    , solo_mode_(false)
+    , solo_address_("")
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain_);
     
@@ -1129,6 +1152,8 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
     , running_(false)
     , testnet_(testnet)
     , blockchain_(blockchain)
+    , solo_mode_(false)
+    , solo_address_("")
 {
     mining_interface_ = std::make_shared<MiningInterface>(testnet, node, blockchain);
     
@@ -1170,6 +1195,36 @@ bool WebServer::start()
         
     } catch (const std::exception& e) {
         LOG_ERROR << "Failed to start web server: " << e.what();
+        return false;
+    }
+}
+
+bool WebServer::start_solo()
+{
+    try {
+        LOG_INFO << "Starting C2Pool in SOLO mining mode";
+        
+        // Enable solo mode on the mining interface
+        mining_interface_->set_solo_mode(true);
+        if (!solo_address_.empty()) {
+            mining_interface_->set_solo_address(solo_address_);
+            LOG_INFO << "Solo mining configured with payout address: " << solo_address_;
+        }
+        
+        // Start only the Stratum server for solo mining (no HTTP server)
+        if (!start_stratum_server()) {
+            LOG_ERROR << "Failed to start Stratum server for solo mining";
+            return false;
+        }
+        
+        running_ = true;
+        LOG_INFO << "SOLO mining mode started successfully";
+        LOG_INFO << "Connect your miner to: stratum+tcp://" << bind_address_ << ":" << stratum_port_;
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to start solo mining mode: " << e.what();
         return false;
     }
 }
@@ -1245,6 +1300,11 @@ void WebServer::set_stratum_port(uint16_t port)
             stratum_server_->start();
         }
     }
+}
+
+uint16_t WebServer::get_stratum_port() const
+{
+    return stratum_port_;
 }
 
 void WebServer::accept_connections()

@@ -131,6 +131,12 @@ public:
     void set_pool_payout_address(const std::string& address);
     void set_pool_fee_percent(double fee_percent);
 
+    // Solo mining configuration
+    void set_solo_mode(bool enabled) { m_solo_mode = enabled; }
+    void set_solo_address(const std::string& address) { m_solo_address = address; }
+    bool is_solo_mode() const { return m_solo_mode; }
+    const std::string& get_solo_address() const { return m_solo_address; }
+
 private:
     void setup_methods();
     
@@ -143,6 +149,10 @@ private:
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
     std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
+    
+    // Solo mining configuration
+    bool m_solo_mode = false;
+    std::string m_solo_address;
     
     // TODO: Add connections to actual mining node and coin interface
     // std::shared_ptr<Node> m_node;
@@ -164,6 +174,10 @@ class WebServer
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
 
+    // Solo mining configuration
+    bool solo_mode_;
+    std::string solo_address_;
+    
 public:
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node);
@@ -172,19 +186,21 @@ public:
 
     // Start/stop the server
     bool start();
+    bool start_solo();  // Start in solo mining mode (Stratum only)
     void stop();
     
-    // Stratum server control
+    // Solo mining configuration
+    void set_solo_mode(bool enabled) { solo_mode_ = enabled; }
+    void set_solo_address(const std::string& address) { solo_address_ = address; }
+    bool is_solo_mode() const { return solo_mode_; }
+    const std::string& get_solo_address() const { return solo_address_; }
+
+    // Stratum server control methods
     bool start_stratum_server();
     void stop_stratum_server();
     bool is_stratum_running() const;
-    void set_stratum_port(uint16_t port);  // Set custom Stratum port
-    
-    // Server info
-    std::string get_bind_address() const { return bind_address_; }
-    uint16_t get_port() const { return port_; }
-    uint16_t get_stratum_port() const { return stratum_port_; }
-    bool is_running() const { return running_; }
+    void set_stratum_port(uint16_t port);
+    uint16_t get_stratum_port() const;
 
 private:
     void accept_connections();

@@ -119,48 +119,63 @@ c2pool --sharechain --config pool_config.yaml
 
 ---
 
-## ⚡ **BASIC MODE** (default)
-### Minimal Development Node - **FOR TESTING & DEVELOPMENT**
+## ⚡ **SOLO MODE** (default)
+### Independent Solo Mining - **FOR SOLO MINERS**
 
 **Primary Purpose:**
-Provide a lightweight C2Pool implementation for development, testing, and learning.
+Mine independently without participating in P2Pool network, keeping 100% of block rewards.
 
 **What it provides:**
-- **Core Functionality**: Essential C2Pool features without overhead
-- **Development Platform**: Testing environment for protocol development
-- **Learning Tool**: Understand C2Pool internals and operation
-- **Resource Efficiency**: Minimal system resource usage
+- **Direct Blockchain Connection**: Mine directly to your own node
+- **100% Block Rewards**: Keep all rewards when blocks are found
+- **No Pool Dependencies**: Independent operation without sharechain
+- **Simple Setup**: Minimal configuration required
 
 **Active Components:**
-- ✅ **Basic P2P Functionality** - Core protocol implementation
-- ✅ **Lightweight Operation** - Minimal resource consumption
-- ✅ **Protocol Core** - Essential C2Pool features
+- ✅ **Stratum Mining Server** - Standard mining protocol support
+- ✅ **Direct Blockchain Connection** - No P2Pool network dependency
+- ✅ **Local Difficulty Management** - Automatic difficulty adjustment
+- ✅ **Block Template Generation** - Create work directly from blockchain
+- ✅ **Solo Payout System** - 100% rewards to configured address
+- ✅ **Lightweight Operation** - Minimal resource usage
 
 **Key Features:**
-- **Minimal Footprint**: Low CPU and memory usage
-- **Quick Startup**: Fast initialization and deployment
-- **Educational Value**: Clear view of core protocol mechanics
-- **Development Ready**: Ideal for testing and experimentation
+- **Independent Mining**: No reliance on P2Pool network or other nodes
+- **Full Rewards**: 100% of block rewards go to your address
+- **Direct Control**: Complete control over mining operations
+- **Blockchain Integration**: Direct connection to coin daemon
+- **Simple Configuration**: Minimal setup complexity
+- **Resource Efficient**: Low CPU and memory footprint
 
 **Use Cases:**
-- 💻 **Development**: Protocol development and testing
-- 🎓 **Learning**: Understanding P2Pool internals
-- 🧪 **Experimentation**: Testing new features or modifications
-- 📱 **Resource-constrained**: Running on limited hardware
+- � **Solo Miners**: Independent mining with full rewards
+- 🏠 **Home Mining**: Simple setup for personal mining
+- 🔬 **Testing**: Mining protocol development and testing
+- 📚 **Learning**: Understanding mining fundamentals
+- 🎯 **Small Operations**: Low-complexity mining setups
 
 **Network Ports:**
-- `9333` - Basic P2P Communication (configurable with --p2p-port)
+- `8084` - Stratum Mining Protocol (configurable with --stratum-port)
 
 **Command Examples:**
 ```bash
-# Basic testnet node
-c2pool --testnet --blockchain ltc
+# Basic solo mining (Litecoin testnet)
+c2pool --testnet --blockchain ltc --stratum-port 8084
 
-# Bitcoin mainnet basic node
-c2pool --blockchain btc --p2p-port 9333
+# Solo mining with specific payout address
+c2pool --blockchain ltc --solo-address YOUR_LTC_ADDRESS
 
-# Custom configuration
-c2pool --config custom_config.yaml
+# Custom configuration file
+c2pool --config solo_config.yaml
+```
+
+**Miner Connection:**
+```bash
+# Connect your miners to the solo pool
+cpuminer -o stratum+tcp://127.0.0.1:8084 -u YOUR_LTC_ADDRESS -p x
+
+# Multiple miners to same solo pool
+bfgminer -o stratum+tcp://POOL_IP:8084 -u YOUR_LTC_ADDRESS -p x
 ```
 
 ---

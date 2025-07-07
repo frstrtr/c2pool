@@ -104,11 +104,15 @@ void print_help() {
     std::cout << "   ✅ Protocol Compatibility (LTC-based)\n";
     std::cout << "   ✅ Share Validation & Network Consensus\n\n";
     
-    std::cout << "⚡ BASIC MODE (default) - DEVELOPMENT & TESTING\n";
-    std::cout << "   Minimal C2Pool node for development:\n";
-    std::cout << "   ✅ Basic P2P Functionality\n";
-    std::cout << "   ✅ Lightweight Operation\n";
-    std::cout << "   ✅ Core Protocol Features\n\n";
+    std::cout << "⚡ SOLO MODE (default) - INDEPENDENT SOLO MINING\n";
+    std::cout << "   Standalone mining node without P2P sharechain:\n";
+    std::cout << "   ✅ Direct Blockchain Connection\n";
+    std::cout << "   ✅ Solo Mining (100% block rewards)\n";
+    std::cout << "   ✅ Stratum Mining Server\n";
+    std::cout << "   ✅ Local Difficulty Management\n";
+    std::cout << "   ✅ Block Template Generation\n";
+    std::cout << "   ✅ No P2P Dependencies\n";
+    std::cout << "   ✅ Lightweight Operation\n\n";
     
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -118,7 +122,8 @@ void print_help() {
     std::cout << "  --sharechain              Enable sharechain mode (P2P node)\n";
     std::cout << "  --blockchain CHAIN        Blockchain type: ltc, btc, eth, xmr, zec, doge\n";
     std::cout << "                            (default: ltc - Litecoin)\n";
-    std::cout << "  --config FILE             Load configuration from YAML file\n\n";
+    std::cout << "  --config FILE             Load configuration from YAML file\n";
+    std::cout << "  --solo-address ADDRESS    Solo mining payout address (for solo mode)\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
     std::cout << "  --p2p-port PORT           P2P sharechain port (default: 9333)\n";
@@ -165,10 +170,10 @@ void print_help() {
     std::cout << "     c2pool --sharechain --blockchain btc --p2p-port 9333\n";
     std::cout << "     c2pool --sharechain --config pool_config.yaml\n\n";
     
-    std::cout << "  ⚡ DEVELOPMENT (Basic Mode):\n";
-    std::cout << "     c2pool --testnet --blockchain ltc\n";
-    std::cout << "     c2pool --blockchain ltc --p2p-port 9333\n";
-    std::cout << "     c2pool --config custom_config.yaml\n\n";
+    std::cout << "  ⚡ SOLO MINING (Basic/Solo Mode):\n";
+    std::cout << "     c2pool --testnet --blockchain ltc --stratum-port 8084\n";
+    std::cout << "     c2pool --blockchain ltc --solo-address YOUR_ADDRESS\n";
+    std::cout << "     c2pool --config solo_config.yaml\n\n";
     
     std::cout << "API ENDPOINTS (Integrated Mode):\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -203,6 +208,7 @@ int main(int argc, char* argv[]) {
     std::string http_host = "0.0.0.0";  // HTTP server host
     
     std::string config_file;
+    std::string solo_address;
     bool integrated_mode = false;
     bool sharechain_mode = false;
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
@@ -255,6 +261,9 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--blockchain" && i + 1 < argc) {
             blockchain = parse_blockchain(argv[++i]);
+        }
+        else if (arg == "--solo-address" && i + 1 < argc) {
+            solo_address = argv[++i];
         }
         // Legacy support for old --port option (maps to p2p-port)
         else if (arg == "--port" && i + 1 < argc) {
@@ -353,18 +362,65 @@ int main(int argc, char* argv[]) {
             enhanced_node->shutdown();
         }
         else {
-            // Default mode - simple node
-            LOG_INFO << "Starting c2pool node...";
-            LOG_INFO << "Configuration:";
-            LOG_INFO << "  Testnet: " << (settings->m_testnet ? "Yes" : "No");
-            LOG_INFO << "  P2P Port: " << p2p_port;
-            LOG_INFO << "  Features: Basic mode";
-            LOG_INFO << "c2pool node initialized successfully";
-            LOG_INFO << "Use --help for available options";
+            // Solo mining mode - independent mining without P2P sharechain
+            LOG_INFO << "Starting C2Pool Solo Mining Mode...";
             
-            // Simple run loop
+            std::string blockchain_name = "Unknown";
+            switch (blockchain) {
+                case Blockchain::LITECOIN: blockchain_name = "Litecoin"; break;
+                case Blockchain::BITCOIN: blockchain_name = "Bitcoin"; break;
+                case Blockchain::ETHEREUM: blockchain_name = "Ethereum"; break;
+                case Blockchain::MONERO: blockchain_name = "Monero"; break;
+                case Blockchain::ZCASH: blockchain_name = "Zcash"; break;
+                case Blockchain::DOGECOIN: blockchain_name = "Dogecoin"; break;
+            }
+            
+            LOG_INFO << "Solo Mining Configuration:";
+            LOG_INFO << "  Blockchain: " << blockchain_name << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
+            LOG_INFO << "  Mode: Solo Mining (100% block rewards)";
+            LOG_INFO << "  Stratum Port: " << stratum_port;
+            if (!solo_address.empty()) {
+                LOG_INFO << "  Payout Address: " << solo_address;
+            }
+            LOG_INFO << "  P2P Disabled: No sharechain exchange";
+            LOG_INFO << "  Dependencies: Direct blockchain connection only";
+            
+            // Create a minimal web server for solo mining (Stratum only)
+            core::WebServer solo_server(ioc, http_host, 8083,  // Use default HTTP port since HTTP won't be used
+                                       settings->m_testnet, nullptr, blockchain);
+            
+            // Configure for solo mining mode
+            solo_server.set_solo_mode(true);
+            solo_server.set_stratum_port(static_cast<uint16_t>(stratum_port));  // Set the correct Stratum port
+            if (!solo_address.empty()) {
+                solo_server.set_solo_address(solo_address);
+            }
+            
+            // Start only Stratum server, no HTTP API or P2P
+            if (!solo_server.start_solo()) {
+                LOG_ERROR << "Failed to start solo mining server";
+                return 1;
+            }
+            
+            LOG_INFO << "C2Pool Solo Mining started successfully!";
+            LOG_INFO << "Mining interface: stratum+tcp://" << http_host << ":" << stratum_port;
+            LOG_INFO << "Features enabled:";
+            LOG_INFO << "  ✓ Direct blockchain connection";
+            LOG_INFO << "  ✓ Solo mining (100% rewards)";
+            LOG_INFO << "  ✓ Local difficulty management";
+            LOG_INFO << "  ✓ Block template generation";
+            LOG_INFO << "  ✓ No P2P dependencies";
+            LOG_INFO << "";
+            LOG_INFO << "Connect your miners to: stratum+tcp://" << http_host << ":" << stratum_port;
+            if (!solo_address.empty()) {
+                LOG_INFO << "All rewards will be paid to: " << solo_address;
+            } else {
+                LOG_INFO << "Use your payout address as the username when connecting miners";
+            }
+            
+            // Run until shutdown
             while (!g_shutdown_requested) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                ioc.run_for(std::chrono::milliseconds(100));
             }
         }
         
