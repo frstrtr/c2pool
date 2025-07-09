@@ -175,6 +175,22 @@ public:
     void cleanup_old_contributions(uint64_t cutoff_time);
     size_t get_active_miners_count() const;
     
+    // Enhanced coinbase construction methods
+    nlohmann::json build_coinbase_detailed(uint64_t block_reward_satoshis, const std::string& miner_address, 
+                                           double dev_fee_percent = 0.0, double node_fee_percent = 0.0);
+    std::string build_complete_coinbase_transaction(uint64_t block_reward_satoshis, const std::string& miner_address,
+                                                   double dev_fee_percent = 0.0, double node_fee_percent = 0.0);
+    bool validate_coinbase_transaction(const std::string& coinbase_hex);
+    
+    // Address to script conversion for different address types
+    std::string address_to_script_hex_enhanced(const std::string& address) const;
+    bool is_p2pkh_address(const std::string& address) const;
+    bool is_p2sh_address(const std::string& address) const;
+    bool is_bech32_address(const std::string& address) const;
+    
+    // Access to address validator for API methods
+    const BlockchainAddressValidator* get_address_validator() const { return &address_validator_; }
+    
 private:
     mutable std::mutex contributions_mutex_;
     std::map<std::string, MinerContribution> miner_contributions_;

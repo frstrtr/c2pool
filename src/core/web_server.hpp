@@ -104,6 +104,12 @@ public:
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
     nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "");
 
+    // Enhanced coinbase and validation methods
+    nlohmann::json validate_address(const std::string& address);
+    nlohmann::json build_coinbase(const nlohmann::json& params);
+    nlohmann::json validate_coinbase(const std::string& coinbase_hex);
+    nlohmann::json getblockcandidate(const nlohmann::json& params = nlohmann::json::object());
+
     // Address validation
     bool is_valid_address(const std::string& address) const;
     

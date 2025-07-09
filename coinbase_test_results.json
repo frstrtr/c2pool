@@ -1,0 +1,38 @@
+{
+  "address_validation_legacy_p2pkh": {
+    "ltc_valid": false,
+    "c2pool_valid": true,
+    "address": "mzgiTxxwqsFLuP1Mc7SFfRFfbDZbCvrKWL"
+  },
+  "address_validation_p2sh_segwit": {
+    "ltc_valid": false,
+    "c2pool_valid": true,
+    "address": "2N12LqSKC6yJar1sGomDZ13BT3cM6a1u72a"
+  },
+  "address_validation_bech32_segwit": {
+    "ltc_valid": false,
+    "c2pool_valid": true,
+    "address": "tltc1qea8gdr057k9gyjnurk7v3d9enha8qgds58ajt0"
+  },
+  "address_validation_developer": {
+    "ltc_valid": false,
+    "c2pool_valid": false,
+    "address": "tltc1qc2pool0dev0testnet0addr0for0ltc0testing"
+  },
+  "address_validation_node_owner": {
+    "ltc_valid": false,
+    "c2pool_valid": true,
+    "address": "tltc1q3px4r9ad5dqgsxt7lk8l58qwxk7wt3shjevutp"
+  },
+  "block_template_integration": {
+    "ltc_template": null,
+    "c2pool_work": {
+      "data": "00000001c570c4764025cf068f3f3fba04bde26fb7b449e0bf12523666e49cbdf6aa8b8f00000000",
+      "difficulty": 1.0,
+      "hash1": "00000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000010000",
+      "midstate": "5f796c4974b00d64ffc22c9a72e96f9b23c57d7d83d0e7d6a34c4e1f5b4c4b8f",
+      "target": "00000000ffff0000000000000000000000000000000000000000000000000000"
+    },
+    "ltc_node_available": false
+  }
+}
