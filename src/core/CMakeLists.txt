@@ -36,7 +36,7 @@ set(source
 find_package(yaml-cpp REQUIRED)
 
 add_library(core STATIC ${source})
-target_link_libraries(core btclibs c2pool_payout)
+target_link_libraries(core btclibs)
 
 # Use Boost target names that work with both old and new CMake/Boost versions
 if(TARGET Boost::headers)

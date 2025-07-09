@@ -50,6 +50,7 @@ target_link_libraries(c2pool_node_enhanced
 add_executable(c2pool c2pool_refactored.cpp)
 target_link_libraries(c2pool 
     c2pool_node_enhanced
+    c2pool_payout
     core
     ltc
     nlohmann_json::nlohmann_json
@@ -60,6 +61,7 @@ target_link_libraries(c2pool
 add_executable(c2pool_enhanced c2pool_refactored.cpp)
 target_link_libraries(c2pool_enhanced 
     c2pool_node_enhanced
+    c2pool_payout
     core
     ltc
     nlohmann_json::nlohmann_json

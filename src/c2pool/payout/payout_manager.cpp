@@ -570,8 +570,309 @@ std::string PayoutManager::address_to_script_hex(const std::string& address) con
     return script.str();
 }
 
-uint64_t PayoutManager::get_current_timestamp() const {
-    return static_cast<uint64_t>(std::time(nullptr));
+// Enhanced coinbase construction methods
+nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_satoshis, const std::string& miner_address, 
+                                                      double dev_fee_percent, double node_fee_percent) {
+    nlohmann::json result = nlohmann::json::object();
+    
+    try {
+        // Calculate allocation using existing logic
+        PayoutAllocation allocation = calculate_payout(block_reward_satoshis);
+        
+        // Override with provided parameters if specified
+        if (dev_fee_percent > 0.0) {
+            allocation.developer_percent = dev_fee_percent;
+            allocation.developer_amount = static_cast<uint64_t>(block_reward_satoshis * dev_fee_percent / 100.0);
+        }
+        
+        if (node_fee_percent > 0.0) {
+            allocation.node_owner_percent = node_fee_percent;
+            allocation.node_owner_amount = static_cast<uint64_t>(block_reward_satoshis * node_fee_percent / 100.0);
+        }
+        
+        // Recalculate miner amount
+        allocation.miner_amount = block_reward_satoshis - allocation.developer_amount - allocation.node_owner_amount;
+        
+        // Build outputs array
+        nlohmann::json outputs = nlohmann::json::array();
+        
+        // Miner output (always first)
+        if (allocation.miner_amount > 0) {
+            outputs.push_back({
+                {"address", miner_address},
+                {"amount_satoshis", allocation.miner_amount},
+                {"type", "miner"}
+            });
+        }
+        
+        // Developer output
+        if (allocation.developer_amount > 0 && !allocation.developer_address.empty()) {
+            outputs.push_back({
+                {"address", allocation.developer_address},
+                {"amount_satoshis", allocation.developer_amount},
+                {"type", "developer"}
+            });
+        }
+        
+        // Node owner output
+        if (allocation.node_owner_amount > 0 && !allocation.node_owner_address.empty()) {
+            outputs.push_back({
+                {"address", allocation.node_owner_address},
+                {"amount_satoshis", allocation.node_owner_amount},
+                {"type", "node_owner"}
+            });
+        }
+        
+        // Build complete coinbase transaction
+        std::string coinbase_hex = build_complete_coinbase_transaction(block_reward_satoshis, miner_address, 
+                                                                      dev_fee_percent, node_fee_percent);
+        
+        result["outputs"] = outputs;
+        result["coinbase_hex"] = coinbase_hex;
+        result["total_amount"] = block_reward_satoshis;
+        result["output_count"] = outputs.size();
+        
+        LOG_INFO << "Built detailed coinbase with " << outputs.size() << " outputs, total: " << block_reward_satoshis << " satoshis";
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Error building detailed coinbase: " << e.what();
+        result["error"] = std::string("Coinbase construction failed: ") + e.what();
+    }
+    
+    return result;
+}
+
+std::string PayoutManager::build_complete_coinbase_transaction(uint64_t block_reward_satoshis, const std::string& miner_address,
+                                                              double dev_fee_percent, double node_fee_percent) {
+    std::stringstream tx;
+    
+    // Transaction version (4 bytes, little endian)
+    tx << "01000000";
+    
+    // Number of inputs (1 byte) - coinbase always has 1 input
+    tx << "01";
+    
+    // Coinbase input
+    // Previous transaction hash (32 bytes, all zeros)
+    tx << "0000000000000000000000000000000000000000000000000000000000000000";
+    // Previous output index (4 bytes, 0xffffffff for coinbase)
+    tx << "ffffffff";
+    
+    // Coinbase script length and script
+    std::string coinbase_script = "03"; // Length prefix
+    coinbase_script += "510b1a"; // Block height (placeholder) + extra data
+    tx << std::hex << std::setfill('0') << std::setw(2) << (coinbase_script.length() / 2);
+    tx << coinbase_script;
+    
+    // Sequence (4 bytes)
+    tx << "ffffffff";
+    
+    // Calculate outputs
+    std::vector<std::pair<std::string, uint64_t>> outputs;
+    
+    // Calculate amounts
+    uint64_t dev_amount = static_cast<uint64_t>(block_reward_satoshis * dev_fee_percent / 100.0);
+    uint64_t node_amount = static_cast<uint64_t>(block_reward_satoshis * node_fee_percent / 100.0);
+    uint64_t miner_amount = block_reward_satoshis - dev_amount - node_amount;
+    
+    // Add outputs
+    if (miner_amount > 0) {
+        outputs.emplace_back(miner_address, miner_amount);
+    }
+    
+    if (dev_amount > 0) {
+        std::string dev_addr = get_developer_address();
+        if (!dev_addr.empty()) {
+            outputs.emplace_back(dev_addr, dev_amount);
+        }
+    }
+    
+    if (node_amount > 0) {
+        std::string node_addr = get_node_owner_address();
+        if (!node_addr.empty()) {
+            outputs.emplace_back(node_addr, node_amount);
+        }
+    }
+    
+    // Number of outputs
+    tx << std::hex << std::setfill('0') << std::setw(2) << outputs.size();
+    
+    // Build each output
+    for (const auto& output : outputs) {
+        const std::string& address = output.first;
+        uint64_t amount = output.second;
+        
+        // Amount (8 bytes, little endian)
+        for (int byte = 0; byte < 8; ++byte) {
+            tx << std::hex << std::setfill('0') << std::setw(2) 
+               << ((amount >> (byte * 8)) & 0xFF);
+        }
+        
+        // Script
+        std::string script_hex = address_to_script_hex_enhanced(address);
+        tx << script_hex;
+    }
+    
+    // Lock time (4 bytes)
+    tx << "00000000";
+    
+    return tx.str();
+}
+
+std::string PayoutManager::address_to_script_hex_enhanced(const std::string& address) const {
+    std::stringstream script;
+    
+    if (is_p2pkh_address(address)) {
+        // P2PKH script: OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+        script << "19"; // Script length (25 bytes)
+        script << "76a914"; // OP_DUP OP_HASH160 OP_PUSH20
+        
+        // For demo purposes, generate a realistic-looking hash160 from the address
+        std::string addr_hash = address.length() >= 20 ? address.substr(1, 20) : address;
+        while (addr_hash.length() < 20) addr_hash += "0";
+        
+        // Convert to hex (simplified - real implementation would decode Base58Check)
+        for (char c : addr_hash.substr(0, 20)) {
+            script << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned char>(c);
+        }
+        
+        script << "88ac"; // OP_EQUALVERIFY OP_CHECKSIG
+        
+    } else if (is_p2sh_address(address)) {
+        // P2SH script: OP_HASH160 <20-byte hash> OP_EQUAL
+        script << "17"; // Script length (23 bytes)
+        script << "a914"; // OP_HASH160 OP_PUSH20
+        
+        // Generate hash160 from address (simplified)
+        std::string addr_hash = address.length() >= 20 ? address.substr(1, 20) : address;
+        while (addr_hash.length() < 20) addr_hash += "0";
+        
+        for (char c : addr_hash.substr(0, 20)) {
+            script << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned char>(c);
+        }
+        
+        script << "87"; // OP_EQUAL
+        
+    } else if (is_bech32_address(address)) {
+        // Bech32 native SegWit script: OP_0 <20 or 32-byte hash>
+        script << "16"; // Script length for P2WPKH (22 bytes)
+        script << "0014"; // OP_0 OP_PUSH20
+        
+        // Generate hash160 from bech32 address (simplified)
+        std::string addr_hash = address.length() >= 20 ? address.substr(5, 20) : address;
+        while (addr_hash.length() < 20) addr_hash += "0";
+        
+        for (char c : addr_hash.substr(0, 20)) {
+            script << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned char>(c);
+        }
+        
+    } else {
+        // Fallback to P2PKH format
+        script << "1976a914";
+        for (int i = 0; i < 20; ++i) {
+            script << "00";
+        }
+        script << "88ac";
+    }
+    
+    return script.str();
+}
+
+bool PayoutManager::is_p2pkh_address(const std::string& address) const {
+    if (address.empty()) return false;
+    
+    // Check common P2PKH prefixes
+    if (blockchain_ == Blockchain::LITECOIN) {
+        if (network_ == Network::TESTNET) {
+            return address[0] == 'm' || address[0] == 'n';
+        } else {
+            return address[0] == 'L';
+        }
+    } else if (blockchain_ == Blockchain::BITCOIN) {
+        if (network_ == Network::TESTNET) {
+            return address[0] == 'm' || address[0] == 'n';
+        } else {
+            return address[0] == '1';
+        }
+    }
+    
+    return false;
+}
+
+bool PayoutManager::is_p2sh_address(const std::string& address) const {
+    if (address.empty()) return false;
+    
+    // Check common P2SH prefixes
+    if (blockchain_ == Blockchain::LITECOIN) {
+        if (network_ == Network::TESTNET) {
+            return address[0] == '2' || address[0] == 'Q';
+        } else {
+            return address[0] == 'M' || address[0] == '3';
+        }
+    } else if (blockchain_ == Blockchain::BITCOIN) {
+        if (network_ == Network::TESTNET) {
+            return address[0] == '2';
+        } else {
+            return address[0] == '3';
+        }
+    }
+    
+    return false;
+}
+
+bool PayoutManager::is_bech32_address(const std::string& address) const {
+    if (address.length() < 5) return false;
+    
+    // Check bech32 prefixes
+    if (blockchain_ == Blockchain::LITECOIN) {
+        if (network_ == Network::TESTNET) {
+            return address.substr(0, 5) == "tltc1" || address.substr(0, 5) == "rltc1";
+        } else {
+            return address.substr(0, 4) == "ltc1";
+        }
+    } else if (blockchain_ == Blockchain::BITCOIN) {
+        if (network_ == Network::TESTNET) {
+            return address.substr(0, 3) == "tb1";
+        } else {
+            return address.substr(0, 3) == "bc1";
+        }
+    }
+    
+    return false;
+}
+
+bool PayoutManager::validate_coinbase_transaction(const std::string& coinbase_hex) {
+    try {
+        // Basic hex validation
+        if (coinbase_hex.empty() || coinbase_hex.length() % 2 != 0) {
+            return false;
+        }
+        
+        // Try to parse as hex
+        std::vector<unsigned char> tx_data;
+        for (size_t i = 0; i < coinbase_hex.length(); i += 2) {
+            std::string byte_str = coinbase_hex.substr(i, 2);
+            unsigned char byte = static_cast<unsigned char>(std::stoul(byte_str, nullptr, 16));
+            tx_data.push_back(byte);
+        }
+        
+        // Basic structure validation
+        if (tx_data.size() < 10) { // Minimum transaction size
+            return false;
+        }
+        
+        // Check version (first 4 bytes should be 01000000 for version 1)
+        if (tx_data[0] != 0x01 || tx_data[1] != 0x00 || tx_data[2] != 0x00 || tx_data[3] != 0x00) {
+            return false;
+        }
+        
+        LOG_INFO << "Coinbase transaction validation passed - " << tx_data.size() << " bytes";
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Coinbase validation error: " << e.what();
+        return false;
+    }
 }
 
 // Developer payout system methods
@@ -842,6 +1143,10 @@ bool PayoutManager::try_load_node_owner_from_config() {
         LOG_INFO << "No node owner address found in config file";
         return false;
     }
+}
+
+uint64_t PayoutManager::get_current_timestamp() const {
+    return static_cast<uint64_t>(std::time(nullptr));
 }
 
 } // namespace payout

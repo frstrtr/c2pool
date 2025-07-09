@@ -12,7 +12,7 @@ target_include_directories(c2pool_payout PUBLIC
 target_link_libraries(c2pool_payout
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
-    core
+    btclibs
 )
 
 # Ensure headers are available
