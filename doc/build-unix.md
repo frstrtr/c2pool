@@ -1,13 +1,16 @@
 > [!WARNING]
+
 > While compiling you may get an error like:\
 > `c++: internal compiler error: Killed (program cc1plus)`\
 > \
+
 > Reasons:
+
 > 1. Low ram/swap. Increase ram/swap or decrease the amount of make -j to 1 (more compile threads -> more mem usage).
 > 2. SELinux/grsecurity/Hardened kernel: Kernels that use ASLR as a security measure tend to mess up GCC's precompiled header implementation. Try using an unhardened kernel (without ASLR), or compiling using clang, or gcc without pch. (you can get this issue when using OVH hosting).
 
-
 # Dependencies
+
 | Name      | Version|
 |-----------|--------|
 | CMake     | >= 3.22|
@@ -16,6 +19,7 @@
 | Boost     | 1.78   |
 
 # Instruction
+
 ```shell
 sudo apt update & apt upgrade
 sudo apt install wget
@@ -31,20 +35,25 @@ sudo apt install qt6-base-dev
 ```
 
 If ui config is needed:
+
 ```shell
 sudo apt-get install libgl1-mesa-dev
 ```
 
 install boost 1.78.0:
+
 ```shell
-wget -O boost_1_78_0.tar.gz https://boostorg.jfrog.io/artifactory/main/release/1.78.0/source/boost_1_78_0.tar.gz
-tar xzvf boost_1_78_0.tar.gz
+# Download from SourceForge (JFrog Artifactory is no longer available)
+wget https://sourceforge.net/projects/boost/files/boost/1.78.0/boost_1_78_0.tar.bz2
+tar xjvf boost_1_78_0.tar.bz2
 cd boost_1_78_0
 ./bootstrap.sh --prefix=/usr/
 sudo ./b2 install
+cd ..
 ```
 
 install c2pool:
+
 ```shell
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool
@@ -54,11 +63,13 @@ cmake --build build --target c2pool_main -j 6
 ```
 
 UI Config:
+
 ```shell
 ./c2pool_main --ui_config
 ```
 
 Run:
+
 ```shell
 cd build/c2pool
 ./c2pool_main --web_server=0.0.0.0:8083
