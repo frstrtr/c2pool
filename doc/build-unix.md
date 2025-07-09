@@ -58,7 +58,8 @@ install c2pool:
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool
 mkdir build
-cmake -DCMAKE_BUILD_TYPE=Debug -S . -B build
+# Force CMake to use the newly installed Boost 1.78.0
+cmake -DCMAKE_BUILD_TYPE=Debug -DBoost_ROOT=/usr/ -DBoost_NO_SYSTEM_PATHS=ON -S . -B build
 cmake --build build --target c2pool_main -j 6
 ```
 
