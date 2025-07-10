@@ -64,3 +64,8 @@ libs/secp256k1/*
 /cmake-build-debug-coverage/
 /cmake-build-release
 *.log
+boost_1_78_0.tar.bz2
+/build
+/boost_1_78_0
+/boost_install
+
