@@ -63,10 +63,57 @@ cmake -DCMAKE_BUILD_TYPE=Debug -DBoost_ROOT=/usr/ -DBoost_NO_SYSTEM_PATHS=ON -S 
 cmake --build build --target c2pool_main -j 6
 ```
 
+Essential to build default config.cfg file!
 UI Config:
 
 ```shell
+cd build/c2pool
 ./c2pool_main --ui_config
+```
+
+Configure RPC credentials manually:
+
+```shell
+cd build/c2pool
+# Create network config directory (for testnet)
+mkdir -p tLTC
+
+# Create config file with your Litecoin node RPC credentials
+cat > tLTC/config.cfg << EOF
+[General]
+testnet=true
+address=
+numaddresses=2
+timeaddresses=172800
+
+[coind]
+coind-address=127.0.0.1
+coind-p2p-port=19335
+coind-config-path=
+coind-rpc-ssl=false
+coind-rpc-port=19332
+coind_rpc_userpass=YOUR_RPC_USERNAME:YOUR_RPC_PASSWORD
+
+[pool]
+c2pool_port=3037
+max_conns=40
+outgoing_conns=6
+max_attempts=10
+
+[worker]
+worker_port=5027
+fee=0
+EOF
+
+# Edit the config file to add your actual RPC credentials
+nano tLTC/config.cfg
+```
+
+Get RPC credentials from your Litecoin node:
+
+```shell
+# Check your Litecoin config file for RPC credentials
+cat ~/.litecoin/litecoin.conf | grep -E "rpcuser|rpcpassword"
 ```
 
 Run:
