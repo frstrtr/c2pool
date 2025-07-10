@@ -63,3 +63,8 @@ vc140.pdb
 libs/secp256k1/*
 /cmake-build-debug-coverage/
 /cmake-build-release
+boost_1_78_0.tar.bz2
+/boost_1_78_0
+/build
+/boost_install
+*.log
