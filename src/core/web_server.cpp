@@ -393,24 +393,44 @@ MiningInterface::build_coinbase_parts(
     return { coinb1.str(), coinb2.str() };
 }
 
-// Very rough address → hash160 extraction (for demo purposes).
-// A real implementation must Base58Check-decode the address.
-// For LTC P2PKH the payload bytes are addresss[1..21].
-static std::string get_hash160_stub(const std::string& address)
+// Decode a Base58Check‐encoded address (P2PKH or P2SH) and return the
+// 20-byte hash160 payload as a 40-char lowercase hex string.
+// Returns "" if the address is invalid or the checksum fails.
+static std::string base58check_to_hash160(const std::string& address)
 {
-    // Derive a reproducible 20-byte value from the address string
-    // using a simple fold rather than proper Base58 decoding.
-    std::string h;
-    h.resize(40, '0');
-    for (size_t i = 0; i < address.size(); ++i) {
-        int idx = i % 20;
-        int existing = std::stoi(h.substr(idx * 2, 2), nullptr, 16);
-        existing ^= static_cast<unsigned char>(address[i]);
-        std::ostringstream s;
-        s << std::hex << std::setfill('0') << std::setw(2) << existing;
-        h.replace(idx * 2, 2, s.str());
+    static constexpr const char* B58 =
+        "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    // decoded[0..24]: 1 version byte + 20 hash160 bytes + 4 checksum bytes
+    uint8_t decoded[25] = {};
+    for (unsigned char ch : address) {
+        const char* p = std::strchr(B58, static_cast<char>(ch));
+        if (!p) return "";                      // invalid Base58 character
+        int carry = static_cast<int>(p - B58);
+        for (int i = 24; i >= 0; --i) {
+            carry += 58 * static_cast<int>(decoded[i]);
+            decoded[i] = static_cast<uint8_t>(carry & 0xFF);
+            carry >>= 8;
+        }
+        if (carry) return "";                   // value doesn't fit in 25 bytes
     }
-    return h;
+
+    // Verify checksum: SHA256d(decoded[0..20])[0..4] == decoded[21..24]
+    uint8_t tmp[32], chk[32];
+    CSHA256().Write(decoded, 21).Finalize(tmp);
+    CSHA256().Write(tmp, 32).Finalize(chk);
+    for (int i = 0; i < 4; ++i)
+        if (chk[i] != decoded[21 + i]) return "";  // bad checksum
+
+    // Return bytes [1..20] as 40-char hex (skip the version byte)
+    static const char* HEX = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(40);
+    for (int i = 1; i <= 20; ++i) {
+        hex += HEX[decoded[i] >> 4];
+        hex += HEX[decoded[i] & 0x0f];
+    }
+    return hex;
 }
 
 void MiningInterface::refresh_work()
@@ -431,20 +451,38 @@ void MiningInterface::refresh_work()
         // Compute Stratum merkle branches from those hashes
         auto merkle_branches = compute_merkle_branches(tx_hashes_hex);
 
-        // Build coinbase parts using block height + a minimal output
-        // (single output to coin value → placeholder hash160)
+        // Build coinbase parts with properly split payout outputs
         uint64_t coinbase_value = wd.m_data.value("coinbasevalue", uint64_t(5000000000));
         std::pair<std::string,std::string> cb_parts;
         try {
-            // Use the pool payout address if one is configured
-            std::string payout_addr = "pool_placeholder";
+            std::vector<std::pair<std::string,uint64_t>> outputs;
             if (m_payout_manager_ptr) {
-                auto dev_addr = m_payout_manager_ptr->get_developer_address();
-                if (!dev_addr.empty()) payout_addr = dev_addr;
+                auto alloc = m_payout_manager_ptr->calculate_payout(coinbase_value);
+                // Miner/pool portion → node-owner address (or developer address as fallback)
+                if (alloc.miner_amount > 0) {
+                    std::string addr = m_payout_manager_ptr->get_node_owner_address();
+                    if (addr.empty()) addr = m_payout_manager_ptr->get_developer_address();
+                    auto h160 = base58check_to_hash160(addr);
+                    if (!h160.empty())
+                        outputs.push_back({h160, alloc.miner_amount});
+                }
+                // Developer fee output
+                if (alloc.developer_amount > 0 && !alloc.developer_address.empty()) {
+                    auto h160 = base58check_to_hash160(alloc.developer_address);
+                    if (!h160.empty())
+                        outputs.push_back({h160, alloc.developer_amount});
+                }
+                // Node-owner fee output (separate if different address)
+                if (alloc.node_owner_amount > 0 && !alloc.node_owner_address.empty()) {
+                    auto h160 = base58check_to_hash160(alloc.node_owner_address);
+                    if (!h160.empty())
+                        outputs.push_back({h160, alloc.node_owner_amount});
+                }
             }
-            std::vector<std::pair<std::string,uint64_t>> outputs = {
-                { get_hash160_stub(payout_addr), coinbase_value }
-            };
+            // Fallback: single output to zero-key (burn) so coinbase is always valid
+            if (outputs.empty())
+                outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
+
             cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
@@ -1121,6 +1159,11 @@ bool WebServer::start()
 void WebServer::set_on_block_submitted(std::function<void(const std::string&)> fn)
 {
     mining_interface_->set_on_block_submitted(std::move(fn));
+}
+
+void WebServer::trigger_work_refresh()
+{
+    mining_interface_->refresh_work();
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)

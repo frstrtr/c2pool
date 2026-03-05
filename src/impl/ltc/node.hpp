@@ -90,6 +90,13 @@ public:
         for (auto& [nonce, peer] : m_peers)
             peer->write(message_bestblock::make_raw(header));
     }
+
+    /// Register a callback invoked whenever a bestblock message is received
+    /// from any peer (after relaying). Use this to trigger work refresh.
+    void set_on_bestblock(std::function<void()> fn) { m_on_bestblock = std::move(fn); }
+
+protected:
+    std::function<void()> m_on_bestblock;
 };
 
 struct HandleSharesData

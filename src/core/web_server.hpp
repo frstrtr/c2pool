@@ -265,6 +265,8 @@ public:
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
     // Forward block-found callback to the underlying MiningInterface
     void set_on_block_submitted(std::function<void(const std::string&)> fn);
+    // Immediately refresh the cached block template (call when a new block arrives)
+    void trigger_work_refresh();
 
 private:
     void accept_connections();

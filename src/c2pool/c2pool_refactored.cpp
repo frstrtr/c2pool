@@ -466,6 +466,12 @@ int main(int argc, char* argv[]) {
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
+            // When a peer announces a new best block, refresh our mining template
+            p2p_node->set_on_bestblock([&web_server]() {
+                web_server.trigger_work_refresh();
+                LOG_INFO << "bestblock received from P2P peer — work template refreshed";
+            });
+
             // When a block is successfully submitted, broadcast bestblock to all P2P peers
             web_server.set_on_block_submitted([&p2p_node](const std::string& header_hex) {
                 if (header_hex.size() < 160) return;
@@ -586,10 +592,21 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "  P2P Disabled: No sharechain exchange";
             LOG_INFO << "  Dependencies: Direct blockchain connection only";
             
+            // Coin daemon RPC for live block templates in solo mode
+            ltc::interfaces::Node  solo_coin_node;
+            auto solo_node_rpc = std::make_unique<ltc::coin::NodeRPC>(&ioc, &solo_coin_node, settings->m_testnet);
+            if (rpc_port == 19332 && !settings->m_testnet) rpc_port = 9332;
+            LOG_INFO << "Solo mode: connecting to coin daemon RPC at " << rpc_host << ":" << rpc_port;
+            solo_node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
+                                   rpc_user + ":" + rpc_pass);
+
             // Create a minimal web server for solo mining (Stratum only)
-            core::WebServer solo_server(ioc, http_host, 8083,  // Use default HTTP port since HTTP won't be used
+            core::WebServer solo_server(ioc, http_host, 8083,
                                        settings->m_testnet, nullptr, blockchain);
-            
+
+            // Wire coin daemon so solo Stratum gets live GBT + submitblock
+            solo_server.set_coin_rpc(solo_node_rpc.get(), &solo_coin_node);
+
             // Configure payout system for solo server
             solo_server.set_payout_manager(payout_manager.get());
             

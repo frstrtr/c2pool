@@ -194,7 +194,8 @@ void Legacy::HANDLER(bestblock)
         if (wpeer != peer)
             wpeer->write(message_bestblock::make_raw(msg->m_header));
     }
-    // TODO: Phase 2 — also notify the coin node to refresh getblocktemplate
+    // Notify local work-refresh callback (e.g. to re-fetch getblocktemplate)
+    if (m_on_bestblock) m_on_bestblock();
 }
 
 void Legacy::HANDLER(have_tx)
