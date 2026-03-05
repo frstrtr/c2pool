@@ -2,80 +2,106 @@
 
 #include <core/common.hpp>
 #include <core/hash.hpp>
+#include <core/random.hpp>
 #include <sharechain/prepared_list.hpp>
+
+#include <random>
 
 namespace ltc
 {
 
+static uint64_t make_random_nonce()
+{
+    std::mt19937_64 rng(std::random_device{}());
+    return rng();
+}
+
 void NodeImpl::send_ping(peer_ptr peer)
 {
-	auto rmsg = ltc::message_ping::make_raw();
-	peer->write(std::move(rmsg));
+        auto rmsg = ltc::message_ping::make_raw();
+        peer->write(std::move(rmsg));
 };
+
+void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
+{
+    // Let BaseNode create the peer and set up the timeout timer
+    base_t::connected(socket);
+
+    auto peer = m_connections[socket->get_addr()];
+    send_version(peer);
+}
+
+void NodeImpl::send_version(peer_ptr peer)
+{
+    auto rmsg = ltc::message_version::make_raw(
+        ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION,
+        1,                                    // services
+        addr_t{1, peer->addr()},              // addr_to (the remote)
+        addr_t{1, NetService{"0.0.0.0", ltc::PoolConfig::P2P_PORT}}, // addr_from (us)
+        m_nonce,
+        "/c2pool:0.1/",
+        1,                                    // mode (always 1 for legacy compat)
+        uint256::ZERO                         // best_share — filled after chain init
+    );
+    peer->write(std::move(rmsg));
+}
 
 pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 {
     LOG_DEBUG_POOL << "handle message_version";
-	std::unique_ptr<ltc::message_version> msg;
-	msg = ltc::message_version::make(rmsg->m_data);
-	
-	LOG_INFO << "Peer "
-		 << msg->m_addr_from.m_endpoint.to_string()
-		 << " says protocol version is "
-		 << msg->m_version
-		 << ", client version "
-		 << msg->m_subversion;
+        std::unique_ptr<ltc::message_version> msg;
+        msg = ltc::message_version::make(rmsg->m_data);
 
-	if (peer->m_other_version.has_value())
-	{
+        LOG_INFO << "Peer "
+                 << msg->m_addr_from.m_endpoint.to_string()
+                 << " says protocol version is "
+                 << msg->m_version
+                 << ", client version "
+                 << msg->m_subversion;
+
+        if (peer->m_other_version.has_value())
+        {
         LOG_DEBUG_POOL << "more than one version message";
-		throw std::runtime_error("more than one version message"); // TODO:
-	}
-	// TODO: 
-	// if (msg->version.get() < net->MINIMUM_PROTOCOL_VERSION)
-	// {
+                throw std::runtime_error("more than one version message"); // TODO:
+        }
+        // TODO: 
+        // if (msg->version.get() < net->MINIMUM_PROTOCOL_VERSION)
+        // {
     //     LOG_DEBUG_POOL << "peer too old";
-	// }
+        // }
 
-	peer->m_other_version = msg->m_version;
-	peer->m_other_subversion = msg->m_subversion;
-	peer->m_other_services = msg->m_services;
+        peer->m_other_version = msg->m_version;
+        peer->m_other_subversion = msg->m_subversion;
+        peer->m_other_services = msg->m_services;
 
-	if (m_nonce == msg->m_nonce)
-	{
-		LOG_WARNING << "was connected to self";
-		throw std::runtime_error("was connected to self"); //TODO:
-	}
+        if (m_nonce == msg->m_nonce)
+        {
+                LOG_WARNING << "was connected to self";
+                throw std::runtime_error("was connected to self"); //TODO:
+        }
 
-	if (m_peers.contains(msg->m_nonce))
-	{
-		std::string reason = "[handle_message_version] Detected duplicate connection, disconnecting from " + peer->addr().to_string();
-		LOG_ERROR << reason;
-		throw std::runtime_error(reason);
+        if (m_peers.contains(msg->m_nonce))
+        {
+                std::string reason = "[handle_message_version] Detected duplicate connection, disconnecting from " + peer->addr().to_string();
+                LOG_ERROR << reason;
+                throw std::runtime_error(reason);
         // TODO: handshake->error(libp2p::BAD_PEER, reason);
-	}
+        }
 
-	peer->m_nonce = msg->m_nonce;
-	m_peers[peer->m_nonce] = peer;
+        peer->m_nonce = msg->m_nonce;
+        m_peers[peer->m_nonce] = peer;
 
-	//TODO: if (p2p_node->advertise_ip):
-	//TODO:     раз в random.expovariate(1/100*len(p2p_node->peers.size()+1), отправляется sendAdvertisement()
+        // Request peers from the newly established connection
+        {
+            auto getaddrs_msg = ltc::message_getaddrs::make_raw(8);
+            peer->write(std::move(getaddrs_msg));
+        }
 
-	if (!msg->m_best_share.IsNull())
-	{
-		LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string() << " = " << msg->m_best_share.ToString();
-		// TODO: handle_share_hashes({best_hash}, handshake, handshake->get_addr());
-	}
-
-	// TODO: for what?
-	// if (coind_node->cur_share_version >= 34)
-    //     return;
-
-	// TODO: more events; send have_tx; etc...
-
-	// TODO: add rule for legacy/actual protocol
-    return pool::PeerConnectionType::legacy; 
-}
+        if (!msg->m_best_share.IsNull())
+        {
+                LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string() << " = " << msg->m_best_share.ToString();
+                // TODO: DownloadShareManager — request shares starting from best_share
+        }
     
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {

@@ -176,16 +176,25 @@ void Legacy::HANDLER(sharereply)
             auto share = ltc::load_share(rshare, peer->addr());
             result.push_back(share);
         }
-    } else 
-    {
-        //TODO: res = failure.Failure(self.ShareReplyError(result))
     }
-    //TODO: protocol->get_shares.got_response(msg->id.get(), res);
+    // Resolve the async request that originally sent the sharereq
+    got_share_reply(msg->m_id, result);
 }
 
 void Legacy::HANDLER(bestblock)
 {
+    auto header_hash = Hash(pack(msg->m_header).get_span());
+    LOG_INFO << "New best block from peer " << peer->addr().to_string()
+             << ": " << header_hash.ToString();
 
+    // Relay to all other connected peers so the block notification propagates
+    auto relay = message_bestblock::make_raw(msg->m_header);
+    for (auto& [nonce, wpeer] : m_peers)
+    {
+        if (wpeer != peer)
+            wpeer->write(message_bestblock::make_raw(msg->m_header));
+    }
+    // TODO: Phase 2 — also notify the coin node to refresh getblocktemplate
 }
 
 void Legacy::HANDLER(have_tx)

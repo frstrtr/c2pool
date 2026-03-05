@@ -8,7 +8,10 @@
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
+#include <core/reply_matcher.hpp>
 #include <sharechain/prepared_list.hpp>
+
+#include <random>
 
 namespace ltc
 {
@@ -16,25 +19,71 @@ struct HandleSharesData;
 
 class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
+    // Async share downloader:
+    // ID = uint256 (matches sharereq id to sharereply id)
+    // RESPONSE = vector<ShareType>
+    // REQUEST args: req_id, peer, hashes, parents, stops
+    using share_getter_t = ReplyMatcher::ID<uint256>
+        ::RESPONSE<std::vector<ltc::ShareType>>
+        ::REQUEST<uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>>;
+
 protected:
     ltc::Handler m_handler;
-    
+    share_getter_t m_share_getter;
+
 public:
-    NodeImpl() {}
-    NodeImpl(boost::asio::io_context* ctx, config_t* config) : base_t(ctx, config) {}
+    NodeImpl()
+        : m_share_getter(nullptr,
+            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){}) {}
+
+    NodeImpl(boost::asio::io_context* ctx, config_t* config)
+        : base_t(ctx, config),
+          m_share_getter(ctx,
+            [](uint256 req_id, peer_ptr to_peer,
+               std::vector<uint256> hashes, uint64_t parents,
+               std::vector<uint256> stops)
+            {
+                auto rmsg = ltc::message_sharereq::make_raw(req_id, hashes, parents, stops);
+                to_peer->write(std::move(rmsg));
+            })
+    {
+        // Seed addr store with hardcoded bootstrap peers
+        m_addrs.load(config->pool()->m_bootstrap_addrs);
+        // Randomise our nonce so we detect self-connections
+        std::mt19937_64 rng(std::random_device{}());
+        m_nonce = rng();
+    }
 
     // INetwork:
     void disconnect() override { }
+    void connected(std::shared_ptr<core::Socket> socket) override;
 
     // BaseNode:
     void send_ping(peer_ptr peer) override;
     pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
-    
+
     // ltc
+    void send_version(peer_ptr peer);
     void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
+
+    // Async share download — response delivered to callback when sharereply arrives
+    void request_shares(uint256 id, peer_ptr peer,
+                        std::vector<uint256> hashes, uint64_t parents,
+                        std::vector<uint256> stops,
+                        std::function<void(std::vector<ltc::ShareType>)> callback)
+    {
+        m_share_getter.request(id, callback, id, peer, hashes, parents, stops);
+    }
+
+    // Called from HANDLER(sharereply) to complete a pending async request
+    void got_share_reply(uint256 id, std::vector<ltc::ShareType> shares)
+    {
+        try { m_share_getter.got_response(id, shares); }
+        catch (const std::invalid_argument&) { /* request already timed out */ }
+    }
+
     // TODO: rename to processing_get_share
     std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
-
 };
 
 struct HandleSharesData
