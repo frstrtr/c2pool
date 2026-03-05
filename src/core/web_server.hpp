@@ -158,11 +158,23 @@ public:
     void refresh_work();
     // Return the most recently cached block template (empty json if unavailable)
     nlohmann::json get_current_work_template() const;
-    // Return cached per-transaction hashes (for Stratum merkle branches)
-    std::vector<std::string> get_cached_tx_hashes() const;
+    // Return Stratum-ready merkle branch hashes
+    std::vector<std::string> get_stratum_merkle_branches() const;
+    // Return coinb1 and coinb2 (coinbase parts split around extranonce)
+    std::pair<std::string, std::string> get_coinbase_parts() const;
+
+    // Callback fired whenever a block is successfully forwarded to the coin daemon.
+    // The argument is the header in hex (first 80 bytes = 160 hex chars of the submitted block).
+    void set_on_block_submitted(std::function<void(const std::string& header_hex)> fn);
 
 private:
     void setup_methods();
+    // Build Stratum-compatible coinb1/coinb2 from a live block template
+    static std::pair<std::string, std::string> build_coinbase_parts(
+        const nlohmann::json& tmpl, uint64_t coinbase_value,
+        const std::vector<std::pair<std::string,uint64_t>>& outputs);
+    // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
+    static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     
     // Internal state
     uint64_t m_work_id_counter;
@@ -186,8 +198,13 @@ private:
     ltc::interfaces::Node*  m_coin_node = nullptr;
     std::atomic<bool>       m_work_valid{false};
     nlohmann::json          m_cached_template;
-    std::vector<std::string> m_cached_tx_hashes;
+    std::vector<std::string> m_cached_merkle_branches;   // Stratum merkle branches
+    std::string             m_cached_coinb1;
+    std::string             m_cached_coinb2;
     mutable std::mutex      m_work_mutex;
+
+    // Block-found callback
+    std::function<void(const std::string&)> m_on_block_submitted;
 };
 
 /// Main Web Server class
@@ -246,6 +263,8 @@ public:
 
     // Wire a live coin-daemon RPC connection for block template generation
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
+    // Forward block-found callback to the underlying MiningInterface
+    void set_on_block_submitted(std::function<void(const std::string&)> fn);
 
 private:
     void accept_connections();

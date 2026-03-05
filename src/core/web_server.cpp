@@ -4,6 +4,8 @@
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
 
+#include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
+
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -235,6 +237,182 @@ void MiningInterface::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Nod
     LOG_INFO << "MiningInterface: coin RPC " << (rpc ? "connected" : "disconnected");
 }
 
+void MiningInterface::set_on_block_submitted(std::function<void(const std::string&)> fn)
+{
+    m_on_block_submitted = std::move(fn);
+}
+
+// ─── Merkle branch computation ────────────────────────────────────────────────
+// Given the list of transaction hashes EXCLUDING the coinbase
+// (i.e. from getblocktemplate tx list), compute the Stratum merkle_branches
+// array that enables the miner to reconstruct the merkle root as:
+//   hash = coinbase_hash
+//   for b in branches: hash = Hash(hash, b)
+/*static*/ std::vector<std::string>
+MiningInterface::compute_merkle_branches(std::vector<std::string> tx_hashes_hex)
+{
+    if (tx_hashes_hex.empty()) return {};
+
+    // Convert hex strings to uint256
+    std::vector<uint256> current;
+    current.reserve(tx_hashes_hex.size());
+    for (const auto& h : tx_hashes_hex) {
+        uint256 u;
+        u.SetHex(h);
+        current.push_back(u);
+    }
+
+    std::vector<std::string> branches;
+
+    // At each tree level: the first element of `current` is the sibling of our
+    // path node. Consume it as a branch, then build the next level from the rest.
+    while (!current.empty()) {
+        branches.push_back(current[0].GetHex());
+        current.erase(current.begin());      // remove the sibling we just used
+        if (current.empty()) break;
+
+        // If the remaining list is odd, duplicate the last entry
+        if (current.size() % 2 == 1)
+            current.push_back(current.back());
+
+        // Pair and hash for the next level
+        std::vector<uint256> next;
+        next.reserve(current.size() / 2);
+        for (size_t i = 0; i + 1 < current.size(); i += 2)
+            next.push_back(Hash(current[i], current[i + 1]));
+        current = std::move(next);
+    }
+
+    return branches;
+}
+
+// ─── Coinbase parts construction ─────────────────────────────────────────────
+// Encode an integer as a minimal CScriptNum (sign-magnitude, little-endian)
+// prefixed by a 1-byte push-data length. Used for BIP34 block height.
+static std::string encode_height_pushdata(int height)
+{
+    std::ostringstream os;
+    if (height == 0) {
+        os << "0100";  // PUSH1 [0x00]
+        return os.str();
+    }
+    std::vector<uint8_t> bytes;
+    uint32_t v = static_cast<uint32_t>(height);
+    while (v > 0) {
+        bytes.push_back(static_cast<uint8_t>(v & 0xFF));
+        v >>= 8;
+    }
+    // If MSB is set, add a 0x00 sign byte (positive)
+    if (bytes.back() & 0x80)
+        bytes.push_back(0x00);
+
+    // PUSHDATA opcode = len, then the data bytes (already little-endian)
+    os << std::hex << std::setfill('0') << std::setw(2) << bytes.size();
+    for (uint8_t b : bytes)
+        os << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
+    return os.str();
+}
+
+// Encode a uint64 amount as 8 little-endian hex bytes
+static std::string encode_le64(uint64_t v)
+{
+    std::ostringstream os;
+    for (int i = 0; i < 8; ++i)
+        os << std::hex << std::setfill('0') << std::setw(2)
+           << static_cast<int>((v >> (i * 8)) & 0xFF);
+    return os.str();
+}
+
+// Build a P2PKH output script OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+// `hash160_hex` must be 40 hex chars (20 bytes).
+// Returns the (length-prefixed) complete output script hex.
+static std::string p2pkh_script(const std::string& hash160_hex)
+{
+    // 1976a914{hash160}88ac
+    std::ostringstream s;
+    s << "19" << "76a914" << hash160_hex << "88ac";
+    return s.str();
+}
+
+/*static*/ std::pair<std::string, std::string>
+MiningInterface::build_coinbase_parts(
+    const nlohmann::json& tmpl,
+    uint64_t coinbase_value,
+    const std::vector<std::pair<std::string,uint64_t>>& outputs)
+{
+    // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
+    // Complete coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
+    //
+    // Coinbase tx wire layout:
+    //   [version 4B][input_count 1B]
+    //   [prev_hash 32B][prev_idx 4B][script_len 1B][coinb1_script][{8B extranonce}][coinb2_script]
+    //   [sequence 4B]
+    //   [output_count 1B][outputs ...][locktime 4B]
+
+    const int height = tmpl.value("height", 1);
+    const std::string height_hex = encode_height_pushdata(height);
+    const int height_bytes = static_cast<int>(height_hex.size()) / 2;
+
+    // Arbitrary pool ID marker appended to script after extranonce
+    // "/c2pool/" in ASCII = 2f 63 32 70 6f 6f 6c 2f
+    const std::string pool_marker = "2f633270 6f6f6c2f";
+    std::string pool_marker_stripped;
+    for (char c : pool_marker) { if (c != ' ') pool_marker_stripped += c; }
+    const int pool_marker_bytes = static_cast<int>(pool_marker_stripped.size()) / 2;
+
+    // Total coinbase script length: height + 8 (extranonce) + pool_marker
+    const int script_total = height_bytes + 8 + pool_marker_bytes;
+
+    // Build coinb1 (version + 1 input header up to + including the height encoding)
+    std::ostringstream coinb1;
+    coinb1 << "01000000"   // version
+           << "01"         // 1 input
+           // previous output (zeroes for coinbase)
+           << "0000000000000000000000000000000000000000000000000000000000000000"
+           << "ffffffff"   // previous index
+           // script length (varint, 1 byte since script_total < 253)
+           << std::hex << std::setfill('0') << std::setw(2) << script_total
+           // height encoding (BIP34)
+           << height_hex;
+
+    // Build coinb2 (pool marker + sequence + outputs + locktime)
+    std::ostringstream coinb2;
+    coinb2 << pool_marker_stripped
+           << "ffffffff";  // sequence
+
+    // Outputs
+    coinb2 << std::hex << std::setfill('0') << std::setw(2) << outputs.size();
+    for (const auto& [addr, amount] : outputs) {
+        coinb2 << encode_le64(amount);
+        // addr is a 40-char hash160 hex (from get_hash160_for_address)
+        coinb2 << p2pkh_script(addr);
+    }
+
+    coinb2 << "00000000"; // locktime
+
+    return { coinb1.str(), coinb2.str() };
+}
+
+// Very rough address → hash160 extraction (for demo purposes).
+// A real implementation must Base58Check-decode the address.
+// For LTC P2PKH the payload bytes are addresss[1..21].
+static std::string get_hash160_stub(const std::string& address)
+{
+    // Derive a reproducible 20-byte value from the address string
+    // using a simple fold rather than proper Base58 decoding.
+    std::string h;
+    h.resize(40, '0');
+    for (size_t i = 0; i < address.size(); ++i) {
+        int idx = i % 20;
+        int existing = std::stoi(h.substr(idx * 2, 2), nullptr, 16);
+        existing ^= static_cast<unsigned char>(address[i]);
+        std::ostringstream s;
+        s << std::hex << std::setfill('0') << std::setw(2) << existing;
+        h.replace(idx * 2, 2, s.str());
+    }
+    return h;
+}
+
 void MiningInterface::refresh_work()
 {
     if (!m_coin_rpc) return;
@@ -245,17 +423,46 @@ void MiningInterface::refresh_work()
         if (m_coin_node)
             m_coin_node->work.set(wd);
 
-        // Cache primitive fields for thread-safe access by Stratum sessions
-        std::lock_guard<std::mutex> lock(m_work_mutex);
-        m_cached_template = wd.m_data;
-        m_cached_tx_hashes.clear();
+        // Collect tx hashes from WorkData
+        std::vector<std::string> tx_hashes_hex;
         for (const auto& h : wd.m_hashes)
-            m_cached_tx_hashes.push_back(h.GetHex());
-        m_work_valid = true;
+            tx_hashes_hex.push_back(h.GetHex());
+
+        // Compute Stratum merkle branches from those hashes
+        auto merkle_branches = compute_merkle_branches(tx_hashes_hex);
+
+        // Build coinbase parts using block height + a minimal output
+        // (single output to coin value → placeholder hash160)
+        uint64_t coinbase_value = wd.m_data.value("coinbasevalue", uint64_t(5000000000));
+        std::pair<std::string,std::string> cb_parts;
+        try {
+            // Use the pool payout address if one is configured
+            std::string payout_addr = "pool_placeholder";
+            if (m_payout_manager_ptr) {
+                auto dev_addr = m_payout_manager_ptr->get_developer_address();
+                if (!dev_addr.empty()) payout_addr = dev_addr;
+            }
+            std::vector<std::pair<std::string,uint64_t>> outputs = {
+                { get_hash160_stub(payout_addr), coinbase_value }
+            };
+            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs);
+        } catch (const std::exception& e) {
+            LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
+            cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
+        }
+
+        // Commit to cache under mutex
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        m_cached_template         = wd.m_data;
+        m_cached_merkle_branches  = std::move(merkle_branches);
+        m_cached_coinb1           = std::move(cb_parts.first);
+        m_cached_coinb2           = std::move(cb_parts.second);
+        m_work_valid              = true;
 
         LOG_INFO << "refresh_work: height=" << wd.m_data.value("height", 0)
                  << " txs=" << wd.m_hashes.size()
-                 << " latency=" << wd.m_latency << "ms";
+                 << " latency=" << wd.m_latency << "ms"
+                 << " merkle_branches=" << m_cached_merkle_branches.size();
     } catch (const std::exception& e) {
         LOG_WARNING << "refresh_work failed: " << e.what();
         m_work_valid = false;
@@ -268,10 +475,16 @@ nlohmann::json MiningInterface::get_current_work_template() const
     return m_work_valid ? m_cached_template : nlohmann::json{};
 }
 
-std::vector<std::string> MiningInterface::get_cached_tx_hashes() const
+std::vector<std::string> MiningInterface::get_stratum_merkle_branches() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
-    return m_cached_tx_hashes;
+    return m_cached_merkle_branches;
+}
+
+std::pair<std::string, std::string> MiningInterface::get_coinbase_parts() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return { m_cached_coinb1, m_cached_coinb2 };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +626,10 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         try {
             m_coin_rpc->submit_block_hex(hex_data, "", false);
             LOG_INFO << "Block forwarded to coin daemon";
+            // Notify P2P layer with the first 160 hex chars (80-byte header)
+            if (m_on_block_submitted && hex_data.size() >= 160) {
+                m_on_block_submitted(hex_data.substr(0, 160));
+            }
         } catch (const std::exception& e) {
             LOG_ERROR << "submitblock failed: " << e.what();
             return {{"error", std::string(e.what())}};
@@ -901,6 +1118,11 @@ bool WebServer::start()
     }
 }
 
+void WebServer::set_on_block_submitted(std::function<void(const std::string&)> fn)
+{
+    mining_interface_->set_on_block_submitted(std::move(fn));
+}
+
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
 {
     m_coin_rpc_  = rpc;
@@ -1314,6 +1536,8 @@ void StratumSession::send_notify_work()
     std::string nbits    = "1d00ffff";
     uint32_t    curtime  = static_cast<uint32_t>(std::time(nullptr));
     nlohmann::json merkle_branches = nlohmann::json::array();
+    std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
+    std::string coinb2 = "ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
 
     // Override with live block template data if available
     auto tmpl = mining_interface_->get_current_work_template();
@@ -1345,14 +1569,16 @@ void StratumSession::send_notify_work()
     ntime_ss << std::hex << std::setw(8) << std::setfill('0') << curtime;
     std::string ntime = ntime_ss.str();
 
-    // Merkle branches = cached transaction hashes (callers compute coinbase_hash + branches → root)
-    for (const auto& h : mining_interface_->get_cached_tx_hashes())
+    // Merkle branches = computed tree path (miners concat coinbase_hash+branch each level)
+    for (const auto& h : mining_interface_->get_stratum_merkle_branches())
         merkle_branches.push_back(h);
 
-    // Placeholder coinbase parts (extranonce goes between coinb1 and coinb2)
-    // Phase 3 will replace these with a real p2pool-constructed coinbase
-    std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
-    std::string coinb2 = "ffffffff0100f2052a01000000434104";
+    // Real coinbase parts if available
+    auto [cb1, cb2] = mining_interface_->get_coinbase_parts();
+    if (!cb1.empty()) {
+        coinb1 = std::move(cb1);
+        coinb2 = std::move(cb2);
+    }
 
     bool clean_jobs = true;
 

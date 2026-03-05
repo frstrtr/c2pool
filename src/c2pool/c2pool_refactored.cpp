@@ -459,6 +459,50 @@ int main(int argc, char* argv[]) {
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             web_server.set_coin_rpc(node_rpc.get(), &coin_node);
             
+            // Start P2P sharechain node for broadcasting new best-blocks to peers
+            auto ltc_p2p_config = std::make_unique<ltc::Config>("ltc");
+            ltc_p2p_config->m_testnet = settings->m_testnet;
+            auto p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
+            p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
+            LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
+
+            // When a block is successfully submitted, broadcast bestblock to all P2P peers
+            web_server.set_on_block_submitted([&p2p_node](const std::string& header_hex) {
+                if (header_hex.size() < 160) return;
+                // Parse the 80-byte Bitcoin wire-format block header
+                auto hb = [&](int i) -> uint8_t {
+                    auto d = [](char c) -> uint8_t {
+                        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+                        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+                        return static_cast<uint8_t>(c - 'A' + 10);
+                    };
+                    return static_cast<uint8_t>((d(header_hex[2*i]) << 4) | d(header_hex[2*i+1]));
+                };
+                auto le32 = [&](int off) -> uint32_t {
+                    return hb(off) | (hb(off+1) << 8) | (hb(off+2) << 16) | (hb(off+3) << 24);
+                };
+                // Reverse 32 wire-format bytes into a display-order hex string for SetHex()
+                auto wire32_to_hex = [&](int off) -> std::string {
+                    std::string s; s.reserve(64);
+                    static const char* hex_chars = "0123456789abcdef";
+                    for (int b = 31; b >= 0; --b) {
+                        uint8_t byte = hb(off + b);
+                        s += hex_chars[byte >> 4];
+                        s += hex_chars[byte & 0xf];
+                    }
+                    return s;
+                };
+                ltc::coin::BlockHeaderType hdr;
+                hdr.m_version   = le32(0);
+                hdr.m_previous_block.SetHex(wire32_to_hex(4));
+                hdr.m_merkle_root.SetHex(wire32_to_hex(36));
+                hdr.m_timestamp = le32(68);
+                hdr.m_bits      = le32(72);
+                hdr.m_nonce     = le32(76);
+                p2p_node->broadcast_bestblock(hdr);
+                LOG_INFO << "Broadcast bestblock to P2P peers (nonce=" << hdr.m_nonce << ")";
+            });
+            
             // Configure payout system for web server
             web_server.set_payout_manager(payout_manager.get());
             
