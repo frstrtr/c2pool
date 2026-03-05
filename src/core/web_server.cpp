@@ -1,5 +1,9 @@
 #include "web_server.hpp"
 
+// Real coin daemon RPC (optional - only linked when set_coin_rpc() is called)
+#include <impl/ltc/coin/rpc.hpp>
+#include <impl/ltc/coin/node_interface.hpp>
+
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -222,6 +226,56 @@ void MiningInterface::setup_methods()
     }));
 }
 
+// ─── Live coin-daemon integration ────────────────────────────────────────────
+
+void MiningInterface::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
+{
+    m_coin_rpc  = rpc;
+    m_coin_node = coin;
+    LOG_INFO << "MiningInterface: coin RPC " << (rpc ? "connected" : "disconnected");
+}
+
+void MiningInterface::refresh_work()
+{
+    if (!m_coin_rpc) return;
+    try {
+        auto wd = m_coin_rpc->getwork();
+
+        // Update the coin node's Variable<WorkData> so submit_block() can read it
+        if (m_coin_node)
+            m_coin_node->work.set(wd);
+
+        // Cache primitive fields for thread-safe access by Stratum sessions
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        m_cached_template = wd.m_data;
+        m_cached_tx_hashes.clear();
+        for (const auto& h : wd.m_hashes)
+            m_cached_tx_hashes.push_back(h.GetHex());
+        m_work_valid = true;
+
+        LOG_INFO << "refresh_work: height=" << wd.m_data.value("height", 0)
+                 << " txs=" << wd.m_hashes.size()
+                 << " latency=" << wd.m_latency << "ms";
+    } catch (const std::exception& e) {
+        LOG_WARNING << "refresh_work failed: " << e.what();
+        m_work_valid = false;
+    }
+}
+
+nlohmann::json MiningInterface::get_current_work_template() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_work_valid ? m_cached_template : nlohmann::json{};
+}
+
+std::vector<std::string> MiningInterface::get_cached_tx_hashes() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_tx_hashes;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 nlohmann::json MiningInterface::getwork(const std::string& request_id)
 {
     LOG_INFO << "getwork request received";
@@ -322,11 +376,19 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
 nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, const std::string& request_id)
 {
     LOG_INFO << "getblocktemplate request received";
-    
-    // TODO: Get actual block template from coin node
-    nlohmann::json block_template = {
+
+    // Return live template if available
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (m_work_valid && !m_cached_template.empty())
+            return m_cached_template;
+    }
+
+    // Fallback: static placeholder so callers always get a valid JSON object
+    LOG_WARNING << "getblocktemplate: no live template yet, returning placeholder";
+    return {
         {"version", 536870912},
-        {"previousblockhash", "00000000000000000000000000000000000000000000000000000000000000000"},
+        {"previousblockhash", "0000000000000000000000000000000000000000000000000000000000000000"},
         {"transactions", nlohmann::json::array()},
         {"coinbaseaux", nlohmann::json::object()},
         {"coinbasevalue", 5000000000LL},
@@ -341,19 +403,25 @@ nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, c
         {"height", 1},
         {"rules", nlohmann::json::array({"segwit"})}
     };
-    
-    return block_template;
 }
 
 nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
 {
     LOG_INFO << "Block submission received - size: " << hex_data.length() << " chars";
-    
-    // TODO: Validate and submit block to coin node
-    // For now, return null (success)
-    
-    LOG_INFO << "Block submission accepted";
-    return nullptr;
+
+    if (m_coin_rpc) {
+        try {
+            m_coin_rpc->submit_block_hex(hex_data, "", false);
+            LOG_INFO << "Block forwarded to coin daemon";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "submitblock failed: " << e.what();
+            return {{"error", std::string(e.what())}};
+        }
+    } else {
+        LOG_WARNING << "submitblock: no coin RPC connected, block discarded";
+    }
+
+    return nullptr; // null = accepted in getblocktemplate spec
 }
 
 nlohmann::json MiningInterface::getinfo(const std::string& request_id)
@@ -806,6 +874,23 @@ bool WebServer::start()
         if (stratum_port_ > 0) {
             start_stratum_server();
         }
+
+        // If a coin RPC is connected, schedule a recurring work-refresh timer
+        if (m_coin_rpc_) {
+            auto timer = std::make_shared<net::steady_timer>(ioc_);
+            // Use a shared_ptr<function> so the lambda can reschedule itself
+            auto fn = std::make_shared<std::function<void(beast::error_code)>>();
+            *fn = [this, timer, fn](beast::error_code ec) {
+                if (ec || !running_) return;
+                try { mining_interface_->refresh_work(); } catch (...) {}
+                timer->expires_after(std::chrono::seconds(5));
+                timer->async_wait(*fn);
+            };
+            // First poll after a short delay to let the io_context settle
+            timer->expires_after(std::chrono::milliseconds(500));
+            timer->async_wait(*fn);
+            LOG_INFO << "Work-refresh timer scheduled (every 5 s)";
+        }
         
         running_ = true;
         return true;
@@ -814,6 +899,14 @@ bool WebServer::start()
         LOG_ERROR << "Failed to start WebServer: " << e.what();
         return false;
     }
+}
+
+void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
+{
+    m_coin_rpc_  = rpc;
+    m_coin_node_ = coin;
+    mining_interface_->set_coin_rpc(rpc, coin);
+    LOG_INFO << "WebServer: coin RPC " << (rpc ? "attached" : "detached");
 }
 
 bool WebServer::start_solo()
@@ -1212,22 +1305,62 @@ void StratumSession::send_notify_work()
     nlohmann::json notification;
     notification["id"] = nullptr;
     notification["method"] = "mining.notify";
-    
-    // Generate mock work (in real implementation, get from mining interface)
-    std::string job_id = "job_" + std::to_string(job_counter_.fetch_add(1));
+
+    std::string job_id  = "job_" + std::to_string(job_counter_.fetch_add(1));
+
+    // Defaults (used when no live template is available yet)
     std::string prevhash = "0000000000000000000000000000000000000000000000000000000000000000";
+    std::string version  = "00000001";
+    std::string nbits    = "1d00ffff";
+    uint32_t    curtime  = static_cast<uint32_t>(std::time(nullptr));
+    nlohmann::json merkle_branches = nlohmann::json::array();
+
+    // Override with live block template data if available
+    auto tmpl = mining_interface_->get_current_work_template();
+    if (!tmpl.empty() && !tmpl.is_null()) {
+        if (tmpl.contains("previousblockhash"))
+            prevhash = tmpl["previousblockhash"].get<std::string>();
+
+        if (tmpl.contains("version")) {
+            std::ostringstream ss;
+            ss << std::hex << std::setw(8) << std::setfill('0')
+               << tmpl["version"].get<int>();
+            version = ss.str();
+        }
+
+        if (tmpl.contains("bits"))
+            nbits = tmpl["bits"].get<std::string>();
+
+        if (tmpl.contains("curtime"))
+            curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());
+
+        LOG_INFO << "send_notify_work: live template height="
+                 << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
+    } else {
+        LOG_WARNING << "send_notify_work: no live template, using placeholder work";
+    }
+
+    // Encode curtime as 8-hex-char (4-byte big-endian)
+    std::ostringstream ntime_ss;
+    ntime_ss << std::hex << std::setw(8) << std::setfill('0') << curtime;
+    std::string ntime = ntime_ss.str();
+
+    // Merkle branches = cached transaction hashes (callers compute coinbase_hash + branches → root)
+    for (const auto& h : mining_interface_->get_cached_tx_hashes())
+        merkle_branches.push_back(h);
+
+    // Placeholder coinbase parts (extranonce goes between coinb1 and coinb2)
+    // Phase 3 will replace these with a real p2pool-constructed coinbase
     std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
     std::string coinb2 = "ffffffff0100f2052a01000000434104";
-    std::string merkle_branches = nlohmann::json::array().dump();
-    std::string version = "00000001";
-    std::string nbits = "1d00ffff";
-    std::string ntime = std::to_string(static_cast<uint32_t>(std::time(nullptr)));
+
     bool clean_jobs = true;
-    
+
     notification["params"] = nlohmann::json::array({
-        job_id, prevhash, coinb1, coinb2, merkle_branches, version, nbits, ntime, clean_jobs
+        job_id, prevhash, coinb1, coinb2, merkle_branches,
+        version, nbits, ntime, clean_jobs
     });
-    
+
     send_response(notification);
 }
 

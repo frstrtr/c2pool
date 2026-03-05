@@ -5,6 +5,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
@@ -27,6 +28,10 @@ using Blockchain = c2pool::address::Blockchain;
 using Network = c2pool::address::Network;
 using AddressValidationResult = c2pool::address::AddressValidationResult;
 using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
+
+// Forward declarations for optional coin daemon integration (avoid layering violation)
+namespace ltc { namespace coin { class NodeRPC; } }
+namespace ltc { namespace interfaces { struct Node; } }
 
 namespace core {
 
@@ -147,6 +152,15 @@ public:
     void set_payout_manager(c2pool::payout::PayoutManager* manager) { m_payout_manager_ptr = manager; }
     c2pool::payout::PayoutManager* get_payout_manager_ptr() const { return m_payout_manager_ptr; }
 
+    // Wire a live coin-daemon RPC connection so getblocktemplate/submitblock use real data
+    void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
+    // Fetch a fresh block template from the coin daemon and cache it
+    void refresh_work();
+    // Return the most recently cached block template (empty json if unavailable)
+    nlohmann::json get_current_work_template() const;
+    // Return cached per-transaction hashes (for Stratum merkle branches)
+    std::vector<std::string> get_cached_tx_hashes() const;
+
 private:
     void setup_methods();
     
@@ -166,10 +180,14 @@ private:
     
     // Payout system integration
     c2pool::payout::PayoutManager* m_payout_manager_ptr = nullptr;
-    
-    // TODO: Add connections to actual mining node and coin interface
-    // std::shared_ptr<Node> m_node;
-    // std::shared_ptr<CoinInterface> m_coin;
+
+    // Real coin daemon connection (replaces mock LitecoinRpcClient)
+    ltc::coin::NodeRPC*     m_coin_rpc  = nullptr;
+    ltc::interfaces::Node*  m_coin_node = nullptr;
+    std::atomic<bool>       m_work_valid{false};
+    nlohmann::json          m_cached_template;
+    std::vector<std::string> m_cached_tx_hashes;
+    mutable std::mutex      m_work_mutex;
 };
 
 /// Main Web Server class
@@ -190,9 +208,13 @@ class WebServer
     // Solo mining configuration
     bool solo_mode_;
     std::string solo_address_;
-    
+
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
+
+    // Optional coin daemon RPC (enables real getblocktemplate + submitblock)
+    ltc::coin::NodeRPC*    m_coin_rpc_  = nullptr;
+    ltc::interfaces::Node* m_coin_node_ = nullptr;
     
 public:
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
@@ -221,6 +243,9 @@ public:
     bool is_stratum_running() const;
     void set_stratum_port(uint16_t port);
     uint16_t get_stratum_port() const;
+
+    // Wire a live coin-daemon RPC connection for block template generation
+    void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
 
 private:
     void accept_connections();

@@ -36,6 +36,10 @@
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 
+// Coin daemon RPC
+#include <impl/ltc/coin/rpc.hpp>
+#include <impl/ltc/coin/node_interface.hpp>
+
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 
@@ -141,6 +145,12 @@ void print_help() {
     std::cout << "  --http-port PORT          HTTP/JSON-RPC API port (default: 8083)\n";
     std::cout << "  --stratum-port PORT       Stratum mining port (default: 8084)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
+
+    std::cout << "COIN DAEMON RPC (for live block templates):\n";
+    std::cout << "  --rpchost HOST            Coin daemon RPC host (default: 127.0.0.1)\n";
+    std::cout << "  --rpcport PORT            Coin daemon RPC port (default: 19332 testnet / 9332 mainnet)\n";
+    std::cout << "  --rpcuser USER            Coin daemon RPC username (default: user)\n";
+    std::cout << "  --rpcpassword PASS        Coin daemon RPC password (default: password)\n\n";
     
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -218,6 +228,12 @@ int main(int argc, char* argv[]) {
     int http_port = 8083;          // HTTP/JSON-RPC API port
     int stratum_port = 8084;       // Stratum mining port (temporarily 8084 for current miners)
     std::string http_host = "0.0.0.0";  // HTTP server host
+
+    // Coin daemon RPC connection (used by integrated/solo modes for live block templates)
+    std::string rpc_host = "127.0.0.1";
+    int         rpc_port = 19332;       // LTC testnet default; mainnet = 9332
+    std::string rpc_user = "user";
+    std::string rpc_pass = "password";
     
     std::string config_file;
     std::string solo_address;
@@ -299,6 +315,19 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--no-auto-detect-wallet") {
             auto_detect_wallet = false;
+        }
+        // Coin daemon RPC credentials
+        else if (arg == "--rpchost" && i + 1 < argc) {
+            rpc_host = argv[++i];
+        }
+        else if (arg == "--rpcport" && i + 1 < argc) {
+            rpc_port = std::stoi(argv[++i]);
+        }
+        else if (arg == "--rpcuser" && i + 1 < argc) {
+            rpc_user = argv[++i];
+        }
+        else if (arg == "--rpcpassword" && i + 1 < argc) {
+            rpc_pass = argv[++i];
         }
         // Legacy support for old --port option (maps to p2p-port)
         else if (arg == "--port" && i + 1 < argc) {
@@ -410,9 +439,25 @@ int main(int argc, char* argv[]) {
             // Create enhanced node with default constructor to avoid nullptr issues
             auto enhanced_node = std::make_shared<c2pool::node::EnhancedC2PoolNode>();
             
+            // Set up coin daemon RPC for live block template generation.
+            // The coin_node is kept alive for the duration of the integrated mode loop.
+            ltc::interfaces::Node  coin_node;
+            auto node_rpc = std::make_unique<ltc::coin::NodeRPC>(&ioc, &coin_node, settings->m_testnet);
+
+            // Adjust default RPC port based on testnet flag when user didn't override
+            if (rpc_port == 19332 && !settings->m_testnet)
+                rpc_port = 9332; // mainnet LTC
+
+            LOG_INFO << "Connecting to coin daemon RPC at " << rpc_host << ":" << rpc_port;
+            node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
+                              rpc_user + ":" + rpc_pass);
+
             // Create web server with explicit port configuration
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, nullptr, blockchain);
+            
+            // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
+            web_server.set_coin_rpc(node_rpc.get(), &coin_node);
             
             // Configure payout system for web server
             web_server.set_payout_manager(payout_manager.get());
