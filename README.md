@@ -9,6 +9,21 @@ Bitcointalk forum thread - https://bitcointalk.org/index.php?topic=18313
 
 Some technical details - https://bitcointalk.org/index.php?topic=457574
 
+---
+
+## ⚡ Want a Working Pool Right Now?
+
+C2Pool (C++ rewrite) is actively under development. While it matures, **fully functional and live p2pool implementations** are available in these repositories:
+
+| Repository | Coins | Status |
+|---|---|---|
+| [**frstrtr/p2pool-merged-v36**](https://github.com/frstrtr/p2pool-merged-v36) | Litecoin · DigiByte · Dogecoin (merged mining) | ✅ Live — V36 share format, Docker, multichain dashboard |
+| [**frstrtr/p2pool-dash**](https://github.com/frstrtr/p2pool-dash) | Dash | ✅ Live — decentralized Dash pool |
+
+Both are production-ready, actively maintained forks of the original Python p2pool with modern improvements (V36 protocol, Docker images, enhanced dashboards).
+
+---
+
 ## 🎯 **Enhanced C2Pool - Refactored Implementation**
 
 C2Pool has been **completely refactored** with enhanced features and clear terminology separation:
@@ -92,7 +107,7 @@ Access web interface at: http://localhost:8083
 - ✅ JSON-RPC mining interface
 - ✅ WebUI for monitoring
 
-See [REFACTORING_SUMMARY.md](REFACTORING_SUMMARY.md) for detailed technical information.
+See [docs/REFACTORING_SUMMARY.md](docs/REFACTORING_SUMMARY.md) for detailed technical information.
 
 ---
 
