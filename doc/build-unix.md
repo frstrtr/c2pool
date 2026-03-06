@@ -50,11 +50,13 @@ sudo apt-get install libgl1-mesa-dev
 install boost 1.78.0:
 
 ```shell
-wget -O boost_1_78_0.tar.gz https://boostorg.jfrog.io/artifactory/main/release/1.78.0/source/boost_1_78_0.tar.gz
-tar xzvf boost_1_78_0.tar.gz
+# Download from SourceForge (JFrog Artifactory is no longer available)
+wget https://sourceforge.net/projects/boost/files/boost/1.78.0/boost_1_78_0.tar.bz2
+tar xjvf boost_1_78_0.tar.bz2
 cd boost_1_78_0
 ./bootstrap.sh --prefix=/usr/
 sudo ./b2 install
+cd ..
 ```
 
 ## FreeBSD Instructions
