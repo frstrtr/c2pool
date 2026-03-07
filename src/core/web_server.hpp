@@ -107,6 +107,17 @@ public:
     nlohmann::json getinfo(const std::string& request_id = "");
     nlohmann::json getstats(const std::string& request_id = "");
     nlohmann::json getpeerinfo(const std::string& request_id = "");
+
+    // p2pool-compatible REST endpoints (return plain JSON, not JSON-RPC)
+    nlohmann::json rest_local_rate();
+    nlohmann::json rest_global_rate();
+    nlohmann::json rest_current_payouts();
+    nlohmann::json rest_users();
+    nlohmann::json rest_fee();
+    nlohmann::json rest_recent_blocks();
+
+    // Track a found block for the /recent_blocks endpoint
+    void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
     
     // Stratum-style methods (for advanced miners)
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
@@ -250,6 +261,17 @@ private:
 
     // Integrated merged mining manager (non-owning)
     c2pool::merged::MergedMiningManager* m_mm_manager{nullptr};
+
+    // Pool fee percent (set via set_pool_fee_percent)
+    double m_pool_fee_percent{0.0};
+
+    // Recently found blocks for /recent_blocks
+    struct FoundBlock { uint64_t height; std::string hash; uint64_t ts; };
+    std::vector<FoundBlock> m_found_blocks;   // newest first, capped at 100
+    mutable std::mutex      m_blocks_mutex;
+
+    // Pool start time for /uptime
+    std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
 };
 
 /// Main Web Server class

@@ -73,9 +73,29 @@ void HttpSession::process_request()
             response_body = "";
         }
         else if (request_.method() == http::verb::get) {
-            // Handle GET request - return pool info
-            nlohmann::json info_response = mining_interface_->getinfo();
-            response_body = info_response.dump();
+            // Path-based REST routing for p2pool-compatible endpoints
+            std::string target(request_.target());
+            // Strip query string
+            auto qpos = target.find('?');
+            if (qpos != std::string::npos) target = target.substr(0, qpos);
+
+            nlohmann::json rest_result;
+            if (target == "/local_rate")
+                rest_result = mining_interface_->rest_local_rate();
+            else if (target == "/global_rate")
+                rest_result = mining_interface_->rest_global_rate();
+            else if (target == "/current_payouts")
+                rest_result = mining_interface_->rest_current_payouts();
+            else if (target == "/users")
+                rest_result = mining_interface_->rest_users();
+            else if (target == "/fee")
+                rest_result = mining_interface_->rest_fee();
+            else if (target == "/recent_blocks")
+                rest_result = mining_interface_->rest_recent_blocks();
+            else
+                rest_result = mining_interface_->getinfo();
+
+            response_body = rest_result.dump();
         }
         else if (request_.method() == http::verb::post) {
             // Handle JSON-RPC POST request
@@ -1181,6 +1201,92 @@ nlohmann::json MiningInterface::getminerstats(const std::string& request_id)
         result["stale_stats"] = m_node->get_stale_stats();
     }
     return result;
+}
+
+// ──────────────────────── p2pool-compatible REST endpoints ────────────────────
+
+nlohmann::json MiningInterface::rest_local_rate()
+{
+    double rate = 0.0;
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            rate = hs["global_hashrate"];
+    }
+    return rate;
+}
+
+nlohmann::json MiningInterface::rest_global_rate()
+{
+    double rate = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("networkhashps"))
+            rate = m_cached_template["networkhashps"].get<double>();
+    }
+    return rate;
+}
+
+nlohmann::json MiningInterface::rest_current_payouts()
+{
+    nlohmann::json result = nlohmann::json::object();
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm && pm->has_pplns_data()) {
+        uint64_t subsidy = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_cached_template.is_null())
+                subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        }
+        if (subsidy > 0) {
+            auto outputs = pm->calculate_pplns_outputs(subsidy);
+            static const char* HEX = "0123456789abcdef";
+            for (const auto& [script, amount] : outputs) {
+                std::string key;
+                key.reserve(script.size() * 2);
+                for (unsigned char b : script) {
+                    key += HEX[b >> 4];
+                    key += HEX[b & 0x0f];
+                }
+                result[key] = amount;
+            }
+        }
+    }
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_users()
+{
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    return pm ? nlohmann::json(pm->get_active_miners_count()) : nlohmann::json(0);
+}
+
+nlohmann::json MiningInterface::rest_fee()
+{
+    return m_pool_fee_percent;
+}
+
+nlohmann::json MiningInterface::rest_recent_blocks()
+{
+    nlohmann::json arr = nlohmann::json::array();
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    for (const auto& b : m_found_blocks)
+        arr.push_back({{"height", b.height}, {"hash", b.hash}, {"ts", b.ts}});
+    return arr;
+}
+
+void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts)
+{
+    if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    m_found_blocks.insert(m_found_blocks.begin(), FoundBlock{height, hash.GetHex(), ts});
+    if (m_found_blocks.size() > 100)
+        m_found_blocks.resize(100);
+}
+
+void MiningInterface::set_pool_fee_percent(double fee_percent)
+{
+    m_pool_fee_percent = fee_percent;
 }
 
 nlohmann::json MiningInterface::mining_subscribe(const std::string& user_agent, const std::string& request_id)
