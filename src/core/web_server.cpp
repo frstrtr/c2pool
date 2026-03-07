@@ -766,6 +766,10 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
             block_height = m_cached_template["height"].get<uint64_t>();
     }
 
+    nlohmann::json stale = {{"orphan_count", 0}, {"doa_count", 0}, {"stale_count", 0}, {"stale_prop", 0.0}};
+    if (m_node)
+        stale = m_node->get_stale_stats();
+
     return {
         {"pool_statistics", {
             {"mining_shares", total_mining_shares},
@@ -773,7 +777,11 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
             {"difficulty", difficulty},
             {"block_height", block_height},
             {"connected_peers", connected_peers},
-            {"active_miners", active_miners}
+            {"active_miners", active_miners},
+            {"orphan_shares", stale["orphan_count"]},
+            {"doa_shares", stale["doa_count"]},
+            {"stale_shares", stale["stale_count"]},
+            {"stale_prop", stale["stale_prop"]}
         }}
     };
 }
@@ -812,6 +820,7 @@ nlohmann::json MiningInterface::getminerstats(const std::string& request_id)
     if (m_node) {
         result["hashrate"] = m_node->get_hashrate_stats();
         result["difficulty"] = m_node->get_difficulty_stats();
+        result["stale_stats"] = m_node->get_stale_stats();
     }
     return result;
 }

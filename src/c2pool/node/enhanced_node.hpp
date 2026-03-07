@@ -113,6 +113,12 @@ public:
      * @return Peer count
      */
     size_t get_connected_peers_count() const;
+
+    /**
+     * @brief Get stale/DOA share statistics
+     * @return JSON with orphan_count, doa_count, stale_prop
+     */
+    nlohmann::json get_stale_stats() const;
     
     /**
      * @brief Get storage manager

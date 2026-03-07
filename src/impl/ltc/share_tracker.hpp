@@ -18,6 +18,13 @@
 namespace ltc
 {
 
+struct StaleCounts
+{
+    uint64_t orphan_count = 0;
+    uint64_t doa_count = 0;
+    uint64_t total = 0;
+};
+
 // --- Scoring types ---
 
 struct TailScore
@@ -573,6 +580,46 @@ public:
 
         return stale_count / (stale_count + static_cast<float>(actual_lookbehind));
     }
+
+    // -- Stale share counts by type --
+    StaleCounts get_stale_counts(const uint256& share_hash, uint64_t lookbehind)
+    {
+        StaleCounts counts;
+        auto height = chain.get_height(share_hash);
+        auto actual_lookbehind = std::min(static_cast<int32_t>(lookbehind), height);
+        if (actual_lookbehind <= 0)
+            return counts;
+
+        auto view = chain.get_chain(share_hash, actual_lookbehind);
+        for (auto& [hash, data] : view)
+        {
+            StaleInfo si = StaleInfo::none;
+            data.share.invoke([&](auto* obj) { si = obj->m_stale_info; });
+            if (si == StaleInfo::orphan)
+                counts.orphan_count++;
+            else if (si == StaleInfo::doa)
+                counts.doa_count++;
+        }
+        counts.total = counts.orphan_count + counts.doa_count;
+        return counts;
+    }
+
+    // -- Stale change callback registration --
+    using stale_callback_t = std::function<void(const uint256& /*share_hash*/, StaleInfo /*new_stale_info*/)>;
+
+    void subscribe_stale_change(stale_callback_t cb)
+    {
+        m_stale_callbacks.push_back(std::move(cb));
+    }
+
+    void notify_stale_change(const uint256& share_hash, StaleInfo info)
+    {
+        for (auto& cb : m_stale_callbacks)
+            cb(share_hash, info);
+    }
+
+private:
+    std::vector<stale_callback_t> m_stale_callbacks;
 };
 
 } // namespace ltc

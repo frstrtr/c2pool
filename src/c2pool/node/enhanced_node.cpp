@@ -152,6 +152,17 @@ size_t node::EnhancedC2PoolNode::get_connected_peers_count() const {
     return m_connections.size();
 }
 
+nlohmann::json node::EnhancedC2PoolNode::get_stale_stats() const {
+    nlohmann::json result;
+    result["orphan_count"] = 0;
+    result["doa_count"] = 0;
+    result["stale_count"] = 0;
+    result["stale_prop"] = 0.0;
+    // When ShareTracker is wired, call get_stale_counts / get_average_stale_prop
+    // on the active best share with a configurable lookbehind window.
+    return result;
+}
+
 // Mining interface implementations
 std::string node::EnhancedC2PoolNode::get_mining_work(const std::string& address) {
     // Generate work based on current difficulty

@@ -28,6 +28,9 @@ public:
     
     // Statistics
     virtual void log_sharechain_stats() = 0;
+
+    // Stale/DOA tracking
+    virtual nlohmann::json get_stale_stats() const = 0;
 };
 
 } // namespace core
