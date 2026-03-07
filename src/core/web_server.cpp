@@ -1519,10 +1519,54 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         return response;
     }
     
-    double old_difficulty = hashrate_tracker_.get_current_difficulty();
+    // Extract Stratum submit parameters: [username, job_id, extranonce2, ntime, nonce]
+    if (params.size() < 5 || !params[1].is_string() || !params[2].is_string()
+        || !params[3].is_string() || !params[4].is_string()) {
+        ++rejected_shares_;
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({20, "Invalid parameters", nullptr});
+        return response;
+    }
     
-    // Record the share in the tracker (triggers internal VARDIFF adjustment)
-    hashrate_tracker_.record_mining_share_submission(old_difficulty, true);
+    std::string job_id      = params[1].get<std::string>();
+    std::string extranonce2 = params[2].get<std::string>();
+    std::string ntime       = params[3].get<std::string>();
+    std::string nonce       = params[4].get<std::string>();
+    
+    // Stale detection: check if job_id is still active
+    auto job_it = active_jobs_.find(job_id);
+    if (job_it == active_jobs_.end()) {
+        ++stale_shares_;
+        LOG_INFO << "Stale share from " << username_ << " for expired job " << job_id;
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({21, "Stale share", nullptr});
+        return response;
+    }
+    
+    // Calculate share difficulty and verify it meets the session target
+    double share_difficulty = mining_interface_->calculate_share_difficulty(
+        job_id, extranonce2, ntime, nonce);
+    double required_difficulty = hashrate_tracker_.get_current_difficulty();
+    
+    if (share_difficulty < required_difficulty) {
+        ++rejected_shares_;
+        LOG_WARNING << "Low difficulty share from " << username_
+                    << ": got " << share_difficulty << ", need " << required_difficulty;
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
+        return response;
+    }
+    
+    // Valid share — record and adjust VARDIFF
+    ++accepted_shares_;
+    double old_difficulty = required_difficulty;
+    hashrate_tracker_.record_mining_share_submission(share_difficulty, true);
     
     double new_difficulty = hashrate_tracker_.get_current_difficulty();
     if (new_difficulty != old_difficulty) {
@@ -1531,7 +1575,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                  << old_difficulty << " -> " << new_difficulty;
     }
     
-    LOG_INFO << "Share submitted by " << username_ << " (difficulty: " << new_difficulty << ")";
+    // Forward the accepted share to MiningInterface for block-level checking
+    mining_interface_->mining_submit(username_, job_id, extranonce2, ntime, nonce);
+    
+    LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
+             << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
+             << ", rejected=" << rejected_shares_ << ")";
     
     nlohmann::json response;
     response["id"] = request_id;
@@ -1630,6 +1679,16 @@ void StratumSession::send_notify_work()
     }
 
     bool clean_jobs = true;
+
+    // Track this job for stale detection
+    if (clean_jobs) {
+        active_jobs_.clear();
+    }
+    // Evict oldest if at capacity
+    while (active_jobs_.size() >= MAX_ACTIVE_JOBS) {
+        active_jobs_.erase(active_jobs_.begin());
+    }
+    active_jobs_[job_id] = {prevhash, nbits, curtime};
 
     notification["params"] = nlohmann::json::array({
         job_id, prevhash, coinb1, coinb2, merkle_branches,

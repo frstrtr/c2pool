@@ -290,6 +290,20 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     
     // Per-connection VARDIFF via HashrateTracker
     c2pool::hashrate::HashrateTracker hashrate_tracker_;
+    
+    // Active jobs for stale detection (job_id → prevhash at time of issue)
+    struct JobEntry {
+        std::string prevhash;
+        std::string nbits;
+        uint32_t    ntime{};
+    };
+    std::unordered_map<std::string, JobEntry> active_jobs_;
+    static constexpr size_t MAX_ACTIVE_JOBS = 4; // keep last N jobs for late shares
+    
+    // Per-worker statistics
+    uint64_t accepted_shares_ = 0;
+    uint64_t rejected_shares_ = 0;
+    uint64_t stale_shares_    = 0;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
