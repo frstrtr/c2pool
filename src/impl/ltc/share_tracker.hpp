@@ -647,6 +647,130 @@ public:
         return counts;
     }
 
+    // -- Merged mining: per-chain PPLNS weights --
+    // For a specific aux chain_id, walk the share chain and accumulate PPLNS
+    // weights only for shares that include a merged_addresses entry for that
+    // chain.  The weight keys are the per-chain payout scripts from
+    // MergedAddressEntry, NOT the primary chain address.
+    //
+    // Shares that did not opt into this aux chain (no matching chain_id in
+    // m_merged_addresses) are skipped entirely.
+    CumulativeWeights get_merged_cumulative_weights(
+        const uint256& start, int32_t max_shares,
+        const uint288& desired_weight, uint32_t target_chain_id)
+    {
+        if (start.IsNull())
+            return {};
+
+        auto [start_height, last] = chain.get_height_and_last(start);
+
+        std::map<std::vector<unsigned char>, uint288> weights;
+        uint288 accum_total;
+        uint288 accum_donation;
+
+        auto walk_count = std::min(start_height, max_shares);
+        auto walk_view = chain.get_chain(start, walk_count);
+
+        for (auto& [hash, data] : walk_view)
+        {
+            uint288 share_att;
+            uint32_t share_donation = 0;
+            std::vector<unsigned char> merged_script;
+            bool has_chain = false;
+
+            data.share.invoke([&](auto* obj) {
+                if constexpr (requires { obj->m_merged_addresses; })
+                {
+                    for (const auto& entry : obj->m_merged_addresses)
+                    {
+                        if (entry.m_chain_id == target_chain_id)
+                        {
+                            merged_script = entry.m_script.m_data;
+                            has_chain = true;
+                            break;
+                        }
+                    }
+                }
+                if (has_chain)
+                {
+                    auto target = chain::bits_to_target(obj->m_bits);
+                    share_att = chain::target_to_average_attempts(target);
+                    share_donation = obj->m_donation;
+                }
+            });
+
+            if (!has_chain)
+                continue;
+
+            uint288 share_total = share_att * 65535;
+            uint288 share_don   = share_att * share_donation;
+
+            if (accum_total + share_total > desired_weight)
+            {
+                auto remaining = desired_weight - accum_total;
+                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
+
+                uint288 partial_addr;
+                if (!share_total.IsNull())
+                    partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
+
+                weights[merged_script] += partial_addr;
+
+                uint288 partial_donation;
+                if (!share_total.IsNull())
+                    partial_donation = remaining / 65535 * share_don / (share_total / 65535);
+
+                accum_donation += partial_donation;
+                accum_total = desired_weight;
+                break;
+            }
+
+            auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
+            weights[merged_script] += share_addr_weight;
+            accum_total += share_total;
+            accum_donation += share_don;
+        }
+
+        return {weights, accum_total, accum_donation};
+    }
+
+    // -- Merged mining: per-chain expected payouts --
+    // Given an aux chain's subsidy and chain_id, computes the expected payout
+    // distribution using merged PPLNS weights.
+    std::map<std::vector<unsigned char>, double>
+    get_merged_expected_payouts(const uint256& best_share_hash,
+                                const uint256& block_target,
+                                uint64_t subsidy,
+                                uint32_t chain_id,
+                                const std::vector<unsigned char>& donation_script)
+    {
+        auto chain_len = std::min(chain.get_height(best_share_hash),
+                                  static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+        auto max_weight = chain::target_to_average_attempts(block_target)
+                          * PoolConfig::SHARE_PERIOD * 65535;
+
+        auto [weights, total_weight, donation_weight] =
+            get_merged_cumulative_weights(best_share_hash, chain_len, max_weight, chain_id);
+
+        std::map<std::vector<unsigned char>, double> result;
+        double sum = 0;
+
+        if (!total_weight.IsNull())
+        {
+            for (const auto& [script, weight] : weights)
+            {
+                double payout = subsidy * (weight.getdouble() / total_weight.getdouble());
+                result[script] = payout;
+                sum += payout;
+            }
+        }
+
+        result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
+                                  + static_cast<double>(subsidy) - sum;
+
+        return result;
+    }
+
     // Returns true if shares at `share_version` should be punished because
     // a newer version has reached the 95% activation threshold.
     // Python ref: share.check() version_after_check logic
