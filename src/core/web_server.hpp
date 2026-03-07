@@ -134,8 +134,12 @@ public:
     void log_sync_progress() const;
     
     // Difficulty calculation utilities
-    double calculate_share_difficulty(const std::string& job_id, const std::string& extranonce2, 
+    double calculate_share_difficulty(const std::string& job_id, const std::string& extranonce1,
+                                     const std::string& extranonce2, 
                                      const std::string& ntime, const std::string& nonce) const;
+
+    // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
+    void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = std::move(fn); }
     
     // Payout management methods
     nlohmann::json getpayoutinfo(const std::string& request_id = "");
@@ -214,6 +218,9 @@ private:
 
     // Block-found callback
     std::function<void(const std::string&)> m_on_block_submitted;
+
+    // Share tracker hook
+    std::function<uint256()> m_best_share_hash_fn;
 };
 
 /// Main Web Server class
@@ -276,6 +283,8 @@ public:
     void set_on_block_submitted(std::function<void(const std::string&)> fn);
     // Immediately refresh the cached block template (call when a new block arrives)
     void trigger_work_refresh();
+    // Wire the share tracker's best hash into MiningInterface
+    void set_best_share_hash_fn(std::function<uint256()> fn);
 
 private:
     void accept_connections();

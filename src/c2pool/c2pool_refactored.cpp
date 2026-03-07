@@ -511,6 +511,12 @@ int main(int argc, char* argv[]) {
             
             // Configure payout system for web server
             web_server.set_payout_manager(payout_manager.get());
+
+            // Wire the share tracker's best share hash into the mining interface
+            // so that mining_submit can link new shares to the chain head.
+            web_server.set_best_share_hash_fn([&p2p_node]() {
+                return p2p_node->best_share_hash();
+            });
             
             // Set custom Stratum port if different from default
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
