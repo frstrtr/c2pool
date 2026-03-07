@@ -226,6 +226,14 @@ void MiningInterface::setup_methods()
     Add("getblockcandidate", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         return getblockcandidate(params);
     }));
+    
+    Add("getpayoutinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getpayoutinfo();
+    }));
+    
+    Add("getminerstats", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getminerstats();
+    }));
 }
 
 // ─── Live coin-daemon integration ────────────────────────────────────────────
@@ -702,18 +710,27 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         connections = m_node->get_connected_peers_count();
     }
     
+    // Read block height from cached template
+    uint64_t block_height = 0;
+    double network_hashps = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("height"))
+            block_height = m_cached_template["height"].get<uint64_t>();
+    }
+    
     return {
         {"version", "c2pool/1.0.0"},
         {"protocolversion", 70015},
-        {"blocks", 1}, // TODO: Get from actual chain
+        {"blocks", block_height},
         {"connections", connections},
         {"difficulty", current_difficulty},
-        {"networkhashps", 0}, // TODO: Get from coin node
+        {"networkhashps", network_hashps},
         {"poolhashps", pool_hashrate},
-        {"poolshares", total_shares}, // Mining shares from physical miners
+        {"poolshares", total_shares},
         {"generate", true},
         {"genproclimit", -1},
-        {"testnet", m_testnet}, // Use stored testnet flag
+        {"testnet", m_testnet},
         {"paytxfee", 0.0},
         {"errors", ""}
     };
@@ -721,34 +738,82 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
 
 nlohmann::json MiningInterface::getstats(const std::string& request_id)
 {
+    uint64_t total_mining_shares = 0;
+    uint64_t connected_peers = 0;
+    double pool_hashrate = 0.0;
+    double difficulty = 1.0;
+    uint64_t active_miners = 0;
+
+    if (m_node) {
+        total_mining_shares = m_node->get_total_mining_shares();
+        connected_peers = m_node->get_connected_peers_count();
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            pool_hashrate = hs["global_hashrate"];
+        auto ds = m_node->get_difficulty_stats();
+        if (ds.contains("global_pool_difficulty"))
+            difficulty = ds["global_pool_difficulty"];
+    }
+
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm)
+        active_miners = pm->get_active_miners_count();
+
+    uint64_t block_height = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("height"))
+            block_height = m_cached_template["height"].get<uint64_t>();
+    }
+
     return {
         {"pool_statistics", {
-            {"mining_shares", {  // Shares from physical miners
-                {"total", 0},
-                {"valid", 0},
-                {"invalid", 0},
-                {"stale", 0}
-            }},
-            {"p2p_shares", {  // Shares from cross-node communication
-                {"total", 0},
-                {"received", 0},
-                {"verified", 0},
-                {"forwarded", 0}
-            }},
-            {"pool_hashrate", "0 H/s"},
-            {"network_hashrate", "0 H/s"},
-            {"difficulty", 1.0},
-            {"block_height", 1},
-            {"connected_peers", 0},
-            {"uptime", 0}
+            {"mining_shares", total_mining_shares},
+            {"pool_hashrate", pool_hashrate},
+            {"difficulty", difficulty},
+            {"block_height", block_height},
+            {"connected_peers", connected_peers},
+            {"active_miners", active_miners}
         }}
     };
 }
 
 nlohmann::json MiningInterface::getpeerinfo(const std::string& request_id)
 {
-    // TODO: Get actual peer info from pool node
-    return nlohmann::json::array();
+    nlohmann::json peers = nlohmann::json::array();
+    if (m_node) {
+        size_t count = m_node->get_connected_peers_count();
+        // Return minimal info — detailed peer data requires NodeImpl access
+        peers.push_back({
+            {"connected_peers", count}
+        });
+    }
+    return peers;
+}
+
+nlohmann::json MiningInterface::getpayoutinfo(const std::string& request_id)
+{
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (!pm)
+        return {{"error", "payout manager not available"}};
+
+    return pm->get_payout_statistics();
+}
+
+nlohmann::json MiningInterface::getminerstats(const std::string& request_id)
+{
+    nlohmann::json result;
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    if (pm) {
+        result["active_miners"] = pm->get_active_miners_count();
+        result["pplns_active"] = pm->has_pplns_data();
+        result["payout_statistics"] = pm->get_payout_statistics();
+    }
+    if (m_node) {
+        result["hashrate"] = m_node->get_hashrate_stats();
+        result["difficulty"] = m_node->get_difficulty_stats();
+    }
+    return result;
 }
 
 nlohmann::json MiningInterface::mining_subscribe(const std::string& user_agent, const std::string& request_id)
