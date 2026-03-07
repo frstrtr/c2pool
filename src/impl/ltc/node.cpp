@@ -164,4 +164,110 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	return shares;
 }
 
+void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
+{
+    // Collect shares that exist in our chain
+    std::vector<ShareType> shares;
+    for (const auto& hash : share_hashes)
+    {
+        if (!m_chain->contains(hash))
+            continue;
+        // Retrieve the share via get_chain(hash, 1) — first element is the share itself
+        for (auto& [h, data] : m_chain->get_chain(hash, 1))
+        {
+            shares.push_back(data.share);
+            break;
+        }
+    }
+
+    if (shares.empty())
+        return;
+
+    // Collect transactions that the peer doesn't know about
+    std::set<uint256> needed_txs;
+    for (auto& share : shares)
+    {
+        share.invoke([&](auto* obj) {
+            if constexpr (requires { obj->m_new_transaction_hashes; })
+            {
+                for (const auto& th : obj->m_new_transaction_hashes)
+                {
+                    if (!peer->m_remote_txs.count(th) &&
+                        !peer->m_remembered_txs.count(th))
+                        needed_txs.insert(th);
+                }
+            }
+        });
+    }
+
+    // Send remember_tx for txs the peer needs
+    if (!needed_txs.empty())
+    {
+        std::vector<uint256> known_hashes;   // hashes in peer's remote set
+        std::vector<coin::MutableTransaction> full_txs;  // full txs otherwise
+
+        for (const auto& th : needed_txs)
+        {
+            if (peer->m_remote_txs.count(th))
+            {
+                known_hashes.push_back(th);
+            }
+            else
+            {
+                auto it = m_known_txs.find(th);
+                if (it != m_known_txs.end())
+                    full_txs.emplace_back(it->second);
+            }
+        }
+
+        if (!known_hashes.empty() || !full_txs.empty())
+        {
+            auto rtx_msg = message_remember_tx::make_raw(known_hashes, full_txs);
+            peer->write(std::move(rtx_msg));
+        }
+    }
+
+    // Pack and send shares
+    std::vector<chain::RawShare> rshares;
+    rshares.reserve(shares.size());
+    for (auto& share : shares)
+        rshares.emplace_back(share.version(), pack(share));
+
+    auto shares_msg = message_shares::make_raw(rshares);
+    peer->write(std::move(shares_msg));
+
+    // Send forget_tx so peer can free the remembered txs
+    if (!needed_txs.empty())
+    {
+        std::vector<uint256> forget_vec(needed_txs.begin(), needed_txs.end());
+        auto ftx_msg = message_forget_tx::make_raw(forget_vec);
+        peer->write(std::move(ftx_msg));
+    }
+
+    LOG_INFO << "Sent " << shares.size() << " shares (+" << needed_txs.size()
+             << " txs) to " << peer->addr().to_string();
+}
+
+void NodeImpl::broadcast_share(const uint256& share_hash)
+{
+    // Walk the chain back from share_hash, collecting un-broadcast shares
+    std::vector<uint256> to_send;
+    int32_t height = m_chain->get_height(share_hash);
+    int32_t walk = std::min(height, 5);
+
+    for (auto& [hash, data] : m_chain->get_chain(share_hash, walk))
+    {
+        if (m_shared_share_hashes.count(hash))
+            break;
+        m_shared_share_hashes.insert(hash);
+        to_send.push_back(hash);
+    }
+
+    if (to_send.empty())
+        return;
+
+    for (auto& [nonce, peer] : m_peers)
+        send_shares(peer, to_send);
+}
+
 } // namespace ltc

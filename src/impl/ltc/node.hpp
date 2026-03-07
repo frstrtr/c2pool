@@ -99,8 +99,16 @@ public:
     /// from any peer (after relaying). Use this to trigger work refresh.
     void set_on_bestblock(std::function<void()> fn) { m_on_bestblock = std::move(fn); }
 
+    /// Send a set of shares (with any needed txs) to a single peer.
+    /// Skips shares that originated from that peer.
+    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+
+    /// Broadcast a locally-generated (or newly-received) share to all peers.
+    void broadcast_share(const uint256& share_hash);
+
 protected:
     std::function<void()> m_on_bestblock;
+    std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
 };
 
 struct HandleSharesData
