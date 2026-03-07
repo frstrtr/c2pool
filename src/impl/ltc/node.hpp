@@ -11,6 +11,7 @@
 #include <core/message.hpp>
 #include <core/reply_matcher.hpp>
 #include <sharechain/prepared_list.hpp>
+#include <c2pool/storage/sharechain_storage.hpp>
 
 #include <random>
 
@@ -32,6 +33,7 @@ protected:
     ltc::Handler m_handler;
     share_getter_t m_share_getter;
     ShareTracker m_tracker;
+    std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
     // Protocol handlers look up tx hashes here when processing shares.
@@ -60,6 +62,11 @@ public:
         m_nonce = rng();
         // Route m_chain (used by BaseNode) to the tracker's main chain
         m_chain = &m_tracker.chain;
+
+        // Open LevelDB storage and load any persisted shares
+        std::string net_name = config->m_testnet ? "litecoin_testnet" : "litecoin";
+        m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
+        load_persisted_shares();
     }
 
     // INetwork:
@@ -117,6 +124,9 @@ public:
 
     /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
     uint256 best_share_hash();
+
+    /// Load persisted shares from LevelDB storage into the tracker.
+    void load_persisted_shares();
 
 protected:
     std::function<void()> m_on_bestblock;

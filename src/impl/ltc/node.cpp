@@ -3,6 +3,7 @@
 #include <core/common.hpp>
 #include <core/hash.hpp>
 #include <core/random.hpp>
+#include <core/target_utils.hpp>
 #include <sharechain/prepared_list.hpp>
 
 #include <random>
@@ -148,6 +149,28 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 
 		new_count++;
 		m_tracker.add(share);
+
+		// Persist to LevelDB
+		if (m_storage && m_storage->is_available())
+		{
+			PackStream ps = pack(share);
+			auto span = ps.get_span();
+			std::vector<uint8_t> bytes(reinterpret_cast<const uint8_t*>(span.data()),
+			                           reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+			// Store version as the first 8 bytes so we can reconstruct on load
+			uint64_t ver = share.version();
+			std::vector<uint8_t> versioned;
+			versioned.resize(8 + bytes.size());
+			std::memcpy(versioned.data(), &ver, 8);
+			std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
+
+			share.ACTION({
+				uint256 target = chain::bits_to_target(obj->m_bits);
+				m_storage->store_share(obj->m_hash, versioned, obj->m_prev_hash,
+				                       /*height*/ 0, obj->m_timestamp,
+				                       /*work*/ uint256::ZERO, target);
+			});
+		}
 	}
 
     // Attempt verification on newly added shares
@@ -368,6 +391,55 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
             }
         }
     );
+}
+
+void NodeImpl::load_persisted_shares()
+{
+    if (!m_storage || !m_storage->is_available())
+        return;
+
+    // load_sharechain iterates the height index and loads each share
+    auto hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+    if (hashes.empty())
+    {
+        LOG_INFO << "No persisted shares found in LevelDB";
+        return;
+    }
+
+    int loaded = 0;
+    for (const auto& hash : hashes)
+    {
+        std::vector<uint8_t> data;
+        uint256 prev; uint64_t height, ts; uint256 work, target; bool orphan;
+        if (!m_storage->load_share(hash, data, prev, height, ts, work, target, orphan))
+            continue;
+        if (data.size() < 8)
+            continue;
+
+        try
+        {
+            // First 8 bytes = version (uint64_t LE), rest = packed share
+            uint64_t ver;
+            std::memcpy(&ver, data.data(), 8);
+
+            std::vector<unsigned char> share_bytes(data.begin() + 8, data.end());
+            PackStream ps(share_bytes);
+
+            auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"0.0.0.0", 0});
+            if (!m_chain->contains(share.hash()))
+            {
+                m_tracker.add(share);
+                loaded++;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_WARNING << "Failed to load share " << hash.ToString().substr(0, 16)
+                        << "... from LevelDB: " << e.what();
+        }
+    }
+
+    LOG_INFO << "Loaded " << loaded << " shares from LevelDB storage";
 }
 
 } // namespace ltc

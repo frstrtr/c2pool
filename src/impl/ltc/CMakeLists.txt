@@ -9,6 +9,6 @@ add_library(ltc
     share_types.hpp share.hpp
 )
 
-target_link_libraries(ltc core pool sharechain ltc_coin btclibs)
+target_link_libraries(ltc core pool sharechain ltc_coin btclibs c2pool_storage)
 
 add_subdirectory(test)
