@@ -41,7 +41,7 @@ void NodeImpl::send_version(peer_ptr peer)
         m_nonce,
         "/c2pool:0.1/",
         1,                                    // mode (always 1 for legacy compat)
-        uint256::ZERO                         // best_share — filled after chain init
+        best_share_hash()                     // advertise our tallest chain head
     );
     peer->write(std::move(rmsg));
 }
@@ -61,14 +61,9 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 
         if (peer->m_other_version.has_value())
         {
-        LOG_DEBUG_POOL << "more than one version message";
-                throw std::runtime_error("more than one version message"); // TODO:
+            LOG_DEBUG_POOL << "more than one version message";
+            throw std::runtime_error("more than one version message");
         }
-        // TODO: 
-        // if (msg->version.get() < net->MINIMUM_PROTOCOL_VERSION)
-        // {
-    //     LOG_DEBUG_POOL << "peer too old";
-        // }
 
         peer->m_other_version = msg->m_version;
         peer->m_other_subversion = msg->m_subversion;
@@ -97,10 +92,24 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
             peer->write(std::move(getaddrs_msg));
         }
 
+        // Reject peers running too-old protocol
+        if (msg->m_version < ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION)
+        {
+            LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
+                        << " protocol " << msg->m_version
+                        << " < minimum " << ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION
+                        << ", disconnecting";
+            throw std::runtime_error("peer protocol too old");
+        }
+
         if (!msg->m_best_share.IsNull())
         {
-                LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string() << " = " << msg->m_best_share.ToString();
-                // TODO: DownloadShareManager — request shares starting from best_share
+            LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string()
+                     << " = " << msg->m_best_share.ToString();
+
+            // Start downloading shares if we don't have the peer's best
+            if (!m_chain->contains(msg->m_best_share))
+                download_shares(peer, msg->m_best_share);
         }
 
         return pool::PeerConnectionType::legacy;
@@ -268,6 +277,80 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
     for (auto& [nonce, peer] : m_peers)
         send_shares(peer, to_send);
+}
+
+uint256 NodeImpl::best_share_hash()
+{
+    if (!m_chain || m_chain->size() == 0)
+        return uint256::ZERO;
+
+    // Pick the head with the greatest height
+    uint256 best;
+    int32_t best_height = -1;
+    for (const auto& [head_hash, tail_hash] : m_chain->get_heads())
+    {
+        auto h = m_chain->get_height(head_hash);
+        if (h > best_height)
+        {
+            best = head_hash;
+            best_height = h;
+        }
+    }
+    return best;
+}
+
+void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
+{
+    // Already downloading this hash — avoid duplicate requests
+    if (m_downloading_shares.count(target_hash))
+        return;
+    m_downloading_shares.insert(target_hash);
+
+    auto req_id = core::random::random_uint256();
+
+    // Request up to 500 parents starting from target
+    constexpr uint64_t PARENTS_PER_REQUEST = 500;
+    std::vector<uint256> hashes = { target_hash };
+    std::vector<uint256> stops;  // empty — don't stop early, let handle_get_share apply limits
+
+    LOG_INFO << "Requesting shares from " << peer->addr().to_string()
+             << " starting at " << target_hash.ToString()
+             << " (parents=" << PARENTS_PER_REQUEST << ")";
+
+    // weak_ptr prevents use-after-free if peer disconnects before reply
+    std::weak_ptr<pool::Peer<ltc::Peer>> weak_peer = peer;
+
+    request_shares(req_id, peer, hashes, PARENTS_PER_REQUEST, stops,
+        [this, weak_peer, target_hash](std::vector<ltc::ShareType> shares)
+        {
+            m_downloading_shares.erase(target_hash);
+
+            if (shares.empty())
+            {
+                LOG_DEBUG_POOL << "Empty sharereply for " << target_hash.ToString();
+                return;
+            }
+
+            LOG_INFO << "Received " << shares.size() << " shares for download request";
+
+            // Feed into processing pipeline
+            HandleSharesData data;
+            for (auto& s : shares)
+                data.add(s, {});
+            processing_shares(data, NetService{});
+
+            // Find the oldest share's parent — if unknown, keep fetching
+            uint256 oldest_parent;
+            shares.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
+
+            if (!oldest_parent.IsNull() && !m_chain->contains(oldest_parent))
+            {
+                auto locked = weak_peer.lock();
+                if (locked)
+                    download_shares(locked, oldest_parent);
+            }
+        }
+    );
 }
 
 } // namespace ltc

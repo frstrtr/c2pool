@@ -106,9 +106,17 @@ public:
     /// Broadcast a locally-generated (or newly-received) share to all peers.
     void broadcast_share(const uint256& share_hash);
 
+    /// Start downloading shares from a peer, beginning at `target_hash`.
+    /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.
+    void download_shares(peer_ptr peer, const uint256& target_hash);
+
+    /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
+    uint256 best_share_hash();
+
 protected:
     std::function<void()> m_on_bestblock;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
+    std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 };
 
 struct HandleSharesData
