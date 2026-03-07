@@ -135,6 +135,14 @@ public:
     /// Maintains TARGET_OUTBOUND_PEERS active outbound connections.
     void start_outbound_connections();
 
+    /// Run the share tracker think() cycle: verifies chains, scores heads,
+    /// identifies bad peers, and requests needed shares.
+    /// Should be called periodically (e.g. after processing_shares or on a timer).
+    void run_think();
+
+    /// Check whether a peer address is currently banned.
+    bool is_banned(const NetService& addr) const;
+
 protected:
     std::function<void()> m_on_bestblock;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
@@ -146,6 +154,10 @@ protected:
     std::unique_ptr<core::Timer> m_connect_timer;
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers
+
+    // Peer banning: maps address → ban expiry time
+    std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
+    static constexpr std::chrono::seconds BAN_DURATION{300}; // 5 minutes
 };
 
 struct HandleSharesData

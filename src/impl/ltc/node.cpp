@@ -28,6 +28,14 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
     auto addr = socket->get_addr();
     bool is_outbound = m_pending_outbound.erase(addr) > 0;
 
+    // Reject banned peers
+    if (is_banned(addr))
+    {
+        LOG_INFO << "Rejecting connection from banned peer " << addr.to_string();
+        socket->close();
+        return;
+    }
+
     // Let BaseNode create the peer and set up the timeout timer
     base_t::connected(socket);
 
@@ -203,6 +211,9 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 
         if (verified_count > 0)
             LOG_INFO << "Verified " << verified_count << "/" << new_count << " new shares";
+
+        // Run think() to detect bad peers and request missing shares
+        run_think();
     }
 }
 
@@ -472,8 +483,8 @@ void NodeImpl::start_outbound_connections()
         {
             if (needed == 0)
                 break;
-            // Skip if already connected or already dialing
-            if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr))
+            // Skip if already connected, already dialing, or banned
+            if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr) || is_banned(ap.addr))
                 continue;
 
             LOG_INFO << "Dialing outbound peer " << ap.addr.to_string();
@@ -489,6 +500,66 @@ void NodeImpl::start_outbound_connections()
     // Periodic maintenance — every 30 seconds, check if we need more outbound peers
     m_connect_timer = std::make_unique<core::Timer>(m_context, true);
     m_connect_timer->start(30, try_connect_peers);
+}
+
+void NodeImpl::run_think()
+{
+    // Provide a stub block_rel_height_func (returns 0 — no real blockchain depth check).
+    // In a full implementation this queries the coin daemon for block confirmations.
+    auto block_rel_height = [](uint256) -> int32_t { return 0; };
+
+    uint256 prev_block;  // zero — not used in basic think()
+    uint32_t bits = 0;
+
+    auto result = m_tracker.think(block_rel_height, prev_block, bits);
+
+    // Ban peers that provided invalid/unverifiable shares
+    auto now = std::chrono::steady_clock::now();
+    for (const auto& bad_addr : result.bad_peer_addresses)
+    {
+        if (bad_addr.to_string().empty()) continue;
+        m_ban_list[bad_addr] = now + BAN_DURATION;
+        LOG_WARNING << "Banning peer " << bad_addr.to_string()
+                    << " for " << BAN_DURATION.count() << "s (bad shares)";
+
+        // Disconnect currently-connected bad peer
+        for (auto& [nonce, peer] : m_peers) {
+            if (peer->addr() == bad_addr) {
+                peer->close();
+                break;
+            }
+        }
+    }
+
+    // Expire old bans
+    for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
+        if (it->second <= now)
+            it = m_ban_list.erase(it);
+        else
+            ++it;
+    }
+
+    // Request desired shares from peers
+    for (const auto& [peer_addr, hash] : result.desired) {
+        for (auto& [nonce, peer] : m_peers) {
+            if (peer->addr() == peer_addr) {
+                download_shares(peer, hash);
+                break;
+            }
+        }
+    }
+
+    // Update best share
+    if (!result.best.IsNull()) {
+        LOG_DEBUG_POOL << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
+    }
+}
+
+bool NodeImpl::is_banned(const NetService& addr) const
+{
+    auto it = m_ban_list.find(addr);
+    if (it == m_ban_list.end()) return false;
+    return it->second > std::chrono::steady_clock::now();
 }
 
 } // namespace ltc
