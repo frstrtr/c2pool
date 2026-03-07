@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "share.hpp"
+#include "share_tracker.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
 
@@ -30,6 +31,7 @@ class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 protected:
     ltc::Handler m_handler;
     share_getter_t m_share_getter;
+    ShareTracker m_tracker;
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
     // Protocol handlers look up tx hashes here when processing shares.
@@ -56,6 +58,8 @@ public:
         // Randomise our nonce so we detect self-connections
         std::mt19937_64 rng(std::random_device{}());
         m_nonce = rng();
+        // Route m_chain (used by BaseNode) to the tracker's main chain
+        m_chain = &m_tracker.chain;
     }
 
     // INetwork:
@@ -69,6 +73,7 @@ public:
     // ltc
     void send_version(peer_ptr peer);
     void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
+    ShareTracker& tracker() { return m_tracker; }
 
     // Async share download — response delivered to callback when sharereply arrives
     void request_shares(uint256 id, peer_ptr peer,

@@ -33,7 +33,7 @@ set(sources
         )
 
 add_library(btclibs STATIC ${sources}) #${SOURCE} ${HEADER})
-target_include_directories(btclibs PUBLIC util crypto compat)
+target_include_directories(btclibs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} util crypto compat)
 
 # Use Boost target names that work with both old and new CMake/Boost versions
 if(TARGET Boost::headers)

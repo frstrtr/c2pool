@@ -147,8 +147,25 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 		}
 
 		new_count++;
-		m_chain->add(share);
+		m_tracker.add(share);
 	}
+
+    // Attempt verification on newly added shares
+    if (new_count > 0)
+    {
+        int32_t verified_count = 0;
+        for (auto& share : shares)
+        {
+            auto h = share.hash();
+            if (m_tracker.verified.contains(h))
+                continue;
+            if (m_tracker.attempt_verify(h))
+                verified_count++;
+        }
+
+        if (verified_count > 0)
+            LOG_INFO << "Verified " << verified_count << "/" << new_count << " new shares";
+    }
 }
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)

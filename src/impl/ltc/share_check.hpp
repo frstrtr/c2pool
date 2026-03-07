@@ -32,17 +32,37 @@ namespace ltc
 //
 // Legacy: sharechains/data.cpp  check_hash_link()
 // ============================================================================
-inline uint256 check_hash_link(const HashLinkType& hash_link,
+template <typename HashLinkT>
+inline uint256 check_hash_link(const HashLinkT& hash_link,
                                const std::vector<unsigned char>& data,
                                const std::vector<unsigned char>& const_ending = {})
 {
     const uint64_t extra_length = hash_link.m_length % 64; // 512/8 = 64
 
-    // hash_link.extra_data is always empty in our format (length 0)
-    // so extra == tail of const_ending sized to extra_length
-    std::vector<unsigned char> extra(const_ending);
-    if (extra.size() > extra_length)
-        extra.erase(extra.begin(), extra.begin() + (extra.size() - extra_length));
+    // hash_link.extra_data handling:
+    // Pre-V36: extra_data is always empty (FixedStr<0>)
+    // V36:     extra_data is VarStr (may contain data)
+    std::vector<unsigned char> extra;
+    if constexpr (requires { hash_link.m_extra_data.m_data; })
+    {
+        // V36HashLinkType: extra_data is BaseScript (VarStr)
+        extra.assign(hash_link.m_extra_data.m_data.begin(),
+                     hash_link.m_extra_data.m_data.end());
+        if (extra.size() < extra_length)
+        {
+            // Pad from const_ending tail
+            auto needed = extra_length - extra.size();
+            if (const_ending.size() >= needed)
+                extra.insert(extra.begin(), const_ending.end() - needed, const_ending.end());
+        }
+    }
+    else
+    {
+        // Pre-V36: extra_data always empty, use const_ending tail
+        extra.assign(const_ending.begin(), const_ending.end());
+        if (extra.size() > extra_length)
+            extra.erase(extra.begin(), extra.begin() + (extra.size() - extra_length));
+    }
     if (extra.size() != extra_length)
         throw std::runtime_error("check_hash_link: extra size mismatch");
 
@@ -249,8 +269,9 @@ uint256 share_init_verify(const ShareT& share)
         // nonce (uint32_t LE)
         ref_stream << share.m_nonce;
 
-        // address or pubkey_hash
-        if constexpr (ver >= 34)
+        // address or pubkey_hash — V34/V35 use m_address (VarStr),
+        // V36+ uses m_pubkey_hash (uint160), pre-V34 uses m_pubkey_hash.
+        if constexpr (requires { share.m_address; })
             ref_stream << share.m_address;
         else
             ref_stream << share.m_pubkey_hash;
@@ -416,7 +437,7 @@ bool share_check(const ShareT& share,
         auto height = tracker.chain.get_height(share_hash);
         if (height >= lookbehind)
         {
-            if (tracker.should_punish_version(share_hash, share.VERSION, lookbehind))
+            if (tracker.should_punish_version(share_hash, share.version, lookbehind))
                 throw std::invalid_argument("share version too old — newer version has 95%+ activation");
         }
     }
