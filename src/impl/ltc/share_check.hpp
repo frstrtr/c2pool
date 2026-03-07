@@ -58,17 +58,11 @@ inline uint256 check_hash_link(const HashLinkType& hash_link,
         ReadBE32(state_bytes.data() + 28),
     };
 
-    // Prepare the buffer for the custom CSHA256 constructor
-    // (the partial 64-byte block content at the time of the mid-state)
-    std::vector<unsigned char> buf;
-    if (extra.empty())
-        buf.push_back(0); // legacy quirk: empty buf gets a nul byte
-    else
-        buf = extra;
-
-    // Continue hashing: mid-state → write(data) → finalise(single SHA256)
+    // Continue hashing from mid-state: Write(data) fills the partial
+    // block (extra is already in buf via the constructor), then processes
+    // remaining full blocks.  Single SHA256 pass.
     unsigned char out1[CSHA256::OUTPUT_SIZE];
-    CSHA256(init_state, buf, hash_link.m_length)
+    CSHA256(init_state, extra, hash_link.m_length)
         .Write(data.data(), data.size())
         .Finalize(out1);
 

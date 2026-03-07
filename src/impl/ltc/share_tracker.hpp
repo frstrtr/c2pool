@@ -137,13 +137,13 @@ public:
         if (height < static_cast<int32_t>(PoolConfig::CHAIN_LENGTH) + 1 && !last.IsNull())
             return false;
 
-        // TODO (P2): call share.check() here for full PoW + coinbase verification
-        // Run init-phase verification (hash-link, merkle, PoW)
+        // P2: init-phase verification (hash-link, merkle, PoW) + check-phase
         try
         {
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
                 share_init_verify(*obj);
+                share_check(*obj, share_hash, *this);
             });
         }
         catch (const std::exception&)
