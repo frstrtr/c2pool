@@ -73,6 +73,9 @@ public:
     void disconnect() override { }
     void connected(std::shared_ptr<core::Socket> socket) override;
 
+    // ICommunicator (override BaseNode to track outbound lifecycle):
+    void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override;
+
     // BaseNode:
     void send_ping(peer_ptr peer) override;
     pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
@@ -128,10 +131,21 @@ public:
     /// Load persisted shares from LevelDB storage into the tracker.
     void load_persisted_shares();
 
+    /// Start dialing outbound peers from AddrStore / bootstrap list.
+    /// Maintains TARGET_OUTBOUND_PEERS active outbound connections.
+    void start_outbound_connections();
+
 protected:
     std::function<void()> m_on_bestblock;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
+
+    // Connection maintenance
+    static constexpr size_t TARGET_OUTBOUND_PEERS = 8;
+    static constexpr size_t MAX_PEERS = 30;
+    std::unique_ptr<core::Timer> m_connect_timer;
+    std::set<NetService> m_pending_outbound;   // addresses currently being dialed
+    std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers
 };
 
 struct HandleSharesData

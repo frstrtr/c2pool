@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include <core/uint256.hpp>
+#include <core/timer.hpp>
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -41,6 +42,12 @@ private:
     std::unique_ptr<RPCAuthData> m_auth;
     jsonrpccxx::JsonRpcClient m_client;
 
+    // Reconnection state
+    NetService m_address;
+    std::string m_userpass;
+    bool m_connected = false;
+    std::unique_ptr<core::Timer> m_reconnect_timer;
+
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
@@ -49,6 +56,7 @@ public:
     ~NodeRPC();
 
     void connect(NetService address, std::string userpass);
+    void reconnect();
     // TODO: update for async (maybe c++20 coroutines)
     bool check();
     bool check_blockheader(uint256 header);

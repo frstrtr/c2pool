@@ -25,11 +25,26 @@ void NodeImpl::send_ping(peer_ptr peer)
 
 void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 {
+    auto addr = socket->get_addr();
+    bool is_outbound = m_pending_outbound.erase(addr) > 0;
+
     // Let BaseNode create the peer and set up the timeout timer
     base_t::connected(socket);
 
-    auto peer = m_connections[socket->get_addr()];
+    if (is_outbound)
+        m_outbound_addrs.insert(addr);
+
+    auto peer = m_connections[addr];
     send_version(peer);
+}
+
+void NodeImpl::error(const message_error_type& err, const NetService& service, const std::source_location where)
+{
+    // Clean outbound tracking before base removes the peer
+    m_pending_outbound.erase(service);
+    m_outbound_addrs.erase(service);
+
+    base_t::error(err, service, where);
 }
 
 void NodeImpl::send_version(peer_ptr peer)
@@ -440,6 +455,40 @@ void NodeImpl::load_persisted_shares()
     }
 
     LOG_INFO << "Loaded " << loaded << " shares from LevelDB storage";
+}
+
+void NodeImpl::start_outbound_connections()
+{
+    // Try to connect to peers right away
+    auto try_connect_peers = [this]() {
+        size_t outbound = m_outbound_addrs.size();
+        if (outbound >= TARGET_OUTBOUND_PEERS || m_connections.size() >= MAX_PEERS)
+            return;
+
+        size_t needed = TARGET_OUTBOUND_PEERS - outbound;
+        auto good_peers = get_good_peers(needed + 4);  // ask for a few extra in case some are already connected
+
+        for (auto& ap : good_peers)
+        {
+            if (needed == 0)
+                break;
+            // Skip if already connected or already dialing
+            if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr))
+                continue;
+
+            LOG_INFO << "Dialing outbound peer " << ap.addr.to_string();
+            m_pending_outbound.insert(ap.addr);
+            core::Client::connect(ap.addr);
+            --needed;
+        }
+    };
+
+    // Initial burst
+    try_connect_peers();
+
+    // Periodic maintenance — every 30 seconds, check if we need more outbound peers
+    m_connect_timer = std::make_unique<core::Timer>(m_context, true);
+    m_connect_timer->start(30, try_connect_peers);
 }
 
 } // namespace ltc

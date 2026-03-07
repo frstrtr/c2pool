@@ -485,6 +485,10 @@ int main(int argc, char* argv[]) {
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
+            // Begin actively connecting to outbound peers from bootstrap list / addr store
+            p2p_node->start_outbound_connections();
+            LOG_INFO << "Outbound peer connection loop started";
+
             // When a peer announces a new best block, refresh our mining template
             p2p_node->set_on_bestblock([&web_server]() {
                 web_server.trigger_work_refresh();

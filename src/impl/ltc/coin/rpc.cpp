@@ -16,6 +16,9 @@ NodeRPC::NodeRPC(io::io_context* context, ltc::interfaces::Node* coin, bool test
 
 void NodeRPC::connect(NetService address, std::string userpass)
 {
+	m_address = address;
+	m_userpass = userpass;
+
 	m_auth = std::make_unique<RPCAuthData>();
 	m_http_request = {http::verb::post, "/", 11};
 
@@ -51,7 +54,7 @@ void NodeRPC::connect(NetService address, std::string userpass)
 				{
 					if (check())
 					{
-						// connected();
+						m_connected = true;
 						LOG_INFO << "...CoindRPC connected!";
 						return;
 					}
@@ -60,16 +63,13 @@ void NodeRPC::connect(NetService address, std::string userpass)
 				{
 					LOG_ERROR << "Error when try check CoindRPC: " << ec.what();
 				}
-				// }
-				// catch(const libp2p::node_exception& e)
-				// {
-				// 	LOG_ERROR << "Error when try check CoindRPC: " << e.what();
-				// }
 			}
 			
 			LOG_INFO << "Retry after 15 seconds...";
-			// reconnect_timer.start(15, [this, PROCESS_DUPLICATE] { WORKFLOW_PROCESS(); try_connect(); });
+			m_connected = false;
 			m_stream.close();
+			m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+			m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
 		}
 	);
 }
@@ -84,19 +84,30 @@ NodeRPC::~NodeRPC()
 	}
 }
 
+void NodeRPC::reconnect()
+{
+	if (!m_connected)
+		return;  // already reconnecting or never connected
+	m_connected = false;
+	LOG_WARNING << "RPC connection lost — reconnecting in 15 seconds...";
+	m_stream.close();
+	m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+	m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
+}
+
 std::string NodeRPC::Send(const std::string &request)
 {
 	m_http_request.body() = request;
 	m_http_request.prepare_payload();
 	try
 	{
-		// LOG_DEBUG_COIND_RPC << m_http_request.body();
 		http::write(m_stream, m_http_request);	
 	}
 	catch(const std::exception& e)
 	{
 		LOG_WARNING << "error when try to send message in CoindRPC -> " << e.what();
-		// throw libp2p::node_exception("error when try to send message in CoindRPC -> " + std::string(), this);
+		reconnect();
+		return {};
 	}
 
 	beast::flat_buffer buffer;
@@ -109,7 +120,8 @@ std::string NodeRPC::Send(const std::string &request)
     catch (const std::exception& ex)
     {
 		LOG_WARNING << "error when try to read response -> " << ex.what();
-    	// throw libp2p::node_exception("error when try to read response -> " + std::string(ex.what()), this);
+		reconnect();
+		return {};
     }
 
 	std::string json_result = boost::beast::buffers_to_string(response.body().data());
