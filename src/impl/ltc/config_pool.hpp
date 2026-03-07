@@ -33,7 +33,7 @@ public:
     static constexpr uint32_t CHAIN_LENGTH              = 8640;    // 24*60*60 / 10
     static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3301;
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3600;
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;

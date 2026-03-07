@@ -119,4 +119,71 @@ struct HashLinkType
     SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, /*obj.m_extra_data,*/ VarInt(obj.m_length)); }
 };
 
+// V36 hash link — extra_data becomes VarStr (was FixedStr(0) pre-V36)
+struct V36HashLinkType
+{
+    FixedStrType<32> m_state;
+    BaseScript m_extra_data;     // VarStr in V36
+    uint64_t m_length;
+
+    SERIALIZE_METHODS(V36HashLinkType) { READWRITE(obj.m_state, obj.m_extra_data, VarInt(obj.m_length)); }
+};
+
+// V36 merged mining: per-chain address entry
+struct MergedAddressEntry
+{
+    uint32_t m_chain_id;
+    BaseScript m_script;
+
+    SERIALIZE_METHODS(MergedAddressEntry) { READWRITE(VarInt(obj.m_chain_id), obj.m_script); }
+};
+
+// V36 merged mining: per-chain coinbase verification entry
+struct MergedCoinbaseEntry
+{
+    uint32_t m_chain_id;
+    uint64_t m_coinbase_value;
+    uint32_t m_block_height;
+    FixedStrType<80> m_block_header;
+    MerkleLink m_coinbase_merkle_link;
+
+    template <typename StreamType>
+    void Serialize(StreamType& os) const
+    {
+        ::Serialize(os, Using<CompactFormat>(m_chain_id));
+        ::Serialize(os, Using<CompactFormat>(m_coinbase_value));
+        ::Serialize(os, Using<CompactFormat>(m_block_height));
+        ::Serialize(os, m_block_header);
+        ParamPackStream pstream{MERKLE_LINK_SMALL, os};
+        ::Serialize(pstream, m_coinbase_merkle_link);
+    }
+
+    template <typename StreamType>
+    void Unserialize(StreamType& is)
+    {
+        ::Unserialize(is, Using<CompactFormat>(m_chain_id));
+        ::Unserialize(is, Using<CompactFormat>(m_coinbase_value));
+        ::Unserialize(is, Using<CompactFormat>(m_block_height));
+        ::Unserialize(is, m_block_header);
+        ParamPackStream pstream{MERKLE_LINK_SMALL, is};
+        ::Unserialize(pstream, m_coinbase_merkle_link);
+    }
+};
+
+// V36: abswork is VarInt-encoded on the wire but stored as uint128
+struct AbsworkV36Format
+{
+    template <typename StreamType>
+    static void Write(StreamType& os, const uint128& value)
+    {
+        WriteCompactSize(os, value.GetLow64());
+    }
+
+    template <typename StreamType>
+    static void Read(StreamType& is, uint128& value)
+    {
+        value = uint128(ReadCompactSize(is, false));
+    }
+};
+
 } // namespace ltc

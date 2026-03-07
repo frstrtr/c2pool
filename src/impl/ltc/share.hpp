@@ -130,6 +130,21 @@ struct PaddingBugfixShare : BaseShare<35>, types::DataSegwitShare
     PaddingBugfixShare(const uint256& hash, const uint256& prev_hash) : BaseShare<35>(hash, prev_hash) {}
 };
 
+struct MergedMiningShare : BaseShare<36>
+{
+    uint160 m_pubkey_hash;
+    uint8_t m_pubkey_type{0};                                    // 0=P2PKH, 1=P2WPKH, 2=P2SH
+    std::optional<SegwitData> m_segwit_data;
+    std::vector<MergedAddressEntry> m_merged_addresses;          // empty = none
+    std::vector<MergedCoinbaseEntry> m_merged_coinbase_info;     // empty = none
+    uint256 m_merged_payout_hash;                                // zero = none
+    V36HashLinkType m_hash_link;                                 // shadows BaseShare::m_hash_link
+    BaseScript m_message_data;                                   // empty = none
+
+    MergedMiningShare() {}
+    MergedMiningShare(const uint256& hash, const uint256& prev_hash) : BaseShare<36>(hash, prev_hash) {}
+};
+
 struct Formatter
 {
     SHARE_FORMATTER()
@@ -145,16 +160,32 @@ struct Formatter
         
         std::cout << obj->m_prev_hash.ToString() << " " << obj->m_coinbase.size() << " " << obj->m_nonce << std::endl;
 
-        if constexpr (version >= 34)
+        // Address handling — version-dependent
+        if constexpr (version >= 36)
+        {
+            READWRITE(obj->m_pubkey_hash);   // IntType(160)
+            READWRITE(obj->m_pubkey_type);   // IntType(8)
+        }
+        else if constexpr (version >= 34)
         {
             READWRITE(obj->m_address);
-        } else
+        }
+        else
         {
-            READWRITE(obj->m_pubkey_hash); // pubkey_hash
+            READWRITE(obj->m_pubkey_hash);   // pubkey_hash
+        }
+
+        // Subsidy — V36 uses VarInt, others use fixed uint64
+        if constexpr (version >= 36)
+        {
+            READWRITE(VarInt(obj->m_subsidy));
+        }
+        else
+        {
+            READWRITE(obj->m_subsidy);
         }
 
         READWRITE(
-            obj->m_subsidy,
             obj->m_donation,
             Using<EnumType<IntType<8>>>(obj->m_stale_info),
             VarInt(obj->m_desired_version)
@@ -163,6 +194,12 @@ struct Formatter
         if constexpr (is_segwit_activated(version))
         {
             READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+        }
+
+        // V36: merged_addresses (after segwit_data, before far_share_hash)
+        if constexpr (version >= 36)
+        {
+            READWRITE(obj->m_merged_addresses);
         }
 
         if constexpr (version < 34)
@@ -175,9 +212,25 @@ struct Formatter
             obj->m_max_bits,
             obj->m_bits,
             obj->m_timestamp,
-            obj->m_absheight,
-            obj->m_abswork
+            obj->m_absheight
         );
+
+        // Abswork — V36 uses VarInt-encoded uint64, others use fixed uint128
+        if constexpr (version >= 36)
+        {
+            READWRITE(Using<AbsworkV36Format>(obj->m_abswork));
+        }
+        else
+        {
+            READWRITE(obj->m_abswork);
+        }
+
+        // V36: merged_coinbase_info + merged_payout_hash (after abswork)
+        if constexpr (version >= 36)
+        {
+            READWRITE(obj->m_merged_coinbase_info);
+            READWRITE(obj->m_merged_payout_hash);
+        }
 
     // ref_merkle_link
         READWRITE(
@@ -185,16 +238,22 @@ struct Formatter
         );
     // last_txout_nonce
         READWRITE(obj->m_last_txout_nonce);
-    // hash_link
+    // hash_link (V36: V36HashLinkType with extra_data; others: HashLinkType)
         READWRITE(obj->m_hash_link);
     // merkle_link
         READWRITE(
             MERKLE_LINK_SMALL(obj->m_merkle_link)
         );
+
+        // V36: message_data (at the end)
+        if constexpr (version >= 36)
+        {
+            READWRITE(obj->m_message_data);
+        }
     }
 };
 
-using ShareType = chain::ShareVariants<Formatter, Share, NewShare, SegwitMiningShare, PaddingBugfixShare>;
+using ShareType = chain::ShareVariants<Formatter, Share, NewShare, SegwitMiningShare, PaddingBugfixShare, MergedMiningShare>;
 
 inline ShareType load_share(chain::RawShare& rshare, NetService peer_addr)
 {
@@ -255,7 +314,7 @@ public:
         {
             addr_bytes = share->m_address.m_data;
         }
-        else
+        else if constexpr (requires { std::declval<ShareT>().m_pubkey_hash; })
         {
             addr_bytes = share->m_pubkey_hash.GetChars();
         }
