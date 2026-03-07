@@ -410,8 +410,25 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
               << std::setw(2) << (tx_count & 0xff)
               << std::setw(2) << ((tx_count >> 8) & 0xff);
 
-    // Coinbase transaction
-    block << coinbase_hex;
+    // Coinbase transaction: coinb1 + extranonce1 + extranonce2 + coinb2 is the
+    // non-witness (stripped) serialization used for txid computation and the
+    // Stratum merkle tree.  For segwit blocks the block body must contain the
+    // witness serialization which wraps the same data with marker/flag bytes
+    // and a coinbase witness stack (BIP141: 1 item of 32 zero bytes).
+    if (m_segwit_active) {
+        // Non-witness: [version 4B][input_count 1B][inputs…][outputs…][locktime 4B]
+        // Witness:     [version 4B][00 01][input_count 1B][inputs…][outputs…]
+        //              [witness_stack][locktime 4B]
+        block << coinbase_hex.substr(0, 8)    // version (4 bytes = 8 hex)
+              << "0001"                        // segwit marker + flag
+              << coinbase_hex.substr(8, coinbase_hex.size() - 16) // inputs + outputs
+              << "01"                          // 1 stack item for the single coinbase input
+              << "20"                          // 32 bytes
+              << std::string(64, '0')          // witness nonce (32 zero bytes)
+              << coinbase_hex.substr(coinbase_hex.size() - 8); // locktime
+    } else {
+        block << coinbase_hex;
+    }
 
     // Remaining transactions from the template
     for (const auto& tx : txs) {
@@ -476,7 +493,8 @@ MiningInterface::build_coinbase_parts(
     uint64_t coinbase_value,
     const std::vector<std::pair<std::string,uint64_t>>& outputs,
     bool raw_scripts,
-    const std::vector<uint8_t>& mm_commitment)
+    const std::vector<uint8_t>& mm_commitment,
+    const std::string& witness_commitment_hex)
 {
     // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
     // Complete coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
@@ -485,7 +503,7 @@ MiningInterface::build_coinbase_parts(
     //   [version 4B][input_count 1B]
     //   [prev_hash 32B][prev_idx 4B][script_len 1B][coinb1_script][{8B extranonce}][coinb2_script]
     //   [sequence 4B]
-    //   [output_count 1B][outputs ...][locktime 4B]
+    //   [output_count varint][outputs ...][locktime 4B]
 
     const int height = tmpl.value("height", 1);
     const std::string height_hex = encode_height_pushdata(height);
@@ -532,8 +550,18 @@ MiningInterface::build_coinbase_parts(
     coinb2 << pool_marker_stripped
            << "ffffffff";  // sequence
 
-    // Outputs
-    coinb2 << std::hex << std::setfill('0') << std::setw(2) << outputs.size();
+    // Output count: regular outputs + optional witness commitment
+    size_t num_outputs = outputs.size();
+    if (!witness_commitment_hex.empty()) ++num_outputs;
+
+    // Varint-encode output count
+    if (num_outputs < 0xfd)
+        coinb2 << std::hex << std::setfill('0') << std::setw(2) << num_outputs;
+    else
+        coinb2 << "fd" << std::hex << std::setfill('0')
+               << std::setw(2) << (num_outputs & 0xff)
+               << std::setw(2) << ((num_outputs >> 8) & 0xff);
+
     for (const auto& [addr, amount] : outputs) {
         coinb2 << encode_le64(amount);
         if (raw_scripts) {
@@ -545,6 +573,14 @@ MiningInterface::build_coinbase_parts(
             // addr is a 40-char hash160 hex — wrap in P2PKH
             coinb2 << p2pkh_script(addr);
         }
+    }
+
+    // BIP141 witness commitment output (must be last)
+    if (!witness_commitment_hex.empty()) {
+        coinb2 << encode_le64(0);   // 0 satoshis
+        size_t wc_len = witness_commitment_hex.size() / 2;
+        coinb2 << std::hex << std::setfill('0') << std::setw(2) << wc_len;
+        coinb2 << witness_commitment_hex;
     }
 
     coinb2 << "00000000"; // locktime
@@ -613,6 +649,7 @@ void MiningInterface::refresh_work()
         // Build coinbase parts with properly split payout outputs
         uint64_t coinbase_value = wd.m_data.value("coinbasevalue", uint64_t(5000000000));
         std::pair<std::string,std::string> cb_parts;
+        bool segwit_active = false;
         try {
             std::vector<std::pair<std::string,uint64_t>> outputs;
             bool raw_scripts = false;
@@ -694,8 +731,19 @@ void MiningInterface::refresh_work()
             if (m_mm_manager)
                 mm_commitment = m_mm_manager->get_auxpow_commitment();
 
+            // BIP141: extract segwit witness commitment from template
+            bool segwit_active = false;
+            std::string witness_commitment;
+            if (wd.m_data.contains("rules")) {
+                auto rules = wd.m_data["rules"].get<std::vector<std::string>>();
+                segwit_active = std::any_of(rules.begin(), rules.end(),
+                    [](const auto& r) { return r == "segwit" || r == "!segwit"; });
+            }
+            if (segwit_active && wd.m_data.contains("default_witness_commitment"))
+                witness_commitment = wd.m_data["default_witness_commitment"].get<std::string>();
+
             cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs,
-                                            raw_scripts, mm_commitment);
+                                            raw_scripts, mm_commitment, witness_commitment);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
@@ -707,6 +755,7 @@ void MiningInterface::refresh_work()
         m_cached_merkle_branches  = std::move(merkle_branches);
         m_cached_coinb1           = std::move(cb_parts.first);
         m_cached_coinb2           = std::move(cb_parts.second);
+        m_segwit_active           = segwit_active;
         m_work_valid              = true;
 
         LOG_INFO << "refresh_work: height=" << wd.m_data.value("height", 0)

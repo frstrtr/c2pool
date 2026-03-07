@@ -235,15 +235,21 @@ rpc::WorkData NodeRPC::getwork()
         else
             x = packed_tx.get<std::string>();
 
-        if (m_coin->txidcache.exist(x))
+        // Use the "txid" field from GBT when available — it is
+        // the non-witness (stripped) hash, which is what the block
+        // header merkle tree must use.  Hashing "data" directly
+        // gives the wtxid when segwit witness data is present.
+        if (packed_tx.is_object() && packed_tx.contains("txid")) {
+            txid.SetHex(packed_tx["txid"].get<std::string>());
+            txhashes.push_back(txid);
+        } else if (m_coin->txidcache.exist(x))
         {
             txid = m_coin->txidcache.get(x);
             txhashes.push_back(txid);
         } else 
         {
             ps_tx = PackStream(ParseHex(x));
-            txid = Hash(ps_tx.get_span()); // TODO: CHECK!
-			std::cout << txid.ToString() << std::endl;
+            txid = Hash(ps_tx.get_span());
 			m_coin->txidcache.add(x, txid);
 			txhashes.push_back(txid);
         }

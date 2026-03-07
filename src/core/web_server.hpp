@@ -191,7 +191,8 @@ private:
         const nlohmann::json& tmpl, uint64_t coinbase_value,
         const std::vector<std::pair<std::string,uint64_t>>& outputs,
         bool raw_scripts = false,
-        const std::vector<uint8_t>& mm_commitment = {});
+        const std::vector<uint8_t>& mm_commitment = {},
+        const std::string& witness_commitment_hex = {});
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
@@ -243,6 +244,9 @@ private:
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;
+
+    // Segwit activation (from template rules)
+    bool m_segwit_active{false};
 
     // Integrated merged mining manager (non-owning)
     c2pool::merged::MergedMiningManager* m_mm_manager{nullptr};
