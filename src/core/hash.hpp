@@ -92,7 +92,7 @@ inline uint256 Hash(const T& in1)
 template<typename T1, typename T2>
 inline uint256 Hash(const T1& in1, const T2& in2) {
     uint256 result;
-    CHash256().Write(MakeUCharSpan(in1)).Write(MakeUCharSpan(in2)).Finalize(result);
+    CHash256().Write(MakeUCharSpan(in1)).Write(MakeUCharSpan(in2)).Finalize(std::span<unsigned char>(result.data(), 32));
     return result;
 }
 

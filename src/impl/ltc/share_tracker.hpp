@@ -1,6 +1,7 @@
 #pragma once
 
 #include "share.hpp"
+#include "share_check.hpp"
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -137,7 +138,18 @@ public:
             return false;
 
         // TODO (P2): call share.check() here for full PoW + coinbase verification
-        // For now, accept the share as verified
+        // Run init-phase verification (hash-link, merkle, PoW)
+        try
+        {
+            auto& share_var = chain.get_share(share_hash);
+            share_var.ACTION({
+                share_init_verify(*obj);
+            });
+        }
+        catch (const std::exception&)
+        {
+            return false; // verification failed
+        }
 
         // Add to verified chain
         auto& share_var = chain.get_share(share_hash);

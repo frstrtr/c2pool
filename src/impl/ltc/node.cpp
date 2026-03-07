@@ -102,6 +102,9 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
                 LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string() << " = " << msg->m_best_share.ToString();
                 // TODO: DownloadShareManager — request shares starting from best_share
         }
+
+        return pool::PeerConnectionType::legacy;
+}
     
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
