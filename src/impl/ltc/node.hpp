@@ -31,6 +31,10 @@ protected:
     ltc::Handler m_handler;
     share_getter_t m_share_getter;
 
+    // Global pool of known transactions, populated by remember_tx and coin daemon.
+    // Protocol handlers look up tx hashes here when processing shares.
+    std::map<uint256, coin::Transaction> m_known_txs;
+
 public:
     NodeImpl()
         : m_share_getter(nullptr,

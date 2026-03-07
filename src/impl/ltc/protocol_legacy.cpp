@@ -105,35 +105,15 @@ void Legacy::HANDLER(shares)
             if constexpr (share_t::version >= 13 && share_t::version < 34) 
             for (auto tx_hash : obj->m_tx_info.m_new_transaction_hashes)
             {
-                /* TODO:
-                
-                coind::data::tx_type tx;
-                if (known_txs->value().find(tx_hash) != known_txs->value().end())
+                auto it = m_known_txs.find(tx_hash);
+                if (it != m_known_txs.end())
                 {
-                    tx = known_txs->value()[tx_hash];
-                } else
-                {
-                    bool flag = true;
-                    for (const auto& cache : protocol->known_txs_cache)
-                    {
-                        if (cache.second.find(tx_hash) != cache.second.end())
-                        {
-                            tx = cache.second.at(tx_hash);
-                            LOG_INFO << boost::format("Transaction %1% rescued from peer latency cache!") % tx_hash.GetHex();
-                            flag = false;
-                            break;
-                        }
-                    }
-                    if (flag)
-                    {
-                        std::string reason = (boost::format("Peer referenced unknown transaction %1%, disconnecting") % tx_hash.GetHex()).str();
-                        protocol->error(libp2p::BAD_PEER, reason);
-                        return;
-                    }
+                    txs.emplace_back(it->second);
                 }
-                txs.push_back(tx);
-                
-                */
+                else
+                {
+                    LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString();
+                }
             }
         });
         
@@ -223,98 +203,50 @@ void Legacy::HANDLER(losing_tx)
 
 void Legacy::HANDLER(remember_tx)
 {
+    // Phase 1: tx_hashes — peer tells us to remember these by hash (must be in known_txs)
     for (auto tx_hash : msg->m_tx_hashes)
     {
         if (peer->m_remembered_txs.contains(tx_hash))
         {
-            /*TODO:
-            std::string reason = "[handle_message_remember_tx] Peer referenced transaction twice, disconnecting";
-            protocol->error(libp2p::BAD_PEER, reason);
-            return;
-            */
+            LOG_WARNING << "Peer referenced transaction twice: " << tx_hash.ToString();
+            continue;
         }
 
-        /*TODO:
-        coind::data::stream::TransactionType_stream tx;
-        if (known_txs->value().count(tx_hash))
+        auto it = m_known_txs.find(tx_hash);
+        if (it != m_known_txs.end())
         {
-            tx = known_txs->value()[tx_hash];
-        } else
-        {
-			bool founded_cache = false;
-            for (const auto& cache : protocol->known_txs_cache)
-            {
-                if (cache.second.find(tx_hash) != cache.second.end())
-                {
-                    tx = cache.second.at(tx_hash);
-                    LOG_INFO << "Transaction " << tx_hash.ToString() << " rescued from peer latency cache!";
-					founded_cache = true;
-                    break;
-                }
-            }
-
-			if (!founded_cache)
-			{
-                std::string reason = "[handle_message_remember_tx] Peer referenced unknown transaction " + tx_hash.ToString() + " disconnecting";
-                protocol->error(libp2p::BAD_PEER, reason);
-				return;
-			}
+            peer->m_remembered_txs.insert_or_assign(tx_hash, it->second);
         }
-
-        protocol->remembered_txs[tx_hash] = tx;
-		PackStream stream;
-		stream << tx;
-		protocol->remembered_txs_size += 100 + pack<coind::data::stream::TransactionType_stream>(tx).size();
-        */
+        else
+        {
+            LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString();
+        }
     }
 
-    std::map<uint256, coin::Transaction> added_known_txs;
-    bool warned = false;
-    for (auto tx : msg->m_txs)
-	{
-		// PackStream stream;
-		// stream << tx;
-		// auto tx_size = stream.size();
-		// TODO: auto tx_hash = Hash(stream);
+    // Phase 2: txs — peer sends full transactions (compute hash, store)
+    for (auto& tx : msg->m_txs)
+    {
+        auto packed = pack(coin::TX_WITH_WITNESS(tx));
+        auto tx_hash = Hash(packed.get_span());
 
-		// if (peer->m_remembered_txs.contains(tx_hash))
-		{
-            //TODO:
-            // std::string reason = "[handle_message_remember_tx] Peer referenced transaction twice, disconnecting";
-            // protocol->error(libp2p::BAD_PEER, reason);
-			// return;
-		}
+        if (peer->m_remembered_txs.contains(tx_hash))
+        {
+            LOG_WARNING << "Peer sent duplicate transaction: " << tx_hash.ToString();
+            continue;
+        }
 
-        //TODO:
-		// if (known_txs->exist(tx_hash) && !warned)
-		// {
-		// 	LOG_WARNING << "Peer sent entire transaction " << tx_hash.ToString() << " that was already received";
-		// 	warned = true;
-		// }
+        coin::Transaction full_tx(tx);
+        peer->m_remembered_txs.insert_or_assign(tx_hash, full_tx);
 
-		// peer->m_remembered_txs[tx_hash] = ltc::Transaction(tx);
-        // TODO:
-		// peer->m_remembered_txs_size += 100 + _tx_size;
-		// added_known_txs[tx_hash] = _tx.get();
-	}
-    // TODO: known_txs->add(added_known_txs);
-
-    // TODO:
-    // if (protocol->remembered_txs_size >= protocol->max_remembered_txs_size)
-	// {
-	// 	throw std::runtime_error("too much transaction data stored"); // TODO: custom error
-	// }
+        if (!m_known_txs.contains(tx_hash))
+            m_known_txs.emplace(tx_hash, std::move(full_tx));
+    }
 }
 
 void Legacy::HANDLER(forget_tx)
 {
     for (auto tx_hash : msg->m_tx_hashes)
     {
-        // PackStream stream;
-        // stream << peer->m_remembered_txs[tx_hash];
-        // TODO: 
-        // peer->m_remembered_txs_size -= 100 + stream.size();
-        // assert(protocol->remembered_txs_size >= 0);
         peer->m_remembered_txs.erase(tx_hash);
     }
 }

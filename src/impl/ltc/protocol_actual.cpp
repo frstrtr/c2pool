@@ -105,7 +105,15 @@ void Actual::HANDLER(shares)
             if constexpr (share_t::version >= 13 && share_t::version < 34) 
             for (auto tx_hash : obj->m_tx_info.m_new_transaction_hashes)
             {
-                /* TODO: resolve tx from known_txs / known_txs_cache (P6) */
+                auto it = m_known_txs.find(tx_hash);
+                if (it != m_known_txs.end())
+                {
+                    txs.emplace_back(it->second);
+                }
+                else
+                {
+                    LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString();
+                }
             }
         });
         
@@ -188,23 +196,44 @@ void Actual::HANDLER(losing_tx)
 
 void Actual::HANDLER(remember_tx)
 {
+    // Phase 1: tx_hashes — peer tells us to remember these by hash (must be in known_txs)
     for (auto tx_hash : msg->m_tx_hashes)
     {
         if (peer->m_remembered_txs.contains(tx_hash))
         {
-            /* TODO: disconnect bad peer (P6) */
+            LOG_WARNING << "Peer referenced transaction twice: " << tx_hash.ToString();
+            continue;
         }
 
-        /* TODO: resolve tx from known_txs / known_txs_cache (P6) */
+        auto it = m_known_txs.find(tx_hash);
+        if (it != m_known_txs.end())
+        {
+            peer->m_remembered_txs.insert_or_assign(tx_hash, it->second);
+        }
+        else
+        {
+            LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString();
+        }
     }
 
-    std::map<uint256, coin::Transaction> added_known_txs;
-    bool warned = false;
-    for (auto tx : msg->m_txs)
+    // Phase 2: txs — peer sends full transactions (compute hash, store)
+    for (auto& tx : msg->m_txs)
     {
-        /* TODO: hash tx, check duplicates, add to remembered_txs (P6) */
+        auto packed = pack(coin::TX_WITH_WITNESS(tx));
+        auto tx_hash = Hash(packed.get_span());
+
+        if (peer->m_remembered_txs.contains(tx_hash))
+        {
+            LOG_WARNING << "Peer sent duplicate transaction: " << tx_hash.ToString();
+            continue;
+        }
+
+        coin::Transaction full_tx(tx);
+        peer->m_remembered_txs.insert_or_assign(tx_hash, full_tx);
+
+        if (!m_known_txs.contains(tx_hash))
+            m_known_txs.emplace(tx_hash, std::move(full_tx));
     }
-    /* TODO: known_txs->add(added_known_txs) (P6) */
 }
 
 void Actual::HANDLER(forget_tx)
