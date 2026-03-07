@@ -249,6 +249,15 @@ public:
         return m_shares.contains(hash);
     }
 
+    bool contains(const hash_t& hash) const
+    {
+        return m_shares.contains(hash);
+    }
+
+    const auto& get_heads() const { return m_heads; }
+    const auto& get_tails() const { return m_tails; }
+    size_t size() const { return m_shares.size(); }
+
     int32_t get_height(const hash_t& hash)
     {
         return get_index(hash)->height;
