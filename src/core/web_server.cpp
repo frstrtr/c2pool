@@ -1928,6 +1928,8 @@ void StratumSession::process_message(std::size_t bytes_read)
             response = handle_authorize(params, id);
         } else if (method == "mining.submit") {
             response = handle_submit(params, id);
+        } else if (method == "mining.set_merged_addresses") {
+            response = handle_set_merged_addresses(params, id);
         } else {
             // Unknown method
             send_error(-1, "Unknown method", id);
@@ -1971,6 +1973,28 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
     if (params.size() >= 1 && params[0].is_string()) {
         username_ = params[0];
         authorized_ = true;
+
+        // Parse merged addresses from username: ADDRESS/CHAIN_ID:ADDR/CHAIN_ID:ADDR
+        auto slash_pos = username_.find('/');
+        if (slash_pos != std::string::npos) {
+            std::string remainder = username_.substr(slash_pos + 1);
+            username_ = username_.substr(0, slash_pos);
+            std::istringstream ss(remainder);
+            std::string token;
+            while (std::getline(ss, token, '/')) {
+                auto colon = token.find(':');
+                if (colon != std::string::npos && colon > 0 && colon + 1 < token.size()) {
+                    try {
+                        uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
+                        merged_addresses_[chain_id] = token.substr(colon + 1);
+                    } catch (...) {
+                        // skip malformed entries
+                    }
+                }
+            }
+            if (!merged_addresses_.empty())
+                LOG_INFO << "Merged addresses from username: " << merged_addresses_.size() << " chain(s)";
+        }
         
         LOG_INFO << "Mining authorization successful for: " << username_;
         
@@ -1988,6 +2012,39 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         
         return response;
     }
+}
+
+// mining.set_merged_addresses extension
+// params: [{ "chain_id": "address", ... }]  — keys are chain_id as strings
+// Example: [{"98": "DQkwFoo...", "2": "1btcAddr..."}]
+nlohmann::json StratumSession::handle_set_merged_addresses(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    if (params.empty() || !params[0].is_object()) {
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({20, "Expected object param {chain_id: address}", nullptr});
+        return response;
+    }
+
+    for (auto& [key, val] : params[0].items()) {
+        if (val.is_string()) {
+            try {
+                uint32_t chain_id = static_cast<uint32_t>(std::stoul(key));
+                merged_addresses_[chain_id] = val.get<std::string>();
+            } catch (...) {
+                // skip malformed
+            }
+        }
+    }
+
+    LOG_INFO << "Set merged addresses for " << username_ << ": " << merged_addresses_.size() << " chain(s)";
+
+    nlohmann::json response;
+    response["id"] = request_id;
+    response["result"] = true;
+    response["error"] = nullptr;
+    return response;
 }
 
 nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const nlohmann::json& request_id)

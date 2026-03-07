@@ -351,9 +351,17 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     uint64_t rejected_shares_ = 0;
     uint64_t stale_shares_    = 0;
 
+    // Merged mining: per-chain payout addresses set by the miner.
+    // Maps chain_id → address string (e.g. 98 → "DQkw...").
+    // Populated via mining.set_merged_addresses or from username format.
+    std::map<uint32_t, std::string> merged_addresses_;
+
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
     void start();
+
+    // Merged mining: return the per-chain payout addresses for share construction.
+    const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
 
 private:
     std::string generate_subscription_id();
@@ -363,6 +371,7 @@ private:
     nlohmann::json handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id);
     nlohmann::json handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id);
     nlohmann::json handle_submit(const nlohmann::json& params, const nlohmann::json& request_id);
+    nlohmann::json handle_set_merged_addresses(const nlohmann::json& params, const nlohmann::json& request_id);
     
     void send_response(const nlohmann::json& response);
     void send_error(int code, const std::string& message, const nlohmann::json& request_id);
