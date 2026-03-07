@@ -368,8 +368,14 @@ public:
                 auto* head_idx = chain.get_index(hh);
                 int64_t ts = head_idx->time_seen;
 
-                // No punishment for now (P2 will add should_punish_reason)
+                // Punish heads whose version is below a 95%-activated newer version
                 int32_t reason = 0;
+                {
+                    auto share_version = chain.get_share(hh).version();
+                    auto lookbehind = static_cast<int32_t>(PoolConfig::CHAIN_LENGTH);
+                    if (should_punish_version(hh, share_version, lookbehind))
+                        reason = 1;
+                }
 
                 decorated_heads.push_back({{work_score, reason, ts}, hh});
                 traditional_sort.push_back({{work_score, ts, reason}, hh});
@@ -616,6 +622,51 @@ public:
     {
         for (auto& cb : m_stale_callbacks)
             cb(share_hash, info);
+    }
+
+    // -- Version counting for AutoRatchet upgrade coordination --
+    // Walks back `lookbehind` shares from `share_hash` and counts
+    // how many desire each version. Returns map of version → count.
+    // Python ref: tracker.get_desired_version_counts(...)
+    std::map<uint64_t, int32_t> get_desired_version_counts(const uint256& share_hash, int32_t lookbehind)
+    {
+        std::map<uint64_t, int32_t> counts;
+        auto height = chain.get_height(share_hash);
+        auto actual = std::min(lookbehind, height);
+        if (actual <= 0)
+            return counts;
+
+        auto view = chain.get_chain(share_hash, actual);
+        for (auto& [hash, data] : view)
+        {
+            uint64_t dv = 0;
+            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            counts[dv]++;
+        }
+        return counts;
+    }
+
+    // Returns true if shares at `share_version` should be punished because
+    // a newer version has reached the 95% activation threshold.
+    // Python ref: share.check() version_after_check logic
+    bool should_punish_version(const uint256& share_hash, int64_t share_version, int32_t lookbehind)
+    {
+        auto counts = get_desired_version_counts(share_hash, lookbehind);
+        auto height = chain.get_height(share_hash);
+        auto actual = std::min(lookbehind, height);
+        if (actual <= 0)
+            return false;
+
+        // Check if any version higher than share_version has >= 95% support
+        for (auto& [ver, count] : counts)
+        {
+            if (static_cast<int64_t>(ver) > share_version)
+            {
+                if (count * 100 >= actual * 95) // 95% threshold
+                    return true;
+            }
+        }
+        return false;
     }
 
 private:

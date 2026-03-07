@@ -408,9 +408,18 @@ bool share_check(const ShareT& share,
     if (share.m_timestamp > now + 600)
         throw std::invalid_argument("share timestamp is too far in the future");
 
-    // 2. Version counting (stub)
-    // Legacy: get_desired_version_counts for upgrade enforcement
-    // For now, we skip version switch enforcement — all versions accepted.
+    // 2. Version counting — AutoRatchet upgrade enforcement
+    // If 95% of recent shares desire a higher version, this share's version
+    // is considered obsolete and must be rejected.
+    {
+        auto lookbehind = static_cast<int32_t>(PoolConfig::CHAIN_LENGTH);
+        auto height = tracker.chain.get_height(share_hash);
+        if (height >= lookbehind)
+        {
+            if (tracker.should_punish_version(share_hash, share.VERSION, lookbehind))
+                throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+        }
+    }
 
     // 3. Transaction hash resolution (pre-v34 only)
     // Legacy resolves other_tx_hashes by walking back the chain via
