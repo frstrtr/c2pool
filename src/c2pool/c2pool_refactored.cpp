@@ -588,7 +588,8 @@ int main(int argc, char* argv[]) {
             });
 
             // When a block is successfully submitted, broadcast bestblock to all P2P peers
-            web_server.set_on_block_submitted([&p2p_node](const std::string& header_hex) {
+            // and record the found block for the /recent_blocks REST endpoint.
+            web_server.set_on_block_submitted([&p2p_node, &web_server](const std::string& header_hex) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -621,7 +622,18 @@ int main(int argc, char* argv[]) {
                 hdr.m_bits      = le32(72);
                 hdr.m_nonce     = le32(76);
                 p2p_node->broadcast_bestblock(hdr);
-                LOG_INFO << "Broadcast bestblock to P2P peers (nonce=" << hdr.m_nonce << ")";
+
+                // Record found block for REST /recent_blocks
+                uint256 block_hash = Hash(ParseHex(header_hex.substr(0, 160)));
+                uint64_t height = 0;
+                auto tmpl = web_server.get_mining_interface()->get_current_work_template();
+                if (!tmpl.is_null() && tmpl.contains("height"))
+                    height = tmpl["height"].get<uint64_t>();
+                web_server.get_mining_interface()->record_found_block(height, block_hash);
+
+                LOG_INFO << "Block found! height=" << height
+                         << " hash=" << block_hash.GetHex()
+                         << " — broadcast bestblock to P2P peers";
             });
             
             // Configure payout system for web server

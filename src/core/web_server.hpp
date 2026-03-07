@@ -341,6 +341,9 @@ public:
     // Set the integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr);
 
+    // Access the underlying MiningInterface (e.g. for record_found_block)
+    MiningInterface* get_mining_interface() const { return mining_interface_.get(); }
+
 private:
     void accept_connections();
     void handle_accept(beast::error_code ec, tcp::socket socket);
