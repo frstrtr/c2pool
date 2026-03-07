@@ -24,6 +24,9 @@
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 
+// Forward declaration for merged mining integration
+namespace c2pool { namespace merged { class MergedMiningManager; } }
+
 // Bring the address validation types into the core namespace for convenience
 using Blockchain = c2pool::address::Blockchain;
 using Network = c2pool::address::Network;
@@ -146,6 +149,9 @@ public:
         const uint256& best_hash, const uint256& block_target,
         uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
     void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = std::move(fn); }
+
+    // Integrated merged mining manager
+    void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
     
     // Payout management methods
     nlohmann::json getpayoutinfo(const std::string& request_id = "");
@@ -184,7 +190,8 @@ private:
     static std::pair<std::string, std::string> build_coinbase_parts(
         const nlohmann::json& tmpl, uint64_t coinbase_value,
         const std::vector<std::pair<std::string,uint64_t>>& outputs,
-        bool raw_scripts = false);
+        bool raw_scripts = false,
+        const std::vector<uint8_t>& mm_commitment = {});
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
@@ -195,6 +202,11 @@ private:
                                          const std::string& extranonce2,
                                          const std::string& ntime,
                                          const std::string& nonce) const;
+
+    // Try submitting to merged-mined aux chains if their target is met
+    void check_merged_mining(const std::string& block_hex,
+                             const std::string& extranonce1,
+                             const std::string& extranonce2);
     
     // Internal state
     uint64_t m_work_id_counter;
@@ -231,6 +243,9 @@ private:
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;
+
+    // Integrated merged mining manager (non-owning)
+    c2pool::merged::MergedMiningManager* m_mm_manager{nullptr};
 };
 
 /// Main Web Server class
@@ -297,6 +312,8 @@ public:
     void set_best_share_hash_fn(std::function<uint256()> fn);
     // Wire the PPLNS computation from the share tracker
     void set_pplns_fn(MiningInterface::pplns_fn_t fn);
+    // Set the integrated merged mining manager
+    void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr);
 
 private:
     void accept_connections();

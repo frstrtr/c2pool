@@ -8,6 +8,7 @@
 #include <core/target_utils.hpp> // chain::bits_to_target
 #include <btclibs/util/strencodings.h>  // ParseHex, HexStr
 #include <crypto/scrypt.h>  // scrypt_1024_1_1_256 for Litecoin PoW
+#include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
 
 #include <iomanip>
 #include <sstream>
@@ -253,6 +254,39 @@ void MiningInterface::set_on_block_submitted(std::function<void(const std::strin
     m_on_block_submitted = std::move(fn);
 }
 
+void MiningInterface::check_merged_mining(const std::string& block_hex,
+                                          const std::string& extranonce1,
+                                          const std::string& extranonce2)
+{
+    if (!m_mm_manager) return;
+
+    // Extract 80-byte parent header (first 160 hex chars)
+    if (block_hex.size() < 160) return;
+    std::string parent_header_hex = block_hex.substr(0, 160);
+
+    // Compute parent block hash (scrypt for LTC)
+    auto hdr_bytes = ParseHex(parent_header_hex);
+    uint256 parent_hash;
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_bytes.data()),
+                        reinterpret_cast<char*>(parent_hash.data()));
+
+    // Build stripped coinbase tx (no witness)
+    std::string coinbase_hex;
+    std::vector<std::string> merkle_branches_copy;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
+        merkle_branches_copy = m_cached_merkle_branches;
+    }
+
+    m_mm_manager->try_submit_merged_blocks(
+        parent_header_hex,
+        coinbase_hex,
+        merkle_branches_copy,
+        0,  // coinbase is always at index 0
+        parent_hash);
+}
+
 // ─── Merkle branch computation ────────────────────────────────────────────────
 // Given the list of transaction hashes EXCLUDING the coinbase
 // (i.e. from getblocktemplate tx list), compute the Stratum merkle_branches
@@ -441,7 +475,8 @@ MiningInterface::build_coinbase_parts(
     const nlohmann::json& tmpl,
     uint64_t coinbase_value,
     const std::vector<std::pair<std::string,uint64_t>>& outputs,
-    bool raw_scripts)
+    bool raw_scripts,
+    const std::vector<uint8_t>& mm_commitment)
 {
     // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
     // Complete coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
@@ -463,8 +498,20 @@ MiningInterface::build_coinbase_parts(
     for (char c : pool_marker) { if (c != ' ') pool_marker_stripped += c; }
     const int pool_marker_bytes = static_cast<int>(pool_marker_stripped.size()) / 2;
 
-    // Total coinbase script length: height + 8 (extranonce) + pool_marker
-    const int script_total = height_bytes + 8 + pool_marker_bytes;
+    // AuxPoW merged mining commitment (44 bytes when present)
+    std::string mm_hex;
+    if (!mm_commitment.empty()) {
+        static const char* HEX = "0123456789abcdef";
+        mm_hex.reserve(mm_commitment.size() * 2);
+        for (uint8_t b : mm_commitment) {
+            mm_hex += HEX[b >> 4];
+            mm_hex += HEX[b & 0x0f];
+        }
+    }
+    const int mm_bytes = static_cast<int>(mm_commitment.size());
+
+    // Total coinbase script length: height + 8 (extranonce) + mm_commitment + pool_marker
+    const int script_total = height_bytes + 8 + mm_bytes + pool_marker_bytes;
 
     // Build coinb1 (version + 1 input header up to + including the height encoding)
     std::ostringstream coinb1;
@@ -478,8 +525,10 @@ MiningInterface::build_coinbase_parts(
            // height encoding (BIP34)
            << height_hex;
 
-    // Build coinb2 (pool marker + sequence + outputs + locktime)
+    // Build coinb2 (mm_commitment + pool marker + sequence + outputs + locktime)
     std::ostringstream coinb2;
+    if (!mm_hex.empty())
+        coinb2 << mm_hex;
     coinb2 << pool_marker_stripped
            << "ffffffff";  // sequence
 
@@ -640,7 +689,13 @@ void MiningInterface::refresh_work()
             if (outputs.empty())
                 outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
 
-            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs, raw_scripts);
+            // Get merged mining commitment if an MM manager is wired
+            std::vector<uint8_t> mm_commitment;
+            if (m_mm_manager)
+                mm_commitment = m_mm_manager->get_auxpow_commitment();
+
+            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs,
+                                            raw_scripts, mm_commitment);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
@@ -1195,6 +1250,9 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce);
             if (!block_hex.empty()) {
+                // Check merged mining targets for every share (aux targets are lower)
+                check_merged_mining(block_hex, extranonce1, extranonce2);
+
                 // Validate merkle root before submitting
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 uint256 header_merkle;
@@ -1286,6 +1344,9 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         if (m_coin_rpc && !extranonce1.empty()) {
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce);
             if (!block_hex.empty()) {
+                // Check merged mining targets for every share (aux targets are lower)
+                check_merged_mining(block_hex, extranonce1, extranonce2);
+
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 uint256 header_merkle;
                 std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
@@ -1587,6 +1648,11 @@ void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)
 void WebServer::set_pplns_fn(MiningInterface::pplns_fn_t fn)
 {
     mining_interface_->set_pplns_fn(std::move(fn));
+}
+
+void WebServer::set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr)
+{
+    mining_interface_->set_merged_mining_manager(mgr);
 }
 
 bool WebServer::start_solo()

@@ -7,6 +7,7 @@
 #include <csignal>
 #include <ctime>
 #include <memory>
+#include <sstream>
 
 // Core includes
 #include <core/settings.hpp>
@@ -35,6 +36,9 @@
 #include <c2pool/difficulty/adjustment_engine.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <c2pool/payout/payout_manager.hpp>
+
+// Integrated merged mining
+#include <c2pool/merged/merged_mining.hpp>
 
 // Coin daemon RPC
 #include <impl/ltc/coin/rpc.hpp>
@@ -146,6 +150,11 @@ void print_help() {
     std::cout << "  --stratum-port PORT       Stratum mining port (default: 8084)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
 
+    std::cout << "MERGED MINING:\n";
+    std::cout << "  --merged SPEC             Add aux chain for merged mining. SPEC format:\n";
+    std::cout << "                            SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS\n";
+    std::cout << "                            Example: DOGE:98:127.0.0.1:22555:user:pass\n";
+    std::cout << "                            Can be specified multiple times\n\n";
     std::cout << "COIN DAEMON RPC (for live block templates):\n";
     std::cout << "  --rpchost HOST            Coin daemon RPC host (default: 127.0.0.1)\n";
     std::cout << "  --rpcport PORT            Coin daemon RPC port (default: 19332 testnet / 9332 mainnet)\n";
@@ -245,6 +254,11 @@ int main(int argc, char* argv[]) {
     bool integrated_mode = false;
     bool sharechain_mode = false;
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
+
+    // Merged mining (auxiliary chain) configuration
+    // Multiple --merged flags can be given; each specifies:
+    //   --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
+    std::vector<std::string> merged_chain_specs;
     
     // Helper function to parse blockchain string
     auto parse_blockchain = [](const std::string& blockchain_str) -> Blockchain {
@@ -328,6 +342,11 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--rpcpassword" && i + 1 < argc) {
             rpc_pass = argv[++i];
+        }
+        // Merged mining: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
+        // e.g. --merged DOGE:98:127.0.0.1:22555:dogeuser:dogepass
+        else if (arg == "--merged" && i + 1 < argc) {
+            merged_chain_specs.push_back(argv[++i]);
         }
         // Legacy support for old --port option (maps to p2p-port)
         else if (arg == "--port" && i + 1 < argc) {
@@ -526,7 +545,41 @@ int main(int argc, char* argv[]) {
                 return p2p_node->tracker().get_expected_payouts(
                     best_hash, block_target, subsidy, donation_script);
             });
-            
+
+            // --- Integrated Merged Mining ---
+            // Parse --merged specs and set up the manager (replaces standalone mm-adapter)
+            std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
+            if (!merged_chain_specs.empty()) {
+                mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
+                for (const auto& spec : merged_chain_specs) {
+                    // Format: SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
+                    std::vector<std::string> parts;
+                    std::string token;
+                    std::istringstream ss(spec);
+                    while (std::getline(ss, token, ':'))
+                        parts.push_back(token);
+                    if (parts.size() < 6) {
+                        LOG_ERROR << "Invalid --merged spec (expected SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS): " << spec;
+                        continue;
+                    }
+                    c2pool::merged::AuxChainConfig cfg;
+                    cfg.symbol       = parts[0];
+                    cfg.chain_id     = static_cast<uint32_t>(std::stoul(parts[1]));
+                    cfg.rpc_host     = parts[2];
+                    cfg.rpc_port     = static_cast<uint16_t>(std::stoul(parts[3]));
+                    cfg.rpc_userpass = parts[4] + ":" + parts[5];
+                    cfg.multiaddress = true;
+
+                    mm_manager->add_chain(cfg);
+                    LOG_INFO << "Merged mining: added " << cfg.symbol
+                             << " (chain_id=" << cfg.chain_id << ") at "
+                             << cfg.rpc_host << ":" << cfg.rpc_port;
+                }
+                web_server.set_merged_mining_manager(mm_manager.get());
+                mm_manager->start();
+                LOG_INFO << "Merged mining manager started with " << mm_manager->chain_count() << " chain(s)";
+            }
+
             // Set custom Stratum port if different from default
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
             

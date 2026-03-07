@@ -32,6 +32,18 @@ target_link_libraries(c2pool_storage
     btclibs
 )
 
+# Merged Mining Manager Library (integrated mm-adapter)
+add_library(c2pool_merged_mining
+    merged/merged_mining.cpp
+)
+target_include_directories(c2pool_merged_mining PUBLIC .)
+target_link_libraries(c2pool_merged_mining
+    core
+    btclibs
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
 # Enhanced Node Library
 add_library(c2pool_node_enhanced
     node/enhanced_node.cpp
@@ -51,6 +63,7 @@ add_executable(c2pool c2pool_refactored.cpp)
 target_link_libraries(c2pool 
     c2pool_node_enhanced
     c2pool_payout
+    c2pool_merged_mining
     core
     ltc
     nlohmann_json::nlohmann_json
@@ -62,6 +75,7 @@ add_executable(c2pool_enhanced c2pool_refactored.cpp)
 target_link_libraries(c2pool_enhanced 
     c2pool_node_enhanced
     c2pool_payout
+    c2pool_merged_mining
     core
     ltc
     nlohmann_json::nlohmann_json
