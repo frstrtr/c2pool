@@ -191,9 +191,9 @@ public:
     // Return coinb1 and coinb2 (coinbase parts split around extranonce)
     std::pair<std::string, std::string> get_coinbase_parts() const;
 
-    // Callback fired whenever a block is successfully forwarded to the coin daemon.
-    // The argument is the header in hex (first 80 bytes = 160 hex chars of the submitted block).
-    void set_on_block_submitted(std::function<void(const std::string& header_hex)> fn);
+    // Callback fired whenever a block submission is attempted.
+    // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
+    void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
 
 private:
     void setup_methods();
@@ -247,8 +247,8 @@ private:
     std::string             m_cached_coinb2;
     mutable std::mutex      m_work_mutex;
 
-    // Block-found callback
-    std::function<void(const std::string&)> m_on_block_submitted;
+    // Block-found callback (header_hex, stale_info: 0=none, 253=orphan, 254=doa)
+    std::function<void(const std::string&, int)> m_on_block_submitted;
 
     // Share tracker hook
     std::function<uint256()> m_best_share_hash_fn;
@@ -331,7 +331,7 @@ public:
     // Wire a live coin-daemon RPC connection for block template generation
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
     // Forward block-found callback to the underlying MiningInterface
-    void set_on_block_submitted(std::function<void(const std::string&)> fn);
+    void set_on_block_submitted(std::function<void(const std::string&, int)> fn);
     // Immediately refresh the cached block template (call when a new block arrives)
     void trigger_work_refresh();
     // Wire the share tracker's best hash into MiningInterface

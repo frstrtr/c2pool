@@ -269,7 +269,7 @@ void MiningInterface::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Nod
     LOG_INFO << "MiningInterface: coin RPC " << (rpc ? "connected" : "disconnected");
 }
 
-void MiningInterface::set_on_block_submitted(std::function<void(const std::string&)> fn)
+void MiningInterface::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
 {
     m_on_block_submitted = std::move(fn);
 }
@@ -1032,6 +1032,10 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 LOG_WARNING << "submitblock: stale block — prev_hash mismatch"
                             << " submitted=" << submitted_prev_hash.GetHex()
                             << " expected=" << expected_prev.GetHex();
+                // Fire callback with orphan stale info (253)
+                if (m_on_block_submitted && hex_data.size() >= 160) {
+                    m_on_block_submitted(hex_data.substr(0, 160), 253);
+                }
                 return {{"error", "stale block: previous block hash mismatch"}};
             }
         }
@@ -1050,12 +1054,16 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         try {
             m_coin_rpc->submit_block_hex(hex_data, "", false);
             LOG_INFO << "Block forwarded to coin daemon";
-            // Notify P2P layer with the first 160 hex chars (80-byte header)
+            // Notify P2P layer with stale_info=0 (none — accepted)
             if (m_on_block_submitted && hex_data.size() >= 160) {
-                m_on_block_submitted(hex_data.substr(0, 160));
+                m_on_block_submitted(hex_data.substr(0, 160), 0);
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "submitblock failed: " << e.what();
+            // Fire callback with doa stale info (254)
+            if (m_on_block_submitted && hex_data.size() >= 160) {
+                m_on_block_submitted(hex_data.substr(0, 160), 254);
+            }
             return {{"error", std::string(e.what())}};
         }
     } else {
@@ -1777,7 +1785,7 @@ bool WebServer::start()
     }
 }
 
-void WebServer::set_on_block_submitted(std::function<void(const std::string&)> fn)
+void WebServer::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
 {
     mining_interface_->set_on_block_submitted(std::move(fn));
 }

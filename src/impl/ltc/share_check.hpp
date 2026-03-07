@@ -1083,7 +1083,8 @@ uint256 create_local_share(
     const std::vector<uint256>& merkle_branches,
     const std::vector<unsigned char>& payout_script,
     uint16_t donation = 50,
-    const std::vector<MergedAddressEntry>& merged_addrs = {})
+    const std::vector<MergedAddressEntry>& merged_addrs = {},
+    StaleInfo stale_info = StaleInfo::none)
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1091,7 +1092,7 @@ uint256 create_local_share(
     share.m_subsidy    = subsidy;
     share.m_prev_hash  = prev_share;
     share.m_donation   = donation;
-    share.m_stale_info = static_cast<unsigned int>(StaleInfo::none);
+    share.m_stale_info = static_cast<unsigned int>(stale_info);
     share.m_desired_version = 36;
     share.m_max_bits   = min_header.m_bits;
     share.m_bits       = min_header.m_bits; // block-level share meets network target

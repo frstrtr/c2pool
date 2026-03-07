@@ -587,9 +587,10 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "bestblock received from P2P peer — work template refreshed";
             });
 
-            // When a block is successfully submitted, broadcast bestblock to all P2P peers
+            // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
-            web_server.set_on_block_submitted([&p2p_node, &web_server](const std::string& header_hex) {
+            // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
+            web_server.set_on_block_submitted([&p2p_node, &web_server](const std::string& header_hex, int stale_info) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -621,7 +622,11 @@ int main(int argc, char* argv[]) {
                 hdr.m_timestamp = le32(68);
                 hdr.m_bits      = le32(72);
                 hdr.m_nonce     = le32(76);
-                p2p_node->broadcast_bestblock(hdr);
+
+                // Only broadcast bestblock for accepted blocks
+                if (stale_info == 0) {
+                    p2p_node->broadcast_bestblock(hdr);
+                }
 
                 // Record found block for REST /recent_blocks
                 uint256 block_hash = Hash(ParseHex(header_hex.substr(0, 160)));
@@ -631,8 +636,12 @@ int main(int argc, char* argv[]) {
                     height = tmpl["height"].get<uint64_t>();
                 web_server.get_mining_interface()->record_found_block(height, block_hash);
 
+                const char* stale_str = (stale_info == 253) ? " [ORPHAN]"
+                                      : (stale_info == 254) ? " [DOA]"
+                                      : "";
                 LOG_INFO << "Block found! height=" << height
                          << " hash=" << block_hash.GetHex()
+                         << stale_str
                          << " — broadcast bestblock to P2P peers";
             });
             
