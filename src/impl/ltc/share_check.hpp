@@ -14,6 +14,7 @@
 #include <core/uint256.hpp>
 #include <btclibs/crypto/common.h>
 #include <btclibs/crypto/sha256.h>
+#include <btclibs/crypto/scrypt.h>
 
 #include <algorithm>
 #include <cstring>
@@ -363,17 +364,22 @@ uint256 share_init_verify(const ShareT& share)
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = Hash(hdr_span);
 
-    // --- PoW check ---
-    // For Litecoin the POW_FUNC is scrypt, but blocks are identified by SHA256d.
-    // The pow_hash (scrypt) check against target is deferred until scrypt is
-    // integrated (P2.5).  For now we verify the target is sane.
+    // --- PoW check (scrypt) ---
+    // For Litecoin the POW_FUNC is scrypt(1024,1,1,256).
+    // Blocks are identified by SHA256d, but PoW validity uses scrypt hash.
     uint256 target = chain::bits_to_target(share.m_bits);
-
-    // MAX_TARGET for LTC p2pool = 2^256 / 2^32 = (all-ones >> 32) approximately
-    // The legacy net->MAX_TARGET is "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-    // For safety, just verify target is non-zero
     if (target.IsNull())
         throw std::invalid_argument("share target is zero");
+
+    // Compute the scrypt hash of the 80-byte block header
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
+                        pow_hash_bytes);
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+    if (pow_hash > target)
+        throw std::invalid_argument("share PoW hash does not meet target");
 
     return share_hash;
 }
