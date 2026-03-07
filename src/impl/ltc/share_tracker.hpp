@@ -149,8 +149,9 @@ public:
         {
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
-                share_init_verify(*obj);
-                share_check(*obj, share_hash, *this);
+                auto computed_hash = verify_share(*obj, *this);
+                // verify_share runs both init (PoW/hash-link) and check (PPLNS/gentx)
+                (void)computed_hash;
             });
         }
         catch (const std::exception&)
