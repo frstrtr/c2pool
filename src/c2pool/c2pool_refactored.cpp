@@ -517,6 +517,15 @@ int main(int argc, char* argv[]) {
             web_server.set_best_share_hash_fn([&p2p_node]() {
                 return p2p_node->best_share_hash();
             });
+
+            // Wire the PPLNS computation hook so refresh_work() builds
+            // proportional coinbase outputs from the share tracker.
+            web_server.set_pplns_fn([&p2p_node](
+                    const uint256& best_hash, const uint256& block_target,
+                    uint64_t subsidy, const std::vector<unsigned char>& donation_script) {
+                return p2p_node->tracker().get_expected_payouts(
+                    best_hash, block_target, subsidy, donation_script);
+            });
             
             // Set custom Stratum port if different from default
             web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));

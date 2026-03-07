@@ -440,7 +440,8 @@ static std::string p2pkh_script(const std::string& hash160_hex)
 MiningInterface::build_coinbase_parts(
     const nlohmann::json& tmpl,
     uint64_t coinbase_value,
-    const std::vector<std::pair<std::string,uint64_t>>& outputs)
+    const std::vector<std::pair<std::string,uint64_t>>& outputs,
+    bool raw_scripts)
 {
     // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
     // Complete coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
@@ -486,8 +487,15 @@ MiningInterface::build_coinbase_parts(
     coinb2 << std::hex << std::setfill('0') << std::setw(2) << outputs.size();
     for (const auto& [addr, amount] : outputs) {
         coinb2 << encode_le64(amount);
-        // addr is a 40-char hash160 hex (from get_hash160_for_address)
-        coinb2 << p2pkh_script(addr);
+        if (raw_scripts) {
+            // addr is already hex-encoded full scriptPubKey
+            size_t script_len = addr.size() / 2;
+            coinb2 << std::hex << std::setfill('0') << std::setw(2) << script_len;
+            coinb2 << addr;
+        } else {
+            // addr is a 40-char hash160 hex — wrap in P2PKH
+            coinb2 << p2pkh_script(addr);
+        }
     }
 
     coinb2 << "00000000"; // locktime
@@ -558,9 +566,57 @@ void MiningInterface::refresh_work()
         std::pair<std::string,std::string> cb_parts;
         try {
             std::vector<std::pair<std::string,uint64_t>> outputs;
-            if (m_payout_manager_ptr) {
+            bool raw_scripts = false;
+
+            // PPLNS path: use share-tracker proportional payouts when wired
+            if (m_pplns_fn && m_best_share_hash_fn && m_payout_manager_ptr) {
+                auto best = m_best_share_hash_fn();
+                if (!best.IsNull()) {
+                    // Block target from template bits
+                    uint32_t nbits = std::stoul(
+                        wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                    uint256 block_target = chain::bits_to_target(nbits);
+
+                    // Build donation script (P2PKH) from developer address
+                    std::vector<unsigned char> donation_script;
+                    std::string dev_addr = m_payout_manager_ptr->get_developer_address();
+                    if (!dev_addr.empty()) {
+                        auto h160 = base58check_to_hash160(dev_addr);
+                        if (!h160.empty()) {
+                            donation_script = {0x76, 0xa9, 0x14};
+                            for (size_t i = 0; i < h160.size(); i += 2)
+                                donation_script.push_back(static_cast<unsigned char>(
+                                    std::stoul(h160.substr(i, 2), nullptr, 16)));
+                            donation_script.push_back(0x88);
+                            donation_script.push_back(0xac);
+                        }
+                    }
+
+                    auto expected = m_pplns_fn(best, block_target, coinbase_value, donation_script);
+                    m_payout_manager_ptr->set_pplns_expected_payouts(std::move(expected));
+
+                    auto pplns_out = m_payout_manager_ptr->calculate_pplns_outputs(coinbase_value);
+                    if (!pplns_out.empty()) {
+                        static const char* HEX = "0123456789abcdef";
+                        for (const auto& [script_bytes, amount] : pplns_out) {
+                            std::string hex;
+                            hex.reserve(script_bytes.size() * 2);
+                            for (unsigned char b : script_bytes) {
+                                hex += HEX[b >> 4];
+                                hex += HEX[b & 0x0f];
+                            }
+                            outputs.push_back({std::move(hex), amount});
+                        }
+                        raw_scripts = true;
+                        LOG_INFO << "refresh_work: PPLNS coinbase with "
+                                 << outputs.size() << " outputs";
+                    }
+                }
+            }
+
+            // Fallback: simple percentage-based payout split
+            if (!raw_scripts && m_payout_manager_ptr) {
                 auto alloc = m_payout_manager_ptr->calculate_payout(coinbase_value);
-                // Miner/pool portion → node-owner address (or developer address as fallback)
                 if (alloc.miner_amount > 0) {
                     std::string addr = m_payout_manager_ptr->get_node_owner_address();
                     if (addr.empty()) addr = m_payout_manager_ptr->get_developer_address();
@@ -568,24 +624,23 @@ void MiningInterface::refresh_work()
                     if (!h160.empty())
                         outputs.push_back({h160, alloc.miner_amount});
                 }
-                // Developer fee output
                 if (alloc.developer_amount > 0 && !alloc.developer_address.empty()) {
                     auto h160 = base58check_to_hash160(alloc.developer_address);
                     if (!h160.empty())
                         outputs.push_back({h160, alloc.developer_amount});
                 }
-                // Node-owner fee output (separate if different address)
                 if (alloc.node_owner_amount > 0 && !alloc.node_owner_address.empty()) {
                     auto h160 = base58check_to_hash160(alloc.node_owner_address);
                     if (!h160.empty())
                         outputs.push_back({h160, alloc.node_owner_amount});
                 }
             }
+
             // Fallback: single output to zero-key (burn) so coinbase is always valid
             if (outputs.empty())
                 outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
 
-            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs);
+            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs, raw_scripts);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
@@ -1527,6 +1582,11 @@ void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coi
 void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)
 {
     mining_interface_->set_best_share_hash_fn(std::move(fn));
+}
+
+void WebServer::set_pplns_fn(MiningInterface::pplns_fn_t fn)
+{
+    mining_interface_->set_pplns_fn(std::move(fn));
 }
 
 bool WebServer::start_solo()

@@ -140,6 +140,12 @@ public:
 
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = std::move(fn); }
+
+    // Hook: computes PPLNS expected payouts from the share tracker
+    using pplns_fn_t = std::function<std::map<std::vector<unsigned char>, double>(
+        const uint256& best_hash, const uint256& block_target,
+        uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
+    void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = std::move(fn); }
     
     // Payout management methods
     nlohmann::json getpayoutinfo(const std::string& request_id = "");
@@ -177,7 +183,8 @@ private:
     // Build Stratum-compatible coinb1/coinb2 from a live block template
     static std::pair<std::string, std::string> build_coinbase_parts(
         const nlohmann::json& tmpl, uint64_t coinbase_value,
-        const std::vector<std::pair<std::string,uint64_t>>& outputs);
+        const std::vector<std::pair<std::string,uint64_t>>& outputs,
+        bool raw_scripts = false);
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
@@ -221,6 +228,9 @@ private:
 
     // Share tracker hook
     std::function<uint256()> m_best_share_hash_fn;
+
+    // PPLNS computation hook
+    pplns_fn_t m_pplns_fn;
 };
 
 /// Main Web Server class
@@ -285,6 +295,8 @@ public:
     void trigger_work_refresh();
     // Wire the share tracker's best hash into MiningInterface
     void set_best_share_hash_fn(std::function<uint256()> fn);
+    // Wire the PPLNS computation from the share tracker
+    void set_pplns_fn(MiningInterface::pplns_fn_t fn);
 
 private:
     void accept_connections();
