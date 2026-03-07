@@ -172,9 +172,26 @@ public:
     // Number of registered chains
     size_t chain_count() const { return m_chains.size(); }
 
+    // ─── Multiaddress payout provider ────────────────────────────────────
+    // Callback: given (chain_id, coinbase_value) returns sorted payout list
+    //   vector<(scriptPubKey, satoshis)>.
+    // Set by the integration layer that owns the ShareTracker.
+    using PayoutProvider = std::function<
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>>(
+            uint32_t chain_id, uint64_t coinbase_value)>;
+
+    void set_payout_provider(PayoutProvider provider);
+
 private:
     void poll_loop();
     void refresh_aux_work();
+
+    // Build a complete aux block in multiaddress mode from getblocktemplate
+    // result, PPLNS payout outputs and AuxPoW proof hex.
+    static std::string build_multiaddress_block(
+        const nlohmann::json& block_template,
+        const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
+        const std::string& auxpow_hex);
 
     boost::asio::io_context& m_ioc;
     boost::asio::steady_timer m_poll_timer;
@@ -194,6 +211,9 @@ private:
 
     // Cached commitment
     std::vector<uint8_t> m_cached_commitment;
+
+    // Per-chain payout provider (set by integration layer)
+    PayoutProvider m_payout_provider;
 
     mutable std::mutex m_mutex;
 };

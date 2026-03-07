@@ -618,10 +618,20 @@ void MergedMiningManager::try_submit_merged_blocks(
             proof.index,
             parent_header_hex);
 
-        if (chain.config.multiaddress) {
-            // In multiaddress mode, we'd build the complete block...
-            // For now, use submitauxblock which works with both modes
-            chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+        if (chain.config.multiaddress && m_payout_provider) {
+            // Multiaddress mode: build a complete block with PPLNS payouts
+            auto payouts = m_payout_provider(chain.config.chain_id,
+                                             chain.current_work.coinbase_value);
+            if (!payouts.empty()) {
+                auto block_hex = build_multiaddress_block(
+                    chain.current_work.block_template, payouts, auxpow);
+                if (!block_hex.empty())
+                    chain.rpc->submit_block(block_hex);
+                else
+                    chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+            } else {
+                chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+            }
         } else {
             chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
         }
@@ -636,6 +646,172 @@ std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
         result[c.config.chain_id] = c.current_work;
     }
     return result;
+}
+
+void MergedMiningManager::set_payout_provider(PayoutProvider provider)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_payout_provider = std::move(provider);
+}
+
+// ─── Multiaddress block construction ─────────────────────────────────────────
+//
+// Builds a complete aux-chain block from getblocktemplate data and PPLNS
+// payouts.  The block is ready for submitblock.
+//
+// Block layout:
+//   header(80 bytes) + auxpow + varint(tx_count) + coinbase_tx + template_txs
+//
+// The coinbase transaction is built fresh with the supplied payout outputs.
+// Template transactions are included verbatim from getblocktemplate.
+
+std::string MergedMiningManager::build_multiaddress_block(
+    const nlohmann::json& tmpl,
+    const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
+    const std::string& auxpow_hex)
+{
+    if (payouts.empty() || !tmpl.contains("previousblockhash"))
+        return {};
+
+    // --- Parse template fields ---
+    uint32_t version  = tmpl.value("version", 0x20000002u);
+    std::string prev_hash_hex = tmpl.value("previousblockhash", "");
+    uint32_t curtime  = tmpl.value("curtime", 0u);
+    std::string bits_hex = tmpl.value("bits", "1d00ffff");
+    int height = tmpl.value("height", 0);
+
+    // --- Build coinbase TX ---
+    std::ostringstream cb;
+
+    // tx version (1, LE)
+    cb << "01000000";
+
+    // 1 input
+    cb << "01";
+    // prev_output: null hash + 0xffffffff
+    cb << "0000000000000000000000000000000000000000000000000000000000000000"
+       << "ffffffff";
+
+    // scriptSig: BIP34 height + some padding
+    // BIP34: push height as little-endian
+    std::ostringstream sig;
+    if (height < 17) {
+        sig << to_hex(reinterpret_cast<const uint8_t*>("\x51"), 1); // OP_1..OP_16
+    } else {
+        // Encode height as minimal LE bytes
+        std::vector<uint8_t> hbytes;
+        int h = height;
+        while (h > 0) { hbytes.push_back(h & 0xff); h >>= 8; }
+        sig << to_hex(reinterpret_cast<const uint8_t*>(&hbytes[0]), 0); // push size
+        // Actually: PUSH_N <n bytes>
+        uint8_t push_len = static_cast<uint8_t>(hbytes.size());
+        sig.str("");
+        sig << to_hex(&push_len, 1) << to_hex(hbytes.data(), hbytes.size());
+    }
+    // Append 4 zero bytes as extra nonce space
+    sig << "00000000";
+    std::string sig_hex = sig.str();
+    cb << varint_hex(sig_hex.size() / 2) << sig_hex;
+
+    // sequence
+    cb << "ffffffff";
+
+    // outputs
+    cb << varint_hex(payouts.size());
+    for (const auto& [script, amount] : payouts)
+    {
+        // value: 8 bytes LE
+        uint8_t vbuf[8];
+        for (int i = 0; i < 8; ++i)
+            vbuf[i] = (amount >> (8 * i)) & 0xFF;
+        cb << to_hex(vbuf, 8);
+        // scriptPubKey
+        cb << varint_hex(script.size())
+           << to_hex(script.data(), script.size());
+    }
+
+    // locktime
+    cb << "00000000";
+
+    std::string coinbase_hex = cb.str();
+
+    // --- Coinbase txid (double-SHA256 of serialized coinbase) ---
+    auto coinbase_bytes = from_hex(coinbase_hex);
+    uint256 cb_hash = Hash(coinbase_bytes);
+
+    // --- Collect template transaction hashes ---
+    std::vector<uint256> tx_hashes;
+    tx_hashes.push_back(cb_hash);
+
+    std::vector<std::string> tx_datas;
+    if (tmpl.contains("transactions") && tmpl["transactions"].is_array())
+    {
+        for (const auto& tx : tmpl["transactions"])
+        {
+            std::string txdata = tx.value("data", "");
+            tx_datas.push_back(txdata);
+
+            std::string txid_str = tx.value("txid", "");
+            if (!txid_str.empty()) {
+                uint256 txid;
+                txid.SetHex(txid_str);
+                tx_hashes.push_back(txid);
+            } else {
+                // Compute txid from data
+                auto raw = from_hex(txdata);
+                tx_hashes.push_back(Hash(raw));
+            }
+        }
+    }
+
+    // --- Merkle root ---
+    auto merkle_layer = tx_hashes;
+    while (merkle_layer.size() > 1)
+    {
+        if (merkle_layer.size() % 2 != 0)
+            merkle_layer.push_back(merkle_layer.back());
+        std::vector<uint256> next;
+        for (size_t i = 0; i < merkle_layer.size(); i += 2)
+            next.push_back(Hash(merkle_layer[i], merkle_layer[i + 1]));
+        merkle_layer = std::move(next);
+    }
+    uint256 merkle_root = merkle_layer.empty() ? cb_hash : merkle_layer[0];
+
+    // --- Block header (80 bytes) ---
+    std::ostringstream hdr;
+    hdr << encode_le32(version);
+
+    // Previous block hash: hex is big-endian, we need LE (internal byte order)
+    uint256 prev_hash;
+    prev_hash.SetHex(prev_hash_hex);
+    hdr << uint256_to_le_hex(prev_hash);
+    hdr << uint256_to_le_hex(merkle_root);
+    hdr << encode_le32(curtime);
+    hdr << bits_hex; // bits already in hex LE? No — bits from GBT is hex BE (compact)
+    // Actually bits from GBT is a hex string like "1d00ffff" which is already
+    // the 4-byte compact target in big-endian hex. We need it in LE for the header.
+    // Rewrite: parse as uint32 then emit LE
+    {
+        // Remove the bits_hex we just wrote and redo it properly
+        std::string hdr_so_far = hdr.str();
+        hdr_so_far.resize(hdr_so_far.size() - bits_hex.size());
+        hdr.str(hdr_so_far);
+        hdr.seekp(0, std::ios_base::end);
+        uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
+        hdr << encode_le32(nbits);
+    }
+    hdr << encode_le32(0); // nonce — doesn't matter for AuxPoW
+
+    // --- Assemble full block ---
+    std::ostringstream blk;
+    blk << hdr.str();          // 80 bytes header
+    blk << auxpow_hex;         // AuxPoW proof
+    blk << varint_hex(1 + tx_datas.size()); // transaction count
+    blk << coinbase_hex;       // coinbase tx
+    for (const auto& txd : tx_datas)
+        blk << txd;            // template transactions
+
+    return blk.str();
 }
 
 } // namespace merged
