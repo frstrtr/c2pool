@@ -1149,5 +1149,118 @@ uint64_t PayoutManager::get_current_timestamp() const {
     return static_cast<uint64_t>(std::time(nullptr));
 }
 
+// --- PPLNS integration ---
+
+void PayoutManager::set_pplns_expected_payouts(std::map<std::vector<unsigned char>, double> expected_payouts) {
+    std::lock_guard<std::mutex> lock(contributions_mutex_);
+    pplns_expected_payouts_ = std::move(expected_payouts);
+    has_pplns_data_ = !pplns_expected_payouts_.empty();
+}
+
+bool PayoutManager::has_pplns_data() const {
+    std::lock_guard<std::mutex> lock(contributions_mutex_);
+    return has_pplns_data_;
+}
+
+void PayoutManager::clear_pplns_data() {
+    std::lock_guard<std::mutex> lock(contributions_mutex_);
+    pplns_expected_payouts_.clear();
+    has_pplns_data_ = false;
+}
+
+std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+PayoutManager::calculate_pplns_outputs(uint64_t subsidy) const {
+    std::lock_guard<std::mutex> lock(contributions_mutex_);
+
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> outputs;
+
+    if (!has_pplns_data_ || pplns_expected_payouts_.empty()) {
+        return outputs;
+    }
+
+    // Compute fee deductions
+    uint64_t dev_amount = developer_config_.get_developer_amount(subsidy);
+    uint64_t node_amount = 0;
+    if (node_owner_config_.enabled && node_owner_config_.fee_percent > 0.0) {
+        node_amount = static_cast<uint64_t>(subsidy * node_owner_config_.fee_percent / 100.0);
+    }
+    // Ensure fees don't exceed 51% of subsidy
+    if (dev_amount + node_amount > subsidy / 2) {
+        double scale = static_cast<double>(subsidy / 2) / (dev_amount + node_amount);
+        dev_amount = static_cast<uint64_t>(dev_amount * scale);
+        node_amount = static_cast<uint64_t>(node_amount * scale);
+    }
+    uint64_t miner_pool = subsidy - dev_amount - node_amount;
+
+    // Sum the PPLNS expected amounts (they distribute the full subsidy)
+    double pplns_total = 0.0;
+    for (const auto& [script, amount] : pplns_expected_payouts_) {
+        pplns_total += amount;
+    }
+
+    if (pplns_total <= 0.0) {
+        return outputs;
+    }
+
+    // Scale PPLNS proportions to the miner_pool and convert to satoshis
+    uint64_t distributed = 0;
+    size_t largest_idx = 0;
+    uint64_t largest_val = 0;
+
+    for (const auto& [script, amount] : pplns_expected_payouts_) {
+        uint64_t sat = static_cast<uint64_t>(amount / pplns_total * miner_pool);
+        if (sat < MINIMUM_PAYOUT_SATOSHIS) {
+            continue;  // Skip dust outputs
+        }
+        outputs.emplace_back(script, sat);
+        distributed += sat;
+        if (sat > largest_val) {
+            largest_val = sat;
+            largest_idx = outputs.size() - 1;
+        }
+    }
+
+    // Assign rounding remainder to largest output
+    if (!outputs.empty() && distributed < miner_pool) {
+        outputs[largest_idx].second += (miner_pool - distributed);
+    }
+
+    // Add developer output
+    if (dev_amount > 0) {
+        std::string dev_addr = developer_config_.get_developer_address(blockchain_, network_);
+        if (!dev_addr.empty()) {
+            std::string script_hex = address_to_script_hex(dev_addr);
+            // Convert hex to bytes
+            std::vector<unsigned char> script_bytes;
+            for (size_t i = 0; i < script_hex.size(); i += 2) {
+                script_bytes.push_back(
+                    static_cast<unsigned char>(std::stoul(script_hex.substr(i, 2), nullptr, 16)));
+            }
+            outputs.emplace_back(std::move(script_bytes), dev_amount);
+        }
+    }
+
+    // Add node owner output
+    if (node_amount > 0 && !node_owner_config_.payout_address.empty()) {
+        std::string script_hex = address_to_script_hex(node_owner_config_.payout_address);
+        std::vector<unsigned char> script_bytes;
+        for (size_t i = 0; i < script_hex.size(); i += 2) {
+            script_bytes.push_back(
+                static_cast<unsigned char>(std::stoul(script_hex.substr(i, 2), nullptr, 16)));
+        }
+        outputs.emplace_back(std::move(script_bytes), node_amount);
+    }
+
+    // Sort by amount descending and cap to MAX_COINBASE_OUTPUTS
+    std::sort(outputs.begin(), outputs.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    if (outputs.size() > MAX_COINBASE_OUTPUTS) {
+        outputs.resize(MAX_COINBASE_OUTPUTS);
+    }
+
+    return outputs;
+}
+
 } // namespace payout
 } // namespace c2pool

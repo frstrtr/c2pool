@@ -191,6 +191,20 @@ public:
     // Access to address validator for API methods
     const BlockchainAddressValidator* get_address_validator() const { return &address_validator_; }
     
+    // --- PPLNS integration (ShareTracker → PayoutManager) ---
+    
+    // Accept PPLNS-computed expected payouts from ShareTracker::get_expected_payouts().
+    // Keys are scriptPubKey bytes, values are payout amounts (doubles) for the full subsidy.
+    void set_pplns_expected_payouts(std::map<std::vector<unsigned char>, double> expected_payouts);
+    bool has_pplns_data() const;
+    void clear_pplns_data();
+    
+    // Calculate coinbase outputs using PPLNS weights with developer/node-owner fees applied.
+    // Returns (scriptPubKey → satoshis) pairs sorted by value descending, capped to MAX_COINBASE_OUTPUTS.
+    // Falls back to proportional distribution when no PPLNS data is available.
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+        calculate_pplns_outputs(uint64_t subsidy) const;
+    
 private:
     mutable std::mutex contributions_mutex_;
     std::map<std::string, MinerContribution> miner_contributions_;
@@ -209,6 +223,10 @@ private:
     
     // Validation
     mutable std::vector<std::string> validation_errors_;
+    
+    // PPLNS data (from ShareTracker::get_expected_payouts)
+    std::map<std::vector<unsigned char>, double> pplns_expected_payouts_;
+    bool has_pplns_data_ = false;
     
     // Helper methods
     double calculate_total_difficulty() const;
