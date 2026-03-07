@@ -2,6 +2,7 @@
 #include <fstream>
 #include <string>
 #include <map>
+#include <set>
 #include <thread>
 #include <chrono>
 #include <csignal>
@@ -46,6 +47,7 @@
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 
 // Bring the address validation types into scope
 using Blockchain = c2pool::address::Blockchain;
@@ -259,6 +261,10 @@ int main(int argc, char* argv[]) {
     // Multiple --merged flags can be given; each specifies:
     //   --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
     std::vector<std::string> merged_chain_specs;
+
+    // Track which options were explicitly set via CLI so that --config file
+    // values only fill in gaps (CLI always wins).
+    std::set<std::string> cli_explicit;
     
     // Helper function to parse blockchain string
     auto parse_blockchain = [](const std::string& blockchain_str) -> Blockchain {
@@ -284,77 +290,163 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--testnet") {
             settings->m_testnet = true;
+            cli_explicit.insert("testnet");
         }
         else if (arg == "--p2p-port" && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
+            cli_explicit.insert("p2p_port");
         }
         else if (arg == "--http-port" && i + 1 < argc) {
             http_port = std::stoi(argv[++i]);
+            cli_explicit.insert("http_port");
         }
         else if (arg == "--stratum-port" && i + 1 < argc) {
             stratum_port = std::stoi(argv[++i]);
+            cli_explicit.insert("stratum_port");
         }
         else if (arg == "--http-host" && i + 1 < argc) {
             http_host = argv[++i];
+            cli_explicit.insert("http_host");
         }
         else if (arg == "--integrated") {
             integrated_mode = true;
+            cli_explicit.insert("integrated");
         }
         else if (arg == "--sharechain") {
             sharechain_mode = true;
+            cli_explicit.insert("sharechain");
         }
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
         }
         else if (arg == "--blockchain" && i + 1 < argc) {
             blockchain = parse_blockchain(argv[++i]);
+            cli_explicit.insert("blockchain");
         }
         else if (arg == "--solo-address" && i + 1 < argc) {
             solo_address = argv[++i];
+            cli_explicit.insert("solo_address");
         }
         else if (arg == "--dev-donation" && i + 1 < argc) {
             dev_donation = std::stod(argv[++i]);
+            cli_explicit.insert("dev_donation");
         }
         else if (arg == "--node-owner-fee" && i + 1 < argc) {
             node_owner_fee = std::stod(argv[++i]);
+            cli_explicit.insert("node_owner_fee");
         }
         else if (arg == "--node-owner-address" && i + 1 < argc) {
             node_owner_address = argv[++i];
+            cli_explicit.insert("node_owner_address");
         }
         else if (arg == "--node-owner-script" && i + 1 < argc) {
             node_owner_script = argv[++i];
+            cli_explicit.insert("node_owner_script");
         }
         else if (arg == "--auto-detect-wallet") {
             auto_detect_wallet = true;
+            cli_explicit.insert("auto_detect_wallet");
         }
         else if (arg == "--no-auto-detect-wallet") {
             auto_detect_wallet = false;
+            cli_explicit.insert("auto_detect_wallet");
         }
         // Coin daemon RPC credentials
         else if (arg == "--rpchost" && i + 1 < argc) {
             rpc_host = argv[++i];
+            cli_explicit.insert("rpc_host");
         }
         else if (arg == "--rpcport" && i + 1 < argc) {
             rpc_port = std::stoi(argv[++i]);
+            cli_explicit.insert("rpc_port");
         }
         else if (arg == "--rpcuser" && i + 1 < argc) {
             rpc_user = argv[++i];
+            cli_explicit.insert("rpc_user");
         }
         else if (arg == "--rpcpassword" && i + 1 < argc) {
             rpc_pass = argv[++i];
+            cli_explicit.insert("rpc_pass");
         }
         // Merged mining: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
         // e.g. --merged DOGE:98:127.0.0.1:22555:dogeuser:dogepass
         else if (arg == "--merged" && i + 1 < argc) {
             merged_chain_specs.push_back(argv[++i]);
+            cli_explicit.insert("merged");
         }
         // Legacy support for old --port option (maps to p2p-port)
         else if (arg == "--port" && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
+            cli_explicit.insert("p2p_port");
             LOG_WARNING << "--port is deprecated, use --p2p-port instead";
         }
         else {
             LOG_ERROR << "Unknown argument: " << arg;
+            return 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Load YAML config file if --config was specified.
+    // Config file provides defaults; CLI arguments always take priority.
+    // -----------------------------------------------------------------------
+    if (!config_file.empty()) {
+        try {
+            YAML::Node cfg = YAML::LoadFile(config_file);
+            LOG_INFO << "Loading config from " << config_file;
+
+            // Network / mode
+            if (!cli_explicit.count("testnet") && cfg["testnet"])
+                settings->m_testnet = cfg["testnet"].as<bool>();
+            if (!cli_explicit.count("integrated") && cfg["integrated"])
+                integrated_mode = cfg["integrated"].as<bool>();
+            if (!cli_explicit.count("sharechain") && cfg["sharechain"])
+                sharechain_mode = cfg["sharechain"].as<bool>();
+            if (!cli_explicit.count("blockchain") && cfg["blockchain"])
+                blockchain = parse_blockchain(cfg["blockchain"].as<std::string>());
+
+            // Ports
+            if (!cli_explicit.count("p2p_port") && cfg["port"])
+                p2p_port = cfg["port"].as<int>();
+            if (!cli_explicit.count("stratum_port") && cfg["stratum_port"])
+                stratum_port = cfg["stratum_port"].as<int>();
+            if (!cli_explicit.count("http_port") && cfg["http_port"])
+                http_port = cfg["http_port"].as<int>();
+            if (!cli_explicit.count("http_host") && cfg["http_host"])
+                http_host = cfg["http_host"].as<std::string>();
+
+            // Coin daemon RPC
+            if (!cli_explicit.count("rpc_host") && cfg["ltc_rpc_host"])
+                rpc_host = cfg["ltc_rpc_host"].as<std::string>();
+            if (!cli_explicit.count("rpc_port") && cfg["ltc_rpc_port"])
+                rpc_port = cfg["ltc_rpc_port"].as<int>();
+            if (!cli_explicit.count("rpc_user") && cfg["ltc_rpc_user"])
+                rpc_user = cfg["ltc_rpc_user"].as<std::string>();
+            if (!cli_explicit.count("rpc_pass") && cfg["ltc_rpc_password"])
+                rpc_pass = cfg["ltc_rpc_password"].as<std::string>();
+
+            // Mining / payout
+            if (!cli_explicit.count("solo_address") && cfg["solo_address"])
+                solo_address = cfg["solo_address"].as<std::string>();
+            if (!cli_explicit.count("dev_donation") && cfg["donation_percentage"])
+                dev_donation = cfg["donation_percentage"].as<double>();
+            if (!cli_explicit.count("node_owner_fee") && cfg["node_owner_fee"])
+                node_owner_fee = cfg["node_owner_fee"].as<double>();
+            if (!cli_explicit.count("node_owner_address") && cfg["node_owner_address"])
+                node_owner_address = cfg["node_owner_address"].as<std::string>();
+            if (!cli_explicit.count("node_owner_script") && cfg["node_owner_script"])
+                node_owner_script = cfg["node_owner_script"].as<std::string>();
+            if (!cli_explicit.count("auto_detect_wallet") && cfg["auto_detect_wallet"])
+                auto_detect_wallet = cfg["auto_detect_wallet"].as<bool>();
+
+            // Merged mining chains (config appends; CLI replaces if specified)
+            if (!cli_explicit.count("merged") && cfg["merged"] && cfg["merged"].IsSequence()) {
+                for (const auto& item : cfg["merged"])
+                    merged_chain_specs.push_back(item.as<std::string>());
+            }
+
+        } catch (const YAML::Exception& e) {
+            LOG_ERROR << "Failed to load config file '" << config_file << "': " << e.what();
             return 1;
         }
     }
