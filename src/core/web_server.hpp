@@ -108,7 +108,7 @@ public:
     // Stratum-style methods (for advanced miners)
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
-    nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "");
+    nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "");
 
     // Enhanced coinbase and validation methods
     nlohmann::json validate_address(const std::string& address);
@@ -176,6 +176,14 @@ private:
         const std::vector<std::pair<std::string,uint64_t>>& outputs);
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
+    // Reconstruct merkle root from coinbase hex + Stratum merkle branches
+    static uint256 reconstruct_merkle_root(const std::string& coinbase_hex,
+                                           const std::vector<std::string>& merkle_branches);
+    // Build full block hex from Stratum submit parameters
+    std::string build_block_from_stratum(const std::string& extranonce1,
+                                         const std::string& extranonce2,
+                                         const std::string& ntime,
+                                         const std::string& nonce) const;
     
     // Internal state
     uint64_t m_work_id_counter;
