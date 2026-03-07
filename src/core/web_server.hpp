@@ -22,6 +22,7 @@
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <c2pool/payout/payout_manager.hpp>
+#include <c2pool/hashrate/tracker.hpp>
 
 // Bring the address validation types into the core namespace for convenience
 using Blockchain = c2pool::address::Blockchain;
@@ -287,18 +288,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     bool need_initial_setup_ = false;
     static std::atomic<uint64_t> job_counter_;
     
-    // VARDIFF tracking per miner
-    double current_difficulty_ = 1.0;
-    uint64_t share_count_ = 0;
-    uint64_t last_share_time_ = 0;
-    uint64_t last_vardiff_adjustment_ = 0;
-    double estimated_hashrate_ = 0.0;
-    
-    // VARDIFF configuration
-    static constexpr double VARDIFF_MIN = 1.0;
-    static constexpr double VARDIFF_MAX = 65536.0;
-    static constexpr uint64_t VARDIFF_RETARGET_INTERVAL = 30; // seconds
-    static constexpr uint64_t VARDIFF_TARGET_TIME = 15; // target seconds between shares
+    // Per-connection VARDIFF via HashrateTracker
+    c2pool::hashrate::HashrateTracker hashrate_tracker_;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
@@ -320,11 +311,7 @@ private:
     
     std::string generate_extranonce1();
     
-    // VARDIFF methods
-    void update_hashrate_estimate(double share_difficulty);
-    void check_vardiff_adjustment();
-    double calculate_new_difficulty() const;
-    uint64_t get_current_time_seconds() const;
+
 };
 
 /// Stratum Server for native mining protocol (separate from HTTP)

@@ -1389,6 +1389,8 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
+    hashrate_tracker_.set_difficulty_bounds(1.0, 65536.0);
+    hashrate_tracker_.set_target_time_per_mining_share(15.0);
 }
 
 void StratumSession::start()
@@ -1474,8 +1476,8 @@ nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, co
     
     LOG_INFO << "Mining subscription successful for: " << subscription_id_;
     
-    // Send initial difficulty
-    send_set_difficulty(current_difficulty_);
+    // Send initial difficulty from tracker
+    send_set_difficulty(hashrate_tracker_.get_current_difficulty());
     
     // Send initial work
     send_notify_work();
@@ -1517,15 +1519,19 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         return response;
     }
     
-    // For now, accept all shares (in a real implementation, validate the work)
-    share_count_++;
-    last_share_time_ = get_current_time_seconds();
+    double old_difficulty = hashrate_tracker_.get_current_difficulty();
     
-    // Update hashrate estimate for VARDIFF
-    update_hashrate_estimate(current_difficulty_);
-    check_vardiff_adjustment();
+    // Record the share in the tracker (triggers internal VARDIFF adjustment)
+    hashrate_tracker_.record_mining_share_submission(old_difficulty, true);
     
-    LOG_INFO << "Share submitted by " << username_ << " (difficulty: " << current_difficulty_ << ")";
+    double new_difficulty = hashrate_tracker_.get_current_difficulty();
+    if (new_difficulty != old_difficulty) {
+        send_set_difficulty(new_difficulty);
+        LOG_INFO << "VARDIFF adjustment for " << username_ << ": "
+                 << old_difficulty << " -> " << new_difficulty;
+    }
+    
+    LOG_INFO << "Share submitted by " << username_ << " (difficulty: " << new_difficulty << ")";
     
     nlohmann::json response;
     response["id"] = request_id;
@@ -1642,56 +1648,6 @@ std::string StratumSession::generate_extranonce1()
     return ss.str();
 }
 
-void StratumSession::update_hashrate_estimate(double share_difficulty)
-{
-    uint64_t current_time = get_current_time_seconds();
-    if (last_share_time_ > 0) {
-        uint64_t time_diff = current_time - last_share_time_;
-        if (time_diff > 0) {
-            // Simple hashrate estimation: difficulty / time
-            double instant_hashrate = share_difficulty / time_diff;
-            // Use exponential moving average
-            estimated_hashrate_ = estimated_hashrate_ * 0.8 + instant_hashrate * 0.2;
-        }
-    }
-}
-
-void StratumSession::check_vardiff_adjustment()
-{
-    uint64_t current_time = get_current_time_seconds();
-    
-    if (current_time - last_vardiff_adjustment_ >= VARDIFF_RETARGET_INTERVAL) {
-        double new_difficulty = calculate_new_difficulty();
-        
-        if (new_difficulty != current_difficulty_) {
-            current_difficulty_ = new_difficulty;
-            send_set_difficulty(current_difficulty_);
-            LOG_INFO << "VARDIFF adjustment for " << username_ << ": " << current_difficulty_;
-        }
-        
-        last_vardiff_adjustment_ = current_time;
-    }
-}
-
-double StratumSession::calculate_new_difficulty() const
-{
-    if (estimated_hashrate_ <= 0) {
-        return current_difficulty_;
-    }
-    
-    // Target: VARDIFF_TARGET_TIME seconds per share
-    double target_difficulty = estimated_hashrate_ * VARDIFF_TARGET_TIME;
-    
-    // Clamp to min/max values
-    target_difficulty = std::max(VARDIFF_MIN, std::min(VARDIFF_MAX, target_difficulty));
-    
-    return target_difficulty;
-}
-
-uint64_t StratumSession::get_current_time_seconds() const
-{
-    return static_cast<uint64_t>(std::time(nullptr));
-}
 bool MiningInterface::is_valid_address(const std::string& address) const
 {
     if (m_payout_manager) {
