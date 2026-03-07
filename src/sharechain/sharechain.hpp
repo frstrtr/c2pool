@@ -398,6 +398,79 @@ public:
         return ChainView(*this, hash, n);
     }
 
+    /// Remove all shares beyond max_size from the chain starting at head.
+    /// Walks the prev-pointer chain, cuts at the boundary, subtracts the
+    /// evicted accumulated index data, and frees the removed shares.
+    /// Returns the number of shares removed.
+    size_t trim(const hash_t& head, size_t max_size)
+    {
+        if (!m_shares.contains(head) || max_size == 0)
+            return 0;
+
+        // Walk from head toward tail via prev pointers
+        std::vector<index_t*> chain_indexes;
+        auto* current = get_index(head);
+        chain_indexes.push_back(current);
+        while (current->prev)
+        {
+            current = current->prev;
+            chain_indexes.push_back(current);
+        }
+
+        if (chain_indexes.size() <= max_size)
+            return 0;
+
+        // chain_indexes[max_size-1] = boundary (new tail-end)
+        // chain_indexes[max_size]   = first share to evict
+        index_t* boundary = chain_indexes[max_size - 1];
+        index_t* evicted_top = chain_indexes[max_size];
+
+        // Subtract the evicted portion's accumulated data from every
+        // index above (and including) the boundary
+        for (size_t i = 0; i < max_size; ++i)
+            chain_indexes[i]->operation(evicted_top, index_t::operation_type::minus);
+
+        // Detach boundary from the evicted portion
+        boundary->prev = nullptr;
+
+        // Collect hashes to remove
+        std::vector<hash_t> to_remove;
+        to_remove.reserve(chain_indexes.size() - max_size);
+        for (size_t i = max_size; i < chain_indexes.size(); ++i)
+            to_remove.push_back(chain_indexes[i]->head);
+
+        // Update head/tail tracking
+        hash_t old_tail_ref = m_heads[head];
+        hash_t new_tail_ref = boundary->tail; // boundary share's prev_hash
+
+        m_heads[head] = new_tail_ref;
+
+        if (m_tails.contains(old_tail_ref))
+        {
+            m_tails[old_tail_ref].erase(head);
+            if (m_tails[old_tail_ref].empty())
+                m_tails.erase(old_tail_ref);
+        }
+        m_tails[new_tail_ref].insert(head);
+
+        // Remove evicted shares and free their indexes
+        for (auto& h : to_remove)
+        {
+            // Clean up any stale head/tail entries
+            m_heads.erase(h);
+            m_tails.erase(h);
+
+            auto it = m_shares.find(h);
+            if (it != m_shares.end())
+            {
+                delete it->second.index;
+                m_shares.erase(it);
+            }
+        }
+
+        return to_remove.size();
+    }
+
     void debug()
     {
         std::cout << "m_heads: {";
