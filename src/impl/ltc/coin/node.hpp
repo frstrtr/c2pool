@@ -71,10 +71,25 @@ public:
     {
         // RPC
         init_rpc();
-
-        // P2P
-        // init_p2p();
     }
+
+    /// Start P2P connection to coin daemon for fast block relay.
+    /// Call after run() when P2P address is configured.
+    void start_p2p(const NetService& addr)
+    {
+        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p->connect(addr);
+        LOG_INFO << "Coin P2P broadcaster connecting to " << addr.to_string();
+    }
+
+    /// Submit a block via P2P directly (faster propagation than RPC).
+    void submit_block_p2p(BlockType& block)
+    {
+        if (m_p2p)
+            m_p2p->submit_block(block);
+    }
+
+    bool has_p2p() const { return m_p2p != nullptr; }
 };
     
 } // namespace coin

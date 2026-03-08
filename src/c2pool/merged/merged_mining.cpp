@@ -625,10 +625,14 @@ void MergedMiningManager::try_submit_merged_blocks(
             if (!payouts.empty()) {
                 auto block_hex = build_multiaddress_block(
                     chain.current_work.block_template, payouts, auxpow);
-                if (!block_hex.empty())
+                if (!block_hex.empty()) {
                     chain.rpc->submit_block(block_hex);
-                else
+                    // Also relay via P2P for fast propagation
+                    if (m_block_relay_fn)
+                        m_block_relay_fn(chain.config.chain_id, block_hex);
+                } else {
                     chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+                }
             } else {
                 chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
             }
@@ -652,6 +656,12 @@ void MergedMiningManager::set_payout_provider(PayoutProvider provider)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_payout_provider = std::move(provider);
+}
+
+void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_block_relay_fn = std::move(fn);
 }
 
 // ─── Multiaddress block construction ─────────────────────────────────────────

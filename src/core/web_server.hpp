@@ -259,6 +259,9 @@ public:
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
 
+    // Callback for P2P block relay — receives full block hex for direct daemon P2P broadcast.
+    void set_on_block_relay(std::function<void(const std::string& full_block_hex)> fn);
+
 private:
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
@@ -316,6 +319,10 @@ private:
 
     // Block-found callback (header_hex, stale_info: 0=none, 253=orphan, 254=doa)
     std::function<void(const std::string&, int)> m_on_block_submitted;
+
+    // P2P block relay callback — receives the full block hex for direct P2P broadcast.
+    // Only called for accepted blocks (not stale/orphan/doa).
+    std::function<void(const std::string&)> m_on_block_relay;
 
     // Share tracker hook
     std::function<uint256()> m_best_share_hash_fn;
@@ -421,6 +428,8 @@ public:
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
     // Forward block-found callback to the underlying MiningInterface
     void set_on_block_submitted(std::function<void(const std::string&, int)> fn);
+    // Forward P2P block relay callback to the underlying MiningInterface
+    void set_on_block_relay(std::function<void(const std::string&)> fn);
     // Immediately refresh the cached block template (call when a new block arrives)
     void trigger_work_refresh();
     // Wire the share tracker's best hash into MiningInterface

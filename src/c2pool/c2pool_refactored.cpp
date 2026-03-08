@@ -42,6 +42,7 @@
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/coin_broadcaster.hpp>
 
 // V36-compatible operational features
 #include <impl/ltc/pool_monitor.hpp>
@@ -163,14 +164,18 @@ void print_help() {
 
     std::cout << "MERGED MINING:\n";
     std::cout << "  --merged SPEC             Add aux chain for merged mining. SPEC format:\n";
-    std::cout << "                            SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS\n";
-    std::cout << "                            Example: DOGE:98:127.0.0.1:22555:user:pass\n";
+    std::cout << "                            SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
+    std::cout << "                            Example: DOGE:98:127.0.0.1:22555:user:pass:22556\n";
+    std::cout << "                            P2P_PORT is optional (for fast block relay)\n";
     std::cout << "                            Can be specified multiple times\n\n";
     std::cout << "COIN DAEMON RPC (for live block templates):\n";
     std::cout << "  --rpchost HOST            Coin daemon RPC host (default: 127.0.0.1)\n";
     std::cout << "  --rpcport PORT            Coin daemon RPC port (default: 19332 testnet / 9332 mainnet)\n";
     std::cout << "  --rpcuser USER            Coin daemon RPC username (default: user)\n";
     std::cout << "  --rpcpassword PASS        Coin daemon RPC password (default: password)\n\n";
+    std::cout << "COIN DAEMON P2P BROADCASTER (fast block relay):\n";
+    std::cout << "  --coind-p2p-port PORT     Coin daemon P2P port (e.g. 9333 LTC / 22556 DOGE)\n";
+    std::cout << "  --coind-p2p-address HOST  Coin daemon P2P address (default: same as --rpchost)\n\n";
     
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -266,9 +271,13 @@ int main(int argc, char* argv[]) {
     bool sharechain_mode = false;
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
 
+    // Coin daemon P2P connection (for fast block relay alongside RPC)
+    std::string coind_p2p_address;   // e.g. "127.0.0.1" — defaults to rpc_host
+    int         coind_p2p_port = 0;  // 0 = disabled; e.g. 9333 for LTC mainnet
+
     // Merged mining (auxiliary chain) configuration
     // Multiple --merged flags can be given; each specifies:
-    //   --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
+    //   --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
     std::vector<std::string> merged_chain_specs;
 
     // Redistribute mode for shares from unnamed/broken miners
@@ -380,11 +389,20 @@ int main(int argc, char* argv[]) {
             rpc_pass = argv[++i];
             cli_explicit.insert("rpc_pass");
         }
-        // Merged mining: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
-        // e.g. --merged DOGE:98:127.0.0.1:22555:dogeuser:dogepass
+        // Merged mining: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
+        // e.g. --merged DOGE:98:127.0.0.1:22555:dogeuser:dogepass:22556
         else if (arg == "--merged" && i + 1 < argc) {
             merged_chain_specs.push_back(argv[++i]);
             cli_explicit.insert("merged");
+        }
+        // Coin daemon P2P broadcaster for fast block relay
+        else if (arg == "--coind-p2p-port" && i + 1 < argc) {
+            coind_p2p_port = std::stoi(argv[++i]);
+            cli_explicit.insert("coind_p2p_port");
+        }
+        else if (arg == "--coind-p2p-address" && i + 1 < argc) {
+            coind_p2p_address = argv[++i];
+            cli_explicit.insert("coind_p2p_address");
         }
         // Legacy support for old --port option (maps to p2p-port)
         else if (arg == "--port" && i + 1 < argc) {
@@ -606,6 +624,20 @@ int main(int argc, char* argv[]) {
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
+            // --- Parent chain P2P broadcaster (fast block relay) ---
+            // If --coind-p2p-port is provided, connect to the coin daemon P2P
+            // for direct block propagation (faster than RPC-only submitblock).
+            std::unique_ptr<ltc::coin::p2p::NodeP2P<ltc::Config>> coin_p2p;
+            if (coind_p2p_port > 0) {
+                std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
+                // Override the coin config P2P address with CLI values
+                ltc_p2p_config->coin()->m_p2p.address = NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port));
+                coin_p2p = std::make_unique<ltc::coin::p2p::NodeP2P<ltc::Config>>(
+                    &ioc, &coin_node, ltc_p2p_config.get());
+                coin_p2p->connect(NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port)));
+                LOG_INFO << "Parent coin P2P broadcaster connecting to " << p2p_host << ":" << coind_p2p_port;
+            }
+
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)
             auto whale_detector = std::make_unique<ltc::WhaleDepartureDetector>();
 
@@ -722,6 +754,24 @@ int main(int argc, char* argv[]) {
                 }
             });
             
+            // Wire P2P block relay for fast parent block propagation.
+            // When a block is accepted by the daemon, also send it via P2P
+            // for near-instant propagation to the coin network.
+            if (coin_p2p) {
+                web_server.set_on_block_relay([&coin_p2p](const std::string& full_block_hex) {
+                    try {
+                        auto block_bytes = ParseHex(full_block_hex);
+                        PackStream ps(block_bytes);
+                        ltc::coin::BlockType block;
+                        ps >> block;
+                        coin_p2p->submit_block(block);
+                        LOG_INFO << "Block relayed via P2P broadcaster";
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "P2P block relay failed: " << e.what();
+                    }
+                });
+            }
+
             // Configure payout system for web server (legacy — kept for REST stats)
             web_server.set_payout_manager(payout_manager.get());
 
@@ -912,17 +962,45 @@ int main(int argc, char* argv[]) {
             // --- Integrated Merged Mining ---
             // Parse --merged specs and set up the manager (replaces standalone mm-adapter)
             std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
+            // Merged chain P2P broadcasters (one per chain with P2P configured)
+            std::map<uint32_t, std::unique_ptr<c2pool::merged::CoinBroadcaster>> merged_broadcasters;
+
+            // Known P2P magic prefixes for common chains
+            auto get_chain_p2p_prefix = [](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
+                if (symbol == "DOGE" || symbol == "doge") {
+                    return testnet
+                        ? ParseHexBytes("fcc1b7dc")   // Dogecoin testnet
+                        : ParseHexBytes("c0c0c0c0");  // Dogecoin mainnet
+                }
+                if (symbol == "LTC" || symbol == "ltc") {
+                    return testnet
+                        ? ParseHexBytes("fdd2c8f1")   // Litecoin testnet
+                        : ParseHexBytes("fbc0b6db");  // Litecoin mainnet
+                }
+                if (symbol == "BTC" || symbol == "btc") {
+                    return testnet
+                        ? ParseHexBytes("0b110907")   // Bitcoin testnet
+                        : ParseHexBytes("f9beb4d9");  // Bitcoin mainnet
+                }
+                if (symbol == "DGB" || symbol == "dgb") {
+                    return testnet
+                        ? ParseHexBytes("fdc8bddd")   // DigiByte testnet
+                        : ParseHexBytes("fac3b6da");  // DigiByte mainnet
+                }
+                return {};  // unknown chain — P2P broadcast disabled
+            };
+
             if (!merged_chain_specs.empty()) {
                 mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
                 for (const auto& spec : merged_chain_specs) {
-                    // Format: SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS
+                    // Format: SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
                     std::vector<std::string> parts;
                     std::string token;
                     std::istringstream ss(spec);
                     while (std::getline(ss, token, ':'))
                         parts.push_back(token);
                     if (parts.size() < 6) {
-                        LOG_ERROR << "Invalid --merged spec (expected SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS): " << spec;
+                        LOG_ERROR << "Invalid --merged spec (expected SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]): " << spec;
                         continue;
                     }
                     c2pool::merged::AuxChainConfig cfg;
@@ -933,10 +1011,33 @@ int main(int argc, char* argv[]) {
                     cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;
 
+                    // Optional P2P port (7th field)
+                    if (parts.size() >= 7 && !parts[6].empty()) {
+                        cfg.p2p_port = static_cast<uint16_t>(std::stoul(parts[6]));
+                        cfg.p2p_address = cfg.rpc_host;  // default to same host as RPC
+                    }
+
                     mm_manager->add_chain(cfg);
                     LOG_INFO << "Merged mining: added " << cfg.symbol
                              << " (chain_id=" << cfg.chain_id << ") at "
                              << cfg.rpc_host << ":" << cfg.rpc_port;
+
+                    // Create P2P broadcaster if P2P port is configured
+                    if (cfg.p2p_port > 0) {
+                        auto prefix = get_chain_p2p_prefix(cfg.symbol, settings->m_testnet);
+                        if (!prefix.empty()) {
+                            auto broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                                ioc, cfg.symbol, prefix,
+                                NetService(cfg.p2p_address, cfg.p2p_port));
+                            broadcaster->start();
+                            LOG_INFO << "Merged P2P broadcaster: " << cfg.symbol
+                                     << " → " << cfg.p2p_address << ":" << cfg.p2p_port;
+                            merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
+                        } else {
+                            LOG_WARNING << "Unknown P2P prefix for " << cfg.symbol
+                                        << " — P2P broadcaster disabled for this chain";
+                        }
+                    }
                 }
                 web_server.set_merged_mining_manager(mm_manager.get());
 
@@ -976,6 +1077,28 @@ int main(int argc, char* argv[]) {
 
                 mm_manager->start();
                 LOG_INFO << "Merged mining manager started with " << mm_manager->chain_count() << " chain(s)";
+
+                // Wire merged P2P block relay: when a merged block is submitted
+                // via RPC, also send it over P2P for fast network propagation.
+                if (!merged_broadcasters.empty()) {
+                    mm_manager->set_block_relay_fn(
+                        [&merged_broadcasters](uint32_t chain_id, const std::string& block_hex) {
+                            auto it = merged_broadcasters.find(chain_id);
+                            if (it == merged_broadcasters.end()) return;
+                            try {
+                                auto block_bytes = ParseHex(block_hex);
+                                PackStream ps(block_bytes);
+                                ltc::coin::BlockType block;
+                                ps >> block;
+                                it->second->submit_block(block);
+                                LOG_INFO << "[" << it->second->symbol()
+                                         << "] Merged block relayed via P2P";
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "[" << it->second->symbol()
+                                            << "] Merged P2P relay failed: " << e.what();
+                            }
+                        });
+                }
             }
 
             // Set custom Stratum port if different from default

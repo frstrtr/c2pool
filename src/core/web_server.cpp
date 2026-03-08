@@ -275,6 +275,11 @@ void MiningInterface::set_on_block_submitted(std::function<void(const std::strin
     m_on_block_submitted = std::move(fn);
 }
 
+void MiningInterface::set_on_block_relay(std::function<void(const std::string&)> fn)
+{
+    m_on_block_relay = std::move(fn);
+}
+
 void MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2)
@@ -1134,6 +1139,10 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             if (m_on_block_submitted && hex_data.size() >= 160) {
                 m_on_block_submitted(hex_data.substr(0, 160), 0);
             }
+            // Relay full block via P2P for fast propagation
+            if (m_on_block_relay) {
+                m_on_block_relay(hex_data);
+            }
         } catch (const std::exception& e) {
             LOG_ERROR << "submitblock failed: " << e.what();
             // Fire callback with doa stale info (254)
@@ -1957,6 +1966,11 @@ bool WebServer::start()
 void WebServer::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
 {
     mining_interface_->set_on_block_submitted(std::move(fn));
+}
+
+void WebServer::set_on_block_relay(std::function<void(const std::string&)> fn)
+{
+    mining_interface_->set_on_block_relay(std::move(fn));
 }
 
 void WebServer::trigger_work_refresh()

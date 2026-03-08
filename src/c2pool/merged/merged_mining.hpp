@@ -30,6 +30,10 @@ struct AuxChainConfig
     uint8_t     address_version{0};  // P2PKH version byte
     uint8_t     p2sh_version{0};     // P2SH version byte
     bool        multiaddress{true};  // true = getblocktemplate mode; false = createauxblock
+
+    // P2P broadcaster (optional — for fast block relay to merged daemon)
+    uint16_t    p2p_port{0};         // 0 = disabled; e.g. 22556 for DOGE
+    std::string p2p_address;         // defaults to rpc_host if empty
 };
 
 // ─── Cached work from an auxiliary chain daemon ───────────────────────────────
@@ -182,6 +186,10 @@ public:
 
     void set_payout_provider(PayoutProvider provider);
 
+    /// Callback for P2P block relay: (chain_id, block_hex) after successful RPC submission.
+    using BlockRelayFn = std::function<void(uint32_t chain_id, const std::string& block_hex)>;
+    void set_block_relay_fn(BlockRelayFn fn);
+
 private:
     void poll_loop();
     void refresh_aux_work();
@@ -214,6 +222,9 @@ private:
 
     // Per-chain payout provider (set by integration layer)
     PayoutProvider m_payout_provider;
+
+    // P2P block relay callback (set by integration layer)
+    BlockRelayFn m_block_relay_fn;
 
     mutable std::mutex m_mutex;
 };
