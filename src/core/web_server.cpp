@@ -1469,61 +1469,91 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Track mining_share submission for statistics
         if (m_node) {
-            // Track the mining_share submission
             m_node->track_mining_share_submission(username, share_difficulty);
-            
-            // Create mining_share hash for storage (simplified)
-            uint256 share_hash;
-            std::string hash_input = job_id + extranonce2 + ntime + nonce;
-            share_hash.SetHex(hash_input.substr(0, 64)); // Take first 64 chars as hash
-            
-            LOG_INFO << "Mining share accepted from " << username << " - hash: " << share_hash.ToString().substr(0, 16) << "...";
-            
-            // Link to the current best share in the chain
-            uint256 prev_hash = m_best_share_hash_fn ? m_best_share_hash_fn() : uint256::ZERO;
-            uint256 target;
-            {
-                std::lock_guard<std::mutex> lock(m_work_mutex);
-                if (m_work_valid && m_cached_template.contains("bits")) {
-                    std::string bits_hex = m_cached_template["bits"].get<std::string>();
-                    uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
-                    target = chain::bits_to_target(bits);
-                } else {
-                    target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-                }
-            }
-            
-            m_node->add_local_mining_share(share_hash, prev_hash, target);
-            
-            LOG_INFO << "Mining share stored in sharechain database";
-        } else {
-            LOG_INFO << "Mining share accepted from " << username << " (no node connected for storage)";
         }
-        
+
         // Record share contribution for payout calculation (pool mode only)
         if (m_payout_manager) {
             m_payout_manager->record_share_contribution(share_address, share_difficulty);
             LOG_DEBUG_POOL << "Share contribution recorded: " << share_address << " (difficulty: " << share_difficulty << ")";
         }
 
-        // Create a proper share in the tracker with payout_script + merged_addresses.
+        // Create a proper V36 share in the tracker with all block template data.
         // The payout_script is built from share_address (which may have been
         // probabilistically replaced with the node operator's address for the
         // primary chain node fee).  Merged addresses are passed through
         // unmodified — Python p2pool does NOT apply node fee to merged chains.
         if (m_create_share_fn) {
+            ShareCreationParams params;
+
             // Build P2PKH script from share_address (40-char hex hash160)
-            std::vector<unsigned char> payout_script;
             if (share_address.size() == 40) {
-                payout_script = {0x76, 0xa9, 0x14};
+                params.payout_script = {0x76, 0xa9, 0x14};
                 for (size_t i = 0; i < share_address.size(); i += 2)
-                    payout_script.push_back(static_cast<unsigned char>(
+                    params.payout_script.push_back(static_cast<unsigned char>(
                         std::stoul(share_address.substr(i, 2), nullptr, 16)));
-                payout_script.push_back(0x88);
-                payout_script.push_back(0xac);
+                params.payout_script.push_back(0x88);
+                params.payout_script.push_back(0xac);
             }
-            if (!payout_script.empty())
-                m_create_share_fn(payout_script, merged_addresses);
+
+            params.merged_addresses = merged_addresses;
+            params.nonce = static_cast<uint32_t>(std::stoul(nonce, nullptr, 16));
+            params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
+
+            // Extract block template fields under the work mutex
+            {
+                std::lock_guard<std::mutex> lock(m_work_mutex);
+                if (m_work_valid) {
+                    params.block_version = m_cached_template.value("version", 536870912U);
+                    if (m_cached_template.contains("previousblockhash")) {
+                        params.prev_block_hash.SetHex(
+                            m_cached_template["previousblockhash"].get<std::string>());
+                    }
+                    if (m_cached_template.contains("bits")) {
+                        params.bits = static_cast<uint32_t>(std::stoul(
+                            m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                    }
+                    params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+
+                    // Build coinbase scriptSig from coinb1 (contains BIP34 height + pool tag)
+                    // coinb1 = raw hex up to the extranonce insertion point
+                    // The scriptSig is inside the coinbase tx: after version(4) + vin_count(1)
+                    // + prevout_hash(32) + prevout_idx(4) + scriptSig_len comes the scriptSig.
+                    // For create_local_share, we pass the pool's coinbase tag.
+                    std::string full_coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
+                    // Extract scriptSig: parse the coinbase tx
+                    auto cb_bytes = ParseHex(full_coinbase_hex);
+                    if (cb_bytes.size() > 41) {
+                        // version(4) + vin_count(1) + prevout(36) = 41
+                        // Then varint scriptSig length, then scriptSig bytes
+                        size_t pos = 41;
+                        uint64_t scriptsig_len = cb_bytes[pos++];
+                        if (scriptsig_len < 0xfd && pos + scriptsig_len <= cb_bytes.size()) {
+                            params.coinbase_scriptSig.assign(
+                                cb_bytes.begin() + pos,
+                                cb_bytes.begin() + pos + scriptsig_len);
+                        }
+                    }
+
+                    // Convert string merkle branches to uint256
+                    params.merkle_branches.reserve(m_cached_merkle_branches.size());
+                    for (const auto& branch_hex : m_cached_merkle_branches) {
+                        uint256 h;
+                        h.SetHex(branch_hex);
+                        params.merkle_branches.push_back(h);
+                    }
+
+                    // Segwit fields for SegwitData on the share
+                    params.segwit_active = m_segwit_active;
+                    if (m_segwit_active && m_cached_template.contains("default_witness_commitment"))
+                        params.witness_commitment_hex =
+                            m_cached_template["default_witness_commitment"].get<std::string>();
+                }
+            }
+
+            if (!params.payout_script.empty() && params.bits != 0) {
+                m_create_share_fn(params);
+            }
         }
         
         // Attempt block construction + merkle validation + submission.

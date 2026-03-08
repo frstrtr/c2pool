@@ -1084,7 +1084,9 @@ uint256 create_local_share(
     const std::vector<unsigned char>& payout_script,
     uint16_t donation = 50,
     const std::vector<MergedAddressEntry>& merged_addrs = {},
-    StaleInfo stale_info = StaleInfo::none)
+    StaleInfo stale_info = StaleInfo::none,
+    bool segwit_active = false,
+    const std::string& witness_commitment_hex = {})
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1092,7 +1094,7 @@ uint256 create_local_share(
     share.m_subsidy    = subsidy;
     share.m_prev_hash  = prev_share;
     share.m_donation   = donation;
-    share.m_stale_info = static_cast<unsigned int>(stale_info);
+    share.m_stale_info = stale_info;
     share.m_desired_version = 36;
     share.m_max_bits   = min_header.m_bits;
     share.m_bits       = min_header.m_bits; // block-level share meets network target
@@ -1121,8 +1123,9 @@ uint256 create_local_share(
         auto prev_height = tracker.chain.get_height(prev_share);
         tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
             share.m_absheight = prev->m_absheight + 1;
-            share.m_abswork   = prev->m_abswork +
-                chain::target_to_average_attempts(chain::bits_to_target(prev->m_bits));
+            auto attempts = chain::target_to_average_attempts(
+                chain::bits_to_target(prev->m_bits));
+            share.m_abswork = prev->m_abswork + uint128(attempts.GetLow64());
         });
 
         // far_share_hash: look back REAL_CHAIN_LENGTH shares
@@ -1130,10 +1133,10 @@ uint256 create_local_share(
             static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH),
             prev_height);
         auto far_view = tracker.chain.get_chain(prev_share, static_cast<size_t>(far_dist));
-        if (!far_view.empty())
-            share.m_far_share_hash = far_view.back().first;
-        else
-            share.m_far_share_hash = prev_share;
+        uint256 last_hash = prev_share;
+        for (auto it = far_view.begin(); it != far_view.end(); ++it)
+            last_hash = (*it).first;
+        share.m_far_share_hash = last_hash;
     } else {
         share.m_absheight = 0;
         share.m_far_share_hash = prev_share;
@@ -1162,9 +1165,26 @@ uint256 create_local_share(
     share.m_merkle_link.m_branch = merkle_branches;
     share.m_merkle_link.m_index  = 0;
 
-    // For V36 with segwit, we need txid_merkle_link in segwit_data
-    // (txid merkle link = same as merkle_link since coinbase txid == stripped hash)
-    // TODO: populate segwit_data.txid_merkle_link and wtxid_merkle_root
+    // Populate segwit_data for V36 when segwit is active
+    if (segwit_active && !witness_commitment_hex.empty())
+    {
+        SegwitData sd;
+        // txid_merkle_link == merkle_link (coinbase txid == stripped hash for non-witness)
+        sd.m_txid_merkle_link.m_branch = merkle_branches;
+        sd.m_txid_merkle_link.m_index  = 0;
+        // wtxid_merkle_root: the 32-byte hash from default_witness_commitment
+        // commitment hex = "6a24aa21a9ed" (6 bytes = 12 hex chars) + 32 bytes (64 hex chars)
+        if (witness_commitment_hex.size() >= 76)
+        {
+            sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
+        }
+        else
+        {
+            // Fallback: all-ones default per SegwitDataDefault
+            sd.m_wtxid_merkle_root = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        }
+        share.m_segwit_data = sd;
+    }
 
     // --- Compute the ref_hash ---
     PackStream ref_stream;
@@ -1307,8 +1327,9 @@ uint256 create_local_share(
     // Set the share's identity hash
     share.m_hash = share_hash;
 
-    // Add to tracker
-    tracker.add(share);
+    // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
+    auto* heap_share = new MergedMiningShare(share);
+    tracker.add(heap_share);
     LOG_INFO << "create_local_share: added share " << share_hash.GetHex()
              << " height=" << share.m_absheight
              << " prev=" << prev_share.GetHex().substr(0, 16) << "...";

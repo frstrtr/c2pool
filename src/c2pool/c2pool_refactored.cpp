@@ -27,6 +27,8 @@
 
 // LTC implementation
 #include <impl/ltc/share.hpp>
+#include <impl/ltc/share_check.hpp>
+#include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
 #include <impl/ltc/messages.hpp>
 #include <impl/ltc/config.hpp>
@@ -681,22 +683,65 @@ int main(int argc, char* argv[]) {
                     best_hash, block_target, subsidy, donation_script);
             });
 
-            // Wire the share creation hook so mining_submit() can inject
-            // payout_script + merged_addresses into the share tracker.
-            // Note: full create_local_share() requires block template data;
-            // for now we just record the addresses for the next
-            // create_local_share() invocation (which happens inside the
-            // block-found path elsewhere).
+            // Wire the share creation hook so mining_submit() creates a real
+            // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
-                [&p2p_node](
-                    const std::vector<unsigned char>& /*payout_script*/,
-                    const std::map<uint32_t, std::vector<unsigned char>>& /*merged_addresses*/) {
-                // Placeholder: the full create_local_share() wiring requires
-                // block header, coinbase, subsidy, and merkle branches that
-                // are assembled in the block-found path.  The payout_script
-                // and merged_addresses are now propagated through this hook
-                // so they're available once that path is complete.
-                LOG_DEBUG_POOL << "create_share_fn: share payout + merged addresses received";
+                [&p2p_node](const core::MiningInterface::ShareCreationParams& p) {
+                try {
+                    // Build SmallBlockHeaderType from Stratum params
+                    ltc::coin::SmallBlockHeaderType min_header;
+                    min_header.m_version        = p.block_version;
+                    min_header.m_previous_block  = p.prev_block_hash;
+                    min_header.m_timestamp       = p.timestamp;
+                    min_header.m_bits            = p.bits;
+                    min_header.m_nonce           = p.nonce;
+
+                    // Coinbase scriptSig (BIP34 height + pool identifier)
+                    BaseScript coinbase;
+                    coinbase.m_data = p.coinbase_scriptSig;
+
+                    // Previous best share in the tracker
+                    uint256 prev_share = p2p_node->best_share_hash();
+
+                    // Convert merged_addresses map → vector<MergedAddressEntry>
+                    std::vector<ltc::MergedAddressEntry> merged_addrs;
+                    for (const auto& [chain_id, script] : p.merged_addresses) {
+                        ltc::MergedAddressEntry entry;
+                        entry.m_chain_id = chain_id;
+                        entry.m_script.m_data = script;
+                        merged_addrs.push_back(std::move(entry));
+                    }
+
+                    // Determine stale_info
+                    ltc::StaleInfo stale = ltc::StaleInfo::none;
+                    if (p.stale_info == 253)      stale = ltc::StaleInfo::orphan;
+                    else if (p.stale_info == 254)  stale = ltc::StaleInfo::doa;
+
+                    // Create the share and add it to the tracker
+                    uint256 share_hash = ltc::create_local_share(
+                        p2p_node->tracker(),
+                        min_header,
+                        coinbase,
+                        p.subsidy,
+                        prev_share,
+                        p.merkle_branches,
+                        p.payout_script,
+                        50,  // donation = 0.5%
+                        merged_addrs,
+                        stale,
+                        p.segwit_active,
+                        p.witness_commitment_hex);
+
+                    // Broadcast to all connected peers
+                    p2p_node->broadcast_share(share_hash);
+
+                    LOG_INFO << "Share created and broadcast: "
+                             << share_hash.GetHex().substr(0, 16) << "..."
+                             << " subsidy=" << p.subsidy
+                             << " merged_chains=" << merged_addrs.size();
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "create_share_fn failed: " << e.what();
+                }
             });
 
             // --- Integrated Merged Mining ---

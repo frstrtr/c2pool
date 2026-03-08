@@ -163,11 +163,23 @@ public:
     void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = std::move(fn); }
 
     // Hook: called by mining_submit() pool path to create a share in the tracker.
-    // Parameters: payout_script, merged_addresses (chain_id → scriptPubKey)
-    // The callback should invoke create_local_share() on the ShareTracker.
-    using create_share_fn_t = std::function<void(
-        const std::vector<unsigned char>& payout_script,
-        const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses)>;
+    // All block template data needed by create_local_share() is passed through.
+    struct ShareCreationParams {
+        std::vector<unsigned char> payout_script;
+        std::map<uint32_t, std::vector<unsigned char>> merged_addresses;
+        uint32_t block_version{0};
+        uint256  prev_block_hash;
+        uint32_t timestamp{0};
+        uint32_t bits{0};
+        uint32_t nonce{0};
+        std::vector<unsigned char> coinbase_scriptSig;  // BIP34 height + pool tag
+        uint64_t subsidy{0};
+        std::vector<uint256> merkle_branches;
+        int stale_info{0};  // 0=none, 253=orphan, 254=doa
+        bool segwit_active{false};
+        std::string witness_commitment_hex;  // default_witness_commitment from gbt
+    };
+    using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
 
     // Integrated merged mining manager
