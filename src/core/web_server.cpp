@@ -515,29 +515,35 @@ MiningInterface::build_coinbase_parts(
     const std::vector<std::pair<std::string,uint64_t>>& outputs,
     bool raw_scripts,
     const std::vector<uint8_t>& mm_commitment,
-    const std::string& witness_commitment_hex)
+    const std::string& witness_commitment_hex,
+    const std::string& op_return_hex)
 {
-    // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
-    // Complete coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
+    // coinb1 ends just before extranonce1; coinb2 starts just after extranonce1.
+    // With extranonce2_size=0: coinbase = coinb1 + extranonce1(4B) + coinb2
     //
     // Coinbase tx wire layout:
     //   [version 4B][input_count 1B]
-    //   [prev_hash 32B][prev_idx 4B][script_len 1B][coinb1_script][{8B extranonce}][coinb2_script]
+    //   [prev_hash 32B][prev_idx 4B][script_len 1B][coinb1_script][{4B extranonce1}][coinb2_script]
     //   [sequence 4B]
     //   [output_count varint][outputs ...][locktime 4B]
+    //
+    // Output ordering (must match generate_share_transaction()):
+    //   1. Segwit witness commitment (if present) — value=0
+    //   2. PPLNS payout outputs (sorted by amount desc, script asc)
+    //   3. Donation output (subsidy - sum(payouts))
+    //   4. OP_RETURN commitment (0x6a28 + ref_hash + last_txout_nonce) — value=0
 
     const int height = tmpl.value("height", 1);
     const std::string height_hex = encode_height_pushdata(height);
     const int height_bytes = static_cast<int>(height_hex.size()) / 2;
 
-    // Arbitrary pool ID marker appended to script after extranonce
     // "/c2pool/" in ASCII = 2f 63 32 70 6f 6f 6c 2f
     const std::string pool_marker = "2f633270 6f6f6c2f";
     std::string pool_marker_stripped;
     for (char c : pool_marker) { if (c != ' ') pool_marker_stripped += c; }
     const int pool_marker_bytes = static_cast<int>(pool_marker_stripped.size()) / 2;
 
-    // AuxPoW merged mining commitment (44 bytes when present)
+    // AuxPoW merged mining commitment
     std::string mm_hex;
     if (!mm_commitment.empty()) {
         static const char* HEX = "0123456789abcdef";
@@ -549,31 +555,31 @@ MiningInterface::build_coinbase_parts(
     }
     const int mm_bytes = static_cast<int>(mm_commitment.size());
 
-    // Total coinbase script length: height + 8 (extranonce) + mm_commitment + pool_marker
-    const int script_total = height_bytes + 8 + mm_bytes + pool_marker_bytes;
+    // Total coinbase script length: height + extranonce1(4) + mm_commitment + pool_marker
+    // Note: extranonce2_size=0, so only extranonce1 (4 bytes)
+    const int script_total = height_bytes + 4 + mm_bytes + pool_marker_bytes;
 
     // Build coinb1 (version + 1 input header up to + including the height encoding)
     std::ostringstream coinb1;
     coinb1 << "01000000"   // version
            << "01"         // 1 input
-           // previous output (zeroes for coinbase)
            << "0000000000000000000000000000000000000000000000000000000000000000"
            << "ffffffff"   // previous index
-           // script length (varint, 1 byte since script_total < 253)
            << std::hex << std::setfill('0') << std::setw(2) << script_total
-           // height encoding (BIP34)
            << height_hex;
 
-    // Build coinb2 (mm_commitment + pool marker + sequence + outputs + locktime)
+    // Build coinb2 (mm + pool marker + sequence + outputs + locktime)
     std::ostringstream coinb2;
     if (!mm_hex.empty())
         coinb2 << mm_hex;
     coinb2 << pool_marker_stripped
-           << "ffffffff";  // sequence
+           << "00000000";  // sequence = 0 (matches generate_share_transaction)
 
-    // Output count: regular outputs + optional witness commitment
+    // Count outputs: [segwit?] + PPLNS + [OP_RETURN?]
+    // Note: outputs already includes PPLNS payouts + donation (from caller)
     size_t num_outputs = outputs.size();
     if (!witness_commitment_hex.empty()) ++num_outputs;
+    if (!op_return_hex.empty()) ++num_outputs;
 
     // Varint-encode output count
     if (num_outputs < 0xfd)
@@ -583,20 +589,7 @@ MiningInterface::build_coinbase_parts(
                << std::setw(2) << (num_outputs & 0xff)
                << std::setw(2) << ((num_outputs >> 8) & 0xff);
 
-    for (const auto& [addr, amount] : outputs) {
-        coinb2 << encode_le64(amount);
-        if (raw_scripts) {
-            // addr is already hex-encoded full scriptPubKey
-            size_t script_len = addr.size() / 2;
-            coinb2 << std::hex << std::setfill('0') << std::setw(2) << script_len;
-            coinb2 << addr;
-        } else {
-            // addr is a 40-char hash160 hex — wrap in P2PKH
-            coinb2 << p2pkh_script(addr);
-        }
-    }
-
-    // BIP141 witness commitment output (must be last)
+    // Output 1: Segwit witness commitment (FIRST, matching generate_share_transaction)
     if (!witness_commitment_hex.empty()) {
         coinb2 << encode_le64(0);   // 0 satoshis
         size_t wc_len = witness_commitment_hex.size() / 2;
@@ -604,9 +597,111 @@ MiningInterface::build_coinbase_parts(
         coinb2 << witness_commitment_hex;
     }
 
+    // Outputs 2..N: PPLNS payouts + donation (already sorted by caller)
+    for (const auto& [addr, amount] : outputs) {
+        coinb2 << encode_le64(amount);
+        if (raw_scripts) {
+            size_t script_len = addr.size() / 2;
+            coinb2 << std::hex << std::setfill('0') << std::setw(2) << script_len;
+            coinb2 << addr;
+        } else {
+            coinb2 << p2pkh_script(addr);
+        }
+    }
+
+    // Output N+1: OP_RETURN commitment (LAST, matching generate_share_transaction)
+    if (!op_return_hex.empty()) {
+        coinb2 << encode_le64(0);   // 0 satoshis
+        size_t script_len = op_return_hex.size() / 2;
+        coinb2 << std::hex << std::setfill('0') << std::setw(2) << script_len;
+        coinb2 << op_return_hex;
+    }
+
     coinb2 << "00000000"; // locktime
 
     return { coinb1.str(), coinb2.str() };
+}
+
+std::pair<std::string, std::string>
+MiningInterface::build_connection_coinbase(
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    if (!m_work_valid || m_cached_template.is_null())
+        return {};
+
+    // Build the full coinbase scriptSig for this connection:
+    //   BIP34_height + extranonce1 + mm_commitment + pool_marker
+    // This is share.m_coinbase and determines ref_hash.
+    //
+    // Parse height from coinb1 (already contains height encoding)
+    // Actually, we rebuild the scriptSig from scratch:
+    const int height = m_cached_template.value("height", 1);
+    std::string height_hex = encode_height_pushdata(height);
+
+    // Pool marker
+    const std::string pool_marker_stripped = "2f633270" "6f6f6c2f";
+
+    // MM commitment hex
+    static const char* HEX = "0123456789abcdef";
+    std::string mm_hex;
+    for (uint8_t b : m_cached_mm_commitment) {
+        mm_hex += HEX[b >> 4];
+        mm_hex += HEX[b & 0x0f];
+    }
+
+    // Full scriptSig hex = height + extranonce1 + mm + pool_marker
+    std::string scriptsig_hex = height_hex + extranonce1_hex + mm_hex + pool_marker_stripped;
+
+    // Decode to bytes for ref_hash computation
+    std::vector<unsigned char> scriptsig_bytes;
+    scriptsig_bytes.reserve(scriptsig_hex.size() / 2);
+    for (size_t i = 0; i + 1 < scriptsig_hex.size(); i += 2)
+        scriptsig_bytes.push_back(static_cast<unsigned char>(
+            std::stoul(scriptsig_hex.substr(i, 2), nullptr, 16)));
+
+    // Compute ref_hash via the callback (needs tracker data)
+    if (!m_ref_hash_fn)
+        return {};
+
+    uint64_t subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+    uint32_t bits = 0;
+    if (m_cached_template.contains("bits"))
+        bits = static_cast<uint32_t>(std::stoul(
+            m_cached_template["bits"].get<std::string>(), nullptr, 16));
+    uint32_t timestamp = m_cached_template.value("curtime", uint32_t(0));
+
+    auto [ref_hash, last_txout_nonce] = m_ref_hash_fn(
+        scriptsig_bytes, payout_script, subsidy, bits, timestamp,
+        m_segwit_active, m_cached_witness_commitment, merged_addrs);
+
+    // Build OP_RETURN hex: 6a28 + ref_hash(32 LE) + last_txout_nonce(8 LE)
+    std::string op_return_hex;
+    {
+        op_return_hex += "6a28";
+        auto ref_chars = ref_hash.GetChars();
+        for (unsigned char b : ref_chars) {
+            op_return_hex += HEX[b >> 4];
+            op_return_hex += HEX[b & 0x0f];
+        }
+        for (int i = 0; i < 8; ++i) {
+            unsigned char b = static_cast<unsigned char>((last_txout_nonce >> (i * 8)) & 0xFF);
+            op_return_hex += HEX[b >> 4];
+            op_return_hex += HEX[b & 0x0f];
+        }
+    }
+
+    // Call build_coinbase_parts with the OP_RETURN
+    return build_coinbase_parts(
+        m_cached_template,
+        subsidy,
+        m_cached_pplns_outputs,
+        m_cached_raw_scripts,
+        m_cached_mm_commitment,
+        m_cached_witness_commitment,
+        op_return_hex);
 }
 
 // Decode a Base58Check‐encoded address (P2PKH or P2SH) and return the
@@ -671,21 +766,22 @@ void MiningInterface::refresh_work()
         uint64_t coinbase_value = wd.m_data.value("coinbasevalue", uint64_t(5000000000));
         std::pair<std::string,std::string> cb_parts;
         bool segwit_active = false;
-        try {
-            std::vector<std::pair<std::string,uint64_t>> outputs;
-            bool raw_scripts = false;
 
+        // Cached PPLNS data for per-connection coinbase generation
+        std::vector<std::pair<std::string,uint64_t>> pplns_outputs;
+        bool pplns_raw_scripts = false;
+        std::string witness_commitment;
+        std::vector<uint8_t> mm_commitment;
+
+        try {
             // V36 PPLNS path: use share-tracker proportional payouts directly
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
                 if (!best.IsNull()) {
-                    // Block target from template bits
                     uint32_t nbits = std::stoul(
                         wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
                     uint256 block_target = chain::bits_to_target(nbits);
 
-                    // get_expected_payouts returns map<scriptPubKey, amount_double>
-                    // with donation remainder already included via m_donation_script
                     auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
 
                     if (!expected.empty()) {
@@ -699,27 +795,24 @@ void MiningInterface::refresh_work()
                                 hex += HEX[b >> 4];
                                 hex += HEX[b & 0x0f];
                             }
-                            outputs.push_back({std::move(hex), sat});
+                            pplns_outputs.push_back({std::move(hex), sat});
                         }
-                        raw_scripts = true;
+                        pplns_raw_scripts = true;
                         LOG_INFO << "refresh_work: V36 PPLNS coinbase with "
-                                 << outputs.size() << " outputs";
+                                 << pplns_outputs.size() << " outputs";
                     }
                 }
             }
 
             // Fallback: single output to zero-key (burn) so coinbase is always valid
-            if (outputs.empty())
-                outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
+            if (pplns_outputs.empty())
+                pplns_outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
 
             // Get merged mining commitment if an MM manager is wired
-            std::vector<uint8_t> mm_commitment;
             if (m_mm_manager)
                 mm_commitment = m_mm_manager->get_auxpow_commitment();
 
             // BIP141: extract segwit witness commitment from template
-            bool segwit_active = false;
-            std::string witness_commitment;
             if (wd.m_data.contains("rules")) {
                 auto rules = wd.m_data["rules"].get<std::vector<std::string>>();
                 segwit_active = std::any_of(rules.begin(), rules.end(),
@@ -728,8 +821,9 @@ void MiningInterface::refresh_work()
             if (segwit_active && wd.m_data.contains("default_witness_commitment"))
                 witness_commitment = wd.m_data["default_witness_commitment"].get<std::string>();
 
-            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, outputs,
-                                            raw_scripts, mm_commitment, witness_commitment);
+            // Build fallback coinbase (without OP_RETURN, for non-p2pool or initial work)
+            cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, pplns_outputs,
+                                            pplns_raw_scripts, mm_commitment, witness_commitment);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
@@ -742,6 +836,10 @@ void MiningInterface::refresh_work()
         m_cached_coinb1           = std::move(cb_parts.first);
         m_cached_coinb2           = std::move(cb_parts.second);
         m_segwit_active           = segwit_active;
+        m_cached_pplns_outputs    = std::move(pplns_outputs);
+        m_cached_raw_scripts      = pplns_raw_scripts;
+        m_cached_witness_commitment = std::move(witness_commitment);
+        m_cached_mm_commitment    = std::move(mm_commitment);
         m_work_valid              = true;
 
         LOG_INFO << "refresh_work: height=" << wd.m_data.value("height", 0)
@@ -1301,7 +1399,7 @@ nlohmann::json MiningInterface::mining_subscribe(const std::string& user_agent, 
     return nlohmann::json::array({
         nlohmann::json::array({"mining.notify", "subscription_id_1"}),
         "extranonce1",
-        4 // extranonce2_size
+        0 // extranonce2_size = 0 (p2pool per-connection coinbase)
     });
 }
 
@@ -2175,7 +2273,7 @@ nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, co
     response["result"] = nlohmann::json::array({
         nlohmann::json::array({"mining.set_difficulty", subscription_id_}),
         extranonce1_,
-        4  // extranonce2_size
+        0  // extranonce2_size = 0 (p2pool: coinbase is deterministic per connection)
     });
     response["error"] = nullptr;
     
@@ -2409,7 +2507,7 @@ void StratumSession::send_notify_work()
     uint32_t    curtime  = static_cast<uint32_t>(std::time(nullptr));
     nlohmann::json merkle_branches = nlohmann::json::array();
     std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
-    std::string coinb2 = "ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+    std::string coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
 
     // Override with live block template data if available
     auto tmpl = mining_interface_->get_current_work_template();
@@ -2441,15 +2539,55 @@ void StratumSession::send_notify_work()
     ntime_ss << std::hex << std::setw(8) << std::setfill('0') << curtime;
     std::string ntime = ntime_ss.str();
 
-    // Merkle branches = computed tree path (miners concat coinbase_hash+branch each level)
+    // Merkle branches
     for (const auto& h : mining_interface_->get_stratum_merkle_branches())
         merkle_branches.push_back(h);
 
-    // Real coinbase parts if available
-    auto [cb1, cb2] = mining_interface_->get_coinbase_parts();
-    if (!cb1.empty()) {
-        coinb1 = std::move(cb1);
-        coinb2 = std::move(cb2);
+    // Per-connection coinbase: build with ref_hash from this session's extranonce1
+    // This ensures the OP_RETURN commitment matches this miner's specific coinbase.
+    {
+        // Build P2PKH payout script from username (authorized address)
+        std::vector<unsigned char> payout_script;
+        if (!username_.empty()) {
+            auto h160 = base58check_to_hash160(username_);
+            if (h160.size() == 40) {
+                payout_script = {0x76, 0xa9, 0x14};
+                for (size_t i = 0; i < h160.size(); i += 2)
+                    payout_script.push_back(static_cast<unsigned char>(
+                        std::stoul(h160.substr(i, 2), nullptr, 16)));
+                payout_script.push_back(0x88);
+                payout_script.push_back(0xac);
+            }
+        }
+
+        // Build merged address entries
+        std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged_addrs;
+        for (const auto& [chain_id, addr] : merged_addresses_) {
+            auto h160 = base58check_to_hash160(addr);
+            if (h160.size() == 40) {
+                std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+                for (size_t i = 0; i < h160.size(); i += 2)
+                    script.push_back(static_cast<unsigned char>(
+                        std::stoul(h160.substr(i, 2), nullptr, 16)));
+                script.push_back(0x88);
+                script.push_back(0xac);
+                merged_addrs.push_back({chain_id, std::move(script)});
+            }
+        }
+
+        auto [cb1, cb2] = mining_interface_->build_connection_coinbase(
+            extranonce1_, payout_script, merged_addrs);
+        if (!cb1.empty()) {
+            coinb1 = std::move(cb1);
+            coinb2 = std::move(cb2);
+        } else {
+            // Fallback to global coinbase (no ref_hash callback wired)
+            auto [gcb1, gcb2] = mining_interface_->get_coinbase_parts();
+            if (!gcb1.empty()) {
+                coinb1 = std::move(gcb1);
+                coinb2 = std::move(gcb2);
+            }
+        }
     }
 
     bool clean_jobs = true;

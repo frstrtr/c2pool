@@ -162,6 +162,27 @@ public:
         uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
     void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = std::move(fn); }
 
+    // Hook: computes the p2pool ref_hash for a given coinbase scriptSig.
+    // Returns (ref_hash, last_txout_nonce) pair.  The ref_hash depends on
+    // the share tracker state (prev_share, absheight, abswork, etc.) and
+    // the miner's payout address (implicit via existing connection state).
+    // Called per-connection during work generation.
+    using ref_hash_fn_t = std::function<std::pair<uint256, uint64_t>(
+        const std::vector<unsigned char>& coinbase_scriptSig,
+        const std::vector<unsigned char>& payout_script,
+        uint64_t subsidy, uint32_t bits, uint32_t timestamp,
+        bool segwit_active, const std::string& witness_commitment_hex,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
+    void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
+
+    // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
+    // then generates coinb1/coinb2 with full output set including OP_RETURN.
+    // Returns (coinb1, coinb2) or empty strings if not possible.
+    std::pair<std::string, std::string> build_connection_coinbase(
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const;
+
     // Hook: called by mining_submit() pool path to create a share in the tracker.
     // All block template data needed by create_local_share() is passed through.
     struct ShareCreationParams {
@@ -237,12 +258,15 @@ public:
 private:
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
+    // Output ordering matches generate_share_transaction():
+    //   segwit_commitment(first) → PPLNS payouts → donation → OP_RETURN(last)
     static std::pair<std::string, std::string> build_coinbase_parts(
         const nlohmann::json& tmpl, uint64_t coinbase_value,
         const std::vector<std::pair<std::string,uint64_t>>& outputs,
         bool raw_scripts = false,
         const std::vector<uint8_t>& mm_commitment = {},
-        const std::string& witness_commitment_hex = {});
+        const std::string& witness_commitment_hex = {},
+        const std::string& op_return_hex = {});
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
@@ -294,6 +318,16 @@ private:
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;
+
+    // Ref hash computation hook (per-connection work generation)
+    ref_hash_fn_t m_ref_hash_fn;
+
+    // Cached PPLNS outputs for per-connection coinbase generation
+    // (populated in refresh_work, consumed in build_connection_coinbase)
+    std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
+    bool m_cached_raw_scripts{false};
+    std::string m_cached_witness_commitment;
+    std::vector<uint8_t> m_cached_mm_commitment;
 
     // Share creation hook
     create_share_fn_t m_create_share_fn;

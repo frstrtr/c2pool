@@ -488,10 +488,9 @@ public:
                 share_att = chain::target_to_average_attempts(target);
                 share_donation = obj->m_donation;
 
-                if constexpr (requires { obj->m_address; })
-                    addr_bytes = obj->m_address.m_data;
-                else
-                    addr_bytes = obj->m_pubkey_hash.GetChars();
+                // Use full scriptPubKey (25/22/23 bytes) to match
+                // generate_share_transaction's PPLNS key type
+                addr_bytes = get_share_script(obj);
             });
 
             uint288 share_total = share_att * 65535;
@@ -537,6 +536,9 @@ public:
     }
 
     // -- Expected payouts from PPLNS weights --
+    // Uses exact integer arithmetic matching generate_share_transaction():
+    //   V36: amount = (uint288(subsidy) * weight / total_weight).GetLow64()
+    //   donation = subsidy - sum(amounts)
     std::map<std::vector<unsigned char>, double>
     get_expected_payouts(const uint256& best_share_hash, const uint256& block_target, uint64_t subsidy,
                          const std::vector<unsigned char>& donation_script)
@@ -549,21 +551,26 @@ public:
         auto [weights, total_weight, donation_weight] = get_cumulative_weights(best_share_hash, chain_len, max_weight);
 
         std::map<std::vector<unsigned char>, double> result;
-        double sum = 0;
+        uint64_t sum = 0;
 
         if (!total_weight.IsNull())
         {
             for (const auto& [script, weight] : weights)
             {
-                double payout = subsidy * (weight.getdouble() / total_weight.getdouble());
-                result[script] = payout;
-                sum += payout;
+                // Exact integer division matching generate_share_transaction (V36)
+                uint64_t amount = (uint288(subsidy) * weight / total_weight).GetLow64();
+                if (amount > 0)
+                {
+                    result[script] = static_cast<double>(amount);
+                    sum += amount;
+                }
             }
         }
 
-        // Remainder goes to donation
+        // Remainder goes to donation (matches generate_share_transaction)
+        uint64_t donation_amount = (subsidy > sum) ? (subsidy - sum) : 0;
         result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
-                                  + static_cast<double>(subsidy) - sum;
+                                  + static_cast<double>(donation_amount);
 
         return result;
     }

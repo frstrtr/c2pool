@@ -716,6 +716,87 @@ int main(int argc, char* argv[]) {
                     best_hash, block_target, subsidy, donation_script);
             });
 
+            // Wire the ref_hash computation hook for per-connection coinbase generation.
+            // This computes the p2pool ref_hash from share fields + tracker state.
+            web_server.get_mining_interface()->set_ref_hash_fn(
+                [&p2p_node](
+                    const std::vector<unsigned char>& coinbase_scriptSig,
+                    const std::vector<unsigned char>& payout_script,
+                    uint64_t subsidy, uint32_t bits, uint32_t timestamp,
+                    bool segwit_active, const std::string& witness_commitment_hex,
+                    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
+                    -> std::pair<uint256, uint64_t>
+                {
+                    ltc::RefHashParams params;
+                    params.prev_share = p2p_node->best_share_hash();
+                    params.coinbase_scriptSig = coinbase_scriptSig;
+                    params.share_nonce = 0;
+                    params.subsidy = subsidy;
+                    params.donation = 50; // 0.5%
+                    params.desired_version = 36;
+                    params.max_bits = bits;
+                    params.bits = bits;
+                    params.timestamp = timestamp;
+
+                    // Extract pubkey_hash and type from payout_script
+                    if (payout_script.size() == 25 &&
+                        payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
+                        payout_script[2] == 0x14) {
+                        std::memcpy(params.pubkey_hash.data(), payout_script.data() + 3, 20);
+                        params.pubkey_type = 0; // P2PKH
+                    } else if (payout_script.size() >= 22 &&
+                               payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+                        std::memcpy(params.pubkey_hash.data(), payout_script.data() + 2, 20);
+                        params.pubkey_type = 1; // P2WPKH
+                    } else if (payout_script.size() >= 20) {
+                        std::memcpy(params.pubkey_hash.data(), payout_script.data(), 20);
+                        params.pubkey_type = 0;
+                    }
+
+                    // Segwit data
+                    if (segwit_active && !witness_commitment_hex.empty()) {
+                        params.has_segwit = true;
+                        ltc::SegwitData sd;
+                        // wtxid_merkle_root from witness commitment
+                        if (witness_commitment_hex.size() >= 76) {
+                            sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
+                        }
+                        params.segwit_data = sd;
+                    }
+
+                    // Merged addresses
+                    for (const auto& [chain_id, script] : merged_addrs) {
+                        ltc::MergedAddressEntry entry;
+                        entry.m_chain_id = chain_id;
+                        entry.m_script.m_data = script;
+                        params.merged_addresses.push_back(std::move(entry));
+                    }
+
+                    // Chain position from tracker
+                    auto& tracker = p2p_node->tracker();
+                    if (!params.prev_share.IsNull() && tracker.chain.contains(params.prev_share)) {
+                        tracker.chain.get(params.prev_share).share.invoke([&](auto* prev) {
+                            params.absheight = prev->m_absheight + 1;
+                            auto attempts = chain::target_to_average_attempts(
+                                chain::bits_to_target(prev->m_bits));
+                            params.abswork = prev->m_abswork + uint128(attempts.GetLow64());
+                        });
+
+                        // far_share_hash
+                        auto prev_height = tracker.chain.get_height(params.prev_share);
+                        auto far_dist = std::min(
+                            static_cast<int32_t>(ltc::PoolConfig::REAL_CHAIN_LENGTH),
+                            prev_height);
+                        auto far_view = tracker.chain.get_chain(params.prev_share, static_cast<size_t>(far_dist));
+                        uint256 last_hash = params.prev_share;
+                        for (auto it = far_view.begin(); it != far_view.end(); ++it)
+                            last_hash = (*it).first;
+                        params.far_share_hash = last_hash;
+                    }
+
+                    return ltc::compute_ref_hash_for_work(params);
+                });
+
             // Wire the share creation hook so mining_submit() creates a real
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(

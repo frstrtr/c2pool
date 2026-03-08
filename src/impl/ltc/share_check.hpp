@@ -234,6 +234,95 @@ inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_ver
 }
 
 // ============================================================================
+// compute_ref_hash_for_work()
+//
+// Computes the p2pool ref_hash for a set of share fields.  Used at Stratum
+// work generation time to build the OP_RETURN commitment per connection.
+//
+// Parameters mirror the share fields that feed into the ref_stream.
+// Returns (ref_hash, last_txout_nonce).
+// ============================================================================
+struct RefHashParams {
+    uint256 prev_share;
+    std::vector<unsigned char> coinbase_scriptSig;
+    uint32_t share_nonce{0};
+    uint160  pubkey_hash;
+    uint8_t  pubkey_type{0};
+    uint64_t subsidy{0};
+    uint16_t donation{50};
+    uint8_t  stale_info{0};
+    uint64_t desired_version{36};
+    bool     has_segwit{false};
+    SegwitData segwit_data;
+    std::vector<MergedAddressEntry> merged_addresses;
+    uint256  far_share_hash;
+    uint32_t max_bits{0};
+    uint32_t bits{0};
+    uint32_t timestamp{0};
+    uint32_t absheight{0};
+    uint128  abswork;
+    BaseScript merged_coinbase_info;
+    uint256  merged_payout_hash;
+};
+
+inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParams& p)
+{
+    PackStream ref_stream;
+
+    // IDENTIFIER
+    {
+        auto hex = PoolConfig::IDENTIFIER_HEX;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+            unsigned char byte = static_cast<unsigned char>(
+                std::stoul(hex.substr(i, 2), nullptr, 16));
+            ref_stream.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(&byte), 1));
+        }
+    }
+
+    ref_stream << p.prev_share;
+
+    // coinbase as VarStr
+    {
+        BaseScript bs;
+        bs.m_data = p.coinbase_scriptSig;
+        ref_stream << bs;
+    }
+
+    ref_stream << p.share_nonce;
+    ref_stream << p.pubkey_hash;
+    ref_stream << p.pubkey_type;
+    ::Serialize(ref_stream, VarInt(p.subsidy));
+    ref_stream << p.donation;
+    ref_stream << p.stale_info;
+    ::Serialize(ref_stream, VarInt(p.desired_version));
+
+    if (p.has_segwit)
+        ref_stream << p.segwit_data;
+
+    ref_stream << p.merged_addresses;
+    ref_stream << p.far_share_hash;
+    ref_stream << p.max_bits;
+    ref_stream << p.bits;
+    ref_stream << p.timestamp;
+    ref_stream << p.absheight;
+    ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
+    ref_stream << p.merged_coinbase_info;
+    ref_stream << p.merged_payout_hash;
+
+    auto ref_span = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
+    uint256 ref_hash = Hash(ref_span);
+
+    // Generate a random-ish last_txout_nonce
+    uint64_t nonce = static_cast<uint64_t>(std::time(nullptr)) ^
+                     (static_cast<uint64_t>(p.timestamp) << 32) ^
+                     (static_cast<uint64_t>(p.absheight) << 16);
+
+    return {ref_hash, nonce};
+}
+
+// ============================================================================
 // share_init_verify()
 //
 // Performs the init()-phase verification of a share:
@@ -309,14 +398,24 @@ uint256 share_init_verify(const ShareT& share)
         ref_stream << share.m_nonce;
 
         // address or pubkey_hash — V34/V35 use m_address (VarStr),
-        // V36+ uses m_pubkey_hash (uint160), pre-V34 uses m_pubkey_hash.
+        // V36+ uses m_pubkey_hash (uint160) + m_pubkey_type (uint8_t),
+        // pre-V34 uses m_pubkey_hash only.
         if constexpr (requires { share.m_address; })
             ref_stream << share.m_address;
+        else if constexpr (requires { share.m_pubkey_type; })
+        {
+            ref_stream << share.m_pubkey_hash;
+            ref_stream << share.m_pubkey_type;
+        }
         else
             ref_stream << share.m_pubkey_hash;
 
-        // subsidy (uint64_t LE), donation (uint16_t LE)
-        ref_stream << share.m_subsidy;
+        // subsidy: VarInt for V36+, raw uint64_t LE for older
+        if constexpr (ver >= 36)
+            ::Serialize(ref_stream, VarInt(share.m_subsidy));
+        else
+            ref_stream << share.m_subsidy;
+
         ref_stream << share.m_donation;
         // stale_info as EnumType<IntType<8>> — single byte
         {
@@ -332,8 +431,18 @@ uint256 share_init_verify(const ShareT& share)
         // segwit_data (optional)
         if constexpr (requires { share.m_segwit_data; })
         {
-            if (share.m_segwit_data.has_value())
-                ref_stream << share.m_segwit_data.value();
+            if constexpr (ver >= ltc::SEGWIT_ACTIVATION_VERSION)
+            {
+                if (share.m_segwit_data.has_value())
+                    ref_stream << share.m_segwit_data.value();
+            }
+        }
+
+        // merged_addresses (V36+)
+        if constexpr (ver >= 36)
+        {
+            if constexpr (requires { share.m_merged_addresses; })
+                ref_stream << share.m_merged_addresses;
         }
 
         // tx info (pre-v34)
@@ -343,14 +452,32 @@ uint256 share_init_verify(const ShareT& share)
                 ref_stream << share.m_tx_info;
         }
 
-        // far_share_hash, max_bits (uint32_t), bits (uint32_t),
-        // timestamp (uint32_t), absheight (uint32_t), abswork (uint128)
+        // far_share_hash, max_bits, bits, timestamp, absheight
         ref_stream << share.m_far_share_hash;
         ref_stream << share.m_max_bits;
         ref_stream << share.m_bits;
         ref_stream << share.m_timestamp;
         ref_stream << share.m_absheight;
-        ref_stream << share.m_abswork;
+
+        // abswork: AbsworkV36Format for V36+, raw uint128 LE for older
+        if constexpr (ver >= 36)
+        {
+            if constexpr (requires { share.m_abswork; })
+                ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
+        }
+        else
+        {
+            ref_stream << share.m_abswork;
+        }
+
+        // V36+ merged mining commitment fields
+        if constexpr (ver >= 36)
+        {
+            if constexpr (requires { share.m_merged_coinbase_info; })
+                ref_stream << share.m_merged_coinbase_info;
+            if constexpr (requires { share.m_merged_payout_hash; })
+                ref_stream << share.m_merged_payout_hash;
+        }
     }
 
     // hash256 of the ref_type serialisation
@@ -1206,6 +1333,9 @@ uint256 create_local_share(
     ref_stream << share.m_donation;
     { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
     ::Serialize(ref_stream, VarInt(share.m_desired_version));
+    // segwit_data (V36+, optional)
+    if (share.m_segwit_data.has_value())
+        ref_stream << share.m_segwit_data.value();
     ref_stream << share.m_merged_addresses;
     ref_stream << share.m_far_share_hash;
     ref_stream << share.m_max_bits;
@@ -1222,8 +1352,99 @@ uint256 create_local_share(
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
     // --- Build the full coinbase TX (non-witness) ---
-    // This matches generate_share_transaction() output format.
-    // We need this to compute hash_link.
+    // This MUST match generate_share_transaction() exactly so that remote peers
+    // can verify the share.  We compute the same PPLNS outputs here.
+
+    // 1. Compute PPLNS weights (same logic as generate_share_transaction)
+    std::map<std::vector<unsigned char>, uint288> weights;
+    uint288 total_weight;
+    uint288 total_donation_weight;
+
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+    {
+        auto chain_len = std::min(
+            tracker.chain.get_height(prev_share),
+            static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+        auto block_target = chain::bits_to_target(share.m_max_bits);
+        auto max_weight = chain::target_to_average_attempts(block_target)
+                          * PoolConfig::SHARE_PERIOD * 65535;
+        auto walk_count = static_cast<size_t>(chain_len);
+        auto walk_view = tracker.chain.get_chain(prev_share, walk_count);
+
+        for (auto& [hash, data] : walk_view)
+        {
+            uint288 share_att;
+            uint32_t share_don = 0;
+            std::vector<unsigned char> script;
+            data.share.invoke([&](auto* obj) {
+                auto target = chain::bits_to_target(obj->m_bits);
+                share_att = chain::target_to_average_attempts(target);
+                share_don = obj->m_donation;
+                script = get_share_script(obj);
+            });
+
+            uint288 share_total = share_att * 65535;
+            uint288 share_don_w = share_att * share_don;
+
+            if (total_weight + share_total > max_weight)
+            {
+                auto remaining = max_weight - total_weight;
+                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_don);
+                uint288 partial_addr;
+                if (!share_total.IsNull())
+                    partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
+                if (weights.contains(script))
+                    weights[script] += partial_addr;
+                else
+                    weights[script] = partial_addr;
+                uint288 partial_donation;
+                if (!share_total.IsNull())
+                    partial_donation = remaining / 65535 * share_don_w / (share_total / 65535);
+                total_donation_weight += partial_donation;
+                total_weight = max_weight;
+                break;
+            }
+
+            auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_don);
+            if (weights.contains(script))
+                weights[script] += share_addr_weight;
+            else
+                weights[script] = share_addr_weight;
+            total_weight += share_total;
+            total_donation_weight += share_don_w;
+        }
+    }
+
+    // 2. Convert weights to integer payout amounts (V36 formula)
+    std::map<std::vector<unsigned char>, uint64_t> amounts;
+    if (!total_weight.IsNull())
+    {
+        for (auto& [script, weight] : weights)
+        {
+            uint64_t amount = (uint288(subsidy) * weight / total_weight).GetLow64();
+            if (amount > 0)
+                amounts[script] = amount;
+        }
+    }
+
+    uint64_t sum_amounts = 0;
+    for (auto& [s, a] : amounts)
+        sum_amounts += a;
+    uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
+
+    // 3. Build sorted output list (amount desc, script asc)
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
+        amounts.begin(), amounts.end());
+    std::sort(payout_outputs.begin(), payout_outputs.end(),
+        [](const auto& a, const auto& b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+    constexpr size_t MAX_OUTPUTS = 4000;
+    if (payout_outputs.size() > MAX_OUTPUTS)
+        payout_outputs.resize(MAX_OUTPUTS);
+
+    // 4. Serialize the coinbase TX (matches generate_share_transaction exactly)
     PackStream gentx;
     { uint32_t v = 1; gentx.write(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(&v), 4)); }
@@ -1237,47 +1458,65 @@ uint256 create_local_share(
     { uint32_t seq = 0; gentx.write(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(&seq), 4)); }
 
-    // Outputs: compute PPLNS from tracker (mirrors generate_share_transaction)
-    // For simplicity, we compute the exact same outputs the verifier expects.
-    // This calls the same PPLNS weight computation.
+    // Count total outputs
+    size_t n_outs = payout_outputs.size() + 1 /* donation */ + 1 /* OP_RETURN */;
+    bool has_segwit = share.m_segwit_data.has_value();
+    if (has_segwit) n_outs += 1;
 
-    // We need the payout_outputs, donation_amount — extract from generate_share_transaction logic
-    // Here we use a simplified approach: since we have the subsidy and share chain,
-    // we can recompute the expected transaction and extract the coinbase prefix.
-    //
-    // Actually, the simplest approach: call generate_share_transaction() itself
-    // after we've added the share to the tracker, and verify it matches.
-    // But we need the hash_link BEFORE adding, so we compute the coinbase here.
+    // vout count
+    if (n_outs < 253) {
+        uint8_t cnt = static_cast<uint8_t>(n_outs);
+        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1));
+    } else {
+        uint8_t marker = 0xfd;
+        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&marker), 1));
+        uint16_t cnt = static_cast<uint16_t>(n_outs);
+        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2));
+    }
 
-    // For now, we compute a minimal coinbase and hash_link.
-    // The full PPLNS output reconstruction is deferred — the share will be
-    // locally valid for tracker insertion but may not pass remote verification
-    // until the coinbase exactly matches generate_share_transaction output.
+    auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script) {
+        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
+        BaseScript bs;
+        bs.m_data = script;
+        gentx << bs;
+    };
+
+    // Segwit commitment output (FIRST, if present)
+    if (has_segwit)
+    {
+        auto& sd = share.m_segwit_data.value();
+        std::vector<unsigned char> wscript;
+        wscript.push_back(0x6a);
+        wscript.push_back(0x24);
+        wscript.push_back(0xaa);
+        wscript.push_back(0x21);
+        wscript.push_back(0xa9);
+        wscript.push_back(0xed);
+        auto root_bytes = sd.m_wtxid_merkle_root.GetChars();
+        wscript.insert(wscript.end(), root_bytes.begin(), root_bytes.end());
+        write_txout(0, wscript);
+    }
+
+    // PPLNS payout outputs (sorted)
+    for (auto& [script, amount] : payout_outputs)
+        write_txout(amount, script);
 
     // Donation output
     auto donation_script_v = PoolConfig::get_donation_script(int64_t(36));
-    uint64_t donation_amount = subsidy; // Will be adjusted when PPLNS is computed
+    write_txout(donation_amount, donation_script_v);
 
-    // OP_RETURN commitment data
-    std::vector<unsigned char> op_return_data;
-    op_return_data.push_back(0x6a); // OP_RETURN
-    op_return_data.push_back(0x28); // PUSH 40
-    op_return_data.insert(op_return_data.end(), ref_hash.data(), ref_hash.data() + 32);
-    { uint64_t n = share.m_last_txout_nonce;
-      auto* p = reinterpret_cast<const unsigned char*>(&n);
-      op_return_data.insert(op_return_data.end(), p, p + 8); }
+    // OP_RETURN commitment (LAST)
+    {
+        std::vector<unsigned char> op_return_data;
+        op_return_data.push_back(0x6a);
+        op_return_data.push_back(0x28);
+        op_return_data.insert(op_return_data.end(), ref_hash.data(), ref_hash.data() + 32);
+        { uint64_t n = share.m_last_txout_nonce;
+          auto* p = reinterpret_cast<const unsigned char*>(&n);
+          op_return_data.insert(op_return_data.end(), p, p + 8); }
+        write_txout(0, op_return_data);
+    }
 
-    // Output count: donation + OP_RETURN = 2 minimum
-    { uint8_t cnt = 2; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&cnt), 1)); }
-    // Donation output
-    gentx.write(std::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(&donation_amount), 8));
-    { BaseScript bs; bs.m_data = donation_script_v; gentx << bs; }
-    // OP_RETURN output
-    { uint64_t zero = 0; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&zero), 8)); }
-    { BaseScript bs; bs.m_data = op_return_data; gentx << bs; }
     // locktime
     { uint32_t lt = 0; gentx.write(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(&lt), 4)); }
