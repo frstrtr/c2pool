@@ -38,8 +38,9 @@ private:
 public:
     /**
      * @brief Default constructor
+     * @param testnet Whether to use testnet storage path
      */
-    EnhancedC2PoolNode();
+    EnhancedC2PoolNode(bool testnet = false);
     
     /**
      * @brief Construct with IO context and configuration

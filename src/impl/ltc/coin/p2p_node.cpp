@@ -15,7 +15,7 @@ std::string parse_net_error(const boost::system::error_code& ec)
     case boost::asio::error::eof:
         return "EOF, socket disconnected";
     default:
-        return "???";
+        return ec.message();
     }
 }
 

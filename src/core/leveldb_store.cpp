@@ -574,6 +574,10 @@ std::vector<uint256> SharechainLevelDBStore::get_shares_by_height_range(uint64_t
         return hashes;
     }
 
+    // Cap to the actual stored height to avoid iterating billions of empty keys
+    if (end_height > m_metadata.max_height)
+        end_height = m_metadata.max_height;
+
     try {
         for (uint64_t height = start_height; height <= end_height; height++) {
             std::string height_key = make_height_key(height);

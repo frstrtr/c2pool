@@ -216,6 +216,7 @@ struct VarWrapper
     VarType m_value;
     std::mutex m_mutex;
 
+    VarWrapper() : m_value{} {}
     VarWrapper(const VarType& value) : m_value(value) { }
 };
 
@@ -233,7 +234,7 @@ public:
     Event<var_t> changed;
     Event<var_t, var_t> transitioned;
 
-    explicit Variable() {}
+    explicit Variable() : m_wrapper(std::make_shared<wrap_t>()) {}
 
     explicit Variable(const var_t& value)
     {

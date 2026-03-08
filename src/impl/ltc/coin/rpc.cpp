@@ -337,8 +337,6 @@ void NodeRPC::submit_block_hex(const std::string& block_hex, const std::string& 
 
 nlohmann::json NodeRPC::getblocktemplate(std::vector<std::string> rules)
 {
-	for (auto r : rules)
-		std::cout << r << std::endl;
 	nlohmann::json j = nlohmann::json::object({{"rules", rules}});
 	return CallAPIMethod("getblocktemplate", {j});
 }

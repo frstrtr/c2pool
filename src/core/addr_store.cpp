@@ -21,11 +21,20 @@ void AddrStore::from_json(std::string j_str)
         j = nlohmann::json::parse(j_str);
     } catch(const nlohmann::json::exception& e)
     {
-        LOG_WARNING << "AddrStore::FromJSON " << e.what() << ", j_str = " << j_str;
+        LOG_WARNING << "AddrStore::FromJSON " << e.what();
         return;
     }
-    if (!j.is_null())
+    if (j.is_null()) return;
+
+    try {
+        // Legacy: to_json() used brace-init which wrapped the map in an extra array.
+        // Unwrap [[[k,v],...]] → [[k,v],...] so get<map>() can parse it.
+        if (j.is_array() && j.size() == 1 && j[0].is_array())
+            j = j[0];
         m_data = j.get<std::map<NetService, AddrValue>>();
+    } catch (const nlohmann::json::exception& e) {
+        LOG_WARNING << "AddrStore: cannot parse " << m_path.string() << ": " << e.what();
+    }
 }
 
 void AddrStore::add(const NetService& addr, AddrValue value)

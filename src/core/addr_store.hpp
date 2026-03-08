@@ -52,7 +52,7 @@ class AddrStore
     std::filesystem::path m_path;
 
 private:
-    nlohmann::json to_json() const { return nlohmann::json{m_data}; }
+    nlohmann::json to_json() const { return m_data; }
     void from_json(std::string j_str);
 
 public:

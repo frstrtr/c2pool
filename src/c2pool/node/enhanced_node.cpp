@@ -4,14 +4,15 @@
 namespace c2pool {
 namespace node {
 
-EnhancedC2PoolNode::EnhancedC2PoolNode() {
+EnhancedC2PoolNode::EnhancedC2PoolNode(bool testnet) {
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
-    m_storage = std::make_unique<storage::SharechainStorage>("testnet");
+    std::string network = testnet ? "testnet" : "mainnet";
+    m_storage = std::make_unique<storage::SharechainStorage>(network);
     
     LOG_INFO << "Enhanced C2Pool node initialized with default configuration";
     LOG_INFO << "  - Automatic difficulty adjustment";
     LOG_INFO << "  - Real-time hashrate tracking";
-    LOG_INFO << "  - Persistent storage (testnet)";
+    LOG_INFO << "  - Persistent storage (" << network << ")";
 }
 
 EnhancedC2PoolNode::EnhancedC2PoolNode(boost::asio::io_context* ctx, ltc::Config* config) 

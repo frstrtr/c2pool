@@ -242,8 +242,8 @@ int main(int argc, char* argv[]) {
     
     // Port configuration with p2pool-compatible defaults
     int p2p_port = 9326;           // P2Pool P2P sharechain port (p2pool default)
-    int http_port = 9327;          // HTTP/JSON-RPC API port
-    int stratum_port = 9327;       // Stratum mining port (same as worker port in p2pool)
+    int http_port = 9327;          // HTTP/JSON-RPC API port (p2pool: -w / --worker-port)
+    int stratum_port = 0;          // Stratum mining port (0 = auto: http_port + 10)
     std::string http_host = "0.0.0.0";  // HTTP server host
 
     // Coin daemon RPC connection (used by integrated/solo modes for live block templates)
@@ -281,6 +281,9 @@ int main(int argc, char* argv[]) {
     std::string merged_coind_rpc_pass;
     int         merged_coind_p2p_port = 0;
     std::string merged_coind_p2p_address;
+
+    // Seed nodes from -n flag (p2pool compat)
+    std::vector<std::string> seed_nodes;
 
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
@@ -342,8 +345,13 @@ int main(int argc, char* argv[]) {
             p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_port");
         }
-        // Worker/Stratum port (p2pool: -w / --worker-port)
-        else if ((arg == "--worker-port" || arg == "-w" || arg == "--stratum-port") && i + 1 < argc) {
+        // Worker port (p2pool: -w / --worker-port) — sets HTTP API port
+        else if ((arg == "--worker-port" || arg == "-w") && i + 1 < argc) {
+            http_port = std::stoi(argv[++i]);
+            cli_explicit.insert("http_port");
+        }
+        // Explicit stratum port override (separate from worker port)
+        else if (arg == "--stratum-port" && i + 1 < argc) {
             stratum_port = std::stoi(argv[++i]);
             cli_explicit.insert("stratum_port");
         }
@@ -476,6 +484,14 @@ int main(int argc, char* argv[]) {
             redistribute_mode_str = argv[++i];
             cli_explicit.insert("redistribute");
         }
+        // Seed node: -n HOST:PORT (p2pool compat)
+        else if (arg == "-n" && i + 1 < argc) {
+            seed_nodes.push_back(argv[++i]);
+        }
+        // Flags accepted but ignored (p2pool compat)
+        else if (arg == "--no-console") {
+            // c2pool has no interactive console — silently accept
+        }
         else if (arg[0] == '-') {
             LOG_ERROR << "Unknown argument: " << arg;
             return 1;
@@ -603,6 +619,15 @@ int main(int argc, char* argv[]) {
     // If --address was given without --node-owner-address, use it for node owner too
     if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
         node_owner_address = payout_address;
+
+    // Resolve stratum port: auto-assign to http_port + 10 if not explicitly set or conflicts
+    if (stratum_port == 0)
+        stratum_port = http_port + 10;
+    if (stratum_port == http_port) {
+        stratum_port = http_port + 10;
+        LOG_WARNING << "Stratum port conflicts with HTTP port " << http_port
+                    << ", using " << stratum_port;
+    }
     
     try {
         boost::asio::io_context ioc;
@@ -701,7 +726,7 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Features: automatic difficulty adjustment, blockchain-specific address validation";
             
             // Create enhanced node with default constructor to avoid nullptr issues
-            auto enhanced_node = std::make_shared<c2pool::node::EnhancedC2PoolNode>();
+            auto enhanced_node = std::make_shared<c2pool::node::EnhancedC2PoolNode>(settings->m_testnet);
             
             // Set up coin daemon RPC for live block template generation.
             // The coin_node is kept alive for the duration of the integrated mode loop.
@@ -771,6 +796,12 @@ int main(int argc, char* argv[]) {
                     } catch (...) {}
                     return 0; // RPC error or not found — safe default
                 });
+
+            // Inject seed nodes from -n flags into bootstrap list
+            for (const auto& seed : seed_nodes) {
+                ltc_p2p_config->pool()->m_bootstrap_addrs.emplace_back(seed);
+                LOG_INFO << "Added seed node: " << seed;
+            }
 
             // Begin actively connecting to outbound peers from bootstrap list / addr store
             p2p_node->start_outbound_connections();
