@@ -504,6 +504,13 @@ void NodeImpl::start_outbound_connections()
 
 void NodeImpl::run_think()
 {
+    // Rate-limit: skip if called too recently
+    auto now = std::chrono::steady_clock::now();
+    if (now - m_last_think_time < THINK_MIN_INTERVAL)
+        return;
+    m_last_think_time = now;
+
+  try {
     // Provide a stub block_rel_height_func (returns 0 — no real blockchain depth check).
     // In a full implementation this queries the coin daemon for block confirmations.
     auto block_rel_height = [](uint256) -> int32_t { return 0; };
@@ -553,6 +560,12 @@ void NodeImpl::run_think()
     if (!result.best.IsNull()) {
         LOG_DEBUG_POOL << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
     }
+
+  } catch (const std::exception& e) {
+    LOG_ERROR << "run_think() failed: " << e.what();
+  } catch (...) {
+    LOG_ERROR << "run_think() failed: unknown error";
+  }
 }
 
 bool NodeImpl::is_banned(const NetService& addr) const

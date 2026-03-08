@@ -90,7 +90,7 @@ private:
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
-						{}//TODO: error(libp2p::ASIO_ERROR, "CoindConnector::connect_socket: " + ec.message(), NetAddress{ep});
+						LOG_WARNING << "Factory::Client::connect_socket failed: " << ec.message();
 					else
 						LOG_DEBUG_COIND << "Factory::Client::connect_socket canceled";
 					return;
@@ -113,7 +113,7 @@ private:
 				{
 					
 					if (ec != boost::system::errc::operation_canceled)
-						{}//TODO: error(libp2p::ASIO_ERROR, "CoindConnector::try_connect: " + ec.message(), address);
+						LOG_WARNING << "Factory::Client::resolve failed: " << ec.message();
 					else
 						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";
 					return;

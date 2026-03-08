@@ -1021,34 +1021,11 @@ std::string PayoutManager::get_node_owner_config_path() const {
 }
 
 std::string PayoutManager::get_developer_address() const {
-    // Return the developer address for the current blockchain/network
-    switch (blockchain_) {
-        case address::Blockchain::BITCOIN:
-            switch (network_) {
-                case address::Network::MAINNET:
-                    return "bc1qdev123..."; // TODO: Replace with actual developer address
-                case address::Network::TESTNET:
-                    return "tb1qdev123..."; // TODO: Replace with actual developer testnet address
-                case address::Network::REGTEST:
-                    return "bcrt1qdev123..."; // TODO: Replace with actual developer regtest address
-            }
-            break;
-        case address::Blockchain::LITECOIN:
-            switch (network_) {
-                case address::Network::MAINNET:
-                    return "ltc1qdev123..."; // TODO: Replace with actual developer address
-                case address::Network::TESTNET:
-                    return "tltc1qdev123..."; // TODO: Replace with actual developer testnet address
-                case address::Network::REGTEST:
-                    return "rltc1qdev123..."; // TODO: Replace with actual developer regtest address
-            }
-            break;
-        default:
-            LOG_WARNING << "Unknown blockchain type for developer address";
-            break;
-    }
-    
-    return ""; // Fallback
+    // Developer/donation addresses are defined in PoolConfig::get_donation_script()
+    // (consensus-level, per-version P2SH/P2PK scripts matching Python p2pool).
+    // This legacy PayoutManager method is not used for coinbase construction since P32.
+    LOG_WARNING << "get_developer_address() is deprecated — use PoolConfig::get_donation_script()";
+    return "";
 }
 
 std::string PayoutManager::get_node_owner_address() const {

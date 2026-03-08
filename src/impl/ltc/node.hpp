@@ -158,6 +158,10 @@ protected:
     // Peer banning: maps address → ban expiry time
     std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
     static constexpr std::chrono::seconds BAN_DURATION{300}; // 5 minutes
+
+    // Rate-limit run_think(): minimum interval between calls
+    std::chrono::steady_clock::time_point m_last_think_time{};
+    static constexpr std::chrono::seconds THINK_MIN_INTERVAL{5};
 };
 
 struct HandleSharesData

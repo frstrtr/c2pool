@@ -592,7 +592,7 @@ int main(int argc, char* argv[]) {
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
-            web_server.set_on_block_submitted([&p2p_node, &web_server](const std::string& header_hex, int stale_info) {
+            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc](const std::string& header_hex, int stale_info) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -645,6 +645,39 @@ int main(int argc, char* argv[]) {
                          << " hash=" << block_hash.GetHex()
                          << stale_str
                          << " — broadcast bestblock to P2P peers";
+
+                // Schedule post-submission orphan check at +30s and +120s
+                if (stale_info == 0)
+                {
+                    auto check_block = [&ioc, &node_rpc, block_hash](int delay_sec) {
+                        auto timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                        timer->expires_after(std::chrono::seconds(delay_sec));
+                        timer->async_wait([timer, &node_rpc, block_hash, delay_sec](
+                                              boost::system::error_code ec) {
+                            if (ec) return;
+                            try {
+                                auto info = node_rpc->getblock(block_hash);
+                                if (info.contains("confirmations")) {
+                                    int confs = info["confirmations"].get<int>();
+                                    if (confs < 0)
+                                        LOG_WARNING << "Block " << block_hash.GetHex().substr(0, 16)
+                                                    << "... ORPHANED (confirmations=" << confs
+                                                    << ") after " << delay_sec << "s";
+                                    else
+                                        LOG_INFO << "Block " << block_hash.GetHex().substr(0, 16)
+                                                 << "... confirmed (" << confs
+                                                 << " confirmations) after " << delay_sec << "s";
+                                }
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "Orphan check failed for "
+                                            << block_hash.GetHex().substr(0, 16)
+                                            << "...: " << e.what();
+                            }
+                        });
+                    };
+                    check_block(30);
+                    check_block(120);
+                }
             });
             
             // Configure payout system for web server (legacy — kept for REST stats)

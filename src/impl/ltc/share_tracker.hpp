@@ -282,7 +282,8 @@ public:
             });
             bad_peer_addresses.insert(bad_peer);
 
-            // TODO (P5): chain.remove(bad) — remove() not yet implemented
+            chain.remove(bad);
+            LOG_WARNING << "Removed bad share " << bad.GetHex().substr(0, 16) << "... from chain";
         }
 
         // Phase 2: Extend verification from verified heads

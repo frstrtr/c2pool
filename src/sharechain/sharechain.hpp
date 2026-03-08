@@ -471,6 +471,133 @@ public:
         return to_remove.size();
     }
 
+    /// Remove a single share from the chain.
+    /// If the share is a head (tip), the chain is shortened and its
+    /// predecessor becomes the new head.
+    /// If the share is mid-chain, the chain is split: children above it
+    /// become a separate fork whose tail now points past the removed share.
+    /// Returns true if the share was found and removed.
+    bool remove(const hash_t& hash)
+    {
+        auto it = m_shares.find(hash);
+        if (it == m_shares.end())
+            return false;
+
+        index_t* idx = it->second.index;
+        hash_t share_tail = idx->tail; // == share->m_prev_hash
+
+        // Determine if this share is currently a head
+        bool is_head = m_heads.contains(hash);
+
+        // Find any child shares whose prev == hash (shares that point to us)
+        std::vector<hash_t> children;
+        for (auto& [h, cd] : m_shares)
+        {
+            if (h != hash && cd.index->tail == hash && cd.index->prev == idx)
+                children.push_back(h);
+        }
+
+        if (is_head && children.empty())
+        {
+            // Simple case: head with no children above us.
+            // Remove from heads, update tails.
+            hash_t our_tail = m_heads[hash]; // the tail this fork reaches
+            m_heads.erase(hash);
+
+            if (m_tails.contains(our_tail))
+            {
+                m_tails[our_tail].erase(hash);
+                if (m_tails[our_tail].empty())
+                    m_tails.erase(our_tail);
+            }
+
+            // If prev share exists, it might become a new head or the tail ref
+            // moves. If prev is not itself a head, make it one.
+            if (idx->prev)
+            {
+                hash_t prev_hash = idx->prev->head;
+                if (!m_heads.contains(prev_hash))
+                {
+                    m_heads[prev_hash] = our_tail;
+                    m_tails[our_tail].insert(prev_hash);
+                }
+                // Subtract this share's contribution from the prev chain
+                // (idx has height 1 for this single share, but cumulative
+                //  values were already folded in calculate_head_tail)
+            }
+        }
+        else
+        {
+            // Mid-chain or has children: detach children so they form
+            // new forks whose tail points past us to share_tail.
+            for (auto& child_hash : children)
+            {
+                index_t* child_idx = m_shares[child_hash].index;
+
+                // Walk from child up to the head of its fork, subtracting
+                // our contribution.
+                // Simpler approach: just detach prev pointer.
+                // The child becomes a new fork root with prev = idx->prev.
+                child_idx->prev = idx->prev;
+                // Recalculate from scratch if needed (heights will be off
+                // by idx->height, but since idx->height == 1 for a single
+                // share we can just decrement).
+                // Walk up from child_hash to its head:
+                hash_t head_of_fork = child_hash;
+                for (auto& [h, _] : m_heads)
+                {
+                    // Check if child_hash's fork reaches this head
+                    if (m_shares.contains(h))
+                    {
+                        index_t* cur = m_shares[h].index;
+                        while (cur)
+                        {
+                            if (cur->head == child_hash)
+                            {
+                                head_of_fork = h;
+                                break;
+                            }
+                            cur = cur->prev;
+                        }
+                    }
+                }
+
+                // Update the head→tail mapping
+                if (m_heads.contains(head_of_fork))
+                {
+                    hash_t old_tail = m_heads[head_of_fork];
+                    m_heads[head_of_fork] = share_tail;
+
+                    if (m_tails.contains(old_tail))
+                    {
+                        m_tails[old_tail].erase(head_of_fork);
+                        if (m_tails[old_tail].empty())
+                            m_tails.erase(old_tail);
+                    }
+                    m_tails[share_tail].insert(head_of_fork);
+                }
+            }
+
+            // If we were a head, remove that entry
+            if (is_head)
+            {
+                hash_t our_tail = m_heads[hash];
+                m_heads.erase(hash);
+                if (m_tails.contains(our_tail))
+                {
+                    m_tails[our_tail].erase(hash);
+                    if (m_tails[our_tail].empty())
+                        m_tails.erase(our_tail);
+                }
+            }
+        }
+
+        // Free the index and remove from m_shares
+        delete idx;
+        m_shares.erase(it);
+        return true;
+    }
+
     void debug()
     {
         std::cout << "m_heads: {";

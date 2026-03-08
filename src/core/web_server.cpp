@@ -1823,7 +1823,9 @@ bool WebServer::start()
             auto fn = std::make_shared<std::function<void(beast::error_code)>>();
             *fn = [this, timer, fn](beast::error_code ec) {
                 if (ec || !running_) return;
-                try { mining_interface_->refresh_work(); } catch (...) {}
+                try { mining_interface_->refresh_work(); }
+                catch (const std::exception& e) { LOG_WARNING << "refresh_work failed: " << e.what(); }
+                catch (...) { LOG_WARNING << "refresh_work failed: unknown error"; }
                 timer->expires_after(std::chrono::seconds(5));
                 timer->async_wait(*fn);
             };
