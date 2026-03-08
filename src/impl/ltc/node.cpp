@@ -511,9 +511,10 @@ void NodeImpl::run_think()
     m_last_think_time = now;
 
   try {
-    // Provide a stub block_rel_height_func (returns 0 — no real blockchain depth check).
-    // In a full implementation this queries the coin daemon for block confirmations.
-    auto block_rel_height = [](uint256) -> int32_t { return 0; };
+    // Use the wired block_rel_height function, or a safe default stub
+    auto block_rel_height = m_block_rel_height_fn
+        ? m_block_rel_height_fn
+        : [](uint256) -> int32_t { return 0; };
 
     uint256 prev_block;  // zero — not used in basic think()
     uint32_t bits = 0;

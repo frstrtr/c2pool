@@ -585,6 +585,18 @@ int main(int argc, char* argv[]) {
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
+            // Wire block_rel_height for chain scoring: queries coin daemon for block depth
+            p2p_node->set_block_rel_height_fn(
+                [rpc = node_rpc.get()](uint256 block_hash) -> int32_t {
+                    if (!rpc || block_hash.IsNull()) return 0;
+                    try {
+                        auto reply = rpc->getblock(block_hash, 1);
+                        if (reply.contains("confirmations"))
+                            return reply["confirmations"].get<int32_t>();
+                    } catch (...) {}
+                    return 0; // RPC error or not found — safe default
+                });
+
             // Begin actively connecting to outbound peers from bootstrap list / addr store
             p2p_node->start_outbound_connections();
             LOG_INFO << "Outbound peer connection loop started";

@@ -140,6 +140,13 @@ public:
     /// Should be called periodically (e.g. after processing_shares or on a timer).
     void run_think();
 
+    /// Set the block_rel_height function used by run_think() for chain scoring.
+    /// fn(block_hash) should return confirmations from the coin daemon:
+    ///   >= 0 : block is in main chain (0 = tip, higher = deeper)
+    ///   <  0 : block is NOT in main chain (orphaned/stale)
+    using block_rel_height_fn_t = std::function<int32_t(uint256)>;
+    void set_block_rel_height_fn(block_rel_height_fn_t fn) { m_block_rel_height_fn = std::move(fn); }
+
     /// Check whether a peer address is currently banned.
     bool is_banned(const NetService& addr) const;
 
@@ -162,6 +169,9 @@ protected:
     // Rate-limit run_think(): minimum interval between calls
     std::chrono::steady_clock::time_point m_last_think_time{};
     static constexpr std::chrono::seconds THINK_MIN_INTERVAL{5};
+
+    // Block depth function for chain scoring (set via set_block_rel_height_fn)
+    block_rel_height_fn_t m_block_rel_height_fn;
 };
 
 struct HandleSharesData
