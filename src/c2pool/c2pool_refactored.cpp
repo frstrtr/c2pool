@@ -567,10 +567,16 @@ int main(int argc, char* argv[]) {
 
             // Create web server with explicit port configuration
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
-                                     settings->m_testnet, nullptr, blockchain);
+                                     settings->m_testnet, enhanced_node, blockchain);
             
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             web_server.set_coin_rpc(node_rpc.get(), &coin_node);
+
+            // Feed real network difficulty from block templates to the adjustment engine
+            web_server.get_mining_interface()->set_on_network_difficulty(
+                [engine = &enhanced_node->get_difficulty_engine()](double diff) {
+                    engine->set_network_difficulty(diff);
+                });
             
             // Start P2P sharechain node for broadcasting new best-blocks to peers
             auto ltc_p2p_config = std::make_unique<ltc::Config>("ltc");

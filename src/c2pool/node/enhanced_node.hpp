@@ -9,6 +9,7 @@
 #include <c2pool/difficulty/adjustment_engine.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/message.hpp>
+#include <core/mining_node_interface.hpp>
 #include <core/common.hpp>
 #include <nlohmann/json.hpp>
 
@@ -21,7 +22,7 @@ namespace node {
  * Integrates all the enhanced features while maintaining compatibility with
  * the existing LTC sharechain infrastructure and c2pool network protocol.
  */
-class EnhancedC2PoolNode {
+class EnhancedC2PoolNode : public core::IMiningNode {
 private:
     std::unique_ptr<storage::SharechainStorage> m_storage;
     uint64_t m_shares_since_save = 0;
@@ -81,44 +82,49 @@ public:
     /**
      * @brief Log comprehensive sharechain statistics
      */
-    void log_sharechain_stats();
+    void log_sharechain_stats() override;
     
     /**
      * @brief Track mining_share submission for mining interface
      * @param session_id Session identifier
      * @param difficulty MiningShare difficulty
      */
-    void track_mining_share_submission(const std::string& session_id, double difficulty);
+    void track_mining_share_submission(const std::string& session_id, double difficulty) override;
     
     /**
      * @brief Get difficulty statistics
      * @return JSON object with difficulty stats
      */
-    nlohmann::json get_difficulty_stats() const;
+    nlohmann::json get_difficulty_stats() const override;
     
     /**
      * @brief Get hashrate statistics
      * @return JSON object with hashrate stats
      */
-    nlohmann::json get_hashrate_stats() const;
+    nlohmann::json get_hashrate_stats() const override;
     
+    /**
+     * @brief Add a local mining share (IMiningNode)
+     */
+    void add_local_mining_share(const uint256& hash, const uint256& prev_hash, const uint256& target) override;
+
     /**
      * @brief Get total number of mining_shares in chain
      * @return MiningShare count
      */
-    uint64_t get_total_mining_shares() const;
+    uint64_t get_total_mining_shares() const override;
     
     /**
      * @brief Get number of connected peers
      * @return Peer count
      */
-    size_t get_connected_peers_count() const;
+    size_t get_connected_peers_count() const override;
 
     /**
      * @brief Get stale/DOA share statistics
      * @return JSON with orphan_count, doa_count, stale_prop
      */
-    nlohmann::json get_stale_stats() const;
+    nlohmann::json get_stale_stats() const override;
     
     /**
      * @brief Get storage manager

@@ -846,6 +846,18 @@ void MiningInterface::refresh_work()
                  << " txs=" << wd.m_hashes.size()
                  << " latency=" << wd.m_latency << "ms"
                  << " merkle_branches=" << m_cached_merkle_branches.size();
+
+        // Push real network difficulty to external consumers (AdjustmentEngine)
+        if (m_on_network_difficulty_fn) {
+            try {
+                uint32_t nbits_val = std::stoul(
+                    wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                double net_diff = chain::target_to_difficulty(
+                    chain::bits_to_target(nbits_val));
+                if (net_diff > 0)
+                    m_on_network_difficulty_fn(net_diff);
+            } catch (...) {}
+        }
     } catch (const std::exception& e) {
         LOG_WARNING << "refresh_work failed: " << e.what();
         m_work_valid = false;

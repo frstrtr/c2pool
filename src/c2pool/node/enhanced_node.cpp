@@ -148,6 +148,11 @@ uint64_t node::EnhancedC2PoolNode::get_total_mining_shares() const {
     return m_chain ? 1000 : 0; // Placeholder - would need proper implementation with LTC chain
 }
 
+void node::EnhancedC2PoolNode::add_local_mining_share(const uint256& /*hash*/, const uint256& /*prev_hash*/, const uint256& /*target*/) {
+    // Handled by the real share creation pipeline (create_local_share + broadcast).
+    // This stub satisfies the IMiningNode interface.
+}
+
 size_t node::EnhancedC2PoolNode::get_connected_peers_count() const {
     return m_connections.size();
 }

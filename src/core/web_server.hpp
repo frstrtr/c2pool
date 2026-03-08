@@ -205,6 +205,10 @@ public:
 
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
+
+    // Network difficulty callback — invoked from refresh_work() with real value
+    using network_difficulty_fn_t = std::function<void(double)>;
+    void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
     
     // Payout management methods
     nlohmann::json getpayoutinfo(const std::string& request_id = "");
@@ -337,6 +341,9 @@ private:
 
     // Integrated merged mining manager (non-owning)
     c2pool::merged::MergedMiningManager* m_mm_manager{nullptr};
+
+    // Network difficulty callback
+    network_difficulty_fn_t m_on_network_difficulty_fn;
 
     // Pool fee percent (set via set_pool_fee_percent)
     double m_pool_fee_percent{0.0};

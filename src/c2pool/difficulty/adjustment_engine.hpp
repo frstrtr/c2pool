@@ -83,12 +83,18 @@ public:
      */
     void force_network_update();
     
+    /**
+     * @brief Set network difficulty from an external source (e.g. getblocktemplate bits)
+     * @param diff Network difficulty value (must be > 0)
+     */
+    void set_network_difficulty(double diff);
+
 private:
     /**
-     * @brief Update network difficulty from external source
+     * @brief Log current network difficulty (value set externally via set_network_difficulty)
      */
     void update_network_difficulty();
-    
+
     /**
      * @brief Adjust pool difficulty based on recent performance
      */

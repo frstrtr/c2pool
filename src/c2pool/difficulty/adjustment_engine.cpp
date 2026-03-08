@@ -102,24 +102,22 @@ void DifficultyAdjustmentEngine::force_network_update() {
     last_network_update_ = static_cast<uint64_t>(std::time(nullptr));
 }
 
+void DifficultyAdjustmentEngine::set_network_difficulty(double diff) {
+    if (diff <= 0) return;
+    network_difficulty_ = diff;
+    uint256 max_target;
+    max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    network_target_ = max_target / static_cast<uint64_t>(diff);
+    last_network_update_ = static_cast<uint64_t>(std::time(nullptr));
+    LOG_INFO << "Network difficulty set: " << network_difficulty_
+             << " (target: " << network_target_.ToString().substr(0, 16) << "...)";
+}
+
 void DifficultyAdjustmentEngine::update_network_difficulty() {
-    // In a real implementation, this would query the network for current difficulty
-    // For now, we'll simulate it
-    try {
-        // Query network via RPC (placeholder)
-        network_difficulty_ = 1000.0; // Placeholder network difficulty
-        
-        // Convert to target
-        uint256 max_target;
-        max_target.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        network_target_ = max_target / static_cast<uint64_t>(network_difficulty_);
-        
-        LOG_INFO << "Network difficulty updated: " << network_difficulty_
-                 << " (target: " << network_target_.ToString().substr(0, 16) << "...)";
-        
-    } catch (const std::exception& e) {
-        LOG_WARNING << "Failed to update network difficulty: " << e.what();
-    }
+    // Network difficulty is now pushed externally via set_network_difficulty().
+    // This method is called periodically from process_new_p2p_share() and just logs.
+    LOG_INFO << "Network difficulty: " << network_difficulty_
+             << " (target: " << network_target_.ToString().substr(0, 16) << "...)";
 }
 
 void DifficultyAdjustmentEngine::adjust_pool_difficulty() {
