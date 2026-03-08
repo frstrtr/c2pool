@@ -437,6 +437,156 @@ public:
         return (use_min_work ? interval.min_work : interval.work) / static_cast<uint32_t>(time);
     }
 
+    // -- Share target computation --
+    // Computes max_bits and bits for a new share, matching p2pool-v36
+    // BaseShare.generate_transaction():
+    //   1. Derive pre_target from pool hashrate estimate
+    //   2. Clamp to ±10% of previous share's max_target
+    //   3. Apply emergency time-based decay (death spiral prevention)
+    //   4. Clamp to [MIN_TARGET, MAX_TARGET]
+    // Returns {max_bits, bits}.
+    struct ShareTarget {
+        uint32_t max_bits;
+        uint32_t bits;
+    };
+
+    ShareTarget compute_share_target(
+        const uint256& prev_share_hash,
+        uint32_t desired_timestamp,
+        const uint256& desired_target)
+    {
+        // p2pool MAX_TARGET for LTC: 2^256 / 2^20 - 1 = 2^236 - 1
+        static const uint256 MAX_TARGET = [] {
+            uint256 t;
+            t.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            return t;
+        }();
+
+        if (prev_share_hash.IsNull())
+            return {chain::target_to_bits_upper_bound(MAX_TARGET),
+                    chain::target_to_bits_upper_bound(MAX_TARGET)};
+
+        auto [height, last] = chain.get_height_and_last(prev_share_hash);
+
+        // Not enough chain depth: use MAX_TARGET
+        if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
+        {
+            auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
+            return {max_bits, max_bits};
+        }
+
+        // Step 1: Derive target from pool hashrate
+        auto aps = get_pool_attempts_per_second(prev_share_hash,
+            PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
+
+        uint256 pre_target;
+        if (aps.IsNull())
+        {
+            pre_target = MAX_TARGET;
+        }
+        else
+        {
+            // pre_target = 2^256 / (SHARE_PERIOD * aps) - 1
+            uint288 two_256;
+            two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+            uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::SHARE_PERIOD);
+            if (divisor.IsNull())
+                divisor = uint288(1);
+            uint288 result = two_256 / divisor;
+            if (result > uint288(1))
+                result = result - uint288(1);
+            // Clamp to 256-bit range
+            uint288 max_288;
+            max_288.SetHex(MAX_TARGET.GetHex());
+            if (result > max_288)
+                pre_target = MAX_TARGET;
+            else
+                pre_target.SetHex(result.GetHex());
+        }
+
+        // Step 2: Get previous share's max_target
+        uint256 prev_max_target;
+        chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+            prev_max_target = chain::bits_to_target(obj->m_max_bits);
+        });
+
+        // Step 3: Emergency time-based decay (death spiral prevention)
+        // Phase 1b from p2pool-v36: doubles target every SHARE_PERIOD * 10
+        // seconds past the threshold of SHARE_PERIOD * 20 seconds since last share.
+        uint256 clamp_ref_target = prev_max_target;
+        uint32_t prev_ts = 0;
+        chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+            prev_ts = obj->m_timestamp;
+        });
+
+        if (prev_ts > 0 && desired_timestamp > prev_ts)
+        {
+            auto time_since_share = desired_timestamp - prev_ts;
+            constexpr uint32_t emergency_threshold = PoolConfig::SHARE_PERIOD * 20;
+            if (time_since_share > emergency_threshold)
+            {
+                constexpr uint32_t half_life = PoolConfig::SHARE_PERIOD * 10;
+                auto excess = time_since_share - emergency_threshold;
+                auto halvings = excess / half_life;
+                auto remainder = excess % half_life;
+                // 2^halvings with linear interpolation for fractional part
+                uint256 eased = prev_max_target;
+                if (halvings < 256)
+                    eased <<= halvings;
+                else
+                    eased = MAX_TARGET;
+                // Linear interpolation: eased = eased * (half_life + remainder) / half_life
+                uint288 eased_288;
+                eased_288.SetHex(eased.GetHex());
+                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
+                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
+                uint288 max_288;
+                max_288.SetHex(MAX_TARGET.GetHex());
+                if (eased_288 > max_288)
+                    clamp_ref_target = MAX_TARGET;
+                else
+                    clamp_ref_target.SetHex(eased_288.GetHex());
+            }
+        }
+
+        // Step 4: Clamp pre_target to ±10% of clamp_ref_target
+        // pre_target2 = clip(pre_target, (clamp_ref * 9/10, clamp_ref * 11/10))
+        uint256 lo = clamp_ref_target / 10 * 9;
+        uint256 hi;
+        {
+            uint288 hi_288;
+            hi_288.SetHex(clamp_ref_target.GetHex());
+            hi_288 = hi_288 * 11;
+            hi_288 = hi_288 / 10;
+            uint288 max_288;
+            max_288.SetHex(MAX_TARGET.GetHex());
+            if (hi_288 > max_288)
+                hi = MAX_TARGET;
+            else
+                hi.SetHex(hi_288.GetHex());
+        }
+
+        uint256 pre_target2 = pre_target;
+        if (pre_target2 < lo) pre_target2 = lo;
+        if (pre_target2 > hi) pre_target2 = hi;
+
+        // Step 5: Clamp to network limits [MIN_TARGET, MAX_TARGET]
+        // MIN_TARGET = 0 → no lower clamp needed
+        uint256 pre_target3 = pre_target2;
+        if (pre_target3 > MAX_TARGET) pre_target3 = MAX_TARGET;
+
+        auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+
+        // bits = from_target_upper_bound(clip(desired_target, (pre_target3/30, pre_target3)))
+        uint256 bits_lo = pre_target3 / 30;
+        uint256 bits_target = desired_target;
+        if (bits_target < bits_lo) bits_target = bits_lo;
+        if (bits_target > pre_target3) bits_target = pre_target3;
+        auto bits = chain::target_to_bits_upper_bound(bits_target);
+
+        return {max_bits, bits};
+    }
+
     // -- PPLNS cumulative weights computation --
     CumulativeWeights get_cumulative_weights(const uint256& start, int32_t max_shares, const uint288& desired_weight)
     {

@@ -158,7 +158,7 @@ namespace sharechain
     {
         struct RuleFunc
         {
-            // Словарь с функциями для инициализации (расчёта) новых значений правил.
+            // Map of functions for initializing (computing) new rule values.
             std::function<std::any(const ValueType&)> make;
             //
             std::function<std::any()> make_none;

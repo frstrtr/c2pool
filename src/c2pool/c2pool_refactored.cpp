@@ -752,8 +752,13 @@ int main(int argc, char* argv[]) {
                     params.subsidy = subsidy;
                     params.donation = 50; // 0.5%
                     params.desired_version = 36;
-                    params.max_bits = bits;
-                    params.bits = bits;
+
+                    // Compute pool-level share target from tracker state
+                    auto desired_target = chain::bits_to_target(bits);
+                    auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
+                        params.prev_share, timestamp, desired_target);
+                    params.max_bits = share_max_bits;
+                    params.bits = share_bits;
                     params.timestamp = timestamp;
 
                     // Extract pubkey_hash and type from payout_script

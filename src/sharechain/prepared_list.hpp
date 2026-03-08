@@ -79,7 +79,7 @@ struct PreparedList
     {
         // temp-data
         std::map<hash_t, it_t> items; // hash->item;
-        std::map<hash_t, std::vector<it_t>> tails; // хэши, которые являются предыдущими существующим item's.
+        std::map<hash_t, std::vector<it_t>> tails; // hashes that are prev-pointers of existing items.
 
         for (auto it = values.begin(); it != values.end(); it++)
         {

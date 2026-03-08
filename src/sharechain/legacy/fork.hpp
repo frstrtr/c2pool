@@ -224,7 +224,7 @@ private:
     using sum_element = typename fork_type::sum_element;
 public:
     std::shared_ptr<fork_type> fork;
-    hash_type split_point; // точка разделения на sub_fork.
+    hash_type split_point; // split point for sub_fork.
 
     SubFork(const std::shared_ptr<fork_type> &_fork, const hash_type &_point) : Fork<SumType, SIZE>(), fork(_fork), split_point(_point)
     {

@@ -40,6 +40,59 @@ inline uint288 target_to_average_attempts(const uint256& target)
     return two_256;
 }
 
+// Convert uint256 target to compact nBits format (upper bound: smallest nBits
+// whose decoded target is >= the input target).
+// Inverse of bits_to_target(). Matches p2pool FloatingInteger.from_target_upper_bound().
+inline uint32_t target_to_bits_upper_bound(const uint256& target)
+{
+    // data() is little-endian: data()[0] is least significant byte
+    const unsigned char* d = target.data();
+
+    // Find the most significant non-zero byte (big-endian size)
+    int nSize = 32;
+    while (nSize > 0 && d[nSize - 1] == 0)
+        --nSize;
+
+    if (nSize == 0)
+        return 0;
+
+    uint32_t nWord;
+    if (nSize <= 3) {
+        nWord = 0;
+        for (int i = nSize - 1; i >= 0; --i)
+            nWord = (nWord << 8) | d[i];
+        nWord <<= 8 * (3 - nSize);
+    } else {
+        // Extract top 3 bytes (big-endian: d[nSize-1], d[nSize-2], d[nSize-3])
+        nWord = (static_cast<uint32_t>(d[nSize - 1]) << 16) |
+                (static_cast<uint32_t>(d[nSize - 2]) << 8) |
+                (static_cast<uint32_t>(d[nSize - 3]));
+        // Round UP: if target has any non-zero bytes below the top 3, increment
+        bool has_remainder = false;
+        for (int i = 0; i < nSize - 3; ++i) {
+            if (d[i] != 0) {
+                has_remainder = true;
+                break;
+            }
+        }
+        if (has_remainder)
+            ++nWord;
+        // Handle overflow of 3-byte mantissa
+        if (nWord > 0x7fffff) {
+            nWord >>= 8;
+            ++nSize;
+        }
+    }
+
+    // High bit of mantissa must be 0 for positive encoding
+    if (nWord & 0x00800000) {
+        nWord >>= 8;
+        ++nSize;
+    }
+
+    return (static_cast<uint32_t>(nSize) << 24) | (nWord & 0x00ffffff);
+}
+
 // Convert target to mining difficulty (relative to max_target for display)
 inline double target_to_difficulty(const uint256& target)
 {

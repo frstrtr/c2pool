@@ -113,7 +113,7 @@ public:
         switch (state)
         {
             case new_fork:
-                //создание нового форка
+                // create a new fork
             {
                 // make new fork
                 auto new_fork = make_fork();
@@ -126,7 +126,7 @@ public:
             }
                 break;
             case both:
-                // объединение двух форков на стыке нового элемента
+                // merge two forks at the junction of a new element
             {
                 auto left_fork = heads.extract(value.prev());
                 auto right_fork = tails.extract(value.hash());
@@ -153,7 +153,7 @@ public:
             }
                 break;
             case only_heads:
-                // продолжение форка спереди
+                // extend fork at the front (head side)
             {
                 auto head_fork = heads.extract(value.prev());
                 head_fork.mapped()->insert(value);
@@ -164,7 +164,7 @@ public:
             }
                 break;
             case only_tails:
-                // продолжение форка сзади
+                // extend fork at the back (tail side)
             {
                 auto tail_forks = tails.extract(value.hash());
                 if (tail_forks.mapped().size() > 1)
@@ -195,7 +195,7 @@ public:
             }
                 break;
             case split:
-                // раскол от шары уже существующего форка.
+                // split from a share of an already existing fork.
             {
                 // make new fork
 //                items.count(value.prev())
@@ -307,7 +307,7 @@ public:
 
     bool is_child_of(hash_type item, hash_type possible_child)
     {
-        // item = possible_child -> объект сам себе дочерний, true
+        // item == possible_child -> an item is its own child, return true
         if (item == possible_child)
             return true;
 
@@ -416,7 +416,7 @@ private:
         return element;
     }
 
-    //TODO: Реализовать, если понадобится создавать новые правила прямо во время работы пулла.
+    //TODO: Implement if creating new rules at runtime becomes necessary.
     void new_rules_calculate(std::vector<std::string> k_rules)
     {
         // legacy code:

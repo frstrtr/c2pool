@@ -49,7 +49,7 @@ namespace core::random
         return *item;
     }
 
-    ///l = <среднее желаемое число>
+    /// l = desired mean value
     double expovariate(double l);
 
     unsigned long long random_nonce();

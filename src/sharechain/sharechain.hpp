@@ -112,14 +112,14 @@ private:
         switch (state)
         {
         case new_fork:
-            // создание нового форка
+            // create a new fork
             {
                 m_heads[head] = tail;    
                 m_tails[tail].insert(head);
             }
             break;
         case merge:
-            // объединение двух форков на стыке нового элемента
+            // merge two forks at the junction of a new element
             {
                 auto left = m_heads.extract(tail); // heads[t]
                 auto& l_tail = left.mapped(); auto& l_head = left.key();
@@ -159,7 +159,7 @@ private:
             }
             break;
         case only_tails:
-            // элемент слева
+            // element on the left (tail side)
             {
                 std::unordered_set<hash_t, hasher_t> dirty_indexs;
                 auto right = m_tails.extract(head);
@@ -191,7 +191,7 @@ private:
             }
             break;
         case only_heads:
-            // элемент справа
+            // element on the right (head side)
             {
                 auto left_part = m_heads.extract(tail);
 

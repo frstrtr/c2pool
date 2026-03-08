@@ -77,7 +77,7 @@ public:
     }
 
     bool empty() const
-    {   // TODO: нужно ли проверять ещё и положение курсора, на случай, если данные имеются? может сделать аргументом метода empty(check_cursor)?
+    {   // TODO: should we also check cursor position in case data exists? Maybe add check_cursor as an argument to empty()?
         return m_vch.empty();
     }
 

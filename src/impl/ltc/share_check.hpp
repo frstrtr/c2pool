@@ -1223,8 +1223,16 @@ uint256 create_local_share(
     share.m_donation   = donation;
     share.m_stale_info = stale_info;
     share.m_desired_version = 36;
-    share.m_max_bits   = min_header.m_bits;
-    share.m_bits       = min_header.m_bits; // block-level share meets network target
+
+    // Compute pool-level share target from hashrate estimate + death spiral
+    // prevention, matching p2pool-v36's generate_transaction() logic.
+    // desired_target = block target (what the miner actually achieved)
+    auto desired_target = chain::bits_to_target(min_header.m_bits);
+    auto [share_max_bits, share_bits] = tracker.compute_share_target(
+        prev_share, min_header.m_timestamp, desired_target);
+    share.m_max_bits   = share_max_bits;
+    share.m_bits       = share_bits;
+
     share.m_timestamp  = min_header.m_timestamp;
     share.m_nonce      = 0; // share commitment nonce (not block nonce)
     share.m_merged_addresses = merged_addrs;

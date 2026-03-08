@@ -92,7 +92,7 @@ public:
 
     void disconnect(int id)
 	{
-        //Дисконнект устроен по принципу:
+        // Disconnect works as follows:
         //signals2::connection bc = w.Signal.connect(bind(&Object::doSomething, o));
         //bc.disconnect();
         //return bc;

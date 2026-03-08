@@ -10,8 +10,8 @@ class ShareTracker;
 
 namespace shares::weight
 {
-    // TODO: хранить без умножения на 65535 и лишь в конце вычислений, результат, как сумму, умножать на 65535*n;
-    // TODO: Оптимизировать память для amount.
+    // TODO: store without multiplying by 65535; only multiply the final sum by 65535*n.
+    // TODO: optimize memory usage for amount.
     class weight_data
     {
     public:
@@ -54,7 +54,7 @@ namespace shares::weight
         {
             for (const auto& el : element.amount)
             {
-                //TODO: сделать проверку на существование script в словаре?
+                //TODO: check whether script exists in the map?
                 amount[el.first] -= el.second;
 
                 if (amount[el.first].IsNull())

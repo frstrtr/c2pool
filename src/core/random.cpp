@@ -48,7 +48,7 @@ namespace core::random
 		return result;
 	}
 
-    ///l = <среднее желаемое число>
+    /// l = desired mean value
     double expovariate(double l)
     {
         boost::random::exponential_distribution<double> rnd(l);

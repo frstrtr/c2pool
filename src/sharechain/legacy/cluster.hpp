@@ -227,7 +227,7 @@ private:
 
     sum_element &recalculate_nodes(ptr_node_type &node, const std::map<int, ptr_node_type> &values, const int &l, const int &r)//const int &index)
     {
-        // в границах заданного интервала
+        // within the specified interval bounds
         if (
                 (node->index_l >= l && node->index_r <= r) ||
                 (node->index_l <= l && node->index_r >= r) ||
@@ -304,7 +304,7 @@ private:
     template <typename T>
     bool push_front_range(const std::vector<T> &_values)
     {
-        //TODO: добавить возможность разделения заданных данных, чтобы часть добавить сюда, а часть в новый кластер.
+        //TODO: add ability to split input data so part goes here and part into a new cluster.
         if (begin - _values.size() < 1)
             return false;
 
@@ -331,7 +331,7 @@ private:
     template <typename T>
     bool push_back_range(const std::vector<T> &_values)
     {
-        //TODO: добавить возможность разделения заданных данных, чтобы часть добавить сюда, а часть в новый кластер.
+        //TODO: add ability to split input data so part goes here and part into a new cluster.
         if (end + _values.size() > data.size() - 1)
             return false;
 
@@ -482,7 +482,7 @@ public:
     }
 
     //TODO: remove?
-//    // Проверяет, находится ли left, левее right?
+//    // Checks whether left is to the left of right
 //    bool check_pos(auto left, auto right)
 //    {
 //        if (!(exist(left) && exist(right)))

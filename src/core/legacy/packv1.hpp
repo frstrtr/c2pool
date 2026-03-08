@@ -39,7 +39,7 @@ concept StreamEnumType = std::is_enum_v<T>;
 
 /// MAKER
 
-struct BaseMaker //TIP, HACK, КОСТЫЛЬ
+struct BaseMaker // workaround / type-erasure helper
 {
 };
 
