@@ -1245,7 +1245,8 @@ uint256 create_local_share(
     const std::vector<MergedAddressEntry>& merged_addrs = {},
     StaleInfo stale_info = StaleInfo::none,
     bool segwit_active = false,
-    const std::string& witness_commitment_hex = {})
+    const std::string& witness_commitment_hex = {},
+    const std::vector<unsigned char>& message_data = {})
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1268,6 +1269,10 @@ uint256 create_local_share(
     share.m_timestamp  = min_header.m_timestamp;
     share.m_nonce      = 0; // share commitment nonce (not block nonce)
     share.m_merged_addresses = merged_addrs;
+
+    // Embed encrypted message_data (from create_message_data()) if provided
+    if (!message_data.empty())
+        share.m_message_data.m_data = message_data;
 
     // Compute merged_payout_hash: deterministic hash of V36-only PPLNS
     // weight distribution so peers can verify merged mining payouts.

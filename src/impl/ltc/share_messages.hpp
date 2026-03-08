@@ -18,10 +18,12 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
 #include <btclibs/crypto/hmac_sha256.h>
+#include <btclibs/crypto/ripemd160.h>
 #include <btclibs/crypto/sha256.h>
 #include <secp256k1.h>
 
@@ -159,7 +161,8 @@ struct ShareMessage
 
 inline const secp256k1_context* get_secp256k1_context()
 {
-    static const secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    static const secp256k1_context* ctx =
+        secp256k1_context_create(SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
     return ctx;
 }
 
@@ -408,6 +411,169 @@ inline std::string validate_message_data(const std::vector<unsigned char>& messa
     }
 
     return {};  // All checks passed
+}
+
+// ============================================================================
+// Message creation: signing, packing, encryption
+// ============================================================================
+
+// ECDSA sign a 32-byte hash with a 32-byte private key.
+// Returns DER-encoded signature, empty on failure.
+inline std::vector<unsigned char> ecdsa_sign(
+    const unsigned char* msghash32,
+    const unsigned char* seckey32)
+{
+    const auto* ctx = get_secp256k1_context();
+
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_sign(ctx, &sig, msghash32, seckey32, nullptr, nullptr))
+        return {};
+
+    unsigned char der[72];
+    size_t der_len = sizeof(der);
+    if (!secp256k1_ecdsa_signature_serialize_der(ctx, der, &der_len, &sig))
+        return {};
+
+    return {der, der + der_len};
+}
+
+// HASH160 = RIPEMD160(SHA256(data)) — standard Bitcoin hash160.
+inline std::array<unsigned char, 20> hash160(
+    const unsigned char* data, size_t len)
+{
+    unsigned char sha256_buf[32];
+    CSHA256().Write(data, len).Finalize(sha256_buf);
+
+    std::array<unsigned char, 20> result;
+    CRIPEMD160().Write(sha256_buf, 32).Finalize(result.data());
+    return result;
+}
+
+// Serialize a ShareMessage to wire format.
+// Wire: [type:1][flags:1][timestamp:4 LE][payload_len:2 LE][payload:N]
+//       [signing_id:20][sig_len:1][signature:M]
+inline std::vector<unsigned char> pack_message(const ShareMessage& msg)
+{
+    std::vector<unsigned char> buf;
+    buf.reserve(8 + msg.payload.size() + 20 + 1 + msg.signature.size());
+
+    buf.push_back(msg.msg_type);
+    buf.push_back(msg.wire_flags);
+
+    uint32_t ts = msg.timestamp;
+    buf.push_back(static_cast<unsigned char>(ts));
+    buf.push_back(static_cast<unsigned char>(ts >> 8));
+    buf.push_back(static_cast<unsigned char>(ts >> 16));
+    buf.push_back(static_cast<unsigned char>(ts >> 24));
+
+    uint16_t pl = static_cast<uint16_t>(msg.payload.size());
+    buf.push_back(static_cast<unsigned char>(pl));
+    buf.push_back(static_cast<unsigned char>(pl >> 8));
+
+    buf.insert(buf.end(), msg.payload.begin(), msg.payload.end());
+    buf.insert(buf.end(), msg.signing_id.begin(), msg.signing_id.end());
+
+    buf.push_back(static_cast<unsigned char>(msg.signature.size()));
+    buf.insert(buf.end(), msg.signature.begin(), msg.signature.end());
+
+    return buf;
+}
+
+// Encrypt inner envelope data with an authority public key.
+// Returns encrypted blob: [0x01][nonce:16][mac:32][ciphertext:N]
+inline std::vector<unsigned char> encrypt_message_envelope(
+    const std::vector<unsigned char>& inner,
+    const AuthorityPubkey& authority_pubkey)
+{
+    // 16-byte random nonce
+    std::array<unsigned char, ENCRYPTION_NONCE_SIZE> nonce;
+    std::random_device rd;
+    for (size_t i = 0; i < ENCRYPTION_NONCE_SIZE; i += 4)
+    {
+        auto val = rd();
+        auto bytes = std::min<size_t>(4, ENCRYPTION_NONCE_SIZE - i);
+        std::memcpy(nonce.data() + i, &val, bytes);
+    }
+
+    // enc_key = HMAC-SHA256(authority_pubkey, nonce)
+    auto enc_key = hmac_sha256(
+        authority_pubkey.data(), authority_pubkey.size(),
+        nonce.data(), nonce.size());
+
+    // stream = counter-mode SHA256
+    std::vector<unsigned char> stream(inner.size());
+    generate_stream(enc_key.data(), stream.data(), inner.size());
+
+    // ciphertext = inner XOR stream
+    std::vector<unsigned char> ciphertext(inner.size());
+    for (size_t i = 0; i < inner.size(); ++i)
+        ciphertext[i] = inner[i] ^ stream[i];
+
+    // mac = HMAC-SHA256(enc_key, ciphertext)
+    auto mac = hmac_sha256(
+        enc_key.data(), enc_key.size(),
+        ciphertext.data(), ciphertext.size());
+
+    // Assemble: [0x01][nonce:16][mac:32][ciphertext]
+    std::vector<unsigned char> result;
+    result.reserve(1 + ENCRYPTION_NONCE_SIZE + ENCRYPTION_MAC_SIZE + ciphertext.size());
+    result.push_back(ENCRYPTED_ENVELOPE_VERSION);
+    result.insert(result.end(), nonce.begin(), nonce.end());
+    result.insert(result.end(), mac.begin(), mac.end());
+    result.insert(result.end(), ciphertext.begin(), ciphertext.end());
+    return result;
+}
+
+// Create encrypted message_data blob for embedding in a V36 share.
+//
+// seckey:           32-byte private key
+// authority_pubkey: 33-byte compressed pubkey corresponding to seckey
+// messages:         ShareMessages with msg_type, wire_flags, timestamp, payload set.
+//                   signature and signing_id are computed and filled in.
+//
+// Returns the complete encrypted message_data blob, or empty on failure.
+inline std::vector<unsigned char> create_message_data(
+    const unsigned char* seckey,
+    const AuthorityPubkey& authority_pubkey,
+    std::vector<ShareMessage>& messages)
+{
+    if (messages.empty() || messages.size() > MAX_MESSAGES_PER_SHARE)
+        return {};
+
+    // Compute signing_id = HASH160(authority_pubkey)
+    auto signing_id = hash160(authority_pubkey.data(), authority_pubkey.size());
+
+    // Sign each message and serialize
+    std::vector<unsigned char> packed_messages;
+    for (auto& msg : messages)
+    {
+        msg.signing_id = signing_id;
+
+        auto msg_hash = compute_message_hash(
+            msg.msg_type, msg.wire_flags, msg.timestamp,
+            msg.payload.data(), msg.payload.size());
+
+        msg.signature = ecdsa_sign(msg_hash.data(), seckey);
+        if (msg.signature.empty())
+            return {};
+
+        auto packed = pack_message(msg);
+        packed_messages.insert(packed_messages.end(), packed.begin(), packed.end());
+    }
+
+    // Inner envelope: [version=1][flags=0][msg_count][reserved=0] + packed_messages
+    std::vector<unsigned char> inner;
+    inner.reserve(4 + packed_messages.size());
+    inner.push_back(0x01);
+    inner.push_back(0x00);
+    inner.push_back(static_cast<unsigned char>(messages.size()));
+    inner.push_back(0x00);
+    inner.insert(inner.end(), packed_messages.begin(), packed_messages.end());
+
+    if (inner.size() > MAX_TOTAL_MESSAGE_BYTES)
+        return {};
+
+    return encrypt_message_envelope(inner, authority_pubkey);
 }
 
 } // namespace ltc

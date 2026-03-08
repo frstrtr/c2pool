@@ -7,11 +7,13 @@
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
+#include <sharechain/weights_skiplist.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -282,6 +284,7 @@ public:
             });
             bad_peer_addresses.insert(bad_peer);
 
+            invalidate_weight_caches(bad);
             chain.remove(bad);
             LOG_WARNING << "Removed bad share " << bad.GetHex().substr(0, 16) << "... from chain";
         }
@@ -603,7 +606,7 @@ public:
         // Get the full interval from start to end
         auto interval = chain.get_interval(start, end_hash);
 
-        // If total weight is within desired, return the full interval's weights
+        // If total weight is within desired, return the full interval's weights (O(1))
         if (interval.total_weight <= desired_weight)
         {
             return {
@@ -613,76 +616,10 @@ public:
             };
         }
 
-        // Walk the chain to find the cutoff point where total_weight >= desired_weight
-        // This is the slow path; walks share-by-share from start toward end
-        std::map<std::vector<unsigned char>, uint288> weights;
-        uint288 accum_total;
-        uint288 accum_donation;
-
-        auto walk_count = std::min(start_height, max_shares);
-        auto walk_view = chain.get_chain(start, walk_count);
-        for (auto& [hash, data] : walk_view)
-        {
-            if (hash == end_hash)
-                break;
-
-            auto* idx = data.index;
-            // Per-share values: from this single share's contribution
-            // We need per-share data, so reconstruct from the share
-            uint288 share_att;
-            uint32_t share_donation = 0;
-            std::vector<unsigned char> addr_bytes;
-
-            data.share.invoke([&](auto* obj) {
-                auto target = chain::bits_to_target(obj->m_bits);
-                share_att = chain::target_to_average_attempts(target);
-                share_donation = obj->m_donation;
-
-                // Use full scriptPubKey (25/22/23 bytes) to match
-                // generate_share_transaction's PPLNS key type
-                addr_bytes = get_share_script(obj);
-            });
-
-            uint288 share_total = share_att * 65535;
-            uint288 share_don = share_att * share_donation;
-
-            // Check if adding this share would exceed desired weight
-            if (accum_total + share_total > desired_weight)
-            {
-                // Proportional inclusion of the last share
-                auto remaining = desired_weight - accum_total;
-                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-
-                uint288 partial_addr;
-                if (!share_total.IsNull())
-                    partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
-
-                if (weights.contains(addr_bytes))
-                    weights[addr_bytes] += partial_addr;
-                else
-                    weights[addr_bytes] = partial_addr;
-
-                uint288 partial_donation;
-                if (!share_total.IsNull())
-                    partial_donation = remaining / 65535 * share_don / (share_total / 65535);
-
-                accum_donation += partial_donation;
-                accum_total = desired_weight;
-                break;
-            }
-
-            // Full inclusion
-            auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-            if (weights.contains(addr_bytes))
-                weights[addr_bytes] += share_addr_weight;
-            else
-                weights[addr_bytes] = share_addr_weight;
-
-            accum_total += share_total;
-            accum_donation += share_don;
-        }
-
-        return {weights, accum_total, accum_donation};
+        // Slow path: O(log n) skip list query
+        ensure_weights_skiplist();
+        auto result = m_weights_skiplist->query(start, max_shares, desired_weight);
+        return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
     // -- Expected payouts from PPLNS weights --
@@ -807,11 +744,7 @@ public:
 
     // -- Merged mining: per-chain PPLNS weights --
     // For a specific aux chain_id, walk the share chain and accumulate PPLNS
-    // weights for V36-signaling shares.  Shares with an explicit
-    // merged_addresses entry for chain_id use that per-chain script as key;
-    // V36 shares WITHOUT an explicit entry fall back to the parent chain
-    // address (matching p2pool-v36 MergedWeightsSkipList behavior).
-    // Pre-V36 shares (desired_version < 36) are excluded entirely.
+    // weights for V36-signaling shares.  Uses O(log n) skip list.
     CumulativeWeights get_merged_cumulative_weights(
         const uint256& start, int32_t max_shares,
         const uint288& desired_weight, uint32_t target_chain_id)
@@ -819,151 +752,23 @@ public:
         if (start.IsNull())
             return {};
 
-        auto [start_height, last] = chain.get_height_and_last(start);
-
-        std::map<std::vector<unsigned char>, uint288> weights;
-        uint288 accum_total;
-        uint288 accum_donation;
-
-        auto walk_count = std::min(start_height, max_shares);
-        auto walk_view = chain.get_chain(start, walk_count);
-
-        for (auto& [hash, data] : walk_view)
-        {
-            uint288 share_att;
-            uint32_t share_donation = 0;
-            std::vector<unsigned char> weight_key;
-            bool is_v36 = false;
-
-            data.share.invoke([&](auto* obj) {
-                // Skip pre-V36 shares: they don't participate in merged mining
-                if (obj->m_desired_version < 36)
-                    return;
-                is_v36 = true;
-
-                auto target = chain::bits_to_target(obj->m_bits);
-                share_att = chain::target_to_average_attempts(target);
-                share_donation = obj->m_donation;
-
-                // Try explicit merged_addresses entry for this chain_id
-                if constexpr (requires { obj->m_merged_addresses; })
-                {
-                    for (const auto& entry : obj->m_merged_addresses)
-                    {
-                        if (entry.m_chain_id == target_chain_id)
-                        {
-                            weight_key = entry.m_script.m_data;
-                            return;
-                        }
-                    }
-                }
-                // Fallback: use parent chain address (auto-converted downstream)
-                weight_key = get_share_script(obj);
-            });
-
-            if (!is_v36)
-                continue;
-
-            uint288 share_total = share_att * 65535;
-            uint288 share_don   = share_att * share_donation;
-
-            if (accum_total + share_total > desired_weight)
-            {
-                auto remaining = desired_weight - accum_total;
-                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-
-                uint288 partial_addr;
-                if (!share_total.IsNull())
-                    partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
-
-                weights[weight_key] += partial_addr;
-
-                uint288 partial_donation;
-                if (!share_total.IsNull())
-                    partial_donation = remaining / 65535 * share_don / (share_total / 65535);
-
-                accum_donation += partial_donation;
-                accum_total = desired_weight;
-                break;
-            }
-
-            auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-            weights[weight_key] += share_addr_weight;
-            accum_total += share_total;
-            accum_donation += share_don;
-        }
-
-        return {weights, accum_total, accum_donation};
+        auto& sl = ensure_merged_skiplist(target_chain_id);
+        auto result = sl.query(start, max_shares, desired_weight);
+        return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
     // -- V36-only unified merged weights (no chain_id) --
-    // Walks the share chain and accumulates PPLNS weights for V36-signaling
-    // shares ONLY, keyed by parent chain address.  Pre-V36 shares are
-    // excluded.  This mirrors p2pool-v36's get_v36_merged_weights(chain_id=None)
-    // and is used to compute the deterministic merged_payout_hash.
+    // Accumulates PPLNS weights for V36-signaling shares ONLY, keyed by
+    // parent chain address.  Uses O(log n) skip list.
     CumulativeWeights get_v36_merged_weights(
         const uint256& start, int32_t max_shares, const uint288& desired_weight)
     {
         if (start.IsNull())
             return {};
 
-        auto [start_height, last] = chain.get_height_and_last(start);
-
-        std::map<std::vector<unsigned char>, uint288> weights;
-        uint288 accum_total;
-        uint288 accum_donation;
-
-        auto walk_count = std::min(start_height, max_shares);
-        auto walk_view = chain.get_chain(start, walk_count);
-
-        for (auto& [hash, data] : walk_view)
-        {
-            uint288 share_att;
-            uint32_t share_donation = 0;
-            std::vector<unsigned char> addr_bytes;
-            bool is_v36 = false;
-
-            data.share.invoke([&](auto* obj) {
-                if (obj->m_desired_version < 36)
-                    return;
-                is_v36 = true;
-                auto target = chain::bits_to_target(obj->m_bits);
-                share_att = chain::target_to_average_attempts(target);
-                share_donation = obj->m_donation;
-                addr_bytes = get_share_script(obj);
-            });
-
-            if (!is_v36)
-                continue;
-
-            uint288 share_total = share_att * 65535;
-            uint288 share_don   = share_att * share_donation;
-
-            if (accum_total + share_total > desired_weight)
-            {
-                auto remaining = desired_weight - accum_total;
-                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-
-                uint288 partial_addr;
-                if (!share_total.IsNull())
-                    partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
-                weights[addr_bytes] += partial_addr;
-
-                uint288 partial_donation;
-                if (!share_total.IsNull())
-                    partial_donation = remaining / 65535 * share_don / (share_total / 65535);
-                accum_donation += partial_donation;
-                accum_total = desired_weight;
-                break;
-            }
-
-            auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-            weights[addr_bytes] += share_addr_weight;
-            accum_total += share_total;
-            accum_donation += share_don;
-        }
-
-        return {weights, accum_total, accum_donation};
+        ensure_v36_skiplist();
+        auto result = m_v36_weights_skiplist->query(start, max_shares, desired_weight);
+        return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
     // -- compute_merged_payout_hash --
@@ -1095,6 +900,118 @@ public:
 
 private:
     std::vector<stale_callback_t> m_stale_callbacks;
+
+    // -- Skip list caches for O(log n) weight queries --
+    std::optional<chain::WeightsSkipList> m_weights_skiplist;
+    std::optional<chain::WeightsSkipList> m_v36_weights_skiplist;
+    std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
+
+    // Previous-share lambda shared by all skip lists
+    auto make_previous_fn()
+    {
+        return [this](const uint256& hash) -> uint256 {
+            if (!chain.contains(hash)) return uint256{};
+            return chain.get_index(hash)->tail;
+        };
+    }
+
+    void ensure_weights_skiplist()
+    {
+        if (m_weights_skiplist)
+            return;
+        m_weights_skiplist.emplace(
+            [this](const uint256& hash) -> chain::WeightsDelta {
+                chain::WeightsDelta delta;
+                if (!chain.contains(hash)) return delta;
+                delta.share_count = 1;
+                chain.get_share(hash).invoke([&](auto* obj) {
+                    auto target = chain::bits_to_target(obj->m_bits);
+                    auto att = chain::target_to_average_attempts(target);
+                    delta.total_weight = att * 65535;
+                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+                    auto addr_bytes = get_share_script(obj);
+                    delta.weights[addr_bytes] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                });
+                return delta;
+            },
+            make_previous_fn()
+        );
+    }
+
+    void ensure_v36_skiplist()
+    {
+        if (m_v36_weights_skiplist)
+            return;
+        m_v36_weights_skiplist.emplace(
+            [this](const uint256& hash) -> chain::WeightsDelta {
+                chain::WeightsDelta delta;
+                if (!chain.contains(hash)) return delta;
+                delta.share_count = 1;
+                chain.get_share(hash).invoke([&](auto* obj) {
+                    if (obj->m_desired_version < 36) return;
+                    auto target = chain::bits_to_target(obj->m_bits);
+                    auto att = chain::target_to_average_attempts(target);
+                    delta.total_weight = att * 65535;
+                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+                    auto addr_bytes = get_share_script(obj);
+                    delta.weights[addr_bytes] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                });
+                return delta;
+            },
+            make_previous_fn()
+        );
+    }
+
+    chain::WeightsSkipList& ensure_merged_skiplist(uint32_t chain_id)
+    {
+        auto it = m_merged_skiplists.find(chain_id);
+        if (it != m_merged_skiplists.end())
+            return it->second;
+
+        auto [new_it, _] = m_merged_skiplists.emplace(
+            chain_id,
+            chain::WeightsSkipList(
+                [this, chain_id](const uint256& hash) -> chain::WeightsDelta {
+                    chain::WeightsDelta delta;
+                    if (!chain.contains(hash)) return delta;
+                    delta.share_count = 1;
+                    chain.get_share(hash).invoke([&](auto* obj) {
+                        if (obj->m_desired_version < 36) return;
+                        auto target = chain::bits_to_target(obj->m_bits);
+                        auto att = chain::target_to_average_attempts(target);
+                        delta.total_weight = att * 65535;
+                        delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+
+                        std::vector<unsigned char> weight_key;
+                        if constexpr (requires { obj->m_merged_addresses; })
+                        {
+                            for (const auto& entry : obj->m_merged_addresses)
+                            {
+                                if (entry.m_chain_id == chain_id)
+                                {
+                                    weight_key = entry.m_script.m_data;
+                                    break;
+                                }
+                            }
+                        }
+                        if (weight_key.empty())
+                            weight_key = get_share_script(obj);
+                        delta.weights[weight_key] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    });
+                    return delta;
+                },
+                make_previous_fn()
+            )
+        );
+        return new_it->second;
+    }
+
+    void invalidate_weight_caches(const uint256& hash)
+    {
+        if (m_weights_skiplist) m_weights_skiplist->forget(hash);
+        if (m_v36_weights_skiplist) m_v36_weights_skiplist->forget(hash);
+        for (auto& [_, sl] : m_merged_skiplists) sl.forget(hash);
+    }
 };
 
 } // namespace ltc
