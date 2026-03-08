@@ -1229,6 +1229,15 @@ uint256 create_local_share(
     share.m_nonce      = 0; // share commitment nonce (not block nonce)
     share.m_merged_addresses = merged_addrs;
 
+    // Compute merged_payout_hash: deterministic hash of V36-only PPLNS
+    // weight distribution so peers can verify merged mining payouts.
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+    {
+        auto block_target = chain::bits_to_target(min_header.m_bits);
+        share.m_merged_payout_hash = tracker.compute_merged_payout_hash(
+            prev_share, block_target);
+    }
+
     // Payout identity
     if (payout_script.size() >= 20) {
         // Extract hash160 from P2PKH script: 76 a9 14 <hash160> 88 ac

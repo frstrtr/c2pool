@@ -657,12 +657,11 @@ public:
 
     // -- Merged mining: per-chain PPLNS weights --
     // For a specific aux chain_id, walk the share chain and accumulate PPLNS
-    // weights only for shares that include a merged_addresses entry for that
-    // chain.  The weight keys are the per-chain payout scripts from
-    // MergedAddressEntry, NOT the primary chain address.
-    //
-    // Shares that did not opt into this aux chain (no matching chain_id in
-    // m_merged_addresses) are skipped entirely.
+    // weights for V36-signaling shares.  Shares with an explicit
+    // merged_addresses entry for chain_id use that per-chain script as key;
+    // V36 shares WITHOUT an explicit entry fall back to the parent chain
+    // address (matching p2pool-v36 MergedWeightsSkipList behavior).
+    // Pre-V36 shares (desired_version < 36) are excluded entirely.
     CumulativeWeights get_merged_cumulative_weights(
         const uint256& start, int32_t max_shares,
         const uint288& desired_weight, uint32_t target_chain_id)
@@ -683,31 +682,36 @@ public:
         {
             uint288 share_att;
             uint32_t share_donation = 0;
-            std::vector<unsigned char> merged_script;
-            bool has_chain = false;
+            std::vector<unsigned char> weight_key;
+            bool is_v36 = false;
 
             data.share.invoke([&](auto* obj) {
+                // Skip pre-V36 shares: they don't participate in merged mining
+                if (obj->m_desired_version < 36)
+                    return;
+                is_v36 = true;
+
+                auto target = chain::bits_to_target(obj->m_bits);
+                share_att = chain::target_to_average_attempts(target);
+                share_donation = obj->m_donation;
+
+                // Try explicit merged_addresses entry for this chain_id
                 if constexpr (requires { obj->m_merged_addresses; })
                 {
                     for (const auto& entry : obj->m_merged_addresses)
                     {
                         if (entry.m_chain_id == target_chain_id)
                         {
-                            merged_script = entry.m_script.m_data;
-                            has_chain = true;
-                            break;
+                            weight_key = entry.m_script.m_data;
+                            return;
                         }
                     }
                 }
-                if (has_chain)
-                {
-                    auto target = chain::bits_to_target(obj->m_bits);
-                    share_att = chain::target_to_average_attempts(target);
-                    share_donation = obj->m_donation;
-                }
+                // Fallback: use parent chain address (auto-converted downstream)
+                weight_key = get_share_script(obj);
             });
 
-            if (!has_chain)
+            if (!is_v36)
                 continue;
 
             uint288 share_total = share_att * 65535;
@@ -722,7 +726,7 @@ public:
                 if (!share_total.IsNull())
                     partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
 
-                weights[merged_script] += partial_addr;
+                weights[weight_key] += partial_addr;
 
                 uint288 partial_donation;
                 if (!share_total.IsNull())
@@ -734,12 +738,149 @@ public:
             }
 
             auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
-            weights[merged_script] += share_addr_weight;
+            weights[weight_key] += share_addr_weight;
             accum_total += share_total;
             accum_donation += share_don;
         }
 
         return {weights, accum_total, accum_donation};
+    }
+
+    // -- V36-only unified merged weights (no chain_id) --
+    // Walks the share chain and accumulates PPLNS weights for V36-signaling
+    // shares ONLY, keyed by parent chain address.  Pre-V36 shares are
+    // excluded.  This mirrors p2pool-v36's get_v36_merged_weights(chain_id=None)
+    // and is used to compute the deterministic merged_payout_hash.
+    CumulativeWeights get_v36_merged_weights(
+        const uint256& start, int32_t max_shares, const uint288& desired_weight)
+    {
+        if (start.IsNull())
+            return {};
+
+        auto [start_height, last] = chain.get_height_and_last(start);
+
+        std::map<std::vector<unsigned char>, uint288> weights;
+        uint288 accum_total;
+        uint288 accum_donation;
+
+        auto walk_count = std::min(start_height, max_shares);
+        auto walk_view = chain.get_chain(start, walk_count);
+
+        for (auto& [hash, data] : walk_view)
+        {
+            uint288 share_att;
+            uint32_t share_donation = 0;
+            std::vector<unsigned char> addr_bytes;
+            bool is_v36 = false;
+
+            data.share.invoke([&](auto* obj) {
+                if (obj->m_desired_version < 36)
+                    return;
+                is_v36 = true;
+                auto target = chain::bits_to_target(obj->m_bits);
+                share_att = chain::target_to_average_attempts(target);
+                share_donation = obj->m_donation;
+                addr_bytes = get_share_script(obj);
+            });
+
+            if (!is_v36)
+                continue;
+
+            uint288 share_total = share_att * 65535;
+            uint288 share_don   = share_att * share_donation;
+
+            if (accum_total + share_total > desired_weight)
+            {
+                auto remaining = desired_weight - accum_total;
+                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
+
+                uint288 partial_addr;
+                if (!share_total.IsNull())
+                    partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
+                weights[addr_bytes] += partial_addr;
+
+                uint288 partial_donation;
+                if (!share_total.IsNull())
+                    partial_donation = remaining / 65535 * share_don / (share_total / 65535);
+                accum_donation += partial_donation;
+                accum_total = desired_weight;
+                break;
+            }
+
+            auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_donation);
+            weights[addr_bytes] += share_addr_weight;
+            accum_total += share_total;
+            accum_donation += share_don;
+        }
+
+        return {weights, accum_total, accum_donation};
+    }
+
+    // -- compute_merged_payout_hash --
+    // Deterministic hash of V36-only PPLNS weight distribution.
+    // Committed into V36 shares so peers can verify that the share creator's
+    // merged mining payouts match the expected distribution.
+    //
+    // Format: sorted "addr_hex:weight|...|T:total|D:donation" → SHA256d
+    // Returns zero uint256 if no V36 shares in window.
+    //
+    // Python ref: p2pool/data.py compute_merged_payout_hash()
+    uint256 compute_merged_payout_hash(
+        const uint256& prev_share_hash, const uint256& block_target)
+    {
+        if (prev_share_hash.IsNull())
+            return uint256{};
+
+        auto height = chain.get_height(prev_share_hash);
+        if (height == 0)
+            return uint256{};
+
+        auto max_weight = chain::target_to_average_attempts(block_target)
+                          * PoolConfig::SHARE_PERIOD * 65535;
+        auto chain_len = std::min(height,
+                                  static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+
+        auto [weights, total_weight, donation_weight] =
+            get_v36_merged_weights(prev_share_hash, chain_len, max_weight);
+
+        if (weights.empty() || total_weight.IsNull())
+            return uint256{};
+
+        // Deterministic serialization: sorted by hex-encoded address key
+        // Format matches p2pool-v36: "hex_addr:weight|...|T:total|D:donation"
+        std::map<std::string, uint288> sorted_by_hex;
+        for (const auto& [script, w] : weights)
+        {
+            std::string hex;
+            hex.reserve(script.size() * 2);
+            for (unsigned char c : script)
+            {
+                static const char digits[] = "0123456789abcdef";
+                hex.push_back(digits[c >> 4]);
+                hex.push_back(digits[c & 0xf]);
+            }
+            sorted_by_hex[hex] += w;
+        }
+
+        std::string payload;
+        for (const auto& [hex_key, w] : sorted_by_hex)
+        {
+            if (!payload.empty())
+                payload.push_back('|');
+            payload += hex_key;
+            payload.push_back(':');
+            payload += w.GetHex();
+        }
+        // Append total and donation
+        payload += "|T:";
+        payload += total_weight.GetHex();
+        payload += "|D:";
+        payload += donation_weight.GetHex();
+
+        // SHA256d (hash256 in p2pool)
+        auto span = std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(payload.data()), payload.size());
+        return Hash(span);
     }
 
     // -- Merged mining: per-chain expected payouts --
