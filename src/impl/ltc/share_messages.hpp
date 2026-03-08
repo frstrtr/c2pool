@@ -10,7 +10,7 @@
 //   3. If decryption fails (MAC mismatch) → REJECT share
 //   4. Parse inner envelope: version, flags, msg_count, messages
 //   5. If inner envelope is malformed or empty → REJECT share
-//   6. TODO: Verify ECDSA signatures (requires secp256k1 library)
+//   6. Verify ECDSA signatures via libsecp256k1
 
 #pragma once
 
@@ -23,6 +23,7 @@
 
 #include <btclibs/crypto/hmac_sha256.h>
 #include <btclibs/crypto/sha256.h>
+#include <secp256k1.h>
 
 namespace ltc {
 
@@ -153,6 +154,16 @@ struct ShareMessage
 };
 
 // ============================================================================
+// secp256k1 context (singleton, thread-safe after init)
+// ============================================================================
+
+inline const secp256k1_context* get_secp256k1_context()
+{
+    static const secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    return ctx;
+}
+
+// ============================================================================
 // Crypto helpers
 // ============================================================================
 
@@ -186,6 +197,50 @@ inline void generate_stream(const unsigned char* enc_key,
         produced += copy;
         ++counter;
     }
+}
+
+// Double-SHA256 of message content for ECDSA signing/verification.
+// Matches Python: SHA256(SHA256(pack('<BBI', msg_type, wire_flags, timestamp) + payload))
+inline std::array<unsigned char, 32> compute_message_hash(
+    uint8_t msg_type, uint8_t wire_flags, uint32_t timestamp,
+    const unsigned char* payload, size_t payload_len)
+{
+    unsigned char header[6];
+    header[0] = msg_type;
+    header[1] = wire_flags;
+    std::memcpy(header + 2, &timestamp, 4); // LE
+
+    unsigned char first[32];
+    CSHA256().Write(header, 6).Write(payload, payload_len).Finalize(first);
+
+    std::array<unsigned char, 32> result;
+    CSHA256().Write(first, 32).Finalize(result.data());
+    return result;
+}
+
+// Verify ECDSA signature against a compressed secp256k1 public key.
+// pubkey_compressed: 33 bytes (0x02/0x03 prefix)
+// msghash32: 32-byte double-SHA256 (from compute_message_hash)
+// sig_der: DER-encoded ECDSA signature
+// Returns true if signature is valid.
+inline bool ecdsa_verify(const unsigned char* pubkey_compressed, size_t pubkey_len,
+                         const unsigned char* msghash32,
+                         const unsigned char* sig_der, size_t sig_len)
+{
+    const auto* ctx = get_secp256k1_context();
+
+    secp256k1_pubkey pubkey;
+    if (!secp256k1_ec_pubkey_parse(ctx, &pubkey, pubkey_compressed, pubkey_len))
+        return false;
+
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_signature_parse_der(ctx, &sig, sig_der, sig_len))
+        return false;
+
+    // Normalize to lower-S form (secp256k1_ecdsa_verify requires this)
+    secp256k1_ecdsa_signature_normalize(ctx, &sig, &sig);
+
+    return secp256k1_ecdsa_verify(ctx, &sig, msghash32, &pubkey) == 1;
 }
 
 // ============================================================================
@@ -333,17 +388,23 @@ inline std::string validate_message_data(const std::vector<unsigned char>& messa
     if (result.messages.empty())
         return "message_data decrypted but contains no valid messages";
 
-    // Verify each message has a signature
-    // NOTE: Full ECDSA verification requires secp256k1 library (not yet integrated).
-    // The MAC-based decryption already proves authority created the envelope.
-    // Signature presence check is defense-in-depth.
+    // Verify each message has a valid ECDSA signature from the authority key
+    // that encrypted the envelope. This is defense-in-depth on top of the
+    // MAC-based decryption (which already proves authority created the envelope).
     for (const auto& msg : result.messages)
     {
         if (!msg.has_signature() || msg.signature.empty())
             return "message contains unsigned message (type 0x" +
                    std::to_string(msg.msg_type) + ") inside encrypted envelope";
-        // TODO: ECDSA verify(authority_pubkey, message_hash, signature)
-        // once secp256k1 is linked.
+
+        auto msg_hash = compute_message_hash(
+            msg.msg_type, msg.wire_flags, msg.timestamp,
+            msg.payload.data(), msg.payload.size());
+
+        if (!ecdsa_verify(result.authority_pubkey->data(), result.authority_pubkey->size(),
+                          msg_hash.data(), msg.signature.data(), msg.signature.size()))
+            return "message ECDSA signature verification failed (type 0x" +
+                   std::to_string(msg.msg_type) + ")";
     }
 
     return {};  // All checks passed

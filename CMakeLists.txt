@@ -35,6 +35,15 @@ endif()
 message(STATUS "LevelDB found: ${LEVELDB_LIBRARIES}")
 message(STATUS "LevelDB includes: ${LEVELDB_INCLUDE_DIRS}")
 
+# Find libsecp256k1 for ECDSA signature verification
+find_library(SECP256K1_LIBRARIES secp256k1)
+find_path(SECP256K1_INCLUDE_DIRS secp256k1.h)
+if(NOT SECP256K1_LIBRARIES OR NOT SECP256K1_INCLUDE_DIRS)
+    message(FATAL_ERROR "libsecp256k1 not found. Please install libsecp256k1-dev.")
+endif()
+message(STATUS "secp256k1 found: ${SECP256K1_LIBRARIES}")
+message(STATUS "secp256k1 includes: ${SECP256K1_INCLUDE_DIRS}")
+
 # Enable testing only if GTest is found
 if(GTest_FOUND OR GTEST_FOUND)
     enable_testing()
