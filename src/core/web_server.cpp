@@ -1330,7 +1330,8 @@ nlohmann::json MiningInterface::mining_authorize(const std::string& username, co
     return true;
 }
 
-nlohmann::json MiningInterface::mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id)
+nlohmann::json MiningInterface::mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id,
+    const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses)
 {
     LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id 
              << " - nonce: " << nonce << ", extranonce2: " << extranonce2 << ", ntime: " << ntime;
@@ -1503,6 +1504,26 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         if (m_payout_manager) {
             m_payout_manager->record_share_contribution(share_address, share_difficulty);
             LOG_DEBUG_POOL << "Share contribution recorded: " << share_address << " (difficulty: " << share_difficulty << ")";
+        }
+
+        // Create a proper share in the tracker with payout_script + merged_addresses.
+        // The payout_script is built from share_address (which may have been
+        // probabilistically replaced with the node operator's address for the
+        // primary chain node fee).  Merged addresses are passed through
+        // unmodified — Python p2pool does NOT apply node fee to merged chains.
+        if (m_create_share_fn) {
+            // Build P2PKH script from share_address (40-char hex hash160)
+            std::vector<unsigned char> payout_script;
+            if (share_address.size() == 40) {
+                payout_script = {0x76, 0xa9, 0x14};
+                for (size_t i = 0; i < share_address.size(); i += 2)
+                    payout_script.push_back(static_cast<unsigned char>(
+                        std::stoul(share_address.substr(i, 2), nullptr, 16)));
+                payout_script.push_back(0x88);
+                payout_script.push_back(0xac);
+            }
+            if (!payout_script.empty())
+                m_create_share_fn(payout_script, merged_addresses);
         }
         
         // Attempt block construction + merkle validation + submission.
@@ -2282,8 +2303,22 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                  << old_difficulty << " -> " << new_difficulty;
     }
     
-    // Forward the accepted share to MiningInterface for block-level checking
-    mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce);
+    // Forward the accepted share to MiningInterface for block-level checking.
+    // Convert per-chain merged addresses (Base58Check strings) to scriptPubKeys.
+    std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
+    for (const auto& [chain_id, addr] : merged_addresses_) {
+        auto h160 = base58check_to_hash160(addr);
+        if (h160.size() == 40) {
+            std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+            for (size_t i = 0; i < h160.size(); i += 2)
+                script.push_back(static_cast<unsigned char>(
+                    std::stoul(h160.substr(i, 2), nullptr, 16)));
+            script.push_back(0x88);
+            script.push_back(0xac);
+            merged_scripts[chain_id] = std::move(script);
+        }
+    }
+    mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts);
     
     LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_

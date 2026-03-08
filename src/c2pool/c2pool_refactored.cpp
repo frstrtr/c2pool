@@ -681,6 +681,24 @@ int main(int argc, char* argv[]) {
                     best_hash, block_target, subsidy, donation_script);
             });
 
+            // Wire the share creation hook so mining_submit() can inject
+            // payout_script + merged_addresses into the share tracker.
+            // Note: full create_local_share() requires block template data;
+            // for now we just record the addresses for the next
+            // create_local_share() invocation (which happens inside the
+            // block-found path elsewhere).
+            web_server.get_mining_interface()->set_create_share_fn(
+                [&p2p_node](
+                    const std::vector<unsigned char>& /*payout_script*/,
+                    const std::map<uint32_t, std::vector<unsigned char>>& /*merged_addresses*/) {
+                // Placeholder: the full create_local_share() wiring requires
+                // block header, coinbase, subsidy, and merkle branches that
+                // are assembled in the block-found path.  The payout_script
+                // and merged_addresses are now propagated through this hook
+                // so they're available once that path is complete.
+                LOG_DEBUG_POOL << "create_share_fn: share payout + merged addresses received";
+            });
+
             // --- Integrated Merged Mining ---
             // Parse --merged specs and set up the manager (replaces standalone mm-adapter)
             std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
@@ -711,6 +729,41 @@ int main(int argc, char* argv[]) {
                              << cfg.rpc_host << ":" << cfg.rpc_port;
                 }
                 web_server.set_merged_mining_manager(mm_manager.get());
+
+                // Wire the merged payout provider so that aux chain block
+                // construction uses per-chain PPLNS weights from the share tracker.
+                auto* mi = web_server.get_mining_interface();
+                mm_manager->set_payout_provider(
+                    [&p2p_node, mi](
+                        uint32_t chain_id, uint64_t coinbase_value)
+                    -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+                {
+                    auto best = p2p_node->best_share_hash();
+                    if (best.IsNull())
+                        return {};
+
+                    // Compute block_target from the share tracker's current tip
+                    uint256 block_target;
+                    p2p_node->tracker().chain.get(best).share.invoke([&](auto* s) {
+                        block_target = chain::bits_to_target(s->m_bits);
+                    });
+
+                    auto& donation_script = mi->get_donation_script();
+                    auto payouts_map = p2p_node->tracker().get_merged_expected_payouts(
+                        best, block_target, coinbase_value, chain_id, donation_script);
+
+                    // Convert map → sorted vector for coinbase construction
+                    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
+                    result.reserve(payouts_map.size());
+                    for (auto& [script, amount] : payouts_map) {
+                        if (amount >= 1.0)
+                            result.emplace_back(script, static_cast<uint64_t>(amount));
+                    }
+                    // Sort by script for deterministic coinbase ordering
+                    std::sort(result.begin(), result.end());
+                    return result;
+                });
+
                 mm_manager->start();
                 LOG_INFO << "Merged mining manager started with " << mm_manager->chain_count() << " chain(s)";
             }

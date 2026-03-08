@@ -122,7 +122,8 @@ public:
     // Stratum-style methods (for advanced miners)
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
-    nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "");
+    nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "",
+        const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses = {});
 
     // Enhanced coinbase and validation methods
     nlohmann::json validate_address(const std::string& address);
@@ -161,6 +162,14 @@ public:
         uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
     void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = std::move(fn); }
 
+    // Hook: called by mining_submit() pool path to create a share in the tracker.
+    // Parameters: payout_script, merged_addresses (chain_id → scriptPubKey)
+    // The callback should invoke create_local_share() on the ShareTracker.
+    using create_share_fn_t = std::function<void(
+        const std::vector<unsigned char>& payout_script,
+        const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses)>;
+    void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
+
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
     
@@ -184,6 +193,7 @@ public:
     void set_donation_script(const std::vector<unsigned char>& script) {
         m_donation_script = script;
     }
+    const std::vector<unsigned char>& get_donation_script() const { return m_donation_script; }
     // String-based overload for donation script
     void set_donation_script_from_address(const std::string& address);
 
@@ -272,6 +282,9 @@ private:
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;
+
+    // Share creation hook
+    create_share_fn_t m_create_share_fn;
 
     // Segwit activation (from template rules)
     bool m_segwit_active{false};
