@@ -347,6 +347,11 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
 uint256 NodeImpl::best_share_hash()
 {
+    // Return the cached result from the most recent think() cycle.
+    // Falls back to O(heads) scan only when think() hasn't run yet.
+    if (!m_best_share_hash.IsNull())
+        return m_best_share_hash;
+
     if (!m_chain || m_chain->size() == 0)
         return uint256::ZERO;
 
@@ -559,6 +564,7 @@ void NodeImpl::run_think()
 
     // Update best share
     if (!result.best.IsNull()) {
+        m_best_share_hash = result.best;
         LOG_DEBUG_POOL << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
     }
 

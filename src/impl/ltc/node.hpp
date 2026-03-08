@@ -172,6 +172,9 @@ protected:
 
     // Block depth function for chain scoring (set via set_block_rel_height_fn)
     block_rel_height_fn_t m_block_rel_height_fn;
+
+    // Cached best share hash from the most recent think() cycle
+    uint256 m_best_share_hash;
 };
 
 struct HandleSharesData
