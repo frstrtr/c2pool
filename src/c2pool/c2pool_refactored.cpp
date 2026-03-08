@@ -165,8 +165,9 @@ void print_help() {
     std::cout << "MERGED MINING:\n";
     std::cout << "  --merged SPEC             Add aux chain for merged mining. SPEC format:\n";
     std::cout << "                            SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
-    std::cout << "                            Example: DOGE:98:127.0.0.1:22555:user:pass:22556\n";
-    std::cout << "                            P2P_PORT is optional (for fast block relay)\n";
+    std::cout << "                            Example: DOGE:98:192.168.86.29:22555:user:pass\n";
+    std::cout << "                            P2P_PORT auto-detected from SYMBOL (DOGE=22556, etc)\n";
+    std::cout << "                            HOST used for both RPC and P2P connections\n";
     std::cout << "                            Can be specified multiple times\n\n";
     std::cout << "COIN DAEMON RPC (for live block templates):\n";
     std::cout << "  --rpchost HOST            Coin daemon RPC host (default: 127.0.0.1)\n";
@@ -174,7 +175,8 @@ void print_help() {
     std::cout << "  --rpcuser USER            Coin daemon RPC username (default: user)\n";
     std::cout << "  --rpcpassword PASS        Coin daemon RPC password (default: password)\n\n";
     std::cout << "COIN DAEMON P2P BROADCASTER (fast block relay):\n";
-    std::cout << "  --coind-p2p-port PORT     Coin daemon P2P port (e.g. 9333 LTC / 22556 DOGE)\n";
+    std::cout << "  --coind-p2p-port PORT     Coin daemon P2P port (auto-detected from chain type;\n";
+    std::cout << "                            set 0 to disable; LTC=9333, DOGE=22556, BTC=8333)\n";
     std::cout << "  --coind-p2p-address HOST  Coin daemon P2P address (default: same as --rpchost)\n\n";
     
     std::cout << "BLOCKCHAIN SUPPORT:\n";
@@ -272,8 +274,8 @@ int main(int argc, char* argv[]) {
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
 
     // Coin daemon P2P connection (for fast block relay alongside RPC)
-    std::string coind_p2p_address;   // e.g. "127.0.0.1" — defaults to rpc_host
-    int         coind_p2p_port = 0;  // 0 = disabled; e.g. 9333 for LTC mainnet
+    std::string coind_p2p_address;   // defaults to rpc_host (same machine as RPC)
+    int         coind_p2p_port = -1; // -1 = auto-detect from chain; 0 = disabled
 
     // Merged mining (auxiliary chain) configuration
     // Multiple --merged flags can be given; each specifies:
@@ -299,6 +301,23 @@ int main(int argc, char* argv[]) {
         LOG_ERROR << "Unknown blockchain: " << blockchain_str;
         LOG_INFO << "Supported blockchains: ltc, btc, eth, xmr, zec, doge";
         throw std::invalid_argument("Unknown blockchain type");
+    };
+
+    // Well-known P2P ports for coin daemons (same machine as RPC by default)
+    auto get_coin_p2p_port = [](const std::string& symbol, bool testnet) -> int {
+        if (symbol == "LTC" || symbol == "ltc") return testnet ? 19335 : 9333;
+        if (symbol == "DOGE" || symbol == "doge") return testnet ? 44556 : 22556;
+        if (symbol == "BTC" || symbol == "btc") return testnet ? 18333 : 8333;
+        if (symbol == "DGB" || symbol == "dgb") return testnet ? 12026 : 12024;
+        return 0;  // unknown chain — caller must specify explicitly
+    };
+    auto blockchain_to_symbol = [](Blockchain b) -> std::string {
+        switch (b) {
+            case Blockchain::LITECOIN: return "LTC";
+            case Blockchain::BITCOIN:  return "BTC";
+            case Blockchain::DOGECOIN: return "DOGE";
+            default: return "";
+        }
     };
     
     // Parse command line arguments
@@ -480,6 +499,12 @@ int main(int argc, char* argv[]) {
                     merged_chain_specs.push_back(item.as<std::string>());
             }
 
+            // Coin daemon P2P broadcaster
+            if (!cli_explicit.count("coind_p2p_port") && cfg["coind_p2p_port"])
+                coind_p2p_port = cfg["coind_p2p_port"].as<int>();
+            if (!cli_explicit.count("coind_p2p_address") && cfg["coind_p2p_address"])
+                coind_p2p_address = cfg["coind_p2p_address"].as<std::string>();
+
             // Redistribute mode
             if (!cli_explicit.count("redistribute") && cfg["redistribute"])
                 redistribute_mode_str = cfg["redistribute"].as<std::string>();
@@ -625,8 +650,13 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
             // --- Parent chain P2P broadcaster (fast block relay) ---
-            // If --coind-p2p-port is provided, connect to the coin daemon P2P
-            // for direct block propagation (faster than RPC-only submitblock).
+            // Auto-detect P2P port from chain type if not explicitly set.
+            // P2P address defaults to the same host as RPC (coin daemon).
+            if (coind_p2p_port == -1) {
+                coind_p2p_port = get_coin_p2p_port(blockchain_to_symbol(blockchain), settings->m_testnet);
+                if (coind_p2p_port > 0)
+                    LOG_INFO << "Auto-detected parent coin P2P port: " << coind_p2p_port;
+            }
             std::unique_ptr<ltc::coin::p2p::NodeP2P<ltc::Config>> coin_p2p;
             if (coind_p2p_port > 0) {
                 std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
@@ -1011,11 +1041,17 @@ int main(int argc, char* argv[]) {
                     cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;
 
-                    // Optional P2P port (7th field)
+                    // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {
                         cfg.p2p_port = static_cast<uint16_t>(std::stoul(parts[6]));
-                        cfg.p2p_address = cfg.rpc_host;  // default to same host as RPC
+                    } else {
+                        int auto_port = get_coin_p2p_port(cfg.symbol, settings->m_testnet);
+                        if (auto_port > 0) {
+                            cfg.p2p_port = static_cast<uint16_t>(auto_port);
+                            LOG_INFO << "Auto-detected P2P port for " << cfg.symbol << ": " << auto_port;
+                        }
                     }
+                    cfg.p2p_address = cfg.rpc_host;  // same host as RPC daemon
 
                     mm_manager->add_chain(cfg);
                     LOG_INFO << "Merged mining: added " << cfg.symbol
