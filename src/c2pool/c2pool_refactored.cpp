@@ -140,89 +140,79 @@ void print_help() {
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
     std::cout << "  --integrated              Enable integrated mode (full mining pool)\n";
     std::cout << "  --sharechain              Enable sharechain mode (P2P node)\n";
-    std::cout << "  --blockchain CHAIN        Blockchain type: ltc, btc, eth, xmr, zec, doge\n";
-    std::cout << "                            (default: ltc - Litecoin)\n";
+    std::cout << "  --net CHAIN               Blockchain network: litecoin, bitcoin, dogecoin\n";
+    std::cout << "                            (alias: --blockchain; default: litecoin)\n";
     std::cout << "  --config FILE             Load configuration from YAML file\n";
-    std::cout << "  --solo-address ADDRESS    Solo mining payout address (for solo mode)\n\n";
+    std::cout << "  --address ADDRESS         Payout address (alias: --solo-address)\n\n";
     
     std::cout << "PAYOUT & FEE CONFIGURATION:\n";
-    std::cout << "  --dev-donation PERCENT    Developer donation (0-50%, default: 0%)\n";
-    std::cout << "                            Note: When 0%, only 1 satoshi used for marking\n";
-    std::cout << "  --node-owner-fee PERCENT  Node owner fee (0-50%, default: 0%)\n";
+    std::cout << "  --give-author PERCENT     Developer donation (alias: --dev-donation; default: 0%)\n";
+    std::cout << "  -f / --fee PERCENT        Node owner fee (alias: --node-owner-fee; default: 0%)\n";
     std::cout << "  --node-owner-address ADDR Node owner payout address\n";
-    std::cout << "  --node-owner-script HEX   Node owner P2SH script (generates address)\n";
-    std::cout << "  --auto-detect-wallet      Auto-detect wallet address from core client\n";
-    std::cout << "  --no-auto-detect-wallet   Disable wallet auto-detection\n";
-    std::cout << "  --redistribute MODE       Redistribution for empty/broken miner addresses:\n";
-    std::cout << "                            pplns (default), fee, boost, donate\n\n";
+    std::cout << "  --redistribute MODE       Redistribution mode: pplns, fee, boost, donate\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
-    std::cout << "  --p2p-port PORT           P2P sharechain port (default: 9333)\n";
-    std::cout << "  --http-port PORT          HTTP/JSON-RPC API port (default: 8083)\n";
-    std::cout << "  --stratum-port PORT       Stratum mining port (default: 8084)\n";
+    std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
+    std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
+    std::cout << "  --http-port PORT          HTTP/JSON-RPC API port (default: 9327)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
 
-    std::cout << "MERGED MINING:\n";
-    std::cout << "  --merged SPEC             Add aux chain for merged mining. SPEC format:\n";
-    std::cout << "                            SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
+    std::cout << "PARENT COIN DAEMON:\n";
+    std::cout << "  --coind-address HOST      RPC host (alias: --rpchost; default: 127.0.0.1)\n";
+    std::cout << "  --coind-rpc-port PORT     RPC port (alias: --rpcport; auto-detected from chain)\n";
+    std::cout << "  --coind-p2p-port PORT     P2P port (auto-detected; set 0 to disable)\n";
+    std::cout << "  --coind-p2p-address HOST  P2P address (default: same as --coind-address)\n";
+    std::cout << "  USER PASS                 RPC credentials as positional args (or use flags below)\n";
+    std::cout << "  --rpcuser USER            RPC username\n";
+    std::cout << "  --rpcpassword PASS        RPC password\n\n";
+
+    std::cout << "MERGED MINING (p2pool-style individual flags):\n";
+    std::cout << "  --merged-coind-address HOST      Merged coin RPC host\n";
+    std::cout << "  --merged-coind-rpc-port PORT     Merged coin RPC port\n";
+    std::cout << "  --merged-coind-rpc-user USER     Merged coin RPC username\n";
+    std::cout << "  --merged-coind-rpc-password PASS Merged coin RPC password\n";
+    std::cout << "  --merged-coind-p2p-port PORT     Merged coin P2P port\n";
+    std::cout << "  --merged-coind-p2p-address HOST  Merged coin P2P address\n\n";
+
+    std::cout << "MERGED MINING (c2pool spec format — alternative):\n";
+    std::cout << "  --merged SPEC             SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]\n";
     std::cout << "                            Example: DOGE:98:192.168.86.29:22555:user:pass\n";
-    std::cout << "                            P2P_PORT auto-detected from SYMBOL (DOGE=22556, etc)\n";
-    std::cout << "                            HOST used for both RPC and P2P connections\n";
     std::cout << "                            Can be specified multiple times\n\n";
-    std::cout << "COIN DAEMON RPC (for live block templates):\n";
-    std::cout << "  --rpchost HOST            Coin daemon RPC host (default: 127.0.0.1)\n";
-    std::cout << "  --rpcport PORT            Coin daemon RPC port (default: 19332 testnet / 9332 mainnet)\n";
-    std::cout << "  --rpcuser USER            Coin daemon RPC username (default: user)\n";
-    std::cout << "  --rpcpassword PASS        Coin daemon RPC password (default: password)\n\n";
-    std::cout << "COIN DAEMON P2P BROADCASTER (fast block relay):\n";
-    std::cout << "  --coind-p2p-port PORT     Coin daemon P2P port (auto-detected from chain type;\n";
-    std::cout << "                            set 0 to disable; LTC=9333, DOGE=22556, BTC=8333)\n";
-    std::cout << "  --coind-p2p-address HOST  Coin daemon P2P address (default: same as --rpchost)\n\n";
+
+    std::cout << "NETWORK TUNING (accepted for p2pool compatibility):\n";
+    std::cout << "  --max-conns N             Max outgoing P2P connections\n";
+    std::cout << "  --outgoing-conns N        Alias for --max-conns\n";
+    std::cout << "  --disable-upnp            Disable UPnP port forwarding\n\n";
     
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  Litecoin (LTC)    ✅ Full support with testnet\n";
+    std::cout << "  Litecoin (LTC)    ✅ Full support with merged mining (parent)\n";
+    std::cout << "  Dogecoin (DOGE)   ✅ Full support as merged-mined aux chain\n";
     std::cout << "  Bitcoin (BTC)     ✅ Protocol compatibility\n";
-    std::cout << "  Ethereum (ETH)    🔧 In development\n";
-    std::cout << "  Monero (XMR)      🔧 In development\n";
-    std::cout << "  Zcash (ZEC)       🔧 In development\n";
-    std::cout << "  Dogecoin (DOGE)   🔧 In development\n\n";
-    
-    std::cout << "FEATURES & CAPABILITIES:\n";
-    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  ✅ Variable Difficulty (VARDIFF) - Automatic per-miner adjustment\n";
-    std::cout << "  ✅ Real-time Hashrate Tracking - Live monitoring and statistics\n";
-    std::cout << "  ✅ Payout Management System - Per-miner contribution tracking\n";
-    std::cout << "  ✅ Address Validation - All address types (legacy, P2SH, bech32)\n";
-    std::cout << "  ✅ LevelDB Storage - Persistent sharechain and miner data\n";
-    std::cout << "  ✅ JSON-RPC API - Complete monitoring interface\n";
-    std::cout << "  ✅ Stratum Protocol - Standard mining protocol support\n";
-    std::cout << "  ✅ Multi-miner Support - Concurrent connections\n";
-    std::cout << "  ✅ Web Interface - Real-time pool monitoring\n\n";
+    std::cout << "  Digibyte (DGB)    🔧 In development\n\n";
     
     std::cout << "DEFAULT NETWORK PORTS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  P2P Sharechain:           9333  (for P2Pool network communication)\n";
-    std::cout << "  HTTP API (JSON-RPC):      8083  (for monitoring and statistics)\n";
-    std::cout << "  Stratum Mining:           8084  (for miner connections)\n\n";
+    std::cout << "  P2P Sharechain:           9326  (for P2Pool network communication)\n";
+    std::cout << "  Stratum / HTTP API:       9327  (for miners and monitoring)\n\n";
     
     std::cout << "USAGE EXAMPLES:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  🏊 POOL OPERATOR (Integrated Mode):\n";
-    std::cout << "     c2pool --integrated --blockchain ltc --testnet\n";
-    std::cout << "     c2pool --integrated --http-port 8083 --stratum-port 8084\n";
-    std::cout << "     c2pool --integrated --blockchain btc --http-host 127.0.0.1\n\n";
+    std::cout << "  p2pool-compatible (LTC+DOGE merged mining):\n";
+    std::cout << "     c2pool --integrated --net litecoin \\\n";
+    std::cout << "       --coind-address 192.168.86.29 --coind-rpc-port 9332 \\\n";
+    std::cout << "       --coind-p2p-port 9333 \\\n";
+    std::cout << "       --merged-coind-address 192.168.86.29 \\\n";
+    std::cout << "       --merged-coind-rpc-port 44556 --merged-coind-p2p-port 22556 \\\n";
+    std::cout << "       --merged-coind-rpc-user dogerpc --merged-coind-rpc-password pass \\\n";
+    std::cout << "       --address YOUR_LTC_ADDRESS --give-author 2 -f 0 \\\n";
+    std::cout << "       litecoinrpc PASSWORD\n\n";
     
-    std::cout << "  🔗 NETWORK PARTICIPANT (Sharechain Mode):\n";
-    std::cout << "     c2pool --sharechain --blockchain ltc --testnet\n";
-    std::cout << "     c2pool --sharechain --blockchain btc --p2p-port 9333\n";
-    std::cout << "     c2pool --sharechain --config pool_config.yaml\n\n";
-    
-    std::cout << "  ⚡ SOLO MINING (Basic/Solo Mode):\n";
-    std::cout << "     c2pool --testnet --blockchain ltc --stratum-port 8084\n";
-    std::cout << "     c2pool --blockchain ltc --solo-address YOUR_ADDRESS\n";
-    std::cout << "     c2pool --config solo_config.yaml\n";
-    std::cout << "     c2pool --dev-donation 2.5 --node-owner-fee 1.0\n\n";
+    std::cout << "  c2pool-style (spec format):\n";
+    std::cout << "     c2pool --integrated --net litecoin \\\n";
+    std::cout << "       --rpchost 192.168.86.29 --rpcport 9332 \\\n";
+    std::cout << "       --rpcuser litecoinrpc --rpcpassword pass \\\n";
+    std::cout << "       --merged DOGE:98:192.168.86.29:44556:dogerpc:pass\n\n";
     
     std::cout << "API ENDPOINTS (Integrated Mode):\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -250,17 +240,20 @@ int main(int argc, char* argv[]) {
     auto settings = std::make_unique<core::Settings>();
     settings->m_testnet = false;
     
-    // Port configuration with C2Pool standard defaults
-    int p2p_port = 9333;           // P2P sharechain port
-    int http_port = 8083;          // HTTP/JSON-RPC API port
-    int stratum_port = 8084;       // Stratum mining port (temporarily 8084 for current miners)
+    // Port configuration with p2pool-compatible defaults
+    int p2p_port = 9326;           // P2Pool P2P sharechain port (p2pool default)
+    int http_port = 9327;          // HTTP/JSON-RPC API port
+    int stratum_port = 9327;       // Stratum mining port (same as worker port in p2pool)
     std::string http_host = "0.0.0.0";  // HTTP server host
 
     // Coin daemon RPC connection (used by integrated/solo modes for live block templates)
     std::string rpc_host = "127.0.0.1";
-    int         rpc_port = 19332;       // LTC testnet default; mainnet = 9332
-    std::string rpc_user = "user";
-    std::string rpc_pass = "password";
+    int         rpc_port = 0;           // 0 = auto-detect from chain+testnet
+    std::string rpc_user;
+    std::string rpc_pass;
+
+    // Payout address (p2pool: --address)
+    std::string payout_address;
     
     std::string config_file;
     std::string solo_address;
@@ -278,9 +271,16 @@ int main(int argc, char* argv[]) {
     int         coind_p2p_port = -1; // -1 = auto-detect from chain; 0 = disabled
 
     // Merged mining (auxiliary chain) configuration
-    // Multiple --merged flags can be given; each specifies:
-    //   --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
+    // p2pool-style: --merged-coind-address, --merged-coind-rpc-port, etc.
+    // c2pool-style: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
     std::vector<std::string> merged_chain_specs;
+    // p2pool-style merged chain flags (assembled into spec at the end)
+    std::string merged_coind_address;
+    int         merged_coind_rpc_port = 0;
+    std::string merged_coind_rpc_user;
+    std::string merged_coind_rpc_pass;
+    int         merged_coind_p2p_port = 0;
+    std::string merged_coind_p2p_address;
 
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
@@ -332,17 +332,24 @@ int main(int argc, char* argv[]) {
             settings->m_testnet = true;
             cli_explicit.insert("testnet");
         }
-        else if (arg == "--p2p-port" && i + 1 < argc) {
+        // Network / blockchain selection (p2pool: --net)
+        else if ((arg == "--net" || arg == "--blockchain") && i + 1 < argc) {
+            blockchain = parse_blockchain(argv[++i]);
+            cli_explicit.insert("blockchain");
+        }
+        // P2Pool P2P sharechain port (p2pool: --p2pool-port)
+        else if ((arg == "--p2pool-port" || arg == "--p2p-port") && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_port");
+        }
+        // Worker/Stratum port (p2pool: -w / --worker-port)
+        else if ((arg == "--worker-port" || arg == "-w" || arg == "--stratum-port") && i + 1 < argc) {
+            stratum_port = std::stoi(argv[++i]);
+            cli_explicit.insert("stratum_port");
         }
         else if (arg == "--http-port" && i + 1 < argc) {
             http_port = std::stoi(argv[++i]);
             cli_explicit.insert("http_port");
-        }
-        else if (arg == "--stratum-port" && i + 1 < argc) {
-            stratum_port = std::stoi(argv[++i]);
-            cli_explicit.insert("stratum_port");
         }
         else if (arg == "--http-host" && i + 1 < argc) {
             http_host = argv[++i];
@@ -359,19 +366,20 @@ int main(int argc, char* argv[]) {
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
         }
-        else if (arg == "--blockchain" && i + 1 < argc) {
-            blockchain = parse_blockchain(argv[++i]);
-            cli_explicit.insert("blockchain");
-        }
-        else if (arg == "--solo-address" && i + 1 < argc) {
-            solo_address = argv[++i];
+        // Payout address (p2pool: --address)
+        else if ((arg == "--address" || arg == "--solo-address") && i + 1 < argc) {
+            payout_address = argv[++i];
+            solo_address = payout_address;  // legacy compat
             cli_explicit.insert("solo_address");
+            cli_explicit.insert("address");
         }
-        else if (arg == "--dev-donation" && i + 1 < argc) {
+        // Donation (p2pool: --give-author)
+        else if ((arg == "--give-author" || arg == "--dev-donation") && i + 1 < argc) {
             dev_donation = std::stod(argv[++i]);
             cli_explicit.insert("dev_donation");
         }
-        else if (arg == "--node-owner-fee" && i + 1 < argc) {
+        // Node owner fee (p2pool: -f / --fee)
+        else if ((arg == "-f" || arg == "--fee" || arg == "--node-owner-fee") && i + 1 < argc) {
             node_owner_fee = std::stod(argv[++i]);
             cli_explicit.insert("node_owner_fee");
         }
@@ -391,31 +399,55 @@ int main(int argc, char* argv[]) {
             auto_detect_wallet = false;
             cli_explicit.insert("auto_detect_wallet");
         }
-        // Coin daemon RPC credentials
-        else if (arg == "--rpchost" && i + 1 < argc) {
+        // Parent coin daemon RPC (p2pool: --coind-address, --coind-rpc-port)
+        else if ((arg == "--coind-address" || arg == "--rpchost" || arg == "--bitcoind-address") && i + 1 < argc) {
             rpc_host = argv[++i];
             cli_explicit.insert("rpc_host");
         }
-        else if (arg == "--rpcport" && i + 1 < argc) {
+        else if ((arg == "--coind-rpc-port" || arg == "--rpcport" || arg == "--bitcoind-rpc-port") && i + 1 < argc) {
             rpc_port = std::stoi(argv[++i]);
             cli_explicit.insert("rpc_port");
         }
-        else if (arg == "--rpcuser" && i + 1 < argc) {
+        else if ((arg == "--rpcuser") && i + 1 < argc) {
             rpc_user = argv[++i];
             cli_explicit.insert("rpc_user");
         }
-        else if (arg == "--rpcpassword" && i + 1 < argc) {
+        else if ((arg == "--rpcpassword") && i + 1 < argc) {
             rpc_pass = argv[++i];
             cli_explicit.insert("rpc_pass");
         }
-        // Merged mining: --merged SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]
-        // e.g. --merged DOGE:98:127.0.0.1:22555:dogeuser:dogepass:22556
+        // c2pool-style merged (colon-separated spec)
         else if (arg == "--merged" && i + 1 < argc) {
             merged_chain_specs.push_back(argv[++i]);
             cli_explicit.insert("merged");
         }
-        // Coin daemon P2P broadcaster for fast block relay
-        else if (arg == "--coind-p2p-port" && i + 1 < argc) {
+        // p2pool-style merged chain flags
+        else if (arg == "--merged-coind-address" && i + 1 < argc) {
+            merged_coind_address = argv[++i];
+            cli_explicit.insert("merged_coind_address");
+        }
+        else if (arg == "--merged-coind-rpc-port" && i + 1 < argc) {
+            merged_coind_rpc_port = std::stoi(argv[++i]);
+            cli_explicit.insert("merged_coind_rpc_port");
+        }
+        else if (arg == "--merged-coind-rpc-user" && i + 1 < argc) {
+            merged_coind_rpc_user = argv[++i];
+            cli_explicit.insert("merged_coind_rpc_user");
+        }
+        else if (arg == "--merged-coind-rpc-password" && i + 1 < argc) {
+            merged_coind_rpc_pass = argv[++i];
+            cli_explicit.insert("merged_coind_rpc_pass");
+        }
+        else if (arg == "--merged-coind-p2p-port" && i + 1 < argc) {
+            merged_coind_p2p_port = std::stoi(argv[++i]);
+            cli_explicit.insert("merged_coind_p2p_port");
+        }
+        else if (arg == "--merged-coind-p2p-address" && i + 1 < argc) {
+            merged_coind_p2p_address = argv[++i];
+            cli_explicit.insert("merged_coind_p2p_address");
+        }
+        // Parent coin daemon P2P (p2pool: --coind-p2p-port / --bitcoind-p2p-port)
+        else if ((arg == "--coind-p2p-port" || arg == "--bitcoind-p2p-port") && i + 1 < argc) {
             coind_p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("coind_p2p_port");
         }
@@ -423,20 +455,43 @@ int main(int argc, char* argv[]) {
             coind_p2p_address = argv[++i];
             cli_explicit.insert("coind_p2p_address");
         }
-        // Legacy support for old --port option (maps to p2p-port)
+        // Connection limits (p2pool: --max-conns, --outgoing-conns, --disable-upnp)
+        else if (arg == "--max-conns" && i + 1 < argc) {
+            /* stored for future use */ ++i;
+        }
+        else if (arg == "--outgoing-conns" && i + 1 < argc) {
+            /* stored for future use */ ++i;
+        }
+        else if (arg == "--disable-upnp") {
+            /* no-op, c2pool doesn't use UPnP */
+        }
+        // Legacy support for old --port option
         else if (arg == "--port" && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_port");
-            LOG_WARNING << "--port is deprecated, use --p2p-port instead";
+            LOG_WARNING << "--port is deprecated, use --p2pool-port instead";
         }
         // Redistribute mode for empty/broken miner addresses
         else if (arg == "--redistribute" && i + 1 < argc) {
             redistribute_mode_str = argv[++i];
             cli_explicit.insert("redistribute");
         }
-        else {
+        else if (arg[0] == '-') {
             LOG_ERROR << "Unknown argument: " << arg;
             return 1;
+        }
+        // Positional arguments: RPC username password (p2pool compat)
+        else {
+            if (rpc_user.empty()) {
+                rpc_user = arg;
+                cli_explicit.insert("rpc_user");
+            } else if (rpc_pass.empty()) {
+                rpc_pass = arg;
+                cli_explicit.insert("rpc_pass");
+            } else {
+                LOG_ERROR << "Unexpected positional argument: " << arg;
+                return 1;
+            }
         }
     }
 
@@ -514,6 +569,40 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Post-parse: auto-detect defaults, assemble p2pool-style merged spec
+    // -----------------------------------------------------------------------
+
+    // Auto-detect RPC port from chain type if not set
+    if (rpc_port == 0) {
+        if (blockchain == Blockchain::LITECOIN)
+            rpc_port = settings->m_testnet ? 19332 : 9332;
+        else if (blockchain == Blockchain::BITCOIN)
+            rpc_port = settings->m_testnet ? 18332 : 8332;
+        else if (blockchain == Blockchain::DOGECOIN)
+            rpc_port = settings->m_testnet ? 44555 : 22555;
+        else
+            rpc_port = 9332;  // fallback
+    }
+
+    // Assemble p2pool-style --merged-coind-* flags into a merged spec
+    if (merged_coind_rpc_port > 0 && !merged_coind_address.empty()) {
+        // p2pool uses a single merged chain; detect symbol from P2P port or default to DOGE
+        std::string merged_symbol = "DOGE";
+        uint32_t merged_chain_id = 98;  // Dogecoin default
+        std::string spec = merged_symbol + ":" + std::to_string(merged_chain_id)
+            + ":" + merged_coind_address + ":" + std::to_string(merged_coind_rpc_port)
+            + ":" + merged_coind_rpc_user + ":" + merged_coind_rpc_pass;
+        if (merged_coind_p2p_port > 0)
+            spec += ":" + std::to_string(merged_coind_p2p_port);
+        merged_chain_specs.push_back(spec);
+        LOG_INFO << "Assembled merged spec from p2pool-style flags: " << spec;
+    }
+
+    // If --address was given without --node-owner-address, use it for node owner too
+    if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
+        node_owner_address = payout_address;
     
     try {
         boost::asio::io_context ioc;
