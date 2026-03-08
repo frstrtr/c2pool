@@ -43,9 +43,9 @@ void Actual::HANDLER(addrs)
 
 void Actual::HANDLER(addrme)
 {
-    if (peer->addr().address() == "127.0.0.0")
+    if (peer->addr().address() == "127.0.0.1")
     {
-        if (m_peers.empty() && (core::random::random_float(0, 1) < 0.8))
+        if (!m_peers.empty() && (core::random::random_float(0, 1) < 0.8))
         {
             auto random_peer = core::random::random_choice(m_peers);
             auto rmsg = ltc::message_addrme::make_raw(msg->m_port);
@@ -55,7 +55,7 @@ void Actual::HANDLER(addrme)
     {
         auto endpoint = NetService{peer->addr().address(), msg->m_port};
         got_addr(endpoint, peer->m_other_services, core::timestamp());
-        if (m_peers.empty() && (core::random::random_float(0, 1) < 0.8))
+        if (!m_peers.empty() && (core::random::random_float(0, 1) < 0.8))
         {
             auto random_peer = core::random::random_choice(m_peers);
             auto rmsg = ltc::message_addrs::make_raw({addr_record_t{peer->m_other_services, endpoint, core::timestamp()} });

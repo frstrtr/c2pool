@@ -43,8 +43,7 @@ struct BlockHeaderType : SmallBlockHeaderType
 {
     uint256 m_merkle_root;
 
-    //TODO: correct merkle_root position?
-    SERIALIZE_METHODS(BlockHeaderType) { READWRITE(VarInt(obj.m_version), obj.m_previous_block, obj.m_merkle_root, obj.m_timestamp, obj.m_bits, obj.m_bits); }
+    SERIALIZE_METHODS(BlockHeaderType) { READWRITE(VarInt(obj.m_version), obj.m_previous_block, obj.m_merkle_root, obj.m_timestamp, obj.m_bits, obj.m_nonce); }
 
     BlockHeaderType() : SmallBlockHeaderType() { }
 
