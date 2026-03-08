@@ -5,6 +5,7 @@
 
 #include "config_pool.hpp"
 #include "share.hpp"
+#include "share_messages.hpp"
 #include "share_types.hpp"
 
 #include <core/hash.hpp>
@@ -263,6 +264,7 @@ struct RefHashParams {
     uint128  abswork;
     BaseScript merged_coinbase_info;
     uint256  merged_payout_hash;
+    BaseScript message_data;              // V36 PossiblyNoneType(b'', VarStrType())
 };
 
 inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParams& p)
@@ -309,6 +311,10 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
     ref_stream << p.merged_coinbase_info;
     ref_stream << p.merged_payout_hash;
+
+    // V36 ref_type includes message_data as PossiblyNoneType(b'', VarStrType())
+    // When empty, BaseScript serialises as varint(0) = 0x00, matching Python's behavior.
+    ref_stream << p.message_data;
 
     auto ref_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
@@ -478,6 +484,14 @@ uint256 share_init_verify(const ShareT& share)
             if constexpr (requires { share.m_merged_payout_hash; })
                 ref_stream << share.m_merged_payout_hash;
         }
+    }
+
+    // V36 ref_type includes message_data as PossiblyNoneType(b'', VarStrType())
+    // When m_message_data is empty, BaseScript serialises as varint(0) = 0x00.
+    if constexpr (ver >= 36)
+    {
+        if constexpr (requires { share.m_message_data; })
+            ref_stream << share.m_message_data;
     }
 
     // hash256 of the ref_type serialisation
@@ -1156,6 +1170,13 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
         }
     }
 
+    // V36 ref_type includes message_data
+    if constexpr (ver >= 36)
+    {
+        if constexpr (requires { share.m_message_data; })
+            ref_stream << share.m_message_data;
+    }
+
     auto ref_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 hash_ref = Hash(ref_span);
@@ -1173,6 +1194,17 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
     }
 
     uint256 gentx_hash = check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
+
+    // V36+: Validate message_data (reject shares with invalid encrypted messages)
+    if constexpr (ver >= 36)
+    {
+        if constexpr (requires { share.m_message_data; })
+        {
+            auto err = validate_message_data(share.m_message_data.m_data);
+            if (!err.empty())
+                throw std::invalid_argument("share " + err);
+        }
+    }
 
     share_check(share, hash, gentx_hash, tracker);
     return hash;
@@ -1362,6 +1394,8 @@ uint256 create_local_share(
     ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
     ref_stream << share.m_merged_coinbase_info;
     ref_stream << share.m_merged_payout_hash;
+    // V36 ref_type includes message_data (empty BaseScript → varint(0) = 0x00)
+    ref_stream << share.m_message_data;
 
     auto ref_span_v = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
