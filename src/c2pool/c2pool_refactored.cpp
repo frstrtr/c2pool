@@ -599,6 +599,8 @@ int main(int argc, char* argv[]) {
             
             // Start P2P sharechain node for broadcasting new best-blocks to peers
             auto ltc_p2p_config = std::make_unique<ltc::Config>("ltc");
+            // Load/create ~/.c2pool/ltc/{pool,coin}.yaml so bootstrap_addrs are available.
+            ltc_p2p_config->init();
             ltc_p2p_config->m_testnet = settings->m_testnet;
             auto p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));

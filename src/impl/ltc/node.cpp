@@ -48,6 +48,17 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 
 void NodeImpl::error(const message_error_type& err, const NetService& service, const std::source_location where)
 {
+    // Drop stale nonce->peer entries for this endpoint before base cleanup.
+    // Without this, reconnects can be rejected as false duplicates because
+    // m_peers still contains the old nonce mapping.
+    for (auto it = m_peers.begin(); it != m_peers.end(); )
+    {
+        if (it->second && it->second->addr() == service)
+            it = m_peers.erase(it);
+        else
+            ++it;
+    }
+
     // Clean outbound tracking before base removes the peer
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
