@@ -5,6 +5,7 @@
 #include <impl/ltc/coin/node_interface.hpp>
 
 #include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
+#include <core/random.hpp> // core::random::random_float for probabilistic fee
 #include <core/target_utils.hpp> // chain::bits_to_target
 #include <btclibs/util/strencodings.h>  // ParseHex, HexStr
 #include <crypto/scrypt.h>  // scrypt_1024_1_1_256 for Litecoin PoW
@@ -674,8 +675,8 @@ void MiningInterface::refresh_work()
             std::vector<std::pair<std::string,uint64_t>> outputs;
             bool raw_scripts = false;
 
-            // PPLNS path: use share-tracker proportional payouts when wired
-            if (m_pplns_fn && m_best_share_hash_fn && m_payout_manager_ptr) {
+            // V36 PPLNS path: use share-tracker proportional payouts directly
+            if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
                 if (!best.IsNull()) {
                     // Block target from template bits
@@ -683,62 +684,27 @@ void MiningInterface::refresh_work()
                         wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
                     uint256 block_target = chain::bits_to_target(nbits);
 
-                    // Build donation script (P2PKH) from developer address
-                    std::vector<unsigned char> donation_script;
-                    std::string dev_addr = m_payout_manager_ptr->get_developer_address();
-                    if (!dev_addr.empty()) {
-                        auto h160 = base58check_to_hash160(dev_addr);
-                        if (!h160.empty()) {
-                            donation_script = {0x76, 0xa9, 0x14};
-                            for (size_t i = 0; i < h160.size(); i += 2)
-                                donation_script.push_back(static_cast<unsigned char>(
-                                    std::stoul(h160.substr(i, 2), nullptr, 16)));
-                            donation_script.push_back(0x88);
-                            donation_script.push_back(0xac);
-                        }
-                    }
+                    // get_expected_payouts returns map<scriptPubKey, amount_double>
+                    // with donation remainder already included via m_donation_script
+                    auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
 
-                    auto expected = m_pplns_fn(best, block_target, coinbase_value, donation_script);
-                    m_payout_manager_ptr->set_pplns_expected_payouts(std::move(expected));
-
-                    auto pplns_out = m_payout_manager_ptr->calculate_pplns_outputs(coinbase_value);
-                    if (!pplns_out.empty()) {
+                    if (!expected.empty()) {
                         static const char* HEX = "0123456789abcdef";
-                        for (const auto& [script_bytes, amount] : pplns_out) {
+                        for (const auto& [script_bytes, amount] : expected) {
+                            uint64_t sat = static_cast<uint64_t>(amount);
+                            if (sat == 0) continue;
                             std::string hex;
                             hex.reserve(script_bytes.size() * 2);
                             for (unsigned char b : script_bytes) {
                                 hex += HEX[b >> 4];
                                 hex += HEX[b & 0x0f];
                             }
-                            outputs.push_back({std::move(hex), amount});
+                            outputs.push_back({std::move(hex), sat});
                         }
                         raw_scripts = true;
-                        LOG_INFO << "refresh_work: PPLNS coinbase with "
+                        LOG_INFO << "refresh_work: V36 PPLNS coinbase with "
                                  << outputs.size() << " outputs";
                     }
-                }
-            }
-
-            // Fallback: simple percentage-based payout split
-            if (!raw_scripts && m_payout_manager_ptr) {
-                auto alloc = m_payout_manager_ptr->calculate_payout(coinbase_value);
-                if (alloc.miner_amount > 0) {
-                    std::string addr = m_payout_manager_ptr->get_node_owner_address();
-                    if (addr.empty()) addr = m_payout_manager_ptr->get_developer_address();
-                    auto h160 = base58check_to_hash160(addr);
-                    if (!h160.empty())
-                        outputs.push_back({h160, alloc.miner_amount});
-                }
-                if (alloc.developer_amount > 0 && !alloc.developer_address.empty()) {
-                    auto h160 = base58check_to_hash160(alloc.developer_address);
-                    if (!h160.empty())
-                        outputs.push_back({h160, alloc.developer_amount});
-                }
-                if (alloc.node_owner_amount > 0 && !alloc.node_owner_address.empty()) {
-                    auto h160 = base58check_to_hash160(alloc.node_owner_address);
-                    if (!h160.empty())
-                        outputs.push_back({h160, alloc.node_owner_amount});
                 }
             }
 
@@ -1297,6 +1263,36 @@ void MiningInterface::set_pool_fee_percent(double fee_percent)
     m_pool_fee_percent = fee_percent;
 }
 
+void MiningInterface::set_node_fee_from_address(double percent, const std::string& address)
+{
+    auto h160 = base58check_to_hash160(address);
+    if (h160.size() != 40) {
+        LOG_WARNING << "set_node_fee_from_address: invalid address " << address;
+        return;
+    }
+    std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+    for (size_t i = 0; i < h160.size(); i += 2)
+        script.push_back(static_cast<unsigned char>(
+            std::stoul(h160.substr(i, 2), nullptr, 16)));
+    script.push_back(0x88);
+    script.push_back(0xac);
+    set_node_fee(percent, script);
+    m_node_fee_address = address;
+}
+
+void MiningInterface::set_donation_script_from_address(const std::string& address)
+{
+    auto h160 = base58check_to_hash160(address);
+    if (h160.size() != 40) return;
+    std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+    for (size_t i = 0; i < h160.size(); i += 2)
+        script.push_back(static_cast<unsigned char>(
+            std::stoul(h160.substr(i, 2), nullptr, 16)));
+    script.push_back(0x88);
+    script.push_back(0xac);
+    set_donation_script(script);
+}
+
 nlohmann::json MiningInterface::mining_subscribe(const std::string& user_agent, const std::string& request_id)
 {
     LOG_INFO << "Stratum mining.subscribe from: " << user_agent;
@@ -1443,6 +1439,32 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         return nlohmann::json{{"result", true}};
     } else {
         // Standard pool mode - track shares for sharechain and payouts
+
+        // V36 probabilistic node fee: with probability m_node_fee_percent%,
+        // replace the miner's address with the node operator's address.
+        // This means ~fee% of shares carry the operator's address in PPLNS.
+        std::string share_address = username;
+        if (m_node_fee_percent > 0.0 && !m_node_fee_script.empty()) {
+            float roll = core::random::random_float(0.0f, 100.0f);
+            if (roll < static_cast<float>(m_node_fee_percent)) {
+                // Replace with node operator address for this share
+                // The script is stored as raw bytes; for share tracking we pass
+                // the hex representation of the hash160 (bytes 3..22 of P2PKH script)
+                if (m_node_fee_script.size() == 25) { // P2PKH: 76 a9 14 <20 bytes> 88 ac
+                    static const char* HEX = "0123456789abcdef";
+                    std::string h160;
+                    h160.reserve(40);
+                    for (int i = 3; i < 23; ++i) {
+                        h160 += HEX[m_node_fee_script[i] >> 4];
+                        h160 += HEX[m_node_fee_script[i] & 0x0f];
+                    }
+                    share_address = h160;
+                    LOG_DEBUG_POOL << "Node fee: share " << job_id
+                                   << " address replaced → operator (roll="
+                                   << roll << " < " << m_node_fee_percent << ")";
+                }
+            }
+        }
         
         // Track mining_share submission for statistics
         if (m_node) {
@@ -1479,24 +1501,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Record share contribution for payout calculation (pool mode only)
         if (m_payout_manager) {
-            m_payout_manager->record_share_contribution(username, share_difficulty);
-            LOG_INFO << "Share contribution recorded for payout: " << username << " (difficulty: " << share_difficulty << ")";
-        }
-        
-        // Calculate developer and node owner payouts for pool mode
-        if (m_payout_manager_ptr) {
-            // Log payout allocation for this share (informational)
-            uint64_t simulated_reward = 2500000000; // 25 LTC for calculation
-            auto allocation = m_payout_manager_ptr->calculate_payout(simulated_reward);
-            
-            if (allocation.is_valid()) {
-                LOG_INFO << "Pool payout allocation (per block):";
-                LOG_INFO << "  Pool miners: " << allocation.miner_percent << "%";
-                LOG_INFO << "  Developer fee: " << allocation.developer_percent << "% -> " << allocation.developer_address;
-                if (allocation.node_owner_amount > 0) {
-                    LOG_INFO << "  Node owner fee: " << allocation.node_owner_percent << "% -> " << allocation.node_owner_address;
-                }
-            }
+            m_payout_manager->record_share_contribution(share_address, share_difficulty);
+            LOG_DEBUG_POOL << "Share contribution recorded: " << share_address << " (difficulty: " << share_difficulty << ")";
         }
         
         // Attempt block construction + merkle validation + submission.

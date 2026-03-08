@@ -645,8 +645,26 @@ int main(int argc, char* argv[]) {
                          << " — broadcast bestblock to P2P peers";
             });
             
-            // Configure payout system for web server
+            // Configure payout system for web server (legacy — kept for REST stats)
             web_server.set_payout_manager(payout_manager.get());
+
+            // V36-compatible node fee: probabilistic address replacement at share
+            // creation time.  The node operator's address accumulates PPLNS weight
+            // for ~fee% of shares, so all peers compute identical coinbase outputs.
+            if (node_owner_fee > 0.0 && !node_owner_address.empty()) {
+                web_server.get_mining_interface()->set_node_fee_from_address(
+                    node_owner_fee, node_owner_address);
+                LOG_INFO << "Node fee: " << node_owner_fee << "% → " << node_owner_address
+                         << " (v36 probabilistic)";
+            }
+
+            // Donation script (protocol-level, goes to p2pool devs)
+            if (payout_manager) {
+                std::string dev_addr = payout_manager->get_developer_address();
+                if (!dev_addr.empty()) {
+                    web_server.get_mining_interface()->set_donation_script_from_address(dev_addr);
+                }
+            }
 
             // Wire the share tracker's best share hash into the mining interface
             // so that mining_submit can link new shares to the chain head.

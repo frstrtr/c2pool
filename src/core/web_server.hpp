@@ -170,6 +170,23 @@ public:
     void set_pool_payout_address(const std::string& address);
     void set_pool_fee_percent(double fee_percent);
 
+    // V36-compatible probabilistic node fee: at share creation time,
+    // with probability fee%, the share's payout address is replaced with
+    // the node operator's address.  This flows through PPLNS naturally.
+    void set_node_fee(double percent, const std::vector<unsigned char>& script) {
+        m_node_fee_percent = percent;
+        m_node_fee_script  = script;
+        m_pool_fee_percent = percent;  // keep /fee endpoint in sync
+    }
+    // String-based overload: converts Base58Check address to P2PKH scriptPubKey
+    void set_node_fee_from_address(double percent, const std::string& address);
+    // Donation script used by get_expected_payouts (p2pool protocol)
+    void set_donation_script(const std::vector<unsigned char>& script) {
+        m_donation_script = script;
+    }
+    // String-based overload for donation script
+    void set_donation_script_from_address(const std::string& address);
+
     // Solo mining configuration
     void set_solo_mode(bool enabled) { m_solo_mode = enabled; }
     void set_solo_address(const std::string& address) { m_solo_address = address; }
@@ -264,6 +281,12 @@ private:
 
     // Pool fee percent (set via set_pool_fee_percent)
     double m_pool_fee_percent{0.0};
+
+    // V36 probabilistic node fee
+    double m_node_fee_percent{0.0};
+    std::vector<unsigned char> m_node_fee_script;   // node operator scriptPubKey
+    std::string m_node_fee_address;                 // node operator address (display/logging)
+    std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
 
     // Recently found blocks for /recent_blocks
     struct FoundBlock { uint64_t height; std::string hash; uint64_t ts; };
