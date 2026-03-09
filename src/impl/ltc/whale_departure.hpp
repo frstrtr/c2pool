@@ -123,7 +123,7 @@ public:
 
         // Secondary signal: long wall-clock share drought while below baseline
         bool gap_trigger = share_gap >= static_cast<int64_t>(
-            PoolConfig::SHARE_PERIOD * gap_trigger_periods_);
+            PoolConfig::share_period() * gap_trigger_periods_);
 
         if (active_)
         {

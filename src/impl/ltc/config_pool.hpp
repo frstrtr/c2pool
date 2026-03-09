@@ -29,14 +29,30 @@ public:
     // Static LTC p2pool network constants (must match frstrtr/p2pool-merged-v36)
     // -----------------------------------------------------------------------
     static constexpr uint16_t P2P_PORT                  = 9326;
-    static constexpr uint32_t SHARE_PERIOD              = 15;      // seconds
-    static constexpr uint32_t CHAIN_LENGTH              = 8640;    // 24*60*60 / 10
-    static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
+    static constexpr uint32_t SPREAD                    = 3;       // blocks (PPLNS window)
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3600;
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
+
+    // Mainnet constants
+    static constexpr uint32_t SHARE_PERIOD              = 15;      // seconds
+    static constexpr uint32_t CHAIN_LENGTH              = 8640;    // 24*60*60 / 10
+    static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
+
+    // Testnet constants (selected at runtime via is_testnet)
+    static constexpr uint32_t TESTNET_SHARE_PERIOD      = 4;       // seconds
+    static constexpr uint32_t TESTNET_CHAIN_LENGTH      = 400;     // 20*60//3
+    static constexpr uint32_t TESTNET_REAL_CHAIN_LENGTH  = 400;
+
+    // Runtime testnet flag — set once at startup
+    static inline bool is_testnet = false;
+
+    // Accessors that return correct value for current network
+    static uint32_t share_period()      { return is_testnet ? TESTNET_SHARE_PERIOD : SHARE_PERIOD; }
+    static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
+    static uint32_t real_chain_length()  { return is_testnet ? TESTNET_REAL_CHAIN_LENGTH : REAL_CHAIN_LENGTH; }
 
     // -----------------------------------------------------------------------
     // Consensus-critical donation scripts
@@ -81,10 +97,18 @@ public:
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
 
-    // Message framing prefix: 72 08 c1 a5 3e f6 29 b0
-    static inline const std::string DEFAULT_PREFIX_HEX = "7208c1a53ef629b0";
-    // Network identifier: e0 37 d5 b8 c6 92 34 10
-    static inline const std::string IDENTIFIER_HEX     = "e037d5b8c6923410";
+    // Message framing prefix (mainnet): 72 08 c1 a5 3e f6 29 b0
+    static inline const std::string DEFAULT_PREFIX_HEX          = "7208c1a53ef629b0";
+    // Message framing prefix (testnet): ad 96 14 f6 46 6a 39 cf
+    static inline const std::string TESTNET_PREFIX_HEX          = "ad9614f6466a39cf";
+    // Network identifier (mainnet): e0 37 d5 b8 c6 92 34 10
+    static inline const std::string IDENTIFIER_HEX              = "e037d5b8c6923410";
+    // Network identifier (testnet): cc a5 e2 4e c6 40 8b 1e
+    static inline const std::string TESTNET_IDENTIFIER_HEX      = "cca5e24ec6408b1e";
+
+    static const std::string& identifier_hex() {
+        return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX;
+    }
 
     static inline const std::set<std::string> SOFTFORKS_REQUIRED = {
         "bip65", "csv", "segwit", "taproot", "mweb"

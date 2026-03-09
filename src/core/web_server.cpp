@@ -833,6 +833,8 @@ void MiningInterface::refresh_work()
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
                 if (!best.IsNull()) {
+                    LOG_INFO << "refresh_work: PPLNS active, best_share=" << best.GetHex().substr(0,16) << "..."
+                             << " donation_script_len=" << m_donation_script.size();
                     uint32_t nbits = std::stoul(
                         wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
                     uint256 block_target = chain::bits_to_target(nbits);
@@ -855,6 +857,12 @@ void MiningInterface::refresh_work()
                         pplns_raw_scripts = true;
                         LOG_INFO << "refresh_work: V36 PPLNS coinbase with "
                                  << pplns_outputs.size() << " outputs";
+                        for (size_t i = 0; i < pplns_outputs.size(); ++i) {
+                            LOG_INFO << "  PPLNS output[" << i << "]: "
+                                     << pplns_outputs[i].second << " sat  script="
+                                     << pplns_outputs[i].first.substr(0, 50)
+                                     << (pplns_outputs[i].first.size() > 50 ? "..." : "");
+                        }
                     }
                 }
             }
@@ -1627,10 +1635,25 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
     } else {
         // Standard pool mode - track shares for sharechain and payouts
 
+        // Extract primary address from multiaddress username format.
+        // Format: PRIMARY_ADDR[,MERGED_ADDR...][.WORKER_NAME]
+        std::string primary_addr = username;
+        {
+            auto dot_pos = primary_addr.rfind('.');
+            if (dot_pos != std::string::npos && dot_pos > 20)
+                primary_addr = primary_addr.substr(0, dot_pos);
+            auto comma_pos = primary_addr.find(',');
+            if (comma_pos != std::string::npos)
+                primary_addr = primary_addr.substr(0, comma_pos);
+        }
+        std::string share_address = base58check_to_hash160(primary_addr);
+        if (share_address.size() != 40) {
+            LOG_WARNING << "mining_submit: cannot convert primary address to hash160: " << primary_addr;
+        }
+
         // V36 probabilistic node fee: with probability m_node_fee_percent%,
         // replace the miner's address with the node operator's address.
         // This means ~fee% of shares carry the operator's address in PPLNS.
-        std::string share_address = username;
         if (m_node_fee_percent > 0.0 && !m_node_fee_script.empty()) {
             float roll = core::random::random_float(0.0f, 100.0f);
             if (roll < static_cast<float>(m_node_fee_percent)) {
@@ -2404,8 +2427,16 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         username_ = params[0];
         authorized_ = true;
 
-        // Parse merged addresses from username: ADDRESS/CHAIN_ID:ADDR/CHAIN_ID:ADDR
+        // Strip worker name suffix (e.g., ".r1c")
+        auto dot_pos = username_.rfind('.');
+        if (dot_pos != std::string::npos && dot_pos > 20)
+            username_ = username_.substr(0, dot_pos);
+
+        // Parse merged addresses — two supported formats:
+        //   Slash format: PRIMARY/CHAIN_ID:ADDR/CHAIN_ID:ADDR
+        //   Comma format: PRIMARY,MERGED_ADDR  (chain_id from MM manager)
         auto slash_pos = username_.find('/');
+        auto comma_pos = username_.find(',');
         if (slash_pos != std::string::npos) {
             std::string remainder = username_.substr(slash_pos + 1);
             username_ = username_.substr(0, slash_pos);
@@ -2422,9 +2453,19 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                     }
                 }
             }
-            if (!merged_addresses_.empty())
-                LOG_INFO << "Merged addresses from username: " << merged_addresses_.size() << " chain(s)";
+        } else if (comma_pos != std::string::npos) {
+            // Comma-separated: "LTC_ADDR,DOGE_ADDR[,ADDR2...]"
+            // First address is primary; subsequent are merged chains.
+            // Use chain_id=0 as placeholder (MM manager resolves actual chain).
+            std::string merged_part = username_.substr(comma_pos + 1);
+            username_ = username_.substr(0, comma_pos);
+            // For single merged chain (common case: LTC+DOGE), assign chain_id=0
+            if (!merged_part.empty()) {
+                merged_addresses_[0] = merged_part;
+            }
         }
+        if (!merged_addresses_.empty())
+            LOG_INFO << "Merged addresses from username: " << merged_addresses_.size() << " chain(s)";
         
         LOG_INFO << "Mining authorization successful for: " << username_;
         

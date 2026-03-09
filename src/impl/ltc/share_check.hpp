@@ -123,6 +123,7 @@ inline V36HashLinkType prefix_to_hash_link(
     V36HashLinkType result;
 
     // Extract mid-state as big-endian bytes (matches check_hash_link's ReadBE32)
+    result.m_state.m_data.resize(32);
     for (int i = 0; i < 8; ++i) {
         WriteBE32(result.m_state.m_data.data() + i * 4, hasher.s[i]);
     }
@@ -273,7 +274,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
 
     // IDENTIFIER
     {
-        auto hex = PoolConfig::IDENTIFIER_HEX;
+        auto hex = PoolConfig::identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2) {
             unsigned char byte = static_cast<unsigned char>(
                 std::stoul(hex.substr(i, 2), nullptr, 16));
@@ -381,7 +382,7 @@ uint256 share_init_verify(const ShareT& share)
 
     // IDENTIFIER bytes (8 bytes from IDENTIFIER_HEX)
     {
-        auto hex = PoolConfig::IDENTIFIER_HEX;
+        auto hex = PoolConfig::identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2)
         {
             unsigned char byte = static_cast<unsigned char>(
@@ -672,11 +673,11 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker)
     {
         auto chain_len = std::min(
             tracker.chain.get_height(prev_hash),
-            static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+            static_cast<int32_t>(PoolConfig::real_chain_length()));
 
         auto block_target = chain::bits_to_target(share.m_max_bits);
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SHARE_PERIOD * 65535;
+                          * PoolConfig::SPREAD * 65535;
 
         // Walk the chain share-by-share to get weights keyed by full script
         auto walk_count = static_cast<size_t>(chain_len);
@@ -902,7 +903,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker)
 
         // IDENTIFIER bytes
         {
-            auto hex = PoolConfig::IDENTIFIER_HEX;
+            auto hex = PoolConfig::identifier_hex();
             for (size_t i = 0; i + 1 < hex.size(); i += 2)
             {
                 unsigned char byte = static_cast<unsigned char>(
@@ -1045,7 +1046,7 @@ bool share_check(const ShareT& share,
     // If 95% of recent shares desire a higher version, this share's version
     // is considered obsolete and must be rejected.
     {
-        auto lookbehind = static_cast<int32_t>(PoolConfig::CHAIN_LENGTH);
+        auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
         auto height = tracker.chain.get_height(share_hash);
         if (height >= lookbehind)
         {
@@ -1088,7 +1089,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
     // Rebuild ref_hash + hash_link_data the same way init does
     PackStream ref_stream;
     {
-        auto hex = PoolConfig::IDENTIFIER_HEX;
+        auto hex = PoolConfig::identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2)
         {
             unsigned char byte = static_cast<unsigned char>(
@@ -1311,7 +1312,7 @@ uint256 create_local_share(
 
         // far_share_hash: look back REAL_CHAIN_LENGTH shares
         auto far_dist = std::min(
-            static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH),
+            static_cast<int32_t>(PoolConfig::real_chain_length()),
             prev_height);
         auto far_view = tracker.chain.get_chain(prev_share, static_cast<size_t>(far_dist));
         uint256 last_hash = prev_share;
@@ -1370,7 +1371,7 @@ uint256 create_local_share(
     // --- Compute the ref_hash ---
     PackStream ref_stream;
     {
-        auto hex = PoolConfig::IDENTIFIER_HEX;
+        auto hex = PoolConfig::identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2) {
             unsigned char byte = static_cast<unsigned char>(
                 std::stoul(hex.substr(i, 2), nullptr, 16));
@@ -1420,10 +1421,10 @@ uint256 create_local_share(
     {
         auto chain_len = std::min(
             tracker.chain.get_height(prev_share),
-            static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+            static_cast<int32_t>(PoolConfig::real_chain_length()));
         auto block_target = chain::bits_to_target(share.m_max_bits);
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SHARE_PERIOD * 65535;
+                          * PoolConfig::SPREAD * 65535;
         auto walk_count = static_cast<size_t>(chain_len);
         auto walk_view = tracker.chain.get_chain(prev_share, walk_count);
 

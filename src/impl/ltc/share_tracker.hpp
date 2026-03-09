@@ -143,7 +143,7 @@ public:
         auto [height, last] = chain.get_height_and_last(share_hash);
 
         // Need CHAIN_LENGTH + 1 depth, or the chain must be rooted (last == null)
-        if (height < static_cast<int32_t>(PoolConfig::CHAIN_LENGTH) + 1 && !last.IsNull())
+        if (height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
             return false;
 
         // P2: init-phase verification (hash-link, merkle, PoW) + check-phase
@@ -177,19 +177,19 @@ public:
         uint288 score_res;
 
         auto head_height = verified.get_height(share_hash);
-        if (head_height < static_cast<int32_t>(PoolConfig::CHAIN_LENGTH))
+        if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
             return {head_height, score_res};
 
         auto end_point = verified.get_nth_parent_key(share_hash,
-            (PoolConfig::CHAIN_LENGTH * 15) / 16);
+            (PoolConfig::chain_length() * 15) / 16);
 
         // Find max block_rel_height in the tail 1/16 of the chain
         std::optional<int32_t> block_height;
         auto tail_count = std::min(
-            static_cast<int32_t>(PoolConfig::CHAIN_LENGTH / 16),
+            static_cast<int32_t>(PoolConfig::chain_length() / 16),
             verified.get_height(end_point));
         if (tail_count <= 0)
-            return {static_cast<int32_t>(PoolConfig::CHAIN_LENGTH), score_res};
+            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
         auto tail_view = verified.get_chain(end_point, tail_count);
         for (auto& [hash, data] : tail_view)
@@ -206,7 +206,7 @@ public:
         }
 
         if (!block_height.has_value() || block_height.value() >= 0)
-            return {static_cast<int32_t>(PoolConfig::CHAIN_LENGTH), score_res};
+            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
         // Get accumulated work between share_hash and end_point on the verified chain
         auto interval = verified.get_interval(share_hash, end_point);
@@ -215,7 +215,7 @@ public:
             time_span = 1;
 
         score_res = interval.work / static_cast<uint32_t>(time_span);
-        return {static_cast<int32_t>(PoolConfig::CHAIN_LENGTH), score_res};
+        return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
     }
 
     // -- Best-chain selection with verification and punishment --
@@ -237,7 +237,7 @@ public:
             auto [head_height, last] = chain.get_height_and_last(head_hash);
             auto walk_count = last.IsNull()
                 ? head_height
-                : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::CHAIN_LENGTH)));
+                : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
 
             if (walk_count <= 0)
                 continue;
@@ -295,10 +295,10 @@ public:
             auto [head_height, last_hash] = verified.get_height_and_last(head_hash);
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            auto want = std::max(static_cast<int32_t>(PoolConfig::CHAIN_LENGTH) - head_height, 0);
+            auto want = std::max(static_cast<int32_t>(PoolConfig::chain_length()) - head_height, 0);
             auto can = last_last_hash.IsNull()
                 ? last_height
-                : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::CHAIN_LENGTH), 0);
+                : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
             auto to_get = std::min(want, can);
 
             if (to_get > 0)
@@ -312,7 +312,7 @@ public:
             }
 
             // Request more shares if verified chain is short
-            if (head_height < static_cast<int32_t>(PoolConfig::CHAIN_LENGTH) && !last_last_hash.IsNull())
+            if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
             {
                 NetService peer;
                 chain.get_share(head_hash).invoke([&](auto* obj) {
@@ -377,7 +377,7 @@ public:
                 int32_t reason = 0;
                 {
                     auto share_version = chain.get_share(hh).version();
-                    auto lookbehind = static_cast<int32_t>(PoolConfig::CHAIN_LENGTH);
+                    auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
                     if (should_punish_version(hh, share_version, lookbehind))
                         reason = 1;
                 }
@@ -492,7 +492,7 @@ public:
             // pre_target = 2^256 / (SHARE_PERIOD * aps) - 1
             uint288 two_256;
             two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-            uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::SHARE_PERIOD);
+            uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::share_period());
             if (divisor.IsNull())
                 divisor = uint288(1);
             uint288 result = two_256 / divisor;
@@ -525,10 +525,10 @@ public:
         if (prev_ts > 0 && desired_timestamp > prev_ts)
         {
             auto time_since_share = desired_timestamp - prev_ts;
-            constexpr uint32_t emergency_threshold = PoolConfig::SHARE_PERIOD * 20;
+            auto emergency_threshold = PoolConfig::share_period() * 20;
             if (time_since_share > emergency_threshold)
             {
-                constexpr uint32_t half_life = PoolConfig::SHARE_PERIOD * 10;
+                auto half_life = PoolConfig::share_period() * 10;
                 auto excess = time_since_share - emergency_threshold;
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
@@ -603,6 +603,57 @@ public:
         if (start_height > max_shares)
             end_hash = chain.get_nth_parent_key(start, max_shares);
 
+        // If end_hash is the chain tail (not an actual share), walk manually
+        // to collect weights. This happens when the chain is shorter than
+        // max_shares — the tail is the null prev_hash of the genesis share.
+        if (!chain.contains(end_hash)) {
+            CumulativeWeights result;
+            uint256 cur = start;
+            for (int32_t i = 0; i < max_shares && !cur.IsNull() && chain.contains(cur); ++i) {
+                auto& share_data = chain.get_share(cur);
+                uint256 next_cur;
+                share_data.invoke([&](auto* obj) {
+                    auto att = chain::target_to_average_attempts(
+                        chain::bits_to_target(obj->m_bits));
+                    uint32_t don = obj->m_donation;
+
+                    std::vector<unsigned char> script;
+                    if constexpr (requires { obj->m_pubkey_hash; }) {
+                        script = {0x76, 0xa9, 0x14};
+                        auto* hash_bytes = obj->m_pubkey_hash.data();
+                        script.insert(script.end(), hash_bytes, hash_bytes + 20);
+                        script.push_back(0x88);
+                        script.push_back(0xac);
+                    } else if constexpr (requires { obj->m_address; }) {
+                        script = obj->m_address.m_data;
+                    }
+
+                    auto share_total = att * 65535;
+                    auto share_addr_w = att * static_cast<uint32_t>(65535 - don);
+                    auto share_don_w = att * don;
+
+                    // Partial last share if we'd exceed desired_weight
+                    if (result.total_weight + share_total > desired_weight) {
+                        auto remaining = desired_weight - result.total_weight;
+                        if (!share_total.IsNull()) {
+                            share_addr_w = remaining / 65535 * share_addr_w / (share_total / 65535);
+                            share_don_w = remaining / 65535 * share_don_w / (share_total / 65535);
+                        }
+                        share_total = remaining;
+                    }
+
+                    result.weights[script] = result.weights[script] + share_addr_w;
+                    result.total_weight = result.total_weight + share_total;
+                    result.total_donation_weight = result.total_donation_weight + share_don_w;
+                    next_cur = obj->m_prev_hash;
+                });
+                cur = next_cur;
+                if (result.total_weight >= desired_weight)
+                    break;
+            }
+            return result;
+        }
+
         // Get the full interval from start to end
         auto interval = chain.get_interval(start, end_hash);
 
@@ -631,9 +682,9 @@ public:
                          const std::vector<unsigned char>& donation_script)
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SHARE_PERIOD * 65535; // SPREAD ≈ SHARE_PERIOD for LTC
+                          * PoolConfig::SPREAD * 65535;
 
         auto [weights, total_weight, donation_weight] = get_cumulative_weights(best_share_hash, chain_len, max_weight);
 
@@ -791,9 +842,9 @@ public:
             return uint256{};
 
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SHARE_PERIOD * 65535;
+                          * PoolConfig::SPREAD * 65535;
         auto chain_len = std::min(height,
-                                  static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
 
         auto [weights, total_weight, donation_weight] =
             get_v36_merged_weights(prev_share_hash, chain_len, max_weight);
@@ -849,9 +900,9 @@ public:
                                 const std::vector<unsigned char>& donation_script)
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::REAL_CHAIN_LENGTH));
+                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SHARE_PERIOD * 65535;
+                          * PoolConfig::SPREAD * 65535;
 
         auto [weights, total_weight, donation_weight] =
             get_merged_cumulative_weights(best_share_hash, chain_len, max_weight, chain_id);

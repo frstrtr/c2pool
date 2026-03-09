@@ -147,6 +147,13 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
                 download_shares(peer, msg->m_best_share);
         }
 
+        // Advertise ourselves to the peer (matching Python p2pool sendAdvertisement)
+        {
+            auto port = core::Server::listen_port();
+            auto addrme_msg = ltc::message_addrme::make_raw(port);
+            peer->write(std::move(addrme_msg));
+        }
+
         return pool::PeerConnectionType::legacy;
 }
     

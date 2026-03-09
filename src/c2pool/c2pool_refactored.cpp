@@ -767,6 +767,15 @@ int main(int argc, char* argv[]) {
             ltc_p2p_config->init();
             ltc_p2p_config->m_testnet = settings->m_testnet;
 
+            // Set testnet flag for runtime constant selection (SHARE_PERIOD, CHAIN_LENGTH, etc.)
+            ltc::PoolConfig::is_testnet = settings->m_testnet;
+
+            // Override P2P prefix for testnet (init() loads mainnet prefix from YAML)
+            if (settings->m_testnet) {
+                ltc_p2p_config->pool()->m_prefix = ParseHexBytes(ltc::PoolConfig::TESTNET_PREFIX_HEX);
+                LOG_INFO << "P2P prefix set to testnet: " << ltc::PoolConfig::TESTNET_PREFIX_HEX;
+            }
+
             // For testnet, discard hardcoded mainnet bootstrap peers before Node construction
             // (Node constructor copies bootstrap_addrs into its addr store)
             if (settings->m_testnet)
@@ -947,11 +956,12 @@ int main(int argc, char* argv[]) {
             }
 
             // Donation script (protocol-level, goes to p2pool devs)
-            if (payout_manager) {
-                std::string dev_addr = payout_manager->get_developer_address();
-                if (!dev_addr.empty()) {
-                    web_server.get_mining_interface()->set_donation_script_from_address(dev_addr);
-                }
+            // Use the consensus donation script directly from PoolConfig (V36).
+            {
+                auto donation_script = ltc::PoolConfig::get_donation_script(36);
+                web_server.get_mining_interface()->set_donation_script(donation_script);
+                LOG_INFO << "Donation script set: V36 COMBINED_DONATION_SCRIPT ("
+                         << donation_script.size() << " bytes)";
             }
 
             // Wire the share tracker's best share hash into the mining interface
@@ -1047,7 +1057,7 @@ int main(int argc, char* argv[]) {
                         // far_share_hash
                         auto prev_height = tracker.chain.get_height(params.prev_share);
                         auto far_dist = std::min(
-                            static_cast<int32_t>(ltc::PoolConfig::REAL_CHAIN_LENGTH),
+                            static_cast<int32_t>(ltc::PoolConfig::real_chain_length()),
                             prev_height);
                         auto far_view = tracker.chain.get_chain(params.prev_share, static_cast<size_t>(far_dist));
                         uint256 last_hash = params.prev_share;

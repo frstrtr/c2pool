@@ -69,6 +69,8 @@ public:
 
 		LOG_INFO << "Factory started for port: " << listen_ep.port();
     }
+
+	uint16_t listen_port() const { return m_acceptor.local_endpoint().port(); }
 };
 
 class Client
