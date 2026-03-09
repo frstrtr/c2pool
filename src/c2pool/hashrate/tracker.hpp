@@ -40,6 +40,9 @@ private:
     uint64_t total_mining_shares_accepted_ = 0;
     double total_work_done_ = 0.0;
     
+    // Internal helper — must be called with shares_mutex_ already held
+    double get_current_hashrate_unlocked() const;
+    
 public:
     /**
      * @brief Record a new mining_share submission

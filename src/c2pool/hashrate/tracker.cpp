@@ -41,7 +41,10 @@ double HashrateTracker::get_current_difficulty() const {
 
 double HashrateTracker::get_current_hashrate() const {
     std::lock_guard<std::mutex> lock(shares_mutex_);
-    
+    return get_current_hashrate_unlocked();
+}
+
+double HashrateTracker::get_current_hashrate_unlocked() const {
     uint64_t now = static_cast<uint64_t>(std::time(nullptr));
     double work_done = 0.0;
     uint64_t time_window = 600; // 10 minutes
@@ -81,7 +84,7 @@ nlohmann::json HashrateTracker::get_statistics() const {
     
     return {
         {"current_difficulty", current_difficulty_},
-        {"current_hashrate", get_current_hashrate()},
+        {"current_hashrate", get_current_hashrate_unlocked()},
         {"total_mining_shares_submitted", total_mining_shares_submitted_},
         {"total_mining_shares_accepted", total_mining_shares_accepted_},
         {"total_work_done", total_work_done_},

@@ -1325,6 +1325,7 @@ int main(int argc, char* argv[]) {
             
             // Run until shutdown
             while (!g_shutdown_requested) {
+                ioc.restart();
                 ioc.run_for(std::chrono::milliseconds(100));
             }
             
@@ -1356,6 +1357,7 @@ int main(int argc, char* argv[]) {
             
             // Run until shutdown
             while (!g_shutdown_requested) {
+                ioc.restart();
                 ioc.run_for(std::chrono::milliseconds(100));
             }
             
@@ -1434,6 +1436,7 @@ int main(int argc, char* argv[]) {
             
             // Run until shutdown
             while (!g_shutdown_requested) {
+                ioc.restart();
                 ioc.run_for(std::chrono::milliseconds(100));
             }
         }

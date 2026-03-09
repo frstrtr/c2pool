@@ -2081,6 +2081,7 @@ void WebServer::accept_connections()
 
 void WebServer::handle_accept(beast::error_code ec, tcp::socket socket)
 {
+
     if (!ec) {
         // Create and run HTTP session
         std::make_shared<HttpSession>(std::move(socket), mining_interface_)->run();
