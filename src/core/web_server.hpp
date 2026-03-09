@@ -352,6 +352,7 @@ private:
     bool m_cached_raw_scripts{false};
     std::string m_cached_witness_commitment;
     std::vector<uint8_t> m_cached_mm_commitment;
+    std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
 
     // Share creation hook
     create_share_fn_t m_create_share_fn;

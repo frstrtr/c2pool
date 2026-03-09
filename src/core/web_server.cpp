@@ -407,9 +407,15 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     uint256 prev_hash;
     prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
 
-    // ntime and nonce from miner (hex strings, 4 bytes each LE)
+    // ntime and nonce from miner (hex strings, 4 bytes each, BE from Stratum)
     auto ntime_bytes = ParseHex(ntime);
     auto nonce_bytes = ParseHex(nonce);
+    auto bits_bytes  = ParseHex(m_cached_template.value("bits", std::string("1d00ffff")));
+
+    // Stratum/GBT sends these as big-endian hex; block header needs little-endian
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    std::reverse(bits_bytes.begin(),  bits_bytes.end());
 
     std::ostringstream block;
     // version LE
@@ -422,12 +428,12 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     block << HexStr(std::span<const unsigned char>(prev_hash.data(), 32));
     // merkle_root
     block << HexStr(std::span<const unsigned char>(merkle_root.data(), 32));
-    // ntime (4 bytes from miner, already LE hex)
-    block << ntime;
-    // nbits from template
-    block << m_cached_template.value("bits", std::string("1d00ffff"));
-    // nonce (4 bytes from miner, already LE hex)
-    block << nonce;
+    // ntime LE
+    block << HexStr(std::span<const unsigned char>(ntime_bytes.data(), ntime_bytes.size()));
+    // nbits LE
+    block << HexStr(std::span<const unsigned char>(bits_bytes.data(), bits_bytes.size()));
+    // nonce LE
+    block << HexStr(std::span<const unsigned char>(nonce_bytes.data(), nonce_bytes.size()));
 
     // Transaction count (varint) + coinbase + rest of transactions
     auto& txs = m_cached_template["transactions"];
@@ -465,6 +471,10 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
         if (tx.contains("data"))
             block << tx["data"].get<std::string>();
     }
+
+    // MWEB extension block (Litecoin): append HogEx flag + MWEB data
+    if (!m_cached_mweb.empty())
+        block << "01" << m_cached_mweb;
 
     return block.str();
 }
@@ -850,6 +860,8 @@ void MiningInterface::refresh_work()
         m_cached_raw_scripts      = pplns_raw_scripts;
         m_cached_witness_commitment = std::move(witness_commitment);
         m_cached_mm_commitment    = std::move(mm_commitment);
+        m_cached_mweb             = wd.m_data.contains("mweb")
+                                  ? wd.m_data["mweb"].get<std::string>() : "";
         m_work_valid              = true;
 
         LOG_INFO << "refresh_work: height=" << wd.m_data.value("height", 0)

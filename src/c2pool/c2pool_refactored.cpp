@@ -602,6 +602,14 @@ int main(int argc, char* argv[]) {
             rpc_port = 9332;  // fallback
     }
 
+    // Auto-detect P2P and Stratum ports for testnet if not explicitly set
+    if (settings->m_testnet) {
+        if (!cli_explicit.count("p2p_port"))
+            p2p_port = 19338;    // p2pool testnet convention (mainnet + 10012)
+        if (!cli_explicit.count("stratum_port"))
+            stratum_port = 19327; // p2pool testnet convention (mainnet + 10000)
+    }
+
     // Assemble p2pool-style --merged-coind-* flags into a merged spec
     if (merged_coind_rpc_port > 0 && !merged_coind_address.empty()) {
         // p2pool uses a single merged chain; detect symbol from P2P port or default to DOGE
@@ -753,10 +761,21 @@ int main(int argc, char* argv[]) {
                 });
             
             // Start P2P sharechain node for broadcasting new best-blocks to peers
-            auto ltc_p2p_config = std::make_unique<ltc::Config>("ltc");
-            // Load/create ~/.c2pool/ltc/{pool,coin}.yaml so bootstrap_addrs are available.
+            std::string p2p_config_dir = settings->m_testnet ? "ltc_testnet" : "ltc";
+            auto ltc_p2p_config = std::make_unique<ltc::Config>(p2p_config_dir);
+            // Load/create ~/.c2pool/{ltc,ltc_testnet}/{pool,coin}.yaml so bootstrap_addrs are available.
             ltc_p2p_config->init();
             ltc_p2p_config->m_testnet = settings->m_testnet;
+
+            // For testnet, discard hardcoded mainnet bootstrap peers before Node construction
+            // (Node constructor copies bootstrap_addrs into its addr store)
+            if (settings->m_testnet)
+                ltc_p2p_config->pool()->m_bootstrap_addrs.clear();
+            for (const auto& seed : seed_nodes) {
+                ltc_p2p_config->pool()->m_bootstrap_addrs.emplace_back(seed);
+                LOG_INFO << "Added seed node: " << seed;
+            }
+
             auto p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
@@ -794,12 +813,6 @@ int main(int argc, char* argv[]) {
                     } catch (...) {}
                     return 0; // RPC error or not found — safe default
                 });
-
-            // Inject seed nodes from -n flags into bootstrap list
-            for (const auto& seed : seed_nodes) {
-                ltc_p2p_config->pool()->m_bootstrap_addrs.emplace_back(seed);
-                LOG_INFO << "Added seed node: " << seed;
-            }
 
             // Begin actively connecting to outbound peers from bootstrap list / addr store
             p2p_node->start_outbound_connections();
