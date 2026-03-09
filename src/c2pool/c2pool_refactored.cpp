@@ -154,7 +154,7 @@ void print_help() {
     std::cout << "PORT CONFIGURATION:\n";
     std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
-    std::cout << "  --http-port PORT          HTTP/JSON-RPC API port (default: 9327)\n";
+    std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
@@ -242,8 +242,8 @@ int main(int argc, char* argv[]) {
     
     // Port configuration with p2pool-compatible defaults
     int p2p_port = 9326;           // P2Pool P2P sharechain port (p2pool default)
-    int http_port = 9327;          // HTTP/JSON-RPC API port (p2pool: -w / --worker-port)
-    int stratum_port = 0;          // Stratum mining port (0 = auto: http_port + 10)
+    int stratum_port = 9327;       // Stratum mining port (p2pool: -w / --worker-port)
+    int http_port = 8080;          // Web dashboard / JSON-RPC API port
     std::string http_host = "0.0.0.0";  // HTTP server host
 
     // Coin daemon RPC connection (used by integrated/solo modes for live block templates)
@@ -345,17 +345,13 @@ int main(int argc, char* argv[]) {
             p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("p2p_port");
         }
-        // Worker port (p2pool: -w / --worker-port) — sets HTTP API port
-        else if ((arg == "--worker-port" || arg == "-w") && i + 1 < argc) {
-            http_port = std::stoi(argv[++i]);
-            cli_explicit.insert("http_port");
-        }
-        // Explicit stratum port override (separate from worker port)
-        else if (arg == "--stratum-port" && i + 1 < argc) {
+        // Worker/Stratum port (p2pool: -w / --worker-port)
+        else if ((arg == "--worker-port" || arg == "-w" || arg == "--stratum-port") && i + 1 < argc) {
             stratum_port = std::stoi(argv[++i]);
             cli_explicit.insert("stratum_port");
         }
-        else if (arg == "--http-port" && i + 1 < argc) {
+        // Web dashboard / JSON-RPC API port
+        else if ((arg == "--http-port" || arg == "--web-port") && i + 1 < argc) {
             http_port = std::stoi(argv[++i]);
             cli_explicit.insert("http_port");
         }
@@ -535,8 +531,12 @@ int main(int argc, char* argv[]) {
                 p2p_port = cfg["port"].as<int>();
             if (!cli_explicit.count("stratum_port") && cfg["stratum_port"])
                 stratum_port = cfg["stratum_port"].as<int>();
-            if (!cli_explicit.count("http_port") && cfg["http_port"])
-                http_port = cfg["http_port"].as<int>();
+            if (!cli_explicit.count("http_port")) {
+                if (cfg["web_port"])
+                    http_port = cfg["web_port"].as<int>();
+                else if (cfg["http_port"])
+                    http_port = cfg["http_port"].as<int>();
+            }
             if (!cli_explicit.count("http_host") && cfg["http_host"])
                 http_host = cfg["http_host"].as<std::string>();
 
@@ -620,13 +620,11 @@ int main(int argc, char* argv[]) {
     if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
         node_owner_address = payout_address;
 
-    // Resolve stratum port: auto-assign to http_port + 10 if not explicitly set or conflicts
-    if (stratum_port == 0)
-        stratum_port = http_port + 10;
+    // Guard against port conflicts between stratum and web dashboard
     if (stratum_port == http_port) {
-        stratum_port = http_port + 10;
-        LOG_WARNING << "Stratum port conflicts with HTTP port " << http_port
-                    << ", using " << stratum_port;
+        LOG_WARNING << "Stratum port " << stratum_port << " conflicts with web dashboard port"
+                    << ", moving dashboard to " << (stratum_port + 1);
+        http_port = stratum_port + 1;
     }
     
     try {
@@ -720,8 +718,8 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Starting integrated C2Pool mining pool for " << blockchain_name 
                     << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
             LOG_INFO << "Port configuration:";
-            LOG_INFO << "  HTTP API (JSON-RPC): " << http_host << ":" << http_port;
             LOG_INFO << "  Stratum (mining):    " << http_host << ":" << stratum_port;
+            LOG_INFO << "  Web dashboard/API:   " << http_host << ":" << http_port;
             LOG_INFO << "  P2P (sharechain):    " << p2p_port;
             LOG_INFO << "Features: automatic difficulty adjustment, blockchain-specific address validation";
             
@@ -1317,8 +1315,8 @@ int main(int argc, char* argv[]) {
             
             LOG_INFO << "Integrated C2Pool Mining Pool started successfully!";
             LOG_INFO << "Blockchain: " << blockchain_name << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
-            LOG_INFO << "Mining interface: http://" << http_host << ":" << http_port;
             LOG_INFO << "Stratum interface: stratum+tcp://" << http_host << ":" << stratum_port;
+            LOG_INFO << "Web dashboard:     http://" << http_host << ":" << http_port;
             LOG_INFO << "Features enabled:";
             LOG_INFO << "  ✓ Blockchain-specific address validation";
             LOG_INFO << "  ✓ Automatic difficulty adjustment";
