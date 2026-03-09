@@ -313,7 +313,7 @@ bool SharechainLevelDBStore::open()
 
 void SharechainLevelDBStore::close()
 {
-    if (m_store) {
+    if (m_store && m_store->is_open()) {
         save_metadata();
         m_store->close();
     }

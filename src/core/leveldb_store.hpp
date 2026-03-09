@@ -59,6 +59,7 @@ public:
 
     bool open();
     void close();
+    bool is_open() const { return m_db != nullptr; }
 
     bool put(const std::string& key, const std::vector<uint8_t>& value);
     bool get(const std::string& key, std::vector<uint8_t>& value);

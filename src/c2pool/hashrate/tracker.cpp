@@ -100,6 +100,9 @@ void HashrateTracker::set_difficulty_bounds(double min_difficulty, double max_di
     std::lock_guard<std::mutex> lock(shares_mutex_);
     min_difficulty_ = min_difficulty;
     max_difficulty_ = max_difficulty;
+    // Start at min difficulty so any miner can begin submitting;
+    // VARDIFF will ramp up once we have share timing data.
+    current_difficulty_ = min_difficulty_;
 }
 
 void HashrateTracker::set_target_time_per_mining_share(double target_seconds) {

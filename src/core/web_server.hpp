@@ -152,6 +152,19 @@ public:
     double calculate_share_difficulty(const std::string& job_id, const std::string& extranonce1,
                                      const std::string& extranonce2, 
                                      const std::string& ntime, const std::string& nonce) const;
+    double calculate_share_difficulty(const std::string& coinb1, const std::string& coinb2,
+                                     const std::string& extranonce1, const std::string& extranonce2,
+                                     const std::string& ntime, const std::string& nonce) const;
+
+    // Fully self-contained difficulty calculation: all template data passed in.
+    // Does NOT acquire m_work_mutex — safe to call from any thread.
+    static double calculate_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches);
 
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = std::move(fn); }
@@ -466,9 +479,14 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     
     // Active jobs for stale detection (job_id → prevhash at time of issue)
     struct JobEntry {
-        std::string prevhash;
+        std::string prevhash;      // Stratum-format (swapped) for stale detection
+        std::string gbt_prevhash;  // Raw GBT previousblockhash (BE display hex) for header reconstruction
         std::string nbits;
         uint32_t    ntime{};
+        std::string coinb1;
+        std::string coinb2;
+        uint32_t    version{};
+        std::vector<std::string> merkle_branches;
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     static constexpr size_t MAX_ACTIVE_JOBS = 4; // keep last N jobs for late shares

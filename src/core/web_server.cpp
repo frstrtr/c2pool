@@ -338,7 +338,8 @@ MiningInterface::compute_merkle_branches(std::vector<std::string> tx_hashes_hex)
     // At each tree level: the first element of `current` is the sibling of our
     // path node. Consume it as a branch, then build the next level from the rest.
     while (!current.empty()) {
-        branches.push_back(current[0].GetHex());
+        // Store in internal byte order (Stratum format: raw SHA256d output hex)
+        branches.push_back(HexStr(std::span<const unsigned char>(current[0].data(), 32)));
         current.erase(current.begin());      // remove the sibling we just used
         if (current.empty()) break;
 
@@ -370,8 +371,11 @@ MiningInterface::reconstruct_merkle_root(const std::string& coinbase_hex,
     uint256 hash = Hash(coinbase_bytes);
 
     for (const auto& branch_hex : merkle_branches) {
+        // Branches are in internal byte order (Stratum format)
         uint256 branch;
-        branch.SetHex(branch_hex);
+        auto branch_bytes = ParseHex(branch_hex);
+        if (branch_bytes.size() == 32)
+            memcpy(branch.begin(), branch_bytes.data(), 32);
         hash = Hash(hash, branch);
     }
     return hash;
@@ -523,8 +527,8 @@ MiningInterface::build_coinbase_parts(
     const std::string& witness_commitment_hex,
     const std::string& op_return_hex)
 {
-    // coinb1 ends just before extranonce1; coinb2 starts just after extranonce1.
-    // With extranonce2_size=0: coinbase = coinb1 + extranonce1(4B) + coinb2
+    // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
+    // coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
     //
     // Coinbase tx wire layout:
     //   [version 4B][input_count 1B]
@@ -560,9 +564,8 @@ MiningInterface::build_coinbase_parts(
     }
     const int mm_bytes = static_cast<int>(mm_commitment.size());
 
-    // Total coinbase script length: height + extranonce1(4) + mm_commitment + pool_marker
-    // Note: extranonce2_size=0, so only extranonce1 (4 bytes)
-    const int script_total = height_bytes + 4 + mm_bytes + pool_marker_bytes;
+    // Total coinbase script length: height + extranonce1(4) + extranonce2(4) + mm_commitment + pool_marker
+    const int script_total = height_bytes + 4 + 4 + mm_bytes + pool_marker_bytes;
 
     // Build coinb1 (version + 1 input header up to + including the height encoding)
     std::ostringstream coinb1;
@@ -657,8 +660,10 @@ MiningInterface::build_connection_coinbase(
         mm_hex += HEX[b & 0x0f];
     }
 
-    // Full scriptSig hex = height + extranonce1 + mm + pool_marker
-    std::string scriptsig_hex = height_hex + extranonce1_hex + mm_hex + pool_marker_stripped;
+    // Full scriptSig hex = height + extranonce1 + extranonce2(zeros) + mm + pool_marker
+    // extranonce2 is 4 zero bytes; the miner fills in its own value at mining time
+    // but ref_hash is computed with zeros (matching what the share verifier expects)
+    std::string scriptsig_hex = height_hex + extranonce1_hex + "00000000" + mm_hex + pool_marker_stripped;
 
     // Decode to bytes for ref_hash computation
     std::vector<unsigned char> scriptsig_bytes;
@@ -1654,11 +1659,13 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         }
                     }
 
-                    // Convert string merkle branches to uint256
+                    // Convert string merkle branches to uint256 (internal byte order)
                     params.merkle_branches.reserve(m_cached_merkle_branches.size());
                     for (const auto& branch_hex : m_cached_merkle_branches) {
                         uint256 h;
-                        h.SetHex(branch_hex);
+                        auto branch_bytes = ParseHex(branch_hex);
+                        if (branch_bytes.size() == 32)
+                            memcpy(h.begin(), branch_bytes.data(), 32);
                         params.merkle_branches.push_back(h);
                     }
 
@@ -2217,7 +2224,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
-    hashrate_tracker_.set_difficulty_bounds(1.0, 65536.0);
+    hashrate_tracker_.set_difficulty_bounds(0.001, 65536.0);
     hashrate_tracker_.set_target_time_per_mining_share(15.0);
 }
 
@@ -2284,6 +2291,12 @@ void StratumSession::process_message(std::size_t bytes_read)
         }
         
         send_response(response);
+
+        // After subscribe response is sent, follow up with difficulty + work
+        if (method == "mining.subscribe") {
+            send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+            send_notify_work();
+        }
         
     } catch (const std::exception& e) {
         LOG_ERROR << "Error processing Stratum message: " << e.what();
@@ -2298,19 +2311,20 @@ nlohmann::json StratumSession::handle_subscribe(const nlohmann::json& params, co
     nlohmann::json response;
     response["id"] = request_id;
     response["result"] = nlohmann::json::array({
-        nlohmann::json::array({"mining.set_difficulty", subscription_id_}),
+        nlohmann::json::array({
+            nlohmann::json::array({"mining.set_difficulty", subscription_id_}),
+            nlohmann::json::array({"mining.notify", subscription_id_})
+        }),
         extranonce1_,
-        0  // extranonce2_size = 0 (p2pool: coinbase is deterministic per connection)
+        4  // extranonce2_size = 4 bytes
     });
     response["error"] = nullptr;
     
     LOG_INFO << "Mining subscription successful for: " << subscription_id_;
     
-    // Send initial difficulty from tracker
-    send_set_difficulty(hashrate_tracker_.get_current_difficulty());
-    
-    // Send initial work
-    send_notify_work();
+    // NOTE: set_difficulty + notify are sent from process_message()
+    // AFTER this response is written, so the miner gets the subscribe
+    // reply (with extranonce1) before any work notifications.
     
     return response;
 }
@@ -2432,9 +2446,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         return response;
     }
     
-    // Calculate share difficulty and verify it meets the session target
-    double share_difficulty = mining_interface_->calculate_share_difficulty(
-        job_id, extranonce1_, extranonce2, ntime, nonce);
+    // Calculate share difficulty using per-connection coinbase and job-specific template data
+    const auto& job = job_it->second;
+    double share_difficulty = MiningInterface::calculate_share_difficulty(
+        job.coinb1, job.coinb2,
+        extranonce1_, extranonce2, ntime, nonce,
+        job.version, job.gbt_prevhash, job.nbits, job.merkle_branches);
     double required_difficulty = hashrate_tracker_.get_current_difficulty();
     
     if (share_difficulty < required_difficulty) {
@@ -2519,6 +2536,33 @@ void StratumSession::send_set_difficulty(double difficulty)
     send_response(notification);
 }
 
+// Convert GBT previousblockhash (big-endian display hex) to Stratum prevhash format.
+// Stratum prevhash = internal LE bytes with each 4-byte chunk reversed.
+static std::string gbt_to_stratum_prevhash(const std::string& gbt_hex)
+{
+    if (gbt_hex.size() != 64) return gbt_hex;
+    // 1. Parse BE hex to bytes
+    std::vector<unsigned char> bytes;
+    bytes.reserve(32);
+    for (size_t i = 0; i < 64; i += 2)
+        bytes.push_back(static_cast<unsigned char>(
+            std::stoul(gbt_hex.substr(i, 2), nullptr, 16)));
+    // 2. Reverse to get internal LE  
+    std::reverse(bytes.begin(), bytes.end());
+    // 3. Reverse each 4-byte chunk
+    for (int i = 0; i < 32; i += 4)
+        std::reverse(bytes.begin() + i, bytes.begin() + i + 4);
+    // 4. Hex encode
+    static const char* HEX = "0123456789abcdef";
+    std::string result;
+    result.reserve(64);
+    for (unsigned char b : bytes) {
+        result += HEX[b >> 4];
+        result += HEX[b & 0x0f];
+    }
+    return result;
+}
+
 void StratumSession::send_notify_work()
 {
     nlohmann::json notification;
@@ -2529,23 +2573,29 @@ void StratumSession::send_notify_work()
 
     // Defaults (used when no live template is available yet)
     std::string prevhash = "0000000000000000000000000000000000000000000000000000000000000000";
+    std::string gbt_prevhash = "0000000000000000000000000000000000000000000000000000000000000000";
     std::string version  = "00000001";
+    uint32_t    version_u32 = 1;
     std::string nbits    = "1d00ffff";
     uint32_t    curtime  = static_cast<uint32_t>(std::time(nullptr));
     nlohmann::json merkle_branches = nlohmann::json::array();
+    std::vector<std::string> merkle_branches_vec;
     std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
     std::string coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
 
     // Override with live block template data if available
     auto tmpl = mining_interface_->get_current_work_template();
     if (!tmpl.empty() && !tmpl.is_null()) {
-        if (tmpl.contains("previousblockhash"))
-            prevhash = tmpl["previousblockhash"].get<std::string>();
+        if (tmpl.contains("previousblockhash")) {
+            gbt_prevhash = tmpl["previousblockhash"].get<std::string>();
+            prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
+        }
 
         if (tmpl.contains("version")) {
+            version_u32 = static_cast<uint32_t>(tmpl["version"].get<int>());
             std::ostringstream ss;
             ss << std::hex << std::setw(8) << std::setfill('0')
-               << tmpl["version"].get<int>();
+               << version_u32;
             version = ss.str();
         }
 
@@ -2567,7 +2617,8 @@ void StratumSession::send_notify_work()
     std::string ntime = ntime_ss.str();
 
     // Merkle branches
-    for (const auto& h : mining_interface_->get_stratum_merkle_branches())
+    merkle_branches_vec = mining_interface_->get_stratum_merkle_branches();
+    for (const auto& h : merkle_branches_vec)
         merkle_branches.push_back(h);
 
     // Per-connection coinbase: build with ref_hash from this session's extranonce1
@@ -2627,7 +2678,8 @@ void StratumSession::send_notify_work()
     while (active_jobs_.size() >= MAX_ACTIVE_JOBS) {
         active_jobs_.erase(active_jobs_.begin());
     }
-    active_jobs_[job_id] = {prevhash, nbits, curtime};
+    active_jobs_[job_id] = {prevhash, gbt_prevhash, nbits, curtime, coinb1, coinb2,
+                            version_u32, merkle_branches_vec};
 
     notification["params"] = nlohmann::json::array({
         job_id, prevhash, coinb1, coinb2, merkle_branches,
@@ -2705,17 +2757,20 @@ double MiningInterface::calculate_share_difficulty(const std::string& job_id, co
     // merkle_root (32 bytes)
     header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
 
-    // ntime (4 bytes from miner hex)
+    // ntime (4 bytes LE — miner sends BE hex, reverse for header)
     auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
     header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
 
-    // nbits (4 bytes from template hex)
+    // nbits (4 bytes LE — GBT gives BE hex, reverse for header)
     std::string bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
     auto bits_bytes = ParseHex(bits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
     header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
 
-    // nonce (4 bytes from miner hex)
+    // nonce (4 bytes LE — miner sends BE hex, reverse for header)
     auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
     header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
 
     if (header.size() != 80)
@@ -2736,6 +2791,136 @@ double MiningInterface::calculate_share_difficulty(const std::string& job_id, co
         return 0.0;
 
     // Convert pow_hash to a double (most significant bytes)
+    double hash_val = 0.0;
+    for (int i = 31; i >= 0; --i)
+        hash_val = hash_val * 256.0 + static_cast<double>(pow_hash.data()[i]);
+
+    if (hash_val == 0.0)
+        return 0.0;
+
+    return truediffone / hash_val;
+}
+
+double MiningInterface::calculate_share_difficulty(const std::string& coinb1, const std::string& coinb2,
+                                                   const std::string& extranonce1, const std::string& extranonce2,
+                                                   const std::string& ntime, const std::string& nonce) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+
+    if (!m_work_valid || m_cached_template.is_null())
+        return 0.0;
+
+    // Reconstruct coinbase from per-connection parts
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, m_cached_merkle_branches);
+
+    uint32_t version = m_cached_template.value("version", 536870912U);
+    uint256 prev_hash;
+    prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+
+    std::vector<unsigned char> header;
+    header.reserve(80);
+
+    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
+
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+
+    // ntime, nbits, nonce: miner/GBT sends as BE hex, header needs LE bytes
+    auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
+
+    std::string bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
+    auto bits_bytes = ParseHex(bits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
+    header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
+
+    auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
+
+    if (header.size() != 80)
+        return 0.0;
+
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+    static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+    if (pow_hash.IsNull())
+        return 0.0;
+
+    double hash_val = 0.0;
+    for (int i = 31; i >= 0; --i)
+        hash_val = hash_val * 256.0 + static_cast<double>(pow_hash.data()[i]);
+
+    if (hash_val == 0.0)
+        return 0.0;
+
+    return truediffone / hash_val;
+}
+
+/*static*/
+double MiningInterface::calculate_share_difficulty(
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches)
+{
+    // Reconstruct coinbase from per-connection parts
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, merkle_branches);
+
+    uint256 prev_hash;
+    prev_hash.SetHex(prevhash_hex);
+
+    std::vector<unsigned char> header;
+    header.reserve(80);
+
+    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
+
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+
+    // ntime: miner sends as BE hex, header needs LE bytes
+    auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
+    header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
+
+    // nbits: GBT sends as BE hex, header needs LE bytes
+    auto bits_bytes = ParseHex(nbits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
+    header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
+
+    // nonce: miner sends as BE hex, header needs LE bytes
+    auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
+    header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
+
+    if (header.size() != 80)
+        return 0.0;
+
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
+
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+
+    static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+    if (pow_hash.IsNull())
+        return 0.0;
+
     double hash_val = 0.0;
     for (int i = 31; i >= 0; --i)
         hash_val = hash_val * 256.0 + static_cast<double>(pow_hash.data()[i]);
