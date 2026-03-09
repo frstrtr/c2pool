@@ -388,29 +388,49 @@ std::string
 MiningInterface::build_block_from_stratum(const std::string& extranonce1,
                                           const std::string& extranonce2,
                                           const std::string& ntime,
-                                          const std::string& nonce) const
+                                          const std::string& nonce,
+                                          const JobSnapshot* job) const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
 
-    if (!m_work_valid || m_cached_template.is_null() || m_cached_coinb1.empty())
+    // When a JobSnapshot is provided, use its frozen template data.
+    // Otherwise fall back to the live m_cached_template (legacy/solo path).
+    const std::string& coinb1 = job ? job->coinb1 : m_cached_coinb1;
+    const std::string& coinb2 = job ? job->coinb2 : m_cached_coinb2;
+
+    if (coinb1.empty())
         return {};
 
     // Reconstruct coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
-    std::string coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
 
-    // Reconstruct merkle root
-    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, m_cached_merkle_branches);
+    // Reconstruct merkle root using the job's branches (or the live cache)
+    const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+    uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, branches);
 
-    // Build the 80-byte block header
-    // version (4 bytes LE) from cached template
-    uint32_t version = m_cached_template.value("version", 536870912U);
+    // Block header fields — from the job snapshot or the live template
+    uint32_t version;
     uint256 prev_hash;
-    prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+    std::string bits_hex;
+    bool segwit;
+    if (job) {
+        version = job->version ? job->version : 536870912U;
+        prev_hash.SetHex(job->gbt_prevhash.empty() ? std::string(64, '0') : job->gbt_prevhash);
+        bits_hex = job->nbits.empty() ? "1d00ffff" : job->nbits;
+        segwit = job->segwit_active;
+    } else {
+        if (!m_work_valid || m_cached_template.is_null())
+            return {};
+        version = m_cached_template.value("version", 536870912U);
+        prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+        bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
+        segwit = m_segwit_active;
+    }
 
     // ntime and nonce from miner (hex strings, 4 bytes each, BE from Stratum)
     auto ntime_bytes = ParseHex(ntime);
     auto nonce_bytes = ParseHex(nonce);
-    auto bits_bytes  = ParseHex(m_cached_template.value("bits", std::string("1d00ffff")));
+    auto bits_bytes  = ParseHex(bits_hex);
 
     // Stratum/GBT sends these as big-endian hex; block header needs little-endian
     std::reverse(ntime_bytes.begin(), ntime_bytes.end());
@@ -435,9 +455,24 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     // nonce LE
     block << HexStr(std::span<const unsigned char>(nonce_bytes.data(), nonce_bytes.size()));
 
+    // DEBUG: log the 80-byte header that will be submitted
+    {
+        std::string hdr = block.str();
+        LOG_INFO << "BLOCK_HEADER_HEX(160): " << hdr.substr(0, 160);
+        LOG_INFO << "BLOCK_HEADER miner_ntime=" << ntime << " miner_nonce=" << nonce;
+    }
+
     // Transaction count (varint) + coinbase + rest of transactions
-    auto& txs = m_cached_template["transactions"];
-    uint64_t tx_count = 1 + txs.size(); // coinbase + template txs
+    const auto& tx_list = job ? job->tx_data : std::vector<std::string>{};
+    // If no job snapshot, collect tx data from the live template
+    std::vector<std::string> live_tx_data;
+    if (!job && m_cached_template.contains("transactions")) {
+        for (const auto& tx : m_cached_template["transactions"])
+            if (tx.contains("data"))
+                live_tx_data.push_back(tx["data"].get<std::string>());
+    }
+    const auto& txs_hex = job ? tx_list : live_tx_data;
+    uint64_t tx_count = 1 + txs_hex.size(); // coinbase + template txs
     // Simple varint encoding
     if (tx_count < 0xfd)
         block << std::hex << std::setfill('0') << std::setw(2) << tx_count;
@@ -451,7 +486,7 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     // Stratum merkle tree.  For segwit blocks the block body must contain the
     // witness serialization which wraps the same data with marker/flag bytes
     // and a coinbase witness stack (BIP141: 1 item of 32 zero bytes).
-    if (m_segwit_active) {
+    if (segwit) {
         // Non-witness: [version 4B][input_count 1B][inputs…][outputs…][locktime 4B]
         // Witness:     [version 4B][00 01][input_count 1B][inputs…][outputs…]
         //              [witness_stack][locktime 4B]
@@ -467,14 +502,14 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     }
 
     // Remaining transactions from the template
-    for (const auto& tx : txs) {
-        if (tx.contains("data"))
-            block << tx["data"].get<std::string>();
+    for (const auto& tx_hex : txs_hex) {
+        block << tx_hex;
     }
 
     // MWEB extension block (Litecoin): append HogEx flag + MWEB data
-    if (!m_cached_mweb.empty())
-        block << "01" << m_cached_mweb;
+    const std::string& mweb_data = job ? job->mweb : m_cached_mweb;
+    if (!mweb_data.empty())
+        block << "01" << mweb_data;
 
     return block.str();
 }
@@ -902,6 +937,18 @@ std::pair<std::string, std::string> MiningInterface::get_coinbase_parts() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
     return { m_cached_coinb1, m_cached_coinb2 };
+}
+
+bool MiningInterface::get_segwit_active() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_segwit_active;
+}
+
+std::string MiningInterface::get_cached_mweb() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_mweb;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1467,7 +1514,8 @@ nlohmann::json MiningInterface::mining_authorize(const std::string& username, co
 }
 
 nlohmann::json MiningInterface::mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id,
-    const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses)
+    const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
+    const JobSnapshot* job)
 {
     LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id 
              << " - nonce: " << nonce << ", extranonce2: " << extranonce2 << ", ntime: " << ntime;
@@ -1544,7 +1592,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 }
             }
             
-            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce);
+            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
                 check_merged_mining(block_hex, extranonce1, extranonce2);
@@ -1557,9 +1605,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 std::string coinbase_hex;
                 uint256 expected_merkle;
                 {
-                    std::lock_guard<std::mutex> lock(m_work_mutex);
-                    coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
-                    expected_merkle = reconstruct_merkle_root(coinbase_hex, m_cached_merkle_branches);
+                    const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                    const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                    const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                    coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                    expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
                 }
 
                 if (header_merkle != expected_merkle) {
@@ -1636,10 +1686,15 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             params.nonce = static_cast<uint32_t>(std::stoul(nonce, nullptr, 16));
             params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
 
-            // Extract block template fields under the work mutex
+            // Extract block template fields — prefer job snapshot over live template
             {
                 std::lock_guard<std::mutex> lock(m_work_mutex);
-                if (m_work_valid) {
+                if (job) {
+                    params.block_version = job->version;
+                    params.prev_block_hash.SetHex(job->gbt_prevhash);
+                    params.bits = static_cast<uint32_t>(std::stoul(job->nbits, nullptr, 16));
+                    params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+                } else if (m_work_valid) {
                     params.block_version = m_cached_template.value("version", 536870912U);
                     if (m_cached_template.contains("previousblockhash")) {
                         params.prev_block_hash.SetHex(
@@ -1650,43 +1705,43 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             m_cached_template["bits"].get<std::string>(), nullptr, 16));
                     }
                     params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
-
-                    // Build coinbase scriptSig from coinb1 (contains BIP34 height + pool tag)
-                    // coinb1 = raw hex up to the extranonce insertion point
-                    // The scriptSig is inside the coinbase tx: after version(4) + vin_count(1)
-                    // + prevout_hash(32) + prevout_idx(4) + scriptSig_len comes the scriptSig.
-                    // For create_local_share, we pass the pool's coinbase tag.
-                    std::string full_coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
-                    // Extract scriptSig: parse the coinbase tx
-                    auto cb_bytes = ParseHex(full_coinbase_hex);
-                    if (cb_bytes.size() > 41) {
-                        // version(4) + vin_count(1) + prevout(36) = 41
-                        // Then varint scriptSig length, then scriptSig bytes
-                        size_t pos = 41;
-                        uint64_t scriptsig_len = cb_bytes[pos++];
-                        if (scriptsig_len < 0xfd && pos + scriptsig_len <= cb_bytes.size()) {
-                            params.coinbase_scriptSig.assign(
-                                cb_bytes.begin() + pos,
-                                cb_bytes.begin() + pos + scriptsig_len);
-                        }
-                    }
-
-                    // Convert string merkle branches to uint256 (internal byte order)
-                    params.merkle_branches.reserve(m_cached_merkle_branches.size());
-                    for (const auto& branch_hex : m_cached_merkle_branches) {
-                        uint256 h;
-                        auto branch_bytes = ParseHex(branch_hex);
-                        if (branch_bytes.size() == 32)
-                            memcpy(h.begin(), branch_bytes.data(), 32);
-                        params.merkle_branches.push_back(h);
-                    }
-
-                    // Segwit fields for SegwitData on the share
-                    params.segwit_active = m_segwit_active;
-                    if (m_segwit_active && m_cached_template.contains("default_witness_commitment"))
-                        params.witness_commitment_hex =
-                            m_cached_template["default_witness_commitment"].get<std::string>();
                 }
+
+                // Build coinbase scriptSig from coinb1 (contains BIP34 height + pool tag)
+                std::string full_coinbase_hex;
+                {
+                    const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                    const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                    full_coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                }
+                // Extract scriptSig: parse the coinbase tx
+                auto cb_bytes = ParseHex(full_coinbase_hex);
+                if (cb_bytes.size() > 41) {
+                    size_t pos = 41;
+                    uint64_t scriptsig_len = cb_bytes[pos++];
+                    if (scriptsig_len < 0xfd && pos + scriptsig_len <= cb_bytes.size()) {
+                        params.coinbase_scriptSig.assign(
+                            cb_bytes.begin() + pos,
+                            cb_bytes.begin() + pos + scriptsig_len);
+                    }
+                }
+
+                // Convert string merkle branches to uint256 (internal byte order)
+                const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                params.merkle_branches.reserve(branches.size());
+                for (const auto& branch_hex : branches) {
+                    uint256 h;
+                    auto branch_bytes = ParseHex(branch_hex);
+                    if (branch_bytes.size() == 32)
+                        memcpy(h.begin(), branch_bytes.data(), 32);
+                    params.merkle_branches.push_back(h);
+                }
+
+                // Segwit fields for SegwitData on the share
+                params.segwit_active = job ? job->segwit_active : m_segwit_active;
+                if (params.segwit_active && m_cached_template.contains("default_witness_commitment"))
+                    params.witness_commitment_hex =
+                        m_cached_template["default_witness_commitment"].get<std::string>();
             }
 
             if (!params.payout_script.empty() && params.bits != 0) {
@@ -1700,7 +1755,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // For now, build + validate for every share; the coin daemon rejects
         // invalid PoW anyway.
         if (m_coin_rpc && !extranonce1.empty()) {
-            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce);
+            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
                 check_merged_mining(block_hex, extranonce1, extranonce2);
@@ -1712,9 +1767,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 std::string coinbase_hex;
                 uint256 expected_merkle;
                 {
-                    std::lock_guard<std::mutex> lock(m_work_mutex);
-                    coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
-                    expected_merkle = reconstruct_merkle_root(coinbase_hex, m_cached_merkle_branches);
+                    const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                    const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                    const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                    coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                    expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
                 }
 
                 if (header_merkle != expected_merkle) {
@@ -2504,7 +2561,21 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
             merged_scripts[chain_id] = std::move(script);
         }
     }
-    mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts);
+
+    // Build a JobSnapshot from the frozen JobEntry data
+    MiningInterface::JobSnapshot snapshot;
+    snapshot.coinb1          = job.coinb1;
+    snapshot.coinb2          = job.coinb2;
+    snapshot.gbt_prevhash    = job.gbt_prevhash;
+    snapshot.nbits           = job.nbits;
+    snapshot.version         = job.version;
+    snapshot.merkle_branches = job.merkle_branches;
+    snapshot.tx_data         = job.tx_data;
+    snapshot.mweb            = job.mweb;
+    snapshot.segwit_active   = job.segwit_active;
+
+    mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
+        &snapshot);
     
     LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
@@ -2680,18 +2751,29 @@ void StratumSession::send_notify_work()
         }
     }
 
-    bool clean_jobs = true;
+    // clean_jobs = true only when prevhash changed (new block on chain)
+    bool clean_jobs = (prevhash != last_prevhash_);
+    last_prevhash_ = prevhash;
 
-    // Track this job for stale detection
-    if (clean_jobs) {
-        active_jobs_.clear();
-    }
-    // Evict oldest if at capacity
+    // Track this job — evict oldest if at capacity (keep MAX_ACTIVE_JOBS for late shares)
     while (active_jobs_.size() >= MAX_ACTIVE_JOBS) {
         active_jobs_.erase(active_jobs_.begin());
     }
     active_jobs_[job_id] = {prevhash, gbt_prevhash, nbits, curtime, coinb1, coinb2,
-                            version_u32, merkle_branches_vec};
+                            version_u32, merkle_branches_vec, {}, "", false};
+
+    // Populate tx_data, mweb, segwit_active from the current template snapshot
+    {
+        auto& je = active_jobs_[job_id];
+        je.segwit_active = mining_interface_->get_segwit_active();
+        je.mweb = mining_interface_->get_cached_mweb();
+        if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {
+            for (const auto& tx : tmpl["transactions"]) {
+                if (tx.contains("data"))
+                    je.tx_data.push_back(tx["data"].get<std::string>());
+            }
+        }
+    }
 
     notification["params"] = nlohmann::json::array({
         job_id, prevhash, coinb1, coinb2, merkle_branches,

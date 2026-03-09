@@ -120,10 +120,24 @@ public:
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
     
     // Stratum-style methods (for advanced miners)
+    // Job snapshot: holds all template data frozen at the time a mining job was sent.
+    // Passed to mining_submit / build_block_from_stratum so the submitted block
+    // matches the exact template the miner hashed (not the live/refreshed one).
+    struct JobSnapshot {
+        std::string coinb1, coinb2;
+        std::string gbt_prevhash;      // BE display hex
+        std::string nbits;             // BE hex e.g. "1e0fffff"
+        uint32_t    version{0};
+        std::vector<std::string> merkle_branches;
+        std::vector<std::string> tx_data;   // raw tx hex from GBT
+        std::string mweb;
+        bool        segwit_active{false};
+    };
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
     nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "",
-        const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses = {});
+        const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses = {},
+        const JobSnapshot* job = nullptr);
 
     // Enhanced coinbase and validation methods
     nlohmann::json validate_address(const std::string& address);
@@ -268,6 +282,11 @@ public:
     // Return coinb1 and coinb2 (coinbase parts split around extranonce)
     std::pair<std::string, std::string> get_coinbase_parts() const;
 
+    // Return whether segwit is active in the current template
+    bool get_segwit_active() const;
+    // Return the cached MWEB extension data (empty if none)
+    std::string get_cached_mweb() const;
+
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
@@ -292,11 +311,13 @@ private:
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
     static uint256 reconstruct_merkle_root(const std::string& coinbase_hex,
                                            const std::vector<std::string>& merkle_branches);
-    // Build full block hex from Stratum submit parameters
+    // Build full block hex from Stratum submit parameters.
+    // When job is provided, uses its frozen template data instead of the live m_cached_template.
     std::string build_block_from_stratum(const std::string& extranonce1,
                                          const std::string& extranonce2,
                                          const std::string& ntime,
-                                         const std::string& nonce) const;
+                                         const std::string& nonce,
+                                         const JobSnapshot* job = nullptr) const;
 
     // Try submitting to merged-mined aux chains if their target is met
     void check_merged_mining(const std::string& block_hex,
@@ -488,8 +509,12 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         std::string coinb2;
         uint32_t    version{};
         std::vector<std::string> merkle_branches;
+        std::vector<std::string> tx_data;     // raw tx hex from GBT template
+        std::string mweb;                      // MWEB extension data
+        bool        segwit_active{false};
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
+    std::string last_prevhash_;  // track prevhash for clean_jobs detection
     static constexpr size_t MAX_ACTIVE_JOBS = 4; // keep last N jobs for late shares
     
     // Per-worker statistics
