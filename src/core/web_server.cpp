@@ -60,7 +60,7 @@ void HttpSession::process_request()
 {
     // Create HTTP response
     http::response<http::string_body> response{http::status::ok, request_.version()};
-    response.set(http::field::server, "c2pool/1.0");
+    response.set(http::field::server, "c2pool/0.0.1");
     response.set(http::field::content_type, "application/json");
     response.set(http::field::access_control_allow_origin, "*");
     response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
@@ -1191,7 +1191,7 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
     }
     
     return {
-        {"version", "c2pool/1.0.0"},
+        {"version", "c2pool/0.0.1"},
         {"protocolversion", 70015},
         {"blocks", block_height},
         {"connections", connections},
