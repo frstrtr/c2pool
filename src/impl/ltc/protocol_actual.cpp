@@ -14,13 +14,23 @@ void Actual::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
     try 
     {
         result = m_handler.parse(rmsg);
-    } catch (const std::runtime_error& ec)
+    } catch (const std::exception& ec)
     {
-        // todo: error
+        LOG_WARNING << "Failed to parse message '" << rmsg->m_command << "' from "
+                    << peer->addr().to_string() << ": " << ec.what();
         return;
     }
 
-    std::visit([&](auto& msg){ handle(std::move(msg), peer); }, result);
+    try
+    {
+        std::visit([&](auto& msg){ handle(std::move(msg), peer); }, result);
+    }
+    catch (const std::exception& ec)
+    {
+        LOG_WARNING << "Handler error for '" << rmsg->m_command << "' from "
+                    << peer->addr().to_string() << ": " << ec.what();
+        return;
+    }
 
     std::cout << "c2pool msg " << rmsg->m_command << std::endl;
 }
@@ -94,8 +104,10 @@ void Actual::HANDLER(shares)
         {
             share = ltc::load_share(wrappedshare, peer->addr());
         }
-        catch(const std::invalid_argument& e)
+        catch(const std::exception& e)
         {
+            LOG_WARNING << "Failed to load share (type=" << wrappedshare.type
+                        << ") from " << peer->addr().to_string() << ": " << e.what();
             continue;
         }
 
@@ -151,8 +163,17 @@ void Actual::HANDLER(sharereply)
     {
         for (auto& rshare : msg->m_shares)
         {
-            auto share = ltc::load_share(rshare, peer->addr());
-            result.push_back(share);
+            try
+            {
+                auto share = ltc::load_share(rshare, peer->addr());
+                result.push_back(share);
+            }
+            catch(const std::exception& e)
+            {
+                LOG_WARNING << "Failed to deserialize share (type=" << rshare.type
+                            << ") from " << peer->addr().to_string() << ": " << e.what();
+                continue;
+            }
         }
     }
     got_share_reply(msg->m_id, result);

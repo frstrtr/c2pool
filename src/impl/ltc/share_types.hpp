@@ -135,7 +135,7 @@ struct MergedAddressEntry
     uint32_t m_chain_id;
     BaseScript m_script;
 
-    SERIALIZE_METHODS(MergedAddressEntry) { READWRITE(VarInt(obj.m_chain_id), obj.m_script); }
+    SERIALIZE_METHODS(MergedAddressEntry) { READWRITE(obj.m_chain_id, obj.m_script); }
 };
 
 // V36 merged mining: per-chain coinbase verification entry
@@ -150,7 +150,7 @@ struct MergedCoinbaseEntry
     template <typename StreamType>
     void Serialize(StreamType& os) const
     {
-        ::Serialize(os, Using<CompactFormat>(m_chain_id));
+        ::Serialize(os, m_chain_id);
         ::Serialize(os, Using<CompactFormat>(m_coinbase_value));
         ::Serialize(os, Using<CompactFormat>(m_block_height));
         ::Serialize(os, m_block_header);
@@ -161,7 +161,7 @@ struct MergedCoinbaseEntry
     template <typename StreamType>
     void Unserialize(StreamType& is)
     {
-        ::Unserialize(is, Using<CompactFormat>(m_chain_id));
+        ::Unserialize(is, m_chain_id);
         ::Unserialize(is, Using<CompactFormat>(m_coinbase_value));
         ::Unserialize(is, Using<CompactFormat>(m_block_height));
         ::Unserialize(is, m_block_header);

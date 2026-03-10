@@ -172,6 +172,23 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 	std::map<uint256, coin::MutableTransaction> all_new_txs;
 	for (auto& share : shares)
 	{
+        // Compute share hash if not yet set (deserialized shares have m_hash = 0)
+        if (share.hash().IsNull())
+        {
+            try
+            {
+                share.ACTION({
+                    obj->m_hash = share_init_verify(*obj, false);
+                });
+            }
+            catch (const std::exception& e)
+            {
+                LOG_WARNING << "Share hash/PoW verification failed from "
+                            << addr.to_string() << ": " << e.what();
+                continue;
+            }
+        }
+
         auto& new_txs = data.m_txs[share.hash()];
 		if (!new_txs.empty())
 		{

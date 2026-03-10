@@ -158,8 +158,6 @@ struct Formatter
             obj->m_nonce
         );
         
-        std::cout << obj->m_prev_hash.ToString() << " " << obj->m_coinbase.size() << " " << obj->m_nonce << std::endl;
-
         // Address handling — version-dependent
         if constexpr (version >= 36)
         {

@@ -349,7 +349,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
 // verification path from legacy Share::init().
 // ============================================================================
 template <typename ShareT>
-uint256 share_init_verify(const ShareT& share)
+uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 {
     // --- Basic validation ---
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
@@ -566,22 +566,68 @@ uint256 share_init_verify(const ShareT& share)
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = Hash(hdr_span);
 
+    // --- Debug: log header details for PoW diagnosis (first 3 shares) ---
+    {
+        static int dbg_count = 0;
+        if (dbg_count < 3)
+        {
+            ++dbg_count;
+            // header hex
+            std::string hdr_hex;
+            for (size_t i = 0; i < header_stream.size(); ++i)
+            {
+                char buf[3];
+                std::snprintf(buf, sizeof(buf), "%02x",
+                    static_cast<unsigned char>(
+                        reinterpret_cast<const char*>(header_stream.data())[i]));
+                hdr_hex += buf;
+            }
+            // scrypt hash
+            char pow_hash_bytes_dbg[32];
+            scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
+                                pow_hash_bytes_dbg);
+            uint256 pow_hash_dbg;
+            memcpy(pow_hash_dbg.begin(), pow_hash_bytes_dbg, 32);
+
+            uint256 target_dbg = chain::bits_to_target(share.m_bits);
+            uint256 target_hdr = chain::bits_to_target(share.m_min_header.m_bits);
+
+            LOG_WARNING << "=== PoW DEBUG share #" << dbg_count << " ==="
+                << "\n  header_size=" << header_stream.size()
+                << "\n  header_hex=" << hdr_hex
+                << "\n  share_hash=" << share_hash.GetHex()
+                << "\n  pow_hash  =" << pow_hash_dbg.GetHex()
+                << "\n  share.m_bits=" << share.m_bits
+                << " target=" << target_dbg.GetHex()
+                << "\n  hdr.m_bits  =" << share.m_min_header.m_bits
+                << " target=" << target_hdr.GetHex()
+                << "\n  hdr.m_version=" << share.m_min_header.m_version
+                << "\n  hdr.m_timestamp=" << share.m_min_header.m_timestamp
+                << "\n  hdr.m_nonce=" << share.m_min_header.m_nonce
+                << "\n  merkle_root=" << merkle_root.GetHex()
+                << "\n  prev_block =" << share.m_min_header.m_previous_block.GetHex();
+        }
+    }
+
     // --- PoW check (scrypt) ---
     // For Litecoin the POW_FUNC is scrypt(1024,1,1,256).
     // Blocks are identified by SHA256d, but PoW validity uses scrypt hash.
-    uint256 target = chain::bits_to_target(share.m_bits);
-    if (target.IsNull())
-        throw std::invalid_argument("share target is zero");
+    if (check_pow)
+    {
+        uint256 target = chain::bits_to_target(share.m_bits);
+        if (target.IsNull())
+            throw std::invalid_argument("share target is zero");
 
-    // Compute the scrypt hash of the 80-byte block header
-    char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
-                        pow_hash_bytes);
-    uint256 pow_hash;
-    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+        // Compute the scrypt hash of the 80-byte block header
+        char pow_hash_bytes[32];
+        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
+                            pow_hash_bytes);
+        uint256 pow_hash;
+        memcpy(pow_hash.begin(), pow_hash_bytes, 32);
 
-    if (pow_hash > target)
-        throw std::invalid_argument("share PoW hash does not meet target");
+        if (pow_hash > target)
+            throw std::invalid_argument("share PoW hash does not meet target");
+    }
 
     return share_hash;
 }
