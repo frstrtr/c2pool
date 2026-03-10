@@ -282,7 +282,8 @@ void MiningInterface::set_on_block_relay(std::function<void(const std::string&)>
 
 void MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
-                                          const std::string& extranonce2)
+                                          const std::string& extranonce2,
+                                          const JobSnapshot* job)
 {
     if (!m_mm_manager) return;
 
@@ -296,13 +297,15 @@ void MiningInterface::check_merged_mining(const std::string& block_hex,
     scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_bytes.data()),
                         reinterpret_cast<char*>(parent_hash.data()));
 
-    // Build stripped coinbase tx (no witness)
+    // Build stripped coinbase tx (no witness) — use per-job parts when available
     std::string coinbase_hex;
     std::vector<std::string> merkle_branches_copy;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
-        coinbase_hex = m_cached_coinb1 + extranonce1 + extranonce2 + m_cached_coinb2;
-        merkle_branches_copy = m_cached_merkle_branches;
+        const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+        const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+        coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+        merkle_branches_copy = job ? job->merkle_branches : m_cached_merkle_branches;
     }
 
     m_mm_manager->try_submit_merged_blocks(
@@ -1175,31 +1178,33 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
 
     // Validate prev_block_hash matches our cached template
     {
-        std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (m_work_valid && !m_cached_template.is_null()
-            && m_cached_template.contains("previousblockhash"))
+        bool is_stale = false;
         {
-            uint256 expected_prev;
-            expected_prev.SetHex(m_cached_template["previousblockhash"].get<std::string>());
-            if (submitted_prev_hash != expected_prev) {
-                LOG_WARNING << "submitblock: stale block — prev_hash mismatch"
-                            << " submitted=" << submitted_prev_hash.GetHex()
-                            << " expected=" << expected_prev.GetHex();
-                // Fire callback with orphan stale info (253)
-                if (m_on_block_submitted && hex_data.size() >= 160) {
-                    m_on_block_submitted(hex_data.substr(0, 160), 253);
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (m_work_valid && !m_cached_template.is_null()
+                && m_cached_template.contains("previousblockhash"))
+            {
+                uint256 expected_prev;
+                expected_prev.SetHex(m_cached_template["previousblockhash"].get<std::string>());
+                if (submitted_prev_hash != expected_prev) {
+                    LOG_WARNING << "submitblock: stale block — prev_hash mismatch"
+                                << " submitted=" << submitted_prev_hash.GetHex()
+                                << " expected=" << expected_prev.GetHex();
+                    is_stale = true;
                 }
-                return {{"error", "stale block: previous block hash mismatch"}};
+            }
+
+            // Reconstruct expected merkle_root from coinbase + merkle branches
+            if (!is_stale && !m_cached_coinb1.empty() && !m_cached_coinb2.empty()) {
+                LOG_INFO << "submitblock: merkle_root=" << submitted_merkle_root.GetHex();
             }
         }
-
-        // Reconstruct expected merkle_root from coinbase + merkle branches
-        if (!m_cached_coinb1.empty() && !m_cached_coinb2.empty()) {
-            // The pool's coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
-            // We can't know the miner's extranonce values for an external submitblock,
-            // so we log the submitted merkle_root for auditing but skip the comparison
-            // when the submit comes from the raw RPC endpoint.
-            LOG_INFO << "submitblock: merkle_root=" << submitted_merkle_root.GetHex();
+        // Fire stale callback OUTSIDE the lock to avoid deadlock
+        if (is_stale) {
+            if (m_on_block_submitted && hex_data.size() >= 160) {
+                m_on_block_submitted(hex_data.substr(0, 160), 253);
+            }
+            return {{"error", "stale block: previous block hash mismatch"}};
         }
     }
 
@@ -1603,7 +1608,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                check_merged_mining(block_hex, extranonce1, extranonce2);
+                check_merged_mining(block_hex, extranonce1, extranonce2, job);
 
                 // Validate merkle root before submitting
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
@@ -1781,7 +1786,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                check_merged_mining(block_hex, extranonce1, extranonce2);
+                check_merged_mining(block_hex, extranonce1, extranonce2, job);
 
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 uint256 header_merkle;

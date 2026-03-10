@@ -30,6 +30,7 @@ struct AuxChainConfig
     uint8_t     address_version{0};  // P2PKH version byte
     uint8_t     p2sh_version{0};     // P2SH version byte
     bool        multiaddress{true};  // true = getblocktemplate mode; false = createauxblock
+    std::string aux_payout_address;  // payout address for createauxblock (non-multiaddress mode)
 
     // P2P broadcaster (optional — for fast block relay to merged daemon)
     uint16_t    p2p_port{0};         // 0 = disabled; e.g. 22556 for DOGE

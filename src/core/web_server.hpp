@@ -322,7 +322,8 @@ private:
     // Try submitting to merged-mined aux chains if their target is met
     void check_merged_mining(const std::string& block_hex,
                              const std::string& extranonce1,
-                             const std::string& extranonce2);
+                             const std::string& extranonce2,
+                             const JobSnapshot* job = nullptr);
     
     // Internal state
     uint64_t m_work_id_counter;

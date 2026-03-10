@@ -931,11 +931,7 @@ int main(int argc, char* argv[]) {
                 web_server.set_on_block_relay([&coin_p2p](const std::string& full_block_hex) {
                     try {
                         auto block_bytes = ParseHex(full_block_hex);
-                        PackStream ps(block_bytes);
-                        ltc::coin::BlockType block;
-                        ps >> block;
-                        coin_p2p->submit_block(block);
-                        LOG_INFO << "Block relayed via P2P broadcaster";
+                        coin_p2p->submit_block_raw(block_bytes);
                     } catch (const std::exception& e) {
                         LOG_WARNING << "P2P block relay failed: " << e.what();
                     }
@@ -1180,7 +1176,14 @@ int main(int argc, char* argv[]) {
                     cfg.rpc_host     = parts[2];
                     cfg.rpc_port     = static_cast<uint16_t>(std::stoul(parts[3]));
                     cfg.rpc_userpass = parts[4] + ":" + parts[5];
-                    cfg.multiaddress = true;
+                    cfg.multiaddress = false;  // Use createauxblock/submitauxblock for now
+
+                    // DOGE testnet burn address (version 0x71, hash160 = zeros)
+                    // Used as payout address for createauxblock RPC
+                    if (cfg.symbol == "DOGE" && settings->m_testnet)
+                        cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
+                    else if (cfg.symbol == "DOGE")
+                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";  // mainnet burn
 
                     // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {

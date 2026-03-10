@@ -183,6 +183,22 @@ public:
         }
     }
 
+    /// Relay a pre-serialized block (Bitcoin wire format) via P2P.
+    /// Avoids BlockType deserialization which uses VarInt version.
+    void submit_block_raw(const std::vector<unsigned char>& block_bytes)
+    {
+        if (m_peer)
+        {
+            PackStream ps(block_bytes);
+            auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
+            m_peer->write(rmsg);
+            LOG_INFO << "Block relayed via P2P (raw, " << block_bytes.size() << " bytes)";
+        } else
+        {
+            LOG_ERROR << "No bitcoind connection for P2P block relay";
+        }
+    }
+
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
     //[x][x][x] void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol); //
     //[x][x][x] void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol); //
