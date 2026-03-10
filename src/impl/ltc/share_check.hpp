@@ -283,7 +283,9 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
         }
     }
 
+    size_t rs0 = ref_stream.size();
     ref_stream << p.prev_share;
+    size_t rs1 = ref_stream.size();
 
     // coinbase as VarStr
     {
@@ -292,6 +294,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
         ref_stream << bs;
     }
 
+    size_t rs2 = ref_stream.size();
     ref_stream << p.share_nonce;
     ref_stream << p.pubkey_hash;
     ref_stream << p.pubkey_type;
@@ -300,16 +303,20 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     ref_stream << p.stale_info;
     ::Serialize(ref_stream, VarInt(p.desired_version));
 
+    size_t rs3 = ref_stream.size();
     if (p.has_segwit)
         ref_stream << p.segwit_data;
 
+    size_t rs4 = ref_stream.size();
     ref_stream << p.merged_addresses;
+    size_t rs5 = ref_stream.size();
     ref_stream << p.far_share_hash;
     ref_stream << p.max_bits;
     ref_stream << p.bits;
     ref_stream << p.timestamp;
     ref_stream << p.absheight;
     ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
+    size_t rs6 = ref_stream.size();
     ref_stream << p.merged_coinbase_info;
     ref_stream << p.merged_payout_hash;
 
@@ -320,6 +327,29 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     auto ref_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 ref_hash = Hash(ref_span);
+
+    // Debug: log ref_hash and key fields at work-gen time
+    {
+        static int dbg_ref = 0;
+        if (dbg_ref < 3) {
+            ++dbg_ref;
+            LOG_WARNING << "=== REF_HASH_FN DEBUG #" << dbg_ref << " ==="
+                << "\n  ref_hash=" << ref_hash.GetHex()
+                << "\n  ref_stream_size=" << ref_stream.size()
+                << "\n  sizes: id=" << rs0 << " +prev=" << rs1 << " +cb=" << rs2
+                << " +fields=" << rs3 << " +segwit=" << rs4
+                << " +merged_addr=" << rs5 << " +abswork=" << rs6
+                << "\n  prev_share=" << p.prev_share.GetHex()
+                << "\n  coinbase_len=" << p.coinbase_scriptSig.size()
+                << "\n  max_bits=" << p.max_bits
+                << "\n  bits=" << p.bits
+                << "\n  timestamp=" << p.timestamp
+                << "\n  absheight=" << p.absheight
+                << "\n  merged_payout_hash=" << p.merged_payout_hash.GetHex()
+                << "\n  has_segwit=" << p.has_segwit
+                << "\n  segwit_branches=" << (p.has_segwit ? p.segwit_data.m_txid_merkle_link.m_branch.size() : 0);
+        }
+    }
 
     // Generate a random-ish last_txout_nonce
     uint64_t nonce = static_cast<uint64_t>(std::time(nullptr)) ^
@@ -1293,7 +1323,8 @@ uint256 create_local_share(
     StaleInfo stale_info = StaleInfo::none,
     bool segwit_active = false,
     const std::string& witness_commitment_hex = {},
-    const std::vector<unsigned char>& message_data = {})
+    const std::vector<unsigned char>& message_data = {},
+    const std::vector<unsigned char>& actual_coinbase_bytes = {})
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1425,8 +1456,11 @@ uint256 create_local_share(
                 reinterpret_cast<const std::byte*>(&byte), 1));
         }
     }
+    size_t s0 = ref_stream.size(); // after IDENTIFIER
     ref_stream << share.m_prev_hash;
+    size_t s1 = ref_stream.size(); // after prev_hash
     ref_stream << share.m_coinbase;
+    size_t s2 = ref_stream.size(); // after coinbase
     ref_stream << share.m_nonce;
     ref_stream << share.m_pubkey_hash;
     ref_stream << share.m_pubkey_type;
@@ -1434,16 +1468,20 @@ uint256 create_local_share(
     ref_stream << share.m_donation;
     { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
     ::Serialize(ref_stream, VarInt(share.m_desired_version));
+    size_t s3 = ref_stream.size(); // after desired_version
     // segwit_data (V36+, optional)
     if (share.m_segwit_data.has_value())
         ref_stream << share.m_segwit_data.value();
+    size_t s4 = ref_stream.size(); // after segwit_data
     ref_stream << share.m_merged_addresses;
+    size_t s5 = ref_stream.size(); // after merged_addresses
     ref_stream << share.m_far_share_hash;
     ref_stream << share.m_max_bits;
     ref_stream << share.m_bits;
     ref_stream << share.m_timestamp;
     ref_stream << share.m_absheight;
     ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
+    size_t s6 = ref_stream.size(); // after abswork
     ref_stream << share.m_merged_coinbase_info;
     ref_stream << share.m_merged_payout_hash;
     // V36 ref_type includes message_data (empty BaseScript → varint(0) = 0x00)
@@ -1452,6 +1490,36 @@ uint256 create_local_share(
     auto ref_span_v = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 hash_ref = Hash(ref_span_v);
+
+    // Debug: log ref_hash and key fields at share creation time
+    {
+        static int dbg_cls = 0;
+        if (dbg_cls < 3) {
+            ++dbg_cls;
+            // Also extract ref_hash from actual_coinbase_bytes (last 44 bytes: ref_hash(32) + nonce(8) + locktime(4))
+            uint256 coinbase_ref_hash;
+            if (actual_coinbase_bytes.size() >= 44) {
+                memcpy(coinbase_ref_hash.begin(), actual_coinbase_bytes.data() + actual_coinbase_bytes.size() - 44, 32);
+            }
+            LOG_WARNING << "=== CREATE_LOCAL_SHARE REF DEBUG #" << dbg_cls << " ==="
+                << "\n  computed_ref_hash=" << hash_ref.GetHex()
+                << "\n  coinbase_ref_hash=" << coinbase_ref_hash.GetHex()
+                << "\n  match=" << (hash_ref == coinbase_ref_hash ? "YES" : "NO")
+                << "\n  ref_stream_size=" << ref_stream.size()
+                << "\n  sizes: id=" << s0 << " +prev=" << s1 << " +cb=" << s2
+                << " +fields=" << s3 << " +segwit=" << s4
+                << " +merged_addr=" << s5 << " +abswork=" << s6
+                << "\n  prev_share=" << prev_share.GetHex()
+                << "\n  coinbase_len=" << coinbase.m_data.size()
+                << "\n  max_bits=" << share.m_max_bits
+                << "\n  bits=" << share.m_bits
+                << "\n  timestamp=" << share.m_timestamp
+                << "\n  absheight=" << share.m_absheight
+                << "\n  merged_payout_hash=" << share.m_merged_payout_hash.GetHex()
+                << "\n  has_segwit=" << share.m_segwit_data.has_value()
+                << "\n  segwit_branches=" << (share.m_segwit_data.has_value() ? share.m_segwit_data->m_txid_merkle_link.m_branch.size() : 0);
+        }
+    }
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
     // --- Build the full coinbase TX (non-witness) ---
@@ -1627,21 +1695,29 @@ uint256 create_local_share(
     // --- Compute hash_link from the coinbase prefix ---
     auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(36));
 
-    // The coinbase prefix for hash_link is everything in the tx BEFORE the ref_hash.
-    // In the coinbase, the ref_hash appears inside the OP_RETURN output, after 0x6a28.
-    // The prefix is: tx_data up to and including the VarStr header of the OP_RETURN
-    // script (which ends with 0x6a28), which is part of gentx_before_refhash.
-    //
+    // Use actual mined coinbase bytes if provided (avoids PPLNS rebuild mismatches).
+    // If not provided, fall back to the rebuilt coinbase (legacy path).
+    const auto& coinbase_for_hash = actual_coinbase_bytes.empty()
+        ? std::vector<unsigned char>(
+              reinterpret_cast<const unsigned char*>(gentx.data()),
+              reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size())
+        : actual_coinbase_bytes;
+
     // The split point: everything before ref_hash + last_txout_nonce + locktime
-    // = gentx_bytes minus last (32 + 8 + 4) = 44 bytes
-    auto gentx_bytes = std::vector<unsigned char>(
-        reinterpret_cast<const unsigned char*>(gentx.data()),
-        reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
-    size_t suffix_len = 32 + 8 + 4; // ref_hash + last_txout_nonce + locktime
-    if (gentx_bytes.size() > suffix_len) {
+    // = coinbase minus last (32 + 8 + 4) = 44 bytes
+    constexpr size_t suffix_len = 32 + 8 + 4; // ref_hash + last_txout_nonce + locktime
+    if (coinbase_for_hash.size() > suffix_len) {
         std::vector<unsigned char> prefix(
-            gentx_bytes.begin(), gentx_bytes.end() - suffix_len);
+            coinbase_for_hash.begin(), coinbase_for_hash.end() - suffix_len);
         share.m_hash_link = prefix_to_hash_link(prefix, gentx_before_refhash);
+
+        // Extract last_txout_nonce from actual coinbase bytes (8 bytes before locktime)
+        if (!actual_coinbase_bytes.empty()) {
+            size_t nonce_offset = coinbase_for_hash.size() - 4 - 8; // skip locktime(4), read nonce(8)
+            uint64_t extracted_nonce = 0;
+            std::memcpy(&extracted_nonce, coinbase_for_hash.data() + nonce_offset, 8);
+            share.m_last_txout_nonce = extracted_nonce;
+        }
     }
 
     // --- Compute share hash ---
@@ -1653,7 +1729,7 @@ uint256 create_local_share(
 
     // Compute merkle root from coinbase txid + merkle branches
     auto gentx_span = std::span<const unsigned char>(
-        reinterpret_cast<const unsigned char*>(gentx.data()), gentx.size());
+        coinbase_for_hash.data(), coinbase_for_hash.size());
     uint256 gentx_hash = Hash(gentx_span);
     uint256 merkle_root = check_merkle_link(gentx_hash, share.m_merkle_link);
 
@@ -1668,6 +1744,20 @@ uint256 create_local_share(
 
     // Set the share's identity hash
     share.m_hash = share_hash;
+
+    // --- Self-validate: verify the share passes PoW check ---
+    // This catches any mismatch between create_local_share and share_init_verify.
+    try {
+        uint256 verify_hash = share_init_verify(share, true);
+        if (verify_hash != share_hash) {
+            LOG_ERROR << "create_local_share: self-validation hash mismatch!"
+                      << " expected=" << share_hash.GetHex()
+                      << " got=" << verify_hash.GetHex();
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR << "create_local_share: self-validation FAILED: " << e.what()
+                  << " share=" << share_hash.GetHex();
+    }
 
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);

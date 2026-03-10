@@ -731,9 +731,21 @@ MiningInterface::build_connection_coinbase(
             m_cached_template["bits"].get<std::string>(), nullptr, 16));
     uint32_t timestamp = m_cached_template.value("curtime", uint32_t(0));
 
+    // Convert cached merkle branches (hex strings) to uint256 for ref_hash callback
+    std::vector<uint256> branches_u256;
+    branches_u256.reserve(m_cached_merkle_branches.size());
+    for (const auto& hex : m_cached_merkle_branches) {
+        uint256 h;
+        auto bytes = ParseHex(hex);
+        if (bytes.size() == 32)
+            memcpy(h.begin(), bytes.data(), 32);
+        branches_u256.push_back(h);
+    }
+
     auto [ref_hash, last_txout_nonce] = m_ref_hash_fn(
         scriptsig_bytes, payout_script, subsidy, bits, timestamp,
-        m_segwit_active, m_cached_witness_commitment, merged_addrs);
+        m_segwit_active, m_cached_witness_commitment, merged_addrs,
+        branches_u256);
 
     // Build OP_RETURN hex: 6a28 + ref_hash(32 LE) + last_txout_nonce(8 LE)
     std::string op_return_hex;
@@ -1721,7 +1733,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.block_version = job->version;
                     params.prev_block_hash.SetHex(job->gbt_prevhash);
                     params.bits = static_cast<uint32_t>(std::stoul(job->nbits, nullptr, 16));
-                    params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+                    params.subsidy = job->subsidy;
                 } else if (m_work_valid) {
                     params.block_version = m_cached_template.value("version", 536870912U);
                     if (m_cached_template.contains("previousblockhash")) {
@@ -1736,14 +1748,22 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 }
 
                 // Build coinbase scriptSig from coinb1 (contains BIP34 height + pool tag)
+                // Use PLACEHOLDER extranonce2 (zeros) for share.m_coinbase so the
+                // ref_hash matches what was embedded at job-creation time.
+                // The real coinbase (with actual extranonce2) is kept in
+                // full_coinbase_bytes for hash_link computation.
                 std::string full_coinbase_hex;
+                std::string placeholder_coinbase_hex;
                 {
                     const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
                     const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
                     full_coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                    // Build placeholder with zeros for extranonce2 (same size)
+                    std::string zero_en2(extranonce2.size(), '0');
+                    placeholder_coinbase_hex = cb1 + extranonce1 + zero_en2 + cb2;
                 }
-                // Extract scriptSig: parse the coinbase tx
-                auto cb_bytes = ParseHex(full_coinbase_hex);
+                // Extract scriptSig from PLACEHOLDER coinbase (zeros for extranonce2)
+                auto cb_bytes = ParseHex(placeholder_coinbase_hex);
                 if (cb_bytes.size() > 41) {
                     size_t pos = 41;
                     uint64_t scriptsig_len = cb_bytes[pos++];
@@ -1767,9 +1787,23 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
 
                 // Segwit fields for SegwitData on the share
                 params.segwit_active = job ? job->segwit_active : m_segwit_active;
-                if (params.segwit_active && m_cached_template.contains("default_witness_commitment"))
-                    params.witness_commitment_hex =
-                        m_cached_template["default_witness_commitment"].get<std::string>();
+                if (params.segwit_active) {
+                    if (job && !job->witness_commitment_hex.empty())
+                        params.witness_commitment_hex = job->witness_commitment_hex;
+                    else if (m_cached_template.contains("default_witness_commitment"))
+                        params.witness_commitment_hex =
+                            m_cached_template["default_witness_commitment"].get<std::string>();
+                }
+
+                // Pass the actual mined coinbase TX bytes for hash_link computation.
+                // This avoids PPLNS rebuild mismatches between work gen and submit.
+                if (!full_coinbase_hex.empty())
+                    params.full_coinbase_bytes = ParseHex(full_coinbase_hex);
+
+                // Use the share chain tip from work-generation time (stored in job)
+                // so ref_hash matches the one embedded in the coinbase OP_RETURN.
+                if (job)
+                    params.prev_share_hash = job->prev_share_hash;
             }
 
             if (!params.payout_script.empty() && params.bits != 0) {
@@ -2474,6 +2508,13 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         
         LOG_INFO << "Mining authorization successful for: " << username_;
         
+        // If merged addresses were parsed, resend work notification so the
+        // coinbase ref_hash includes them.  The initial job sent right after
+        // subscribe had empty merged_addresses because authorize hadn't run yet.
+        if (!merged_addresses_.empty() && mining_interface_) {
+            send_notify_work(true);  // force clean_jobs so miner drops old job without merged_addrs
+        }
+        
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = true;
@@ -2619,6 +2660,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.tx_data         = job.tx_data;
     snapshot.mweb            = job.mweb;
     snapshot.segwit_active   = job.segwit_active;
+    snapshot.prev_share_hash = job.prev_share_hash;
+    snapshot.subsidy         = job.subsidy;
+    snapshot.witness_commitment_hex = job.witness_commitment_hex;
 
     mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
         &snapshot);
@@ -2692,52 +2736,58 @@ static std::string gbt_to_stratum_prevhash(const std::string& gbt_hex)
     return result;
 }
 
-void StratumSession::send_notify_work()
+void StratumSession::send_notify_work(bool force_clean)
 {
+    // Don't send work until a valid block template is available
+    auto tmpl = mining_interface_->get_current_work_template();
+    if (tmpl.empty() || tmpl.is_null()) {
+        LOG_WARNING << "send_notify_work: no live template yet, retrying in 1s";
+        auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+        timer->expires_after(std::chrono::seconds(1));
+        timer->async_wait([this, self = shared_from_this(), timer](boost::system::error_code ec) {
+            if (!ec) send_notify_work();
+        });
+        return;
+    }
+
     nlohmann::json notification;
     notification["id"] = nullptr;
     notification["method"] = "mining.notify";
 
     std::string job_id  = "job_" + std::to_string(job_counter_.fetch_add(1));
 
-    // Defaults (used when no live template is available yet)
-    std::string prevhash = "0000000000000000000000000000000000000000000000000000000000000000";
-    std::string gbt_prevhash = "0000000000000000000000000000000000000000000000000000000000000000";
-    std::string version  = "00000001";
-    uint32_t    version_u32 = 1;
-    std::string nbits    = "1d00ffff";
+    std::string prevhash;
+    std::string gbt_prevhash;
+    std::string version;
+    uint32_t    version_u32;
+    std::string nbits;
     uint32_t    curtime  = static_cast<uint32_t>(std::time(nullptr));
     nlohmann::json merkle_branches = nlohmann::json::array();
     std::vector<std::string> merkle_branches_vec;
     std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
     std::string coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
 
-    // Override with live block template data if available
-    auto tmpl = mining_interface_->get_current_work_template();
-    if (!tmpl.empty() && !tmpl.is_null()) {
-        if (tmpl.contains("previousblockhash")) {
-            gbt_prevhash = tmpl["previousblockhash"].get<std::string>();
-            prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
-        }
+    // Populate from live block template
+    {
+        gbt_prevhash = tmpl.value("previousblockhash", "");
+        prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
 
-        if (tmpl.contains("version")) {
-            version_u32 = static_cast<uint32_t>(tmpl["version"].get<int>());
-            std::ostringstream ss;
-            ss << std::hex << std::setw(8) << std::setfill('0')
-               << version_u32;
-            version = ss.str();
-        }
+        version_u32 = static_cast<uint32_t>(tmpl.value("version", 0x20000000));
+        std::ostringstream ss;
+        ss << std::hex << std::setw(8) << std::setfill('0')
+           << version_u32;
+        version = ss.str();
 
         if (tmpl.contains("bits"))
             nbits = tmpl["bits"].get<std::string>();
+        else
+            nbits = "1d00ffff";
 
         if (tmpl.contains("curtime"))
             curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());
 
         LOG_INFO << "send_notify_work: live template height="
                  << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
-    } else {
-        LOG_WARNING << "send_notify_work: no live template, using placeholder work";
     }
 
     // Encode curtime as 8-hex-char (4-byte big-endian)
@@ -2797,8 +2847,8 @@ void StratumSession::send_notify_work()
         }
     }
 
-    // clean_jobs = true only when prevhash changed (new block on chain)
-    bool clean_jobs = (prevhash != last_prevhash_);
+    // clean_jobs = true when prevhash changed OR forced (e.g. after authorize)
+    bool clean_jobs = force_clean || (prevhash != last_prevhash_);
     last_prevhash_ = prevhash;
 
     // Track this job — evict oldest if at capacity (keep MAX_ACTIVE_JOBS for late shares)
@@ -2806,13 +2856,26 @@ void StratumSession::send_notify_work()
         active_jobs_.erase(active_jobs_.begin());
     }
     active_jobs_[job_id] = {prevhash, gbt_prevhash, nbits, curtime, coinb1, coinb2,
-                            version_u32, merkle_branches_vec, {}, "", false};
+                            version_u32, merkle_branches_vec, {}, "", false, {}, 0, ""};
 
-    // Populate tx_data, mweb, segwit_active from the current template snapshot
+    // Capture share chain tip for this job (must match ref_hash computation)
+    if (auto fn = mining_interface_->get_best_share_hash_fn())
+        active_jobs_[job_id].prev_share_hash = fn();
+
+    // Populate tx_data, mweb, segwit_active, subsidy, witness_commitment from snapshot
     {
         auto& je = active_jobs_[job_id];
         je.segwit_active = mining_interface_->get_segwit_active();
         je.mweb = mining_interface_->get_cached_mweb();
+
+        // Freeze subsidy and witness commitment at job creation time
+        auto cur_tmpl = mining_interface_->get_current_work_template();
+        if (!cur_tmpl.empty() && !cur_tmpl.is_null()) {
+            je.subsidy = cur_tmpl.value("coinbasevalue", uint64_t(0));
+            if (cur_tmpl.contains("default_witness_commitment"))
+                je.witness_commitment_hex = cur_tmpl["default_witness_commitment"].get<std::string>();
+        }
+
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {
             for (const auto& tx : tmpl["transactions"]) {
                 if (tx.contains("data"))

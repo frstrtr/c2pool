@@ -340,8 +340,10 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
     // Pack and send shares
     std::vector<chain::RawShare> rshares;
     rshares.reserve(shares.size());
-    for (auto& share : shares)
-        rshares.emplace_back(share.version(), pack(share));
+    for (size_t i = 0; i < shares.size(); ++i)
+    {
+        rshares.emplace_back(shares[i].version(), pack(shares[i]));
+    }
 
     auto shares_msg = message_shares::make_raw(rshares);
     peer->write(std::move(shares_msg));

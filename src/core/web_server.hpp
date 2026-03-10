@@ -132,6 +132,9 @@ public:
         std::vector<std::string> tx_data;   // raw tx hex from GBT
         std::string mweb;
         bool        segwit_active{false};
+        uint256     prev_share_hash;  // share chain tip when this job was built
+        uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
+        std::string witness_commitment_hex;  // BIP141 commitment frozen at job creation
     };
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
@@ -182,6 +185,7 @@ public:
 
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = std::move(fn); }
+    std::function<uint256()> get_best_share_hash_fn() const { return m_best_share_hash_fn; }
 
     // Hook: computes PPLNS expected payouts from the share tracker
     using pplns_fn_t = std::function<std::map<std::vector<unsigned char>, double>(
@@ -199,7 +203,8 @@ public:
         const std::vector<unsigned char>& payout_script,
         uint64_t subsidy, uint32_t bits, uint32_t timestamp,
         bool segwit_active, const std::string& witness_commitment_hex,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+        const std::vector<uint256>& merkle_branches)>;
     void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
 
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
@@ -226,6 +231,8 @@ public:
         int stale_info{0};  // 0=none, 253=orphan, 254=doa
         bool segwit_active{false};
         std::string witness_commitment_hex;  // default_witness_commitment from gbt
+        std::vector<unsigned char> full_coinbase_bytes;  // actual mined coinbase TX for hash_link
+        uint256 prev_share_hash;  // share chain tip at work-generation time
     };
     using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
@@ -513,6 +520,9 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         std::vector<std::string> tx_data;     // raw tx hex from GBT template
         std::string mweb;                      // MWEB extension data
         bool        segwit_active{false};
+        uint256     prev_share_hash;  // share chain tip when this job was built
+        uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
+        std::string witness_commitment_hex;  // BIP141 commitment frozen at job creation
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection
@@ -548,7 +558,7 @@ private:
     void send_response(const nlohmann::json& response);
     void send_error(int code, const std::string& message, const nlohmann::json& request_id);
     void send_set_difficulty(double difficulty);
-    void send_notify_work();
+    void send_notify_work(bool force_clean = false);
     
     std::string generate_extranonce1();
     

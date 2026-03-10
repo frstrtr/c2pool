@@ -209,7 +209,7 @@ struct BaseScript
     BaseScript(std::string str) : m_data(str.begin(), str.end()) { }
     BaseScript(const_iterator pbegin, const_iterator pend) : m_data(pbegin, pend) { }
     BaseScript(const unsigned char* pbegin, const unsigned char* pend) : m_data(pbegin, pend) { }
-    BaseScript(PackStream& stream) : m_data((unsigned char*)*stream.begin(), (unsigned char*)*stream.end()) { }
+    BaseScript(PackStream& stream) : m_data(reinterpret_cast<unsigned char*>(stream.data()), reinterpret_cast<unsigned char*>(stream.data()) + stream.size()) { }
 
     PackStream as_stream()
     {

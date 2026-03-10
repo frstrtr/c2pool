@@ -983,7 +983,8 @@ int main(int argc, char* argv[]) {
                     const std::vector<unsigned char>& payout_script,
                     uint64_t subsidy, uint32_t bits, uint32_t timestamp,
                     bool segwit_active, const std::string& witness_commitment_hex,
-                    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
+                    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
+                    const std::vector<uint256>& merkle_branches)
                     -> std::pair<uint256, uint64_t>
                 {
                     ltc::RefHashParams params;
@@ -1021,10 +1022,12 @@ int main(int argc, char* argv[]) {
                         params.pubkey_type = 0;
                     }
 
-                    // Segwit data
+                    // Segwit data — txid_merkle_link must match create_local_share
                     if (segwit_active && !witness_commitment_hex.empty()) {
                         params.has_segwit = true;
                         ltc::SegwitData sd;
+                        sd.m_txid_merkle_link.m_branch = merkle_branches;
+                        sd.m_txid_merkle_link.m_index  = 0;
                         // wtxid_merkle_root from witness commitment
                         if (witness_commitment_hex.size() >= 76) {
                             sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
@@ -1060,6 +1063,11 @@ int main(int argc, char* argv[]) {
                         for (auto it = far_view.begin(); it != far_view.end(); ++it)
                             last_hash = (*it).first;
                         params.far_share_hash = last_hash;
+
+                        // Merged payout hash: deterministic V36 PPLNS commitment.
+                        // Must match what create_local_share computes at submit time.
+                        params.merged_payout_hash = tracker.compute_merged_payout_hash(
+                            params.prev_share, chain::bits_to_target(bits));
                     }
 
                     return ltc::compute_ref_hash_for_work(params);
@@ -1082,8 +1090,10 @@ int main(int argc, char* argv[]) {
                     BaseScript coinbase;
                     coinbase.m_data = p.coinbase_scriptSig;
 
-                    // Previous best share in the tracker
-                    uint256 prev_share = p2p_node->best_share_hash();
+                    // Always use the frozen share chain tip from job creation time.
+                    // The ref_hash in the coinbase was computed with this prev_share,
+                    // so create_local_share must use the same value (even if null).
+                    uint256 prev_share = p.prev_share_hash;
 
                     // Convert merged_addresses map → vector<MergedAddressEntry>
                     std::vector<ltc::MergedAddressEntry> merged_addrs;
@@ -1112,17 +1122,23 @@ int main(int argc, char* argv[]) {
                         merged_addrs,
                         stale,
                         p.segwit_active,
-                        p.witness_commitment_hex);
+                        p.witness_commitment_hex,
+                        {},   // message_data
+                        p.full_coinbase_bytes);
 
                     // Broadcast to all connected peers
-                    p2p_node->broadcast_share(share_hash);
+                    try {
+                        p2p_node->broadcast_share(share_hash);
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "broadcast_share failed: " << e.what();
+                    }
 
                     LOG_INFO << "Share created and broadcast: "
                              << share_hash.GetHex().substr(0, 16) << "..."
                              << " subsidy=" << p.subsidy
                              << " merged_chains=" << merged_addrs.size();
                 } catch (const std::exception& e) {
-                    LOG_ERROR << "create_share_fn failed: " << e.what();
+                    LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
                 }
             });
 
