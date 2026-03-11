@@ -23,17 +23,6 @@ static long get_rss_mb() {
     return 0;
 }
 
-// Write directly to stderr (unbuffered) so we see output even if LOG is buffered
-static void rss_log(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    fprintf(stderr, "[RSS] ");
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    fflush(stderr);
-    va_end(args);
-}
-
 static constexpr long RSS_LIMIT_MB = 4000;  // abort if RSS exceeds 4GB
 
 namespace ltc
@@ -187,9 +176,6 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
     
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
-    long rss0 = get_rss_mb();
-    rss_log("processing_shares ENTER items=%zu rss=%ldMB", data.m_items.size(), rss0);
-
     // Step 1: Compute hashes for all shares FIRST so PreparedList can sort them.
     // Shares arrive with m_hash = 0 (hash is computed, not serialized).
     // Without valid hashes, PreparedList cannot topologically order shares.
@@ -219,16 +205,9 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
         valid_shares.push_back(share);
     }
 
-    long rss1 = get_rss_mb();
-    rss_log("hashes computed: valid=%zu fail=%d rss=%ldMB (+%ld)",
-            valid_shares.size(), verify_fail_count, rss1, rss1-rss0);
-
     // Step 2: Topologically sort valid shares by hash/prev_hash linkage
     chain::PreparedList<uint256, ShareType> prepare_shares(valid_shares);
     std::vector<ShareType> shares = prepare_shares.build_list();
-
-    long rss2 = get_rss_mb();
-    rss_log("build_list done shares=%zu rss=%ldMB (+%ld)", shares.size(), rss2, rss2-rss0);
 
     // Step 3: Process sorted shares
     int32_t new_count = 0;
@@ -238,14 +217,11 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 	{
 	    auto& share = shares[i];
 	    
-	    // Log RSS every 100 shares
+	    // Safety: abort if RSS exceeds limit
 	    if (i % 100 == 0) {
 	        long rss_now = get_rss_mb();
-	        rss_log("  share[%d/%zu] rss=%ldMB (+%ld) new=%d dup=%d chain=%zu",
-	                i, shares.size(), rss_now, rss_now-rss0,
-	                new_count, dup_count, m_tracker.chain.size());
 	        if (rss_now > RSS_LIMIT_MB) {
-	            rss_log("RSS LIMIT EXCEEDED (%ldMB > %ldMB) — aborting!", rss_now, RSS_LIMIT_MB);
+	            LOG_ERROR << "RSS LIMIT EXCEEDED (" << rss_now << "MB > " << RSS_LIMIT_MB << "MB) — aborting!";
 	            std::abort();
 	        }
 	    }
@@ -268,12 +244,7 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 
 		new_count++;
 
-		long rss_pre_add = get_rss_mb();
 		m_tracker.add(share);
-		long rss_post_add = get_rss_mb();
-		if (rss_post_add - rss_pre_add > 5)
-		    rss_log("  ADD share[%d] rss %ld->%ldMB (+%ld) chain_sz=%zu",
-		            i, rss_pre_add, rss_post_add, rss_post_add-rss_pre_add, m_tracker.chain.size());
 
 		// Periodically trim the chain DURING batch processing to bound memory.
 		if (new_count % 100 == 0) {
@@ -306,11 +277,6 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 			});
 		}
 	}
-
-    long rss_end = get_rss_mb();
-    rss_log("processing_shares DONE total=%zu new=%d fail=%d dup=%d rss=%ld->%ldMB (+%ld) chain=%zu",
-            shares.size(), new_count, verify_fail_count, dup_count,
-            rss0, rss_end, rss_end-rss0, m_tracker.chain.size());
 
     // NOTE: Do NOT call run_think() here. During download sync, the chain is
     // incomplete and run_think would mark verifiable shares as "bad" and ban
@@ -515,10 +481,7 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
                 return;
             }
 
-            LOG_INFO << "Received " << shares.size() << " shares for download request"
-                     << " RSS=" << get_rss_mb() << "MB";
-
-            rss_log("download_shares callback: %zu shares, rss=%ldMB", shares.size(), get_rss_mb());
+            LOG_INFO << "Received " << shares.size() << " shares for download request";
 
             // Feed into processing pipeline
             HandleSharesData data;

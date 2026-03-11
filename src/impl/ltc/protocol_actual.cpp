@@ -33,8 +33,6 @@ void Actual::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
                     << peer->addr().to_string() << ": " << ec.what();
         return;
     }
-
-    std::cout << "c2pool msg " << rmsg->m_command << std::endl;
 }
 
 void Actual::HANDLER(addrs) 

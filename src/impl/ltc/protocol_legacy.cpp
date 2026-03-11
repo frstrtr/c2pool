@@ -31,8 +31,6 @@ void Legacy::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
                     << peer->addr().to_string() << ": " << ec.what();
         return;
     }
-
-    std::cout << "p2pool msg " << rmsg->m_command << std::endl;
 }
 
 void Legacy::HANDLER(addrs) 
