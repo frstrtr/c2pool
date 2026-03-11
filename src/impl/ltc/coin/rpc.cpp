@@ -323,14 +323,15 @@ void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failu
     	LOG_ERROR << "Block submittal result: " << success << "(" << result.dump() << ") Expected: " << success_expected;
 }
 
-void NodeRPC::submit_block_hex(const std::string& block_hex, const std::string& mweb, bool ignore_failure)
+bool NodeRPC::submit_block_hex(const std::string& block_hex, const std::string& mweb, bool ignore_failure)
 {
 	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex + mweb});
 	bool success = result.is_null();
 	if (!success && !ignore_failure)
 		LOG_ERROR << "submit_block_hex result: " << result.dump();
-	else
+	else if (success)
 		LOG_INFO << "submit_block_hex accepted";
+	return success;
 }
 
 // RPC Methods

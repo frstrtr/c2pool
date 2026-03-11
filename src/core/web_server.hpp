@@ -134,7 +134,8 @@ public:
         bool        segwit_active{false};
         uint256     prev_share_hash;  // share chain tip when this job was built
         uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
-        std::string witness_commitment_hex;  // BIP141 commitment frozen at job creation
+        std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
+        uint256     witness_root;            // raw wtxid merkle root frozen at job creation
     };
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
@@ -199,18 +200,22 @@ public:
     // the miner's payout address (implicit via existing connection state).
     // Called per-connection during work generation.
     using ref_hash_fn_t = std::function<std::pair<uint256, uint64_t>(
+        const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
         const std::vector<unsigned char>& payout_script,
         uint64_t subsidy, uint32_t bits, uint32_t timestamp,
         bool segwit_active, const std::string& witness_commitment_hex,
+        const uint256& witness_root,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
         const std::vector<uint256>& merkle_branches)>;
     void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
 
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
     // then generates coinb1/coinb2 with full output set including OP_RETURN.
+    // prev_share_hash is frozen at the caller and passed in to avoid race conditions.
     // Returns (coinb1, coinb2) or empty strings if not possible.
     std::pair<std::string, std::string> build_connection_coinbase(
+        const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const;
@@ -230,7 +235,8 @@ public:
         std::vector<uint256> merkle_branches;
         int stale_info{0};  // 0=none, 253=orphan, 254=doa
         bool segwit_active{false};
-        std::string witness_commitment_hex;  // default_witness_commitment from gbt
+        std::string witness_commitment_hex;  // P2Pool witness commitment script hex
+        uint256 witness_root;                // raw wtxid merkle root (for SegwitData)
         std::vector<unsigned char> full_coinbase_bytes;  // actual mined coinbase TX for hash_link
         uint256 prev_share_hash;  // share chain tip at work-generation time
     };
@@ -293,6 +299,10 @@ public:
     bool get_segwit_active() const;
     // Return the cached MWEB extension data (empty if none)
     std::string get_cached_mweb() const;
+    // Return the P2Pool witness commitment hex (computed in refresh_work)
+    std::string get_cached_witness_commitment() const;
+    // Return the raw wtxid merkle root (computed in refresh_work)
+    uint256 get_cached_witness_root() const;
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
@@ -312,7 +322,7 @@ private:
         bool raw_scripts = false,
         const std::vector<uint8_t>& mm_commitment = {},
         const std::string& witness_commitment_hex = {},
-        const std::string& op_return_hex = {});
+        const std::string& ref_hash_hex = {});
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
@@ -380,6 +390,7 @@ private:
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
     bool m_cached_raw_scripts{false};
     std::string m_cached_witness_commitment;
+    uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
 
@@ -522,7 +533,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         bool        segwit_active{false};
         uint256     prev_share_hash;  // share chain tip when this job was built
         uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
-        std::string witness_commitment_hex;  // BIP141 commitment frozen at job creation
+        std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
+        uint256     witness_root;            // raw wtxid merkle root frozen at job creation
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection
@@ -537,6 +549,9 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // Maps chain_id → address string (e.g. 98 → "DQkw...").
     // Populated via mining.set_merged_addresses or from username format.
     std::map<uint32_t, std::string> merged_addresses_;
+
+    // Periodic work-push timer (fires every SHARE_PERIOD to keep miners on fresh work)
+    std::shared_ptr<boost::asio::steady_timer> work_push_timer_;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
@@ -559,6 +574,7 @@ private:
     void send_error(int code, const std::string& message, const nlohmann::json& request_id);
     void send_set_difficulty(double difficulty);
     void send_notify_work(bool force_clean = false);
+    void start_periodic_work_push();
     
     std::string generate_extranonce1();
     

@@ -67,16 +67,9 @@ inline uint32_t target_to_bits_upper_bound(const uint256& target)
         nWord = (static_cast<uint32_t>(d[nSize - 1]) << 16) |
                 (static_cast<uint32_t>(d[nSize - 2]) << 8) |
                 (static_cast<uint32_t>(d[nSize - 3]));
-        // Round UP: if target has any non-zero bytes below the top 3, increment
-        bool has_remainder = false;
-        for (int i = 0; i < nSize - 3; ++i) {
-            if (d[i] != 0) {
-                has_remainder = true;
-                break;
-            }
-        }
-        if (has_remainder)
-            ++nWord;
+        // NOTE: Python's FloatingInteger.from_target_upper_bound() does NOT
+        // round up when lower bytes are non-zero — it truncates.
+        // We must match Python's behavior for consensus compatibility.
         // Handle overflow of 3-byte mantissa
         if (nWord > 0x7fffff) {
             nWord >>= 8;

@@ -175,16 +175,31 @@ protected:
 
     // Cached best share hash from the most recent think() cycle
     uint256 m_best_share_hash;
+
+    // Cache of original raw serialized bytes keyed by share hash.
+    // Used for relay so we send the exact bytes we received, avoiding
+    // any round-trip serialization differences.
+    std::unordered_map<uint256, chain::RawShare, ShareHasher> m_raw_share_cache;
 };
 
 struct HandleSharesData
 {
     std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items; // original raw bytes, parallel with m_items
     std::map<uint256, std::vector<coin::MutableTransaction>> m_txs;
 
     void add(const ShareType& share, std::vector<coin::MutableTransaction> txs)
     {
         m_items.push_back(share);
+        m_raw_items.emplace_back(); // no cached raw bytes
+        m_txs[share.hash()] = std::move(txs);
+    }
+
+    void add(const ShareType& share, std::vector<coin::MutableTransaction> txs,
+             const chain::RawShare& raw)
+    {
+        m_items.push_back(share);
+        m_raw_items.push_back(raw);
         m_txs[share.hash()] = std::move(txs);
     }
 };

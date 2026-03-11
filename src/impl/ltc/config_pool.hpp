@@ -54,6 +54,25 @@ public:
     static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
     static uint32_t real_chain_length()  { return is_testnet ? TESTNET_REAL_CHAIN_LENGTH : REAL_CHAIN_LENGTH; }
 
+    // MAX_TARGET: share difficulty floor (easiest allowed)
+    // Mainnet: 2^256 / 2^20 - 1 (≈ 2^236)
+    // Testnet: 2^256 / 20 - 1   (≈ 2^251.7)  — must match Python litecoin_testnet.py
+    static uint256 max_target()
+    {
+        static const uint256 MAINNET_MAX = [] {
+            uint256 t;
+            t.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            return t;
+        }();
+        static const uint256 TESTNET_MAX = [] {
+            // 2^256 / 20 - 1
+            uint256 t;
+            t.SetHex("0ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb");
+            return t;
+        }();
+        return is_testnet ? TESTNET_MAX : MAINNET_MAX;
+    }
+
     // -----------------------------------------------------------------------
     // Consensus-critical donation scripts
     // Must match frstrtr/p2pool-merged-v36 p2pool/data.py exactly.

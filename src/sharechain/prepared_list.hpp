@@ -117,7 +117,9 @@ struct PreparedList
             while (tails.count(head->hash()))
             {
                 PreparedNode *merged_head = nullptr;
-                for (auto _head: tails[head->hash()])
+                auto right_entries = std::move(tails[head->hash()]);
+                tails.erase(head->hash());
+                for (auto _head: right_entries)
                 {
                     PreparedNode *new_head = make_node(*_head);
 //                    branch_heads[new_head->value.hash].insert(new_head);

@@ -316,6 +316,40 @@ void MiningInterface::check_merged_mining(const std::string& block_hex,
         parent_hash);
 }
 
+// ─── Witness merkle root computation ──────────────────────────────────────────
+// Compute the merkle root of a list of hashes (standard Bitcoin merkle tree).
+static uint256 compute_witness_merkle_root(std::vector<uint256> hashes) {
+    if (hashes.empty()) return uint256();
+    while (hashes.size() > 1) {
+        if (hashes.size() % 2 == 1)
+            hashes.push_back(hashes.back());
+        std::vector<uint256> next;
+        next.reserve(hashes.size() / 2);
+        for (size_t i = 0; i + 1 < hashes.size(); i += 2)
+            next.push_back(Hash(hashes[i], hashes[i + 1]));
+        hashes = std::move(next);
+    }
+    return hashes[0];
+}
+
+// P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
+static const unsigned char P2POOL_WITNESS_NONCE_BYTES[32] = {
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+    0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
+};
+
+// Compute the P2Pool witness commitment hex from a raw witness merkle root.
+// Returns the full script hex: "6a24aa21a9ed" + SHA256d(root || '[P2Pool]'*4)
+static std::string compute_p2pool_witness_commitment_hex(const uint256& witness_root) {
+    uint256 nonce;
+    std::memcpy(nonce.data(), P2POOL_WITNESS_NONCE_BYTES, 32);
+    uint256 commitment = Hash(witness_root, nonce);
+    return "6a24aa21a9ed" + HexStr(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(commitment.data()), 32));
+}
+
 // ─── Merkle branch computation ────────────────────────────────────────────────
 // Given the list of transaction hashes EXCLUDING the coinbase
 // (i.e. from getblocktemplate tx list), compute the Stratum merkle_branches
@@ -488,7 +522,7 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     // non-witness (stripped) serialization used for txid computation and the
     // Stratum merkle tree.  For segwit blocks the block body must contain the
     // witness serialization which wraps the same data with marker/flag bytes
-    // and a coinbase witness stack (BIP141: 1 item of 32 zero bytes).
+    // and a coinbase witness stack (BIP141: 1 item of 32 bytes = P2Pool nonce).
     if (segwit) {
         // Non-witness: [version 4B][input_count 1B][inputs…][outputs…][locktime 4B]
         // Witness:     [version 4B][00 01][input_count 1B][inputs…][outputs…]
@@ -498,7 +532,8 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
               << coinbase_hex.substr(8, coinbase_hex.size() - 16) // inputs + outputs
               << "01"                          // 1 stack item for the single coinbase input
               << "20"                          // 32 bytes
-              << std::string(64, '0')          // witness nonce (32 zero bytes)
+              // P2Pool witness nonce: '[P2Pool]' * 4
+              << "5b5032506f6f6c5d5b5032506f6f6c5d5b5032506f6f6c5d5b5032506f6f6c5d"
               << coinbase_hex.substr(coinbase_hex.size() - 8); // locktime
     } else {
         block << coinbase_hex;
@@ -573,22 +608,24 @@ MiningInterface::build_coinbase_parts(
     bool raw_scripts,
     const std::vector<uint8_t>& mm_commitment,
     const std::string& witness_commitment_hex,
-    const std::string& op_return_hex)
+    const std::string& ref_hash_hex)
 {
-    // coinb1 ends just before extranonce1; coinb2 starts just after extranonce2.
+    // P2Pool-compatible coinbase split: extranonce goes into last_txout_nonce,
+    // NOT into the scriptSig.  This way:
+    //   - scriptSig is fixed (no miner-variable data) → share.m_coinbase is deterministic
+    //   - hash_link prefix (everything before last 44 bytes) matches generate_transaction
+    //   - en1+en2 fill the 8-byte last_txout_nonce in OP_RETURN (part of hash_link suffix)
+    //
+    // coinb1 = everything up to and including ref_hash in the OP_RETURN output
+    // coinb2 = locktime only ("00000000")
     // coinbase = coinb1 + extranonce1(4B) + extranonce2(4B) + coinb2
     //
-    // Coinbase tx wire layout:
-    //   [version 4B][input_count 1B]
-    //   [prev_hash 32B][prev_idx 4B][script_len 1B][coinb1_script][{4B extranonce1}][coinb2_script]
-    //   [sequence 4B]
-    //   [output_count varint][outputs ...][locktime 4B]
+    // The en1+en2 become the P2Pool last_txout_nonce (8 bytes).
     //
     // Output ordering (must match generate_share_transaction()):
     //   1. Segwit witness commitment (if present) — value=0
-    //   2. PPLNS payout outputs (sorted by amount desc, script asc)
-    //   3. Donation output (subsidy - sum(payouts))
-    //   4. OP_RETURN commitment (0x6a28 + ref_hash + last_txout_nonce) — value=0
+    //   2. PPLNS payout outputs (sorted by amount asc, script asc) + donation last
+    //   3. OP_RETURN commitment (0x6a28 + ref_hash + last_txout_nonce) — value=0
 
     const int height = tmpl.value("height", 1);
     const std::string height_hex = encode_height_pushdata(height);
@@ -612,10 +649,10 @@ MiningInterface::build_coinbase_parts(
     }
     const int mm_bytes = static_cast<int>(mm_commitment.size());
 
-    // Total coinbase script length: height + extranonce1(4) + extranonce2(4) + mm_commitment + pool_marker
-    const int script_total = height_bytes + 4 + 4 + mm_bytes + pool_marker_bytes;
+    // ScriptSig: height + mm_commitment + pool_marker (NO extranonce!)
+    const int script_total = height_bytes + mm_bytes + pool_marker_bytes;
 
-    // Build coinb1 (version + 1 input header up to + including the height encoding)
+    // Build coinb1: entire coinbase TX up to and including ref_hash in OP_RETURN
     std::ostringstream coinb1;
     coinb1 << "01000000"   // version
            << "01"         // 1 input
@@ -624,62 +661,66 @@ MiningInterface::build_coinbase_parts(
            << std::hex << std::setfill('0') << std::setw(2) << script_total
            << height_hex;
 
-    // Build coinb2 (mm + pool marker + sequence + outputs + locktime)
-    std::ostringstream coinb2;
+    // scriptSig: mm + pool_marker (no en1/en2 — those go into last_txout_nonce)
     if (!mm_hex.empty())
-        coinb2 << mm_hex;
-    coinb2 << pool_marker_stripped
-           << "00000000";  // sequence = 0 (matches generate_share_transaction)
+        coinb1 << mm_hex;
+    coinb1 << pool_marker_stripped
+           << "ffffffff";  // sequence = 0xFFFFFFFF
 
-    // Count outputs: [segwit?] + PPLNS + [OP_RETURN?]
-    // Note: outputs already includes PPLNS payouts + donation (from caller)
+    // Count outputs: [segwit?] + PPLNS + OP_RETURN
     size_t num_outputs = outputs.size();
     if (!witness_commitment_hex.empty()) ++num_outputs;
-    if (!op_return_hex.empty()) ++num_outputs;
+    if (!ref_hash_hex.empty()) ++num_outputs;
 
     // Varint-encode output count
     if (num_outputs < 0xfd)
-        coinb2 << std::hex << std::setfill('0') << std::setw(2) << num_outputs;
+        coinb1 << std::hex << std::setfill('0') << std::setw(2) << num_outputs;
     else
-        coinb2 << "fd" << std::hex << std::setfill('0')
+        coinb1 << "fd" << std::hex << std::setfill('0')
                << std::setw(2) << (num_outputs & 0xff)
                << std::setw(2) << ((num_outputs >> 8) & 0xff);
 
     // Output 1: Segwit witness commitment (FIRST, matching generate_share_transaction)
     if (!witness_commitment_hex.empty()) {
-        coinb2 << encode_le64(0);   // 0 satoshis
+        coinb1 << encode_le64(0);   // 0 satoshis
         size_t wc_len = witness_commitment_hex.size() / 2;
-        coinb2 << std::hex << std::setfill('0') << std::setw(2) << wc_len;
-        coinb2 << witness_commitment_hex;
+        coinb1 << std::hex << std::setfill('0') << std::setw(2) << wc_len;
+        coinb1 << witness_commitment_hex;
     }
 
     // Outputs 2..N: PPLNS payouts + donation (already sorted by caller)
     for (const auto& [addr, amount] : outputs) {
-        coinb2 << encode_le64(amount);
+        coinb1 << encode_le64(amount);
         if (raw_scripts) {
             size_t script_len = addr.size() / 2;
-            coinb2 << std::hex << std::setfill('0') << std::setw(2) << script_len;
-            coinb2 << addr;
+            coinb1 << std::hex << std::setfill('0') << std::setw(2) << script_len;
+            coinb1 << addr;
         } else {
-            coinb2 << p2pkh_script(addr);
+            coinb1 << p2pkh_script(addr);
         }
     }
 
     // Output N+1: OP_RETURN commitment (LAST, matching generate_share_transaction)
-    if (!op_return_hex.empty()) {
-        coinb2 << encode_le64(0);   // 0 satoshis
-        size_t script_len = op_return_hex.size() / 2;
-        coinb2 << std::hex << std::setfill('0') << std::setw(2) << script_len;
-        coinb2 << op_return_hex;
+    // Script = 6a(OP_RETURN) + 28(PUSH_40) + ref_hash(32) + nonce(8)
+    // Total script = 42 bytes = 0x2a
+    // The nonce(8) bytes are filled by en1+en2 (between coinb1 and coinb2)
+    if (!ref_hash_hex.empty()) {
+        coinb1 << encode_le64(0);   // 0 satoshis
+        coinb1 << "2a";             // script length = 42
+        coinb1 << "6a28";           // OP_RETURN + PUSH_40
+        coinb1 << ref_hash_hex;     // 32 bytes = 64 hex chars
+        // nonce (8 bytes) = en1+en2 goes HERE (between coinb1 and coinb2)
     }
 
-    coinb2 << "00000000"; // locktime
+    // coinb2 is just locktime
+    std::string coinb2 = "00000000";
 
-    return { coinb1.str(), coinb2.str() };
+    return { coinb1.str(), coinb2 };
 }
 
 std::pair<std::string, std::string>
 MiningInterface::build_connection_coinbase(
+    const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
@@ -688,12 +729,10 @@ MiningInterface::build_connection_coinbase(
     if (!m_work_valid || m_cached_template.is_null())
         return {};
 
-    // Build the full coinbase scriptSig for this connection:
-    //   BIP34_height + extranonce1 + mm_commitment + pool_marker
+    // Build the coinbase scriptSig (FIXED — no extranonce1/2):
+    //   BIP34_height + mm_commitment + pool_marker
     // This is share.m_coinbase and determines ref_hash.
-    //
-    // Parse height from coinb1 (already contains height encoding)
-    // Actually, we rebuild the scriptSig from scratch:
+    // extranonce1+extranonce2 go into last_txout_nonce (OP_RETURN), not scriptSig.
     const int height = m_cached_template.value("height", 1);
     std::string height_hex = encode_height_pushdata(height);
 
@@ -708,10 +747,8 @@ MiningInterface::build_connection_coinbase(
         mm_hex += HEX[b & 0x0f];
     }
 
-    // Full scriptSig hex = height + extranonce1 + extranonce2(zeros) + mm + pool_marker
-    // extranonce2 is 4 zero bytes; the miner fills in its own value at mining time
-    // but ref_hash is computed with zeros (matching what the share verifier expects)
-    std::string scriptsig_hex = height_hex + extranonce1_hex + "00000000" + mm_hex + pool_marker_stripped;
+    // ScriptSig: height + mm + pool_marker (NO extranonce!)
+    std::string scriptsig_hex = height_hex + mm_hex + pool_marker_stripped;
 
     // Decode to bytes for ref_hash computation
     std::vector<unsigned char> scriptsig_bytes;
@@ -743,27 +780,23 @@ MiningInterface::build_connection_coinbase(
     }
 
     auto [ref_hash, last_txout_nonce] = m_ref_hash_fn(
+        prev_share_hash,
         scriptsig_bytes, payout_script, subsidy, bits, timestamp,
-        m_segwit_active, m_cached_witness_commitment, merged_addrs,
-        branches_u256);
+        m_segwit_active, m_cached_witness_commitment, m_cached_witness_root,
+        merged_addrs, branches_u256);
 
-    // Build OP_RETURN hex: 6a28 + ref_hash(32 LE) + last_txout_nonce(8 LE)
-    std::string op_return_hex;
+    // Build ref_hash hex (32 bytes LE)
+    std::string ref_hash_hex;
     {
-        op_return_hex += "6a28";
         auto ref_chars = ref_hash.GetChars();
         for (unsigned char b : ref_chars) {
-            op_return_hex += HEX[b >> 4];
-            op_return_hex += HEX[b & 0x0f];
-        }
-        for (int i = 0; i < 8; ++i) {
-            unsigned char b = static_cast<unsigned char>((last_txout_nonce >> (i * 8)) & 0xFF);
-            op_return_hex += HEX[b >> 4];
-            op_return_hex += HEX[b & 0x0f];
+            ref_hash_hex += HEX[b >> 4];
+            ref_hash_hex += HEX[b & 0x0f];
         }
     }
 
-    // Call build_coinbase_parts with the OP_RETURN
+    // Call build_coinbase_parts with ref_hash
+    // The last_txout_nonce will be filled by en1+en2 at mining time
     return build_coinbase_parts(
         m_cached_template,
         subsidy,
@@ -771,7 +804,7 @@ MiningInterface::build_connection_coinbase(
         m_cached_raw_scripts,
         m_cached_mm_commitment,
         m_cached_witness_commitment,
-        op_return_hex);
+        ref_hash_hex);
 }
 
 // Decode a Base58Check‐encoded address (P2PKH or P2SH) and return the
@@ -841,6 +874,7 @@ void MiningInterface::refresh_work()
         std::vector<std::pair<std::string,uint64_t>> pplns_outputs;
         bool pplns_raw_scripts = false;
         std::string witness_commitment;
+        uint256 witness_root;
         std::vector<uint8_t> mm_commitment;
 
         try {
@@ -858,26 +892,56 @@ void MiningInterface::refresh_work()
 
                     if (!expected.empty()) {
                         static const char* HEX = "0123456789abcdef";
+
+                        // Convert donation script to hex for identification
+                        std::string donation_script_hex;
+                        for (unsigned char b : m_donation_script) {
+                            donation_script_hex += HEX[b >> 4];
+                            donation_script_hex += HEX[b & 0x0f];
+                        }
+
+                        // Separate PPLNS outputs from donation output
+                        std::pair<std::string, uint64_t> donation_entry;
+                        bool found_donation = false;
+
                         for (const auto& [script_bytes, amount] : expected) {
                             uint64_t sat = static_cast<uint64_t>(amount);
-                            if (sat == 0) continue;
                             std::string hex;
                             hex.reserve(script_bytes.size() * 2);
                             for (unsigned char b : script_bytes) {
                                 hex += HEX[b >> 4];
                                 hex += HEX[b & 0x0f];
                             }
-                            pplns_outputs.push_back({std::move(hex), sat});
+                            if (hex == donation_script_hex) {
+                                donation_entry = {hex, sat};
+                                found_donation = true;
+                            } else {
+                                if (sat == 0) continue; // Only skip zero-value PPLNS outputs
+                                pplns_outputs.push_back({std::move(hex), sat});
+                            }
                         }
+
+                        // Sort PPLNS by (amount ascending, script ascending)
+                        // matching Python's sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
+                        std::sort(pplns_outputs.begin(), pplns_outputs.end(),
+                            [](const auto& a, const auto& b) {
+                                if (a.second != b.second) return a.second < b.second;
+                                return a.first < b.first;
+                            });
+                        constexpr size_t MAX_PPLNS = 4000;
+                        if (pplns_outputs.size() > MAX_PPLNS)
+                            pplns_outputs.erase(pplns_outputs.begin(),
+                                                pplns_outputs.end() - MAX_PPLNS);
+
+                        // Donation output LAST among value outputs
+                        // (matches Python's generate_transaction: payouts + [donation] + OP_RETURN)
+                        if (found_donation)
+                            pplns_outputs.push_back(donation_entry);
+
                         pplns_raw_scripts = true;
                         LOG_INFO << "refresh_work: V36 PPLNS coinbase with "
-                                 << pplns_outputs.size() << " outputs";
-                        for (size_t i = 0; i < pplns_outputs.size(); ++i) {
-                            LOG_INFO << "  PPLNS output[" << i << "]: "
-                                     << pplns_outputs[i].second << " sat  script="
-                                     << pplns_outputs[i].first.substr(0, 50)
-                                     << (pplns_outputs[i].first.size() > 50 ? "..." : "");
-                        }
+                                 << pplns_outputs.size() << " outputs (donation_last="
+                                 << found_donation << ")";
                     }
                 }
             }
@@ -890,14 +954,29 @@ void MiningInterface::refresh_work()
             if (m_mm_manager)
                 mm_commitment = m_mm_manager->get_auxpow_commitment();
 
-            // BIP141: extract segwit witness commitment from template
+            // BIP141: compute P2Pool witness commitment from template transactions
             if (wd.m_data.contains("rules")) {
                 auto rules = wd.m_data["rules"].get<std::vector<std::string>>();
                 segwit_active = std::any_of(rules.begin(), rules.end(),
                     [](const auto& r) { return r == "segwit" || r == "!segwit"; });
             }
-            if (segwit_active && wd.m_data.contains("default_witness_commitment"))
-                witness_commitment = wd.m_data["default_witness_commitment"].get<std::string>();
+            if (segwit_active && wd.m_data.contains("transactions")) {
+                // Compute raw wtxid merkle root from block template transactions
+                std::vector<uint256> wtxids;
+                uint256 zero;  // coinbase wtxid = 0x00
+                wtxids.push_back(zero);
+                for (auto& tx : wd.m_data["transactions"]) {
+                    uint256 wtxid;
+                    if (tx.is_object() && tx.contains("hash"))
+                        wtxid.SetHex(tx["hash"].get<std::string>());
+                    else if (tx.is_object() && tx.contains("txid"))
+                        wtxid.SetHex(tx["txid"].get<std::string>());
+                    wtxids.push_back(wtxid);
+                }
+                witness_root = compute_witness_merkle_root(std::move(wtxids));
+                // P2Pool commitment: SHA256d(witness_root || '[P2Pool]'*4)
+                witness_commitment = compute_p2pool_witness_commitment_hex(witness_root);
+            }
 
             // Build fallback coinbase (without OP_RETURN, for non-p2pool or initial work)
             cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, pplns_outputs,
@@ -917,6 +996,7 @@ void MiningInterface::refresh_work()
         m_cached_pplns_outputs    = std::move(pplns_outputs);
         m_cached_raw_scripts      = pplns_raw_scripts;
         m_cached_witness_commitment = std::move(witness_commitment);
+        m_cached_witness_root       = witness_root;
         m_cached_mm_commitment    = std::move(mm_commitment);
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
@@ -972,6 +1052,18 @@ std::string MiningInterface::get_cached_mweb() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
     return m_cached_mweb;
+}
+
+std::string MiningInterface::get_cached_witness_commitment() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_witness_commitment;
+}
+
+uint256 MiningInterface::get_cached_witness_root() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_witness_root;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1222,15 +1314,17 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
 
     if (m_coin_rpc) {
         try {
-            m_coin_rpc->submit_block_hex(hex_data, "", false);
+            bool accepted = m_coin_rpc->submit_block_hex(hex_data, "", false);
             LOG_INFO << "Block forwarded to coin daemon";
-            // Notify P2P layer with stale_info=0 (none — accepted)
-            if (m_on_block_submitted && hex_data.size() >= 160) {
-                m_on_block_submitted(hex_data.substr(0, 160), 0);
-            }
-            // Relay full block via P2P for fast propagation
-            if (m_on_block_relay) {
-                m_on_block_relay(hex_data);
+            if (accepted) {
+                // Notify P2P layer with stale_info=0 (none — accepted)
+                if (m_on_block_submitted && hex_data.size() >= 160) {
+                    m_on_block_submitted(hex_data.substr(0, 160), 0);
+                }
+                // Relay full block via P2P for fast propagation
+                if (m_on_block_relay) {
+                    m_on_block_relay(hex_data);
+                }
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "submitblock failed: " << e.what();
@@ -1606,44 +1700,53 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Check if share meets network difficulty and attempt block submission
         if (m_coin_rpc && !extranonce1.empty()) {
-            double network_difficulty = 1.0;
-            {
-                std::lock_guard<std::mutex> lock(m_work_mutex);
-                if (!m_cached_template.is_null() && m_cached_template.contains("target")) {
-                    // Convert hex target to approximate difficulty for comparison
-                    // A share at difficulty D has probability 1/D of meeting network target
-                    // For now, attempt block construction for every share and let the
-                    // coin daemon reject invalid blocks (the PoW check is authoritative)
-                }
-            }
-            
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
                 check_merged_mining(block_hex, extranonce1, extranonce2, job);
 
-                // Validate merkle root before submitting
+                // Check PoW hash against the blockchain target before submitting
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
-                uint256 header_merkle;
-                std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
+                if (block_bytes.size() == 80) {
+                    char pow_hash_bytes[32];
+                    scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
+                    uint256 pow_hash;
+                    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
 
-                std::string coinbase_hex;
-                uint256 expected_merkle;
-                {
-                    const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
-                    const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
-                    const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
-                    coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
-                    expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
-                }
+                    uint256 block_target;
+                    {
+                        std::lock_guard<std::mutex> lock(m_work_mutex);
+                        if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
+                            std::string bits_hex = m_cached_template["bits"].get<std::string>();
+                            uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
+                            block_target = chain::bits_to_target(bits);
+                        }
+                    }
 
-                if (header_merkle != expected_merkle) {
-                    LOG_ERROR << "Block merkle_root mismatch!"
-                              << " header=" << header_merkle.GetHex()
-                              << " expected=" << expected_merkle.GetHex();
-                } else {
-                    LOG_INFO << "Block merkle_root validated, submitting to coin daemon";
-                    submitblock(block_hex);
+                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                        // Validate merkle root before submitting
+                        uint256 header_merkle;
+                        std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
+
+                        std::string coinbase_hex;
+                        uint256 expected_merkle;
+                        {
+                            const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                            const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                            const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                            coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                            expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
+                        }
+
+                        if (header_merkle != expected_merkle) {
+                            LOG_ERROR << "Block merkle_root mismatch!"
+                                      << " header=" << header_merkle.GetHex()
+                                      << " expected=" << expected_merkle.GetHex();
+                        } else {
+                            LOG_INFO << "Block meets blockchain target! Submitting to coin daemon";
+                            submitblock(block_hex);
+                        }
+                    }
                 }
             }
         }
@@ -1747,23 +1850,19 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
                 }
 
-                // Build coinbase scriptSig from coinb1 (contains BIP34 height + pool tag)
-                // Use PLACEHOLDER extranonce2 (zeros) for share.m_coinbase so the
-                // ref_hash matches what was embedded at job-creation time.
-                // The real coinbase (with actual extranonce2) is kept in
-                // full_coinbase_bytes for hash_link computation.
+                // Build the actual mined coinbase: coinb1 + en1 + en2 + coinb2
+                // In the new split, en1+en2 fill the last_txout_nonce (in OP_RETURN),
+                // not the scriptSig.  So the scriptSig is the same in all coinbases.
                 std::string full_coinbase_hex;
-                std::string placeholder_coinbase_hex;
                 {
                     const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
                     const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
                     full_coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
-                    // Build placeholder with zeros for extranonce2 (same size)
-                    std::string zero_en2(extranonce2.size(), '0');
-                    placeholder_coinbase_hex = cb1 + extranonce1 + zero_en2 + cb2;
                 }
-                // Extract scriptSig from PLACEHOLDER coinbase (zeros for extranonce2)
-                auto cb_bytes = ParseHex(placeholder_coinbase_hex);
+
+                // Extract scriptSig from the coinbase (scriptSig is fixed, no en1/en2).
+                // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) + script_len(1+)
+                auto cb_bytes = ParseHex(full_coinbase_hex);
                 if (cb_bytes.size() > 41) {
                     size_t pos = 41;
                     uint64_t scriptsig_len = cb_bytes[pos++];
@@ -1788,15 +1887,17 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 // Segwit fields for SegwitData on the share
                 params.segwit_active = job ? job->segwit_active : m_segwit_active;
                 if (params.segwit_active) {
-                    if (job && !job->witness_commitment_hex.empty())
+                    if (job && !job->witness_commitment_hex.empty()) {
                         params.witness_commitment_hex = job->witness_commitment_hex;
-                    else if (m_cached_template.contains("default_witness_commitment"))
-                        params.witness_commitment_hex =
-                            m_cached_template["default_witness_commitment"].get<std::string>();
+                        params.witness_root = job->witness_root;
+                    } else {
+                        // Fallback: use cached values from refresh_work
+                        params.witness_commitment_hex = m_cached_witness_commitment;
+                        params.witness_root = m_cached_witness_root;
+                    }
                 }
 
                 // Pass the actual mined coinbase TX bytes for hash_link computation.
-                // This avoids PPLNS rebuild mismatches between work gen and submit.
                 if (!full_coinbase_hex.empty())
                     params.full_coinbase_bytes = ParseHex(full_coinbase_hex);
 
@@ -1811,11 +1912,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             }
         }
         
-        // Attempt block construction + merkle validation + submission.
-        // calculate_share_difficulty now computes real scrypt PoW, so in
-        // production we could gate on share_difficulty >= network_difficulty.
-        // For now, build + validate for every share; the coin daemon rejects
-        // invalid PoW anyway.
+        // Attempt block construction + submission only when PoW meets blockchain target.
         if (m_coin_rpc && !extranonce1.empty()) {
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
@@ -1823,26 +1920,45 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 check_merged_mining(block_hex, extranonce1, extranonce2, job);
 
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
-                uint256 header_merkle;
-                std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
+                if (block_bytes.size() == 80) {
+                    char pow_hash_bytes[32];
+                    scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
+                    uint256 pow_hash;
+                    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
 
-                std::string coinbase_hex;
-                uint256 expected_merkle;
-                {
-                    const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
-                    const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
-                    const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
-                    coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
-                    expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
-                }
+                    uint256 block_target;
+                    {
+                        std::lock_guard<std::mutex> lock(m_work_mutex);
+                        if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
+                            std::string bits_hex = m_cached_template["bits"].get<std::string>();
+                            uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
+                            block_target = chain::bits_to_target(bits);
+                        }
+                    }
 
-                if (header_merkle != expected_merkle) {
-                    LOG_ERROR << "Pool block merkle_root mismatch!"
-                              << " header=" << header_merkle.GetHex()
-                              << " expected=" << expected_merkle.GetHex();
-                } else {
-                    LOG_INFO << "Pool block merkle_root validated, submitting to coin daemon";
-                    submitblock(block_hex);
+                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                        uint256 header_merkle;
+                        std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
+
+                        std::string coinbase_hex;
+                        uint256 expected_merkle;
+                        {
+                            const std::string& cb1 = job ? job->coinb1 : m_cached_coinb1;
+                            const std::string& cb2 = job ? job->coinb2 : m_cached_coinb2;
+                            const auto& branches = job ? job->merkle_branches : m_cached_merkle_branches;
+                            coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
+                            expected_merkle = reconstruct_merkle_root(coinbase_hex, branches);
+                        }
+
+                        if (header_merkle != expected_merkle) {
+                            LOG_ERROR << "Pool block merkle_root mismatch!"
+                                      << " header=" << header_merkle.GetHex()
+                                      << " expected=" << expected_merkle.GetHex();
+                        } else {
+                            LOG_INFO << "Pool block merkle_root validated, submitting to coin daemon";
+                            submitblock(block_hex);
+                        }
+                    }
                 }
             }
         }
@@ -2355,7 +2471,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
-    hashrate_tracker_.set_difficulty_bounds(0.001, 65536.0);
+    hashrate_tracker_.set_difficulty_bounds(0.0000001, 65536.0);  // TEST: very low min diff for CPU miner
     hashrate_tracker_.set_target_time_per_mining_share(15.0);
 }
 
@@ -2515,6 +2631,9 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             send_notify_work(true);  // force clean_jobs so miner drops old job without merged_addrs
         }
         
+        // Start periodic work push (every SHARE_PERIOD) to keep miner on fresh work
+        start_periodic_work_push();
+        
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = true;
@@ -2663,6 +2782,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.prev_share_hash = job.prev_share_hash;
     snapshot.subsidy         = job.subsidy;
     snapshot.witness_commitment_hex = job.witness_commitment_hex;
+    snapshot.witness_root            = job.witness_root;
 
     mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
         &snapshot);
@@ -2802,6 +2922,11 @@ void StratumSession::send_notify_work(bool force_clean)
 
     // Per-connection coinbase: build with ref_hash from this session's extranonce1
     // This ensures the OP_RETURN commitment matches this miner's specific coinbase.
+    // Freeze share chain tip ONCE — used for both ref_hash computation
+    // and the job's stored prev_share_hash to avoid race conditions.
+    uint256 frozen_prev_share;
+    if (auto fn = mining_interface_->get_best_share_hash_fn())
+        frozen_prev_share = fn();
     {
         // Build P2PKH payout script from username (authorized address)
         std::vector<unsigned char> payout_script;
@@ -2833,7 +2958,7 @@ void StratumSession::send_notify_work(bool force_clean)
         }
 
         auto [cb1, cb2] = mining_interface_->build_connection_coinbase(
-            extranonce1_, payout_script, merged_addrs);
+            frozen_prev_share, extranonce1_, payout_script, merged_addrs);
         if (!cb1.empty()) {
             coinb1 = std::move(cb1);
             coinb2 = std::move(cb2);
@@ -2858,9 +2983,8 @@ void StratumSession::send_notify_work(bool force_clean)
     active_jobs_[job_id] = {prevhash, gbt_prevhash, nbits, curtime, coinb1, coinb2,
                             version_u32, merkle_branches_vec, {}, "", false, {}, 0, ""};
 
-    // Capture share chain tip for this job (must match ref_hash computation)
-    if (auto fn = mining_interface_->get_best_share_hash_fn())
-        active_jobs_[job_id].prev_share_hash = fn();
+    // Store the SAME frozen prev_share_hash that was used for ref_hash computation
+    active_jobs_[job_id].prev_share_hash = frozen_prev_share;
 
     // Populate tx_data, mweb, segwit_active, subsidy, witness_commitment from snapshot
     {
@@ -2872,9 +2996,10 @@ void StratumSession::send_notify_work(bool force_clean)
         auto cur_tmpl = mining_interface_->get_current_work_template();
         if (!cur_tmpl.empty() && !cur_tmpl.is_null()) {
             je.subsidy = cur_tmpl.value("coinbasevalue", uint64_t(0));
-            if (cur_tmpl.contains("default_witness_commitment"))
-                je.witness_commitment_hex = cur_tmpl["default_witness_commitment"].get<std::string>();
         }
+        // Use the P2Pool witness commitment and root computed in refresh_work()
+        je.witness_commitment_hex = mining_interface_->get_cached_witness_commitment();
+        je.witness_root = mining_interface_->get_cached_witness_root();
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {
             for (const auto& tx : tmpl["transactions"]) {
@@ -2890,6 +3015,21 @@ void StratumSession::send_notify_work(bool force_clean)
     });
 
     send_response(notification);
+}
+
+void StratumSession::start_periodic_work_push()
+{
+    work_push_timer_ = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+    auto self = shared_from_this();
+    auto fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+    *fn = [this, self, fn](boost::system::error_code ec) {
+        if (ec) return;
+        send_notify_work();
+        work_push_timer_->expires_after(std::chrono::seconds(4));
+        work_push_timer_->async_wait(*fn);
+    };
+    work_push_timer_->expires_after(std::chrono::seconds(4));
+    work_push_timer_->async_wait(*fn);
 }
 
 std::string StratumSession::generate_extranonce1()

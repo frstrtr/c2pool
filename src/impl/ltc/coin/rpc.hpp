@@ -63,7 +63,8 @@ public:
     rpc::WorkData getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());
     void submit_block(BlockType& block, std::string mweb, bool ignore_failure); //TODO: p2p node; void submit_block(coind::data::types::BlockType &block, std::string mweb, /*bool use_getblocktemplate,*/ bool ignore_failure, bool segwit_activated);
     // Submit a pre-serialised block passed in as a hex string (avoids re-packing)
-    void submit_block_hex(const std::string& block_hex, const std::string& mweb, bool ignore_failure);
+    // Returns true if the daemon accepted the block (result is null), false otherwise.
+    bool submit_block_hex(const std::string& block_hex, const std::string& mweb, bool ignore_failure);
 
     // RPC Methods
     nlohmann::json getblocktemplate(std::vector<std::string> rules);

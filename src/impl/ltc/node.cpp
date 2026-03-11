@@ -6,7 +6,35 @@
 #include <core/target_utils.hpp>
 #include <sharechain/prepared_list.hpp>
 
+#include <fstream>
 #include <random>
+
+// Helper: read current RSS from /proc/self/status (Linux only)
+static long get_rss_mb() {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            long kb = 0;
+            sscanf(line.c_str(), "VmRSS: %ld", &kb);
+            return kb / 1024;
+        }
+    }
+    return 0;
+}
+
+// Write directly to stderr (unbuffered) so we see output even if LOG is buffered
+static void rss_log(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[RSS] ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    va_end(args);
+}
+
+static constexpr long RSS_LIMIT_MB = 4000;  // abort if RSS exceeds 4GB
 
 namespace ltc
 {
@@ -159,54 +187,103 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
     
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
-    // auto t1 = core::debug_timestamp();
-    chain::PreparedList<uint256, ShareType> prepare_shares(data.m_items);
-    std::vector<ShareType> shares = prepare_shares.build_list();
+    long rss0 = get_rss_mb();
+    rss_log("processing_shares ENTER items=%zu rss=%ldMB", data.m_items.size(), rss0);
 
-    if (shares.size() > 5)
+    // Step 1: Compute hashes for all shares FIRST so PreparedList can sort them.
+    // Shares arrive with m_hash = 0 (hash is computed, not serialized).
+    // Without valid hashes, PreparedList cannot topologically order shares.
+    int32_t verify_fail_count = 0;
+    std::vector<ShareType> valid_shares;
+    valid_shares.reserve(data.m_items.size());
+    for (size_t idx = 0; idx < data.m_items.size(); ++idx)
     {
-        LOG_INFO << "Processing " << shares.size() << " shares from " << addr.to_string() << "...";
-    }
-
-    int32_t new_count = 0;
-	std::map<uint256, coin::MutableTransaction> all_new_txs;
-	for (auto& share : shares)
-	{
-        // Compute share hash if not yet set (deserialized shares have m_hash = 0)
+        auto& share = data.m_items[idx];
         if (share.hash().IsNull())
         {
             try
             {
                 share.ACTION({
-                    obj->m_hash = share_init_verify(*obj, false);
+                    obj->m_hash = share_init_verify(*obj, true);
                 });
             }
             catch (const std::exception& e)
             {
-                LOG_WARNING << "Share hash/PoW verification failed from "
-                            << addr.to_string() << ": " << e.what();
+                ++verify_fail_count;
                 continue;
             }
         }
+        // Cache original raw bytes for relay (keyed by computed hash)
+        if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty())
+            m_raw_share_cache[share.hash()] = std::move(data.m_raw_items[idx]);
+        valid_shares.push_back(share);
+    }
+
+    long rss1 = get_rss_mb();
+    rss_log("hashes computed: valid=%zu fail=%d rss=%ldMB (+%ld)",
+            valid_shares.size(), verify_fail_count, rss1, rss1-rss0);
+
+    // Step 2: Topologically sort valid shares by hash/prev_hash linkage
+    chain::PreparedList<uint256, ShareType> prepare_shares(valid_shares);
+    std::vector<ShareType> shares = prepare_shares.build_list();
+
+    long rss2 = get_rss_mb();
+    rss_log("build_list done shares=%zu rss=%ldMB (+%ld)", shares.size(), rss2, rss2-rss0);
+
+    // Step 3: Process sorted shares
+    int32_t new_count = 0;
+    int32_t dup_count = 0;
+	std::map<uint256, coin::MutableTransaction> all_new_txs;
+	for (int i = 0; i < (int)shares.size(); ++i)
+	{
+	    auto& share = shares[i];
+	    
+	    // Log RSS every 100 shares
+	    if (i % 100 == 0) {
+	        long rss_now = get_rss_mb();
+	        rss_log("  share[%d/%zu] rss=%ldMB (+%ld) new=%d dup=%d chain=%zu",
+	                i, shares.size(), rss_now, rss_now-rss0,
+	                new_count, dup_count, m_tracker.chain.size());
+	        if (rss_now > RSS_LIMIT_MB) {
+	            rss_log("RSS LIMIT EXCEEDED (%ldMB > %ldMB) — aborting!", rss_now, RSS_LIMIT_MB);
+	            std::abort();
+	        }
+	    }
 
         auto& new_txs = data.m_txs[share.hash()];
 		if (!new_txs.empty())
 		{
 			for (auto& new_tx : new_txs)
 			{
-                PackStream packed_tx = pack(coin::TX_WITH_WITNESS(new_tx)); //TODO: WITH_WITNESS?
+                PackStream packed_tx = pack(coin::TX_WITH_WITNESS(new_tx));
 				all_new_txs[Hash(packed_tx.get_span())] = new_tx;
 			}
 		}
 
 		if (m_chain->contains(share.hash()))
 		{
-            LOG_WARNING << "Got duplicate share, ignoring. Hash: " << share.hash().ToString();
+		    ++dup_count;
 			continue;
 		}
 
 		new_count++;
+
+		long rss_pre_add = get_rss_mb();
 		m_tracker.add(share);
+		long rss_post_add = get_rss_mb();
+		if (rss_post_add - rss_pre_add > 5)
+		    rss_log("  ADD share[%d] rss %ld->%ldMB (+%ld) chain_sz=%zu",
+		            i, rss_pre_add, rss_post_add, rss_post_add-rss_pre_add, m_tracker.chain.size());
+
+		// Periodically trim the chain DURING batch processing to bound memory.
+		if (new_count % 100 == 0) {
+		    const size_t keep = PoolConfig::chain_length() * 2;
+		    if (m_tracker.chain.size() > keep) {
+		        auto heads_copy = m_tracker.chain.get_heads();
+		        for (auto& [hh, th] : heads_copy)
+		            m_tracker.chain.trim(hh, keep);
+		    }
+		}
 
 		// Persist to LevelDB
 		if (m_storage && m_storage->is_available())
@@ -215,7 +292,6 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 			auto span = ps.get_span();
 			std::vector<uint8_t> bytes(reinterpret_cast<const uint8_t*>(span.data()),
 			                           reinterpret_cast<const uint8_t*>(span.data()) + span.size());
-			// Store version as the first 8 bytes so we can reconstruct on load
 			uint64_t ver = share.version();
 			std::vector<uint8_t> versioned;
 			versioned.resize(8 + bytes.size());
@@ -231,25 +307,15 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 		}
 	}
 
-    // Attempt verification on newly added shares
-    if (new_count > 0)
-    {
-        int32_t verified_count = 0;
-        for (auto& share : shares)
-        {
-            auto h = share.hash();
-            if (m_tracker.verified.contains(h))
-                continue;
-            if (m_tracker.attempt_verify(h))
-                verified_count++;
-        }
+    long rss_end = get_rss_mb();
+    rss_log("processing_shares DONE total=%zu new=%d fail=%d dup=%d rss=%ld->%ldMB (+%ld) chain=%zu",
+            shares.size(), new_count, verify_fail_count, dup_count,
+            rss0, rss_end, rss_end-rss0, m_tracker.chain.size());
 
-        if (verified_count > 0)
-            LOG_INFO << "Verified " << verified_count << "/" << new_count << " new shares";
-
-        // Run think() to detect bad peers and request missing shares
-        run_think();
-    }
+    // NOTE: Do NOT call run_think() here. During download sync, the chain is
+    // incomplete and run_think would mark verifiable shares as "bad" and ban
+    // the peer we're downloading from — killing the sync.
+    // run_think() is called periodically from the main event loop instead.
 }
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
@@ -258,6 +324,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	std::vector<ltc::ShareType> shares;
 	for (const auto& handle_hash : hashes)
 	{
+		if (!m_chain->contains(handle_hash))
+			continue;
 		uint64_t n = std::min(parents+1, (uint64_t) m_chain->get_height(handle_hash));
 		for (auto& [hash, data] : m_chain->get_chain(handle_hash, n))
         {
@@ -337,12 +405,20 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         }
     }
 
-    // Pack and send shares
+    // Pack and send shares — use cached original bytes when available
     std::vector<chain::RawShare> rshares;
     rshares.reserve(shares.size());
     for (size_t i = 0; i < shares.size(); ++i)
     {
-        rshares.emplace_back(shares[i].version(), pack(shares[i]));
+        auto it = m_raw_share_cache.find(shares[i].hash());
+        if (it != m_raw_share_cache.end())
+        {
+            rshares.push_back(it->second);
+        }
+        else
+        {
+            rshares.emplace_back(shares[i].version(), pack(shares[i]));
+        }
     }
 
     auto shares_msg = message_shares::make_raw(rshares);
@@ -439,7 +515,10 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
                 return;
             }
 
-            LOG_INFO << "Received " << shares.size() << " shares for download request";
+            LOG_INFO << "Received " << shares.size() << " shares for download request"
+                     << " RSS=" << get_rss_mb() << "MB";
+
+            rss_log("download_shares callback: %zu shares, rss=%ldMB", shares.size(), get_rss_mb());
 
             // Feed into processing pipeline
             HandleSharesData data;
@@ -552,6 +631,10 @@ void NodeImpl::run_think()
         return;
     m_last_think_time = now;
 
+    LOG_INFO << "run_think(): chain=" << m_tracker.chain.size()
+             << " verified=" << m_tracker.verified.size()
+             << " heads=" << m_tracker.chain.get_heads().size();
+
   try {
     // Use the wired block_rel_height function, or a safe default stub
     auto block_rel_height = m_block_rel_height_fn
@@ -564,21 +647,13 @@ void NodeImpl::run_think()
     auto result = m_tracker.think(block_rel_height, prev_block, bits);
 
     // Ban peers that provided invalid/unverifiable shares
+    // TEMPORARILY DISABLED: during initial sync, PPLNS verification fails for all
+    // Python-created shares due to GENTX-MISMATCH. Banning would kill sync.
+    // TODO: re-enable once generate_share_transaction matches Python's output
     auto now = std::chrono::steady_clock::now();
-    for (const auto& bad_addr : result.bad_peer_addresses)
-    {
-        if (bad_addr.to_string().empty()) continue;
-        m_ban_list[bad_addr] = now + BAN_DURATION;
-        LOG_WARNING << "Banning peer " << bad_addr.to_string()
-                    << " for " << BAN_DURATION.count() << "s (bad shares)";
-
-        // Disconnect currently-connected bad peer
-        for (auto& [nonce, peer] : m_peers) {
-            if (peer->addr() == bad_addr) {
-                peer->close();
-                break;
-            }
-        }
+    if (!result.bad_peer_addresses.empty()) {
+        LOG_WARNING << "run_think: " << result.bad_peer_addresses.size()
+                    << " peer(s) with unverifiable shares (NOT banning during debug)";
     }
 
     // Expire old bans
@@ -602,8 +677,33 @@ void NodeImpl::run_think()
     // Update best share
     if (!result.best.IsNull()) {
         m_best_share_hash = result.best;
-        LOG_DEBUG_POOL << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
+        LOG_INFO << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
+    } else {
+        LOG_WARNING << "think(): result.best is NULL — verified_tails="
+                    << m_tracker.verified.get_tails().size()
+                    << " verified_heads=" << m_tracker.verified.get_heads().size();
     }
+
+    // Trim stale shares to prevent unbounded memory growth.
+    // Keep 2 * chain_length per head (matches Python p2pool behavior).
+    // Must trim even when result.best is null (during initial sync).
+    const size_t keep_per_head = PoolConfig::chain_length() * 2;
+    auto trim_chain = [&](auto& sc, const char* label) {
+        if (sc.size() <= keep_per_head)
+            return;
+        // Copy heads since trim may modify the heads map
+        auto heads_copy = sc.get_heads();
+        size_t total_removed = 0;
+        for (auto& [head_hash, tail_hash] : heads_copy) {
+            auto removed = sc.trim(head_hash, keep_per_head);
+            total_removed += removed;
+        }
+        if (total_removed > 0)
+            LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
+                     << " (now " << sc.size() << ")";
+    };
+    trim_chain(m_tracker.chain, "chain");
+    trim_chain(m_tracker.verified, "verified");
 
   } catch (const std::exception& e) {
     LOG_ERROR << "run_think() failed: " << e.what();

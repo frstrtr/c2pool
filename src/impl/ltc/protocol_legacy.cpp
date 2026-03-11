@@ -137,7 +137,36 @@ void Legacy::HANDLER(shares)
 
 void Legacy::HANDLER(sharereq)
 {
+    // Debug: log what's being requested
+    {
+        static int dbg_req = 0;
+        if (dbg_req < 20)
+        {
+            ++dbg_req;
+            std::string req_hashes;
+            for (auto& h : msg->m_hashes) req_hashes += h.ToString().substr(0, 16) + " ";
+            LOG_WARNING << "SHAREREQ #" << dbg_req << " from " << peer->addr().to_string()
+                        << " hashes=[" << req_hashes << "] parents=" << msg->m_parents
+                        << " stops=" << msg->m_stops.size();
+        }
+    }
+
     auto shares = handle_get_share(msg->m_hashes, msg->m_parents, msg->m_stops, peer->addr());
+
+    // Debug: log what we're returning
+    {
+        static int dbg_rep = 0;
+        if (dbg_rep < 20)
+        {
+            ++dbg_rep;
+            LOG_WARNING << "SHAREREPLY #" << dbg_rep << " returning " << shares.size() << " shares";
+            for (size_t i = 0; i < std::min(shares.size(), (size_t)3); ++i)
+            {
+                LOG_WARNING << "  share[" << i << "] hash=" << shares[i].hash().ToString().substr(0, 16);
+            }
+        }
+    }
+
     std::vector<chain::RawShare> rshares;
 
     try

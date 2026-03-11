@@ -8,6 +8,7 @@
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
 #include <sharechain/weights_skiplist.hpp>
+#include <btclibs/base58.h>
 
 #include <algorithm>
 #include <chrono>
@@ -156,8 +157,11 @@ public:
                 (void)computed_hash;
             });
         }
-        catch (const std::exception&)
+        catch (const std::exception& e)
         {
+            LOG_WARNING << "attempt_verify FAILED for " << share_hash.ToString().substr(0,16)
+                        << " height=" << height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                        << " error: " << e.what();
             return false; // verification failed
         }
 
@@ -458,12 +462,9 @@ public:
         uint32_t desired_timestamp,
         const uint256& desired_target)
     {
-        // p2pool MAX_TARGET for LTC: 2^256 / 2^20 - 1 = 2^236 - 1
-        static const uint256 MAX_TARGET = [] {
-            uint256 t;
-            t.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            return t;
-        }();
+        // MAX_TARGET: network-specific share difficulty floor
+        // Mainnet: 2^236 - 1, Testnet: 2^256/20 - 1  (from PoolConfig)
+        const uint256 MAX_TARGET = PoolConfig::max_target();
 
         if (prev_share_hash.IsNull())
             return {chain::target_to_bits_upper_bound(MAX_TARGET),
@@ -471,10 +472,18 @@ public:
 
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
+        LOG_WARNING << "compute_share_target: prev=" << prev_share_hash.ToString().substr(0,16)
+                  << " height=" << height
+                  << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                  << " TARGET_LOOKBEHIND=" << PoolConfig::TARGET_LOOKBEHIND
+                  << " chain_size=" << chain.size();
+
         // Not enough chain depth: use MAX_TARGET
         if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
             auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
+            LOG_WARNING << "compute_share_target: returning MAX_TARGET because height("
+                        << height << ") < TARGET_LOOKBEHIND(" << PoolConfig::TARGET_LOOKBEHIND << ")";
             return {max_bits, max_bits};
         }
 
@@ -486,6 +495,7 @@ public:
         if (aps.IsNull())
         {
             pre_target = MAX_TARGET;
+            LOG_WARNING << "CST step1: aps=NULL → pre_target=MAX_TARGET";
         }
         else
         {
@@ -502,16 +512,29 @@ public:
             uint288 max_288;
             max_288.SetHex(MAX_TARGET.GetHex());
             if (result > max_288)
+            {
                 pre_target = MAX_TARGET;
+                LOG_WARNING << "CST step1: aps=" << aps.GetHex()
+                            << " divisor=" << divisor.GetHex()
+                            << " result>MAX → pre_target=MAX_TARGET";
+            }
             else
+            {
                 pre_target.SetHex(result.GetHex());
+                LOG_WARNING << "CST step1: aps=" << aps.GetHex()
+                            << " pre_target=" << pre_target.GetHex().substr(0,32);
+            }
         }
 
         // Step 2: Get previous share's max_target
         uint256 prev_max_target;
+        uint32_t prev_max_bits_raw = 0;
         chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+            prev_max_bits_raw = obj->m_max_bits;
             prev_max_target = chain::bits_to_target(obj->m_max_bits);
         });
+        LOG_WARNING << "CST step2: prev_max_bits=" << prev_max_bits_raw
+                    << " prev_max_target=" << prev_max_target.GetHex().substr(0,32);
 
         // Step 3: Emergency time-based decay (death spiral prevention)
         // Phase 1b from p2pool-v36: doubles target every SHARE_PERIOD * 10
@@ -572,6 +595,10 @@ public:
         uint256 pre_target2 = pre_target;
         if (pre_target2 < lo) pre_target2 = lo;
         if (pre_target2 > hi) pre_target2 = hi;
+
+        LOG_WARNING << "CST step4: clamp_ref=" << clamp_ref_target.GetHex().substr(0,32)
+                    << " lo=" << lo.GetHex().substr(0,32) << " hi=" << hi.GetHex().substr(0,32)
+                    << " pre_target2=" << pre_target2.GetHex().substr(0,32);
 
         // Step 5: Clamp to network limits [MIN_TARGET, MAX_TARGET]
         // MIN_TARGET = 0 → no lower clamp needed
@@ -673,6 +700,116 @@ public:
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
+    // -- V36 PPLNS with exponential depth-decay --
+    // Matches Python: get_decayed_cumulative_weights()
+    // half_life = CHAIN_LENGTH // 4
+    // Each share's weight is multiplied by 2^(-depth/half_life)
+    // Fixed-point arithmetic with 40-bit precision
+    CumulativeWeights get_v36_decayed_cumulative_weights(
+        const uint256& start, int32_t max_shares, const uint288& desired_weight)
+    {
+        if (start.IsNull())
+            return {};
+
+        static constexpr uint64_t DECAY_PRECISION = 40;
+        static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
+        static constexpr uint64_t LN2_MICRO = 693147;
+
+        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
+        uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
+
+        CumulativeWeights result;
+        int32_t share_count = 0;
+        uint64_t decay_fp = DECAY_SCALE; // starts at 1.0
+
+        uint256 cur = start;
+        while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
+        {
+            auto& share_data = chain.get_share(cur);
+            uint256 next_cur;
+
+            share_data.invoke([&](auto* obj) {
+                auto att = chain::target_to_average_attempts(
+                    chain::bits_to_target(obj->m_bits));
+                uint32_t don = obj->m_donation;
+
+                // DEBUG: log per-share values for first few in each call
+                {
+                    static int dbg_walk_calls = 0;
+                    static int dbg_current_call = 0;
+                    if (share_count == 0) { dbg_current_call = dbg_walk_calls++; }
+                    if (dbg_current_call < 3 && (share_count < 3 || share_count == 399)) {
+                        std::string script_hex;
+                        auto scr = get_share_script(obj);
+                        for (size_t ii = 0; ii < std::min(scr.size(), size_t(10)); ++ii) {
+                            char buf[3]; std::snprintf(buf, 3, "%02x", scr[ii]); script_hex += buf;
+                        }
+                        LOG_WARNING << "  PPLNS walk[" << share_count << "] hash="
+                            << cur.GetHex().substr(0,16) << " don=" << don
+                            << " bits=" << obj->m_bits
+                            << " att_lo64=" << att.GetLow64()
+                            << " script=" << script_hex;
+                    }
+                }
+
+                // Apply exponential decay: decayed_att = att * decay_fp >> PRECISION
+                uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
+
+                auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
+                auto don_w  = decayed_att * don;
+                auto this_total = addr_w + don_w; // = decayed_att * 65535
+
+                // Cap at desired_weight (partial last share)
+                if (result.total_weight + this_total > desired_weight) {
+                    auto remaining = desired_weight - result.total_weight;
+                    if (!this_total.IsNull()) {
+                        addr_w = addr_w * remaining / this_total;
+                        don_w  = don_w * remaining / this_total;
+                    }
+                    this_total = remaining;
+                }
+
+                std::vector<unsigned char> script = get_share_script(obj);
+
+                result.weights[script] = result.weights[script] + addr_w;
+                result.total_weight = result.total_weight + this_total;
+                result.total_donation_weight = result.total_donation_weight + don_w;
+                next_cur = obj->m_prev_hash;
+            });
+
+            ++share_count;
+            if (result.total_weight >= desired_weight)
+                break;
+
+            cur = next_cur;
+            // Decay for next (older) share
+            // Use 128-bit multiply to avoid overflow: decay_fp and decay_per are both ~2^40,
+            // their product is ~2^80 which overflows uint64_t (max 2^64).
+            decay_fp = static_cast<uint64_t>(
+                (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
+        }
+
+        // DEBUG: log actual walk length and termination reason
+        {
+            static int dbg_walk_summary = 0;
+            if (dbg_walk_summary < 20) {
+                ++dbg_walk_summary;
+                std::string reason = "max_shares";
+                if (cur.IsNull()) reason = "NULL_prev";
+                else if (!chain.contains(cur)) reason = "NOT_IN_CHAIN(cur=" + cur.GetHex().substr(0,16) + ")";
+                else if (result.total_weight >= desired_weight) reason = "weight_cap";
+                LOG_WARNING << "PPLNS walk done: walked=" << share_count
+                    << " max_shares=" << max_shares
+                    << " n_addr=" << result.weights.size()
+                    << " total_w_lo64=" << result.total_weight.GetLow64()
+                    << " reason=" << reason
+                    << " start=" << start.GetHex().substr(0,16);
+            }
+        }
+
+        return result;
+    }
+
     // -- Expected payouts from PPLNS weights --
     // Uses exact integer arithmetic matching generate_share_transaction():
     //   V36: amount = (uint288(subsidy) * weight / total_weight).GetLow64()
@@ -686,7 +823,8 @@ public:
         auto max_weight = chain::target_to_average_attempts(block_target)
                           * PoolConfig::SPREAD * 65535;
 
-        auto [weights, total_weight, donation_weight] = get_cumulative_weights(best_share_hash, chain_len, max_weight);
+        // V36: use exponential depth-decay (matching Python's get_decayed_cumulative_weights)
+        auto [weights, total_weight, donation_weight] = get_v36_decayed_cumulative_weights(best_share_hash, chain_len, max_weight);
 
         std::map<std::vector<unsigned char>, double> result;
         uint64_t sum = 0;
@@ -707,6 +845,18 @@ public:
 
         // Remainder goes to donation (matches generate_share_transaction)
         uint64_t donation_amount = (subsidy > sum) ? (subsidy - sum) : 0;
+
+        // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
+        if (donation_amount < 1 && subsidy > 0 && !result.empty()) {
+            auto largest = std::max_element(result.begin(), result.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+            if (largest != result.end() && largest->second >= 1.0) {
+                largest->second -= 1.0;
+                sum -= 1;
+                donation_amount = subsidy - sum;
+            }
+        }
+
         result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
                                   + static_cast<double>(donation_amount);
 
@@ -852,36 +1002,79 @@ public:
         if (weights.empty() || total_weight.IsNull())
             return uint256{};
 
-        // Deterministic serialization: sorted by hex-encoded address key
-        // Format matches p2pool-v36: "hex_addr:weight|...|T:total|D:donation"
-        std::map<std::string, uint288> sorted_by_hex;
-        for (const auto& [script, w] : weights)
-        {
-            std::string hex;
-            hex.reserve(script.size() * 2);
-            for (unsigned char c : script)
+        // Convert uint288 to decimal string, matching Python's '%d' formatting
+        auto to_decimal = [](const uint288& val) -> std::string {
+            if (val.IsNull()) return "0";
+            uint288 tmp = val;
+            std::string result;
+            while (!tmp.IsNull()) {
+                uint32_t rem = 0;
+                for (int i = uint288::WIDTH - 1; i >= 0; --i) {
+                    uint64_t cur = (static_cast<uint64_t>(rem) << 32) | tmp.pn[i];
+                    tmp.pn[i] = static_cast<uint32_t>(cur / 10);
+                    rem = static_cast<uint32_t>(cur % 10);
+                }
+                result.push_back('0' + static_cast<char>(rem));
+            }
+            std::reverse(result.begin(), result.end());
+            return result;
+        };
+
+        // Convert script bytes to base58check address string,
+        // matching Python's share.address format used as dict key.
+        auto script_to_address = [](const std::vector<unsigned char>& script) -> std::string {
+            // P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
+            if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9
+                && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
             {
+                unsigned char addr_ver = PoolConfig::is_testnet ? 111 : 48;
+                std::vector<unsigned char> data = {addr_ver};
+                data.insert(data.end(), script.begin() + 3, script.begin() + 23);
+                return EncodeBase58Check(data);
+            }
+            // P2SH: OP_HASH160 <20> <hash160> OP_EQUAL
+            if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14
+                && script[22] == 0x87)
+            {
+                unsigned char addr_ver = PoolConfig::is_testnet ? 58 : 50;
+                std::vector<unsigned char> data = {addr_ver};
+                data.insert(data.end(), script.begin() + 2, script.begin() + 22);
+                return EncodeBase58Check(data);
+            }
+            // Unknown script: fall back to hex encoding
+            std::string hex;
+            for (unsigned char c : script) {
                 static const char digits[] = "0123456789abcdef";
                 hex.push_back(digits[c >> 4]);
                 hex.push_back(digits[c & 0xf]);
             }
-            sorted_by_hex[hex] += w;
-        }
+            return hex;
+        };
+
+        // Deterministic serialization: sorted by address key (matches Python)
+        // Format: "addr1:weight1|addr2:weight2|...|T:total|D:donation"
+        // where addr is base58check address string and weight is decimal integer
+        std::map<std::string, uint288> sorted_by_addr;
+        for (const auto& [script, w] : weights)
+            sorted_by_addr[script_to_address(script)] += w;
 
         std::string payload;
-        for (const auto& [hex_key, w] : sorted_by_hex)
+        for (const auto& [addr_key, w] : sorted_by_addr)
         {
             if (!payload.empty())
                 payload.push_back('|');
-            payload += hex_key;
+            payload += addr_key;
             payload.push_back(':');
-            payload += w.GetHex();
+            payload += to_decimal(w);
         }
         // Append total and donation
         payload += "|T:";
-        payload += total_weight.GetHex();
+        payload += to_decimal(total_weight);
         payload += "|D:";
-        payload += donation_weight.GetHex();
+        payload += to_decimal(donation_weight);
+
+        // DEBUG: log payload for comparison with Python
+        LOG_WARNING << "MPH payload (len=" << payload.size() << "): " << payload.substr(0, 500);
 
         // SHA256d (hash256 in p2pool)
         auto span = std::span<const unsigned char>(

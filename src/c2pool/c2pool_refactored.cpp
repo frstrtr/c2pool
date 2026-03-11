@@ -979,16 +979,18 @@ int main(int argc, char* argv[]) {
             // This computes the p2pool ref_hash from share fields + tracker state.
             web_server.get_mining_interface()->set_ref_hash_fn(
                 [&p2p_node, &whale_detector](
+                    const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
                     uint64_t subsidy, uint32_t bits, uint32_t timestamp,
                     bool segwit_active, const std::string& witness_commitment_hex,
+                    const uint256& witness_root,
                     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
                     const std::vector<uint256>& merkle_branches)
                     -> std::pair<uint256, uint64_t>
                 {
                     ltc::RefHashParams params;
-                    params.prev_share = p2p_node->best_share_hash();
+                    params.prev_share = frozen_prev_share;
                     params.coinbase_scriptSig = coinbase_scriptSig;
                     params.share_nonce = 0;
                     params.subsidy = subsidy;
@@ -997,10 +999,6 @@ int main(int argc, char* argv[]) {
 
                     // Compute pool-level share target from tracker state
                     auto desired_target = chain::bits_to_target(bits);
-                    // Phase 1c: whale departure override — mine at easiest allowed difficulty
-                    if (whale_detector->is_active()) {
-                        desired_target = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-                    }
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
                     params.max_bits = share_max_bits;
@@ -1028,8 +1026,10 @@ int main(int argc, char* argv[]) {
                         ltc::SegwitData sd;
                         sd.m_txid_merkle_link.m_branch = merkle_branches;
                         sd.m_txid_merkle_link.m_index  = 0;
-                        // wtxid_merkle_root from witness commitment
-                        if (witness_commitment_hex.size() >= 76) {
+                        // Use raw wtxid merkle root (not the commitment hash)
+                        if (!witness_root.IsNull()) {
+                            sd.m_wtxid_merkle_root = witness_root;
+                        } else if (witness_commitment_hex.size() >= 76) {
                             sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
                         }
                         params.segwit_data = sd;
@@ -1046,23 +1046,38 @@ int main(int argc, char* argv[]) {
                     // Chain position from tracker
                     auto& tracker = p2p_node->tracker();
                     if (!params.prev_share.IsNull() && tracker.chain.contains(params.prev_share)) {
+                        // Timestamp: clip to at least previous_share.timestamp + 1 (matches Python)
                         tracker.chain.get(params.prev_share).share.invoke([&](auto* prev) {
                             params.absheight = prev->m_absheight + 1;
+                            if (params.timestamp <= prev->m_timestamp)
+                                params.timestamp = prev->m_timestamp + 1;
+                        });
+
+                        // Recompute share target with the clipped timestamp
+                        {
+                            auto desired_target2 = chain::bits_to_target(bits);
+                            auto [sm, sb] = tracker.compute_share_target(
+                                params.prev_share, params.timestamp, desired_target2);
+                            params.max_bits = sm;
+                            params.bits = sb;
+                        }
+
+                        // abswork: prev_abswork + target_to_average_attempts(THIS share's bits)
+                        tracker.chain.get(params.prev_share).share.invoke([&](auto* prev) {
                             auto attempts = chain::target_to_average_attempts(
-                                chain::bits_to_target(prev->m_bits));
+                                chain::bits_to_target(params.bits));
                             params.abswork = prev->m_abswork + uint128(attempts.GetLow64());
                         });
 
-                        // far_share_hash
-                        auto prev_height = tracker.chain.get_height(params.prev_share);
-                        auto far_dist = std::min(
-                            static_cast<int32_t>(ltc::PoolConfig::real_chain_length()),
-                            prev_height);
-                        auto far_view = tracker.chain.get_chain(params.prev_share, static_cast<size_t>(far_dist));
-                        uint256 last_hash = params.prev_share;
-                        for (auto it = far_view.begin(); it != far_view.end(); ++it)
-                            last_hash = (*it).first;
-                        params.far_share_hash = last_hash;
+                        // far_share_hash: 99th ancestor (matches Python: get_nth_parent_hash(prev, 99))
+                        {
+                            auto [prev_height, last] = tracker.chain.get_height_and_last(params.prev_share);
+                            if (last.IsNull() && prev_height < 99) {
+                                params.far_share_hash = uint256();
+                            } else {
+                                params.far_share_hash = tracker.chain.get_nth_parent_key(params.prev_share, 99);
+                            }
+                        }
 
                         // Merged payout hash: deterministic V36 PPLNS commitment.
                         // Must match what create_local_share computes at submit time.
@@ -1078,6 +1093,14 @@ int main(int argc, char* argv[]) {
             web_server.get_mining_interface()->set_create_share_fn(
                 [&p2p_node](const core::MiningInterface::ShareCreationParams& p) {
                 try {
+                    // Don't create shares before PPLNS is available.
+                    // Without chain data, the coinbase won't have correct PPLNS outputs
+                    // and Python peers will reject and ban us.
+                    if (p.prev_share_hash.IsNull()) {
+                        LOG_WARNING << "Skipping share creation: no prev_share (chain not ready)";
+                        return;
+                    }
+
                     // Build SmallBlockHeaderType from Stratum params
                     ltc::coin::SmallBlockHeaderType min_header;
                     min_header.m_version        = p.block_version;
@@ -1124,7 +1147,13 @@ int main(int argc, char* argv[]) {
                         p.segwit_active,
                         p.witness_commitment_hex,
                         {},   // message_data
-                        p.full_coinbase_bytes);
+                        p.full_coinbase_bytes,
+                        p.witness_root);
+
+                    // Only broadcast if self-validation passed (non-null hash)
+                    if (share_hash.IsNull()) {
+                        return;  // share failed PoW or validation; don't broadcast
+                    }
 
                     // Broadcast to all connected peers
                     try {
@@ -1329,6 +1358,22 @@ int main(int argc, char* argv[]) {
                     ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
                 redistributor->set_donation_identity(don_hash, 2); // P2SH
             }
+
+            // Periodic run_think timer (every 15 seconds) — verify shares & manage peers
+            auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            std::function<void(boost::system::error_code)> think_tick;
+            think_tick = [&, think_timer](boost::system::error_code ec) {
+                if (ec || g_shutdown_requested) return;
+                try {
+                    p2p_node->run_think();
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[THINK] error: " << e.what();
+                }
+                think_timer->expires_after(std::chrono::seconds(15));
+                think_timer->async_wait(think_tick);
+            };
+            think_timer->expires_after(std::chrono::seconds(15));
+            think_timer->async_wait(think_tick);
 
             // Periodic monitoring timer (every 30 seconds)
             auto monitor_timer = std::make_shared<boost::asio::steady_timer>(ioc);
