@@ -303,9 +303,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
         }
     }
 
-    size_t rs0 = ref_stream.size();
     ref_stream << p.prev_share;
-    size_t rs1 = ref_stream.size();
 
     // coinbase as VarStr
     {
@@ -314,7 +312,6 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
         ref_stream << bs;
     }
 
-    size_t rs2 = ref_stream.size();
     ref_stream << p.share_nonce;
     ref_stream << p.pubkey_hash;
     ref_stream << p.pubkey_type;
@@ -323,20 +320,16 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     ref_stream << p.stale_info;
     ::Serialize(ref_stream, VarInt(p.desired_version));
 
-    size_t rs3 = ref_stream.size();
     if (p.has_segwit)
         ref_stream << p.segwit_data;
 
-    size_t rs4 = ref_stream.size();
     ref_stream << p.merged_addresses;
-    size_t rs5 = ref_stream.size();
     ref_stream << p.far_share_hash;
     ref_stream << p.max_bits;
     ref_stream << p.bits;
     ref_stream << p.timestamp;
     ref_stream << p.absheight;
     ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
-    size_t rs6 = ref_stream.size();
     ref_stream << p.merged_coinbase_info;
     ref_stream << p.merged_payout_hash;
 
@@ -347,29 +340,6 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     auto ref_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 ref_hash = Hash(ref_span);
-
-    // Debug: log ref_hash and key fields at work-gen time
-    {
-        static int dbg_ref = 0;
-        if (dbg_ref < 3) {
-            ++dbg_ref;
-            LOG_WARNING << "=== REF_HASH_FN DEBUG #" << dbg_ref << " ==="
-                << "\n  ref_hash=" << ref_hash.GetHex()
-                << "\n  ref_stream_size=" << ref_stream.size()
-                << "\n  sizes: id=" << rs0 << " +prev=" << rs1 << " +cb=" << rs2
-                << " +fields=" << rs3 << " +segwit=" << rs4
-                << " +merged_addr=" << rs5 << " +abswork=" << rs6
-                << "\n  prev_share=" << p.prev_share.GetHex()
-                << "\n  coinbase_len=" << p.coinbase_scriptSig.size()
-                << "\n  max_bits=" << p.max_bits
-                << "\n  bits=" << p.bits
-                << "\n  timestamp=" << p.timestamp
-                << "\n  absheight=" << p.absheight
-                << "\n  merged_payout_hash=" << p.merged_payout_hash.GetHex()
-                << "\n  has_segwit=" << p.has_segwit
-                << "\n  segwit_branches=" << (p.has_segwit ? p.segwit_data.m_txid_merkle_link.m_branch.size() : 0);
-        }
-    }
 
     // Generate a random-ish last_txout_nonce
     uint64_t nonce = static_cast<uint64_t>(std::time(nullptr)) ^
@@ -575,58 +545,6 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
     // --- check_hash_link → gentx_hash ---
     uint256 gentx_hash = check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
 
-    // DEBUG: comprehensive pipeline trace (first 5 shares only)
-    {
-        static int dbg_refhash = 0;
-        if (dbg_refhash < 20)
-        {
-            ++dbg_refhash;
-            // Compute BOTH possible merkle_roots
-            uint256 mr_via_merkle_link = check_merkle_link(gentx_hash, share.m_merkle_link);
-            uint256 mr_via_txid_link;
-            bool has_segwit = false;
-            if constexpr (ver >= ltc::SEGWIT_ACTIVATION_VERSION) {
-                if constexpr (requires { share.m_segwit_data; }) {
-                    has_segwit = share.m_segwit_data.has_value();
-                    if (has_segwit)
-                        mr_via_txid_link = check_merkle_link(gentx_hash, share.m_segwit_data->m_txid_merkle_link);
-                }
-            }
-            // gentx_before_refhash hex
-            std::string gbr_hex;
-            for (size_t i = 0; i < gentx_before_refhash.size(); ++i) {
-                char buf[3]; std::snprintf(buf, 3, "%02x", gentx_before_refhash[i]);
-                gbr_hex += buf;
-            }
-            // hash_link state hex
-            std::string hl_state_hex;
-            for (size_t i = 0; i < 32 && i < share.m_hash_link.m_state.m_data.size(); ++i) {
-                char buf[3]; std::snprintf(buf, 3, "%02x", (unsigned char)share.m_hash_link.m_state.m_data[i]);
-                hl_state_hex += buf;
-            }
-            LOG_WARNING << "=== PIPELINE DEBUG share #" << dbg_refhash << " ==="
-                << "\n  share_version=" << ver
-                << "\n  has_segwit_data=" << has_segwit
-                << "\n  ref_stream_size=" << ref_stream.size()
-                << "\n  hash_ref=" << hash_ref.GetHex()
-                << "\n  ref_hash=" << ref_hash.GetHex()
-                << "\n  gentx_hash=" << gentx_hash.GetHex()
-                << "\n  hash_link.state=" << hl_state_hex
-                << "\n  hash_link.length=" << share.m_hash_link.m_length
-                << "\n  hash_link.extra_len=" << (share.m_hash_link.m_length % 64)
-                << "\n  gentx_before_refhash(" << gentx_before_refhash.size() << ")=" << gbr_hex
-                << "\n  last_txout_nonce=" << share.m_last_txout_nonce
-                << "\n  mr_via_merkle_link=" << mr_via_merkle_link.GetHex()
-                << "\n  mr_via_txid_link  =" << mr_via_txid_link.GetHex()
-                << "\n  merkle_link.branch_sz=" << share.m_merkle_link.m_branch.size()
-                << "\n  prev_block=" << share.m_min_header.m_previous_block.GetHex()
-                << "\n  timestamp=" << share.m_min_header.m_timestamp
-                << "\n  bits=" << share.m_min_header.m_bits
-                << "\n  nonce=" << share.m_min_header.m_nonce
-                << "\n  share.m_bits=" << share.m_bits;
-        }
-    }
-
     // --- Merkle root ---
     // For segwit-activated shares, use segwit_data.txid_merkle_link; otherwise merkle_link
     uint256 merkle_root;
@@ -667,49 +585,6 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
     auto hdr_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = Hash(hdr_span);
-
-    // --- Debug: log header details for PoW diagnosis (first 3 shares) ---
-    {
-        static int dbg_count = 0;
-        if (dbg_count < 3)
-        {
-            ++dbg_count;
-            // header hex
-            std::string hdr_hex;
-            for (size_t i = 0; i < header_stream.size(); ++i)
-            {
-                char buf[3];
-                std::snprintf(buf, sizeof(buf), "%02x",
-                    static_cast<unsigned char>(
-                        reinterpret_cast<const char*>(header_stream.data())[i]));
-                hdr_hex += buf;
-            }
-            // scrypt hash
-            char pow_hash_bytes_dbg[32];
-            scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
-                                pow_hash_bytes_dbg);
-            uint256 pow_hash_dbg;
-            memcpy(pow_hash_dbg.begin(), pow_hash_bytes_dbg, 32);
-
-            uint256 target_dbg = chain::bits_to_target(share.m_bits);
-            uint256 target_hdr = chain::bits_to_target(share.m_min_header.m_bits);
-
-            LOG_WARNING << "=== PoW DEBUG share #" << dbg_count << " ==="
-                << "\n  header_size=" << header_stream.size()
-                << "\n  header_hex=" << hdr_hex
-                << "\n  share_hash=" << share_hash.GetHex()
-                << "\n  pow_hash  =" << pow_hash_dbg.GetHex()
-                << "\n  share.m_bits=" << share.m_bits
-                << " target=" << target_dbg.GetHex()
-                << "\n  hdr.m_bits  =" << share.m_min_header.m_bits
-                << " target=" << target_hdr.GetHex()
-                << "\n  hdr.m_version=" << share.m_min_header.m_version
-                << "\n  hdr.m_timestamp=" << share.m_min_header.m_timestamp
-                << "\n  hdr.m_nonce=" << share.m_min_header.m_nonce
-                << "\n  merkle_root=" << merkle_root.GetHex()
-                << "\n  prev_block =" << share.m_min_header.m_previous_block.GetHex();
-        }
-    }
 
     // --- PoW check (scrypt) ---
     // For Litecoin the POW_FUNC is scrypt(1024,1,1,256).
@@ -951,27 +826,6 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker)
                 largest->second -= 1;
                 sum_amounts -= 1;
                 donation_amount = subsidy - sum_amounts;
-            }
-        }
-    }
-
-    // DEBUG: Log PPLNS intermediate values for GENTX-MISMATCH diagnosis
-    {
-        static int gst_log_count = 0;
-        if (gst_log_count < 3) {
-            ++gst_log_count;
-            LOG_WARNING << "GST DEBUG: ver=" << ver << " subsidy=" << subsidy
-                        << " donation_bps=" << donation << " donation_amt=" << donation_amount
-                        << " sum_amounts=" << sum_amounts << " n_payees=" << amounts.size()
-                        << " total_weight=" << total_weight.GetHex().substr(0,16)
-                        << " total_don_weight=" << total_donation_weight.GetHex().substr(0,16);
-            int i = 0;
-            for (auto& [script, amt] : amounts) {
-                if (i >= 5) { LOG_WARNING << "  ... (" << amounts.size() - 5 << " more outputs)"; break; }
-                std::string hex;
-                for (auto b : script) { char buf[3]; snprintf(buf, 3, "%02x", b); hex += buf; }
-                LOG_WARNING << "  payout[" << i << "] script=" << hex.substr(0,40) << " amt=" << amt;
-                ++i;
             }
         }
     }
@@ -1620,11 +1474,8 @@ uint256 create_local_share(
                 reinterpret_cast<const std::byte*>(&byte), 1));
         }
     }
-    size_t s0 = ref_stream.size(); // after IDENTIFIER
     ref_stream << share.m_prev_hash;
-    size_t s1 = ref_stream.size(); // after prev_hash
     ref_stream << share.m_coinbase;
-    size_t s2 = ref_stream.size(); // after coinbase
     ref_stream << share.m_nonce;
     ref_stream << share.m_pubkey_hash;
     ref_stream << share.m_pubkey_type;
@@ -1632,20 +1483,16 @@ uint256 create_local_share(
     ref_stream << share.m_donation;
     { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
     ::Serialize(ref_stream, VarInt(share.m_desired_version));
-    size_t s3 = ref_stream.size(); // after desired_version
     // segwit_data (V36+, optional)
     if (share.m_segwit_data.has_value())
         ref_stream << share.m_segwit_data.value();
-    size_t s4 = ref_stream.size(); // after segwit_data
     ref_stream << share.m_merged_addresses;
-    size_t s5 = ref_stream.size(); // after merged_addresses
     ref_stream << share.m_far_share_hash;
     ref_stream << share.m_max_bits;
     ref_stream << share.m_bits;
     ref_stream << share.m_timestamp;
     ref_stream << share.m_absheight;
     ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
-    size_t s6 = ref_stream.size(); // after abswork
     ref_stream << share.m_merged_coinbase_info;
     ref_stream << share.m_merged_payout_hash;
     // V36 ref_type includes message_data (empty BaseScript → varint(0) = 0x00)
@@ -1654,55 +1501,6 @@ uint256 create_local_share(
     auto ref_span_v = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 hash_ref = Hash(ref_span_v);
-
-    // Debug: log ref_hash and key fields at share creation time
-    {
-        static int dbg_cls = 0;
-        if (dbg_cls < 3) {
-            ++dbg_cls;
-            // Also extract ref_hash from actual_coinbase_bytes (last 44 bytes: ref_hash(32) + nonce(8) + locktime(4))
-            uint256 coinbase_ref_hash;
-            if (actual_coinbase_bytes.size() >= 44) {
-                memcpy(coinbase_ref_hash.begin(), actual_coinbase_bytes.data() + actual_coinbase_bytes.size() - 44, 32);
-            }
-            LOG_WARNING << "=== CREATE_LOCAL_SHARE REF DEBUG #" << dbg_cls << " ==="
-                << "\n  computed_ref_hash=" << hash_ref.GetHex()
-                << "\n  coinbase_ref_hash=" << coinbase_ref_hash.GetHex()
-                << "\n  match=" << (hash_ref == coinbase_ref_hash ? "YES" : "NO")
-                << "\n  ref_stream_size=" << ref_stream.size()
-                << "\n  sizes: id=" << s0 << " +prev=" << s1 << " +cb=" << s2
-                << " +fields=" << s3 << " +segwit=" << s4
-                << " +merged_addr=" << s5 << " +abswork=" << s6
-                << "\n  prev_share=" << prev_share.GetHex()
-                << "\n  coinbase_len=" << coinbase.m_data.size()
-                << "\n  max_bits=" << share.m_max_bits
-                << "\n  bits=" << share.m_bits
-                << "\n  timestamp=" << share.m_timestamp
-                << "\n  absheight=" << share.m_absheight
-                << "\n  merged_payout_hash=" << share.m_merged_payout_hash.GetHex()
-                << "\n  has_segwit=" << share.m_segwit_data.has_value()
-                << "\n  segwit_branches=" << (share.m_segwit_data.has_value() ? share.m_segwit_data->m_txid_merkle_link.m_branch.size() : 0);
-            // Hex dump of actual coinbase bytes (first 200 + last 100)
-            if (!actual_coinbase_bytes.empty()) {
-                std::string hex_dump;
-                static const char HEX[] = "0123456789abcdef";
-                size_t dump_head = std::min<size_t>(200, actual_coinbase_bytes.size());
-                for (size_t i = 0; i < dump_head; ++i) {
-                    hex_dump += HEX[actual_coinbase_bytes[i] >> 4];
-                    hex_dump += HEX[actual_coinbase_bytes[i] & 0xf];
-                }
-                LOG_WARNING << "  actual_coinbase_head(" << dump_head << ")=" << hex_dump;
-                hex_dump.clear();
-                size_t dump_tail_start = actual_coinbase_bytes.size() > 100 ? actual_coinbase_bytes.size() - 100 : 0;
-                for (size_t i = dump_tail_start; i < actual_coinbase_bytes.size(); ++i) {
-                    hex_dump += HEX[actual_coinbase_bytes[i] >> 4];
-                    hex_dump += HEX[actual_coinbase_bytes[i] & 0xf];
-                }
-                LOG_WARNING << "  actual_coinbase_tail(" << (actual_coinbase_bytes.size() - dump_tail_start) << ")=" << hex_dump;
-                LOG_WARNING << "  actual_coinbase_total_len=" << actual_coinbase_bytes.size();
-            }
-        }
-    }
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
     // --- Build the full coinbase TX (non-witness) ---
@@ -1729,24 +1527,6 @@ uint256 create_local_share(
         weights = std::move(result.weights);
         total_weight = result.total_weight;
         total_donation_weight = result.total_donation_weight;
-
-        // DEBUG: Log PPLNS weight details
-        {
-            static int dbg_pplns = 0;
-            if (dbg_pplns < 5) {
-                ++dbg_pplns;
-                uint288 sum_w;
-                for (auto& [s, w] : weights) sum_w = sum_w + w;
-                LOG_WARNING << "=== CLS PPLNS DEBUG #" << dbg_pplns << " ==="
-                    << "\n  chain_len=" << chain_len
-                    << "\n  n_addresses=" << weights.size()
-                    << "\n  total_weight=" << total_weight.GetHex()
-                    << "\n  sum_weights=" << sum_w.GetHex()
-                    << "\n  donation_weight=" << total_donation_weight.GetHex()
-                    << "\n  sum+don=" << (sum_w + total_donation_weight).GetHex()
-                    << "\n  max_weight=" << max_weight.GetHex();
-            }
-        }
     }
 
     // 2. Convert weights to integer payout amounts (V36 formula)
@@ -1820,19 +1600,11 @@ uint256 create_local_share(
         gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2));
     }
 
-    // Track outputs for debug
-    struct DbgOut { uint64_t value; std::string script_hex; std::string label; };
-    std::vector<DbgOut> dbg_outs;
-
-    auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script, const std::string& label = "") {
+    auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script, const std::string& = "") {
         gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
         BaseScript bs;
         bs.m_data = script;
         gentx << bs;
-        // Record for debug
-        std::string hex;
-        for (auto b : script) { char buf[3]; std::snprintf(buf, 3, "%02x", b); hex += buf; }
-        dbg_outs.push_back({value, hex, label});
     };
 
     // Segwit commitment output (FIRST, if present)
@@ -1894,19 +1666,6 @@ uint256 create_local_share(
             reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
     }
 
-    // DEBUG: dump full coinbase TX hex for comparison with Python
-    {
-        std::string hex;
-        hex.reserve(coinbase_bytes_for_hashlink.size() * 2);
-        static const char hx[] = "0123456789abcdef";
-        for (auto b : coinbase_bytes_for_hashlink) {
-            hex.push_back(hx[b >> 4]);
-            hex.push_back(hx[b & 0xf]);
-        }
-        LOG_WARNING << "CLS GENTX_HEX len=" << coinbase_bytes_for_hashlink.size()
-                    << " hex=" << hex;
-    }
-
     // The split point: everything before ref_hash + last_txout_nonce + locktime
     // = coinbase minus last (32 + 8 + 4) = 44 bytes
     constexpr size_t suffix_len = 32 + 8 + 4; // ref_hash + last_txout_nonce + locktime
@@ -1949,67 +1708,6 @@ uint256 create_local_share(
     else
         merkle_root = check_merkle_link(gentx_hash_for_header, share.m_merkle_link);
 
-    // DEBUG: compare gentx_hash from create_local_share vs what share_init_verify would get
-    {
-        static int dbg_cls_gentx = 0;
-        if (dbg_cls_gentx < 5) {
-            ++dbg_cls_gentx;
-            uint256 mr_direct = check_merkle_link(gentx_hash_for_header, share.m_merkle_link);
-            uint256 mr_txid = share.m_segwit_data.has_value()
-                ? check_merkle_link(gentx_hash_for_header, share.m_segwit_data->m_txid_merkle_link)
-                : mr_direct;
-            // Also dump first/last 32 bytes of coinbase used for hash_link
-            std::string cb_head, cb_tail;
-            for (size_t i = 0; i < std::min(size_t(32), coinbase_bytes_for_hashlink.size()); ++i) {
-                char buf[3]; std::snprintf(buf, 3, "%02x", coinbase_bytes_for_hashlink[i]);
-                cb_head += buf;
-            }
-            if (coinbase_bytes_for_hashlink.size() > 32) {
-                size_t start = coinbase_bytes_for_hashlink.size() - 32;
-                for (size_t i = start; i < coinbase_bytes_for_hashlink.size(); ++i) {
-                    char buf[3]; std::snprintf(buf, 3, "%02x", coinbase_bytes_for_hashlink[i]);
-                    cb_tail += buf;
-                }
-            }
-            // Dump full rebuilt gentx hex (this is what generate_transaction would produce)
-            std::string rebuilt_hex;
-            {
-                const unsigned char* gp = reinterpret_cast<const unsigned char*>(gentx.data());
-                for (size_t i = 0; i < gentx.size(); ++i) {
-                    char buf[3]; std::snprintf(buf, 3, "%02x", gp[i]);
-                    rebuilt_hex += buf;
-                }
-            }
-            // Dump actual coinbase hex used for header merkle root
-            std::string actual_hex;
-            if (!actual_coinbase_bytes.empty()) {
-                for (size_t i = 0; i < actual_coinbase_bytes.size(); ++i) {
-                    char buf[3]; std::snprintf(buf, 3, "%02x", actual_coinbase_bytes[i]);
-                    actual_hex += buf;
-                }
-            }
-            LOG_WARNING << "=== CLS GENTX DEBUG #" << dbg_cls_gentx << " ==="
-                << "\n  n_outs=" << n_outs << " payout_outputs=" << payout_outputs.size()
-                << " has_segwit=" << has_segwit
-                << "\n  subsidy=" << subsidy << " donation_amount=" << donation_amount
-                << "\n  gentx_hash(for_header)=" << gentx_hash_for_header.GetHex()
-                << "\n  mr(direct+merkle_link)=" << mr_direct.GetHex()
-                << "\n  mr(direct+txid_link)  =" << mr_txid.GetHex()
-                << "\n  rebuilt_gentx_size=" << gentx.size()
-                << "\n  actual_coinbase_size=" << actual_coinbase_bytes.size()
-                << "\n  rebuilt_gentx=" << rebuilt_hex
-                << "\n  actual_coinbase=" << actual_hex
-                << "\n  hash_link.length=" << share.m_hash_link.m_length;
-            // Dump per-output details
-            for (size_t oi = 0; oi < dbg_outs.size(); ++oi) {
-                LOG_WARNING << "  out[" << oi << "] " << dbg_outs[oi].label
-                    << " value=" << dbg_outs[oi].value
-                    << " script(" << (dbg_outs[oi].script_hex.size()/2) << ")="
-                    << dbg_outs[oi].script_hex;
-            }
-        }
-    }
-
     header_stream << merkle_root;
     header_stream << min_header.m_timestamp;
     header_stream << min_header.m_bits;
@@ -2022,28 +1720,6 @@ uint256 create_local_share(
     // Set the share's identity hash
     share.m_hash = share_hash;
 
-    // --- Self-validate: verify the share passes PoW check ---
-    // This catches any mismatch between create_local_share and share_init_verify.
-    // First, compute scrypt PoW locally to see if we even meet target
-    {
-        char pow_bytes[32];
-        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()), pow_bytes);
-        uint256 pow_hash;
-        memcpy(pow_hash.begin(), pow_bytes, 32);
-        uint256 share_target = chain::bits_to_target(share.m_bits);
-        static int dbg_pow_cls = 0;
-        if (dbg_pow_cls < 5 || pow_hash > share_target) {
-            ++dbg_pow_cls;
-            LOG_WARNING << "=== CLS PoW CHECK #" << dbg_pow_cls << " ==="
-                << "\n  pow_hash    =" << pow_hash.GetHex()
-                << "\n  share_target=" << share_target.GetHex()
-                << "\n  share.m_bits=" << share.m_bits
-                << "\n  passes=" << (pow_hash <= share_target ? "YES" : "NO")
-                << "\n  share_hash  =" << share_hash.GetHex()
-                << "\n  merkle_root =" << merkle_root.GetHex()
-                << "\n  hdr_size    =" << header_stream.size();
-        }
-    }
     // Phase 1: share_init_verify — checks hash_link, merkle, PoW
     try {
         uint256 verify_hash = share_init_verify(share);

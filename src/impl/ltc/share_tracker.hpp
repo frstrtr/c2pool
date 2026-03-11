@@ -472,18 +472,10 @@ public:
 
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
-        LOG_WARNING << "compute_share_target: prev=" << prev_share_hash.ToString().substr(0,16)
-                  << " height=" << height
-                  << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
-                  << " TARGET_LOOKBEHIND=" << PoolConfig::TARGET_LOOKBEHIND
-                  << " chain_size=" << chain.size();
-
         // Not enough chain depth: use MAX_TARGET
         if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
             auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
-            LOG_WARNING << "compute_share_target: returning MAX_TARGET because height("
-                        << height << ") < TARGET_LOOKBEHIND(" << PoolConfig::TARGET_LOOKBEHIND << ")";
             return {max_bits, max_bits};
         }
 
@@ -495,7 +487,6 @@ public:
         if (aps.IsNull())
         {
             pre_target = MAX_TARGET;
-            LOG_WARNING << "CST step1: aps=NULL → pre_target=MAX_TARGET";
         }
         else
         {
@@ -514,27 +505,18 @@ public:
             if (result > max_288)
             {
                 pre_target = MAX_TARGET;
-                LOG_WARNING << "CST step1: aps=" << aps.GetHex()
-                            << " divisor=" << divisor.GetHex()
-                            << " result>MAX → pre_target=MAX_TARGET";
             }
             else
             {
                 pre_target.SetHex(result.GetHex());
-                LOG_WARNING << "CST step1: aps=" << aps.GetHex()
-                            << " pre_target=" << pre_target.GetHex().substr(0,32);
             }
         }
 
         // Step 2: Get previous share's max_target
         uint256 prev_max_target;
-        uint32_t prev_max_bits_raw = 0;
         chain.get_share(prev_share_hash).invoke([&](auto* obj) {
-            prev_max_bits_raw = obj->m_max_bits;
             prev_max_target = chain::bits_to_target(obj->m_max_bits);
         });
-        LOG_WARNING << "CST step2: prev_max_bits=" << prev_max_bits_raw
-                    << " prev_max_target=" << prev_max_target.GetHex().substr(0,32);
 
         // Step 3: Emergency time-based decay (death spiral prevention)
         // Phase 1b from p2pool-v36: doubles target every SHARE_PERIOD * 10
@@ -595,10 +577,6 @@ public:
         uint256 pre_target2 = pre_target;
         if (pre_target2 < lo) pre_target2 = lo;
         if (pre_target2 > hi) pre_target2 = hi;
-
-        LOG_WARNING << "CST step4: clamp_ref=" << clamp_ref_target.GetHex().substr(0,32)
-                    << " lo=" << lo.GetHex().substr(0,32) << " hi=" << hi.GetHex().substr(0,32)
-                    << " pre_target2=" << pre_target2.GetHex().substr(0,32);
 
         // Step 5: Clamp to network limits [MIN_TARGET, MAX_TARGET]
         // MIN_TARGET = 0 → no lower clamp needed
@@ -733,25 +711,6 @@ public:
                     chain::bits_to_target(obj->m_bits));
                 uint32_t don = obj->m_donation;
 
-                // DEBUG: log per-share values for first few in each call
-                {
-                    static int dbg_walk_calls = 0;
-                    static int dbg_current_call = 0;
-                    if (share_count == 0) { dbg_current_call = dbg_walk_calls++; }
-                    if (dbg_current_call < 3 && (share_count < 3 || share_count == 399)) {
-                        std::string script_hex;
-                        auto scr = get_share_script(obj);
-                        for (size_t ii = 0; ii < std::min(scr.size(), size_t(10)); ++ii) {
-                            char buf[3]; std::snprintf(buf, 3, "%02x", scr[ii]); script_hex += buf;
-                        }
-                        LOG_WARNING << "  PPLNS walk[" << share_count << "] hash="
-                            << cur.GetHex().substr(0,16) << " don=" << don
-                            << " bits=" << obj->m_bits
-                            << " att_lo64=" << att.GetLow64()
-                            << " script=" << script_hex;
-                    }
-                }
-
                 // Apply exponential decay: decayed_att = att * decay_fp >> PRECISION
                 uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
 
@@ -787,24 +746,6 @@ public:
             // their product is ~2^80 which overflows uint64_t (max 2^64).
             decay_fp = static_cast<uint64_t>(
                 (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
-        }
-
-        // DEBUG: log actual walk length and termination reason
-        {
-            static int dbg_walk_summary = 0;
-            if (dbg_walk_summary < 20) {
-                ++dbg_walk_summary;
-                std::string reason = "max_shares";
-                if (cur.IsNull()) reason = "NULL_prev";
-                else if (!chain.contains(cur)) reason = "NOT_IN_CHAIN(cur=" + cur.GetHex().substr(0,16) + ")";
-                else if (result.total_weight >= desired_weight) reason = "weight_cap";
-                LOG_WARNING << "PPLNS walk done: walked=" << share_count
-                    << " max_shares=" << max_shares
-                    << " n_addr=" << result.weights.size()
-                    << " total_w_lo64=" << result.total_weight.GetLow64()
-                    << " reason=" << reason
-                    << " start=" << start.GetHex().substr(0,16);
-            }
         }
 
         return result;
@@ -1072,9 +1013,6 @@ public:
         payload += to_decimal(total_weight);
         payload += "|D:";
         payload += to_decimal(donation_weight);
-
-        // DEBUG: log payload for comparison with Python
-        LOG_WARNING << "MPH payload (len=" << payload.size() << "): " << payload.substr(0, 500);
 
         // SHA256d (hash256 in p2pool)
         auto span = std::span<const unsigned char>(

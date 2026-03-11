@@ -492,13 +492,6 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     // nonce LE
     block << HexStr(std::span<const unsigned char>(nonce_bytes.data(), nonce_bytes.size()));
 
-    // DEBUG: log the 80-byte header that will be submitted
-    {
-        std::string hdr = block.str();
-        LOG_INFO << "BLOCK_HEADER_HEX(160): " << hdr.substr(0, 160);
-        LOG_INFO << "BLOCK_HEADER miner_ntime=" << ntime << " miner_nonce=" << nonce;
-    }
-
     // Transaction count (varint) + coinbase + rest of transactions
     const auto& tx_list = job ? job->tx_data : std::vector<std::string>{};
     // If no job snapshot, collect tx data from the live template

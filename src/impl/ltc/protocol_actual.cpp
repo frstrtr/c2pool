@@ -5,8 +5,6 @@
 #include <core/random.hpp>
 #include <core/common.hpp>
 
-#include <iomanip>
-#include <sstream>
 #include <cstring>
 
 namespace ltc
@@ -136,45 +134,6 @@ void Actual::HANDLER(shares)
                 }
             }
         });
-        
-        // Round-trip diagnostic: re-serialize and compare with original bytes
-        {
-            PackStream reser = pack(share);
-            auto orig_span = raw_copy.contents.m_data;
-            auto reser_span = reser.get_span();
-            bool match = (orig_span.size() == (size_t)reser_span.size()) &&
-                         std::memcmp(orig_span.data(), reser_span.data(), orig_span.size()) == 0;
-            if (!match) {
-                static int rt_dbg = 0;
-                if (rt_dbg < 10) {
-                    ++rt_dbg;
-                    LOG_WARNING << "ROUND-TRIP MISMATCH #" << rt_dbg
-                                << " type=" << raw_copy.type
-                                << " orig_len=" << orig_span.size()
-                                << " reser_len=" << reser_span.size();
-                    // Find first differing byte
-                    size_t min_len = std::min(orig_span.size(), (size_t)reser_span.size());
-                    for (size_t b = 0; b < min_len; ++b) {
-                        if (orig_span[b] != (unsigned char)reser_span[b]) {
-                            LOG_WARNING << "  first diff at byte " << b
-                                        << " orig=0x" << std::hex << (int)orig_span[b]
-                                        << " reser=0x" << (int)(unsigned char)reser_span[b] << std::dec;
-                            // Show a few bytes of context around the diff
-                            size_t ctx_start = (b > 8) ? b - 8 : 0;
-                            size_t ctx_end = std::min(b + 16, min_len);
-                            std::ostringstream oss_o, oss_r;
-                            for (size_t c = ctx_start; c < ctx_end; ++c)
-                                oss_o << std::hex << std::setfill('0') << std::setw(2) << (int)orig_span[c];
-                            for (size_t c = ctx_start; c < ctx_end; ++c)
-                                oss_r << std::hex << std::setfill('0') << std::setw(2) << (int)(unsigned char)reser_span[c];
-                            LOG_WARNING << "  orig[" << ctx_start << ".." << ctx_end << "]: " << oss_o.str();
-                            LOG_WARNING << "  resr[" << ctx_start << ".." << ctx_end << "]: " << oss_r.str();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
 
         result.add(share, txs, raw_copy);
     }
@@ -184,34 +143,7 @@ void Actual::HANDLER(shares)
 
 void Actual::HANDLER(sharereq)
 {
-    // Debug: log what's being requested
-    {
-        static int dbg_req = 0;
-        if (dbg_req < 20)
-        {
-            ++dbg_req;
-            std::string req_hashes;
-            for (auto& h : msg->m_hashes) req_hashes += h.ToString().substr(0, 16) + " ";
-            LOG_WARNING << "SHAREREQ #" << dbg_req << " from " << peer->addr().to_string()
-                        << " hashes=[" << req_hashes << "] parents=" << msg->m_parents;
-        }
-    }
-
     auto shares = handle_get_share(msg->m_hashes, msg->m_parents, msg->m_stops, peer->addr());
-
-    // Debug: log what we're returning
-    {
-        static int dbg_rep = 0;
-        if (dbg_rep < 20)
-        {
-            ++dbg_rep;
-            LOG_WARNING << "SHAREREPLY #" << dbg_rep << " returning " << shares.size() << " shares";
-            for (size_t i = 0; i < std::min(shares.size(), (size_t)3); ++i)
-            {
-                LOG_WARNING << "  share[" << i << "] hash=" << shares[i].hash().ToString().substr(0, 16);
-            }
-        }
-    }
 
     std::vector<chain::RawShare> rshares;
 

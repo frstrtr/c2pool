@@ -647,13 +647,13 @@ void NodeImpl::run_think()
     auto result = m_tracker.think(block_rel_height, prev_block, bits);
 
     // Ban peers that provided invalid/unverifiable shares
-    // TEMPORARILY DISABLED: during initial sync, PPLNS verification fails for all
-    // Python-created shares due to GENTX-MISMATCH. Banning would kill sync.
-    // TODO: re-enable once generate_share_transaction matches Python's output
     auto now = std::chrono::steady_clock::now();
     if (!result.bad_peer_addresses.empty()) {
-        LOG_WARNING << "run_think: " << result.bad_peer_addresses.size()
-                    << " peer(s) with unverifiable shares (NOT banning during debug)";
+        for (const auto& bad_addr : result.bad_peer_addresses) {
+            LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
+                        << " for unverifiable shares";
+            m_ban_list[bad_addr] = now + std::chrono::seconds(300);
+        }
     }
 
     // Expire old bans
