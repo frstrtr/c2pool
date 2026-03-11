@@ -87,6 +87,16 @@ class ShareChain
         chain_data(index_t* _index, share_t& _share) : index(_index), share(std::move(_share)) {}
     };
 
+public:
+    ~ShareChain()
+    {
+        for (auto& [h, cd] : m_shares)
+        {
+            cd.share.destroy();
+            delete cd.index;
+        }
+    }
+
 private:
     std::unordered_map<hash_t, chain_data, hasher_t> m_shares;
 
@@ -463,6 +473,7 @@ public:
             auto it = m_shares.find(h);
             if (it != m_shares.end())
             {
+                it->second.share.destroy();
                 delete it->second.index;
                 m_shares.erase(it);
             }
@@ -592,7 +603,8 @@ public:
             }
         }
 
-        // Free the index and remove from m_shares
+        // Free the share object and index, then remove from m_shares
+        it->second.share.destroy();
         delete idx;
         m_shares.erase(it);
         return true;

@@ -113,6 +113,12 @@ public:
         return *this;
     }
 
+    /// Free the heap-allocated share object held by this variant.
+    void destroy()
+    {
+        std::visit([](auto* ptr) { delete ptr; }, *this);
+    }
+
     auto version() const
     {
         return std::visit([&](auto* share){ return share->version; }, *this);
