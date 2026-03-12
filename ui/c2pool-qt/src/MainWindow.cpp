@@ -50,7 +50,7 @@ MainWindow::MainWindow(QWidget* parent)
     launchPage_     = new PageLaunch(stack_);
     overviewPage_   = new PageOverview(stack_);
     miningPage_     = new PageMining(stack_);
-    sharechainPage_ = new PageSharechain(std::make_shared<ApiClient>(&api_), stack_);
+    sharechainPage_ = new PageSharechain(stack_);
     logsPage_       = new PageLogs(stack_);
 
     stack_->addWidget(launchPage_);     // index 0
@@ -179,7 +179,7 @@ void MainWindow::refreshCurrentPage()
         statusLabel_->setText("Mining refreshed");
         break;
     case 3:
-        sharechainPage_->refresh();
+        sharechainPage_->refresh(&api_);
         statusLabel_->setText("Sharechain refreshed");
         break;
     case 4:

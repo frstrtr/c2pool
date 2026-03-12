@@ -1,68 +1,109 @@
 #include "PageOverview.hpp"
 
-#include <QGridLayout>
+#include <QFormLayout>
+#include <QGroupBox>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QVBoxLayout>
 
 PageOverview::PageOverview(QWidget* parent)
     : QWidget(parent)
 {
-    auto* layout = new QGridLayout(this);
+    auto* layout = new QVBoxLayout(this);
 
-    layout->addWidget(new QLabel("Uptime:"), 0, 0);
+    // Network / Pool stats
+    auto* poolGroup = new QGroupBox("Pool Statistics", this);
+    auto* poolForm = new QFormLayout(poolGroup);
     uptimeValue_ = new QLabel("-");
-    layout->addWidget(uptimeValue_, 0, 1);
-
-    layout->addWidget(new QLabel("Pool Hashrate:"), 1, 0);
+    poolForm->addRow("Uptime:", uptimeValue_);
     poolHashrateValue_ = new QLabel("-");
-    layout->addWidget(poolHashrateValue_, 1, 1);
-
-    layout->addWidget(new QLabel("Pool Stale Ratio:"), 2, 0);
+    poolForm->addRow("Pool Hashrate:", poolHashrateValue_);
     staleRateValue_ = new QLabel("-");
-    layout->addWidget(staleRateValue_, 2, 1);
-
-    layout->addWidget(new QLabel("Network Difficulty:"), 3, 0);
+    poolForm->addRow("Pool Stale Ratio:", staleRateValue_);
     networkDiffValue_ = new QLabel("-");
-    layout->addWidget(networkDiffValue_, 3, 1);
+    poolForm->addRow("Network Difficulty:", networkDiffValue_);
+    layout->addWidget(poolGroup);
 
-    layout->addWidget(new QLabel("Status:"), 4, 0);
+    // Sharechain stats
+    auto* chainGroup = new QGroupBox("Sharechain", this);
+    auto* chainForm = new QFormLayout(chainGroup);
+    chainHeightValue_ = new QLabel("-");
+    chainForm->addRow("Chain Height:", chainHeightValue_);
+    sharesValue_ = new QLabel("-");
+    chainForm->addRow("Total Shares:", sharesValue_);
+    uniqueMinersValue_ = new QLabel("-");
+    chainForm->addRow("Unique Miners:", uniqueMinersValue_);
+    peersValue_ = new QLabel("-");
+    chainForm->addRow("P2P Connections:", peersValue_);
+    layout->addWidget(chainGroup);
+
     statusValue_ = new QLabel("Idle");
-    layout->addWidget(statusValue_, 4, 1);
-
-    layout->setColumnStretch(2, 1);
+    layout->addWidget(statusValue_);
+    layout->addStretch();
 }
 
 void PageOverview::refresh(ApiClient* api)
 {
     statusValue_->setText("Refreshing...");
 
-    api->getJson("/global_stats",
-        [this](const QJsonDocument& doc) {
-            if (!doc.isObject()) {
-                statusValue_->setText("Unexpected /global_stats payload");
-                return;
-            }
-            const auto obj = doc.object();
-            poolHashrateValue_->setText(QString::number(obj.value("pool_hash_rate").toDouble(), 'f', 2));
-            staleRateValue_->setText(QString::number(obj.value("pool_stale_prop").toDouble(), 'f', 6));
-            networkDiffValue_->setText(QString::number(obj.value("network_block_difficulty").toDouble(), 'f', 2));
-            statusValue_->setText("Global stats OK");
-        },
-        [this](const QString& error) {
-            statusValue_->setText(error);
-        }
-    );
-
+    // Uptime (plain text)
     api->getText("/uptime",
         [this](const QString& text) {
             bool ok = false;
             const double seconds = text.trimmed().toDouble(&ok);
             if (ok) {
-                uptimeValue_->setText(QString::number(seconds, 'f', 1) + " s");
+                if (seconds < 3600)
+                    uptimeValue_->setText(QString("%1 min").arg(seconds / 60.0, 0, 'f', 1));
+                else
+                    uptimeValue_->setText(QString("%1 h").arg(seconds / 3600.0, 0, 'f', 1));
             }
         },
-        [this](const QString&) {
-            // Keep last value
+        [](const QString&) { }
+    );
+
+    // Global stats (pool hashrate, stale ratio)
+    api->getJson("/global_stats",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            const double hashrate = obj.value("pool_hashrate").toDouble();
+            poolHashrateValue_->setText(hashrate > 0
+                ? QString("%1 MH/s").arg(hashrate / 1e6, 0, 'f', 2)
+                : "0.00");
+            staleRateValue_->setText(
+                QString::number(obj.value("pool_stale_ratio").toDouble(), 'f', 6));
+            statusValue_->setText("OK");
+        },
+        [this](const QString& err) {
+            statusValue_->setText(err);
         }
+    );
+
+    // Local stats (network difficulty, connections)
+    api->getJson("/local_stats",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            networkDiffValue_->setText(
+                QString::number(obj.value("difficulty").toDouble(), 'f', 4));
+            peersValue_->setText(
+                QString::number(obj.value("connections").toInt()));
+        },
+        [](const QString&) { }
+    );
+
+    // Sharechain stats (height, shares, miners)
+    api->getJson("/sharechain/stats",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            chainHeightValue_->setText(
+                QString::number(obj.value("chain_height").toInt()));
+            sharesValue_->setText(
+                QString::number(obj.value("total_shares").toInt()));
+            const auto miners = obj.value("shares_by_miner").toObject();
+            uniqueMinersValue_->setText(QString::number(miners.size()));
+        },
+        [](const QString&) { }
     );
 }

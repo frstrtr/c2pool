@@ -18,5 +18,9 @@ private:
     QLabel* poolHashrateValue_;
     QLabel* staleRateValue_;
     QLabel* networkDiffValue_;
+    QLabel* chainHeightValue_;
+    QLabel* sharesValue_;
+    QLabel* uniqueMinersValue_;
+    QLabel* peersValue_;
     QLabel* statusValue_;
 };

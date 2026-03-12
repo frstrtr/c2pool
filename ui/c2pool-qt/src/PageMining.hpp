@@ -30,6 +30,11 @@ private:
     QLabel* statusValue_;
     QLabel* connectedMinersValue_;
     QLabel* miningStateValue_;
+    QLabel* acceptedValue_;
+    QLabel* rejectedValue_;
+    QLabel* hashrateValue_;
+    QLabel* sharesPerMinValue_;
+    QLabel* difficultyValue_;
     QTableWidget* workersTable_;
 
     QPushButton* startButton_;

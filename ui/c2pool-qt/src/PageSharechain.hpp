@@ -30,8 +30,8 @@ class PageSharechain : public QWidget {
     Q_OBJECT
 
 public:
-    explicit PageSharechain(std::shared_ptr<ApiClient> api, QWidget* parent = nullptr);
-    void refresh();
+    explicit PageSharechain(QWidget* parent = nullptr);
+    void refresh(ApiClient* api);
 
 private:
     void setupUI();
@@ -40,8 +40,6 @@ private:
     void displayVersionDistribution(const QJsonObject& version_data);
     void displayMetrics(const QJsonObject& metrics);
     void drawTimelineChart();
-
-    std::shared_ptr<ApiClient> api_;
     
     // UI Components
     QLabel* statusValue_;

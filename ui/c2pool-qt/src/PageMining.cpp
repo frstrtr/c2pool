@@ -1,5 +1,7 @@
 #include "PageMining.hpp"
 
+#include <QFormLayout>
+#include <QGroupBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -32,12 +34,27 @@ PageMining::PageMining(QWidget* parent)
     banLayout->addWidget(unbanButton_);
     layout->addLayout(banLayout);
 
-    connectedMinersValue_ = new QLabel("Connected miners: -");
-    layout->addWidget(connectedMinersValue_);
+    // Aggregate stratum stats
+    auto* statsGroup = new QGroupBox("Stratum Statistics", this);
+    auto* statsForm = new QFormLayout(statsGroup);
+    connectedMinersValue_ = new QLabel("-");
+    statsForm->addRow("Connected miners:", connectedMinersValue_);
+    miningStateValue_ = new QLabel("unknown");
+    statsForm->addRow("Mining state:", miningStateValue_);
+    acceptedValue_ = new QLabel("-");
+    statsForm->addRow("Accepted shares:", acceptedValue_);
+    rejectedValue_ = new QLabel("-");
+    statsForm->addRow("Rejected shares:", rejectedValue_);
+    hashrateValue_ = new QLabel("-");
+    statsForm->addRow("Pool hashrate:", hashrateValue_);
+    sharesPerMinValue_ = new QLabel("-");
+    statsForm->addRow("Shares/min:", sharesPerMinValue_);
+    difficultyValue_ = new QLabel("-");
+    statsForm->addRow("Share difficulty:", difficultyValue_);
+    layout->addWidget(statsGroup);
 
-    miningStateValue_ = new QLabel("Mining state: unknown");
-    layout->addWidget(miningStateValue_);
-
+    // Per-worker table (populated when workers connect)
+    layout->addWidget(new QLabel("Workers:", this));
     workersTable_ = new QTableWidget(this);
     workersTable_->setColumnCount(6);
     workersTable_->setHorizontalHeaderLabels({
@@ -64,17 +81,12 @@ void PageMining::refresh(ApiClient* api)
 
     api->getJson("/connected_miners",
         [this](const QJsonDocument& doc) {
-            if (doc.isObject()) {
-                const auto obj = doc.object();
-                const int total = obj.value("total_connected").toInt();
-                connectedMinersValue_->setText(QString("Connected miners: %1").arg(total));
-            } else if (doc.isArray()) {
-                connectedMinersValue_->setText(QString("Connected miners: %1").arg(doc.array().size()));
-            }
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            connectedMinersValue_->setText(
+                QString::number(obj.value("total_connected").toInt()));
         },
-        [this](const QString&) {
-            // Keep last value
-        }
+        [](const QString&) { }
     );
 
     api->getJson("/stratum_stats",
@@ -86,14 +98,27 @@ void PageMining::refresh(ApiClient* api)
 
             const auto root = doc.object();
             const bool miningEnabled = root.value("mining_enabled").toBool(true);
-            miningStateValue_->setText(QString("Mining state: %1").arg(miningEnabled ? "running" : "stopped"));
+            miningStateValue_->setText(miningEnabled ? "running" : "stopped");
+
+            acceptedValue_->setText(QString::number(root.value("accepted_shares").toInt()));
+            rejectedValue_->setText(QString::number(root.value("rejected_shares").toInt()));
+
+            const double hashrate = root.value("hashrate").toDouble();
+            hashrateValue_->setText(hashrate > 0
+                ? QString("%1 MH/s").arg(hashrate / 1e6, 0, 'f', 2)
+                : "0.00");
+
+            sharesPerMinValue_->setText(
+                QString::number(root.value("shares_per_minute").toDouble(), 'f', 2));
+            difficultyValue_->setText(
+                QString::number(root.value("difficulty").toDouble(), 'f', 4));
+
+            // Per-worker breakdown (if available)
             const auto workers = root.value("workers").toObject();
             workersTable_->setRowCount(workers.size());
-
             int row = 0;
             for (auto it = workers.begin(); it != workers.end(); ++it, ++row) {
                 const auto w = it.value().toObject();
-
                 workersTable_->setItem(row, 0, new QTableWidgetItem(it.key()));
                 workersTable_->setItem(row, 1, new QTableWidgetItem(QString::number(w.value("accepted").toInt())));
                 workersTable_->setItem(row, 2, new QTableWidgetItem(QString::number(w.value("rejected").toInt())));
@@ -102,7 +127,8 @@ void PageMining::refresh(ApiClient* api)
                 workersTable_->setItem(row, 5, new QTableWidgetItem(w.value("merged_redistributed").toBool() ? "yes" : "no"));
             }
 
-            statusValue_->setText(QString("Loaded %1 workers").arg(workers.size()));
+            const int active = root.value("active_workers").toInt();
+            statusValue_->setText(QString("%1 active worker(s)").arg(active));
         },
         [this](const QString& error) {
             statusValue_->setText(error);

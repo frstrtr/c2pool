@@ -14,8 +14,8 @@
 #include <iomanip>
 #include <sstream>
 
-PageSharechain::PageSharechain(std::shared_ptr<ApiClient> api, QWidget* parent)
-    : QWidget(parent), api_(api) 
+PageSharechain::PageSharechain(QWidget* parent)
+    : QWidget(parent)
 {
     setupUI();
 }
@@ -95,11 +95,11 @@ void PageSharechain::setupUI()
     setLayout(mainLayout);
 }
 
-void PageSharechain::refresh()
+void PageSharechain::refresh(ApiClient* api)
 {
-    if (!api_) return;
+    if (!api) return;
     
-    api_->getJson("/sharechain/stats",
+    api->getJson("/sharechain/stats",
         [this](const QJsonDocument& data) {
             if (data.isObject()) {
                 updateChartData(data.object());
