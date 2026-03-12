@@ -302,7 +302,13 @@ public:
         // Phase 2: Extend verification from verified heads
         for (auto& [head_hash, tail_hash] : verified.get_heads())
         {
+            if (!chain.contains(head_hash))
+                continue;
+
             auto [head_height, last_hash] = verified.get_height_and_last(head_hash);
+            if (!chain.contains(last_hash))
+                continue;
+
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
             auto want = std::max(static_cast<int32_t>(PoolConfig::chain_length()) - head_height, 0);
@@ -376,6 +382,9 @@ public:
             const auto& head_hashes = verified.get_tails().at(best_tail);
             for (const auto& hh : head_hashes)
             {
+                if (!chain.contains(hh))
+                    continue;
+
                 auto v_height = verified.get_height(hh);
                 auto recent_ancestor = verified.get_nth_parent_key(hh, std::min(5, v_height));
                 uint288 work_score = verified.get_index(recent_ancestor)->work;
@@ -408,7 +417,7 @@ public:
 
         // Phase 6: Compute cutoffs for desired shares filtering
         uint32_t timestamp_cutoff;
-        if (!best.IsNull())
+        if (!best.IsNull() && chain.contains(best))
         {
             uint32_t best_ts = 0;
             chain.get_share(best).invoke([&](auto* obj) {
@@ -432,7 +441,7 @@ public:
     // -- Pool hashrate estimation --
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
-        if (dist < 2)
+        if (dist < 2 || !chain.contains(share_hash))
             return uint288(0);
 
         auto far_hash = chain.get_nth_parent_key(share_hash, dist - 1);
@@ -875,6 +884,8 @@ public:
     std::map<uint64_t, int32_t> get_desired_version_counts(const uint256& share_hash, int32_t lookbehind)
     {
         std::map<uint64_t, int32_t> counts;
+        if (!chain.contains(share_hash))
+            return counts;
         auto height = chain.get_height(share_hash);
         auto actual = std::min(lookbehind, height);
         if (actual <= 0)
@@ -1068,6 +1079,8 @@ public:
     // Python ref: share.check() version_after_check logic
     bool should_punish_version(const uint256& share_hash, int64_t share_version, int32_t lookbehind)
     {
+        if (!chain.contains(share_hash))
+            return false;
         auto counts = get_desired_version_counts(share_hash, lookbehind);
         auto height = chain.get_height(share_hash);
         auto actual = std::min(lookbehind, height);

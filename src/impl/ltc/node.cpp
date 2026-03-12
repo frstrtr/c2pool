@@ -130,9 +130,8 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 
         if (m_peers.contains(msg->m_nonce))
         {
-                std::string reason = "[handle_message_version] Detected duplicate connection, disconnecting from " + peer->addr().to_string();
-                LOG_ERROR << reason;
-                throw std::runtime_error(reason);
+                LOG_DEBUG_POOL << "[handle_message_version] Detected duplicate connection, disconnecting from " << peer->addr().to_string();
+                throw std::runtime_error("duplicate connection");
         }
 
         peer->m_nonce = msg->m_nonce;
