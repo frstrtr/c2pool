@@ -1,0 +1,94 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  schedule:
+    - cron: '30 1 * * 1'   # Weekly on Monday 01:30 UTC
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: python
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-and-quality
+
+      # ── C++ build (manual mode only) ─────────────────────────────────────
+      - if: matrix.build-mode == 'manual'
+        name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make \
+            libleveldb-dev \
+            libsecp256k1-dev
+
+      - if: matrix.build-mode == 'manual'
+        name: Set up Python for Conan
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - if: matrix.build-mode == 'manual'
+        name: Install Conan 2
+        run: |
+          pip install "conan>=2.0,<3.0"
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
+            "$(conan profile path default)"
+
+      - if: matrix.build-mode == 'manual'
+        name: Restore Conan package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan2-codeql-ubuntu24-gcc13-debug-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-codeql-ubuntu24-gcc13-debug-
+
+      - if: matrix.build-mode == 'manual'
+        name: Install Conan dependencies
+        run: |
+          conan install . \
+            --build=missing \
+            --output-folder=build_codeql \
+            --settings=build_type=Debug
+
+      - if: matrix.build-mode == 'manual'
+        name: Build for CodeQL analysis
+        run: |
+          cmake -S . -B build_codeql \
+            -DCMAKE_TOOLCHAIN_FILE=build_codeql/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build_codeql --target c2pool -j$(nproc)
+
+      # ── Analysis ──────────────────────────────────────────────────────────
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

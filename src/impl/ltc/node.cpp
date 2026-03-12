@@ -6,6 +6,7 @@
 #include <core/target_utils.hpp>
 #include <sharechain/prepared_list.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <random>
 
@@ -270,9 +271,12 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 
 			share.ACTION({
 				uint256 target = chain::bits_to_target(obj->m_bits);
+				// Convert m_abswork (uint128) to uint256 by zero-padding high 128 bits
+				uint256 abswork_256;
+				std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
 				m_storage->store_share(obj->m_hash, versioned, obj->m_prev_hash,
-				                       /*height*/ 0, obj->m_timestamp,
-				                       /*work*/ uint256::ZERO, target);
+				                       obj->m_absheight, obj->m_timestamp,
+				                       abswork_256, target);
 			});
 		}
 	}
