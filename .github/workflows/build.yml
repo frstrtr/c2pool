@@ -81,6 +81,7 @@ jobs:
         run: |
           cmake --build build_ci \
             --target test_hardening test_share_messages test_coin_broadcaster \
+                    core_test sharechain_test share_test \
             -j$(nproc)
 
       # ── 9. Run test suite ─────────────────────────────────────────────────
