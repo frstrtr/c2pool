@@ -3,6 +3,9 @@
 #include <ctime>
 #include <sstream>
 #include <iomanip>
+#include <btclibs/bech32.h>
+#include <btclibs/base58.h>
+#include <core/hash.hpp>
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
@@ -99,59 +102,104 @@ void NodeOwnerPayoutConfig::set_payout_script(const std::string& script_hex, Blo
     }
 }
 
-std::string NodeOwnerPayoutConfig::generate_address_from_script(Blockchain blockchain, Network network) const {
-    if (payout_script_hex.empty()) {
-        return "";
+// Decode a hex string into bytes. Returns empty vector on bad input.
+static std::vector<uint8_t> hex_to_bytes(const std::string& hex)
+{
+    if (hex.size() % 2 != 0) return {};
+    std::vector<uint8_t> out;
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        char hi = hex[i], lo = hex[i + 1];
+        auto from_hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int h = from_hex(hi), l = from_hex(lo);
+        if (h < 0 || l < 0) return {};
+        out.push_back(static_cast<uint8_t>((h << 4) | l));
     }
-    
-    try {
-        // This is a simplified implementation
-        // In a real implementation, you would:
-        // 1. Parse the script hex
-        // 2. Create a P2SH address from the script hash
-        // 3. Format according to blockchain and network type
-        
-        LOG_INFO << "Generating address from script for " 
-                 << (blockchain == Blockchain::LITECOIN ? "LTC" : "BTC")
-                 << " " << (network == Network::TESTNET ? "testnet" : "mainnet");
-                 
-        // Placeholder implementation - would need proper script-to-address conversion
-        std::string prefix;
-        switch (blockchain) {
-            case Blockchain::LITECOIN:
-                prefix = (network == Network::TESTNET) ? "tltc1" : "ltc1";
-                break;
-            case Blockchain::BITCOIN:
-                prefix = (network == Network::TESTNET) ? "tb1" : "bc1";
-                break;
-            default:
-                LOG_WARNING << "Script-to-address conversion not implemented for this blockchain";
-                return "";
-        }
-        
-        // Generate a placeholder P2SH address based on script hash
-        // TODO: Implement proper script-to-address conversion using real cryptographic hashing
-        std::string script_hash = payout_script_hex.substr(0, 32); // Simplified
-        
-        // Create a more realistic bech32-style address for testing
-        // Note: This is still a placeholder, not a cryptographically valid address
-        if (blockchain == Blockchain::LITECOIN && network == Network::TESTNET) {
-            // Use a realistic testnet LTC bech32 format
-            return "tltc1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
-        } else if (blockchain == Blockchain::LITECOIN && network == Network::MAINNET) {
-            return "ltc1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
-        } else if (blockchain == Blockchain::BITCOIN && network == Network::TESTNET) {
-            return "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
-        } else if (blockchain == Blockchain::BITCOIN && network == Network::MAINNET) {
-            return "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
-        }
-        
-        return prefix + "qw508d6qejxtdg4y5r3zarvary0c5xw7k" + script_hash.substr(0, 8);
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR << "Failed to generate address from script: " << e.what();
-        return "";
+    return out;
+}
+
+std::string NodeOwnerPayoutConfig::generate_address_from_script(Blockchain blockchain, Network network) const
+{
+    if (payout_script_hex.empty())
+        return {};
+
+    auto script = hex_to_bytes(payout_script_hex);
+    if (script.empty()) {
+        LOG_WARNING << "generate_address_from_script: invalid hex in payout_script_hex";
+        return {};
     }
+
+    // ---- version bytes (base58check) ----
+    // P2PKH version bytes:  LTC mainnet 0x30 (L…), LTC testnet 0x6f (m/n…)
+    //                       BTC mainnet 0x00 (1…), BTC testnet 0x6f (m/n…)
+    // P2SH  version bytes:  LTC mainnet 0x32 (M…), LTC testnet 0xc4 (Q…)
+    //                       BTC mainnet 0x05 (3…), BTC testnet 0xc4 (Q…)
+    uint8_t p2pkh_ver = 0x00, p2sh_ver = 0x05;
+    std::string bech32_hrp = "bc1";
+    if (blockchain == Blockchain::LITECOIN) {
+        if (network == Network::MAINNET) {
+            p2pkh_ver = 0x30; p2sh_ver = 0x32; bech32_hrp = "ltc";
+        } else {
+            p2pkh_ver = 0x6f; p2sh_ver = 0xc4; bech32_hrp = "tltc";
+        }
+    } else { // BITCOIN
+        if (network == Network::MAINNET) {
+            p2pkh_ver = 0x00; p2sh_ver = 0x05; bech32_hrp = "bc";
+        } else {
+            p2pkh_ver = 0x6f; p2sh_ver = 0xc4; bech32_hrp = "tb";
+        }
+    }
+
+    const size_t n = script.size();
+
+    // P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
+    //        76 a9 14 {20 bytes} 88 ac
+    if (n == 25 && script[0] == 0x76 && script[1] == 0xa9 &&
+        script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
+    {
+        std::vector<unsigned char> payload(22);
+        payload[0] = p2pkh_ver;
+        std::copy(script.begin() + 3, script.begin() + 23, payload.begin() + 1);
+        payload[21] = 0; // not used; EncodeBase58Check takes span<const uchar>
+        payload.resize(21);
+        return EncodeBase58Check({payload.data(), payload.size()});
+    }
+
+    // P2SH: OP_HASH160 <20> <hash160> OP_EQUAL
+    //       a9 14 {20 bytes} 87
+    if (n == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87)
+    {
+        std::vector<unsigned char> payload(21);
+        payload[0] = p2sh_ver;
+        std::copy(script.begin() + 2, script.begin() + 22, payload.begin() + 1);
+        return EncodeBase58Check({payload.data(), payload.size()});
+    }
+
+    // P2WPKH: OP_0 <20> <witness-program-20-bytes>
+    //         00 14 {20 bytes}
+    if (n == 22 && script[0] == 0x00 && script[1] == 0x14)
+    {
+        std::vector<uint8_t> prog(script.begin() + 2, script.end());
+        return bech32::encode_segwit(bech32_hrp, 0, prog);
+    }
+
+    // P2WSH: OP_0 <32> <witness-program-32-bytes>
+    //        00 20 {32 bytes}
+    if (n == 34 && script[0] == 0x00 && script[1] == 0x20)
+    {
+        std::vector<uint8_t> prog(script.begin() + 2, script.end());
+        return bech32::encode_segwit(bech32_hrp, 0, prog);
+    }
+
+    LOG_WARNING << "generate_address_from_script: unrecognised script type "
+                << "(len=" << n << ", prefix="
+                << std::hex << static_cast<int>(script[0]) << ")";
+    return {};
 }
 
 bool NodeOwnerPayoutConfig::save_to_config_file(const std::string& config_dir, Blockchain blockchain, Network network) const {

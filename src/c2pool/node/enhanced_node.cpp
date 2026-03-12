@@ -146,7 +146,7 @@ nlohmann::json node::EnhancedC2PoolNode::get_hashrate_stats() const {
 }
 
 uint64_t node::EnhancedC2PoolNode::get_total_mining_shares() const {
-    return m_chain ? 1000 : 0; // Placeholder - would need proper implementation with LTC chain
+    return m_chain ? static_cast<uint64_t>(m_chain->size()) : 0;
 }
 
 void node::EnhancedC2PoolNode::add_local_mining_share(const uint256& /*hash*/, const uint256& /*prev_hash*/, const uint256& /*target*/) {
