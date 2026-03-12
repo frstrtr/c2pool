@@ -12,6 +12,7 @@
 #include <core/random.hpp>
 #include <core/factory.hpp>
 #include <core/reply_matcher.hpp>
+#include <core/timer.hpp>
 
 namespace io = boost::asio;
 
@@ -49,6 +50,9 @@ private:
     p2p::Handler m_handler;
 
     std::unique_ptr<Connection> m_peer; // TODO: add ping
+    std::unique_ptr<core::Timer> m_reconnect_timer;
+    NetService m_target_addr;
+    bool m_reconnect_enabled = false;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config) 
@@ -57,10 +61,28 @@ public:
         
     }
 
+    /// Connect with automatic reconnection on failure/disconnect (30s interval).
+    void connect(NetService addr)
+    {
+        m_target_addr = addr;
+        m_reconnect_enabled = true;
+        core::Factory<core::Client>::connect(addr);
+
+        // Periodic reconnect check: if m_peer is null, try again
+        m_reconnect_timer = std::make_unique<core::Timer>(m_context, true);
+        m_reconnect_timer->start(30, [this]() {
+            if (!m_peer && m_reconnect_enabled) {
+                LOG_INFO << "P2P reconnecting to " << m_target_addr.to_string() << "...";
+                core::Factory<core::Client>::connect(m_target_addr);
+            }
+        });
+    }
+
     // INetwork
     void connected(std::shared_ptr<core::Socket> socket) override
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
+        LOG_INFO << "P2P connected to " << m_target_addr.to_string();
 
         // TODO: LEGACY REWORK!
 

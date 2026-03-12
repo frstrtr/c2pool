@@ -322,6 +322,30 @@ int main(int argc, char* argv[]) {
             default: return "";
         }
     };
+    // Known P2P magic prefixes for common chains
+    auto get_chain_p2p_prefix = [](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
+        if (symbol == "DOGE" || symbol == "doge") {
+            return testnet
+                ? ParseHexBytes("d4a1f4a1")   // Dogecoin testnet4alpha
+                : ParseHexBytes("c0c0c0c0");  // Dogecoin mainnet
+        }
+        if (symbol == "LTC" || symbol == "ltc") {
+            return testnet
+                ? ParseHexBytes("fdd2c8f1")   // Litecoin testnet
+                : ParseHexBytes("fbc0b6db");  // Litecoin mainnet
+        }
+        if (symbol == "BTC" || symbol == "btc") {
+            return testnet
+                ? ParseHexBytes("0b110907")   // Bitcoin testnet
+                : ParseHexBytes("f9beb4d9");  // Bitcoin mainnet
+        }
+        if (symbol == "DGB" || symbol == "dgb") {
+            return testnet
+                ? ParseHexBytes("fdc8bddd")   // DigiByte testnet
+                : ParseHexBytes("fac3b6da");  // DigiByte mainnet
+        }
+        return {};  // unknown chain — P2P broadcast disabled
+    };
     
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -800,7 +824,9 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::p2p::NodeP2P<ltc::Config>> coin_p2p;
             if (coind_p2p_port > 0) {
                 std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
-                // Override the coin config P2P address with CLI values
+                // Override coin config P2P prefix + address with correct values
+                auto parent_symbol = blockchain_to_symbol(blockchain);
+                ltc_p2p_config->coin()->m_p2p.prefix = get_chain_p2p_prefix(parent_symbol, settings->m_testnet);
                 ltc_p2p_config->coin()->m_p2p.address = NetService(p2p_host, static_cast<uint16_t>(coind_p2p_port));
                 coin_p2p = std::make_unique<ltc::coin::p2p::NodeP2P<ltc::Config>>(
                     &ioc, &coin_node, ltc_p2p_config.get());
@@ -1176,31 +1202,6 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
             // Merged chain P2P broadcasters (one per chain with P2P configured)
             std::map<uint32_t, std::unique_ptr<c2pool::merged::CoinBroadcaster>> merged_broadcasters;
-
-            // Known P2P magic prefixes for common chains
-            auto get_chain_p2p_prefix = [](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
-                if (symbol == "DOGE" || symbol == "doge") {
-                    return testnet
-                        ? ParseHexBytes("fcc1b7dc")   // Dogecoin testnet
-                        : ParseHexBytes("c0c0c0c0");  // Dogecoin mainnet
-                }
-                if (symbol == "LTC" || symbol == "ltc") {
-                    return testnet
-                        ? ParseHexBytes("fdd2c8f1")   // Litecoin testnet
-                        : ParseHexBytes("fbc0b6db");  // Litecoin mainnet
-                }
-                if (symbol == "BTC" || symbol == "btc") {
-                    return testnet
-                        ? ParseHexBytes("0b110907")   // Bitcoin testnet
-                        : ParseHexBytes("f9beb4d9");  // Bitcoin mainnet
-                }
-                if (symbol == "DGB" || symbol == "dgb") {
-                    return testnet
-                        ? ParseHexBytes("fdc8bddd")   // DigiByte testnet
-                        : ParseHexBytes("fac3b6da");  // DigiByte mainnet
-                }
-                return {};  // unknown chain — P2P broadcast disabled
-            };
 
             if (!merged_chain_specs.empty()) {
                 mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);

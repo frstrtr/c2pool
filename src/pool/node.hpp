@@ -185,7 +185,6 @@ public:
 
         if (peer->type() == PeerConnectionType::unknown)
         {
-            std::cout << "[" << rmsg->m_command << "] != \"version\"?: " << (rmsg->m_command.compare(0, 7, "version") != 0) << std::endl;
             if (rmsg->m_command.compare(0, 7, "version") != 0)
                 return Base::error("message wanna for be version", service);
 
