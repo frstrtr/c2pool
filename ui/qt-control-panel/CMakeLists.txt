@@ -14,6 +14,7 @@ add_executable(c2pool-qt-control-panel
     src/main.cpp
     src/ApiClient.cpp
     src/MainWindow.cpp
+    src/PageLaunch.cpp
     src/PageOverview.cpp
     src/PageMining.cpp
     src/PageSharechain.cpp
