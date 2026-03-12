@@ -5,6 +5,7 @@
 Build a desktop control panel for c2pool in a Bitcoin-Qt style with:
 
 - live monitoring dashboard
+- downloadable statistics reports (node and miner)
 - message center (signals, warnings, errors, future BBS)
 - logs viewer
 - settings editor
@@ -135,6 +136,33 @@ Message Center categories in UI:
 - Operator announcements
 - Chat/BBS stream (future, optional tab)
 
+### 5.8 Reportable Metrics (Export/Download)
+
+Node-level reports should include:
+
+- hashrate and stale-rate time series
+- stratum accepted/rejected shares
+- peer and network health summary
+- uptime, difficulty, and key alerts during range
+
+Miner-level reports should include:
+
+- accepted/rejected/stale shares per miner and worker
+- estimated hashrate windows
+- merged mining conversion/redistribution flags
+- security events (temporary bans, mitigation actions)
+
+Report output formats:
+
+- CSV (default for spreadsheet analysis)
+- JSON (full-fidelity machine-readable)
+- optional HTML snapshot (phase 4)
+
+Time ranges:
+
+- last 15m, 1h, 6h, 24h, 7d
+- custom range (start/end timestamps)
+
 ## 6. Control Surface (Operator Actions)
 
 ### 6.1 Actions We Already Have Endpoint Support For
@@ -174,7 +202,14 @@ Controls to add or confirm server support for:
 - config apply with validation and rollback
 - controlled log level change
 - safe RPC command execution (allowlist)
+- report export/download action (node/miner/all workers)
 - optional peer management actions in future revision
+
+Recommended reporting endpoints (add if missing):
+
+- GET /reports/node?from=<ts>&to=<ts>&format=csv|json
+- GET /reports/miner/<address>?from=<ts>&to=<ts>&format=csv|json
+- GET /reports/workers?from=<ts>&to=<ts>&format=csv|json
 
 ## 7. Technical Architecture
 
@@ -203,6 +238,7 @@ Controls to add or confirm server support for:
 - ConsoleController: command history and safe dispatch
 - MessageController: signals/alerts/chat stream + moderation actions
 - AbuseController: risk scoring, ban workflow, redistribution policy controls
+- ReportController: on-demand report generation, export jobs, file download/save
 
 ## 8. Polling And Refresh Plan
 
@@ -248,6 +284,9 @@ Implementation priority is changed to: "start mining operations reliably first, 
   - /uptime
 - Minimal Logs page:
   - live tail + severity filter + search
+- Basic report export for operations:
+  - node summary CSV (last 1h/24h)
+  - per-miner CSV for selected address
 - Quick actions required for operations:
   - temporary ban/unban for abusive clients
   - emergency DDoS shield toggle (if backend supports)
@@ -257,6 +296,7 @@ Exit criteria for MVP-1:
 - Operator can start/monitor mining from panel only
 - Operator can see accepted/rejected shares and miner connectivity in real time
 - Operator can apply emergency abuse action in under 10 seconds
+- Operator can download node and selected-miner CSV reports from panel
 
 ### MVP-2: Stability And Safety (4-6 days)
 
@@ -269,6 +309,7 @@ Exit criteria for MVP-1:
 
 - Payouts page (/current_payouts, /current_merged_payouts, /fee)
 - Message Center full view (/msg/recent, /msg/alerts, /msg/status, /msg/stats)
+- Extended reports page (custom range, JSON export, worker aggregate report)
 - Settings editor (validated apply)
 
 ### Phase 4: Advanced Ops (1 week)
@@ -296,6 +337,9 @@ Exit criteria for MVP-1:
   - launch daemon from panel
   - verify /stratum_stats and /connected_miners update continuously
   - execute temp ban and verify effect in ban stats
+- Reporting test:
+  - export node report CSV (1h) and validate headers/non-empty rows
+  - export per-miner report CSV and validate selected address scope
 - E2E smoke test:
   - start daemon
   - verify all page data load
@@ -454,5 +498,6 @@ read-only DDoS telemetry from existing security stats and expose controls as
 
 1. Freeze MVP-1 endpoint contract only (/stratum_stats, /connected_miners, /miner_stats, /global_stats, /local_stats, /uptime, /ban_stats).
 2. Scaffold Qt project under a new directory (for example ui/qt-control-panel).
-3. Build Mining + Overview + minimal Logs first, with process controls.
-4. Demo mining-start workflow before implementing payout/settings/console features.
+3. Add MVP report contract (node CSV + miner CSV) and wire download UX.
+4. Build Mining + Overview + minimal Logs + basic reports first, with process controls.
+5. Demo mining-start workflow and report export before implementing payout/settings/console features.
