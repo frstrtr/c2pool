@@ -10,13 +10,10 @@ jobs:
   build:
     name: Ubuntu 24.04 / GCC 13 / Debug
     runs-on: ubuntu-24.04
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
       # ── 1. Source ──────────────────────────────────────────────────────────
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         # No submodules — plain clone is sufficient.
 
       # ── 2. System dependencies (not provided by Conan) ────────────────────
@@ -30,7 +27,7 @@ jobs:
 
       # ── 3. Python / Conan 2 ───────────────────────────────────────────────
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -49,7 +46,7 @@ jobs:
       # Key encodes OS + compiler version + build type + dependency manifest.
       # Cache restores saves ~15 min of boost compilation on cache hit.
       - name: Restore Conan package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-debug-${{ hashFiles('conanfile.txt') }}
@@ -94,7 +91,7 @@ jobs:
       # ── 10. Upload test results on failure ───────────────────────────────
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: build_ci/Testing/
