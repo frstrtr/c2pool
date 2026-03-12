@@ -28,6 +28,7 @@
 // LTC implementation
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
+#include <impl/ltc/share_messages.hpp>
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
 #include <impl/ltc/messages.hpp>
@@ -56,6 +57,7 @@
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
+#include <btclibs/util/strencodings.h>
 
 // Bring the address validation types into scope
 using Blockchain = c2pool::address::Blockchain;
@@ -183,6 +185,10 @@ void print_help() {
     std::cout << "  --max-conns N             Max outgoing P2P connections\n";
     std::cout << "  --outgoing-conns N        Alias for --max-conns\n";
     std::cout << "  --disable-upnp            Disable UPnP port forwarding\n\n";
+
+    std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
+    std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
+    std::cout << "                            to embed in locally created V36 shares\n\n";
     
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -287,6 +293,9 @@ int main(int argc, char* argv[]) {
 
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
+
+    // Optional encrypted authority message_data blob for local V36 shares.
+    std::string operator_message_blob_hex;
 
     // Track which options were explicitly set via CLI so that --config file
     // values only fill in gaps (CLI always wins).
@@ -493,6 +502,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--disable-upnp") {
             /* no-op, c2pool doesn't use UPnP */
         }
+        else if (arg == "--message-blob-hex" && i + 1 < argc) {
+            operator_message_blob_hex = argv[++i];
+            cli_explicit.insert("message_blob_hex");
+        }
         // Legacy support for old --port option
         else if (arg == "--port" && i + 1 < argc) {
             p2p_port = std::stoi(argv[++i]);
@@ -603,6 +616,10 @@ int main(int argc, char* argv[]) {
             // Redistribute mode
             if (!cli_explicit.count("redistribute") && cfg["redistribute"])
                 redistribute_mode_str = cfg["redistribute"].as<std::string>();
+
+            // Optional operator-provided V36 message_data blob
+            if (!cli_explicit.count("message_blob_hex") && cfg["message_blob_hex"])
+                operator_message_blob_hex = cfg["message_blob_hex"].as<std::string>();
 
         } catch (const YAML::Exception& e) {
             LOG_ERROR << "Failed to load config file '" << config_file << "': " << e.what();
@@ -986,10 +1003,82 @@ int main(int argc, char* argv[]) {
                          << donation_script.size() << " bytes)";
             }
 
+            // Optional operator-provided encrypted authority message blob.
+            // This blob is embedded in locally created V36 shares as message_data.
+            if (!operator_message_blob_hex.empty()) {
+                if (operator_message_blob_hex.size() % 2 != 0) {
+                    LOG_ERROR << "--message-blob-hex must have even length";
+                    return 1;
+                }
+                std::vector<unsigned char> blob;
+                try {
+                    blob = ParseHex(operator_message_blob_hex);
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "Invalid --message-blob-hex: " << e.what();
+                    return 1;
+                }
+                auto err = ltc::validate_message_data(blob);
+                if (!err.empty()) {
+                    LOG_ERROR << "Rejected --message-blob-hex: " << err;
+                    return 1;
+                }
+                web_server.get_mining_interface()->set_operator_message_blob(blob);
+                LOG_INFO << "Operator message blob configured (" << blob.size() << " bytes)";
+            }
+
             // Wire the share tracker's best share hash into the mining interface
             // so that mining_submit can link new shares to the chain head.
             web_server.set_best_share_hash_fn([&p2p_node]() {
                 return p2p_node->best_share_hash();
+            });
+
+            // Expose decoded protocol messages from best share via API.
+            web_server.get_mining_interface()->set_protocol_messages_fn([&p2p_node]() {
+                nlohmann::json result = {
+                    {"best_share_hash", ""},
+                    {"message_data_hex", ""},
+                    {"decrypted", false},
+                    {"authority_pubkey_hex", ""},
+                    {"messages", nlohmann::json::array()}
+                };
+
+                auto best = p2p_node->best_share_hash();
+                if (best.IsNull())
+                    return result;
+
+                result["best_share_hash"] = best.GetHex();
+
+                std::vector<unsigned char> blob;
+                p2p_node->tracker().chain.get(best).share.invoke([&](auto* s) {
+                    if constexpr (requires { s->m_message_data; })
+                        blob = s->m_message_data.m_data;
+                });
+
+                if (blob.empty())
+                    return result;
+
+                result["message_data_hex"] = HexStr(blob);
+
+                auto unpacked = ltc::unpack_share_messages(blob.data(), blob.size());
+                result["decrypted"] = unpacked.decrypted;
+                if (!unpacked.decrypted || unpacked.authority_pubkey == nullptr)
+                    return result;
+
+                result["authority_pubkey_hex"] = HexStr(*unpacked.authority_pubkey);
+                nlohmann::json msgs = nlohmann::json::array();
+                for (const auto& msg : unpacked.messages) {
+                    msgs.push_back({
+                        {"type", msg.msg_type},
+                        {"flags", msg.flags},
+                        {"timestamp", msg.timestamp},
+                        {"payload_hex", HexStr(msg.payload)},
+                        {"signature_hex", HexStr(msg.signature)},
+                        {"protocol_authority", (msg.wire_flags & ltc::FLAG_PROTOCOL_AUTHORITY) != 0},
+                        {"is_transition_signal", msg.msg_type == ltc::MSG_TRANSITION_SIGNAL}
+                    });
+                }
+                result["messages"] = msgs;
+                return result;
             });
 
             // Wire the PPLNS computation hook so refresh_work() builds
@@ -1172,7 +1261,7 @@ int main(int argc, char* argv[]) {
                         stale,
                         p.segwit_active,
                         p.witness_commitment_hex,
-                        {},   // message_data
+                        p.message_data,
                         p.full_coinbase_bytes,
                         p.witness_root);
 

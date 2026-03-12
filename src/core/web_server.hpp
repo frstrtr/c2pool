@@ -238,10 +238,21 @@ public:
         std::string witness_commitment_hex;  // P2Pool witness commitment script hex
         uint256 witness_root;                // raw wtxid merkle root (for SegwitData)
         std::vector<unsigned char> full_coinbase_bytes;  // actual mined coinbase TX for hash_link
+        std::vector<unsigned char> message_data;         // optional V36 authority message blob
         uint256 prev_share_hash;  // share chain tip at work-generation time
     };
     using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
+
+    // Operator-controlled V36 message blob to embed into locally created shares.
+    // Empty means no message_data in locally produced shares.
+    void set_operator_message_blob(const std::vector<unsigned char>& blob);
+    std::vector<unsigned char> get_operator_message_blob() const;
+
+    // Hook: expose decoded protocol messages (e.g. from current best share)
+    // through API methods for dashboard/monitoring clients.
+    using protocol_messages_fn_t = std::function<nlohmann::json()>;
+    void set_protocol_messages_fn(protocol_messages_fn_t fn) { m_protocol_messages_fn = std::move(fn); }
 
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
@@ -253,6 +264,8 @@ public:
     // Payout management methods
     nlohmann::json getpayoutinfo(const std::string& request_id = "");
     nlohmann::json getminerstats(const std::string& request_id = "");
+    nlohmann::json setmessageblob(const std::string& message_blob_hex, const std::string& request_id = "");
+    nlohmann::json getmessageblob(const std::string& request_id = "");
     void set_pool_payout_address(const std::string& address);
     void set_pool_fee_percent(double fee_percent);
 
@@ -396,6 +409,13 @@ private:
 
     // Share creation hook
     create_share_fn_t m_create_share_fn;
+
+    // Protocol message extraction hook for API display.
+    protocol_messages_fn_t m_protocol_messages_fn;
+
+    // Operator blob injected into locally created shares (thread-safe).
+    mutable std::mutex m_message_blob_mutex;
+    std::vector<unsigned char> m_operator_message_blob;
 
     // Segwit activation (from template rules)
     bool m_segwit_active{false};

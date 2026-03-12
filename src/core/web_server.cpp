@@ -3,6 +3,7 @@
 // Real coin daemon RPC (optional - only linked when set_coin_rpc() is called)
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
+#include <impl/ltc/share_messages.hpp>
 
 #include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
 #include <core/random.hpp> // core::random::random_float for probabilistic fee
@@ -21,6 +22,11 @@
 #include "btclibs/base58.h"
 
 namespace core {
+
+static std::string to_hex(const std::vector<unsigned char>& data)
+{
+    return HexStr(std::span<const unsigned char>(data.data(), data.size()));
+}
 
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
@@ -259,6 +265,29 @@ void MiningInterface::setup_methods()
     Add("getminerstats", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         return getminerstats();
     }));
+
+    Add("setmessageblob", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (params.empty()) {
+            throw jsonrpccxx::JsonRpcException(-1, "setmessageblob requires hex blob parameter");
+        }
+        return setmessageblob(params[0]);
+    }));
+
+    Add("getmessageblob", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        return getmessageblob();
+    }));
+}
+
+void MiningInterface::set_operator_message_blob(const std::vector<unsigned char>& blob)
+{
+    std::lock_guard<std::mutex> lock(m_message_blob_mutex);
+    m_operator_message_blob = blob;
+}
+
+std::vector<unsigned char> MiningInterface::get_operator_message_blob() const
+{
+    std::lock_guard<std::mutex> lock(m_message_blob_mutex);
+    return m_operator_message_blob;
 }
 
 // ─── Live coin-daemon integration ────────────────────────────────────────────
@@ -1366,6 +1395,17 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
             block_height = m_cached_template["height"].get<uint64_t>();
     }
     
+    nlohmann::json protocol_messages = nlohmann::json::array();
+    if (m_protocol_messages_fn) {
+        try {
+            protocol_messages = m_protocol_messages_fn();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "protocol_messages hook failed: " << e.what();
+        }
+    }
+
+    auto operator_blob = get_operator_message_blob();
+
     return {
         {"version", "c2pool/0.0.1"},
         {"protocolversion", 70015},
@@ -1379,7 +1419,9 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         {"genproclimit", -1},
         {"testnet", m_testnet},
         {"paytxfee", 0.0},
-        {"errors", ""}
+        {"errors", ""},
+        {"operator_message_blob_hex", to_hex(operator_blob)},
+        {"protocol_messages", protocol_messages}
     };
 }
 
@@ -1417,6 +1459,17 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
     if (m_node)
         stale = m_node->get_stale_stats();
 
+    nlohmann::json protocol_messages = nlohmann::json::array();
+    if (m_protocol_messages_fn) {
+        try {
+            protocol_messages = m_protocol_messages_fn();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "protocol_messages hook failed: " << e.what();
+        }
+    }
+
+    auto operator_blob = get_operator_message_blob();
+
     return {
         {"pool_statistics", {
             {"mining_shares", total_mining_shares},
@@ -1429,7 +1482,62 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
             {"doa_shares", stale["doa_count"]},
             {"stale_shares", stale["stale_count"]},
             {"stale_prop", stale["stale_prop"]}
-        }}
+        }},
+        {"operator_message_blob_hex", to_hex(operator_blob)},
+        {"protocol_messages", protocol_messages}
+    };
+}
+
+nlohmann::json MiningInterface::setmessageblob(const std::string& message_blob_hex,
+                                               const std::string& request_id)
+{
+    if (message_blob_hex.empty()) {
+        set_operator_message_blob({});
+        return {
+            {"ok", true},
+            {"enabled", false},
+            {"size", 0},
+            {"message", "operator message blob cleared"}
+        };
+    }
+
+    if (message_blob_hex.size() % 2 != 0) {
+        throw jsonrpccxx::JsonRpcException(-1, "message blob hex length must be even");
+    }
+
+    std::vector<unsigned char> blob;
+    try {
+        blob = ParseHex(message_blob_hex);
+    } catch (const std::exception& e) {
+        throw jsonrpccxx::JsonRpcException(-1, std::string("invalid hex blob: ") + e.what());
+    }
+
+    if (blob.size() > 4096) {
+        throw jsonrpccxx::JsonRpcException(-1, "message blob too large (max 4096 bytes)");
+    }
+
+    // Validate encrypted authority blob using V36 consensus validation path.
+    auto err = ltc::validate_message_data(blob);
+    if (!err.empty()) {
+        throw jsonrpccxx::JsonRpcException(-1, "message blob rejected: " + err);
+    }
+
+    set_operator_message_blob(blob);
+    return {
+        {"ok", true},
+        {"enabled", true},
+        {"size", blob.size()},
+        {"hex", message_blob_hex}
+    };
+}
+
+nlohmann::json MiningInterface::getmessageblob(const std::string& request_id)
+{
+    auto blob = get_operator_message_blob();
+    return {
+        {"enabled", !blob.empty()},
+        {"size", blob.size()},
+        {"hex", to_hex(blob)}
     };
 }
 
@@ -1893,6 +2001,9 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 // Pass the actual mined coinbase TX bytes for hash_link computation.
                 if (!full_coinbase_hex.empty())
                     params.full_coinbase_bytes = ParseHex(full_coinbase_hex);
+
+                // Optional operator-provided authority message blob (V36 message_data).
+                params.message_data = get_operator_message_blob();
 
                 // Use the share chain tip from work-generation time (stored in job)
                 // so ref_hash matches the one embedded in the coinbase OP_RETURN.
