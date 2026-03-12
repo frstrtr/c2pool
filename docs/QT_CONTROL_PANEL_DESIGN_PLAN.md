@@ -362,6 +362,65 @@ For each enforcement decision:
 - operator/manual flag
 - expiry time (if temporary)
 
+### 13.8 DDoS Management (Panel-Controlled)
+
+The Qt panel should expose explicit DDoS controls, not only passive metrics.
+
+Detection signals:
+
+- new_connections_per_sec (global and per-IP)
+- handshake_fail_ratio_1m
+- auth_fail_ratio_1m
+- submit_rate_per_ip_10s
+- malformed_request_rate_1m
+- concurrent_sessions_per_ip
+- banned_ips_growth_rate
+
+Mitigation levels:
+
+- Level 0 (Normal)
+  - standard limits
+- Level 1 (Elevated)
+  - tighten per-IP connection burst limit
+  - enable stricter request parsing and early drop
+- Level 2 (High)
+  - per-IP token-bucket rate limiting for submit/auth calls
+  - temporary cooldown on repeated auth failures
+  - lower max concurrent sessions per IP
+- Level 3 (Critical)
+  - challenge/allowlist mode for new connections
+  - aggressive temporary bans on abusive IPs/subnets
+  - prioritize existing long-lived healthy miners
+
+Panel controls (Security/Abuse page):
+
+- DDoS mode selector: auto / manual
+- Active mitigation level selector (manual mode)
+- Per-IP burst and sustained rate sliders
+- Temporary ban TTL controls
+- Trusted source allowlist editor (localhost/LAN/admin hosts)
+- Emergency button: "shield mode" for immediate Level 3
+
+Operational safeguards:
+
+- Dry-run preview: show expected impact before applying stricter policy
+- Rollback timer: auto-revert emergency settings after N minutes unless confirmed
+- Minimum service guarantee: never block localhost admin channel
+- Change journal entry for each DDoS policy change
+
+Recommended backend additions for full control support:
+
+- GET /ddos/status
+- POST /ddos/mode              (auto|manual)
+- POST /ddos/level             (0..3)
+- POST /ddos/limits            (burst/sustained/session caps)
+- POST /ddos/allowlist         (add/remove host or cidr)
+- POST /ddos/shield            (enable/disable with ttl)
+
+If these endpoints are not available initially, the panel should still provide
+read-only DDoS telemetry from existing security stats and expose controls as
+"planned/disabled" until server support lands.
+
 ## 14. Immediate Next Steps
 
 1. Freeze v1 endpoint contract and JSON schema snapshots.
