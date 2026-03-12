@@ -275,6 +275,30 @@ Recommended log export endpoints (add if missing):
 - AbuseController: risk scoring, ban workflow, redistribution policy controls
 - ReportController: on-demand report generation, export jobs, file download/save
 
+## 7.4 API Endpoints vs Direct In-Process Wiring
+
+Decision for MVP and public view-only dashboard:
+
+- Prefer API endpoints as the primary integration boundary.
+- Keep c2pool daemon as the source of truth and expose read/write operations through HTTP JSON.
+- Do not embed consensus/sharechain mutation logic into the Qt process.
+
+Rationale (aligned with Bitcoin-Qt / bitcoin-cli style):
+
+- In Bitcoin architecture, UI/CLI clients communicate with a daemon process through RPC boundaries.
+- This separation enables safer operations, easier remote/readonly dashboards, and simpler testability.
+- API boundaries make it straightforward to add web/mobile dashboards later without reusing Qt internals.
+
+When direct in-process wiring is acceptable:
+
+- Only for local operator-only helper modules where no consensus-critical state is duplicated.
+- Example: local process lifecycle helpers, local file pickers, UI-only caching.
+
+Recommendation:
+
+- Continue API-first for monitoring and control surfaces.
+- If lower-latency is needed later, add push channels (WebSocket/SSE) behind the same daemon boundary, not direct GUI-to-core coupling.
+
 ## 8. Polling And Refresh Plan
 
 - Fast (1-2s): stratum stats, hashrate, top strip health

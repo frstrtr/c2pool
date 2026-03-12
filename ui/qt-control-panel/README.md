@@ -29,6 +29,11 @@ Default API base URL in the app:
 
 - http://127.0.0.1:8080 (separate port to avoid stratum conflict)
 
+Important:
+
+- Point this URL to the c2pool web/API endpoint.
+- Do not point it to coin daemon RPC ports (for example litecoind RPC on 19332), which are not c2pool panel endpoints.
+
 Use the top bar to change base URL and refresh pages.
 
 ## Current status

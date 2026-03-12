@@ -37,6 +37,7 @@ class SmokeTest:
         self.results = []
         self.passed = 0
         self.failed = 0
+        self.connectivity_ok = False
     
     def run_all(self) -> bool:
         """Run all smoke tests"""
@@ -51,7 +52,8 @@ class SmokeTest:
             self._test_mock_responses()
         else:
             self._test_daemon_connectivity()
-            self._test_endpoint_responses()
+            if self.connectivity_ok:
+                self._test_endpoint_responses()
         
         self._print_summary()
         return self.failed == 0
@@ -91,6 +93,16 @@ class SmokeTest:
             parsed = urlparse(self.daemon_url)
             host = parsed.hostname or "127.0.0.1"
             port = parsed.port or 8080
+
+            # Guard against accidental targeting of coin-daemon RPC endpoints.
+            # c2pool panel expects c2pool HTTP API, not litecoind/bitcoind RPC.
+            if port in (19332, 9332):
+                self._fail(
+                    f"Refusing to test coin-daemon RPC port {port}. "
+                    "Use c2pool web/API port (default 8080)."
+                )
+                self.connectivity_ok = False
+                return
             
             # Try socket connection
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -100,10 +112,16 @@ class SmokeTest:
             
             if result == 0:
                 self._pass(f"Daemon reachable at {host}:{port}")
+                self.connectivity_ok = True
             else:
-                self._fail(f"Cannot reach daemon at {host}:{port}")
+                self._fail(
+                    f"Cannot reach c2pool API at {host}:{port}. "
+                    "If this is coin daemon host, point to c2pool node/API host instead."
+                )
+                self.connectivity_ok = False
         except Exception as e:
             self._fail(f"Connectivity error: {e}")
+            self.connectivity_ok = False
     
     def _test_endpoint_responses(self):
         """Test 4: Each endpoint returns valid data"""
