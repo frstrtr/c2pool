@@ -80,6 +80,7 @@ jobs:
         run: |
           cmake --build build_ci \
             --target test_hardening test_share_messages test_coin_broadcaster \
+                    test_redistribute_address \
                     core_test sharechain_test share_test \
             -j$(nproc)
 
