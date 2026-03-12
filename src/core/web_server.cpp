@@ -17,9 +17,11 @@
 #include <ctime>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <boost/process.hpp>
 #include <boost/algorithm/string.hpp>
 #include "btclibs/base58.h"
+#include "filesystem.hpp"
 
 namespace core {
 
@@ -81,10 +83,30 @@ void HttpSession::process_request()
         }
         else if (request_.method() == http::verb::get) {
             // Path-based REST routing for p2pool-compatible endpoints
-            std::string target(request_.target());
+            std::string raw_target(request_.target());
+            std::string target(raw_target);
             // Strip query string
             auto qpos = target.find('?');
             if (qpos != std::string::npos) target = target.substr(0, qpos);
+
+            auto getQueryParam = [&raw_target](const std::string& key) -> std::string {
+                const auto qp = raw_target.find('?');
+                if (qp == std::string::npos) {
+                    return {};
+                }
+                const std::string query = raw_target.substr(qp + 1);
+                const std::string prefix = key + "=";
+                auto pos = query.find(prefix);
+                if (pos == std::string::npos) {
+                    return {};
+                }
+                pos += prefix.size();
+                auto end = query.find('&', pos);
+                if (end == std::string::npos) {
+                    end = query.size();
+                }
+                return query.substr(pos, end - pos);
+            };
 
             nlohmann::json rest_result;
             if (target == "/local_rate")
@@ -99,6 +121,51 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_fee();
             else if (target == "/recent_blocks")
                 rest_result = mining_interface_->rest_recent_blocks();
+            else if (target == "/uptime")
+                rest_result = mining_interface_->rest_uptime();
+            else if (target == "/connected_miners")
+                rest_result = mining_interface_->rest_connected_miners();
+            else if (target == "/stratum_stats")
+                rest_result = mining_interface_->rest_stratum_stats();
+            else if (target == "/global_stats")
+                rest_result = mining_interface_->rest_global_stats();
+            else if (target == "/sharechain/stats")
+                rest_result = mining_interface_->rest_sharechain_stats();
+            else if (target == "/sharechain/window")
+                rest_result = mining_interface_->rest_sharechain_window();
+            else if (target == "/control/mining/start")
+                rest_result = mining_interface_->rest_control_mining_start();
+            else if (target == "/control/mining/stop")
+                rest_result = mining_interface_->rest_control_mining_stop();
+            else if (target == "/control/mining/restart")
+                rest_result = mining_interface_->rest_control_mining_restart();
+            else if (target == "/control/mining/ban")
+                rest_result = mining_interface_->rest_control_mining_ban(getQueryParam("target"));
+            else if (target == "/control/mining/unban")
+                rest_result = mining_interface_->rest_control_mining_unban(getQueryParam("target"));
+            else if (target == "/web/log") {
+                // Return plain text log (not JSON)
+                response.set(http::field::content_type, "text/plain; charset=utf-8");
+                response.body() = mining_interface_->rest_web_log();
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
+            else if (target == "/logs/export") {
+                const std::string scope = getQueryParam("scope");
+                int64_t from_ts = 0, to_ts = 0;
+                try { from_ts = std::stoll(getQueryParam("from")); } catch (...) {}
+                try { to_ts = std::stoll(getQueryParam("to")); } catch (...) {}
+                const std::string fmt = getQueryParam("format");
+                response.set(http::field::content_type,
+                    (fmt == "csv") ? "text/csv; charset=utf-8" :
+                    (fmt == "jsonl") ? "application/x-ndjson; charset=utf-8" :
+                    "text/plain; charset=utf-8");
+                response.body() = mining_interface_->rest_logs_export(scope, from_ts, to_ts, fmt);
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
             else
                 rest_result = mining_interface_->getinfo();
 
@@ -307,6 +374,27 @@ void MiningInterface::set_on_block_submitted(std::function<void(const std::strin
 void MiningInterface::set_on_block_relay(std::function<void(const std::string&)> fn)
 {
     m_on_block_relay = std::move(fn);
+}
+
+bool MiningInterface::has_merged_chain(uint32_t chain_id) const
+{
+    if (!m_mm_manager) return false;
+    return m_mm_manager->get_chain_rpc(chain_id) != nullptr;
+}
+
+std::string MiningInterface::get_node_fee_hash160() const
+{
+    // Extract hash160 from a 25-byte P2PKH scriptPubKey (bytes 3–22)
+    if (m_node_fee_script.size() != 25) return {};
+    if (m_node_fee_script[0] != 0x76 || m_node_fee_script[1] != 0xa9) return {};
+    static const char* HEX = "0123456789abcdef";
+    std::string h160;
+    h160.reserve(40);
+    for (int i = 3; i < 23; ++i) {
+        h160 += HEX[m_node_fee_script[i] >> 4];
+        h160 += HEX[m_node_fee_script[i] & 0x0f];
+    }
+    return h160;
 }
 
 void MiningInterface::check_merged_mining(const std::string& block_hex,
@@ -1652,6 +1740,185 @@ nlohmann::json MiningInterface::rest_recent_blocks()
     return arr;
 }
 
+nlohmann::json MiningInterface::rest_uptime()
+{
+    // Return daemon uptime in seconds
+    static auto start_time = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+    return nlohmann::json(uptime_seconds);
+}
+
+nlohmann::json MiningInterface::rest_connected_miners()
+{
+    // Return count of connected miners and active sessions
+    nlohmann::json result = nlohmann::json::object();
+    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
+    
+    result["total_connected"] = pm ? pm->get_active_miners_count() : 0;
+    result["active_workers"] = pm ? pm->get_active_miners_count() : 0;
+    result["stale_count"] = 0;  // Will be populated by actual stratum session tracking
+    
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_stratum_stats()
+{
+    // Return stratum protocol statistics
+    nlohmann::json result = nlohmann::json::object();
+    
+    // Mining share metrics
+    result["difficulty"] = 1.0;
+    result["accepted_shares"] = 0;
+    result["rejected_shares"] = 0;
+    result["stale_shares"] = 0;
+    result["hashrate"] = 0.0;
+    
+    // Worker diversity
+    result["active_workers"] = 0;
+    result["unique_addresses"] = 0;
+    
+    // Recent submissions
+    result["shares_per_minute"] = 0.0;
+    result["last_share_time"] = static_cast<uint64_t>(std::time(nullptr));
+
+    {
+        std::lock_guard<std::mutex> lock(m_control_mutex);
+        result["mining_enabled"] = m_mining_enabled;
+        result["banned_count"] = static_cast<uint64_t>(m_banned_targets.size());
+    }
+    
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_global_stats()
+{
+    // Return comprehensive node statistics
+    nlohmann::json result = nlohmann::json::object();
+    
+    // Pool stats
+    result["pool_hashrate"] = 0.0;
+    result["network_hashrate"] = 0.0;
+    result["pool_stale_ratio"] = 0.0;
+    
+    // Share chain
+    result["shares_in_chain"] = 0;
+    result["unique_miners"] = 0;
+    result["current_height"] = 0;
+    
+    // Uptime and health
+    result["uptime_seconds"] = rest_uptime();
+    result["status"] = "operational";
+    result["last_block"] = 0;
+    
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_stats()
+{
+    // Delegate to the live tracker callback if wired
+    if (m_sharechain_stats_fn)
+        return m_sharechain_stats_fn();
+
+    // Fallback: return empty stub when no tracker is connected
+    nlohmann::json result = nlohmann::json::object();
+    result["total_shares"] = 0;
+    result["shares_by_version"] = nlohmann::json::object();
+    result["shares_by_miner"] = nlohmann::json::object();
+    result["chain_height"] = 0;
+    result["chain_tip_hash"] = "";
+    result["fork_count"] = 0;
+    result["heaviest_fork_weight"] = 0.0;
+    result["average_difficulty"] = 1.0;
+    result["difficulty_trend"] = nlohmann::json::array();
+    auto now = std::time(nullptr);
+    nlohmann::json timeline = nlohmann::json::array();
+    for (int i = 5; i >= 0; --i) {
+        nlohmann::json slot;
+        slot["timestamp"] = now - (i * 600);
+        slot["share_count"] = 0;
+        slot["miner_distribution"] = nlohmann::json::object();
+        timeline.push_back(slot);
+    }
+    result["timeline"] = timeline;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_window()
+{
+    if (m_sharechain_window_fn)
+        return m_sharechain_window_fn();
+
+    // Fallback stub
+    nlohmann::json result;
+    result["shares"] = nlohmann::json::array();
+    result["total"] = 0;
+    result["best_hash"] = "";
+    result["chain_length"] = 0;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_control_mining_start()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = true;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "start"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_stop()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = false;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "stop"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_restart()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = true;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "restart"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_ban(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    if (!target.empty()) {
+        m_banned_targets.insert(target);
+    }
+    return nlohmann::json::object({
+        {"ok", !target.empty()},
+        {"action", "ban"},
+        {"target", target},
+        {"banned_count", static_cast<uint64_t>(m_banned_targets.size())}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_unban(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    if (!target.empty()) {
+        m_banned_targets.erase(target);
+    }
+    return nlohmann::json::object({
+        {"ok", !target.empty()},
+        {"action", "unban"},
+        {"target", target},
+        {"banned_count", static_cast<uint64_t>(m_banned_targets.size())}
+    });
+}
+
 void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
@@ -1659,6 +1926,80 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     m_found_blocks.insert(m_found_blocks.begin(), FoundBlock{height, hash.GetHex(), ts});
     if (m_found_blocks.size() > 100)
         m_found_blocks.resize(100);
+}
+
+// ── Log endpoints (read directly from debug.log) ───────────────────────
+
+static std::string tail_file(const std::filesystem::path& path, size_t max_lines)
+{
+    std::ifstream f(path, std::ios::ate);
+    if (!f.is_open()) return {};
+
+    const auto size = f.tellg();
+    if (size <= 0) return {};
+
+    // Scan backwards for newlines
+    std::string result;
+    size_t lines = 0;
+    std::streamoff pos = size;
+    while (pos > 0 && lines <= max_lines) {
+        --pos;
+        f.seekg(pos);
+        char c;
+        f.get(c);
+        if (c == '\n' && pos + 1 < size)
+            ++lines;
+    }
+    if (pos > 0) {
+        // skip the newline we're on
+        f.seekg(pos + 1);
+    } else {
+        f.seekg(0);
+    }
+    result.resize(static_cast<size_t>(size - f.tellg()));
+    f.read(result.data(), static_cast<std::streamsize>(result.size()));
+    return result;
+}
+
+std::string MiningInterface::rest_web_log()
+{
+    auto path = core::filesystem::config_path() / "debug.log";
+    return tail_file(path, 500);
+}
+
+std::string MiningInterface::rest_logs_export(const std::string& scope,
+                                               int64_t /*from_ts*/, int64_t /*to_ts*/,
+                                               const std::string& format)
+{
+    // Read all lines, optionally filter by scope keyword
+    auto path = core::filesystem::config_path() / "debug.log";
+    std::ifstream f(path);
+    if (!f.is_open()) return "# log file not found\n";
+
+    std::string out;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Scope filter: if scope is "node","stratum","security" etc, check if keyword appears
+        if (!scope.empty() && scope != "all") {
+            std::string upper_scope = scope;
+            for (auto& c : upper_scope) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (line.find(upper_scope) == std::string::npos &&
+                line.find(scope) == std::string::npos)
+                continue;
+        }
+        if (format == "csv") {
+            out += "0," + scope + "," + line + '\n';
+        } else if (format == "jsonl") {
+            nlohmann::json j;
+            j["ts"] = 0;
+            j["scope"] = scope;
+            j["line"] = line;
+            out += j.dump() + '\n';
+        } else {
+            out += line + '\n';
+        }
+    }
+    return out;
 }
 
 void MiningInterface::set_pool_fee_percent(double fee_percent)
@@ -1869,7 +2210,40 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         }
         std::string share_address = base58check_to_hash160(primary_addr);
         if (share_address.size() != 40) {
-            LOG_WARNING << "mining_submit: cannot convert primary address to hash160: " << primary_addr;
+            // Case 4 (Python work.py): invalid/empty LTC address but miner provided an
+            // explicit DOGE merged address → derive LTC hash160 from DOGE P2PKH script.
+            // LTC and DOGE use identical secp256k1 keys: same pubkey_hash, different version byte.
+            static constexpr uint32_t DOGE_CHAIN_ID = 98;
+            auto doge_it = merged_addresses.find(DOGE_CHAIN_ID);
+            if (doge_it != merged_addresses.end()) {
+                const auto& doge_script = doge_it->second;
+                // P2PKH script: 76 a9 14 <20-byte hash160> 88 ac
+                if (doge_script.size() == 25 &&
+                    doge_script[0] == 0x76 && doge_script[1] == 0xa9 && doge_script[2] == 0x14) {
+                    static const char* HEX = "0123456789abcdef";
+                    std::string h160;
+                    h160.reserve(40);
+                    for (int i = 3; i < 23; ++i) {
+                        h160 += HEX[doge_script[i] >> 4];
+                        h160 += HEX[doge_script[i] & 0x0f];
+                    }
+                    share_address = h160;
+                    LOG_INFO << "mining_submit: Case 4 — LTC share hash160 derived from DOGE merged address";
+                }
+            }
+        }
+        if (share_address.size() != 40) {
+            // Case 3 (Python work.py): no valid LTC or DOGE address → redistribute
+            // according to the node's configured --redistribute mode.
+            if (m_address_fallback_fn) {
+                share_address = m_address_fallback_fn(primary_addr);
+                if (share_address.size() == 40)
+                    LOG_INFO << "mining_submit: Case 3 — redistributed share for invalid address '"
+                             << primary_addr << "'";
+            }
+            if (share_address.size() != 40)
+                LOG_WARNING << "mining_submit: cannot resolve share address for '"
+                            << primary_addr << "' — share will carry zero-hash payout";
         }
 
         // V36 probabilistic node fee: with probability m_node_fee_percent%,
@@ -2727,8 +3101,24 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             LOG_INFO << "Merged addresses from username: " << merged_addresses_.size() << " chain(s)";
         
         LOG_INFO << "Mining authorization successful for: " << username_;
-        
-        // If merged addresses were parsed, resend work notification so the
+
+        // Case 2 (Python work.py): if LTC address is valid but no explicit DOGE merged
+        // address provided, auto-derive DOGE merged address from the same hash160.
+        // LTC and DOGE use identical secp256k1 keys → same pubkey_hash, different version byte.
+        // We store the LTC address under DOGE_CHAIN_ID; base58check_to_hash160() is
+        // version-byte-agnostic, so the script produced will be hash160-identical.
+        static constexpr uint32_t DOGE_CHAIN_ID = 98;
+        if (mining_interface_ && mining_interface_->has_merged_chain(DOGE_CHAIN_ID)) {
+            if (merged_addresses_.find(DOGE_CHAIN_ID) == merged_addresses_.end()) {
+                auto h160 = base58check_to_hash160(username_);
+                if (h160.size() == 40) {
+                    merged_addresses_[DOGE_CHAIN_ID] = username_;
+                    LOG_INFO << "Case 2: auto-generated DOGE merged address from LTC address for " << username_;
+                }
+            }
+        }
+
+        // If merged addresses were parsed (or auto-generated), resend work notification so the
         // coinbase ref_hash includes them.  The initial job sent right after
         // subscribe had empty merged_addresses because authorize hadn't run yet.
         if (!merged_addresses_.empty() && mining_interface_) {

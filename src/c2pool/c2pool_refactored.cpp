@@ -290,6 +290,8 @@ int main(int argc, char* argv[]) {
 
     // Seed nodes from -n flag (p2pool compat)
     std::vector<std::string> seed_nodes;
+    int max_outgoing_conns = 0;
+    bool max_outgoing_conns_set = false;
 
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
@@ -494,10 +496,12 @@ int main(int argc, char* argv[]) {
         }
         // Connection limits (p2pool: --max-conns, --outgoing-conns, --disable-upnp)
         else if (arg == "--max-conns" && i + 1 < argc) {
-            /* stored for future use */ ++i;
+            max_outgoing_conns = std::stoi(argv[++i]);
+            max_outgoing_conns_set = true;
         }
         else if (arg == "--outgoing-conns" && i + 1 < argc) {
-            /* stored for future use */ ++i;
+            max_outgoing_conns = std::stoi(argv[++i]);
+            max_outgoing_conns_set = true;
         }
         else if (arg == "--disable-upnp") {
             /* no-op, c2pool doesn't use UPnP */
@@ -827,6 +831,10 @@ int main(int argc, char* argv[]) {
             }
 
             auto p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
+            if (max_outgoing_conns_set) {
+                p2p_node->set_target_outbound_peers(static_cast<size_t>(max_outgoing_conns));
+                LOG_INFO << "Configured outbound peer target: " << max_outgoing_conns;
+            }
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
@@ -1030,6 +1038,152 @@ int main(int argc, char* argv[]) {
             // so that mining_submit can link new shares to the chain head.
             web_server.set_best_share_hash_fn([&p2p_node]() {
                 return p2p_node->best_share_hash();
+            });
+
+            // Wire live sharechain statistics into the REST API.
+            web_server.get_mining_interface()->set_sharechain_stats_fn([&p2p_node]() {
+                nlohmann::json result;
+                auto& chain = p2p_node->tracker().chain;
+                auto best = p2p_node->best_share_hash();
+
+                result["total_shares"]    = static_cast<int>(chain.size());
+                result["fork_count"]      = static_cast<int>(chain.get_heads().size());
+                result["chain_tip_hash"]  = best.IsNull() ? "" : best.GetHex();
+                result["chain_height"]    = best.IsNull() ? 0 : chain.get_height(best);
+
+                std::map<std::string, int> by_version;
+                std::map<std::string, int> by_miner;
+                double diff_sum = 0.0;
+                int diff_count  = 0;
+
+                // Timeline: 6 slots of 10 minutes each, ending at now
+                auto now_ts = static_cast<uint32_t>(std::time(nullptr));
+                constexpr int SLOTS = 6;
+                constexpr uint32_t SLOT_SEC = 600;
+                uint32_t window_start = now_ts - SLOTS * SLOT_SEC;
+                struct Slot { uint32_t ts; int count; std::map<std::string, int> miners; };
+                std::vector<Slot> slots(SLOTS);
+                for (int i = 0; i < SLOTS; ++i)
+                    slots[i].ts = window_start + (i + 1) * SLOT_SEC;
+
+                // Walk up to 2000 shares from best head backwards
+                if (!best.IsNull()) {
+                    int height = chain.get_height(best);
+                    int walk = std::min(height, 2000);
+                    if (walk > 0) {
+                        try {
+                            auto view = chain.get_chain(best, walk);
+                            for (auto& [hash, data] : view) {
+                                data.share.invoke([&](auto* s) {
+                                    // Version
+                                    auto ver_key = std::to_string(s->version);
+                                    by_version[ver_key]++;
+
+                                    // Miner address (version-dependent)
+                                    std::string miner;
+                                    if constexpr (requires { s->m_address; })
+                                        miner = HexStr(s->m_address.m_data);
+                                    else if constexpr (requires { s->m_pubkey_hash; })
+                                        miner = s->m_pubkey_hash.GetHex();
+                                    if (!miner.empty())
+                                        by_miner[miner]++;
+
+                                    // Difficulty
+                                    auto target = chain::bits_to_target(s->m_bits);
+                                    double diff = chain::target_to_difficulty(target);
+                                    diff_sum += diff;
+                                    diff_count++;
+
+                                    // Timeline bucketing
+                                    if (s->m_timestamp >= window_start) {
+                                        int idx = static_cast<int>((s->m_timestamp - window_start) / SLOT_SEC);
+                                        if (idx >= SLOTS) idx = SLOTS - 1;
+                                        slots[idx].count++;
+                                        if (!miner.empty())
+                                            slots[idx].miners[miner]++;
+                                    }
+                                });
+                            }
+                        } catch (...) {
+                            // chain walk may throw if data is inconsistent; return partial results
+                        }
+                    }
+                }
+
+                result["shares_by_version"] = by_version;
+                result["shares_by_miner"]   = by_miner;
+                result["average_difficulty"] = diff_count > 0 ? diff_sum / diff_count : 1.0;
+                result["heaviest_fork_weight"] = 0.0; // TODO: compute when multi-fork scoring is needed
+                result["difficulty_trend"] = nlohmann::json::array();
+
+                nlohmann::json tl = nlohmann::json::array();
+                for (auto& sl : slots) {
+                    tl.push_back({
+                        {"timestamp",          sl.ts},
+                        {"share_count",        sl.count},
+                        {"miner_distribution", sl.miners}
+                    });
+                }
+                result["timeline"] = tl;
+                return result;
+            });
+
+            // Wire per-share window data for the defragmenter grid
+            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node]() {
+                nlohmann::json result;
+                auto& chain = p2p_node->tracker().chain;
+                auto& verified = p2p_node->tracker().verified;
+                auto best = p2p_node->best_share_hash();
+
+                result["best_hash"] = best.IsNull() ? "" : best.GetHex();
+                result["chain_length"] = static_cast<int>(chain.size());
+
+                nlohmann::json shares_arr = nlohmann::json::array();
+
+                if (!best.IsNull()) {
+                    int height = chain.get_height(best);
+                    int walk = std::min(height, 2000);
+                    if (walk > 0) {
+                        try {
+                            int pos = 0;
+                            auto view = chain.get_chain(best, walk);
+                            for (auto& [hash, data] : view) {
+                                nlohmann::json s;
+                                s["hash"] = hash.GetHex().substr(0, 16);
+                                s["pos"] = pos++;
+                                s["verified"] = verified.contains(hash);
+
+                                data.share.invoke([&](auto* obj) {
+                                    s["ts"] = obj->m_timestamp;
+                                    s["ver"] = obj->version;
+                                    s["stale"] = static_cast<int>(obj->m_stale_info);
+
+                                    std::string miner;
+                                    if constexpr (requires { obj->m_pubkey_hash; })
+                                        miner = obj->m_pubkey_hash.GetHex();
+                                    else if constexpr (requires { obj->m_address; })
+                                        miner = HexStr(obj->m_address.m_data);
+                                    s["miner"] = miner;
+                                });
+
+                                shares_arr.push_back(std::move(s));
+                            }
+                        } catch (...) {
+                            // partial results on chain inconsistency
+                        }
+                    }
+                }
+
+                // heads and tails for fork marking
+                nlohmann::json heads_arr = nlohmann::json::array();
+                for (auto& [hh, _] : chain.get_heads()) {
+                    heads_arr.push_back(hh.GetHex().substr(0, 16));
+                }
+
+                result["shares"] = std::move(shares_arr);
+                result["heads"] = std::move(heads_arr);
+                result["total"] = static_cast<int>(chain.size());
+                return result;
             });
 
             // Expose decoded protocol messages from best share via API.
@@ -1448,15 +1602,18 @@ int main(int argc, char* argv[]) {
             redistributor->set_mode(redistribute_mode);
             LOG_INFO << "Redistribute mode: " << ltc::redistribute_mode_str(redistribute_mode);
 
-            // Set operator identity for "fee" mode from node_owner_address
-            // (uses same P2PKH extraction as payout_script handling)
-            if (!node_owner_address.empty() && node_owner_fee > 0.0) {
-                // The operator's pubkey_hash will be set when set_node_fee_from_address
-                // was called earlier (which stores the scriptPubKey). For redistribute
-                // we need the raw hash160. Extract from the stored fee script by reading
-                // the MiningInterface's node fee data.
-                // Since we can't access the private m_node_fee_script, use the COMBINED_DONATION
-                // fallback for now; the operator identity gets wired below via lambda capture.
+            // Set operator identity for "fee" and "boost" modes.
+            // get_node_fee_hash160() extracts the hash160 from the P2PKH fee scriptPubKey
+            // that was set earlier via set_node_fee_from_address().
+            {
+                auto op_h160 = web_server.get_mining_interface()->get_node_fee_hash160();
+                if (op_h160.size() == 40) {
+                    uint160 op_hash;
+                    for (int i = 0; i < 20; ++i)
+                        op_hash.data()[i] = static_cast<uint8_t>(
+                            std::stoul(op_h160.substr(i * 2, 2), nullptr, 16));
+                    redistributor->set_operator_identity(op_hash, 0); // P2PKH
+                }
             }
 
             // Set donation identity for "donate" mode (V36 combined donation P2SH)
@@ -1466,6 +1623,33 @@ int main(int argc, char* argv[]) {
                     ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
                 redistributor->set_donation_identity(don_hash, 2); // P2SH
             }
+
+            // Wire Redistributor into MiningInterface as the address-fallback callback.
+            // Called for Case 3: invalid/empty LTC address with no usable DOGE address.
+            //
+            // redistributor_ptr is a raw pointer — the unique_ptr is kept alive for the
+            // duration of the pool (moved into redistributor_holder below).
+            {
+                auto* redistributor_ptr = redistributor.get();
+                auto* node_ptr = p2p_node.get();
+                web_server.get_mining_interface()->set_address_fallback_fn(
+                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
+                        auto best = node_ptr->best_share_hash();
+                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
+                        // Convert uint160 to 40-char hex string
+                        static const char* HEX = "0123456789abcdef";
+                        std::string h160;
+                        h160.reserve(40);
+                        const unsigned char* bytes = result.pubkey_hash.data();
+                        for (int i = 0; i < 20; ++i) {
+                            h160 += HEX[bytes[i] >> 4];
+                            h160 += HEX[bytes[i] & 0x0f];
+                        }
+                        return h160;
+                    });
+            }
+            // Keep redistributor alive for the lifetime of the pool
+            auto redistributor_holder = std::move(redistributor);
 
             // Periodic run_think timer (every 15 seconds) — verify shares & manage peers
             auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);

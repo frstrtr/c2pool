@@ -111,19 +111,14 @@ public:
 
     void write(std::unique_ptr<RawMessage> msg_data)
     {
-        auto packet = Packet::from_message(m_node->get_prefix(), msg_data);
-        // for (auto it = packet.begin(); it != packet.end(); it++)
-        //     std::cout << (int) *it << " ";
-        // std::cout << std::endl;
-        boost::asio::async_write(*m_socket, boost::asio::buffer(packet.data(), packet.size()),
-            [this, packet](const boost::system::error_code& ec, std::size_t length)
+        auto packet = std::make_shared<PackStream>(Packet::from_message(m_node->get_prefix(), msg_data));
+        boost::asio::async_write(*m_socket, boost::asio::buffer(packet->data(), packet->size()),
+            [self = shared_from_this(), this, packet](const boost::system::error_code& ec, std::size_t length)
             {
                 if (ec)
                 {
                     m_node->error("Socket::write error: " + ec.message(), get_addr());
                 }
-
-                // message received
             }
         );
     }

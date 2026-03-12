@@ -6,7 +6,7 @@ namespace core
 
 #define ASYNC_READ(buffer, handler)\
     if (!m_status) return;\
-    boost::asio::async_read(*m_socket, buffer, [this, packet](const auto& ec, std::size_t len) handler)
+    boost::asio::async_read(*m_socket, buffer, [self = shared_from_this(), this, packet](const auto& ec, std::size_t len) handler)
 
 void Socket::read_prefix(std::shared_ptr<Packet> packet)
 {
@@ -116,8 +116,10 @@ void Socket::message_processing(std::shared_ptr<Packet> packet)
     // checksum 
     uint256 hash_checksum = Hash(std::span<std::byte>(packet->payload.data(), packet->payload.size()));
     if (hash_checksum.pn[0] != packet->checksum)
+    {
         m_node->error("Socket::message_processing missmatch checksum!", get_addr());
-        // std::cout << "ERROR CHECKSUM!: " << hash_checksum.pn[7] << "(" << hash_checksum.pn[0] << ") != " << packet->checksum  << std::endl;
+        return;
+    }
     
     auto msg = packet->to_message();
     m_node->handle(std::move(msg), m_addr);

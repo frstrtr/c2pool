@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
@@ -115,6 +116,23 @@ public:
     nlohmann::json rest_users();
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
+
+    // Monitoring endpoints for Qt control panel
+    nlohmann::json rest_uptime();
+    nlohmann::json rest_connected_miners();
+    nlohmann::json rest_stratum_stats();
+    nlohmann::json rest_global_stats();
+    nlohmann::json rest_sharechain_stats();
+    nlohmann::json rest_sharechain_window();
+    nlohmann::json rest_control_mining_start();
+    nlohmann::json rest_control_mining_stop();
+    nlohmann::json rest_control_mining_restart();
+    nlohmann::json rest_control_mining_ban(const std::string& target);
+    nlohmann::json rest_control_mining_unban(const std::string& target);
+
+    // Log endpoints for Qt PageLogs — read directly from debug.log
+    std::string rest_web_log();
+    std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
 
     // Track a found block for the /recent_blocks endpoint
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
@@ -257,6 +275,14 @@ public:
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
 
+    // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
+    using sharechain_stats_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = std::move(fn); }
+
+    // Sharechain window callback — returns per-share data for the defragmenter grid
+    using sharechain_window_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
+
     // Network difficulty callback — invoked from refresh_work() with real value
     using network_difficulty_fn_t = std::function<void(double)>;
     void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
@@ -323,7 +349,18 @@ public:
 
     // Callback for P2P block relay — receives full block hex for direct daemon P2P broadcast.
     void set_on_block_relay(std::function<void(const std::string& full_block_hex)> fn);
+    // Redistribute / address-fallback callback.
+    // Called when a share's primary address cannot be resolved to a valid hash160.
+    // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
+    using address_fallback_fn_t = std::function<std::string(const std::string&)>;
+    void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
 
+    // Return true if the merged-mining manager has a configured chain with chain_id.
+    bool has_merged_chain(uint32_t chain_id) const;
+
+    // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
+    // Returns "" if the fee script is not a 25-byte P2PKH.
+    std::string get_node_fee_hash160() const;
 private:
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
@@ -392,6 +429,10 @@ private:
     // Share tracker hook
     std::function<uint256()> m_best_share_hash_fn;
 
+    // Sharechain stats callback
+    sharechain_stats_fn_t m_sharechain_stats_fn;
+    sharechain_window_fn_t m_sharechain_window_fn;
+
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;
 
@@ -442,6 +483,14 @@ private:
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
+
+    // Lightweight runtime state for MVP mining controls.
+    bool m_mining_enabled{true};
+    std::set<std::string> m_banned_targets;
+    mutable std::mutex m_control_mutex;
+
+    // Fallback address resolver for invalid/empty miner addresses (redistribute / DOGE→LTC)
+    address_fallback_fn_t m_address_fallback_fn;
 };
 
 /// Main Web Server class

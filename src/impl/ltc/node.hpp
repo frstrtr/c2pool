@@ -18,15 +18,20 @@
 namespace ltc
 {
 struct HandleSharesData;
+struct ShareReplyData
+{
+    std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items;
+};
 
 class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
     // Async share downloader:
     // ID = uint256 (matches sharereq id to sharereply id)
-    // RESPONSE = vector<ShareType>
+    // RESPONSE = parsed shares plus their original raw payloads
     // REQUEST args: req_id, peer, hashes, parents, stops
     using share_getter_t = ReplyMatcher::ID<uint256>
-        ::RESPONSE<std::vector<ltc::ShareType>>
+        ::RESPONSE<ltc::ShareReplyData>
         ::REQUEST<uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>>;
 
 protected:
@@ -75,10 +80,11 @@ public:
 
     // ICommunicator (override BaseNode to track outbound lifecycle):
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override;
+    void close_connection(const NetService& service) override;
 
     // BaseNode:
     void send_ping(peer_ptr peer) override;
-    pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
+    std::optional<pool::PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
 
     // ltc
     void send_version(peer_ptr peer);
@@ -89,13 +95,13 @@ public:
     void request_shares(uint256 id, peer_ptr peer,
                         std::vector<uint256> hashes, uint64_t parents,
                         std::vector<uint256> stops,
-                        std::function<void(std::vector<ltc::ShareType>)> callback)
+                        std::function<void(ltc::ShareReplyData)> callback)
     {
         m_share_getter.request(id, callback, id, peer, hashes, parents, stops);
     }
 
     // Called from HANDLER(sharereply) to complete a pending async request
-    void got_share_reply(uint256 id, std::vector<ltc::ShareType> shares)
+    void got_share_reply(uint256 id, ltc::ShareReplyData shares)
     {
         try { m_share_getter.got_response(id, shares); }
         catch (const std::invalid_argument&) { /* request already timed out */ }
@@ -131,8 +137,12 @@ public:
     void load_persisted_shares();
 
     /// Start dialing outbound peers from AddrStore / bootstrap list.
-    /// Maintains TARGET_OUTBOUND_PEERS active outbound connections.
+    /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
+
+    /// Set desired number of outbound peers maintained by connection loop.
+    /// A value of 0 disables outbound dialing.
+    void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
 
     /// Run the share tracker think() cycle: verifies chains, scores heads,
     /// identifies bad peers, and requests needed shares.
@@ -155,8 +165,9 @@ protected:
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
     // Connection maintenance
-    static constexpr size_t TARGET_OUTBOUND_PEERS = 8;
+    static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
     static constexpr size_t MAX_PEERS = 30;
+    size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers

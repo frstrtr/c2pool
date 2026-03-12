@@ -34,6 +34,8 @@
 # CMake
 /cmake-build-debug
 CMakeUserPresets.json
+/build-qt-mvp
+*.qtc.user
 
 #other
 /.idea

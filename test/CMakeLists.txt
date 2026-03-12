@@ -24,8 +24,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
 
+    add_executable(test_redistribute_address test_redistribute_address.cpp)
+    target_link_libraries(test_redistribute_address PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        c2pool_payout c2pool_merged_mining c2pool_hashrate
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+
     include(GoogleTest)
     gtest_add_tests(test_coin_broadcaster "" AUTO)
     gtest_add_tests(test_share_messages "" AUTO)
     gtest_add_tests(test_hardening "" AUTO)
+    gtest_add_tests(test_redistribute_address "" AUTO)
 endif()

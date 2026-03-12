@@ -187,15 +187,18 @@ void Legacy::HANDLER(sharereq)
 
 void Legacy::HANDLER(sharereply)
 {
-    std::vector<ltc::ShareType> result;
+    ltc::ShareReplyData result;
     if (msg->m_result == ShareReplyResult::good)
     {
+        result.m_items.reserve(msg->m_shares.size());
+        result.m_raw_items.reserve(msg->m_shares.size());
         for (auto& rshare : msg->m_shares)
         {
             try
             {
                 auto share = ltc::load_share(rshare, peer->addr());
-                result.push_back(share);
+                result.m_items.push_back(share);
+                result.m_raw_items.push_back(rshare);
             }
             catch(const std::exception& e)
             {

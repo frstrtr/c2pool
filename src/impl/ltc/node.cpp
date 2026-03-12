@@ -84,6 +84,13 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     base_t::error(err, service, where);
 }
 
+void NodeImpl::close_connection(const NetService& service)
+{
+    m_pending_outbound.erase(service);
+    m_outbound_addrs.erase(service);
+    base_t::close_connection(service);
+}
+
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
@@ -99,7 +106,7 @@ void NodeImpl::send_version(peer_ptr peer)
     peer->write(std::move(rmsg));
 }
 
-pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
+std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 {
     LOG_DEBUG_POOL << "handle message_version";
         std::unique_ptr<ltc::message_version> msg;
@@ -125,14 +132,13 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
         if (m_nonce == msg->m_nonce)
         {
                 LOG_WARNING << "was connected to self";
-                throw std::runtime_error("was connected to self");
+                return std::nullopt;
         }
 
         if (m_peers.contains(msg->m_nonce))
         {
-                std::string reason = "[handle_message_version] Detected duplicate connection, disconnecting from " + peer->addr().to_string();
-                LOG_ERROR << reason;
-                throw std::runtime_error(reason);
+                LOG_DEBUG_POOL << "Detected duplicate connection, disconnecting from " << peer->addr().to_string();
+                return std::nullopt;
         }
 
         peer->m_nonce = msg->m_nonce;
@@ -173,7 +179,7 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 
         return pool::PeerConnectionType::legacy;
 }
-    
+
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
     // Step 1: Compute hashes for all shares FIRST so PreparedList can sort them.
@@ -246,23 +252,30 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 
 		m_tracker.add(share);
 
-		// Periodically trim the chain DURING batch processing to bound memory.
-		if (new_count % 100 == 0) {
-		    const size_t keep = PoolConfig::chain_length() * 2;
-		    if (m_tracker.chain.size() > keep) {
-		        auto heads_copy = m_tracker.chain.get_heads();
-		        for (auto& [hh, th] : heads_copy)
-		            m_tracker.chain.trim(hh, keep);
-		    }
-		}
+		// NOTE: Do NOT trim inside the processing loop. The trim in run_think()
+		// handles pruning between batches. Trimming here is unsafe because
+		// shares added at the tail can be freed while the loop still holds
+		// dangling raw pointers to them (use-after-free).
 
 		// Persist to LevelDB
 		if (m_storage && m_storage->is_available())
 		{
-			PackStream ps = pack(share);
-			auto span = ps.get_span();
-			std::vector<uint8_t> bytes(reinterpret_cast<const uint8_t*>(span.data()),
-			                           reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            std::vector<uint8_t> bytes;
+            auto raw_it = m_raw_share_cache.find(share.hash());
+            if (raw_it != m_raw_share_cache.end() &&
+                raw_it->second.type == share.version() &&
+                !raw_it->second.contents.m_data.empty())
+            {
+                bytes.assign(raw_it->second.contents.m_data.begin(),
+                             raw_it->second.contents.m_data.end());
+            }
+            else
+            {
+                PackStream ps = pack(share);
+                auto span = ps.get_span();
+                bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
+                             reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            }
 			uint64_t ver = share.version();
 			std::vector<uint8_t> versioned;
 			versioned.resize(8 + bytes.size());
@@ -474,27 +487,32 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
     std::weak_ptr<pool::Peer<ltc::Peer>> weak_peer = peer;
 
     request_shares(req_id, peer, hashes, PARENTS_PER_REQUEST, stops,
-        [this, weak_peer, target_hash](std::vector<ltc::ShareType> shares)
+        [this, weak_peer, target_hash](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
 
-            if (shares.empty())
+            if (reply.m_items.empty())
             {
                 LOG_DEBUG_POOL << "Empty sharereply for " << target_hash.ToString();
                 return;
             }
 
-            LOG_INFO << "Received " << shares.size() << " shares for download request";
+            LOG_INFO << "Received " << reply.m_items.size() << " shares for download request";
 
             // Feed into processing pipeline
             HandleSharesData data;
-            for (auto& s : shares)
-                data.add(s, {});
+            for (size_t idx = 0; idx < reply.m_items.size(); ++idx)
+            {
+                if (idx < reply.m_raw_items.size())
+                    data.add(reply.m_items[idx], {}, reply.m_raw_items[idx]);
+                else
+                    data.add(reply.m_items[idx], {});
+            }
             processing_shares(data, NetService{});
 
             // Find the oldest share's parent — if unknown, keep fetching
             uint256 oldest_parent;
-            shares.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
+            reply.m_items.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
 
             if (!oldest_parent.IsNull() && !m_chain->contains(oldest_parent))
             {
@@ -557,13 +575,19 @@ void NodeImpl::load_persisted_shares()
 
 void NodeImpl::start_outbound_connections()
 {
+    if (m_target_outbound_peers == 0)
+    {
+        LOG_INFO << "Outbound peer dialing disabled (target=0)";
+        return;
+    }
+
     // Try to connect to peers right away
     auto try_connect_peers = [this]() {
         size_t outbound = m_outbound_addrs.size();
-        if (outbound >= TARGET_OUTBOUND_PEERS || m_connections.size() >= MAX_PEERS)
+        if (outbound >= m_target_outbound_peers || m_connections.size() >= MAX_PEERS)
             return;
 
-        size_t needed = TARGET_OUTBOUND_PEERS - outbound;
+        size_t needed = m_target_outbound_peers - outbound;
         auto good_peers = get_good_peers(needed + 4);  // ask for a few extra in case some are already connected
 
         for (auto& ap : good_peers)
@@ -653,23 +677,25 @@ void NodeImpl::run_think()
     // Trim stale shares to prevent unbounded memory growth.
     // Keep 2 * chain_length per head (matches Python p2pool behavior).
     // Must trim even when result.best is null (during initial sync).
-    const size_t keep_per_head = PoolConfig::chain_length() * 2;
-    auto trim_chain = [&](auto& sc, const char* label) {
+    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
         if (sc.size() <= keep_per_head)
             return;
         // Copy heads since trim may modify the heads map
         auto heads_copy = sc.get_heads();
         size_t total_removed = 0;
         for (auto& [head_hash, tail_hash] : heads_copy) {
-            auto removed = sc.trim(head_hash, keep_per_head);
+            auto removed = sc.trim(head_hash, keep_per_head, owns_data);
             total_removed += removed;
         }
         if (total_removed > 0)
             LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
                      << " (now " << sc.size() << ")";
     };
+    // Trim verified FIRST (non-destructive: it borrows share data from chain)
+    trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
+    // Then trim chain (destructive: it owns the share data)
     trim_chain(m_tracker.chain, "chain");
-    trim_chain(m_tracker.verified, "verified");
 
     // Prune caches — fixed caps safe for variable chain_length (v37+)
     constexpr size_t MAX_SHARED_HASHES  = 50000;
