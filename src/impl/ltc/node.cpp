@@ -672,22 +672,24 @@ void NodeImpl::run_think()
     // Keep 2 * chain_length per head (matches Python p2pool behavior).
     // Must trim even when result.best is null (during initial sync).
     const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
-    auto trim_chain = [&](auto& sc, const char* label) {
+    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
         if (sc.size() <= keep_per_head)
             return;
         // Copy heads since trim may modify the heads map
         auto heads_copy = sc.get_heads();
         size_t total_removed = 0;
         for (auto& [head_hash, tail_hash] : heads_copy) {
-            auto removed = sc.trim(head_hash, keep_per_head);
+            auto removed = sc.trim(head_hash, keep_per_head, owns_data);
             total_removed += removed;
         }
         if (total_removed > 0)
             LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
                      << " (now " << sc.size() << ")";
     };
+    // Trim verified FIRST (non-destructive: it borrows share data from chain)
+    trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
+    // Then trim chain (destructive: it owns the share data)
     trim_chain(m_tracker.chain, "chain");
-    trim_chain(m_tracker.verified, "verified");
 
     // Prune caches — fixed caps safe for variable chain_length (v37+)
     constexpr size_t MAX_SHARED_HASHES  = 50000;

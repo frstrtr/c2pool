@@ -423,7 +423,10 @@ public:
     /// Walks the prev-pointer chain, cuts at the boundary, subtracts the
     /// evicted accumulated index data, and frees the removed shares.
     /// Returns the number of shares removed.
-    size_t trim(const hash_t& head, size_t max_size)
+    /// @param owns_data When true (default) the evicted share data is
+    ///        destroyed.  Set to false for chains that borrow share
+    ///        pointers from another chain (e.g. verified borrows from chain).
+    size_t trim(const hash_t& head, size_t max_size, bool owns_data = true)
     {
         if (!m_shares.contains(head) || max_size == 0)
             return 0;
@@ -484,7 +487,8 @@ public:
             auto it = m_shares.find(h);
             if (it != m_shares.end())
             {
-                it->second.share.destroy();
+                if (owns_data)
+                    it->second.share.destroy();
                 delete it->second.index;
                 m_shares.erase(it);
             }
