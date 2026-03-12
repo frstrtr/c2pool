@@ -224,35 +224,60 @@ Backoff behavior:
 - Message moderation and blob loading remain localhost-only.
 - Never store wallet secrets in UI config.
 
-## 10. Milestone Plan
+## 10. Mining-First MVP Plan
 
-### Milestone A: Foundation (1 week)
+Implementation priority is changed to: "start mining operations reliably first, then expand operator features".
 
-- Create Qt app shell, nav, status strip, shared API client
-- Implement Overview page with /global_stats and /local_stats
-- Add daemon health indicator and reconnect handling
+### MVP-0: Bootstrap (2-3 days)
 
-### Milestone B: Core Operations (1 week)
+- Qt shell (Widgets), sidebar, status strip, page routing
+- API client with retry/backoff + endpoint health badges
+- Daemon process controls: start/stop/restart and state indicator
 
-- Mining page with /stratum_stats, /connected_miners, /miner_stats
-- Network page with /peer_list, /pings, broadcaster status
-- Logs page with live tail and filters
-- Message Center read-only feed (signals/alerts/status)
+### MVP-1: Start Mining Core (1 week) [PRIMARY GOAL]
 
-### Milestone C: Payout + Settings + Console (1-2 weeks)
+- Mining page first:
+  - /stratum_stats
+  - /connected_miners
+  - /miner_stats/<address>
+  - /stratum_security
+  - /ban_stats
+- Overview essentials:
+  - /global_stats
+  - /local_stats
+  - /uptime
+- Minimal Logs page:
+  - live tail + severity filter + search
+- Quick actions required for operations:
+  - temporary ban/unban for abusive clients
+  - emergency DDoS shield toggle (if backend supports)
 
-- Payout page with current and merged payouts
-- Settings editor with validation pipeline
-- RPC console with command history and JSON formatting
+Exit criteria for MVP-1:
 
-### Milestone D: Alerts And Controls (1 week)
+- Operator can start/monitor mining from panel only
+- Operator can see accepted/rejected shares and miner connectivity in real time
+- Operator can apply emergency abuse action in under 10 seconds
 
-- Message/alerts page using /msg/* endpoints
-- Add operator control actions (ban/unban/load_blob, daemon lifecycle)
-- Add Security/Abuse controls page (poolhopper policy + ban workflow)
-- Add confirmations and audit log panel in UI
+### MVP-2: Stability And Safety (4-6 days)
 
-### Milestone E: Release Candidate (3-5 days)
+- Security/Abuse page with score table and policy toggles
+- DDoS telemetry widgets and mitigation level control
+- Action audit journal visible in UI
+- Safe defaults + rollback timer for emergency controls
+
+### Phase 3: Economics And Operator Tools (1 week)
+
+- Payouts page (/current_payouts, /current_merged_payouts, /fee)
+- Message Center full view (/msg/recent, /msg/alerts, /msg/status, /msg/stats)
+- Settings editor (validated apply)
+
+### Phase 4: Advanced Ops (1 week)
+
+- RPC console (allowlist mode)
+- Network deep-dive views (peer list detail, pings, broadcaster status)
+- Message moderation extras (load_blob workflow, BBS/chat preview)
+
+### Phase 5: Release Candidate (3-5 days)
 
 - Stabilization and bugfixes
 - Packaging scripts and launch docs
@@ -267,6 +292,10 @@ Backoff behavior:
 - Integration tests:
   - mocked API responses for all pages
   - process controller start/stop/restart
+- MVP mining flow test:
+  - launch daemon from panel
+  - verify /stratum_stats and /connected_miners update continuously
+  - execute temp ban and verify effect in ban stats
 - E2E smoke test:
   - start daemon
   - verify all page data load
@@ -421,9 +450,9 @@ If these endpoints are not available initially, the panel should still provide
 read-only DDoS telemetry from existing security stats and expose controls as
 "planned/disabled" until server support lands.
 
-## 14. Immediate Next Steps
+## 14. Immediate Next Steps (Mining MVP)
 
-1. Freeze v1 endpoint contract and JSON schema snapshots.
-2. Define page-level wireframes (low fidelity is enough).
-3. Scaffold Qt project under a new directory (for example ui/qt-control-panel).
-4. Implement Milestone A only, then demo before expanding scope.
+1. Freeze MVP-1 endpoint contract only (/stratum_stats, /connected_miners, /miner_stats, /global_stats, /local_stats, /uptime, /ban_stats).
+2. Scaffold Qt project under a new directory (for example ui/qt-control-panel).
+3. Build Mining + Overview + minimal Logs first, with process controls.
+4. Demo mining-start workflow before implementing payout/settings/console features.
