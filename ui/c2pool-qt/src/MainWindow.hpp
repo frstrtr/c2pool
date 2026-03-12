@@ -13,6 +13,7 @@
 #include <QMainWindow>
 #include <QPushButton>
 #include <QStackedWidget>
+#include <QStatusBar>
 #include <QTimer>
 
 class MainWindow : public QMainWindow
@@ -26,17 +27,20 @@ protected:
 
 private:
     void refreshCurrentPage();
+    void updateDaemonState(bool api_online);
     void loadSettings();
     void saveSettings() const;
 
     ApiClient api_;
 
     QLineEdit* baseUrlEdit_;
+    QListWidget* navList_;
+    QStackedWidget* stack_;
+
+    // Status bar widgets (bottom, Bitcoin-Qt style)
     QLabel* daemonStateLabel_;
     QLabel* connectionStateLabel_;
     QLabel* statusLabel_;
-    QListWidget* navList_;
-    QStackedWidget* stack_;
 
     PageLaunch*    launchPage_;
     PageOverview*  overviewPage_;
@@ -45,4 +49,5 @@ private:
     PageSharechain* sharechainPage_;
 
     QTimer refreshTimer_;
+    bool lastApiOnline_{false};
 };

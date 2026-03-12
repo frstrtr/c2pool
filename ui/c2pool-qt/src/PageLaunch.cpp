@@ -204,6 +204,18 @@ void PageLaunch::setupUi()
         rpcPassEdit_->setToolTip("--rpcpassword");
         form->addRow("RPC password:", rpcPassEdit_);
 
+        coindP2pPortSpin_ = new QSpinBox;
+        coindP2pPortSpin_->setRange(0, 65535);
+        coindP2pPortSpin_->setValue(0);
+        coindP2pPortSpin_->setSpecialValueText("auto-detect");
+        coindP2pPortSpin_->setToolTip("--coind-p2p-port  (0 = auto-detect from chain)");
+        form->addRow("P2P port:", coindP2pPortSpin_);
+
+        coindP2pAddrEdit_ = new QLineEdit;
+        coindP2pAddrEdit_->setPlaceholderText("same as RPC host");
+        coindP2pAddrEdit_->setToolTip("--coind-p2p-address  (defaults to RPC host)");
+        form->addRow("P2P address:", coindP2pAddrEdit_);
+
         vbox->addWidget(g);
     }
 
@@ -214,8 +226,13 @@ void PageLaunch::setupUi()
 
         addressEdit_ = new QLineEdit;
         addressEdit_->setPlaceholderText("LTC/BTC/DOGE payout address");
-        addressEdit_->setToolTip("--address / --solo-address");
+        addressEdit_->setToolTip("--address / --solo-address  (YOUR mining payout address)");
         form->addRow("Payout address:", addressEdit_);
+
+        autoDetectWalletCheck_ = new QCheckBox("Auto-detect wallet address");
+        autoDetectWalletCheck_->setChecked(true);
+        autoDetectWalletCheck_->setToolTip("--auto-detect-wallet / --no-auto-detect-wallet");
+        form->addRow("", autoDetectWalletCheck_);
 
         feeSpinBox_ = new QDoubleSpinBox;
         feeSpinBox_->setRange(0.0, 100.0);
@@ -229,6 +246,11 @@ void PageLaunch::setupUi()
         nodeOwnerAddrEdit_->setPlaceholderText("Leave blank to use same as payout address");
         nodeOwnerAddrEdit_->setToolTip("--node-owner-address");
         form->addRow("Node owner address:", nodeOwnerAddrEdit_);
+
+        nodeOwnerScriptEdit_ = new QLineEdit;
+        nodeOwnerScriptEdit_->setPlaceholderText("hex script (advanced, usually leave blank)");
+        nodeOwnerScriptEdit_->setToolTip("--node-owner-script  (raw hex script for node-owner payout)");
+        form->addRow("Node owner script:", nodeOwnerScriptEdit_);
 
         giveAuthorSpinBox_ = new QDoubleSpinBox;
         giveAuthorSpinBox_->setRange(0.0, 100.0);
@@ -295,6 +317,34 @@ void PageLaunch::setupUi()
         maxConnsSpinBox_->setSpecialValueText("default");
         maxConnsSpinBox_->setToolTip("--max-conns / --outgoing-conns  (0 = default)");
         form->addRow("Max outgoing P2P connections:", maxConnsSpinBox_);
+
+        seedNodesEdit_ = new QPlainTextEdit;
+        seedNodesEdit_->setMaximumHeight(80);
+        seedNodesEdit_->setPlaceholderText("One HOST:PORT per line, e.g. 192.168.86.29:19338");
+        seedNodesEdit_->setToolTip("-n HOST:PORT  (seed/bootstrap node addresses)");
+        form->addRow("Seed nodes (-n):", seedNodesEdit_);
+
+        httpHostEdit_ = new QLineEdit("0.0.0.0");
+        httpHostEdit_->setToolTip("--http-host  (bind address for HTTP API server)");
+        form->addRow("HTTP bind address:", httpHostEdit_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 8. Advanced ──────────────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Advanced");
+        auto* form = new QFormLayout(g);
+
+        configFileEdit_ = new QLineEdit;
+        configFileEdit_->setPlaceholderText("path/to/config.yaml (optional)");
+        configFileEdit_->setToolTip("--config  (load settings from YAML config file)");
+        form->addRow("Config file:", configFileEdit_);
+
+        messageBlobEdit_ = new QLineEdit;
+        messageBlobEdit_->setPlaceholderText("hex string (optional, v36+)");
+        messageBlobEdit_->setToolTip("--message-blob-hex  (embedded share message data)");
+        form->addRow("Message blob hex:", messageBlobEdit_);
 
         vbox->addWidget(g);
     }
@@ -367,6 +417,10 @@ QString PageLaunch::buildCommand() const
     parts << "-w"            << QString::number(stratumPortSpin_->value());
     parts << "--web-port"    << QString::number(httpPortSpin_->value());
 
+    // Config file (must come early so CLI flags override it)
+    const QString configFile = configFileEdit_->text().trimmed();
+    if (!configFile.isEmpty()) parts << "--config" << configFile;
+
     // Coin daemon
     const QString coindHost = coindHostEdit_->text().trimmed();
     if (!coindHost.isEmpty()) parts << "--coind-address" << coindHost;
@@ -376,10 +430,16 @@ QString PageLaunch::buildCommand() const
     const QString rpcPass = rpcPassEdit_->text().trimmed();
     if (!rpcUser.isEmpty()) parts << "--rpcuser" << rpcUser;
     if (!rpcPass.isEmpty()) parts << "--rpcpassword" << rpcPass;
+    if (coindP2pPortSpin_->value() > 0)
+        parts << "--coind-p2p-port" << QString::number(coindP2pPortSpin_->value());
+    const QString coindP2pAddr = coindP2pAddrEdit_->text().trimmed();
+    if (!coindP2pAddr.isEmpty()) parts << "--coind-p2p-address" << coindP2pAddr;
 
     // Payout address
     const QString addr = addressEdit_->text().trimmed();
     if (!addr.isEmpty()) parts << "--address" << addr;
+    if (!autoDetectWalletCheck_->isChecked())
+        parts << "--no-auto-detect-wallet";
 
     // Fee / donation
     if (feeSpinBox_->value() > 0.0)
@@ -389,6 +449,9 @@ QString PageLaunch::buildCommand() const
     const QString nodeOwnerAddr = nodeOwnerAddrEdit_->text().trimmed();
     if (!nodeOwnerAddr.isEmpty())
         parts << "--node-owner-address" << nodeOwnerAddr;
+    const QString nodeOwnerScript = nodeOwnerScriptEdit_->text().trimmed();
+    if (!nodeOwnerScript.isEmpty())
+        parts << "--node-owner-script" << nodeOwnerScript;
 
     // Redistribute (only if non-default)
     const QString redistribute = redistributeCombo_->currentText();
@@ -421,6 +484,24 @@ QString PageLaunch::buildCommand() const
     // Network tuning
     if (maxConnsSpinBox_->value() > 0)
         parts << "--max-conns" << QString::number(maxConnsSpinBox_->value());
+
+    // HTTP host
+    const QString httpHost = httpHostEdit_->text().trimmed();
+    if (!httpHost.isEmpty() && httpHost != "0.0.0.0")
+        parts << "--http-host" << httpHost;
+
+    // Seed nodes
+    const QStringList seedLines = seedNodesEdit_->toPlainText().split('\n', Qt::SkipEmptyParts);
+    for (const QString& line : seedLines) {
+        const QString trimmed = line.trimmed();
+        if (!trimmed.isEmpty())
+            parts << "-n" << trimmed;
+    }
+
+    // Message blob
+    const QString msgBlob = messageBlobEdit_->text().trimmed();
+    if (!msgBlob.isEmpty())
+        parts << "--message-blob-hex" << msgBlob;
 
     return parts.join(" ");
 }
@@ -543,6 +624,14 @@ void PageLaunch::saveSettings() const
     s.setValue("giveAuthor",    giveAuthorSpinBox_->value());
     s.setValue("redistribute",  redistributeCombo_->currentText());
     s.setValue("maxConns",      maxConnsSpinBox_->value());
+    s.setValue("coindP2pPort",  coindP2pPortSpin_->value());
+    s.setValue("coindP2pAddr",  coindP2pAddrEdit_->text());
+    s.setValue("autoDetectWallet", autoDetectWalletCheck_->isChecked());
+    s.setValue("nodeOwnerScript", nodeOwnerScriptEdit_->text());
+    s.setValue("httpHost",      httpHostEdit_->text());
+    s.setValue("seedNodes",     seedNodesEdit_->toPlainText());
+    s.setValue("configFile",    configFileEdit_->text());
+    s.setValue("messageBlob",   messageBlobEdit_->text());
 
     // Merged chains
     s.remove("merged");
@@ -586,6 +675,14 @@ void PageLaunch::loadSettings()
         redistributeCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
     maxConnsSpinBox_->setValue(s.value("maxConns", 0).toInt());
+    coindP2pPortSpin_->setValue(s.value("coindP2pPort", 0).toInt());
+    coindP2pAddrEdit_->setText(s.value("coindP2pAddr").toString());
+    autoDetectWalletCheck_->setChecked(s.value("autoDetectWallet", true).toBool());
+    nodeOwnerScriptEdit_->setText(s.value("nodeOwnerScript").toString());
+    httpHostEdit_->setText(s.value("httpHost", "0.0.0.0").toString());
+    seedNodesEdit_->setPlainText(s.value("seedNodes").toString());
+    configFileEdit_->setText(s.value("configFile").toString());
+    messageBlobEdit_->setText(s.value("messageBlob").toString());
 
     // Merged chains
     mergedTable_->setRowCount(0);

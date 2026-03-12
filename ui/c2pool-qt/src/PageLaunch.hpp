@@ -6,6 +6,7 @@
 #include <QGroupBox>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
 #include <QSpinBox>
@@ -85,15 +86,19 @@ private:
 
     // ── Parent Coin Daemon ──────────────────────────────────────────────────
     QLineEdit* coindHostEdit_;
-    QSpinBox*  coindPortSpin_;   ///< 0 = auto-detect from chain
+    QSpinBox*  coindPortSpin_;       ///< 0 = auto-detect from chain
     QLineEdit* rpcUserEdit_;
     QLineEdit* rpcPassEdit_;
+    QSpinBox*  coindP2pPortSpin_;    ///< --coind-p2p-port
+    QLineEdit* coindP2pAddrEdit_;    ///< --coind-p2p-address
 
     // ── Payout & Fees ───────────────────────────────────────────────────────
     QLineEdit*     addressEdit_;
+    QCheckBox*     autoDetectWalletCheck_; ///< --auto-detect-wallet (default on)
     QDoubleSpinBox* feeSpinBox_;        ///< -f / --fee (node-owner fee %)
     QDoubleSpinBox* giveAuthorSpinBox_; ///< --give-author (dev donation %)
     QLineEdit*     nodeOwnerAddrEdit_;
+    QLineEdit*     nodeOwnerScriptEdit_; ///< --node-owner-script (hex)
     QComboBox*     redistributeCombo_;  ///< pplns / fee / boost / donate
 
     // ── Merged Mining ───────────────────────────────────────────────────────
@@ -102,8 +107,14 @@ private:
     QPushButton*  addMergedBtn_;
     QPushButton*  removeMergedBtn_;
 
-    // ── Additional p2pool-compat options ───────────────────────────────────
+    // ── Network Tuning ────────────────────────────────────────────────────
     QSpinBox*  maxConnsSpinBox_;   ///< --max-conns
+    QPlainTextEdit* seedNodesEdit_;  ///< -n HOST:PORT (one per line)
+    QLineEdit* httpHostEdit_;        ///< --http-host (bind address)
+
+    // ── Advanced ────────────────────────────────────────────────────────────
+    QLineEdit* configFileEdit_;      ///< --config (YAML file)
+    QLineEdit* messageBlobEdit_;     ///< --message-blob-hex
 
     // ── Command Preview ─────────────────────────────────────────────────────
     QTextEdit*   cmdPreview_;

@@ -10,9 +10,10 @@
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
-    setWindowTitle("c2pool Qt Control Panel (MVP)");
+    setWindowTitle("c2pool-qt");
     resize(1200, 760);
 
+    // ── Top toolbar: Base URL + Apply / Refresh ───────────────────────────
     auto* topBar = addToolBar("Connection");
     topBar->setMovable(false);
 
@@ -26,17 +27,17 @@ MainWindow::MainWindow(QWidget* parent)
     topBar->addWidget(applyButton);
     topBar->addWidget(refreshButton);
 
-    daemonStateLabel_ = new QLabel("Daemon: stopped", this);
-    topBar->addWidget(daemonStateLabel_);
-
-    topBar->addSeparator();
+    // ── Bottom status bar (Bitcoin-Qt style) ──────────────────────────────
+    auto* sb = statusBar();
+    daemonStateLabel_ = new QLabel("Daemon: detecting...", this);
     connectionStateLabel_ = new QLabel("API: unknown", this);
-    topBar->addWidget(connectionStateLabel_);
-
     statusLabel_ = new QLabel("Idle", this);
-    topBar->addSeparator();
-    topBar->addWidget(statusLabel_);
 
+    sb->addWidget(daemonStateLabel_);
+    sb->addWidget(connectionStateLabel_);
+    sb->addPermanentWidget(statusLabel_);
+
+    // ── Central area: nav list + stacked pages ────────────────────────────
     auto* central = new QWidget(this);
     auto* layout = new QHBoxLayout(central);
 
@@ -92,13 +93,13 @@ MainWindow::MainWindow(QWidget* parent)
                 api_.setBaseUrl(url);
             });
 
+    // ── API connection state → daemon auto-detect ─────────────────────────
     connect(&api_, &ApiClient::connectionStateChanged, this, [this](const QString& state) {
+        const bool online = (state == "online");
         connectionStateLabel_->setText(QString("API: %1").arg(state));
-        if (state == "online") {
-            connectionStateLabel_->setStyleSheet("color: #1d7f3b;");
-        } else {
-            connectionStateLabel_->setStyleSheet("color: #b04020;");
-        }
+        connectionStateLabel_->setStyleSheet(
+            online ? "color: #1d7f3b;" : "color: #b04020;");
+        updateDaemonState(online);
     });
 
     connect(&api_, &ApiClient::requestFailed, this, [this](const QString& message) {
@@ -142,12 +143,33 @@ void MainWindow::saveSettings() const
     s.setValue("ui/refreshMs", refreshTimer_.interval());
 }
 
+void MainWindow::updateDaemonState(bool api_online)
+{
+    lastApiOnline_ = api_online;
+    if (launchPage_->isDaemonRunning()) {
+        // Managed by us — PageLaunch signals handle the label
+        return;
+    }
+    if (api_online) {
+        daemonStateLabel_->setText("Daemon: running (external)");
+        daemonStateLabel_->setStyleSheet("color: #1d7f3b;");
+    } else {
+        daemonStateLabel_->setText("Daemon: stopped");
+        daemonStateLabel_->setStyleSheet("color: #b04020;");
+    }
+}
+
 void MainWindow::refreshCurrentPage()
 {
     const int idx = stack_->currentIndex();
     switch (idx) {
-    case 0: // Launch — no API poll needed
+    case 0: {
+        // Ping the API even on Launch page so daemon state updates
+        api_.getText("/uptime",
+            [](const QString&) { /* connectionStateChanged handles it */ },
+            [](const QString&) { });
         break;
+    }
     case 1:
         overviewPage_->refresh(&api_);
         statusLabel_->setText("Overview refreshed");
