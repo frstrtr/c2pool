@@ -259,10 +259,22 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 		// Persist to LevelDB
 		if (m_storage && m_storage->is_available())
 		{
-			PackStream ps = pack(share);
-			auto span = ps.get_span();
-			std::vector<uint8_t> bytes(reinterpret_cast<const uint8_t*>(span.data()),
-			                           reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            std::vector<uint8_t> bytes;
+            auto raw_it = m_raw_share_cache.find(share.hash());
+            if (raw_it != m_raw_share_cache.end() &&
+                raw_it->second.type == share.version() &&
+                !raw_it->second.contents.m_data.empty())
+            {
+                bytes.assign(raw_it->second.contents.m_data.begin(),
+                             raw_it->second.contents.m_data.end());
+            }
+            else
+            {
+                PackStream ps = pack(share);
+                auto span = ps.get_span();
+                bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
+                             reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            }
 			uint64_t ver = share.version();
 			std::vector<uint8_t> versioned;
 			versioned.resize(8 + bytes.size());
@@ -474,27 +486,32 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
     std::weak_ptr<pool::Peer<ltc::Peer>> weak_peer = peer;
 
     request_shares(req_id, peer, hashes, PARENTS_PER_REQUEST, stops,
-        [this, weak_peer, target_hash](std::vector<ltc::ShareType> shares)
+        [this, weak_peer, target_hash](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
 
-            if (shares.empty())
+            if (reply.m_items.empty())
             {
                 LOG_DEBUG_POOL << "Empty sharereply for " << target_hash.ToString();
                 return;
             }
 
-            LOG_INFO << "Received " << shares.size() << " shares for download request";
+            LOG_INFO << "Received " << reply.m_items.size() << " shares for download request";
 
             // Feed into processing pipeline
             HandleSharesData data;
-            for (auto& s : shares)
-                data.add(s, {});
+            for (size_t idx = 0; idx < reply.m_items.size(); ++idx)
+            {
+                if (idx < reply.m_raw_items.size())
+                    data.add(reply.m_items[idx], {}, reply.m_raw_items[idx]);
+                else
+                    data.add(reply.m_items[idx], {});
+            }
             processing_shares(data, NetService{});
 
             // Find the oldest share's parent — if unknown, keep fetching
             uint256 oldest_parent;
-            shares.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
+            reply.m_items.back().invoke([&](auto* obj) { oldest_parent = obj->m_prev_hash; });
 
             if (!oldest_parent.IsNull() && !m_chain->contains(oldest_parent))
             {

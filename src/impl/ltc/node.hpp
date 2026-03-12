@@ -18,15 +18,20 @@
 namespace ltc
 {
 struct HandleSharesData;
+struct ShareReplyData
+{
+    std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items;
+};
 
 class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
 {
     // Async share downloader:
     // ID = uint256 (matches sharereq id to sharereply id)
-    // RESPONSE = vector<ShareType>
+    // RESPONSE = parsed shares plus their original raw payloads
     // REQUEST args: req_id, peer, hashes, parents, stops
     using share_getter_t = ReplyMatcher::ID<uint256>
-        ::RESPONSE<std::vector<ltc::ShareType>>
+        ::RESPONSE<ltc::ShareReplyData>
         ::REQUEST<uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>>;
 
 protected:
@@ -89,13 +94,13 @@ public:
     void request_shares(uint256 id, peer_ptr peer,
                         std::vector<uint256> hashes, uint64_t parents,
                         std::vector<uint256> stops,
-                        std::function<void(std::vector<ltc::ShareType>)> callback)
+                        std::function<void(ltc::ShareReplyData)> callback)
     {
         m_share_getter.request(id, callback, id, peer, hashes, parents, stops);
     }
 
     // Called from HANDLER(sharereply) to complete a pending async request
-    void got_share_reply(uint256 id, std::vector<ltc::ShareType> shares)
+    void got_share_reply(uint256 id, ltc::ShareReplyData shares)
     {
         try { m_share_getter.got_response(id, shares); }
         catch (const std::invalid_argument&) { /* request already timed out */ }
