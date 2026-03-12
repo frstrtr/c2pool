@@ -1,136 +1,204 @@
-# Unix Build Instructions
+# Build instructions — Linux (Ubuntu 24.04)
 
-This document covers building c2pool on Unix-like systems including Linux distributions and FreeBSD.
+This guide covers building c2pool on Ubuntu 24.04 LTS.  
+The same steps work on Ubuntu 22.04 and Debian 12 with minor version differences.
 
-> [!WARNING]
-> While compiling you may get an error like:\
-> `c++: internal compiler error: Killed (program cc1plus)`\
-> \
-> Reasons:
-> 1. Low ram/swap. Increase ram/swap or decrease the amount of make -j to 1 (more compile threads -> more mem usage).
-> 2. SELinux/grsecurity/Hardened kernel: Kernels that use ASLR as a security measure tend to mess up GCC's precompiled header implementation. Try using an unhardened kernel (without ASLR), or compiling using clang, or gcc without pch. (you can get this issue when using OVH hosting).
+> **Low-RAM warning**: if compilation is killed mid-way, reduce parallelism:
+> `cmake --build . --target c2pool -j1`
 
-> [!NOTE]
-> **CMake 3.30+ Compatibility**: This project now supports CMake 3.30+ which removed the FindBoost module. The build system automatically detects and adapts to your CMake version.
+---
 
-# Dependencies
-| Name      | Version    | Notes |
-|-----------|------------|-------|
-| CMake     | >= 3.22    | 3.30+ supported with automatic compatibility |
-| OpenSSL   | >= 3.xx    | |
-| GCC       | 11+        | Or equivalent Clang version |
-| Boost     | 1.78+      | Components: log, log_setup, thread, filesystem, system |
-| nlohmann-json | Any    | JSON library |
-| yaml-cpp  | Any        | YAML configuration support |
-| GoogleTest| Any        | For testing (optional) |
-| LevelDB   | Any        | Database backend |
+## 1. System packages
 
-## Linux (Ubuntu/Debian) Instructions
-
-```shell
-sudo apt update & apt upgrade
-sudo apt install wget
-sudo apt install git
-
-sudo apt install g++-11
-sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 1100 --slave /usr/bin/g++ g++ /usr/bin/g++-11
-
-sudo apt install cmake
-sudo apt install make
-sudo apt-get install libleveldb-dev
-sudo apt install qt6-base-dev
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    g++ \
+    cmake \
+    make \
+    libleveldb-dev \
+    libsecp256k1-dev \
+    python3-pip \
+    git
 ```
 
-If ui config is needed:
+| Package | Provides |
+|---------|----------|
+| `g++` | GCC 13 C++ compiler |
+| `cmake` | Build system (3.28 on 24.04) |
+| `libleveldb-dev` | LevelDB — persistent sharechain storage |
+| `libsecp256k1-dev` | secp256k1 — ECDSA crypto for btclibs |
+| `python3-pip` | needed to install Conan |
 
-```shell
-sudo apt-get install libgl1-mesa-dev
+> All other dependencies (Boost 1.78, nlohmann_json, yaml-cpp, GoogleTest, zlib,
+> bzip2, libbacktrace) are downloaded and compiled automatically by Conan.
+
+---
+
+## 2. Install Conan 2
+
+Conan 2 is the C++ package manager that handles all remaining dependencies.
+
+```bash
+pip install "conan>=2.0,<3.0" --break-system-packages
 ```
 
-install boost 1.78.0:
+> On Ubuntu 24.04, `--break-system-packages` is required because of PEP 668.
+> Alternatively, use a venv:
+> `python3 -m venv ~/.conan-venv && source ~/.conan-venv/bin/activate && pip install conan`
 
-```shell
-# Download from SourceForge (JFrog Artifactory is no longer available)
-wget https://sourceforge.net/projects/boost/files/boost/1.78.0/boost_1_78_0.tar.bz2
-tar xjvf boost_1_78_0.tar.bz2
-cd boost_1_78_0
-./bootstrap.sh --prefix=/usr/
-sudo ./b2 install
-cd ..
+Create the default toolchain profile (auto-detects GCC 13):
+
+```bash
+conan profile detect --force
 ```
 
-## FreeBSD Instructions
+Verify:
 
-FreeBSD users can install dependencies using the package manager:
-
-```shell
-pkg install cmake
-pkg install leveldb
-pkg install boost-all
-pkg install googletest
-pkg install nlohmann-json
-pkg install yaml-cpp
+```bash
+conan profile show
+# Should show: compiler=gcc, compiler.version=13, os=Linux
 ```
 
-## Building c2pool
+---
 
-For all Unix systems (Linux, FreeBSD, etc.):
+## 3. Clone the repository
 
-```shell
+```bash
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool
+```
+
+> No submodules — a plain `git clone` is sufficient.
+
+---
+
+## 4. Install dependencies with Conan
+
+```bash
 mkdir build
-cmake -DCMAKE_BUILD_TYPE=Debug -S . -B build
-make -C build c2pool -j$(nproc)
+cd build
+conan install .. \
+    --build=missing \
+    --output-folder=. \
+    --settings=build_type=Debug
 ```
 
-## Configuration
+This downloads and compiles all managed dependencies into `~/.conan2/` and
+generates `conan_toolchain.cmake` and `CMakePresets.json` in `build/`.
 
-UI Config:
+**First run**: ~15–20 min (Boost 1.78 compiles from source).  
+**Subsequent runs**: seconds (packages are cached in `~/.conan2/`).
 
-```shell
-./build/src/c2pool/c2pool --ui_config
+---
+
+## 5. Configure and build
+
+```bash
+# still inside build/
+cmake .. --preset conan-debug
+cmake --build . --target c2pool -j$(nproc)
 ```
 
-## Running
+The compiled binary is at `build/src/c2pool/c2pool`.
 
-Start the mining pool with web server:
+### Build the test suite (optional)
 
-```shell
-./build/src/c2pool/c2pool --web_server=0.0.0.0:8083
+```bash
+cmake --build . \
+    --target test_hardening test_share_messages test_coin_broadcaster \
+    -j$(nproc)
+ctest --output-on-failure -j$(nproc)
+# Expected: 94 tests, 0 failures
 ```
 
-### Mining Pool Features
+---
 
-- **HTTP/JSON-RPC interface** on port 8083 for standard miners
-- **Native Stratum protocol** on port 8084 for hardware miners
-- **Automatic sync detection** - Stratum starts only when blockchain is synchronized
-- **Multi-network support** - LTC, BTC, DGB
-- **Comprehensive address validation** - All address formats supported
+## 6. Running
 
-### Supported Methods
+All examples assume you are in the repository root.
 
-- `getwork`, `submitwork` - Standard mining interface
-- `getblocktemplate`, `submitblock` - Advanced mining
-- `getinfo`, `getstats` - Pool statistics
-- `mining.subscribe`, `mining.authorize`, `mining.submit` - Stratum protocol
+### Integrated mode — full pool (LTC + DOGE merged mining)
+
+```bash
+./build/src/c2pool/c2pool \
+    --integrated \
+    --net litecoin \
+    --coind-address 127.0.0.1 --coind-rpc-port 9332 \
+    --coind-p2p-port 9333 \
+    --merged DOGE:98:127.0.0.1:44556:dogerpc:rpcpass \
+    --address YOUR_LTC_ADDRESS \
+    --give-author 2 \
+    litecoinrpc RPCPASSWORD
+```
+
+### Testnet smoke-test
+
+```bash
+./build/src/c2pool/c2pool --integrated --testnet
+```
+
+### Sharechain-only node
+
+```bash
+./build/src/c2pool/c2pool \
+    --sharechain \
+    --net litecoin \
+    --coind-address 127.0.0.1 --coind-rpc-port 9332 \
+    litecoinrpc RPCPASSWORD
+```
+
+### Full option reference
+
+```bash
+./build/src/c2pool/c2pool --help
+```
+
+**Default ports**
+
+| Port | Purpose |
+|------|--------|
+| 9326 | P2Pool sharechain peer-to-peer |
+| 9327 | Stratum mining server + HTTP API |
+
+---
+
+## 7. Configuration file (optional)
+
+Pass `--config path/to/config.yaml` to load settings from YAML.  
+Templates are in `doc/configs-templates/`.
+
+---
 
 ## Troubleshooting
 
-### CMake 3.30+ Issues
+### Compilation killed (out of memory)
 
-If you encounter Boost-related errors with newer CMake versions, the build system automatically handles compatibility. No manual intervention required.
-
-### Low Memory Issues
-
-If compilation fails with "internal compiler error: Killed", reduce parallel compilation:
-
-```shell
-make -C build c2pool -j1
+```bash
+cmake --build . --target c2pool -j1
 ```
 
-### FreeBSD Specific Notes
+### `libleveldb.so` not found at runtime
 
-- Ensure all dependencies are installed via `pkg install`
-- The build process is identical to Linux after dependency installation
-- Some package names may differ slightly between FreeBSD versions
+```bash
+sudo apt-get install -y libleveldb-dev
+```
+
+### Conan packages rebuild unexpectedly
+
+The Conan profile must match the original build. If you changed compiler
+version or build type, packages will recompile once and then be cached.
+
+### CMake 3.30+ / FindBoost warning
+
+The project already handles `CMP0167` — no manual workaround needed.
+
+---
+
+## FreeBSD
+
+See [build-freebsd.md](build-freebsd.md).
+
+## Windows
+
+See [build-windows.md](build-windows.md).

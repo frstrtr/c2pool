@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [master, p2pool-v36-compat]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    name: Ubuntu 24.04 / GCC 13 / Debug
+    runs-on: ubuntu-24.04
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No submodules — plain clone is sufficient.
+
+      # ── 2. System dependencies (not provided by Conan) ────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make \
+            libleveldb-dev \
+            libsecp256k1-dev
+
+      # ── 3. Python / Conan 2 ───────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile (GCC 13 + C++20)
+        run: |
+          conan profile detect --force
+          # Override cppstd to match CMakeLists.txt (CMAKE_CXX_STANDARD 20)
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
+            "$(conan profile path default)"
+          conan profile show
+
+      # ── 4. Conan package cache ────────────────────────────────────────────
+      # Key encodes OS + compiler version + build type + dependency manifest.
+      # Cache restores saves ~15 min of boost compilation on cache hit.
+      - name: Restore Conan package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-debug-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-debug-
+
+      # ── 5. Install Conan dependencies ─────────────────────────────────────
+      # Use a separate output folder so we never touch the committed build/
+      # directory (which contains developer-local absolute paths in
+      # CMakeCache.txt and CMakePresets.json).
+      - name: Install Conan dependencies
+        run: |
+          conan install . \
+            --build=missing \
+            --output-folder=build_ci \
+            --settings=build_type=Debug
+
+      # ── 6. CMake configure ────────────────────────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build_ci \
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Debug
+
+      # ── 7. Build main binary ──────────────────────────────────────────────
+      - name: Build c2pool
+        run: cmake --build build_ci --target c2pool -j$(nproc)
+
+      # ── 8. Build test targets ─────────────────────────────────────────────
+      - name: Build tests
+        run: |
+          cmake --build build_ci \
+            --target test_hardening test_share_messages test_coin_broadcaster \
+            -j$(nproc)
+
+      # ── 9. Run test suite ─────────────────────────────────────────────────
+      - name: Run tests
+        working-directory: build_ci
+        run: ctest --output-on-failure -j$(nproc)
+
+      # ── 10. Upload test results on failure ───────────────────────────────
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build_ci/Testing/
+          retention-days: 7

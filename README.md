@@ -1,137 +1,141 @@
-# c2pool - p2pool rebirth in c++
-(started 02.02.2020)
+# c2pool — P2Pool rebirth in C++
 
-based on Forrest Voight (https://github.com/forrestv) concept and python code (https://github.com/p2pool/p2pool)
+[![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 
-Bitcoin wiki page - https://en.bitcoin.it/wiki/P2Pool
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + Dogecoin merged mining.
 
-Bitcointalk forum thread - https://bitcointalk.org/index.php?topic=18313
-
-Some technical details - https://bitcointalk.org/index.php?topic=457574
+Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>  
+Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ---
 
-## ⚡ Want a Working Pool Right Now?
+## Status
 
-C2Pool (C++ rewrite) is actively under development. While it matures, **fully functional and live p2pool implementations** are available in these repositories:
+| Area | Status |
+|---|---|
+| V36 share format (LTC) | Active development |
+| Merged mining (LTC+DOGE) | Working |
+| Coin daemon RPC/P2P | Hardened (softfork gate, keepalive, timeouts) |
+| Stratum mining server | Working |
+| VARDIFF | Working |
+| Payout / PPLNS | Working |
+| Authority message blobs (V36) | Working |
+| Test suite | 94 tests, all passing |
 
-| Repository | Coins | Status |
-|---|---|---|
-| [**frstrtr/p2pool-merged-v36**](https://github.com/frstrtr/p2pool-merged-v36) | Litecoin · DigiByte · Dogecoin (merged mining) | ✅ Live — V36 share format, Docker, multichain dashboard |
-| [**frstrtr/p2pool-dash**](https://github.com/frstrtr/p2pool-dash) | Dash | ✅ Live — decentralized Dash pool |
-
-Both are production-ready, actively maintained forks of the original Python p2pool with modern improvements (V36 protocol, Docker images, enhanced dashboards).
+> **Need a pool running today?**  
+> [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
 
 ---
 
-## 🎯 **Enhanced C2Pool - Refactored Implementation**
+## Quick start
 
-C2Pool has been **completely refactored** with enhanced features and clear terminology separation:
-
-### ✨ **Key Improvements**
-- **🔄 Share Type Separation** - Clear distinction between:
-  - `mining_shares` - From physical miners via Stratum protocol
-  - `p2p_shares` - From cross-node P2Pool communication
-- **⚡ Automatic Difficulty Adjustment (VARDIFF)** - Dynamic mining difficulty
-- **📊 Real-time Hashrate Tracking** - Accurate performance monitoring  
-- **💾 Persistent Storage** - LevelDB-based sharechain persistence
-- **🌐 Web Interface** - JSON-RPC mining interface with monitoring
-- **🔐 Blockchain-specific Address Validation** - Multi-coin support
-- **📈 Enhanced Statistics** - Separated mining vs P2P metrics
-
-### 🏗️ **Modular Components**
-- **`hashrate/`** - Real-time hashrate tracking with mining_share metrics
-- **`difficulty/`** - Automatic difficulty adjustment engine
-- **`storage/`** - Persistent LevelDB sharechain storage
-- **`node/`** - Enhanced C2Pool node implementation
-- **`archive/`** - Legacy code archive (for reference only)
-
-### 🚀 **Quick Start**
-
-#### Building
 ```bash
-git clone https://github.com/username/c2pool.git
-cd c2pool
-mkdir build && cd build
-cmake ..
-make c2pool        # Primary executable (refactored)
-make c2pool_enhanced  # Explicit enhanced version
+# 1 — prerequisites (Ubuntu 24.04)
+sudo apt-get install -y g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip
+pip install "conan>=2.0,<3.0" --break-system-packages
+conan profile detect --force
+
+# 2 — clone and build
+git clone https://github.com/frstrtr/c2pool.git
+cd c2pool && mkdir build && cd build
+conan install .. --build=missing --output-folder=. --settings=build_type=Debug
+cmake .. --preset conan-debug
+cmake --build . --target c2pool -j$(nproc)
 ```
 
-#### Running
+Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
+
+---
+
+## Running
+
 ```bash
-# Integrated mining pool for Litecoin testnet
-./c2pool --integrated 0.0.0.0:8084 --blockchain ltc --testnet
+# Integrated mode — full pool (LTC + DOGE merged mining)
+./src/c2pool/c2pool --integrated --net litecoin \
+  --coind-address 127.0.0.1 --coind-rpc-port 9332 \
+  --coind-p2p-port 9333 \
+  --merged DOGE:98:127.0.0.1:44556:rpcuser:rpcpass \
+  --address YOUR_LTC_ADDRESS \
+  litecoinrpc RPCPASSWORD
 
-# Enhanced sharechain node
-./c2pool --sharechain --testnet --port 9333
+# Testnet quick smoke-test
+./src/c2pool/c2pool --integrated --testnet
 
-# Help
-./c2pool --help
+# Full option reference
+./src/c2pool/c2pool --help
 ```
 
-### 📊 **Current Implementation**
+**Default ports**
 
-- **Primary Entry Point**: `src/c2pool/c2pool_refactored.cpp`
-- **Build Targets**: `c2pool` (primary), `c2pool_enhanced` (explicit)
-- **Legacy Files**: Archived in `archive/` directory for reference
+| Port | Purpose |
+|------|--------|
+| 9326 | P2Pool sharechain (peer-to-peer) |
+| 9327 | Stratum mining + HTTP API |
 
-#### Build Enhanced C2Pool
-```bash
-mkdir -p build && cd build
-cmake ..
-make c2pool_enhanced -j4
+**API endpoints** (integrated mode)
+
+```
+GET  /api/stats          pool statistics and hashrate
+POST /api/getinfo        pool information
+POST /api/getminerstats  per-miner statistics
+POST /api/getpayoutinfo  payout balances
 ```
 
-#### Run Mining Pool with Web Interface
+---
+
+## Authority message blobs (V36)
+
+Node operators distributing upgrade signals or pool announcements use the
+standalone Python 3 CLI in [util/](util/):
+
 ```bash
-./src/c2pool/c2pool_enhanced --testnet --integrated 0.0.0.0:8083
-```
-Access web interface at: http://localhost:8083
+# authority key holder — create transition signal
+python3 util/create_transition_message.py create \
+    --privkey <64-hex> \
+    --from 36 --to 37 --msg "Upgrade to V37" --urgency recommended
 
-#### Run Enhanced Sharechain Node
+# node operator — pass blob at startup
+./src/c2pool/c2pool ... --message-blob-hex 01a2b3c4...
+```
+
+See [util/README.md](util/README.md) for full documentation.
+
+---
+
+## Build targets
+
+| Target | Description |
+|--------|-------------|
+| `c2pool` | Primary binary |
+| `test_hardening` | Softfork gate + reply-matcher regression tests |
+| `test_share_messages` | V36 authority message decrypt/verify tests |
+| `test_coin_broadcaster` | Coin peer-manager and broadcaster tests |
+
+Run all tests:
 ```bash
-./src/c2pool/c2pool_enhanced --testnet --sharechain
+cd build && ctest --output-on-failure -j$(nproc)
 ```
 
-#### Available Options
-```bash
-./src/c2pool/c2pool_enhanced --help
-```
+---
 
-### 📊 **Features**
-- ✅ Automatic difficulty adjustment (VARDIFF)
-- ✅ Real-time hashrate tracking
-- ✅ Legacy share tracker compatibility
-- ✅ LevelDB persistent storage
-- ✅ JSON-RPC mining interface
-- ✅ WebUI for monitoring
+## Community
 
-See [docs/REFACTORING_SUMMARY.md](docs/REFACTORING_SUMMARY.md) for detailed technical information.
+- Telegram: <https://t.me/c2pooldev>
+- Discord: <https://discord.gg/yb6ujsPRsv>
 
 ---
 
 <details>
-  
-  <summary>Donations towards further development of с2pool implementation in C++</summary>
+<summary>Donations</summary>
 
-
-### PayPal donation:
-
+### PayPal
 [![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=9DF676HUWAHKY)
-
-![image](https://github.com/frstrtr/c2pool/assets/4164913/51e82162-3d0b-435a-89b7-d8051983b3dc)
-
 
 </details>
 
-### Telegram
-https://t.me/c2pooldev
+---
 
-### Discord:
-https://discord.gg/yb6ujsPRsv
-
-# Install:
-### [UNIX instruction](doc/build-unix.md)
-### [FreeBSD specific guide](doc/build-freebsd.md)
-### [Windows instruction](doc/build-windows.md)
+### Install guides
+- [Ubuntu / Debian / Linux](doc/build-unix.md)
+- [FreeBSD](doc/build-freebsd.md)
+- [Windows](doc/build-windows.md)
