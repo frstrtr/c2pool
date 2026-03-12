@@ -1248,15 +1248,38 @@ int main(int argc, char* argv[]) {
                              << " (chain_id=" << cfg.chain_id << ") at "
                              << cfg.rpc_host << ":" << cfg.rpc_port;
 
-                    // Create P2P broadcaster if P2P port is configured
+                    // Create multi-peer P2P broadcaster if P2P port is configured
                     if (cfg.p2p_port > 0) {
                         auto prefix = get_chain_p2p_prefix(cfg.symbol, settings->m_testnet);
                         if (!prefix.empty()) {
+                            // Valid ports for this chain (main + testnet)
+                            c2pool::merged::PeerManagerConfig pm_cfg;
+                            pm_cfg.is_merged = true;
+                            pm_cfg.max_peers = 20;
+                            pm_cfg.min_peers = 4;
+                            pm_cfg.max_connection_attempts = 5;
+                            pm_cfg.refresh_interval_sec = 300; // 5 min for merged
+                            // Populate valid ports for this chain
+                            if (cfg.symbol == "DOGE" || cfg.symbol == "doge") {
+                                pm_cfg.valid_ports = {22556, 44556, 44557};
+                            } else if (cfg.symbol == "LTC" || cfg.symbol == "ltc") {
+                                pm_cfg.valid_ports = {9333, 19335};
+                            } else if (cfg.symbol == "BTC" || cfg.symbol == "btc") {
+                                pm_cfg.valid_ports = {8333, 18333};
+                            }
                             auto broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
                                 ioc, cfg.symbol, prefix,
-                                NetService(cfg.p2p_address, cfg.p2p_port));
+                                NetService(cfg.p2p_address, cfg.p2p_port),
+                                ".", pm_cfg);
+                            // Wire getpeerinfo bootstrap from the aux chain RPC
+                            auto* rpc_ptr = mm_manager->get_chain_rpc(cfg.chain_id);
+                            if (rpc_ptr) {
+                                broadcaster->set_getpeerinfo_fn([rpc_ptr]() {
+                                    return rpc_ptr->getpeerinfo();
+                                });
+                            }
                             broadcaster->start();
-                            LOG_INFO << "Merged P2P broadcaster: " << cfg.symbol
+                            LOG_INFO << "Merged multi-peer broadcaster: " << cfg.symbol
                                      << " → " << cfg.p2p_address << ":" << cfg.p2p_port;
                             merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
                         } else {
@@ -1313,12 +1336,7 @@ int main(int argc, char* argv[]) {
                             if (it == merged_broadcasters.end()) return;
                             try {
                                 auto block_bytes = ParseHex(block_hex);
-                                PackStream ps(block_bytes);
-                                ltc::coin::BlockType block;
-                                ps >> block;
-                                it->second->submit_block(block);
-                                LOG_INFO << "[" << it->second->symbol()
-                                         << "] Merged block relayed via P2P";
+                                it->second->submit_block_raw(block_bytes);
                             } catch (const std::exception& e) {
                                 LOG_WARNING << "[" << it->second->symbol()
                                             << "] Merged P2P relay failed: " << e.what();

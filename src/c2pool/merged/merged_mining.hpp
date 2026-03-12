@@ -10,6 +10,7 @@
 #include <cstdint>
 
 #include <core/uint256.hpp>
+#include <core/netaddress.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -120,6 +121,9 @@ public:
     // Tip detection
     std::string get_best_block_hash();
 
+    // Get connected peers from daemon (for broadcaster bootstrap)
+    std::vector<NetService> getpeerinfo();
+
     const AuxChainConfig& config() const { return m_config; }
 
 private:
@@ -179,6 +183,9 @@ public:
 
     // Number of registered chains
     size_t chain_count() const { return m_chains.size(); }
+
+    // Get RPC client for a chain (for wiring broadcaster getpeerinfo)
+    AuxChainRPC* get_chain_rpc(uint32_t chain_id);
 
     // ─── Multiaddress payout provider ────────────────────────────────────
     // Callback: given (chain_id, coinbase_value) returns sorted payout list

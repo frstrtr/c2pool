@@ -456,6 +456,33 @@ std::string AuxChainRPC::get_block_hex(const std::string& block_hash)
     }
 }
 
+std::vector<NetService> AuxChainRPC::getpeerinfo()
+{
+    std::vector<NetService> result;
+    try {
+        auto peers = call("getpeerinfo");
+        if (!peers.is_array()) return result;
+        for (auto& peer : peers) {
+            if (!peer.contains("addr")) continue;
+            std::string addr_str = peer["addr"].get<std::string>();
+            // Parse "host:port" — handle IPv6 [::]:port
+            auto colon = addr_str.rfind(':');
+            if (colon == std::string::npos) continue;
+            std::string host = addr_str.substr(0, colon);
+            uint16_t port = static_cast<uint16_t>(
+                std::stoul(addr_str.substr(colon + 1)));
+            // Strip brackets from IPv6
+            if (!host.empty() && host.front() == '[' && host.back() == ']') {
+                host = host.substr(1, host.size() - 2);
+            }
+            result.emplace_back(host, port);
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING << "[MM:" << m_config.symbol << "] getpeerinfo failed: " << e.what();
+    }
+    return result;
+}
+
 // ─── MergedMiningManager ────────────────────────────────────────────────────
 
 MergedMiningManager::MergedMiningManager(boost::asio::io_context& ioc)
@@ -486,6 +513,16 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config)
     LOG_INFO << "[MM] Registered aux chain: " << config.symbol
              << " (chain_id=" << config.chain_id << ", slot="
              << m_tree.slot_map[config.chain_id] << "/" << m_tree.size << ")";
+}
+
+AuxChainRPC* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& chain : m_chains) {
+        if (chain.config.chain_id == chain_id)
+            return chain.rpc.get();
+    }
+    return nullptr;
 }
 
 void MergedMiningManager::start()

@@ -54,6 +54,10 @@ private:
     NetService m_target_addr;
     bool m_reconnect_enabled = false;
 
+    // Callbacks for broadcaster integration
+    using AddrCallback = std::function<void(const std::vector<NetService>&)>;
+    AddrCallback m_addr_callback;
+
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config) 
         : core::Factory<core::Client>(context, this), m_context(context), m_coin(coin), m_config(config) 
@@ -204,6 +208,27 @@ public:
         }
     }
 
+    /// Set callback for received addr messages (peer discovery).
+    void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+
+    /// Send getaddr to request peer addresses.
+    void send_getaddr()
+    {
+        if (m_peer) {
+            auto msg = message_getaddr::make_raw();
+            m_peer->write(msg);
+        }
+    }
+
+    /// Send inv for a block hash (merged chain relay — announcement only).
+    void send_block_inv(const uint256& block_hash)
+    {
+        if (m_peer) {
+            auto msg = message_inv::make_raw({inventory_type(inventory_type::block, block_hash)});
+            m_peer->write(msg);
+        }
+    }
+
     /// Relay a pre-serialized block (Bitcoin wire format) via P2P.
     /// Avoids BlockType deserialization which uses VarInt version.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
@@ -330,6 +355,23 @@ private:
         }
 
         m_coin->new_headers.happened(vheaders);
+    }
+
+    ADD_P2P_HANDLER(getaddr)
+    {
+        // We don't serve addresses — ignore
+    }
+
+    ADD_P2P_HANDLER(addr)
+    {
+        if (m_addr_callback && !msg->m_addrs.empty()) {
+            std::vector<NetService> addrs;
+            addrs.reserve(msg->m_addrs.size());
+            for (auto& rec : msg->m_addrs) {
+                addrs.push_back(rec.m_endpoint);
+            }
+            m_addr_callback(addrs);
+        }
     }
 
     #undef ADD_P2P_HANDLER

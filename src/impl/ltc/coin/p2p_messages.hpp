@@ -172,6 +172,21 @@ BEGIN_MESSAGE(headers)
     }
 END_MESSAGE()
 
+// P2P address discovery messages (used by coin broadcaster)
+BEGIN_MESSAGE(getaddr)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
+BEGIN_MESSAGE(addr)
+    MESSAGE_FIELDS
+    (
+        (std::vector<addr_record_t>, m_addrs)
+    )
+    {
+        READWRITE(obj.m_addrs);
+    }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -181,7 +196,9 @@ using Handler = MessageHandler<
     message_inv,
     message_tx,
     message_block,
-    message_headers
+    message_headers,
+    message_getaddr,
+    message_addr
 >;
 
 } // namespace p2p
