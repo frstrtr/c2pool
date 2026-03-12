@@ -1,0 +1,4 @@
+# Hashes of file build rules.
+a61ef6347a9ce5c2af2759a735ccfd32 CMakeFiles/c2pool-qt-control-panel_autogen
+a61ef6347a9ce5c2af2759a735ccfd32 CMakeFiles/c2pool-qt-control-panel_autogen_timestamp_deps
+27c2c353e2177e627bcd7ec27a145587 c2pool-qt-control-panel_autogen/timestamp

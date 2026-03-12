@@ -1,0 +1,5 @@
+/home/user0/Github/c2pool/build-qt-mvp/CMakeFiles/c2pool-qt-control-panel.dir
+/home/user0/Github/c2pool/build-qt-mvp/CMakeFiles/edit_cache.dir
+/home/user0/Github/c2pool/build-qt-mvp/CMakeFiles/rebuild_cache.dir
+/home/user0/Github/c2pool/build-qt-mvp/CMakeFiles/c2pool-qt-control-panel_autogen_timestamp_deps.dir
+/home/user0/Github/c2pool/build-qt-mvp/CMakeFiles/c2pool-qt-control-panel_autogen.dir

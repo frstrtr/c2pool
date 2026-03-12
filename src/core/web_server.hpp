@@ -116,6 +116,13 @@ public:
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
 
+    // Monitoring endpoints for Qt control panel
+    nlohmann::json rest_uptime();
+    nlohmann::json rest_connected_miners();
+    nlohmann::json rest_stratum_stats();
+    nlohmann::json rest_global_stats();
+    nlohmann::json rest_sharechain_stats();
+
     // Track a found block for the /recent_blocks endpoint
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
     

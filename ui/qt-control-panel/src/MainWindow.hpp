@@ -4,6 +4,7 @@
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
+#include "PageSharechain.hpp"
 
 #include <QLabel>
 #include <QLineEdit>
@@ -32,6 +33,7 @@ private:
     PageOverview* overviewPage_;
     PageMining* miningPage_;
     PageLogs* logsPage_;
+    PageSharechain* sharechainPage_;
 
     QTimer refreshTimer_;
 };
