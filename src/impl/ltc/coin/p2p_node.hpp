@@ -15,7 +15,7 @@
 
 namespace io = boost::asio;
 
-#define ADD_HANDLER(name)\
+#define ADD_P2P_HANDLER(name)\
     void handle(std::unique_ptr<ltc::coin::p2p::message_##name> msg)
 namespace ltc
 {
@@ -144,7 +144,6 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
-        LOG_INFO << "HANDLE: " << rmsg->m_command;
         p2p::Handler::result_t result;
         try 
         {
@@ -210,14 +209,14 @@ public:
     //[x][x][x] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
 
 private:
-    ADD_HANDLER(version)
+    ADD_P2P_HANDLER(version)
     {
         LOG_INFO << "version is?: " << msg->m_command;
         auto verack_msg = message_verack::make_raw();
         m_peer->write(verack_msg);
     }
 
-    ADD_HANDLER(verack)
+    ADD_P2P_HANDLER(verack)
     {
         m_peer->init_requests(
             [&](uint256 hash)
@@ -237,23 +236,23 @@ private:
         // connected()
     }
 
-    ADD_HANDLER(ping)
+    ADD_P2P_HANDLER(ping)
     {
         auto msg_pong = message_pong::make_raw(msg->m_nonce);
         m_peer->write(msg_pong);
     }
     
-    ADD_HANDLER(pong)
+    ADD_P2P_HANDLER(pong)
     {
         // just handled pong
     }
 
-    ADD_HANDLER(alert)
+    ADD_P2P_HANDLER(alert)
     {
         LOG_WARNING << "Handled message_alert signature: " << msg->m_signature;
     }
 
-    ADD_HANDLER(inv)
+    ADD_P2P_HANDLER(inv)
     {
         std::vector<inventory_type> vinv;
         
@@ -280,12 +279,12 @@ private:
         }
     }
 
-    ADD_HANDLER(tx)
+    ADD_P2P_HANDLER(tx)
     {
         m_coin->new_tx.happened(Transaction(msg->m_tx));
     }
 
-    ADD_HANDLER(block)
+    ADD_P2P_HANDLER(block)
     {
         // TODO: check
         auto header = (BlockHeaderType) msg->m_block;
@@ -295,7 +294,7 @@ private:
         m_peer->get_header(blockhash, header);
     }
 
-    ADD_HANDLER(headers)
+    ADD_P2P_HANDLER(headers)
     {
         // TODO: check
         std::vector<BlockHeaderType> vheaders;
@@ -311,7 +310,7 @@ private:
         m_coin->new_headers.happened(vheaders);
     }
 
-    #undef ADD_HANDLER
+    #undef ADD_P2P_HANDLER
 };
 
 } // namespace p2p
