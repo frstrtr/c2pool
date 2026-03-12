@@ -101,7 +101,6 @@ public:
         catch (const std::invalid_argument&) { /* request already timed out */ }
     }
 
-    // TODO: rename to processing_get_share
     std::vector<ltc::ShareType> handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 
     /// Broadcast a new best-block notification to all connected P2P peers.

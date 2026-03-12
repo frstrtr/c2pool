@@ -211,7 +211,6 @@ public:
             static_cast<Actual*>(this)->handle_message(std::move(rmsg), peer);
             break;
         default:
-            // TODO: error
             return;
         }
     }

@@ -1,6 +1,7 @@
 #include "rpc.hpp"
 
 #include <impl/ltc/config_pool.hpp>
+#include <impl/ltc/coin/softfork_check.hpp>
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
@@ -82,7 +83,7 @@ NodeRPC::~NodeRPC()
 	m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
 	if (ec)
 	{
-		//TODO:
+		// shutdown errors on close are typically benign; ignore
 	}
 }
 
@@ -173,28 +174,10 @@ bool NodeRPC::check()
 
 	std::set<std::string> softforks_supported;
 
-	auto collect_softfork_names = [&](const nlohmann::json& value)
-	{
-		if (value.is_array())
-		{
-			for (const auto& item : value)
-			{
-				if (item.is_object() && item.contains("id") && item["id"].is_string())
-					softforks_supported.insert(item["id"].get<std::string>());
-				else if (item.is_string())
-					softforks_supported.insert(item.get<std::string>());
-			}
-		} else if (value.is_object())
-		{
-			for (auto it = value.begin(); it != value.end(); ++it)
-				softforks_supported.insert(it.key());
-		}
-	};
-
 	if (blockchaininfo.contains("softforks"))
-		collect_softfork_names(blockchaininfo["softforks"]);
+		ltc::coin::collect_softfork_names(blockchaininfo["softforks"], softforks_supported);
 	if (blockchaininfo.contains("bip9_softforks"))
-		collect_softfork_names(blockchaininfo["bip9_softforks"]);
+		ltc::coin::collect_softfork_names(blockchaininfo["bip9_softforks"], softforks_supported);
 
 	// Fallback for daemons that don't populate getblockchaininfo softfork fields.
 	if (softforks_supported.empty())
@@ -263,7 +246,6 @@ rpc::WorkData NodeRPC::getwork()
 	if (!m_coin->txidcache.is_started())
 		m_coin->txidcache.start();
 
-// TODO: legacy part:
 	std::vector<uint256> txhashes;
 	std::vector<ltc::coin::Transaction> unpacked_transactions;
     for (auto& packed_tx : work["transactions"])
@@ -339,9 +321,7 @@ rpc::WorkData NodeRPC::getwork()
 
 void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failure)
 {
-	// TODO:
-	// segwit_rules = set(['!segwit', 'segwit'])
-    // segwit_activated = len(segwit_rules - set(bitcoind_work.value['rules'])) < len(segwit_rules)
+	// Determine whether segwit is active (required for full-block vs stripped packing).
 	bool segwit_activated = false;
 	auto work = *m_coin->work;
 	if (work.m_data.contains("rules"))
@@ -352,15 +332,14 @@ void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failu
     	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "!segwit";});
 	}
 	
-	//TODO: (stripped_block for blocks without segwit?)
-	// result = yield bitcoind.rpc_submitblock((bitcoin_data.block_type if segwit_activated else bitcoin_data.stripped_block_type).pack(block).encode('hex') + bitcoind_work.value['mweb'])
-
+	// Since taproot+segwit are required forks, stripped-block packing is not needed.
 	PackStream packed_block = pack<ltc::coin::BlockType>(block);
 	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span()) + mweb});
 	bool success = result.is_null();
 	
 	auto block_header = pack<ltc::coin::BlockHeaderType>(block); // cast to header?
-	auto success_expected = true; // TODO:
+	// We always expect the submit to succeed (non-null result means rejection).
+	auto success_expected = true;
 
 	if ((!success && success_expected && !ignore_failure) || (success && !success_expected))
     	LOG_ERROR << "Block submittal result: " << success << "(" << result.dump() << ") Expected: " << success_expected;

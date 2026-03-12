@@ -124,7 +124,7 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
         if (m_nonce == msg->m_nonce)
         {
                 LOG_WARNING << "was connected to self";
-                throw std::runtime_error("was connected to self"); //TODO:
+                throw std::runtime_error("was connected to self");
         }
 
         if (m_peers.contains(msg->m_nonce))
@@ -132,7 +132,6 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
                 std::string reason = "[handle_message_version] Detected duplicate connection, disconnecting from " + peer->addr().to_string();
                 LOG_ERROR << reason;
                 throw std::runtime_error(reason);
-        // TODO: handshake->error(libp2p::BAD_PEER, reason);
         }
 
         peer->m_nonce = msg->m_nonce;

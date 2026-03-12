@@ -102,38 +102,6 @@ public:
             timeout("handshake timeout");
         });
 
-        // TODO: LEGACY REWORK!
-
-        /*
-            version=70002,
-            services=1,
-            time=1723920793,
-            addr_to=dict(
-                services=1,
-                address="192.168.0.1",
-                port=2222,
-            ),
-            addr_from=dict(
-                services=1,
-                address="192.168.0.1",
-                port=2222,
-            ),
-            nonce=1,
-            sub_version_num='c2pool',
-            start_height=0
-        */
-
-        // auto msg_version = message_version::make_raw(
-        //     70002,
-        //     1,
-        //     1723920793,
-        //     addr_t{1, NetService{"192.168.0.1", 2222}}, 
-        //     addr_t{1, NetService{"192.168.0.1", 2222}},
-        //     1,
-        //     "c2pool",
-        //     0
-        // );
-
         auto msg_version = message_version::make_raw(
             70017,
             1,
@@ -146,13 +114,6 @@ public:
         );
 
         m_peer->write(msg_version);
-        //=======================
-
-        // // configure peer timeout timer
-        // peer->m_timeout = std::make_unique<core::Timer>(m_context, true);
-        // peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, addr = peer->addr()](){ timeout(addr); });
-
-        // LOG_INFO << socket->get_addr().to_string() << " try to connect!";
     }
 
     void disconnect() override
@@ -224,9 +185,7 @@ public:
             m_peer->write(rmsg);
         } else
         {
-            //TODO: add net.PARENT.BLOCK_EXPLORER_URL_PREFIX
-            LOG_ERROR << "No bitcoind connection when block submittal attempted!"; //<< /*net.PARENT.BLOCK_EXPLORER_URL_PREFIX <<*/ /*bitcoin_data.hash256(bitcoin_data.block_header_type.pack(block['header'])))*/
-            // TODO: raise deferral.RetrySilentlyException()
+            LOG_ERROR << "No bitcoind connection when block submittal attempted!";
             throw std::runtime_error("No bitcoind connection in submit_block");
         }
     }
@@ -340,7 +299,6 @@ private:
         m_peer->init_requests(
             [&](uint256 hash)
             {
-                //TODO:
                 auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, hash)});
                 m_peer->write(getdata_msg);
             },
@@ -411,7 +369,6 @@ private:
 
     ADD_P2P_HANDLER(block)
     {
-        // TODO: check
         auto header = (BlockHeaderType) msg->m_block;
         auto packed_header = pack(header); // block_type -> block_header_type
         auto blockhash = Hash(packed_header.get_span());
@@ -421,7 +378,6 @@ private:
 
     ADD_P2P_HANDLER(headers)
     {
-        // TODO: check
         std::vector<BlockHeaderType> vheaders;
 
         for (auto block : msg->m_headers)
