@@ -67,10 +67,9 @@ public:
 template <typename...Args>
 class EventData
 {
-    // TODO: add subscribe_once?
 private:
     core::Counter m_idcounter;
-    uint32_t m_times;
+    std::atomic<uint32_t> m_times{0};
 
     auto get_id()
     {
@@ -81,13 +80,13 @@ public:
     mutable std::mutex m_mutex;
     boost::signals2::signal<void(Args...)> m_sig;
     boost::signals2::signal<void()> m_sig_anon; // For subs without args
+    boost::signals2::signal<void(Args...)> m_sig_once;
     
     std::map<int, boost::signals2::connection> m_subs;
 
     auto get_times() const
     {
-        std::lock_guard lock(m_mutex);
-        return m_times;
+        return m_times.load();
     }
 
     void disconnect(int id)
@@ -123,6 +122,19 @@ public:
         return EventDisposable::make(id, [this](int id) { disconnect(id); });
     }
 
+    // Fires handler exactly once, then automatically disconnects.
+    template <typename Handler>
+    void connect_once(Handler func)
+    {
+        std::lock_guard lock(m_mutex);
+        // Use a shared_ptr to the connection so the lambda can disconnect itself.
+        auto conn = std::make_shared<boost::signals2::connection>();
+        *conn = m_sig_once.connect([func = std::move(func), conn](Args... args) mutable {
+            conn->disconnect();
+            func(args...);
+        });
+    }
+
     auto connect(std::function<void()> func)
     {
         std::lock_guard lock(m_mutex);
@@ -134,17 +146,14 @@ public:
 
     void call(const Args&... args)
     {
-        m_times += 1;
+        ++m_times;
 
         if (!m_sig.empty())
             m_sig(args...);
         if (!m_sig_anon.empty())
             m_sig_anon();
-        // if(!once.empty())
-        // {
-        //     once(args...);
-        //     once.disconnect_all_slots();
-        // }
+        if (!m_sig_once.empty())
+            m_sig_once(args...);
     }
 };
 
@@ -185,6 +194,14 @@ public:
         check_data();
 
         return m_data->connect(func);
+    }
+
+    /// Subscribe a one-shot handler: fires once on the next `happened()`, then auto-disconnects.
+    template <typename Lambda>
+    void subscribe_once(Lambda func)
+    {
+        check_data();
+        m_data->connect_once(std::move(func));
     }
 
     auto run_subscribe(std::function<void()> func)
@@ -288,6 +305,6 @@ public:
         return m_wrapper->m_value;
     }
 
-    bool is_null() const { return m_wrapper; } //TODO: add constexpr check for methods VarType::[isNull()/is_null()/IsNull()]
+    bool is_null() const { return !m_has_value.load(); }
 
 };
