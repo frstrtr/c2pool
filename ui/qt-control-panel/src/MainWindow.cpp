@@ -1,12 +1,15 @@
 #include "MainWindow.hpp"
 
+#include <QCloseEvent>
+#include <QDir>
 #include <QHBoxLayout>
+#include <QSettings>
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
 MainWindow::MainWindow(QWidget* parent)
-    : QMainWindow(parent)
+    : QMainWindow(parent), daemonProcess_(new QProcess(this))
 {
     setWindowTitle("c2pool Qt Control Panel (MVP)");
     resize(1200, 760);
@@ -23,6 +26,21 @@ MainWindow::MainWindow(QWidget* parent)
     auto* refreshButton = new QPushButton("Refresh", this);
     topBar->addWidget(applyButton);
     topBar->addWidget(refreshButton);
+
+    topBar->addSeparator();
+    topBar->addWidget(new QLabel("Daemon cmd:", this));
+    daemonCmdEdit_ = new QLineEdit("./build-debug.sh", this);
+    daemonCmdEdit_->setMinimumWidth(240);
+    topBar->addWidget(daemonCmdEdit_);
+    auto* daemonStartButton = new QPushButton("Start", this);
+    auto* daemonStopButton = new QPushButton("Stop", this);
+    auto* daemonRestartButton = new QPushButton("Restart", this);
+    topBar->addWidget(daemonStartButton);
+    topBar->addWidget(daemonStopButton);
+    topBar->addWidget(daemonRestartButton);
+
+    daemonStateLabel_ = new QLabel("Daemon: stopped", this);
+    topBar->addWidget(daemonStateLabel_);
 
     topBar->addSeparator();
     connectionStateLabel_ = new QLabel("API: unknown", this);
@@ -71,6 +89,28 @@ MainWindow::MainWindow(QWidget* parent)
         refreshCurrentPage();
     });
 
+    connect(daemonStartButton, &QPushButton::clicked, this, &MainWindow::startDaemon);
+    connect(daemonStopButton, &QPushButton::clicked, this, &MainWindow::stopDaemon);
+    connect(daemonRestartButton, &QPushButton::clicked, this, &MainWindow::restartDaemon);
+
+    connect(daemonProcess_, &QProcess::started, this, [this]() {
+        daemonStateLabel_->setText("Daemon: running");
+        daemonStateLabel_->setStyleSheet("color: #1d7f3b;");
+        statusLabel_->setText("Daemon started");
+    });
+
+    connect(daemonProcess_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus) {
+        daemonStateLabel_->setText(QString("Daemon: stopped (%1)").arg(code));
+        daemonStateLabel_->setStyleSheet("color: #b04020;");
+    });
+
+    connect(daemonProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError err) {
+        Q_UNUSED(err);
+        daemonStateLabel_->setText("Daemon: error");
+        daemonStateLabel_->setStyleSheet("color: #b04020;");
+        statusLabel_->setText(daemonProcess_->errorString());
+    });
+
     connect(&api_, &ApiClient::connectionStateChanged, this, [this](const QString& state) {
         connectionStateLabel_->setText(QString("API: %1").arg(state));
         if (state == "online") {
@@ -84,6 +124,9 @@ MainWindow::MainWindow(QWidget* parent)
         statusLabel_->setText(message);
     });
 
+    loadSettings();
+    api_.setBaseUrl(baseUrlEdit_->text());
+
     refreshTimer_.setInterval(5000);
     connect(&refreshTimer_, &QTimer::timeout, this, [this]() {
         refreshCurrentPage();
@@ -91,6 +134,70 @@ MainWindow::MainWindow(QWidget* parent)
     refreshTimer_.start();
 
     refreshCurrentPage();
+}
+
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    saveSettings();
+    if (daemonProcess_->state() != QProcess::NotRunning) {
+        daemonProcess_->terminate();
+        daemonProcess_->waitForFinished(1500);
+    }
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::loadSettings()
+{
+    QSettings s;
+    baseUrlEdit_->setText(s.value("ui/baseUrl", "http://127.0.0.1:8080").toString());
+    daemonCmdEdit_->setText(s.value("daemon/command", "./build-debug.sh").toString());
+    const int refreshMs = s.value("ui/refreshMs", 5000).toInt();
+    refreshTimer_.setInterval(refreshMs > 0 ? refreshMs : 5000);
+}
+
+void MainWindow::saveSettings() const
+{
+    QSettings s;
+    s.setValue("ui/baseUrl", baseUrlEdit_->text().trimmed());
+    s.setValue("daemon/command", daemonCmdEdit_->text().trimmed());
+    s.setValue("ui/refreshMs", refreshTimer_.interval());
+}
+
+void MainWindow::startDaemon()
+{
+    if (daemonProcess_->state() != QProcess::NotRunning) {
+        statusLabel_->setText("Daemon already running");
+        return;
+    }
+
+    const QString command = daemonCmdEdit_->text().trimmed();
+    if (command.isEmpty()) {
+        statusLabel_->setText("Daemon command is empty");
+        return;
+    }
+
+    daemonProcess_->setWorkingDirectory(QDir::currentPath());
+    daemonProcess_->start("/bin/bash", {"-lc", command});
+}
+
+void MainWindow::stopDaemon()
+{
+    if (daemonProcess_->state() == QProcess::NotRunning) {
+        statusLabel_->setText("Daemon not running");
+        return;
+    }
+    daemonProcess_->terminate();
+    if (!daemonProcess_->waitForFinished(2000)) {
+        daemonProcess_->kill();
+        daemonProcess_->waitForFinished(1000);
+    }
+    statusLabel_->setText("Daemon stopped");
+}
+
+void MainWindow::restartDaemon()
+{
+    stopDaemon();
+    startDaemon();
 }
 
 void MainWindow::refreshCurrentPage()

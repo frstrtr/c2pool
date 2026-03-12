@@ -10,6 +10,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
+#include <QProcess>
 #include <QPushButton>
 #include <QStackedWidget>
 #include <QTimer>
@@ -20,12 +21,22 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget* parent = nullptr);
 
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
 private:
     void refreshCurrentPage();
+    void loadSettings();
+    void saveSettings() const;
+    void startDaemon();
+    void stopDaemon();
+    void restartDaemon();
 
     ApiClient api_;
 
     QLineEdit* baseUrlEdit_;
+    QLineEdit* daemonCmdEdit_;
+    QLabel* daemonStateLabel_;
     QLabel* connectionStateLabel_;
     QLabel* statusLabel_;
     QListWidget* navList_;
@@ -37,4 +48,5 @@ private:
     PageSharechain* sharechainPage_;
 
     QTimer refreshTimer_;
+    QProcess* daemonProcess_;
 };
