@@ -114,6 +114,9 @@ public:
     // Submit auxpow proof (single-address)
     bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex);
 
+    // Fetch raw serialized block by hash (verbosity=0 → hex string)
+    std::string get_block_hex(const std::string& block_hash);
+
     // Tip detection
     std::string get_best_block_hash();
 
@@ -214,6 +217,9 @@ private:
         std::string                      last_tip;   // for change detection
     };
     std::vector<ChainState> m_chains;
+
+    // Submit via submitauxblock and relay the accepted block via P2P
+    void submit_aux_and_relay(ChainState& chain, const std::string& auxpow);
 
     // Current AuxPoW tree (rebuilt when chains change)
     AuxPowTree m_tree;

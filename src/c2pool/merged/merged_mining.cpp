@@ -444,6 +444,18 @@ std::string AuxChainRPC::get_best_block_hash()
     }
 }
 
+std::string AuxChainRPC::get_block_hex(const std::string& block_hash)
+{
+    try {
+        // verbosity 0 → raw hex serialization of the full block
+        auto result = call("getblock", nlohmann::json::array({block_hash, 0}));
+        return result.get<std::string>();
+    } catch (const std::exception& e) {
+        LOG_WARNING << "[MM:" << m_config.symbol << "] getblock(hex) failed: " << e.what();
+        return "";
+    }
+}
+
 // ─── MergedMiningManager ────────────────────────────────────────────────────
 
 MergedMiningManager::MergedMiningManager(boost::asio::io_context& ioc)
@@ -640,13 +652,28 @@ void MergedMiningManager::try_submit_merged_blocks(
                     if (m_block_relay_fn)
                         m_block_relay_fn(chain.config.chain_id, block_hex);
                 } else {
-                    chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+                    submit_aux_and_relay(chain, auxpow);
                 }
             } else {
-                chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+                submit_aux_and_relay(chain, auxpow);
             }
         } else {
-            chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+            submit_aux_and_relay(chain, auxpow);
+        }
+    }
+}
+
+void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::string& auxpow)
+{
+    if (chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow)) {
+        // Fetch the accepted block and relay via P2P for fast propagation
+        if (m_block_relay_fn) {
+            auto best = chain.rpc->get_best_block_hash();
+            if (!best.empty()) {
+                auto block_hex = chain.rpc->get_block_hex(best);
+                if (!block_hex.empty())
+                    m_block_relay_fn(chain.config.chain_id, block_hex);
+            }
         }
     }
 }
