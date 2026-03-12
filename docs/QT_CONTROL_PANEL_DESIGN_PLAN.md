@@ -163,6 +163,33 @@ Time ranges:
 - last 15m, 1h, 6h, 24h, 7d
 - custom range (start/end timestamps)
 
+### 5.9 Log Export Coverage
+
+Log export categories (MVP):
+
+- node logs (core daemon)
+- stratum logs (connections, auth, shares, vardiff)
+- security/abuse logs (bans, DDoS level changes, mitigation actions)
+
+Optional categories (phase 3+):
+
+- network peer logs
+- payout engine logs
+- message center moderation logs
+
+Log export formats:
+
+- TXT (raw lines)
+- CSV (parsed structured fields when available)
+- JSONL (one JSON object per line, preferred for tooling)
+
+Log export filters:
+
+- time range (preset/custom)
+- severity (debug/info/warn/error)
+- component (node/stratum/security/...)
+- address/worker/ip keyword filters
+
 ## 6. Control Surface (Operator Actions)
 
 ### 6.1 Actions We Already Have Endpoint Support For
@@ -201,6 +228,7 @@ Controls to add or confirm server support for:
   - restart
 - config apply with validation and rollback
 - controlled log level change
+- log export/download action (node/stratum/security)
 - safe RPC command execution (allowlist)
 - report export/download action (node/miner/all workers)
 - optional peer management actions in future revision
@@ -210,6 +238,13 @@ Recommended reporting endpoints (add if missing):
 - GET /reports/node?from=<ts>&to=<ts>&format=csv|json
 - GET /reports/miner/<address>?from=<ts>&to=<ts>&format=csv|json
 - GET /reports/workers?from=<ts>&to=<ts>&format=csv|json
+
+Recommended log export endpoints (add if missing):
+
+- GET /logs/export?scope=node&from=<ts>&to=<ts>&format=txt|csv|jsonl
+- GET /logs/export?scope=stratum&from=<ts>&to=<ts>&format=txt|csv|jsonl
+- GET /logs/export?scope=security&from=<ts>&to=<ts>&format=txt|csv|jsonl
+- GET /logs/export?scope=all&from=<ts>&to=<ts>&format=txt|csv|jsonl
 
 ## 7. Technical Architecture
 
@@ -284,6 +319,7 @@ Implementation priority is changed to: "start mining operations reliably first, 
   - /uptime
 - Minimal Logs page:
   - live tail + severity filter + search
+  - export node + stratum + security logs (preset ranges)
 - Basic report export for operations:
   - node summary CSV (last 1h/24h)
   - per-miner CSV for selected address
@@ -297,6 +333,7 @@ Exit criteria for MVP-1:
 - Operator can see accepted/rejected shares and miner connectivity in real time
 - Operator can apply emergency abuse action in under 10 seconds
 - Operator can download node and selected-miner CSV reports from panel
+- Operator can export node and stratum logs for the selected time range
 
 ### MVP-2: Stability And Safety (4-6 days)
 
@@ -340,6 +377,10 @@ Exit criteria for MVP-1:
 - Reporting test:
   - export node report CSV (1h) and validate headers/non-empty rows
   - export per-miner report CSV and validate selected address scope
+- Log export test:
+  - export node logs (TXT) and validate non-empty output for active node
+  - export stratum logs (CSV/JSONL) and validate required fields (timestamp, level, message)
+  - export security logs and validate ban/mitigation actions are present when triggered
 - E2E smoke test:
   - start daemon
   - verify all page data load
@@ -498,6 +539,6 @@ read-only DDoS telemetry from existing security stats and expose controls as
 
 1. Freeze MVP-1 endpoint contract only (/stratum_stats, /connected_miners, /miner_stats, /global_stats, /local_stats, /uptime, /ban_stats).
 2. Scaffold Qt project under a new directory (for example ui/qt-control-panel).
-3. Add MVP report contract (node CSV + miner CSV) and wire download UX.
-4. Build Mining + Overview + minimal Logs + basic reports first, with process controls.
-5. Demo mining-start workflow and report export before implementing payout/settings/console features.
+3. Add MVP report contract (node CSV + miner CSV) and log export contract (node/stratum/security).
+4. Build Mining + Overview + minimal Logs + basic reports/log exports first, with process controls.
+5. Demo mining-start workflow plus stats/log export before implementing payout/settings/console features.
