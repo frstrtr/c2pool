@@ -18,6 +18,7 @@
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
+#include <core/filesystem.hpp>
 #include <core/netaddress.hpp>
 
 namespace c2pool {
@@ -411,7 +412,13 @@ private:
 
     std::string db_path() const
     {
-        return m_data_dir + "/broadcast_peers_" + m_symbol + ".json";
+        std::filesystem::path dir;
+        if (m_data_dir.empty() || m_data_dir == ".")
+            dir = core::filesystem::config_path() / "broadcaster";
+        else
+            dir = m_data_dir;
+        std::filesystem::create_directories(dir);
+        return (dir / ("peers_" + m_symbol + ".json")).string();
     }
 
     void save_peers()

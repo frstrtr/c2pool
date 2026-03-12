@@ -440,7 +440,7 @@ TEST(CoinPeerManager, GetPeerInfoBootstrap)
     EXPECT_EQ(pm.peer_count(), 2);
     pm.stop();
     // Cleanup
-    std::string db = tmp_dir + "/broadcast_peers_LTC.json";
+    std::string db = tmp_dir + "/peers_LTC.json";
     ::unlink(db.c_str());
     ::rmdir(tmp_dir.c_str());
 }
