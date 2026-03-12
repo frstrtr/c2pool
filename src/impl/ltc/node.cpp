@@ -668,6 +668,18 @@ void NodeImpl::run_think()
     trim_chain(m_tracker.chain, "chain");
     trim_chain(m_tracker.verified, "verified");
 
+    // Prune caches — fixed caps safe for variable chain_length (v37+)
+    constexpr size_t MAX_SHARED_HASHES  = 50000;
+    constexpr size_t MAX_KNOWN_TXS      = 10000;
+    constexpr size_t MAX_RAW_CACHE      = 50000;
+
+    if (m_shared_share_hashes.size() > MAX_SHARED_HASHES)
+        m_shared_share_hashes.clear();
+    if (m_known_txs.size() > MAX_KNOWN_TXS)
+        m_known_txs.clear();
+    if (m_raw_share_cache.size() > MAX_RAW_CACHE)
+        m_raw_share_cache.clear();
+
   } catch (const std::exception& e) {
     LOG_ERROR << "run_think() failed: " << e.what();
   } catch (...) {
