@@ -1789,37 +1789,31 @@ nlohmann::json MiningInterface::rest_global_stats()
 
 nlohmann::json MiningInterface::rest_sharechain_stats()
 {
-    // Return sharechain structure and visualization data
+    // Delegate to the live tracker callback if wired
+    if (m_sharechain_stats_fn)
+        return m_sharechain_stats_fn();
+
+    // Fallback: return empty stub when no tracker is connected
     nlohmann::json result = nlohmann::json::object();
-    
-    // Share distribution by type/version
     result["total_shares"] = 0;
     result["shares_by_version"] = nlohmann::json::object();
     result["shares_by_miner"] = nlohmann::json::object();
-    
-    // Sharechain metrics
     result["chain_height"] = 0;
     result["chain_tip_hash"] = "";
     result["fork_count"] = 0;
     result["heaviest_fork_weight"] = 0.0;
-    
-    // Difficulty metrics
     result["average_difficulty"] = 1.0;
     result["difficulty_trend"] = nlohmann::json::array();
-    
-    // Timeline (for bar chart visualization)
     auto now = std::time(nullptr);
     nlohmann::json timeline = nlohmann::json::array();
     for (int i = 5; i >= 0; --i) {
-        auto timestamp = now - (i * 600);  // 10-minute intervals
-        nlohmann::json slot = nlohmann::json::object();
-        slot["timestamp"] = timestamp;
+        nlohmann::json slot;
+        slot["timestamp"] = now - (i * 600);
         slot["share_count"] = 0;
         slot["miner_distribution"] = nlohmann::json::object();
         timeline.push_back(slot);
     }
     result["timeline"] = timeline;
-    
     return result;
 }
 

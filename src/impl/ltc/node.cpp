@@ -246,15 +246,10 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 
 		m_tracker.add(share);
 
-		// Periodically trim the chain DURING batch processing to bound memory.
-		if (new_count % 100 == 0) {
-		    const size_t keep = PoolConfig::chain_length() * 2;
-		    if (m_tracker.chain.size() > keep) {
-		        auto heads_copy = m_tracker.chain.get_heads();
-		        for (auto& [hh, th] : heads_copy)
-		            m_tracker.chain.trim(hh, keep);
-		    }
-		}
+		// NOTE: Do NOT trim inside the processing loop. The trim in run_think()
+		// handles pruning between batches. Trimming here is unsafe because
+		// shares added at the tail can be freed while the loop still holds
+		// dangling raw pointers to them (use-after-free).
 
 		// Persist to LevelDB
 		if (m_storage && m_storage->is_available())
@@ -574,13 +569,19 @@ void NodeImpl::load_persisted_shares()
 
 void NodeImpl::start_outbound_connections()
 {
+    if (m_target_outbound_peers == 0)
+    {
+        LOG_INFO << "Outbound peer dialing disabled (target=0)";
+        return;
+    }
+
     // Try to connect to peers right away
     auto try_connect_peers = [this]() {
         size_t outbound = m_outbound_addrs.size();
-        if (outbound >= TARGET_OUTBOUND_PEERS || m_connections.size() >= MAX_PEERS)
+        if (outbound >= m_target_outbound_peers || m_connections.size() >= MAX_PEERS)
             return;
 
-        size_t needed = TARGET_OUTBOUND_PEERS - outbound;
+        size_t needed = m_target_outbound_peers - outbound;
         auto good_peers = get_good_peers(needed + 4);  // ask for a few extra in case some are already connected
 
         for (auto& ap : good_peers)
@@ -670,7 +671,7 @@ void NodeImpl::run_think()
     // Trim stale shares to prevent unbounded memory growth.
     // Keep 2 * chain_length per head (matches Python p2pool behavior).
     // Must trim even when result.best is null (during initial sync).
-    const size_t keep_per_head = PoolConfig::chain_length() * 2;
+    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
     auto trim_chain = [&](auto& sc, const char* label) {
         if (sc.size() <= keep_per_head)
             return;

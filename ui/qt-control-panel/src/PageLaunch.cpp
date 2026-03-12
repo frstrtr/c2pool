@@ -11,6 +11,42 @@
 #include <QStringList>
 #include <QVBoxLayout>
 
+namespace {
+
+struct PortDefaults {
+    int p2p;
+    int stratum;
+    int http;
+    int rpc;
+};
+
+PortDefaults defaultsForNetwork(const QString& chain, bool testnet)
+{
+    if (chain == "bitcoin") {
+        const int p2p = testnet ? 19333 : 9333;
+        const int stratum = testnet ? 19332 : 9332;
+        const int http = (stratum + 1 == p2p) ? stratum + 2 : stratum + 1;
+        const int rpc = testnet ? 18332 : 8332;
+        return {p2p, stratum, http, rpc};
+    }
+
+    if (chain == "dogecoin") {
+        const int p2p = testnet ? 44556 : 22556;
+        const int stratum = testnet ? 44555 : 22555;
+        const int http = stratum + 2;
+        const int rpc = testnet ? 44555 : 22555;
+        return {p2p, stratum, http, rpc};
+    }
+
+    const int p2p = testnet ? 19338 : 9338;
+    const int stratum = testnet ? 19327 : 9327;
+    const int http = stratum + 1;
+    const int rpc = testnet ? 19332 : 9332;
+    return {p2p, stratum, http, rpc};
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19,6 +55,11 @@ PageLaunch::PageLaunch(QWidget* parent)
     : QWidget(parent), process_(new QProcess(this))
 {
     setupUi();
+
+    connect(modeCombo_, &QComboBox::currentIndexChanged, this, &PageLaunch::updateNetworkDefaults);
+    connect(chainCombo_, &QComboBox::currentIndexChanged, this, &PageLaunch::updateNetworkDefaults);
+    connect(testnetCheck_, &QCheckBox::stateChanged, this, &PageLaunch::updateNetworkDefaults);
+    connect(httpPortSpin_, &QSpinBox::valueChanged, this, &PageLaunch::emitApiBaseUrlChanged);
 
     // Process state signals → daemonStateChanged
     connect(process_, &QProcess::started, this, [this]() {
@@ -47,6 +88,8 @@ PageLaunch::PageLaunch(QWidget* parent)
             QString("Daemon: error — %1").arg(process_->errorString()),
             "color: #b04020;");
     });
+
+    updateNetworkDefaults();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +126,7 @@ void PageLaunch::setupUi()
 
         modeCombo_ = new QComboBox;
         modeCombo_->addItems({"Integrated (full pool)", "Sharechain (P2P node)", "Solo (default)"});
+        modeCombo_->setCurrentIndex(1);
         form->addRow("Mode:", modeCombo_);
 
         chainCombo_ = new QComboBox;
@@ -114,20 +158,20 @@ void PageLaunch::setupUi()
 
         p2pPortSpin_ = new QSpinBox;
         p2pPortSpin_->setRange(1, 65535);
-        p2pPortSpin_->setValue(9326);
-        p2pPortSpin_->setToolTip("--p2pool-port  (P2P sharechain, default 9326; testnet 19338)");
+        p2pPortSpin_->setValue(19338);
+        p2pPortSpin_->setToolTip("--p2pool-port  (Python p2pool-compatible sharechain port)");
         form->addRow("P2P sharechain port:", p2pPortSpin_);
 
         stratumPortSpin_ = new QSpinBox;
         stratumPortSpin_->setRange(1, 65535);
-        stratumPortSpin_->setValue(9327);
-        stratumPortSpin_->setToolTip("-w / --worker-port  (Stratum for miners, default 9327)");
+        stratumPortSpin_->setValue(19327);
+        stratumPortSpin_->setToolTip("-w / --worker-port  (Python p2pool worker/Stratum default for selected chain/network)");
         form->addRow("Stratum / worker port:", stratumPortSpin_);
 
         httpPortSpin_ = new QSpinBox;
         httpPortSpin_->setRange(1, 65535);
-        httpPortSpin_->setValue(8080);
-        httpPortSpin_->setToolTip("--web-port / --http-port  (JSON-RPC API & dashboard)");
+        httpPortSpin_->setValue(19328);
+        httpPortSpin_->setToolTip("--web-port / --http-port  (dashboard/API; defaults next to worker port to avoid collisions)");
         form->addRow("HTTP API port:", httpPortSpin_);
 
         vbox->addWidget(g);
@@ -144,7 +188,7 @@ void PageLaunch::setupUi()
 
         coindPortSpin_ = new QSpinBox;
         coindPortSpin_->setRange(0, 65535);
-        coindPortSpin_->setValue(0);
+        coindPortSpin_->setValue(19332);
         coindPortSpin_->setSpecialValueText("auto-detect");
         coindPortSpin_->setToolTip("--coind-rpc-port  (0 = auto-detect from chain)");
         form->addRow("RPC port:", coindPortSpin_);
@@ -293,6 +337,7 @@ void PageLaunch::setupUi()
 
     vbox->addStretch();
     onBuildPreview();  // initial preview
+    emitApiBaseUrlChanged();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -380,6 +425,11 @@ QString PageLaunch::buildCommand() const
     return parts.join(" ");
 }
 
+QString PageLaunch::suggestedApiBaseUrl() const
+{
+    return QString("http://127.0.0.1:%1").arg(httpPortSpin_->value());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Slots
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,18 +439,37 @@ void PageLaunch::onBuildPreview()
     cmdPreview_->setPlainText(buildCommand());
 }
 
+void PageLaunch::updateNetworkDefaults()
+{
+    const PortDefaults defaults = defaultsForNetwork(chainCombo_->currentText(), testnetCheck_->isChecked());
+    p2pPortSpin_->setValue(defaults.p2p);
+    stratumPortSpin_->setValue(defaults.stratum);
+    httpPortSpin_->setValue(defaults.http);
+    coindPortSpin_->setValue(defaults.rpc);
+
+    onBuildPreview();
+    emitApiBaseUrlChanged();
+}
+
+void PageLaunch::emitApiBaseUrlChanged()
+{
+    emit apiBaseUrlChanged(suggestedApiBaseUrl());
+}
+
 void PageLaunch::addMergedRow()
 {
     const int row = mergedTable_->rowCount();
     mergedTable_->insertRow(row);
-    // Default: DOGE testnet chain_id=98, testnet RPC port 44555
+    const bool testnet = testnetCheck_->isChecked();
+    const QString rpcPort = testnet ? "44555" : "22555";
+    const QString p2pPort = testnet ? "44556" : "22556";
     mergedTable_->setItem(row, 0, new QTableWidgetItem("DOGE"));
     mergedTable_->setItem(row, 1, new QTableWidgetItem("98"));
-    mergedTable_->setItem(row, 2, new QTableWidgetItem("127.0.0.1"));
-    mergedTable_->setItem(row, 3, new QTableWidgetItem("22555"));
-    mergedTable_->setItem(row, 4, new QTableWidgetItem("dogerpc"));
+    mergedTable_->setItem(row, 2, new QTableWidgetItem(testnet ? "192.168.86.27" : "127.0.0.1"));
+    mergedTable_->setItem(row, 3, new QTableWidgetItem(rpcPort));
+    mergedTable_->setItem(row, 4, new QTableWidgetItem(testnet ? "dogecoinrpc" : "dogerpc"));
     mergedTable_->setItem(row, 5, new QTableWidgetItem(""));
-    mergedTable_->setItem(row, 6, new QTableWidgetItem("22556"));
+    mergedTable_->setItem(row, 6, new QTableWidgetItem(p2pPort));
 }
 
 void PageLaunch::removeSelectedMergedRow()
@@ -494,17 +563,18 @@ void PageLaunch::loadSettings()
     QSettings s;
     s.beginGroup("launch");
     binaryEdit_->setText(s.value("binary", "./build/bin/c2pool").toString());
-    modeCombo_->setCurrentIndex(s.value("mode", 0).toInt());
+    modeCombo_->setCurrentIndex(s.value("mode", 1).toInt());
     {
         const int idx = chainCombo_->findText(s.value("chain", "litecoin").toString());
         chainCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
     }
-    testnetCheck_->setChecked(s.value("testnet", false).toBool());
-    p2pPortSpin_->setValue(s.value("p2pPort", 9326).toInt());
-    stratumPortSpin_->setValue(s.value("stratumPort", 9327).toInt());
-    httpPortSpin_->setValue(s.value("httpPort", 8080).toInt());
+    testnetCheck_->setChecked(s.value("testnet", true).toBool());
+    const PortDefaults defaults = defaultsForNetwork(chainCombo_->currentText(), testnetCheck_->isChecked());
+    p2pPortSpin_->setValue(s.value("p2pPort", defaults.p2p).toInt());
+    stratumPortSpin_->setValue(s.value("stratumPort", defaults.stratum).toInt());
+    httpPortSpin_->setValue(s.value("httpPort", defaults.http).toInt());
     coindHostEdit_->setText(s.value("coindHost", "127.0.0.1").toString());
-    coindPortSpin_->setValue(s.value("coindPort", 0).toInt());
+    coindPortSpin_->setValue(s.value("coindPort", defaults.rpc).toInt());
     rpcUserEdit_->setText(s.value("rpcUser").toString());
     rpcPassEdit_->setText(s.value("rpcPass").toString());
     addressEdit_->setText(s.value("address").toString());
@@ -532,4 +602,5 @@ void PageLaunch::loadSettings()
     s.endGroup();
 
     onBuildPreview();
+    emitApiBaseUrlChanged();
 }

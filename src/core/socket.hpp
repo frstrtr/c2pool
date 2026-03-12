@@ -116,7 +116,7 @@ public:
         //     std::cout << (int) *it << " ";
         // std::cout << std::endl;
         boost::asio::async_write(*m_socket, boost::asio::buffer(packet.data(), packet.size()),
-            [this, packet](const boost::system::error_code& ec, std::size_t length)
+            [self = shared_from_this(), this, packet](const boost::system::error_code& ec, std::size_t length)
             {
                 if (ec)
                 {

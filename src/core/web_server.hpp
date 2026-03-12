@@ -270,6 +270,10 @@ public:
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
 
+    // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
+    using sharechain_stats_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = std::move(fn); }
+
     // Network difficulty callback — invoked from refresh_work() with real value
     using network_difficulty_fn_t = std::function<void(double)>;
     void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
@@ -415,6 +419,9 @@ private:
 
     // Share tracker hook
     std::function<uint256()> m_best_share_hash_fn;
+
+    // Sharechain stats callback
+    sharechain_stats_fn_t m_sharechain_stats_fn;
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;

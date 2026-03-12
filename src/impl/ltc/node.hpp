@@ -136,8 +136,12 @@ public:
     void load_persisted_shares();
 
     /// Start dialing outbound peers from AddrStore / bootstrap list.
-    /// Maintains TARGET_OUTBOUND_PEERS active outbound connections.
+    /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
+
+    /// Set desired number of outbound peers maintained by connection loop.
+    /// A value of 0 disables outbound dialing.
+    void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
 
     /// Run the share tracker think() cycle: verifies chains, scores heads,
     /// identifies bad peers, and requests needed shares.
@@ -160,8 +164,9 @@ protected:
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
     // Connection maintenance
-    static constexpr size_t TARGET_OUTBOUND_PEERS = 8;
+    static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
     static constexpr size_t MAX_PEERS = 30;
+    size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers

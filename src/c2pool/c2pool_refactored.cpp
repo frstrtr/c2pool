@@ -290,6 +290,8 @@ int main(int argc, char* argv[]) {
 
     // Seed nodes from -n flag (p2pool compat)
     std::vector<std::string> seed_nodes;
+    int max_outgoing_conns = 0;
+    bool max_outgoing_conns_set = false;
 
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
@@ -494,10 +496,12 @@ int main(int argc, char* argv[]) {
         }
         // Connection limits (p2pool: --max-conns, --outgoing-conns, --disable-upnp)
         else if (arg == "--max-conns" && i + 1 < argc) {
-            /* stored for future use */ ++i;
+            max_outgoing_conns = std::stoi(argv[++i]);
+            max_outgoing_conns_set = true;
         }
         else if (arg == "--outgoing-conns" && i + 1 < argc) {
-            /* stored for future use */ ++i;
+            max_outgoing_conns = std::stoi(argv[++i]);
+            max_outgoing_conns_set = true;
         }
         else if (arg == "--disable-upnp") {
             /* no-op, c2pool doesn't use UPnP */
@@ -827,6 +831,10 @@ int main(int argc, char* argv[]) {
             }
 
             auto p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
+            if (max_outgoing_conns_set) {
+                p2p_node->set_target_outbound_peers(static_cast<size_t>(max_outgoing_conns));
+                LOG_INFO << "Configured outbound peer target: " << max_outgoing_conns;
+            }
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
@@ -1030,6 +1038,94 @@ int main(int argc, char* argv[]) {
             // so that mining_submit can link new shares to the chain head.
             web_server.set_best_share_hash_fn([&p2p_node]() {
                 return p2p_node->best_share_hash();
+            });
+
+            // Wire live sharechain statistics into the REST API.
+            web_server.get_mining_interface()->set_sharechain_stats_fn([&p2p_node]() {
+                nlohmann::json result;
+                auto& chain = p2p_node->tracker().chain;
+                auto best = p2p_node->best_share_hash();
+
+                result["total_shares"]    = static_cast<int>(chain.size());
+                result["fork_count"]      = static_cast<int>(chain.get_heads().size());
+                result["chain_tip_hash"]  = best.IsNull() ? "" : best.GetHex();
+                result["chain_height"]    = best.IsNull() ? 0 : chain.get_height(best);
+
+                std::map<std::string, int> by_version;
+                std::map<std::string, int> by_miner;
+                double diff_sum = 0.0;
+                int diff_count  = 0;
+
+                // Timeline: 6 slots of 10 minutes each, ending at now
+                auto now_ts = static_cast<uint32_t>(std::time(nullptr));
+                constexpr int SLOTS = 6;
+                constexpr uint32_t SLOT_SEC = 600;
+                uint32_t window_start = now_ts - SLOTS * SLOT_SEC;
+                struct Slot { uint32_t ts; int count; std::map<std::string, int> miners; };
+                std::vector<Slot> slots(SLOTS);
+                for (int i = 0; i < SLOTS; ++i)
+                    slots[i].ts = window_start + (i + 1) * SLOT_SEC;
+
+                // Walk up to 2000 shares from best head backwards
+                if (!best.IsNull()) {
+                    int height = chain.get_height(best);
+                    int walk = std::min(height, 2000);
+                    if (walk > 0) {
+                        try {
+                            auto view = chain.get_chain(best, walk);
+                            for (auto& [hash, data] : view) {
+                                data.share.invoke([&](auto* s) {
+                                    // Version
+                                    auto ver_key = std::to_string(s->version);
+                                    by_version[ver_key]++;
+
+                                    // Miner address (version-dependent)
+                                    std::string miner;
+                                    if constexpr (requires { s->m_address; })
+                                        miner = HexStr(s->m_address.m_data);
+                                    else if constexpr (requires { s->m_pubkey_hash; })
+                                        miner = s->m_pubkey_hash.GetHex();
+                                    if (!miner.empty())
+                                        by_miner[miner]++;
+
+                                    // Difficulty
+                                    auto target = chain::bits_to_target(s->m_bits);
+                                    double diff = chain::target_to_difficulty(target);
+                                    diff_sum += diff;
+                                    diff_count++;
+
+                                    // Timeline bucketing
+                                    if (s->m_timestamp >= window_start) {
+                                        int idx = static_cast<int>((s->m_timestamp - window_start) / SLOT_SEC);
+                                        if (idx >= SLOTS) idx = SLOTS - 1;
+                                        slots[idx].count++;
+                                        if (!miner.empty())
+                                            slots[idx].miners[miner]++;
+                                    }
+                                });
+                            }
+                        } catch (...) {
+                            // chain walk may throw if data is inconsistent; return partial results
+                        }
+                    }
+                }
+
+                result["shares_by_version"] = by_version;
+                result["shares_by_miner"]   = by_miner;
+                result["average_difficulty"] = diff_count > 0 ? diff_sum / diff_count : 1.0;
+                result["heaviest_fork_weight"] = 0.0; // TODO: compute when multi-fork scoring is needed
+                result["difficulty_trend"] = nlohmann::json::array();
+
+                nlohmann::json tl = nlohmann::json::array();
+                for (auto& sl : slots) {
+                    tl.push_back({
+                        {"timestamp",          sl.ts},
+                        {"share_count",        sl.count},
+                        {"miner_distribution", sl.miners}
+                    });
+                }
+                result["timeline"] = tl;
+                return result;
             });
 
             // Expose decoded protocol messages from best share via API.

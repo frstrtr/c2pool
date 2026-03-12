@@ -36,6 +36,7 @@ public:
 
     /// Build the full shell command from current form state.
     QString buildCommand() const;
+    QString suggestedApiBaseUrl() const;
 
     /// Persist form state to QSettings under the "launch/" prefix.
     void saveSettings() const;
@@ -54,11 +55,14 @@ signals:
     /// Emitted whenever daemon process state changes.
     /// text/style are for the MainWindow status label.
     void daemonStateChanged(const QString& text, const QString& styleSheet);
+    void apiBaseUrlChanged(const QString& url);
 
 private slots:
     void onBuildPreview();
     void addMergedRow();
     void removeSelectedMergedRow();
+    void updateNetworkDefaults();
+    void emitApiBaseUrlChanged();
 
 private:
     void setupUi();

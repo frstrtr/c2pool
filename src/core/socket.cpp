@@ -6,7 +6,7 @@ namespace core
 
 #define ASYNC_READ(buffer, handler)\
     if (!m_status) return;\
-    boost::asio::async_read(*m_socket, buffer, [this, packet](const auto& ec, std::size_t len) handler)
+    boost::asio::async_read(*m_socket, buffer, [self = shared_from_this(), this, packet](const auto& ec, std::size_t len) handler)
 
 void Socket::read_prefix(std::shared_ptr<Packet> packet)
 {

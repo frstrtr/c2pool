@@ -116,6 +116,12 @@ private:
 
 public:
     ShareTracker() = default;
+    ~ShareTracker()
+    {
+        // verified borrows raw share pointers from chain — free its
+        // indexes only, then let chain's destructor free the share data.
+        verified.clear_unowned();
+    }
 
     // -- Add share to the main chain --
     template <typename ShareT>

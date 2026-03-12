@@ -97,6 +97,17 @@ public:
         }
     }
 
+    /// Release indexes and clear maps without freeing share data.
+    /// Use when this chain borrows raw share pointers owned by another chain.
+    void clear_unowned()
+    {
+        for (auto& [h, cd] : m_shares)
+            delete cd.index;
+        m_shares.clear();
+        m_heads.clear();
+        m_tails.clear();
+    }
+
 private:
     std::unordered_map<hash_t, chain_data, hasher_t> m_shares;
 

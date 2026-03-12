@@ -84,6 +84,14 @@ MainWindow::MainWindow(QWidget* parent)
                 daemonStateLabel_->setStyleSheet(style);
             });
 
+    connect(launchPage_, &PageLaunch::apiBaseUrlChanged, this,
+            [this](const QString& url) {
+                if (baseUrlEdit_->text().trimmed() == url)
+                    return;
+                baseUrlEdit_->setText(url);
+                api_.setBaseUrl(url);
+            });
+
     connect(&api_, &ApiClient::connectionStateChanged, this, [this](const QString& state) {
         connectionStateLabel_->setText(QString("API: %1").arg(state));
         if (state == "online") {
