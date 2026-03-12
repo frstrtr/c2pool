@@ -1,18 +1,190 @@
 #include "PageSharechain.hpp"
 #include "ApiClient.hpp"
-#include <QVBoxLayout>
+
+#include <QDateTime>
 #include <QHBoxLayout>
-#include <QHeaderView>
-#include <QMessageBox>
-#include <QFileDialog>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QJsonArray>
+#include <QJsonObject>
+#include <QPainter>
+#include <QToolTip>
+#include <QVBoxLayout>
+#include <QHelpEvent>
 #include <QFont>
+
+#include <algorithm>
 #include <cmath>
-#include <ctime>
-#include <iomanip>
-#include <sstream>
+#include <functional>
+
+// ── Deterministic colour palette ────────────────────────────────────────
+static const QColor kPalette[] = {
+    QColor(74, 222, 128),   // green
+    QColor(34, 211, 238),   // cyan
+    QColor(168,  85, 247),  // purple
+    QColor(249, 115,  22),  // orange
+    QColor( 59, 130, 246),  // blue
+    QColor(244,  63,  94),  // rose
+    QColor(132, 204,  22),  // lime
+    QColor(236,  72, 153),  // pink
+    QColor(234, 179,   8),  // yellow
+    QColor( 20, 184, 166),  // teal
+    QColor(239,  68,  68),  // red
+    QColor(147, 197, 253),  // light blue
+};
+static constexpr int kPaletteSize = sizeof(kPalette) / sizeof(kPalette[0]);
+
+static const QColor kNetworkGray(51, 65, 85);   // for "hidden" / network shares
+static const QColor kOrphanMark(239, 68, 68);    // red X
+static const QColor kDoaMark(251, 191, 36);       // yellow cross
+static const QColor kHeadGlow(255, 255, 255);     // white ring for chain heads
+
+
+// ══════════════════════════════════════════════════════════════════════════
+//  DefragWidget
+// ══════════════════════════════════════════════════════════════════════════
+
+DefragWidget::DefragWidget(QWidget* parent)
+    : QWidget(parent)
+{
+    setMouseTracking(true);
+}
+
+void DefragWidget::setShares(std::vector<ShareEntry> shares, const QStringList& heads)
+{
+    shares_ = std::move(shares);
+    heads_ = heads;
+    updateGeometry();
+    update();
+}
+
+void DefragWidget::setHiddenMiners(const std::set<QString>& hidden)
+{
+    hiddenMiners_ = hidden;
+    update();
+}
+
+void DefragWidget::setCellSize(int sz)
+{
+    cellSize_ = std::max(3, sz);
+    updateGeometry();
+    update();
+}
+
+QSize DefragWidget::sizeHint() const
+{
+    if (shares_.empty()) return QSize(200, 100);
+    int w = width() > 0 ? width() : 800;
+    int cols = std::max(1, w / (cellSize_ + 1));
+    int rows = (static_cast<int>(shares_.size()) + cols - 1) / cols;
+    return QSize(w, rows * (cellSize_ + 1) + 2);
+}
+
+int DefragWidget::cellAt(QPoint pos) const
+{
+    int gap = 1;
+    int step = cellSize_ + gap;
+    int cols = std::max(1, width() / step);
+    int col = pos.x() / step;
+    int row = pos.y() / step;
+    if (col >= cols) return -1;
+    int idx = row * cols + col;
+    if (idx < 0 || idx >= static_cast<int>(shares_.size())) return -1;
+    return idx;
+}
+
+bool DefragWidget::event(QEvent* event)
+{
+    if (event->type() == QEvent::ToolTip) {
+        auto* he = static_cast<QHelpEvent*>(event);
+        int idx = cellAt(he->pos());
+        if (idx >= 0) {
+            auto& s = shares_[idx];
+            QString status;
+            if (s.stale == 253) status = "ORPHAN";
+            else if (s.stale == 254) status = "DOA";
+            else status = s.verified ? "verified" : "unverified";
+
+            auto dt = QDateTime::fromSecsSinceEpoch(s.timestamp);
+            QString tip = QString(
+                "%1\nMiner: %2\nTime: %3\nVer: v%4 | %5\nPos: %6")
+                .arg(s.hash)
+                .arg(s.miner.left(12) + "...")
+                .arg(dt.toString("hh:mm:ss"))
+                .arg(s.version)
+                .arg(status)
+                .arg(s.pos);
+            QToolTip::showText(he->globalPos(), tip, this);
+        } else {
+            QToolTip::hideText();
+        }
+        return true;
+    }
+    return QWidget::event(event);
+}
+
+void DefragWidget::paintEvent(QPaintEvent*)
+{
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, false);
+
+    int gap = 1;
+    int step = cellSize_ + gap;
+    int cols = std::max(1, width() / step);
+    int total = static_cast<int>(shares_.size());
+
+    // Build head set for O(1) lookup
+    std::set<QString> headSet;
+    for (auto& h : heads_) headSet.insert(h);
+
+    for (int i = 0; i < total; ++i) {
+        auto& s = shares_[i];
+        int col = i % cols;
+        int row = i / cols;
+        int x = col * step;
+        int y = row * step;
+
+        bool hidden = hiddenMiners_.count(s.miner) > 0;
+
+        // Age-based opacity: newest (pos=0) is brightest, oldest fades
+        double age = static_cast<double>(s.pos) / std::max(1, total);
+        double opacity = 1.0 - age * 0.7;
+
+        QColor cellColor;
+        if (hidden) {
+            cellColor = kNetworkGray;
+            cellColor.setAlphaF(opacity * 0.3);
+        } else {
+            cellColor = PageSharechain::colorForMiner(s.miner);
+            cellColor.setAlphaF(opacity);
+        }
+
+        p.fillRect(x, y, cellSize_, cellSize_, cellColor);
+
+        // Stale marks
+        if (s.stale == 253) {
+            // Orphan: red X
+            p.setPen(QPen(kOrphanMark, 1));
+            p.drawLine(x, y, x + cellSize_ - 1, y + cellSize_ - 1);
+            p.drawLine(x + cellSize_ - 1, y, x, y + cellSize_ - 1);
+        } else if (s.stale == 254) {
+            // DOA: yellow diagonal
+            p.setPen(QPen(kDoaMark, 1));
+            p.drawLine(x, y, x + cellSize_ - 1, y + cellSize_ - 1);
+        }
+
+        // Head marker: white dot
+        if (headSet.count(s.hash) > 0) {
+            p.setPen(Qt::NoPen);
+            p.setBrush(kHeadGlow);
+            int r = std::max(1, cellSize_ / 3);
+            p.drawEllipse(QPoint(x + cellSize_ / 2, y + cellSize_ / 2), r, r);
+        }
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PageSharechain
+// ══════════════════════════════════════════════════════════════════════════
 
 PageSharechain::PageSharechain(QWidget* parent)
     : QWidget(parent)
@@ -20,259 +192,264 @@ PageSharechain::PageSharechain(QWidget* parent)
     setupUI();
 }
 
+QColor PageSharechain::colorForMiner(const QString& miner)
+{
+    // Stable hash → palette index
+    uint32_t h = 0;
+    for (auto ch : miner) h = h * 31 + ch.unicode();
+    return kPalette[h % kPaletteSize];
+}
+
 void PageSharechain::setupUI()
 {
     auto* mainLayout = new QVBoxLayout(this);
-    
-    // Top metrics section
-    auto* metricsLayout = new QHBoxLayout();
-    
-    statusValue_ = new QLabel("Loading...", this);
-    chainMetricsLabel_ = new QLabel("Height: 0 | Forks: 0", this);
-    forkCountLabel_ = new QLabel("Heaviest Fork: 0.0%", this);
-    difficultyLabel_ = new QLabel("Avg Difficulty: 1.0", this);
-    
-    metricsLayout->addWidget(new QLabel("Status:", this));
-    metricsLayout->addWidget(statusValue_);
-    metricsLayout->addSpacing(20);
-    metricsLayout->addWidget(chainMetricsLabel_);
-    metricsLayout->addSpacing(20);
-    metricsLayout->addWidget(forkCountLabel_);
-    metricsLayout->addSpacing(20);
-    metricsLayout->addWidget(difficultyLabel_);
-    metricsLayout->addStretch();
-    
-    mainLayout->addLayout(metricsLayout);
-    
-    // View mode selector
-    auto* viewLayout = new QHBoxLayout();
-    viewLayout->addWidget(new QLabel("View Mode:", this));
-    viewModeBox_ = new QComboBox(this);
-    viewModeBox_->addItems({"Timeline", "Miners", "Versions"});
-    viewLayout->addWidget(viewModeBox_);
-    viewLayout->addStretch();
-    
-    exportButton_ = new QPushButton("Export Data", this);
-    viewLayout->addWidget(exportButton_);
-    
-    mainLayout->addLayout(viewLayout);
-    
-    // Timeline chart (ASCII bars showing shares over time)
-    timelineTable_ = new QTableWidget(this);
-    timelineTable_->setColumnCount(3);
-    timelineTable_->setHorizontalHeaderLabels({"Time", "Shares", "Distribution"});
-    timelineTable_->horizontalHeader()->setStretchLastSection(true);
-    timelineTable_->setMaximumHeight(200);
-    mainLayout->addWidget(new QLabel("Share Timeline (10-min intervals):", this));
-    mainLayout->addWidget(timelineTable_);
-    
-    // Miner distribution table
-    minerTable_ = new QTableWidget(this);
-    minerTable_->setColumnCount(4);
-    minerTable_->setHorizontalHeaderLabels({"Miner Address", "Shares", "Percentage", "Trend"});
-    minerTable_->horizontalHeader()->setStretchLastSection(true);
-    mainLayout->addWidget(new QLabel("Miners in Sharechain:", this));
-    mainLayout->addWidget(minerTable_);
-    
-    // Version distribution table
-    versionTable_ = new QTableWidget(this);
-    versionTable_->setColumnCount(4);
-    versionTable_->setHorizontalHeaderLabels({"Share Version", "Count", "Percentage", "Bar Chart"});
-    versionTable_->horizontalHeader()->setStretchLastSection(true);
-    mainLayout->addWidget(new QLabel("Share Versions:", this));
-    mainLayout->addWidget(versionTable_);
-    
-    // Connect signals
-    connect(exportButton_, &QPushButton::clicked, this, [this]() {
-        QString filename = QFileDialog::getSaveFileName(this, "Export Sharechain Data", 
-                                                       "sharechain_data.json", "JSON (*.json)");
-        if (!filename.isEmpty()) {
-            // Export functionality to be implemented
-            QMessageBox::information(this, "Export", "Sharechain data export pending implementation");
-        }
+    mainLayout->setContentsMargins(8, 8, 8, 8);
+
+    // ── Top stats bar ────────────────────────────────────────────────
+    auto* statsBar = new QHBoxLayout();
+    auto makeStatBox = [&](const QString& label) -> QLabel* {
+        auto* box = new QWidget(this);
+        auto* bl = new QVBoxLayout(box);
+        bl->setContentsMargins(8, 4, 8, 4);
+        auto* lbl = new QLabel(label, box);
+        lbl->setStyleSheet("color: #64748b; font-size: 9px; font-weight: bold;");
+        auto* val = new QLabel("—", box);
+        val->setStyleSheet("font-size: 16px; font-weight: bold;");
+        bl->addWidget(lbl);
+        bl->addWidget(val);
+        box->setStyleSheet("background: #0f172a; border: 1px solid #1e293b; border-radius: 6px;");
+        statsBar->addWidget(box);
+        return val;
+    };
+
+    totalSharesLabel_ = makeStatBox("TOTAL SHARES");
+    verifiedLabel_    = makeStatBox("VERIFIED");
+    headsLabel_       = makeStatBox("CHAIN HEADS");
+    windowAgeLabel_   = makeStatBox("WINDOW SPAN");
+    statusValue_      = makeStatBox("STATUS");
+
+    mainLayout->addLayout(statsBar);
+
+    // ── Controls bar ─────────────────────────────────────────────────
+    auto* controlBar = new QHBoxLayout();
+    auto* gridLabel = new QLabel("SHARECHAIN DEFRAGMENTER", this);
+    gridLabel->setStyleSheet("font-size: 11px; font-weight: bold; color: #e2e8f0;");
+    controlBar->addWidget(gridLabel);
+    controlBar->addStretch();
+
+    selectAllBtn_ = new QPushButton("Select All", this);
+    deselectAllBtn_ = new QPushButton("Deselect All", this);
+    selectAllBtn_->setFixedHeight(24);
+    deselectAllBtn_->setFixedHeight(24);
+    controlBar->addWidget(selectAllBtn_);
+    controlBar->addWidget(deselectAllBtn_);
+
+    mainLayout->addLayout(controlBar);
+
+    // ── Main content: grid + miner list side by side ─────────────────
+    auto* contentLayout = new QHBoxLayout();
+
+    // Defrag grid inside scroll area
+    defragWidget_ = new DefragWidget(this);
+    scrollArea_ = new QScrollArea(this);
+    scrollArea_->setWidget(defragWidget_);
+    scrollArea_->setWidgetResizable(true);
+    scrollArea_->setStyleSheet(
+        "QScrollArea { background: #020617; border: 1px solid #334155; border-radius: 8px; }"
+    );
+    contentLayout->addWidget(scrollArea_, 1);
+
+    // Miner list panel (right side)
+    auto* minerPanel = new QWidget(this);
+    auto* minerPanelLay = new QVBoxLayout(minerPanel);
+    minerPanelLay->setContentsMargins(4, 4, 4, 4);
+    auto* minerTitle = new QLabel("MINERS", minerPanel);
+    minerTitle->setStyleSheet("font-size: 10px; font-weight: bold; color: #64748b;");
+    minerPanelLay->addWidget(minerTitle);
+
+    auto* minerScroll = new QScrollArea(minerPanel);
+    minerListWidget_ = new QWidget(minerScroll);
+    minerListWidget_->setLayout(new QVBoxLayout(minerListWidget_));
+    minerListWidget_->layout()->setContentsMargins(0, 0, 0, 0);
+    minerListWidget_->layout()->setSpacing(2);
+    minerScroll->setWidget(minerListWidget_);
+    minerScroll->setWidgetResizable(true);
+    minerScroll->setFixedWidth(200);
+    minerPanelLay->addWidget(minerScroll, 1);
+
+    minerPanel->setStyleSheet(
+        "background: #0f172a; border: 1px solid #1e293b; border-radius: 6px;"
+    );
+    minerPanel->setFixedWidth(210);
+    contentLayout->addWidget(minerPanel);
+
+    mainLayout->addLayout(contentLayout, 1);
+
+    // ── Legend bar ───────────────────────────────────────────────────
+    auto* legendLayout = new QHBoxLayout();
+    auto makeLegendItem = [&](const QColor& color, const QString& label) {
+        auto* item = new QWidget(this);
+        auto* il = new QHBoxLayout(item);
+        il->setContentsMargins(4, 2, 4, 2);
+        auto* swatch = new QLabel(item);
+        swatch->setFixedSize(10, 10);
+        swatch->setStyleSheet(QString("background: %1; border-radius: 2px;").arg(color.name()));
+        il->addWidget(swatch);
+        auto* txt = new QLabel(label, item);
+        txt->setStyleSheet("font-size: 9px; color: #94a3b8;");
+        il->addWidget(txt);
+        legendLayout->addWidget(item);
+    };
+
+    makeLegendItem(kOrphanMark, "Orphan (red X)");
+    makeLegendItem(kDoaMark, "DOA (yellow stripe)");
+    makeLegendItem(kHeadGlow, "Chain head (dot)");
+    makeLegendItem(kNetworkGray, "Hidden miner");
+    legendLayout->addStretch();
+    auto* ageNote = new QLabel("← Newest   |   Oldest →", this);
+    ageNote->setStyleSheet("font-size: 9px; color: #475569;");
+    legendLayout->addWidget(ageNote);
+
+    mainLayout->addLayout(legendLayout);
+
+    // ── Signals ──────────────────────────────────────────────────────
+    connect(selectAllBtn_, &QPushButton::clicked, this, [this]() {
+        for (auto& [_, cb] : minerChecks_) cb->setChecked(true);
+        defragWidget_->setHiddenMiners({});
     });
-    
-    setLayout(mainLayout);
+    connect(deselectAllBtn_, &QPushButton::clicked, this, [this]() {
+        std::set<QString> all;
+        for (auto& [m, cb] : minerChecks_) { cb->setChecked(false); all.insert(m); }
+        defragWidget_->setHiddenMiners(all);
+    });
 }
 
 void PageSharechain::refresh(ApiClient* api)
 {
     if (!api) return;
-    
-    api->getJson("/sharechain/stats",
+
+    api->getJson("/sharechain/window",
         [this](const QJsonDocument& data) {
-            if (data.isObject()) {
-                updateChartData(data.object());
-                statusValue_->setText("✓ Updated");
-                statusValue_->setStyleSheet("color: green;");
-            }
+            if (data.isObject())
+                updateFromJson(data.object());
+            statusValue_->setText("OK");
+            statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
         },
         [this](const QString& err) {
-            statusValue_->setText(QString("✗ Error: ") + err);
-            statusValue_->setStyleSheet("color: red;");
+            statusValue_->setText("ERR");
+            statusValue_->setStyleSheet("color: #ef4444; font-size: 16px; font-weight: bold;");
         });
 }
 
-void PageSharechain::updateChartData(const QJsonObject& stats)
+void PageSharechain::updateFromJson(const QJsonObject& obj)
 {
-    // Parse sharechain metrics
-    try {
-        // Clear existing tables
-        timelineTable_->setRowCount(0);
-        minerTable_->setRowCount(0);
-        versionTable_->setRowCount(0);
-        
-        // Update basic metrics
-        int chain_height = stats.contains("chain_height") ? stats.value("chain_height").toInt() : 0;
-        int fork_count = stats.contains("fork_count") ? stats.value("fork_count").toInt() : 0;
-        double heaviest_fork = stats.contains("heaviest_fork_weight") ? stats.value("heaviest_fork_weight").toDouble() : 0.0;
-        double avg_difficulty = stats.contains("average_difficulty") ? stats.value("average_difficulty").toDouble() : 1.0;
-        
-        chainMetricsLabel_->setText(
-            QString("Height: %1 | Forks: %2").arg(chain_height).arg(fork_count)
-        );
-        forkCountLabel_->setText(
-            QString("Heaviest Fork: %1%").arg(heaviest_fork * 100, 0, 'f', 2)
-        );
-        difficultyLabel_->setText(
-            QString("Avg Difficulty: %1").arg(avg_difficulty, 0, 'f', 4)
-        );
-        
-        // Update timeline
-        if (stats.contains("timeline") && stats["timeline"].isArray()) {
-            const auto timeline = stats["timeline"].toArray();
-            int max_shares = 1;
-            
-            // First pass: find max
-            for (const auto& val : timeline) {
-                if (val.isObject()) {
-                    auto o = val.toObject();
-                    int sc = o.contains("share_count") ? o.value("share_count").toInt() : 0;
-                    max_shares = std::max(max_shares, sc);
-                }
-            }
-            
-            // Second pass: display
-            for (const auto& val : timeline) {
-                if (!val.isObject()) continue;
-                
-                auto obj = val.toObject();
-                auto row = timelineTable_->rowCount();
-                timelineTable_->insertRow(row);
-                
-                // Format timestamp
-                auto ts = obj.contains("timestamp") ? obj.value("timestamp").toInt() : 0;
-                std::time_t t = ts;
-                std::tm* tm_info = std::localtime(&t);
-                char buf[20];
-                std::strftime(buf, sizeof(buf), "%H:%M", tm_info);
-                
-                auto* timeItem = new QTableWidgetItem(QString(buf));
-                timelineTable_->setItem(row, 0, timeItem);
-                
-                int share_count = obj.contains("share_count") ? obj.value("share_count").toInt() : 0;
-                auto* countItem = new QTableWidgetItem(QString::number(share_count));
-                timelineTable_->setItem(row, 1, countItem);
-                
-                // ASCII bar chart
-                std::string bar;
-                if (max_shares > 0) {
-                    int bar_width = (share_count * 20) / max_shares;
-                    bar = std::string(bar_width, '#');
-                    bar += " " + std::to_string(share_count);
-                } else {
-                    bar = "-";
-                }
-                auto* barItem = new QTableWidgetItem(QString::fromStdString(bar));
-                barItem->setFont(QFont("Courier", 9));
-                timelineTable_->setItem(row, 2, barItem);
-            }
-        }
-        
-        // Update miner distribution
-        if (stats.contains("shares_by_miner") && stats["shares_by_miner"].isObject()) {
-            const auto miners = stats["shares_by_miner"].toObject();
-            int total_shares = stats.contains("total_shares") ? stats.value("total_shares").toInt() : 1;
-            
-            for (auto it = miners.begin(); it != miners.end(); ++it) {
-                auto row = minerTable_->rowCount();
-                minerTable_->insertRow(row);
-                
-                auto miner_addr = it.key();
-                if (miner_addr.length() > 20) {
-                    miner_addr = miner_addr.left(17) + "...";
-                }
-                
-                int count = it.value().toInt();
-                double pct = (count * 100.0) / std::max(total_shares, 1);
-                
-                auto* addrItem = new QTableWidgetItem(miner_addr);
-                minerTable_->setItem(row, 0, addrItem);
-                
-                auto* countItem = new QTableWidgetItem(QString::number(count));
-                minerTable_->setItem(row, 1, countItem);
-                
-                auto* pctItem = new QTableWidgetItem(QString::number(pct, 'f', 2) + "%");
-                minerTable_->setItem(row, 2, pctItem);
-                
-                std::string bar = std::string(static_cast<int>(pct / 5), '#');
-                auto* barItem = new QTableWidgetItem(QString::fromStdString(bar));
-                barItem->setFont(QFont("Courier", 9));
-                minerTable_->setItem(row, 3, barItem);
-            }
-        }
-        
-        // Update version distribution
-        if (stats.contains("shares_by_version") && stats["shares_by_version"].isObject()) {
-            const auto versions = stats["shares_by_version"].toObject();
-            int total_shares = stats.contains("total_shares") ? stats.value("total_shares").toInt() : 1;
-            
-            for (auto it = versions.begin(); it != versions.end(); ++it) {
-                auto row = versionTable_->rowCount();
-                versionTable_->insertRow(row);
-                
-                auto version_str = QString("v%1").arg(it.key());
-                int count = it.value().toInt();
-                double pct = (count * 100.0) / std::max(total_shares, 1);
-                
-                auto* verItem = new QTableWidgetItem(version_str);
-                versionTable_->setItem(row, 0, verItem);
-                
-                auto* countItem = new QTableWidgetItem(QString::number(count));
-                versionTable_->setItem(row, 1, countItem);
-                
-                auto* pctItem = new QTableWidgetItem(QString::number(pct, 'f', 2) + "%");
-                versionTable_->setItem(row, 2, pctItem);
-                
-                std::string bar = std::string(static_cast<int>(pct / 5), '#');
-                auto* barItem = new QTableWidgetItem(QString::fromStdString(bar));
-                barItem->setFont(QFont("Courier", 9));
-                versionTable_->setItem(row, 3, barItem);
-            }
-        }
-        
-    } catch (const std::exception& e) {
-        statusValue_->setText(QString("✗ Parse error"));
-        statusValue_->setStyleSheet("color: red;");
+    shares_.clear();
+    minerCounts_.clear();
+
+    auto arr = obj.value("shares").toArray();
+    shares_.reserve(arr.size());
+
+    for (auto&& v : arr) {
+        auto o = v.toObject();
+        ShareEntry e;
+        e.hash      = o.value("hash").toString();
+        e.miner     = o.value("miner").toString();
+        e.timestamp = static_cast<uint32_t>(o.value("ts").toDouble());
+        e.stale     = o.value("stale").toInt();
+        e.version   = o.value("ver").toInt();
+        e.verified  = o.value("verified").toBool();
+        e.pos       = o.value("pos").toInt();
+        shares_.push_back(e);
+        minerCounts_[e.miner]++;
     }
+
+    heads_.clear();
+    auto headsArr = obj.value("heads").toArray();
+    for (auto&& v : headsArr)
+        heads_.push_back(v.toString());
+
+    // Stats
+    int total = obj.value("total").toInt();
+    totalSharesLabel_->setText(QString::number(total));
+
+    int verifiedCount = 0;
+    for (auto& s : shares_)
+        if (s.verified) verifiedCount++;
+    verifiedLabel_->setText(QString::number(verifiedCount));
+
+    headsLabel_->setText(QString::number(heads_.size()));
+
+    // Window age: difference between newest and oldest timestamp
+    if (!shares_.empty()) {
+        uint32_t newest = shares_.front().timestamp;
+        uint32_t oldest = shares_.back().timestamp;
+        int span = static_cast<int>(newest) - static_cast<int>(oldest);
+        if (span > 3600)
+            windowAgeLabel_->setText(QString("%1h %2m").arg(span / 3600).arg((span % 3600) / 60));
+        else if (span > 60)
+            windowAgeLabel_->setText(QString("%1m").arg(span / 60));
+        else
+            windowAgeLabel_->setText(QString("%1s").arg(span));
+    } else {
+        windowAgeLabel_->setText("—");
+    }
+
+    rebuildMinerList();
+    defragWidget_->setShares(shares_, heads_);
 }
 
-void PageSharechain::displayMinerDistribution(const QJsonObject& miner_data)
+void PageSharechain::rebuildMinerList()
 {
-    // Handled in updateChartData
-}
+    // Sort miners by share count (descending)
+    std::vector<std::pair<QString, int>> sorted(minerCounts_.begin(), minerCounts_.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](auto& a, auto& b) { return a.second > b.second; });
 
-void PageSharechain::displayVersionDistribution(const QJsonObject& version_data)
-{
-    // Handled in updateChartData
-}
+    // Preserve existing hidden state
+    std::set<QString> wasHidden;
+    for (auto& [m, cb] : minerChecks_)
+        if (!cb->isChecked()) wasHidden.insert(m);
 
-void PageSharechain::displayMetrics(const QJsonObject& metrics)
-{
-    // Handled in updateChartData
-}
+    // Clear old checkboxes
+    auto* lay = minerListWidget_->layout();
+    QLayoutItem* item;
+    while ((item = lay->takeAt(0)) != nullptr) {
+        delete item->widget();
+        delete item;
+    }
+    minerChecks_.clear();
 
-void PageSharechain::drawTimelineChart()
-{
-    // ASCII-based chart drawing (handled in table visualization)
+    int totalShares = static_cast<int>(shares_.size());
+
+    for (auto& [miner, count] : sorted) {
+        auto* cb = new QCheckBox(minerListWidget_);
+        QColor col = colorForMiner(miner);
+        double pct = totalShares > 0 ? (count * 100.0 / totalShares) : 0;
+
+        cb->setText(QString("%1... (%2, %3%)")
+                    .arg(miner.left(8))
+                    .arg(count)
+                    .arg(pct, 0, 'f', 1));
+        cb->setChecked(!wasHidden.count(miner));
+        cb->setStyleSheet(QString(
+            "QCheckBox { color: %1; font-size: 10px; }"
+            "QCheckBox::indicator { width: 10px; height: 10px; }"
+        ).arg(col.name()));
+
+        connect(cb, &QCheckBox::toggled, this, [this](bool) {
+            std::set<QString> hidden;
+            for (auto& [m, c] : minerChecks_)
+                if (!c->isChecked()) hidden.insert(m);
+            defragWidget_->setHiddenMiners(hidden);
+        });
+
+        lay->addWidget(cb);
+        minerChecks_[miner] = cb;
+    }
+
+    // Apply initial hidden state
+    std::set<QString> hidden;
+    for (auto& [m, cb] : minerChecks_)
+        if (!cb->isChecked()) hidden.insert(m);
+    defragWidget_->setHiddenMiners(hidden);
 }

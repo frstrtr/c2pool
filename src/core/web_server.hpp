@@ -123,6 +123,7 @@ public:
     nlohmann::json rest_stratum_stats();
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
+    nlohmann::json rest_sharechain_window();
     nlohmann::json rest_control_mining_start();
     nlohmann::json rest_control_mining_stop();
     nlohmann::json rest_control_mining_restart();
@@ -278,6 +279,10 @@ public:
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = std::move(fn); }
 
+    // Sharechain window callback — returns per-share data for the defragmenter grid
+    using sharechain_window_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
+
     // Network difficulty callback — invoked from refresh_work() with real value
     using network_difficulty_fn_t = std::function<void(double)>;
     void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
@@ -426,6 +431,7 @@ private:
 
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
+    sharechain_window_fn_t m_sharechain_window_fn;
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;

@@ -131,6 +131,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_global_stats();
             else if (target == "/sharechain/stats")
                 rest_result = mining_interface_->rest_sharechain_stats();
+            else if (target == "/sharechain/window")
+                rest_result = mining_interface_->rest_sharechain_window();
             else if (target == "/control/mining/start")
                 rest_result = mining_interface_->rest_control_mining_start();
             else if (target == "/control/mining/stop")
@@ -1839,6 +1841,20 @@ nlohmann::json MiningInterface::rest_sharechain_stats()
         timeline.push_back(slot);
     }
     result["timeline"] = timeline;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_window()
+{
+    if (m_sharechain_window_fn)
+        return m_sharechain_window_fn();
+
+    // Fallback stub
+    nlohmann::json result;
+    result["shares"] = nlohmann::json::array();
+    result["total"] = 0;
+    result["best_hash"] = "";
+    result["chain_length"] = 0;
     return result;
 }
 

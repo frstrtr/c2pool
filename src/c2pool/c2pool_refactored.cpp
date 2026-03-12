@@ -1128,6 +1128,64 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
+            // Wire per-share window data for the defragmenter grid
+            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node]() {
+                nlohmann::json result;
+                auto& chain = p2p_node->tracker().chain;
+                auto& verified = p2p_node->tracker().verified;
+                auto best = p2p_node->best_share_hash();
+
+                result["best_hash"] = best.IsNull() ? "" : best.GetHex();
+                result["chain_length"] = static_cast<int>(chain.size());
+
+                nlohmann::json shares_arr = nlohmann::json::array();
+
+                if (!best.IsNull()) {
+                    int height = chain.get_height(best);
+                    int walk = std::min(height, 2000);
+                    if (walk > 0) {
+                        try {
+                            int pos = 0;
+                            auto view = chain.get_chain(best, walk);
+                            for (auto& [hash, data] : view) {
+                                nlohmann::json s;
+                                s["hash"] = hash.GetHex().substr(0, 16);
+                                s["pos"] = pos++;
+                                s["verified"] = verified.contains(hash);
+
+                                data.share.invoke([&](auto* obj) {
+                                    s["ts"] = obj->m_timestamp;
+                                    s["ver"] = obj->version;
+                                    s["stale"] = static_cast<int>(obj->m_stale_info);
+
+                                    std::string miner;
+                                    if constexpr (requires { obj->m_pubkey_hash; })
+                                        miner = obj->m_pubkey_hash.GetHex();
+                                    else if constexpr (requires { obj->m_address; })
+                                        miner = HexStr(obj->m_address.m_data);
+                                    s["miner"] = miner;
+                                });
+
+                                shares_arr.push_back(std::move(s));
+                            }
+                        } catch (...) {
+                            // partial results on chain inconsistency
+                        }
+                    }
+                }
+
+                // heads and tails for fork marking
+                nlohmann::json heads_arr = nlohmann::json::array();
+                for (auto& [hh, _] : chain.get_heads()) {
+                    heads_arr.push_back(hh.GetHex().substr(0, 16));
+                }
+
+                result["shares"] = std::move(shares_arr);
+                result["heads"] = std::move(heads_arr);
+                result["total"] = static_cast<int>(chain.size());
+                return result;
+            });
+
             // Expose decoded protocol messages from best share via API.
             web_server.get_mining_interface()->set_protocol_messages_fn([&p2p_node]() {
                 nlohmann::json result = {
