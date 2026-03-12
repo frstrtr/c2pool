@@ -323,7 +323,18 @@ public:
 
     // Callback for P2P block relay — receives full block hex for direct daemon P2P broadcast.
     void set_on_block_relay(std::function<void(const std::string& full_block_hex)> fn);
+    // Redistribute / address-fallback callback.
+    // Called when a share's primary address cannot be resolved to a valid hash160.
+    // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
+    using address_fallback_fn_t = std::function<std::string(const std::string&)>;
+    void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
 
+    // Return true if the merged-mining manager has a configured chain with chain_id.
+    bool has_merged_chain(uint32_t chain_id) const;
+
+    // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
+    // Returns "" if the fee script is not a 25-byte P2PKH.
+    std::string get_node_fee_hash160() const;
 private:
     void setup_methods();
     // Build Stratum-compatible coinb1/coinb2 from a live block template
@@ -442,6 +453,9 @@ private:
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
+
+    // Fallback address resolver for invalid/empty miner addresses (redistribute / DOGE→LTC)
+    address_fallback_fn_t m_address_fallback_fn;
 };
 
 /// Main Web Server class

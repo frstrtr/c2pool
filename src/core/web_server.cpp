@@ -309,6 +309,27 @@ void MiningInterface::set_on_block_relay(std::function<void(const std::string&)>
     m_on_block_relay = std::move(fn);
 }
 
+bool MiningInterface::has_merged_chain(uint32_t chain_id) const
+{
+    if (!m_mm_manager) return false;
+    return m_mm_manager->get_chain_rpc(chain_id) != nullptr;
+}
+
+std::string MiningInterface::get_node_fee_hash160() const
+{
+    // Extract hash160 from a 25-byte P2PKH scriptPubKey (bytes 3–22)
+    if (m_node_fee_script.size() != 25) return {};
+    if (m_node_fee_script[0] != 0x76 || m_node_fee_script[1] != 0xa9) return {};
+    static const char* HEX = "0123456789abcdef";
+    std::string h160;
+    h160.reserve(40);
+    for (int i = 3; i < 23; ++i) {
+        h160 += HEX[m_node_fee_script[i] >> 4];
+        h160 += HEX[m_node_fee_script[i] & 0x0f];
+    }
+    return h160;
+}
+
 void MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
@@ -1869,7 +1890,40 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         }
         std::string share_address = base58check_to_hash160(primary_addr);
         if (share_address.size() != 40) {
-            LOG_WARNING << "mining_submit: cannot convert primary address to hash160: " << primary_addr;
+            // Case 4 (Python work.py): invalid/empty LTC address but miner provided an
+            // explicit DOGE merged address → derive LTC hash160 from DOGE P2PKH script.
+            // LTC and DOGE use identical secp256k1 keys: same pubkey_hash, different version byte.
+            static constexpr uint32_t DOGE_CHAIN_ID = 98;
+            auto doge_it = merged_addresses.find(DOGE_CHAIN_ID);
+            if (doge_it != merged_addresses.end()) {
+                const auto& doge_script = doge_it->second;
+                // P2PKH script: 76 a9 14 <20-byte hash160> 88 ac
+                if (doge_script.size() == 25 &&
+                    doge_script[0] == 0x76 && doge_script[1] == 0xa9 && doge_script[2] == 0x14) {
+                    static const char* HEX = "0123456789abcdef";
+                    std::string h160;
+                    h160.reserve(40);
+                    for (int i = 3; i < 23; ++i) {
+                        h160 += HEX[doge_script[i] >> 4];
+                        h160 += HEX[doge_script[i] & 0x0f];
+                    }
+                    share_address = h160;
+                    LOG_INFO << "mining_submit: Case 4 — LTC share hash160 derived from DOGE merged address";
+                }
+            }
+        }
+        if (share_address.size() != 40) {
+            // Case 3 (Python work.py): no valid LTC or DOGE address → redistribute
+            // according to the node's configured --redistribute mode.
+            if (m_address_fallback_fn) {
+                share_address = m_address_fallback_fn(primary_addr);
+                if (share_address.size() == 40)
+                    LOG_INFO << "mining_submit: Case 3 — redistributed share for invalid address '"
+                             << primary_addr << "'";
+            }
+            if (share_address.size() != 40)
+                LOG_WARNING << "mining_submit: cannot resolve share address for '"
+                            << primary_addr << "' — share will carry zero-hash payout";
         }
 
         // V36 probabilistic node fee: with probability m_node_fee_percent%,
@@ -2727,8 +2781,24 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             LOG_INFO << "Merged addresses from username: " << merged_addresses_.size() << " chain(s)";
         
         LOG_INFO << "Mining authorization successful for: " << username_;
-        
-        // If merged addresses were parsed, resend work notification so the
+
+        // Case 2 (Python work.py): if LTC address is valid but no explicit DOGE merged
+        // address provided, auto-derive DOGE merged address from the same hash160.
+        // LTC and DOGE use identical secp256k1 keys → same pubkey_hash, different version byte.
+        // We store the LTC address under DOGE_CHAIN_ID; base58check_to_hash160() is
+        // version-byte-agnostic, so the script produced will be hash160-identical.
+        static constexpr uint32_t DOGE_CHAIN_ID = 98;
+        if (mining_interface_ && mining_interface_->has_merged_chain(DOGE_CHAIN_ID)) {
+            if (merged_addresses_.find(DOGE_CHAIN_ID) == merged_addresses_.end()) {
+                auto h160 = base58check_to_hash160(username_);
+                if (h160.size() == 40) {
+                    merged_addresses_[DOGE_CHAIN_ID] = username_;
+                    LOG_INFO << "Case 2: auto-generated DOGE merged address from LTC address for " << username_;
+                }
+            }
+        }
+
+        // If merged addresses were parsed (or auto-generated), resend work notification so the
         // coinbase ref_hash includes them.  The initial job sent right after
         // subscribe had empty merged_addresses because authorize hadn't run yet.
         if (!merged_addresses_.empty() && mining_interface_) {

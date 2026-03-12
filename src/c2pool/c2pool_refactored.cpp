@@ -1448,15 +1448,18 @@ int main(int argc, char* argv[]) {
             redistributor->set_mode(redistribute_mode);
             LOG_INFO << "Redistribute mode: " << ltc::redistribute_mode_str(redistribute_mode);
 
-            // Set operator identity for "fee" mode from node_owner_address
-            // (uses same P2PKH extraction as payout_script handling)
-            if (!node_owner_address.empty() && node_owner_fee > 0.0) {
-                // The operator's pubkey_hash will be set when set_node_fee_from_address
-                // was called earlier (which stores the scriptPubKey). For redistribute
-                // we need the raw hash160. Extract from the stored fee script by reading
-                // the MiningInterface's node fee data.
-                // Since we can't access the private m_node_fee_script, use the COMBINED_DONATION
-                // fallback for now; the operator identity gets wired below via lambda capture.
+            // Set operator identity for "fee" and "boost" modes.
+            // get_node_fee_hash160() extracts the hash160 from the P2PKH fee scriptPubKey
+            // that was set earlier via set_node_fee_from_address().
+            {
+                auto op_h160 = web_server.get_mining_interface()->get_node_fee_hash160();
+                if (op_h160.size() == 40) {
+                    uint160 op_hash;
+                    for (int i = 0; i < 20; ++i)
+                        op_hash.data()[i] = static_cast<uint8_t>(
+                            std::stoul(op_h160.substr(i * 2, 2), nullptr, 16));
+                    redistributor->set_operator_identity(op_hash, 0); // P2PKH
+                }
             }
 
             // Set donation identity for "donate" mode (V36 combined donation P2SH)
@@ -1466,6 +1469,33 @@ int main(int argc, char* argv[]) {
                     ltc::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
                 redistributor->set_donation_identity(don_hash, 2); // P2SH
             }
+
+            // Wire Redistributor into MiningInterface as the address-fallback callback.
+            // Called for Case 3: invalid/empty LTC address with no usable DOGE address.
+            //
+            // redistributor_ptr is a raw pointer — the unique_ptr is kept alive for the
+            // duration of the pool (moved into redistributor_holder below).
+            {
+                auto* redistributor_ptr = redistributor.get();
+                auto* node_ptr = p2p_node.get();
+                web_server.get_mining_interface()->set_address_fallback_fn(
+                    [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
+                        auto best = node_ptr->best_share_hash();
+                        auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
+                        // Convert uint160 to 40-char hex string
+                        static const char* HEX = "0123456789abcdef";
+                        std::string h160;
+                        h160.reserve(40);
+                        const unsigned char* bytes = result.pubkey_hash.data();
+                        for (int i = 0; i < 20; ++i) {
+                            h160 += HEX[bytes[i] >> 4];
+                            h160 += HEX[bytes[i] & 0x0f];
+                        }
+                        return h160;
+                    });
+            }
+            // Keep redistributor alive for the lifetime of the pool
+            auto redistributor_holder = std::move(redistributor);
 
             // Periodic run_think timer (every 15 seconds) — verify shares & manage peers
             auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
