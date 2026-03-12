@@ -116,8 +116,10 @@ void Socket::message_processing(std::shared_ptr<Packet> packet)
     // checksum 
     uint256 hash_checksum = Hash(std::span<std::byte>(packet->payload.data(), packet->payload.size()));
     if (hash_checksum.pn[0] != packet->checksum)
+    {
         m_node->error("Socket::message_processing missmatch checksum!", get_addr());
-        // std::cout << "ERROR CHECKSUM!: " << hash_checksum.pn[7] << "(" << hash_checksum.pn[0] << ") != " << packet->checksum  << std::endl;
+        return;
+    }
     
     auto msg = packet->to_message();
     m_node->handle(std::move(msg), m_addr);
