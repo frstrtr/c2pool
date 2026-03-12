@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
@@ -122,6 +123,11 @@ public:
     nlohmann::json rest_stratum_stats();
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
+    nlohmann::json rest_control_mining_start();
+    nlohmann::json rest_control_mining_stop();
+    nlohmann::json rest_control_mining_restart();
+    nlohmann::json rest_control_mining_ban(const std::string& target);
+    nlohmann::json rest_control_mining_unban(const std::string& target);
 
     // Track a found block for the /recent_blocks endpoint
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
@@ -460,6 +466,11 @@ private:
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
+
+    // Lightweight runtime state for MVP mining controls.
+    bool m_mining_enabled{true};
+    std::set<std::string> m_banned_targets;
+    mutable std::mutex m_control_mutex;
 
     // Fallback address resolver for invalid/empty miner addresses (redistribute / DOGE→LTC)
     address_fallback_fn_t m_address_fallback_fn;

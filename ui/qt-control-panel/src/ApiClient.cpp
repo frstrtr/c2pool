@@ -3,7 +3,10 @@
 #include <QFile>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QTimer>
 #include <QUrl>
+
+#include <memory>
 
 ApiClient::ApiClient(QObject* parent)
     : QObject(parent), baseUrl_("http://127.0.0.1:8080")
@@ -34,45 +37,83 @@ QString ApiClient::makeUrl(const QString& path) const
 
 void ApiClient::getJson(const QString& path, JsonSuccess onSuccess, Failure onFailure)
 {
-    QNetworkRequest req(QUrl(makeUrl(path)));
-    auto* reply = manager_.get(req);
+    auto attempts = std::make_shared<int>(0);
+    auto doRequest = std::make_shared<std::function<void()>>();
 
-    connect(reply, &QNetworkReply::finished, this, [reply, onSuccess, onFailure]() {
-        const auto err = reply->error();
-        const QByteArray payload = reply->readAll();
-        reply->deleteLater();
+    *doRequest = [this, path, onSuccess, onFailure, attempts, doRequest]() {
+        QNetworkRequest req(QUrl(makeUrl(path)));
+        req.setTransferTimeout(4000);
+        auto* reply = manager_.get(req);
 
-        if (err != QNetworkReply::NoError) {
-            onFailure(QString("HTTP error: %1").arg(reply->errorString()));
-            return;
-        }
+        connect(reply, &QNetworkReply::finished, this, [this, reply, onSuccess, onFailure, attempts, doRequest]() {
+            const auto err = reply->error();
+            const QByteArray payload = reply->readAll();
+            reply->deleteLater();
 
-        QJsonParseError parseErr;
-        const auto doc = QJsonDocument::fromJson(payload, &parseErr);
-        if (parseErr.error != QJsonParseError::NoError) {
-            onFailure(QString("JSON parse error: %1").arg(parseErr.errorString()));
-            return;
-        }
-        onSuccess(doc);
-    });
+            if (err != QNetworkReply::NoError) {
+                if (*attempts == 0) {
+                    *attempts = 1;
+                    QTimer::singleShot(300, this, [doRequest]() { (*doRequest)(); });
+                    return;
+                }
+                const QString message = QString("HTTP error: %1").arg(reply->errorString());
+                emit connectionStateChanged("offline");
+                emit requestFailed(message);
+                onFailure(message);
+                return;
+            }
+
+            QJsonParseError parseErr;
+            const auto doc = QJsonDocument::fromJson(payload, &parseErr);
+            if (parseErr.error != QJsonParseError::NoError) {
+                const QString message = QString("JSON parse error: %1").arg(parseErr.errorString());
+                emit requestFailed(message);
+                onFailure(message);
+                return;
+            }
+
+            emit connectionStateChanged("online");
+            onSuccess(doc);
+        });
+    };
+
+    (*doRequest)();
 }
 
 void ApiClient::getText(const QString& path, TextSuccess onSuccess, Failure onFailure)
 {
-    QNetworkRequest req(QUrl(makeUrl(path)));
-    auto* reply = manager_.get(req);
+    auto attempts = std::make_shared<int>(0);
+    auto doRequest = std::make_shared<std::function<void()>>();
 
-    connect(reply, &QNetworkReply::finished, this, [reply, onSuccess, onFailure]() {
-        const auto err = reply->error();
-        const QByteArray payload = reply->readAll();
-        reply->deleteLater();
+    *doRequest = [this, path, onSuccess, onFailure, attempts, doRequest]() {
+        QNetworkRequest req(QUrl(makeUrl(path)));
+        req.setTransferTimeout(4000);
+        auto* reply = manager_.get(req);
 
-        if (err != QNetworkReply::NoError) {
-            onFailure(QString("HTTP error: %1").arg(reply->errorString()));
-            return;
-        }
-        onSuccess(QString::fromUtf8(payload));
-    });
+        connect(reply, &QNetworkReply::finished, this, [this, reply, onSuccess, onFailure, attempts, doRequest]() {
+            const auto err = reply->error();
+            const QByteArray payload = reply->readAll();
+            reply->deleteLater();
+
+            if (err != QNetworkReply::NoError) {
+                if (*attempts == 0) {
+                    *attempts = 1;
+                    QTimer::singleShot(300, this, [doRequest]() { (*doRequest)(); });
+                    return;
+                }
+                const QString message = QString("HTTP error: %1").arg(reply->errorString());
+                emit connectionStateChanged("offline");
+                emit requestFailed(message);
+                onFailure(message);
+                return;
+            }
+
+            emit connectionStateChanged("online");
+            onSuccess(QString::fromUtf8(payload));
+        });
+    };
+
+    (*doRequest)();
 }
 
 void ApiClient::download(const QString& path, const QString& outputPath, TextSuccess onSuccess, Failure onFailure)

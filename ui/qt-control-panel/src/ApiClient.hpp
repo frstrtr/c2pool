@@ -25,6 +25,10 @@ public:
     void getText(const QString& path, TextSuccess onSuccess, Failure onFailure);
     void download(const QString& path, const QString& outputPath, TextSuccess onSuccess, Failure onFailure);
 
+signals:
+    void connectionStateChanged(const QString& state);
+    void requestFailed(const QString& message);
+
 private:
     QString makeUrl(const QString& path) const;
 

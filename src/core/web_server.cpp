@@ -81,10 +81,30 @@ void HttpSession::process_request()
         }
         else if (request_.method() == http::verb::get) {
             // Path-based REST routing for p2pool-compatible endpoints
-            std::string target(request_.target());
+            std::string raw_target(request_.target());
+            std::string target(raw_target);
             // Strip query string
             auto qpos = target.find('?');
             if (qpos != std::string::npos) target = target.substr(0, qpos);
+
+            auto getQueryParam = [&raw_target](const std::string& key) -> std::string {
+                const auto qp = raw_target.find('?');
+                if (qp == std::string::npos) {
+                    return {};
+                }
+                const std::string query = raw_target.substr(qp + 1);
+                const std::string prefix = key + "=";
+                auto pos = query.find(prefix);
+                if (pos == std::string::npos) {
+                    return {};
+                }
+                pos += prefix.size();
+                auto end = query.find('&', pos);
+                if (end == std::string::npos) {
+                    end = query.size();
+                }
+                return query.substr(pos, end - pos);
+            };
 
             nlohmann::json rest_result;
             if (target == "/local_rate")
@@ -109,6 +129,16 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_global_stats();
             else if (target == "/sharechain/stats")
                 rest_result = mining_interface_->rest_sharechain_stats();
+            else if (target == "/control/mining/start")
+                rest_result = mining_interface_->rest_control_mining_start();
+            else if (target == "/control/mining/stop")
+                rest_result = mining_interface_->rest_control_mining_stop();
+            else if (target == "/control/mining/restart")
+                rest_result = mining_interface_->rest_control_mining_restart();
+            else if (target == "/control/mining/ban")
+                rest_result = mining_interface_->rest_control_mining_ban(getQueryParam("target"));
+            else if (target == "/control/mining/unban")
+                rest_result = mining_interface_->rest_control_mining_unban(getQueryParam("target"));
             else
                 rest_result = mining_interface_->getinfo();
 
@@ -1724,6 +1754,12 @@ nlohmann::json MiningInterface::rest_stratum_stats()
     // Recent submissions
     result["shares_per_minute"] = 0.0;
     result["last_share_time"] = static_cast<uint64_t>(std::time(nullptr));
+
+    {
+        std::lock_guard<std::mutex> lock(m_control_mutex);
+        result["mining_enabled"] = m_mining_enabled;
+        result["banned_count"] = static_cast<uint64_t>(m_banned_targets.size());
+    }
     
     return result;
 }
@@ -1785,6 +1821,67 @@ nlohmann::json MiningInterface::rest_sharechain_stats()
     result["timeline"] = timeline;
     
     return result;
+}
+
+nlohmann::json MiningInterface::rest_control_mining_start()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = true;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "start"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_stop()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = false;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "stop"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_restart()
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    m_mining_enabled = true;
+    return nlohmann::json::object({
+        {"ok", true},
+        {"action", "restart"},
+        {"mining_enabled", m_mining_enabled}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_ban(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    if (!target.empty()) {
+        m_banned_targets.insert(target);
+    }
+    return nlohmann::json::object({
+        {"ok", !target.empty()},
+        {"action", "ban"},
+        {"target", target},
+        {"banned_count", static_cast<uint64_t>(m_banned_targets.size())}
+    });
+}
+
+nlohmann::json MiningInterface::rest_control_mining_unban(const std::string& target)
+{
+    std::lock_guard<std::mutex> lock(m_control_mutex);
+    if (!target.empty()) {
+        m_banned_targets.erase(target);
+    }
+    return nlohmann::json::object({
+        {"ok", !target.empty()},
+        {"action", "unban"},
+        {"target", target},
+        {"banned_count", static_cast<uint64_t>(m_banned_targets.size())}
+    });
 }
 
 void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts)

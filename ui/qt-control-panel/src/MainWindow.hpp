@@ -26,6 +26,7 @@ private:
     ApiClient api_;
 
     QLineEdit* baseUrlEdit_;
+    QLabel* connectionStateLabel_;
     QLabel* statusLabel_;
     QListWidget* navList_;
     QStackedWidget* stack_;

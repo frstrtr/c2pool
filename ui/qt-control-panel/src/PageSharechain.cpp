@@ -215,7 +215,7 @@ void PageSharechain::updateChartData(const QJsonObject& stats)
                 auto* pctItem = new QTableWidgetItem(QString::number(pct, 'f', 2) + "%");
                 minerTable_->setItem(row, 2, pctItem);
                 
-                std::string bar = std::string(static_cast<int>(pct / 5), '█');
+                std::string bar = std::string(static_cast<int>(pct / 5), '#');
                 auto* barItem = new QTableWidgetItem(QString::fromStdString(bar));
                 barItem->setFont(QFont("Courier", 9));
                 minerTable_->setItem(row, 3, barItem);

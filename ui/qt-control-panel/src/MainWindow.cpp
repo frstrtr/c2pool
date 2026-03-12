@@ -24,6 +24,10 @@ MainWindow::MainWindow(QWidget* parent)
     topBar->addWidget(applyButton);
     topBar->addWidget(refreshButton);
 
+    topBar->addSeparator();
+    connectionStateLabel_ = new QLabel("API: unknown", this);
+    topBar->addWidget(connectionStateLabel_);
+
     statusLabel_ = new QLabel("Idle", this);
     topBar->addSeparator();
     topBar->addWidget(statusLabel_);
@@ -65,6 +69,19 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(refreshButton, &QPushButton::clicked, this, [this]() {
         refreshCurrentPage();
+    });
+
+    connect(&api_, &ApiClient::connectionStateChanged, this, [this](const QString& state) {
+        connectionStateLabel_->setText(QString("API: %1").arg(state));
+        if (state == "online") {
+            connectionStateLabel_->setStyleSheet("color: #1d7f3b;");
+        } else {
+            connectionStateLabel_->setStyleSheet("color: #b04020;");
+        }
+    });
+
+    connect(&api_, &ApiClient::requestFailed, this, [this](const QString& message) {
+        statusLabel_->setText(message);
     });
 
     refreshTimer_.setInterval(5000);
