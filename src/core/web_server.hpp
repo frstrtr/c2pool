@@ -129,6 +129,10 @@ public:
     nlohmann::json rest_control_mining_ban(const std::string& target);
     nlohmann::json rest_control_mining_unban(const std::string& target);
 
+    // Log endpoints for Qt PageLogs — read directly from debug.log
+    std::string rest_web_log();
+    std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
+
     // Track a found block for the /recent_blocks endpoint
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
     

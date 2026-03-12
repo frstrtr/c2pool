@@ -17,9 +17,11 @@
 #include <ctime>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <boost/process.hpp>
 #include <boost/algorithm/string.hpp>
 #include "btclibs/base58.h"
+#include "filesystem.hpp"
 
 namespace core {
 
@@ -139,6 +141,29 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_control_mining_ban(getQueryParam("target"));
             else if (target == "/control/mining/unban")
                 rest_result = mining_interface_->rest_control_mining_unban(getQueryParam("target"));
+            else if (target == "/web/log") {
+                // Return plain text log (not JSON)
+                response.set(http::field::content_type, "text/plain; charset=utf-8");
+                response.body() = mining_interface_->rest_web_log();
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
+            else if (target == "/logs/export") {
+                const std::string scope = getQueryParam("scope");
+                int64_t from_ts = 0, to_ts = 0;
+                try { from_ts = std::stoll(getQueryParam("from")); } catch (...) {}
+                try { to_ts = std::stoll(getQueryParam("to")); } catch (...) {}
+                const std::string fmt = getQueryParam("format");
+                response.set(http::field::content_type,
+                    (fmt == "csv") ? "text/csv; charset=utf-8" :
+                    (fmt == "jsonl") ? "application/x-ndjson; charset=utf-8" :
+                    "text/plain; charset=utf-8");
+                response.body() = mining_interface_->rest_logs_export(scope, from_ts, to_ts, fmt);
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
             else
                 rest_result = mining_interface_->getinfo();
 
@@ -1885,6 +1910,80 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     m_found_blocks.insert(m_found_blocks.begin(), FoundBlock{height, hash.GetHex(), ts});
     if (m_found_blocks.size() > 100)
         m_found_blocks.resize(100);
+}
+
+// ── Log endpoints (read directly from debug.log) ───────────────────────
+
+static std::string tail_file(const std::filesystem::path& path, size_t max_lines)
+{
+    std::ifstream f(path, std::ios::ate);
+    if (!f.is_open()) return {};
+
+    const auto size = f.tellg();
+    if (size <= 0) return {};
+
+    // Scan backwards for newlines
+    std::string result;
+    size_t lines = 0;
+    std::streamoff pos = size;
+    while (pos > 0 && lines <= max_lines) {
+        --pos;
+        f.seekg(pos);
+        char c;
+        f.get(c);
+        if (c == '\n' && pos + 1 < size)
+            ++lines;
+    }
+    if (pos > 0) {
+        // skip the newline we're on
+        f.seekg(pos + 1);
+    } else {
+        f.seekg(0);
+    }
+    result.resize(static_cast<size_t>(size - f.tellg()));
+    f.read(result.data(), static_cast<std::streamsize>(result.size()));
+    return result;
+}
+
+std::string MiningInterface::rest_web_log()
+{
+    auto path = core::filesystem::config_path() / "debug.log";
+    return tail_file(path, 500);
+}
+
+std::string MiningInterface::rest_logs_export(const std::string& scope,
+                                               int64_t /*from_ts*/, int64_t /*to_ts*/,
+                                               const std::string& format)
+{
+    // Read all lines, optionally filter by scope keyword
+    auto path = core::filesystem::config_path() / "debug.log";
+    std::ifstream f(path);
+    if (!f.is_open()) return "# log file not found\n";
+
+    std::string out;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Scope filter: if scope is "node","stratum","security" etc, check if keyword appears
+        if (!scope.empty() && scope != "all") {
+            std::string upper_scope = scope;
+            for (auto& c : upper_scope) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (line.find(upper_scope) == std::string::npos &&
+                line.find(scope) == std::string::npos)
+                continue;
+        }
+        if (format == "csv") {
+            out += "0," + scope + "," + line + '\n';
+        } else if (format == "jsonl") {
+            nlohmann::json j;
+            j["ts"] = 0;
+            j["scope"] = scope;
+            j["line"] = line;
+            out += j.dump() + '\n';
+        } else {
+            out += line + '\n';
+        }
+    }
+    return out;
 }
 
 void MiningInterface::set_pool_fee_percent(double fee_percent)

@@ -94,3 +94,9 @@ target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
 add_subdirectory(ltc)
 add_subdirectory(payout)
+
+# core's web_server.cpp references symbols from c2pool_payout, c2pool_hashrate,
+# and secp256k1, so expose them transitively so any target linking core also
+# picks them up (fixes link ordering for test executables).
+# NOTE: uses plain signature to match core/CMakeLists.txt's style.
+target_link_libraries(core c2pool_payout c2pool_hashrate c2pool_merged_mining ltc ${SECP256K1_LIBRARIES})
