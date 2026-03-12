@@ -62,7 +62,7 @@ struct Matcher
     using request_func = std::function<void(RequestArgs...)>;
     using wrapper_type = ResponseWrapper<response_func>;
 
-    const int TIMEOUT = 5;
+    int m_timeout{5};
 
     boost::asio::io_context* m_context;
 
@@ -72,14 +72,15 @@ struct Matcher
     // response_func m_resp;
 
 
-    Matcher(boost::asio::io_context* context, request_func req) : m_context(context), m_req(req) { }
+    Matcher(boost::asio::io_context* context, request_func req, int timeout_sec = 5)
+        : m_timeout(timeout_sec), m_context(context), m_req(req) { }
 
     void request(id_type id, response_func resp, RequestArgs... args)
     {
         if (!m_watchers.contains(id))
         {
             auto timer = std::make_unique<core::Timer>(m_context);
-            timer->start(TIMEOUT, [&, id = id](){ m_watchers.erase(id); });
+            timer->start(m_timeout, [&, id = id](){ m_watchers.erase(id); });
 
             // auto wrapper = wrapper_type(resp, std::move(timer));
             m_watchers[id] = wrapper_type(resp, std::move(timer));

@@ -18,7 +18,7 @@ namespace p2p
     
 class Connection
 {
-// TODO: add timeout
+    static constexpr int REQUEST_TIMEOUT_SEC = 15;
     using get_block_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockType>::REQUEST<uint256>;
     using get_header_t = ReplyMatcher::ID<uint256>::RESPONSE<BlockHeaderType>::REQUEST<uint256>;
     
@@ -52,8 +52,8 @@ public:
 
     void init_requests(std::function<void(uint256)> block_req, std::function<void(uint256)> header_req)
     {
-        m_get_block = new get_block_t(m_context, block_req);
-        m_get_header = new get_header_t(m_context, header_req);
+        m_get_block = new get_block_t(m_context, block_req, REQUEST_TIMEOUT_SEC);
+        m_get_header = new get_header_t(m_context, header_req, REQUEST_TIMEOUT_SEC);
     }
 
     void request_block(uint256 id, uint256 hash, std::function<void(BlockType)> handler);

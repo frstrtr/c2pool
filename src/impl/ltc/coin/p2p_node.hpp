@@ -44,15 +44,22 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
     using config_t = ConfigType;
 
 private:
+    static constexpr time_t CONNECT_TIMEOUT_SEC = 10;
+    static constexpr time_t IDLE_TIMEOUT_SEC = 100;
+    static constexpr time_t PING_INTERVAL_SEC = 30;
+
     ltc::interfaces::Node* m_coin;
     io::io_context* m_context;
     config_t* m_config;
     p2p::Handler m_handler;
 
-    std::unique_ptr<Connection> m_peer; // TODO: add ping
+    std::unique_ptr<Connection> m_peer;
     std::unique_ptr<core::Timer> m_reconnect_timer;
+    std::unique_ptr<core::Timer> m_ping_timer;
+    std::unique_ptr<core::Timer> m_timeout_timer;
     NetService m_target_addr;
     bool m_reconnect_enabled = false;
+    bool m_handshake_complete = false;
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -86,7 +93,14 @@ public:
     void connected(std::shared_ptr<core::Socket> socket) override
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
+        m_handshake_complete = false;
         LOG_INFO << "P2P connected to " << m_target_addr.to_string();
+
+        // Require version/verack progress soon after connect.
+        ensure_timeout_timer();
+        m_timeout_timer->start(CONNECT_TIMEOUT_SEC, [this]() {
+            timeout("handshake timeout");
+        });
 
         // TODO: LEGACY REWORK!
 
@@ -143,7 +157,10 @@ public:
 
     void disconnect() override
     {
-        
+        stop_ping_timer();
+        stop_timeout_timer();
+        m_handshake_complete = false;
+        m_peer.reset();
     }
 
     // ICommmunicator
@@ -161,6 +178,10 @@ public:
         {
             LOG_ERROR << "\tpeers not exist " << service.to_string();
         }
+
+        stop_ping_timer();
+        stop_timeout_timer();
+        m_handshake_complete = false;
     }
 
     void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override
@@ -170,6 +191,8 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
+        on_activity();
+
         p2p::Handler::result_t result;
         try 
         {
@@ -256,6 +279,55 @@ public:
     //[x][x][x] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
 
 private:
+    void ensure_timeout_timer()
+    {
+        if (!m_timeout_timer)
+            m_timeout_timer = std::make_unique<core::Timer>(m_context, false);
+    }
+
+    void ensure_ping_timer()
+    {
+        if (!m_ping_timer)
+            m_ping_timer = std::make_unique<core::Timer>(m_context, true);
+    }
+
+    void stop_timeout_timer()
+    {
+        if (m_timeout_timer)
+            m_timeout_timer->stop();
+    }
+
+    void stop_ping_timer()
+    {
+        if (m_ping_timer)
+            m_ping_timer->stop();
+    }
+
+    void on_activity()
+    {
+        if (!m_peer)
+            return;
+
+        ensure_timeout_timer();
+        auto timeout = m_handshake_complete ? IDLE_TIMEOUT_SEC : CONNECT_TIMEOUT_SEC;
+        m_timeout_timer->restart(timeout);
+    }
+
+    void timeout(const char* reason)
+    {
+        auto endpoint = m_peer ? m_peer->get_addr() : m_target_addr;
+        error(std::string("peer timeout: ") + reason, endpoint);
+    }
+
+    void send_ping()
+    {
+        if (!m_peer || !m_handshake_complete)
+            return;
+
+        auto msg_ping = message_ping::make_raw(core::random::random_nonce());
+        m_peer->write(msg_ping);
+    }
+
     ADD_P2P_HANDLER(version)
     {
         LOG_INFO << "version is?: " << msg->m_command;
@@ -279,8 +351,14 @@ private:
             }
         );
 
-        // TODO: PING
-        // connected()
+        m_handshake_complete = true;
+        ensure_timeout_timer();
+        m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
+
+        ensure_ping_timer();
+        m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
+            send_ping();
+        });
     }
 
     ADD_P2P_HANDLER(ping)

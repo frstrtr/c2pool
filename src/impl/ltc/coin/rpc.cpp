@@ -1,5 +1,7 @@
 #include "rpc.hpp"
 
+#include <impl/ltc/config_pool.hpp>
+
 #include <core/log.hpp>
 #include <core/hash.hpp>
 namespace ltc
@@ -138,6 +140,7 @@ bool NodeRPC::check()
 {
 	bool has_block = check_blockheader(uint256S("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"));
 	bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
+	nlohmann::json blockchaininfo;
 
 	if (is_main_chain && !has_block)
 	{
@@ -162,39 +165,79 @@ bool NodeRPC::check()
 
     try 
     {
-	    auto blockchaininfo = getblockchaininfo();
+	    blockchaininfo = getblockchaininfo();
     } catch (const jsonrpccxx::JsonRpcException& ex)
     {
         return false;
     }
 
-	// set<string> softforsk_supported;
-	//TODO: check softforks, move to try-catch upper:
-	// if (blockchaininfo["error"].isNull()) 
-	// {
-	// 	// try:
-	// 	//     softforks_supported = set(item['id'] for item in blockchaininfo.get('softforks', [])) # not working with 0.19.0.1
-	// 	// except TypeError:
-	// 	//     softforks_supported = set(item for item in blockchaininfo.get('softforks', [])) # fix for https://github.com/jtoomim/p2pool/issues/38
-	// 	// try:
-	// 	//     softforks_supported |= set(item['id'] for item in blockchaininfo.get('bip9_softforks', []))
-	// 	// except TypeError: # https://github.com/bitcoin/bitcoin/pull/7863
-	// 	//     softforks_supported |= set(item for item in blockchaininfo.get('bip9_softforks', []))
-	// }
-	// unsupported_forks = getattr(net, 'SOFTFORKS_REQUIRED', set()) - softforks_supported
+	std::set<std::string> softforks_supported;
 
-	/*
-	if unsupported_forks:
-	print "You are running a coin daemon that does not support all of the "
-	print "forking features that have been activated on this blockchain."
-	print "Consequently, your node may mine invalid blocks or may mine blocks that"
-	print "are not part of the Nakamoto consensus blockchain.\n"
-	print "Missing fork features:", ', '.join(unsupported_forks)
-	if not args.allow_obsolete_bitcoind:
-		print "\nIf you know what you're doing, this error may be overridden by running p2pool"
-		print "with the '--allow-obsolete-bitcoind' command-line option.\n\n\n"
-		raise deferral.RetrySilentlyException()
-	*/
+	auto collect_softfork_names = [&](const nlohmann::json& value)
+	{
+		if (value.is_array())
+		{
+			for (const auto& item : value)
+			{
+				if (item.is_object() && item.contains("id") && item["id"].is_string())
+					softforks_supported.insert(item["id"].get<std::string>());
+				else if (item.is_string())
+					softforks_supported.insert(item.get<std::string>());
+			}
+		} else if (value.is_object())
+		{
+			for (auto it = value.begin(); it != value.end(); ++it)
+				softforks_supported.insert(it.key());
+		}
+	};
+
+	if (blockchaininfo.contains("softforks"))
+		collect_softfork_names(blockchaininfo["softforks"]);
+	if (blockchaininfo.contains("bip9_softforks"))
+		collect_softfork_names(blockchaininfo["bip9_softforks"]);
+
+	// Fallback for daemons that don't populate getblockchaininfo softfork fields.
+	if (softforks_supported.empty())
+	{
+		try
+		{
+			auto gbt = getblocktemplate({"segwit", "mweb"});
+			if (gbt.contains("rules") && gbt["rules"].is_array())
+			{
+				for (const auto& rule : gbt["rules"])
+				{
+					if (!rule.is_string()) continue;
+					auto r = rule.get<std::string>();
+					if (!r.empty() && r[0] == '!') r.erase(r.begin());
+					softforks_supported.insert(r);
+				}
+			}
+		}
+		catch (const std::exception&)
+		{
+			// Keep empty set; missing forks check below will fail safely.
+		}
+	}
+
+	std::vector<std::string> missing;
+	for (const auto& req : ltc::PoolConfig::SOFTFORKS_REQUIRED)
+	{
+		if (!softforks_supported.contains(req))
+			missing.push_back(req);
+	}
+
+	if (!missing.empty())
+	{
+		std::string joined;
+		for (size_t i = 0; i < missing.size(); ++i)
+		{
+			if (i) joined += ", ";
+			joined += missing[i];
+		}
+		LOG_ERROR << "Coin daemon missing required softfork features: " << joined;
+		LOG_ERROR << "Refusing to start to avoid mining invalid/non-consensus blocks.";
+		return false;
+	}
 
 	return true;
 }
