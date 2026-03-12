@@ -27,7 +27,7 @@ cmake --build build-qt-mvp -j4
 
 Default API base URL in the app:
 
-- http://127.0.0.1:9332
+- http://127.0.0.1:8080 (separate port to avoid stratum conflict)
 
 Use the top bar to change base URL and refresh pages.
 

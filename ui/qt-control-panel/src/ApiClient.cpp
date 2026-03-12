@@ -6,7 +6,7 @@
 #include <QUrl>
 
 ApiClient::ApiClient(QObject* parent)
-    : QObject(parent), baseUrl_("http://127.0.0.1:9332")
+    : QObject(parent), baseUrl_("http://127.0.0.1:8080")
 {
 }
 

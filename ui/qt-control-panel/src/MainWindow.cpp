@@ -14,7 +14,7 @@ MainWindow::MainWindow(QWidget* parent)
     auto* topBar = addToolBar("Connection");
     topBar->setMovable(false);
 
-    baseUrlEdit_ = new QLineEdit("http://127.0.0.1:9332", this);
+    baseUrlEdit_ = new QLineEdit("http://127.0.0.1:8080", this);
     baseUrlEdit_->setMinimumWidth(320);
     topBar->addWidget(new QLabel("Base URL:", this));
     topBar->addWidget(baseUrlEdit_);
