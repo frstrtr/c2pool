@@ -80,10 +80,11 @@ public:
 
     // ICommunicator (override BaseNode to track outbound lifecycle):
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override;
+    void close_connection(const NetService& service) override;
 
     // BaseNode:
     void send_ping(peer_ptr peer) override;
-    pool::PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
+    std::optional<pool::PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
 
     // ltc
     void send_version(peer_ptr peer);

@@ -84,6 +84,13 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     base_t::error(err, service, where);
 }
 
+void NodeImpl::close_connection(const NetService& service)
+{
+    m_pending_outbound.erase(service);
+    m_outbound_addrs.erase(service);
+    base_t::close_connection(service);
+}
+
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
@@ -99,7 +106,7 @@ void NodeImpl::send_version(peer_ptr peer)
     peer->write(std::move(rmsg));
 }
 
-pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
+std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 {
     LOG_DEBUG_POOL << "handle message_version";
         std::unique_ptr<ltc::message_version> msg;
@@ -125,13 +132,13 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
         if (m_nonce == msg->m_nonce)
         {
                 LOG_WARNING << "was connected to self";
-                throw std::runtime_error("was connected to self");
+                return std::nullopt;
         }
 
         if (m_peers.contains(msg->m_nonce))
         {
-                LOG_DEBUG_POOL << "[handle_message_version] Detected duplicate connection, disconnecting from " << peer->addr().to_string();
-                throw std::runtime_error("duplicate connection");
+                LOG_DEBUG_POOL << "Detected duplicate connection, disconnecting from " << peer->addr().to_string();
+                return std::nullopt;
         }
 
         peer->m_nonce = msg->m_nonce;
@@ -172,7 +179,7 @@ pool::PeerConnectionType NodeImpl::handle_version(std::unique_ptr<RawMessage> rm
 
         return pool::PeerConnectionType::legacy;
 }
-    
+
 void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 {
     // Step 1: Compute hashes for all shares FIRST so PreparedList can sort them.

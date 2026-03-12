@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <optional>
 #include <source_location>
 
 #include <pool/peer.hpp>
@@ -59,7 +60,7 @@ protected:
 
     uint64_t m_nonce; // node_id todo: init
     std::map<NetService, peer_ptr> m_connections;
-    std::map<int, peer_ptr> m_peers; // key = peers nonce
+    std::map<uint64_t, peer_ptr> m_peers; // key = peers nonce
 
     std::unique_ptr<core::Timer> m_ping_timer;
 
@@ -124,6 +125,19 @@ public:
         error("peer timeout!", service);
     }
 
+    /// Gracefully close a connection without error logging.
+    /// Used for expected disconnects (duplicate connections, self-connections).
+    virtual void close_connection(const NetService& service)
+    {
+        if (m_connections.contains(service))
+        {
+            auto peer = m_connections.extract(service);
+            peer.mapped()->m_timeout->stop();
+            peer.mapped()->cancel();
+            peer.mapped()->close();
+        }
+    }
+
     void got_addr(NetService addr, uint64_t services, uint64_t timestamp)
     {
     	if (m_addrs.check(addr))
@@ -165,7 +179,7 @@ public:
     }
 
     virtual void send_ping(peer_ptr peer) = 0;
-    virtual PeerConnectionType handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
+    virtual std::optional<PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) = 0;
 };
 
 // Legacy -- p2pool; Actual -- c2pool
@@ -188,7 +202,7 @@ public:
             if (rmsg->m_command.compare(0, 7, "version") != 0)
                 return Base::error("message wanna for be version", service);
 
-            PeerConnectionType peer_type = unknown;
+            std::optional<PeerConnectionType> peer_type;
             try
             {
                 peer_type = Base::handle_version(std::move(rmsg), peer);
@@ -197,8 +211,13 @@ public:
                 Base::error(ex.what(), service);
                 return;
             }
-            assert(peer_type != PeerConnectionType::unknown); // peer_type is "unknown" after message_version!
-            peer->stable(peer_type, Base::PEER_TIMEOUT_TIME); // after message_version a stable connection is established.
+            if (!peer_type.has_value())
+            {
+                // Graceful disconnect (duplicate or self-connection)
+                Base::close_connection(service);
+                return;
+            }
+            peer->stable(*peer_type, Base::PEER_TIMEOUT_TIME); // after message_version a stable connection is established.
             return;
         }
 
