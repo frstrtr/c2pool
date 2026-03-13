@@ -175,8 +175,8 @@ const C2PoolAPI = (() => {
 
     return {
         // Native endpoints
-        localRate, globalRate, payouts, users, fee, recentBlocks, uptime,
-        miners, stratumStats, globalStats, sharechainStats, sharechainWindow,
+        localRate, globalRate, payouts, currentPayouts: payouts, users, fee, recentBlocks, uptime,
+        miners, connectedMiners: miners, stratumStats, globalStats, sharechainStats, sharechainWindow,
         webLog,
         // Legacy p2pool endpoints
         localStats, p2poolGlobalStats: p2poolGlobalStats, version, currencyInfo,
@@ -194,7 +194,7 @@ const C2PoolAPI = (() => {
         broadcasterStatus, mergedBroadcasterStatus,
         // /web/ sub-endpoints
         webHeads, webVerifiedHeads, webTails, webVerifiedTails,
-        webMyShareHashes, webMyShareHashes50, webShare, webPayoutAddress,
+        webMyShareHashes, webMyShareHashes50, myShareHashes50: webMyShareHashes50, webShare, webPayoutAddress,
         webLogJson, webGraphData,
         // Control
         controlStart, controlStop, controlRestart,

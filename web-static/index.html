@@ -9,285 +9,593 @@
 </head>
 <body>
 
-<div class="header">
-    <h1>
-        &#x26CF; c2pool <span class="coin-symbol">LTC</span>
-        <span class="badge" id="net-badge">testnet</span>
-    </h1>
-    <nav>
-        <a href="index.html" class="active">Dashboard</a>
-        <a href="graphs.html">Graphs</a>
-        <a href="share.html">Share Explorer</a>
-    </nav>
-</div>
+<header>
+    <div class="header-content">
+        <div class="logo">
+            <h1>c2pool</h1>
+            <span class="symbol-badge" id="header-symbol">LTC</span>
+            <span class="version-tag" id="header-version">c2pool/0.0.1</span>
+        </div>
+        <nav>
+            <a href="index.html" class="active">Dashboard</a>
+            <a href="graphs.html">Graphs</a>
+            <a href="share.html">Share Explorer</a>
+            <button class="refresh-btn" id="btn-refresh" onclick="manualRefresh()">&#x1F504; Refresh</button>
+            <button class="refresh-btn auto-refresh-btn active" id="btn-auto" onclick="toggleAutoRefresh()">Auto-Refresh: ON</button>
+        </nav>
+    </div>
+</header>
 
 <div class="container">
 
-    <div id="warnings"></div>
-
-    <!-- ── Key metrics ───────────────────────────────── -->
-    <div class="grid">
-        <div class="card">
-            <h3>Pool Hashrate</h3>
-            <div class="value" id="pool-rate">—</div>
-            <div class="sub"><span class="status-dot green"></span>Local</div>
+    <!-- ── Sub-header: Miner Config + Network Info ────── -->
+    <div class="sub-header">
+        <div class="miner-config">
+            <h3>&#x26CF; Miner Configuration</h3>
+            <div class="config-row">
+                <span class="config-label">Stratum URL:</span>
+                <span class="config-value" id="stratum-url">stratum+tcp://HOST:<span id="stratum-port">9327</span></span>
+            </div>
+            <div class="config-row">
+                <span class="config-label">Username:</span>
+                <span class="config-value">&lt;<span id="cfg-symbol">LTC</span>_ADDR&gt;.WORKER</span>
+            </div>
+            <div class="config-row">
+                <span class="config-label">Password:</span>
+                <span class="config-value">anything</span>
+            </div>
         </div>
-        <div class="card">
-            <h3>Network Hashrate</h3>
-            <div class="value" id="net-rate">—</div>
-            <div class="sub">Global difficulty</div>
-        </div>
-        <div class="card">
-            <h3>Connected Miners</h3>
-            <div class="value" id="miner-count">—</div>
-            <div class="sub" id="miner-sub">Active workers</div>
-        </div>
-        <div class="card">
-            <h3>Block Value</h3>
-            <div class="value" id="block-value">—</div>
-            <div class="sub"><span class="coin-symbol">LTC</span></div>
-        </div>
-        <div class="card">
-            <h3>Uptime</h3>
-            <div class="value" id="uptime">—</div>
-            <div class="sub">Node running</div>
-        </div>
-        <div class="card">
-            <h3>Pool Fee</h3>
-            <div class="value" id="pool-fee">—</div>
-            <div class="sub">Operator fee</div>
-        </div>
-        <div class="card">
-            <h3>Shares</h3>
-            <div class="value" id="shares-total">—</div>
-            <div class="sub" id="shares-sub">in chain</div>
-        </div>
-        <div class="card">
-            <h3>Best Share</h3>
-            <div class="value" id="best-share">—</div>
-            <div class="sub">Chain tip</div>
+        <div class="network-info">
+            <h3>&#x1F517; Network</h3>
+            <div class="info-row">
+                <span class="info-label">Peers:</span>
+                <span id="peers-summary">0 (Out: 0 | In: 0)</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Uptime:</span>
+                <span id="uptime-display">-</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Network:</span>
+                <span id="network-name">-</span>
+            </div>
         </div>
     </div>
 
-    <!-- ── Payout info ───────────────────────────────── -->
-    <div class="card wide">
-        <h3>Your Payout (if a block were found now)</h3>
-        <div style="margin-top:8px">
-            <span id="payout-addr-display" style="font-family:var(--mono);font-size:0.85rem;color:var(--accent)"></span>
-            <span id="payout-amount" style="font-family:var(--mono);font-size:1.2rem;margin-left:12px;font-weight:600"></span>
-            <span class="coin-symbol" style="font-size:0.9rem;color:var(--text-dim)">LTC</span>
+    <!-- ── Warnings ──────────────────────────────────── -->
+    <div class="warnings" id="warnings"></div>
+
+    <div class="last-update">Last update: <span id="last-update-time">-</span></div>
+
+    <!-- ── Main Layout: left stat column + right column ── -->
+    <div class="main-layout">
+
+        <!-- Left Column: P2Pool Hash Rate + Miners Block Value + Node Fee -->
+        <div class="left-column">
+            <div class="stat-card">
+                <h3><span class="icon">&#x1F310;</span> P2Pool Hash Rate</h3>
+                <div class="stat-value primary" id="pool-rate">-</div>
+                <div class="stat-sub">DOA+Orphan: <span id="pool-stale">-</span></div>
+                <div class="stat-detail">Share Difficulty: <span id="share-difficulty">-</span></div>
+            </div>
+
+            <div class="stat-card">
+                <h3><span class="icon">&#x1F4B0;</span> Miners Block Value</h3>
+                <div class="stat-value warning" id="block-value">-</div>
+                <div class="stat-detail">Expected: <span id="time-to-block">-</span></div>
+            </div>
+
+            <div class="stat-card">
+                <h3><span class="icon">&#x1F48E;</span> Node Fee: <span id="node-fee-pct">-</span></h3>
+                <div class="stat-value success" id="node-payout">-</div>
+                <div class="stat-detail">Per block found now</div>
+            </div>
+        </div>
+
+        <!-- Right Column: top stats row + bottom tables -->
+        <div class="right-column">
+            <!-- Top Stats Row: Local Hash Rate, Shares, Best Share -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3><span class="icon">&#x26CF;</span> Local Hash Rate</h3>
+                    <div class="stat-value success" id="local-rate">-</div>
+                    <div class="stat-sub">DOA: <span id="local-doa">0.0%</span></div>
+                    <div class="stat-detail">Expected Share: <span id="time-to-share">-</span></div>
+                </div>
+
+                <div class="stat-card">
+                    <h3><span class="icon">&#x1F4CA;</span> Shares</h3>
+                    <div class="stat-value" id="shares-total">-</div>
+                    <div class="stat-sub">Orphan: <span id="shares-orphan">0</span> | Dead: <span id="shares-dead">0</span></div>
+                    <div class="stat-detail">Efficiency: <span id="efficiency">-</span></div>
+                </div>
+
+                <div class="stat-card">
+                    <h3><span class="icon">&#x1F3AF;</span> Best Share</h3>
+                    <div class="stat-value primary" id="best-share-pct">-</div>
+                    <div class="stat-sub" id="best-share-diff">-</div>
+                    <div class="stat-detail">&#x1F3C6; <span id="best-share-alltime">-</span></div>
+                </div>
+            </div>
+
+            <!-- Active Miners Table -->
+            <div class="table-container">
+                <div class="section-header">
+                    <h2>&#x26CF; Active Miners <span style="font-size:14px;color:var(--text-muted);font-weight:normal">(Connected via Stratum)</span></h2>
+                    <span class="badge" id="active-miners-count">0</span>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Address / Worker</th>
+                            <th>Hashrate</th>
+                            <th>Accepted</th>
+                            <th>Rejected</th>
+                            <th>Last Seen</th>
+                        </tr>
+                    </thead>
+                    <tbody id="miners-table"></tbody>
+                </table>
+                <div class="empty-state" id="no-miners">No miners connected via stratum.</div>
+            </div>
         </div>
     </div>
 
-    <!-- ── Recent blocks ─────────────────────────────── -->
-    <div class="card wide" style="margin-top:16px">
-        <h3>Blocks Found Recently</h3>
-        <table style="margin-top:8px">
+    <!-- ── Two-column: Recent Blocks + Current Payouts ── -->
+    <div class="two-col">
+        <!-- Recent Blocks -->
+        <div class="table-container table-panel">
+            <div class="section-header" style="flex-wrap:wrap;flex-direction:column;align-items:flex-start;gap:6px">
+                <h2>&#x1F3C6; Recent Blocks</h2>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <span class="badge" id="blocks-count">0</span>
+                    <span class="luck-badge" id="luck-7d" style="background:var(--primary);color:#fff;display:none">7d: -</span>
+                    <span class="luck-badge" id="luck-30d" style="background:var(--primary);color:#fff;display:none">30d: -</span>
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Height</th>
+                        <th>Block Hash</th>
+                        <th>Luck</th>
+                        <th>&#x2713;</th>
+                    </tr>
+                </thead>
+                <tbody id="blocks-table"></tbody>
+            </table>
+            <div class="empty-state" id="no-blocks">No blocks found yet.</div>
+        </div>
+
+        <!-- Current Payouts -->
+        <div class="table-container table-panel">
+            <div class="section-header">
+                <h2>&#x1F4B8; Current Payouts</h2>
+                <span class="badge" id="payouts-count">0</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Address</th>
+                        <th>Amount</th>
+                    </tr>
+                </thead>
+                <tbody id="payouts-table"></tbody>
+            </table>
+            <div class="empty-state" id="no-payouts">No payout data available.</div>
+        </div>
+    </div>
+
+    <!-- ── P2Pool Nodes (Peers) ──────────────────────── -->
+    <div class="table-container">
+        <div class="section-header">
+            <h2>&#x1F310; P2Pool Nodes</h2>
+            <span class="badge" id="peers-count">0</span>
+        </div>
+        <div class="stats-grid" style="margin-bottom:15px;grid-template-columns:repeat(3,1fr)">
+            <div style="text-align:center">
+                <div style="font-size:1.5rem;font-weight:700;color:var(--primary)" id="peers-total">0</div>
+                <div style="font-size:0.8rem;color:var(--text-muted)">Connections</div>
+            </div>
+            <div style="text-align:center">
+                <div style="font-size:1.5rem;font-weight:700;color:var(--success)" id="peers-out">0</div>
+                <div style="font-size:0.8rem;color:var(--text-muted)">Outgoing</div>
+            </div>
+            <div style="text-align:center">
+                <div style="font-size:1.5rem;font-weight:700;color:var(--warning)" id="peers-in">0</div>
+                <div style="font-size:0.8rem;color:var(--text-muted)">Incoming</div>
+            </div>
+        </div>
+        <table>
             <thead>
-                <tr><th>Time</th><th>Height</th><th>Hash</th></tr>
-            </thead>
-            <tbody id="blocks-table"></tbody>
-        </table>
-        <div id="no-blocks" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
-            No blocks found yet.
-        </div>
-    </div>
-
-    <!-- ── Payouts table ─────────────────────────────── -->
-    <div class="card wide" style="margin-top:16px">
-        <h3>PPLNS Payouts (current window)</h3>
-        <table style="margin-top:8px">
-            <thead>
-                <tr><th>Script / Address</th><th>Amount</th></tr>
-            </thead>
-            <tbody id="payouts-table"></tbody>
-        </table>
-        <div id="no-payouts" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
-            No payout data available.
-        </div>
-    </div>
-
-    <!-- ── Peers ─────────────────────────────────────── -->
-    <div class="card wide" style="margin-top:16px">
-        <h3>Connected Peers</h3>
-        <table style="margin-top:8px">
-            <thead>
-                <tr><th>Address</th><th>Version</th><th>Direction</th><th>Uptime</th><th>TxPool</th></tr>
+                <tr>
+                    <th>Address</th>
+                    <th>Version</th>
+                    <th>Direction</th>
+                    <th>Uptime</th>
+                    <th>TxPool</th>
+                </tr>
             </thead>
             <tbody id="peers-table"></tbody>
         </table>
-        <div id="no-peers" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
-            No peers connected.
-        </div>
+        <div class="empty-state" id="no-peers">No peers connected.</div>
     </div>
 
-    <!-- ── Node Info ─────────────────────────────────── -->
-    <div class="card wide" style="margin-top:16px">
-        <h3>Node Info</h3>
-        <div style="display:flex;flex-wrap:wrap;gap:24px;margin-top:8px;font-size:0.9rem">
-            <div><strong>Network:</strong> <span id="node-network">—</span></div>
-            <div><strong>Symbol:</strong> <span id="node-symbol">—</span></div>
-            <div><strong>P2P Port:</strong> <span id="node-p2p-port">—</span></div>
-            <div><strong>Worker Port:</strong> <span id="node-worker-port">—</span></div>
-            <div><strong>Stale Rates:</strong> Good <span id="stale-good">—</span> / Orphan <span id="stale-orphan">—</span> / Dead <span id="stale-dead">—</span></div>
+    <!-- ── Share Explorer Quick Links ────────────────── -->
+    <div class="explorer-section">
+        <div class="section-header">
+            <h2>&#x1F50D; Share Explorer</h2>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:24px;margin-top:12px">
+            <div class="explorer-field">
+                <div class="label">Best Share</div>
+                <div class="val"><a id="best-share-link" href="#">-</a></div>
+            </div>
+            <div class="explorer-field">
+                <div class="label">Chain Tip</div>
+                <div class="val"><a id="chain-tip-link" href="#">-</a></div>
+            </div>
+            <div class="explorer-field">
+                <div class="label">My Shares (last 50)</div>
+                <div class="val" id="my-shares-list">-</div>
+            </div>
         </div>
     </div>
 
 </div>
 
-<div class="footer">
+<footer>
     <span id="version-text">c2pool</span> &mdash;
     p2pool/p2pool &rarr; jtoomim/p2pool &rarr; frstrtr/c2pool &mdash;
-    <a href="https://github.com/frstrtr/c2pool" target="_blank">GitHub</a>
-</div>
+    <a href="https://github.com/frstrtr/c2pool" target="_blank" rel="noopener noreferrer">GitHub</a>
+</footer>
 
 <script>
-(async function refresh() {
-    try {
-        const data = await C2PoolAPI.fetchAll();
+"use strict";
 
-        // Currency info
-        const ci = data.currencyInfo;
-        if (ci) {
-            document.querySelectorAll(".coin-symbol").forEach(el => el.textContent = ci.symbol);
+let autoRefreshEnabled = true;
+let refreshTimer = null;
+
+function toggleAutoRefresh() {
+    autoRefreshEnabled = !autoRefreshEnabled;
+    const btn = document.getElementById("btn-auto");
+    if (autoRefreshEnabled) {
+        btn.textContent = "Auto-Refresh: ON";
+        btn.classList.add("active");
+        scheduleRefresh();
+    } else {
+        btn.textContent = "Auto-Refresh: OFF";
+        btn.classList.remove("active");
+        if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+    }
+}
+
+function scheduleRefresh() {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(async () => {
+        await doRefresh();
+        if (autoRefreshEnabled) scheduleRefresh();
+    }, 10000);
+}
+
+async function manualRefresh() {
+    await doRefresh();
+}
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+}
+
+async function doRefresh() {
+    try {
+        // Fetch all data in parallel
+        const [localRate, globalRate, fee, uptime, users, localStats, globalStats,
+               sharechainStats, payouts, recentBlocks, peerList, nodeInfo,
+               staleRates, bestShare, luckStats, connectedMiners, stratumStats,
+               currencyInfo, version, bestShareHash, myShares] = await Promise.all([
+            C2PoolAPI.localRate(),
+            C2PoolAPI.globalRate(),
+            C2PoolAPI.fee(),
+            C2PoolAPI.uptime(),
+            C2PoolAPI.users(),
+            C2PoolAPI.localStats(),
+            C2PoolAPI.globalStats(),
+            C2PoolAPI.sharechainStats(),
+            C2PoolAPI.currentPayouts(),
+            C2PoolAPI.recentBlocks(),
+            C2PoolAPI.peerList(),
+            C2PoolAPI.nodeInfo(),
+            C2PoolAPI.staleRates(),
+            C2PoolAPI.bestShare(),
+            C2PoolAPI.luckStats(),
+            C2PoolAPI.connectedMiners(),
+            C2PoolAPI.stratumStats(),
+            C2PoolAPI.currencyInfo(),
+            C2PoolAPI.version(),
+            C2PoolAPI.bestShareHash(),
+            C2PoolAPI.myShareHashes50()
+        ]);
+
+        // ── Header ──
+        const ci = currencyInfo;
+        if (ci && ci.symbol) {
+            setText("header-symbol", ci.symbol);
+            setText("cfg-symbol", ci.symbol);
             document.title = "c2pool " + ci.symbol + " Dashboard";
         }
-
-        // Key metrics
-        setText("pool-rate", C2PoolAPI.formatHashrate(data.localRate));
-        setText("net-rate", C2PoolAPI.formatHashrate(data.globalRate));
-        setText("miner-count", data.users != null ? data.users : "—");
-        setText("uptime", C2PoolAPI.formatDuration(data.uptime));
-        setText("pool-fee", data.fee != null ? data.fee + "%" : "—");
-
-        // Block value (from local_stats or sharechain_stats)
-        const ls = await C2PoolAPI.localStats();
-        if (ls && ls.block_value != null)
-            setText("block-value", parseFloat(ls.block_value).toFixed(4));
-
-        // Shares
-        if (data.sharechainStats) {
-            const sc = data.sharechainStats;
-            setText("shares-total", sc.total_shares != null ? sc.total_shares : "—");
+        if (version && version.version) setText("header-version", version.version);
+        if (version && version.testnet) {
+            const badge = document.getElementById("header-symbol");
+            if (badge) badge.style.background = "#6f42c1";
         }
 
-        // Best share hash
-        const bsh = await C2PoolAPI.bestShareHash();
-        if (bsh && bsh !== "0000000000000000000000000000000000000000000000000000000000000000")
-            setText("best-share", bsh.substring(bsh.length - 12));
-
-        // Payout addr + amount
-        const addr = await C2PoolAPI.payoutAddr();
-        const pays = data.payouts;
-        if (addr) {
-            const addrEl = document.getElementById("payout-addr-display");
-            if (ci && ci.address_explorer_url_prefix && C2PoolAPI.isSafeUrl(ci.address_explorer_url_prefix + "test")) {
-                const a = document.createElement("a");
-                a.href = ci.address_explorer_url_prefix + encodeURIComponent(addr);
-                a.target = "_blank";
-                a.rel = "noopener noreferrer";
-                a.textContent = addr;
-                addrEl.textContent = "";
-                addrEl.appendChild(a);
-            } else {
-                addrEl.textContent = addr;
-            }
-        }
-        if (pays && typeof pays === "object") {
-            let total = 0;
-            for (const k in pays) total += pays[k];
-            if (total > 0)
-                setText("payout-amount", C2PoolAPI.formatCoins(total, 6));
+        // ── Miner Config ──
+        if (nodeInfo) {
+            setText("stratum-port", nodeInfo.worker_port || "9327");
+            setText("network-name", nodeInfo.network || "-");
         }
 
-        // Warnings (from local_stats)
+        // ── Network Info ──
+        const ls = localStats;
+        if (ls && ls.peers) {
+            const total = (ls.peers.incoming || 0) + (ls.peers.outgoing || 0);
+            setText("peers-summary", total + " (Out: " + (ls.peers.outgoing || 0) + " | In: " + (ls.peers.incoming || 0) + ")");
+        }
+        setText("uptime-display", C2PoolAPI.formatDuration(uptime || (ls && ls.uptime) || 0));
+
+        // ── Warnings ──
         const warningsEl = document.getElementById("warnings");
         warningsEl.innerHTML = "";
-        if (ls && ls.warnings && ls.warnings.length > 0) {
+        if (version && version.errors && version.errors.length > 0) {
+            const div = document.createElement("div");
+            div.className = "warning-item daemon-warning";
+            div.textContent = "(from daemon) " + version.errors;
+            warningsEl.appendChild(div);
+        }
+        if (ls && ls.warnings) {
             ls.warnings.forEach(w => {
                 const div = document.createElement("div");
-                div.className = "warning";
-                div.textContent = "Warning: " + w;
+                div.className = "warning-item";
+                div.textContent = w;
                 warningsEl.appendChild(div);
             });
         }
 
-        // Recent blocks
-        const blocks = data.recentBlocks;
+        // ── Last update ──
+        setText("last-update-time", new Date().toLocaleTimeString());
+
+        // ── P2Pool Hash Rate (left column) ──
+        setText("pool-rate", C2PoolAPI.formatHashrate(globalRate || (globalStats && globalStats.pool_hashrate) || 0));
+        if (staleRates) {
+            const stale = ((staleRates.orphan || 0) + (staleRates.dead || 0)) * 100;
+            setText("pool-stale", stale.toFixed(1) + "%");
+        }
+        setText("share-difficulty", stratumStats && stratumStats.difficulty != null ? stratumStats.difficulty.toFixed(4) : "-");
+
+        // ── Miners Block Value ──
+        if (ls && ls.block_value != null) {
+            const sym = (ci && ci.symbol) || "LTC";
+            setText("block-value", parseFloat(ls.block_value).toFixed(4) + " " + sym);
+        }
+        if (ls && ls.attempts_to_block) {
+            setText("time-to-block", C2PoolAPI.formatDuration(ls.attempts_to_block));
+        }
+
+        // ── Node Fee ──
+        if (fee != null) {
+            setText("node-fee-pct", fee + "%");
+        }
+        if (ls && ls.donation_proportion != null) {
+            setText("node-fee-pct", (ls.donation_proportion * 100).toFixed(1) + "%");
+        }
+        // Node payout: fee * block_value
+        if (ls && ls.block_value != null && ls.donation_proportion != null) {
+            const payout = ls.block_value * ls.donation_proportion;
+            const sym = (ci && ci.symbol) || "LTC";
+            setText("node-payout", payout.toFixed(6) + " " + sym);
+        }
+
+        // ── Local Hash Rate ──
+        let localHashrate = localRate || 0;
+        if (ls && ls.miner_hash_rates) {
+            let sum = 0;
+            for (const k in ls.miner_hash_rates) sum += ls.miner_hash_rates[k];
+            if (sum > 0) localHashrate = sum;
+        }
+        setText("local-rate", C2PoolAPI.formatHashrate(localHashrate));
+
+        // DOA rate
+        if (ls && ls.miner_hash_rates && ls.miner_dead_hash_rates) {
+            let alive = 0, dead = 0;
+            for (const k in ls.miner_hash_rates) alive += ls.miner_hash_rates[k];
+            for (const k in ls.miner_dead_hash_rates) dead += ls.miner_dead_hash_rates[k];
+            const doa = alive > 0 ? (dead / alive * 100) : 0;
+            setText("local-doa", doa.toFixed(1) + "%");
+        }
+
+        // Time to share
+        if (ls && ls.attempts_to_share) {
+            setText("time-to-share", C2PoolAPI.formatDuration(ls.attempts_to_share));
+        }
+
+        // ── Shares ──
+        if (ls && ls.shares) {
+            setText("shares-total", ls.shares.total);
+            setText("shares-orphan", ls.shares.orphan);
+            setText("shares-dead", ls.shares.dead);
+            if (ls.efficiency != null) {
+                setText("efficiency", (ls.efficiency * 100).toFixed(1) + "%");
+            } else if (ls.shares.total > 0) {
+                const eff = (ls.shares.total - ls.shares.orphan - ls.shares.dead) / ls.shares.total * 100;
+                setText("efficiency", eff.toFixed(1) + "%");
+            }
+        }
+
+        // ── Best Share ──
+        if (bestShare) {
+            const rd = bestShare.round || {};
+            const at = bestShare.all_time || {};
+            if (rd.pct_of_block > 0) {
+                setText("best-share-pct", (rd.pct_of_block * 100).toFixed(2) + "%");
+            }
+            if (rd.difficulty > 0) {
+                setText("best-share-diff", rd.difficulty.toFixed(2) + " / " + (bestShare.network_difficulty || 0).toFixed(2));
+            }
+            if (at.pct_of_block > 0) {
+                setText("best-share-alltime", (at.pct_of_block * 100).toFixed(4) + "%");
+            }
+        }
+
+        // ── Active Miners Table ──
+        const minersTable = document.getElementById("miners-table");
+        const noMiners = document.getElementById("no-miners");
+        minersTable.innerHTML = "";
+
+        if (stratumStats && stratumStats.workers && Object.keys(stratumStats.workers).length > 0) {
+            noMiners.style.display = "none";
+            const workers = stratumStats.workers;
+            let count = 0;
+            for (const [name, w] of Object.entries(workers)) {
+                count++;
+                const tr = document.createElement("tr");
+                [name,
+                 C2PoolAPI.formatHashrate(w.hash_rate || 0),
+                 String(w.accepted || 0),
+                 String(w.rejected || 0),
+                 w.last_seen ? new Date(w.last_seen * 1000).toLocaleTimeString() : "-"
+                ].forEach(text => {
+                    const td = document.createElement("td");
+                    td.textContent = text;
+                    tr.appendChild(td);
+                });
+                minersTable.appendChild(tr);
+            }
+            setText("active-miners-count", String(count));
+        } else if (connectedMiners && connectedMiners.active_workers > 0) {
+            noMiners.style.display = "none";
+            // Fallback: show summary row
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = 5;
+            td.textContent = connectedMiners.active_workers + " worker(s) connected";
+            td.style.textAlign = "center";
+            td.style.color = "var(--text-muted)";
+            tr.appendChild(td);
+            minersTable.appendChild(tr);
+            setText("active-miners-count", String(connectedMiners.active_workers));
+        } else {
+            noMiners.style.display = "block";
+            setText("active-miners-count", "0");
+        }
+
+        // ── Recent Blocks Table ──
         const blocksTable = document.getElementById("blocks-table");
         const noBlocks = document.getElementById("no-blocks");
         blocksTable.innerHTML = "";
-        if (blocks && blocks.length > 0) {
+
+        if (recentBlocks && recentBlocks.length > 0) {
             noBlocks.style.display = "none";
-            blocks.forEach(b => {
+            setText("blocks-count", String(recentBlocks.length));
+            recentBlocks.forEach(b => {
                 const tr = document.createElement("tr");
+                // Time
                 const tdTime = document.createElement("td");
-                tdTime.textContent = new Date(b.ts * 1000).toLocaleString();
+                tdTime.textContent = b.ts ? new Date(b.ts * 1000).toLocaleString() : "-";
+                tr.appendChild(tdTime);
+                // Height
                 const tdHeight = document.createElement("td");
-                tdHeight.textContent = b.height;
+                tdHeight.textContent = b.height || b.number || "-";
+                tr.appendChild(tdHeight);
+                // Hash
                 const tdHash = document.createElement("td");
-                if (ci && ci.block_explorer_url_prefix && C2PoolAPI.isSafeUrl(ci.block_explorer_url_prefix + "test")) {
+                const hash = b.hash || "-";
+                if (ci && ci.block_explorer_url_prefix && C2PoolAPI.isSafeUrl(ci.block_explorer_url_prefix + "x")) {
                     const a = document.createElement("a");
-                    a.href = ci.block_explorer_url_prefix + encodeURIComponent(b.hash);
+                    a.href = ci.block_explorer_url_prefix + encodeURIComponent(hash);
                     a.target = "_blank";
                     a.rel = "noopener noreferrer";
-                    a.textContent = b.hash.substring(0, 16) + "…";
+                    a.textContent = hash.substring(0, 16) + "\u2026";
+                    a.title = hash;
+                    a.className = "hash-truncate";
                     tdHash.appendChild(a);
                 } else {
-                    tdHash.textContent = b.hash.substring(0, 16) + "…";
+                    tdHash.textContent = hash.substring(0, 16) + "\u2026";
+                    tdHash.title = hash;
                 }
-                tr.appendChild(tdTime);
-                tr.appendChild(tdHeight);
                 tr.appendChild(tdHash);
+                // Luck
+                const tdLuck = document.createElement("td");
+                tdLuck.textContent = b.luck != null ? (b.luck * 100).toFixed(0) + "%" : "-";
+                tr.appendChild(tdLuck);
+                // Status
+                const tdStatus = document.createElement("td");
+                const badge = document.createElement("span");
+                const status = (b.status || "pending").toLowerCase();
+                badge.className = "status-badge " + (status === "confirmed" ? "confirmed" : status === "orphaned" ? "orphaned" : "pending");
+                badge.textContent = status === "confirmed" ? "\u2713" : status === "orphaned" ? "\u2717" : "\u23F3";
+                tdStatus.appendChild(badge);
+                tr.appendChild(tdStatus);
                 blocksTable.appendChild(tr);
             });
         } else {
             noBlocks.style.display = "block";
         }
 
-        // Payouts table
-        if (pays && typeof pays === "object") {
-            const payoutsTable = document.getElementById("payouts-table");
-            const noPayouts = document.getElementById("no-payouts");
-            const entries = Object.entries(pays).sort((a, b) => b[1] - a[1]);
-            payoutsTable.innerHTML = "";
+        // Luck badges
+        if (luckStats && luckStats.luck_available) {
+            // Show luck badges if available
+        }
+
+        // ── Current Payouts Table ──
+        const payoutsTable = document.getElementById("payouts-table");
+        const noPayouts = document.getElementById("no-payouts");
+        payoutsTable.innerHTML = "";
+
+        if (payouts && typeof payouts === "object") {
+            const entries = Object.entries(payouts).sort((a, b) => b[1] - a[1]);
             if (entries.length > 0) {
                 noPayouts.style.display = "none";
-                entries.forEach(([script, amount]) => {
+                setText("payouts-count", String(entries.length));
+                entries.forEach(([addr, amount]) => {
                     const tr = document.createElement("tr");
                     const tdAddr = document.createElement("td");
-                    tdAddr.textContent = script;
-                    tdAddr.style.maxWidth = "400px";
+                    tdAddr.textContent = addr;
+                    tdAddr.style.maxWidth = "300px";
                     tdAddr.style.overflow = "hidden";
                     tdAddr.style.textOverflow = "ellipsis";
+                    tdAddr.title = addr;
+                    tr.appendChild(tdAddr);
                     const tdAmt = document.createElement("td");
                     tdAmt.textContent = C2PoolAPI.formatCoins(amount, 8);
-                    tr.appendChild(tdAddr);
                     tr.appendChild(tdAmt);
                     payoutsTable.appendChild(tr);
                 });
             } else {
                 noPayouts.style.display = "block";
             }
+        } else {
+            noPayouts.style.display = "block";
         }
 
-    } catch (e) {
-        console.error("Dashboard refresh error:", e);
-    }
-
-    // Peers table
-    try {
-        const peers = await C2PoolAPI.peerList();
+        // ── P2Pool Nodes ──
         const peersTable = document.getElementById("peers-table");
         const noPeers = document.getElementById("no-peers");
         peersTable.innerHTML = "";
-        if (peers && peers.length > 0) {
+
+        if (peerList && peerList.length > 0) {
             noPeers.style.display = "none";
-            peers.forEach(p => {
+            setText("peers-count", String(peerList.length));
+            let outCount = 0, inCount = 0;
+            peerList.forEach(p => {
+                if (p.incoming) inCount++; else outCount++;
                 const tr = document.createElement("tr");
-                [p.address || "—", p.version || "—", p.incoming ? "in" : "out",
+                [p.address || "-",
+                 p.version || "-",
+                 p.incoming ? "In" : "Out",
                  C2PoolAPI.formatDuration(p.uptime || 0),
-                 p.txpool_size != null ? String(p.txpool_size) : "—"
+                 p.txpool_size != null ? String(p.txpool_size) : "-"
                 ].forEach(text => {
                     const td = document.createElement("td");
                     td.textContent = text;
@@ -295,36 +603,67 @@
                 });
                 peersTable.appendChild(tr);
             });
+            setText("peers-total", String(peerList.length));
+            setText("peers-out", String(outCount));
+            setText("peers-in", String(inCount));
         } else {
             noPeers.style.display = "block";
+            // Use local_stats peers if peer_list is empty
+            if (ls && ls.peers) {
+                const total = (ls.peers.incoming || 0) + (ls.peers.outgoing || 0);
+                setText("peers-total", String(total));
+                setText("peers-out", String(ls.peers.outgoing || 0));
+                setText("peers-in", String(ls.peers.incoming || 0));
+                setText("peers-count", String(total));
+            }
         }
-    } catch (e) {}
 
-    // Node info + stale rates
-    try {
-        const ni = await C2PoolAPI.nodeInfo();
-        if (ni) {
-            setText("node-network", ni.network || "—");
-            setText("node-symbol", ni.symbol || "—");
-            setText("node-p2p-port", ni.p2p_port || "—");
-            setText("node-worker-port", ni.worker_port || "—");
+        // ── Share Explorer Quick Links ──
+        if (bestShareHash) {
+            const hash = typeof bestShareHash === "string" ? bestShareHash : (bestShareHash.hash || "-");
+            const link = document.getElementById("best-share-link");
+            link.textContent = hash.substring(0, 20) + "\u2026";
+            link.href = "share.html#" + encodeURIComponent(hash);
+            link.title = hash;
         }
-        const sr = await C2PoolAPI.staleRates();
-        if (sr) {
-            setText("stale-good", (sr.good * 100).toFixed(1) + "%");
-            setText("stale-orphan", (sr.orphan * 100).toFixed(1) + "%");
-            setText("stale-dead", (sr.dead * 100).toFixed(1) + "%");
+        if (sharechainStats && sharechainStats.chain_tip_hash) {
+            const tip = sharechainStats.chain_tip_hash;
+            const link = document.getElementById("chain-tip-link");
+            link.textContent = tip.substring(0, 20) + "\u2026";
+            link.href = "share.html#" + encodeURIComponent(tip);
+            link.title = tip;
         }
-    } catch (e) {}
+        if (myShares && Array.isArray(myShares) && myShares.length > 0) {
+            const container = document.getElementById("my-shares-list");
+            container.innerHTML = "";
+            myShares.slice(0, 10).forEach((h, i) => {
+                if (i > 0) container.appendChild(document.createTextNode(", "));
+                const a = document.createElement("a");
+                a.href = "share.html#" + encodeURIComponent(h);
+                a.textContent = h.substring(0, 8) + "\u2026";
+                a.title = h;
+                container.appendChild(a);
+            });
+            if (myShares.length > 10) {
+                container.appendChild(document.createTextNode(" +" + (myShares.length - 10) + " more"));
+            }
+        }
 
-    // Auto-refresh every 10 seconds
-    setTimeout(refresh, 10000);
-})();
+        // ── Version footer ──
+        if (version && version.version) {
+            setText("version-text", version.version);
+        }
 
-function setText(id, text) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = text;
+    } catch (e) {
+        console.error("Dashboard refresh error:", e);
+    }
 }
+
+// Initial load + auto-refresh
+(async function init() {
+    await doRefresh();
+    scheduleRefresh();
+})();
 </script>
 
 </body>

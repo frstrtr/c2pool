@@ -9,54 +9,72 @@
 </head>
 <body>
 
-<div class="header">
-    <h1>&#x26CF; c2pool <span class="coin-symbol">LTC</span></h1>
-    <nav>
-        <a href="index.html">Dashboard</a>
-        <a href="graphs.html" class="active">Graphs</a>
-        <a href="share.html">Share Explorer</a>
-    </nav>
-</div>
+<header>
+    <div class="header-content">
+        <div class="logo">
+            <h1>c2pool</h1>
+            <span class="symbol-badge" id="header-symbol">LTC</span>
+        </div>
+        <nav>
+            <a href="index.html">Dashboard</a>
+            <a href="graphs.html" class="active">Graphs</a>
+            <a href="share.html">Share Explorer</a>
+        </nav>
+    </div>
+</header>
 
 <div class="container">
 
     <!-- ── Hashrate chart ────────────────────────────── -->
-    <div class="chart-container">
-        <h2>Pool Hashrate</h2>
-        <canvas id="chart-hashrate" height="200"></canvas>
-        <div id="chart-hashrate-fallback" style="padding:16px;color:var(--text-dim);font-size:0.85rem">
-            Collecting data points… The chart will appear once enough samples are available.
+    <div class="table-container">
+        <div class="section-header">
+            <h2>&#x1F4C8; Pool Hashrate</h2>
+        </div>
+        <div style="padding:16px">
+            <canvas id="chart-hashrate" height="200"></canvas>
+            <div class="empty-state" id="chart-hashrate-fallback">
+                Collecting data points… The chart will appear once enough samples are available.
+            </div>
         </div>
     </div>
 
     <!-- ── Miner distribution chart ──────────────────── -->
-    <div class="chart-container">
-        <h2>Sharechain — Miners by Share Count</h2>
-        <canvas id="chart-miners" height="200"></canvas>
-        <div id="chart-miners-fallback" style="padding:16px;color:var(--text-dim);font-size:0.85rem">
-            Loading sharechain data…
+    <div class="table-container" style="margin-top:16px">
+        <div class="section-header">
+            <h2>&#x26CF; Sharechain — Miners by Share Count</h2>
+        </div>
+        <div style="padding:16px">
+            <canvas id="chart-miners" height="200"></canvas>
+            <div class="empty-state" id="chart-miners-fallback">
+                Loading sharechain data…
+            </div>
         </div>
     </div>
 
     <!-- ── Sharechain timeline ───────────────────────── -->
-    <div class="chart-container">
-        <h2>Sharechain Timeline</h2>
-        <div id="timeline" style="overflow-x:auto"></div>
+    <div class="table-container" style="margin-top:16px">
+        <div class="section-header">
+            <h2>&#x23F1; Sharechain Timeline</h2>
+        </div>
+        <div id="timeline" style="overflow-x:auto;padding:8px"></div>
     </div>
 
     <!-- ── Live stats table ──────────────────────────── -->
-    <div class="card wide">
-        <h3>Live Statistics (auto-refreshing)</h3>
-        <table style="margin-top:8px">
+    <div class="table-container" style="margin-top:16px">
+        <div class="section-header">
+            <h2>&#x1F4CA; Live Statistics</h2>
+        </div>
+        <table>
             <tbody id="stats-table"></tbody>
         </table>
     </div>
 
 </div>
 
-<div class="footer">
-    <a href="https://github.com/frstrtr/c2pool" target="_blank">c2pool</a>
-</div>
+<footer>
+    <span id="version-text">c2pool</span> &mdash;
+    <a href="https://github.com/frstrtr/c2pool" target="_blank" rel="noopener noreferrer">GitHub</a>
+</footer>
 
 <script>
 // Simple in-memory time-series for hashrate (no backend graph_data endpoints needed)
@@ -79,7 +97,7 @@ function drawSimpleChart(canvasId, data, label, unit) {
     const minVal = 0;
 
     // Grid
-    ctx.strokeStyle = "#30363d";
+    ctx.strokeStyle = "rgba(58, 58, 90, 0.6)";
     ctx.lineWidth = 0.5;
     for (let i = 0; i <= 4; i++) {
         const y = H - (i / 4) * H;
@@ -90,7 +108,7 @@ function drawSimpleChart(canvasId, data, label, unit) {
     }
 
     // Line
-    ctx.strokeStyle = "#58a6ff";
+    ctx.strokeStyle = "#008de4";
     ctx.lineWidth = 2;
     ctx.beginPath();
     data.forEach((d, i) => {
@@ -105,11 +123,11 @@ function drawSimpleChart(canvasId, data, label, unit) {
     ctx.lineTo(W, H);
     ctx.lineTo(0, H);
     ctx.closePath();
-    ctx.fillStyle = "rgba(88, 166, 255, 0.08)";
+    ctx.fillStyle = "rgba(0, 141, 228, 0.08)";
     ctx.fill();
 
     // Y-axis label
-    ctx.fillStyle = "#8b949e";
+    ctx.fillStyle = "#8888a0";
     ctx.font = "11px sans-serif";
     ctx.fillText(C2PoolAPI.formatHashrate(maxVal), 4, 14);
     ctx.fillText("0", 4, H - 4);
@@ -130,14 +148,14 @@ function drawMinerBars(data) {
 
     const maxVal = entries[0][1] || 1;
     const barH = Math.min(30, (H - 20) / entries.length);
-    const colors = ["#58a6ff", "#3fb950", "#d29922", "#f85149", "#a371f7",
+    const colors = ["#008de4", "#28a745", "#ffc107", "#dc3545", "#a371f7",
                     "#79c0ff", "#56d364", "#e3b341", "#ffa198", "#bc8cff"];
 
     entries.forEach(([miner, count], i) => {
         const w = (count / maxVal) * (W - 160);
         ctx.fillStyle = colors[i % colors.length];
         ctx.fillRect(4, i * barH + 2, w, barH - 4);
-        ctx.fillStyle = "#e6edf3";
+        ctx.fillStyle = "#e0e0e0";
         ctx.font = "11px monospace";
         const label = miner.length > 16 ? miner.substring(0, 16) + "…" : miner;
         ctx.fillText(label + " (" + count + ")", w + 10, i * barH + barH / 2 + 4);
@@ -151,7 +169,7 @@ function drawTimeline(timeline) {
     if (!timeline || timeline.length === 0) {
         el.textContent = "";
         const span = document.createElement("span");
-        span.style.cssText = "color:var(--text-dim);font-size:0.85rem";
+        span.className = "empty-state";
         span.textContent = "No timeline data.";
         el.appendChild(span);
         return;
@@ -225,7 +243,7 @@ async function refreshGraphs() {
         stats.forEach(([k, v]) => {
             const tr = document.createElement("tr");
             const tdK = document.createElement("td");
-            tdK.style.color = "var(--text-dim)";
+            tdK.style.color = "var(--text-muted)";
             tdK.textContent = k;
             const tdV = document.createElement("td");
             tdV.textContent = String(v);
@@ -236,7 +254,15 @@ async function refreshGraphs() {
 
         // Currency info
         const ci = data.currencyInfo;
-        if (ci) document.querySelectorAll(".coin-symbol").forEach(el => el.textContent = ci.symbol);
+        if (ci && ci.symbol) {
+            document.getElementById("header-symbol").textContent = ci.symbol;
+            document.title = "c2pool " + ci.symbol + " Graphs";
+        }
+
+        // Version footer
+        if (data.version && data.version.version) {
+            document.getElementById("version-text").textContent = data.version.version;
+        }
 
     } catch (e) {
         console.error("Graphs refresh error:", e);

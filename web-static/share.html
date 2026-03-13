@@ -9,60 +9,74 @@
 </head>
 <body>
 
-<div class="header">
-    <h1>&#x26CF; c2pool <span class="coin-symbol">LTC</span></h1>
-    <nav>
-        <a href="index.html">Dashboard</a>
-        <a href="graphs.html">Graphs</a>
-        <a href="share.html" class="active">Share Explorer</a>
-    </nav>
-</div>
+<header>
+    <div class="header-content">
+        <div class="logo">
+            <h1>c2pool</h1>
+            <span class="symbol-badge" id="header-symbol">LTC</span>
+        </div>
+        <nav>
+            <a href="index.html">Dashboard</a>
+            <a href="graphs.html">Graphs</a>
+            <a href="share.html" class="active">Share Explorer</a>
+        </nav>
+    </div>
+</header>
 
 <div class="container">
 
     <!-- ── Best share ────────────────────────────────── -->
-    <div class="card wide">
-        <h3>Chain Tip</h3>
-        <div class="explorer-field">
+    <div class="table-container">
+        <div class="section-header">
+            <h2>&#x1F50D; Chain Tip</h2>
+        </div>
+        <div class="explorer-field" style="padding:12px">
             <div class="label">Best Share Hash</div>
-            <div class="val" id="best-hash">Loading…</div>
+            <div class="val" id="best-hash" style="font-family:var(--mono);word-break:break-all">Loading…</div>
         </div>
     </div>
 
     <!-- ── Sharechain window (last N shares) ─────────── -->
-    <div class="card wide" style="margin-top:16px">
-        <h3>Recent Shares (Sharechain Window)</h3>
-        <table style="margin-top:8px">
+    <div class="table-container" style="margin-top:16px">
+        <div class="section-header">
+            <h2>&#x1F4CA; Recent Shares (Sharechain Window)</h2>
+            <span class="badge" id="window-count">0</span>
+        </div>
+        <table>
             <thead>
                 <tr><th>#</th><th>Hash (short)</th><th>Miner</th><th>Version</th></tr>
             </thead>
             <tbody id="window-table"></tbody>
         </table>
-        <div id="no-window" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
-            No share window data available.
-        </div>
+        <div class="empty-state" id="no-window">No share window data available.</div>
     </div>
 
     <!-- ── Sharechain stats summary ──────────────────── -->
-    <div class="card wide" style="margin-top:16px">
-        <h3>Sharechain Overview</h3>
-        <table style="margin-top:8px">
+    <div class="table-container" style="margin-top:16px">
+        <div class="section-header">
+            <h2>&#x26D3; Sharechain Overview</h2>
+        </div>
+        <table>
             <tbody id="sc-stats-table"></tbody>
         </table>
     </div>
 
 </div>
 
-<div class="footer">
-    <a href="https://github.com/frstrtr/c2pool" target="_blank">c2pool</a>
-</div>
+<footer>
+    <span id="version-text">c2pool</span> &mdash;
+    <a href="https://github.com/frstrtr/c2pool" target="_blank" rel="noopener noreferrer">GitHub</a>
+</footer>
 
 <script>
 async function refreshExplorer() {
     try {
         // Currency info
         const ci = await C2PoolAPI.currencyInfo();
-        if (ci) document.querySelectorAll(".coin-symbol").forEach(el => el.textContent = ci.symbol);
+        if (ci && ci.symbol) {
+            document.getElementById("header-symbol").textContent = ci.symbol;
+            document.title = "c2pool " + ci.symbol + " Share Explorer";
+        }
 
         // Best share hash
         const bsh = await C2PoolAPI.bestShareHash();
@@ -80,6 +94,7 @@ async function refreshExplorer() {
 
         if (sw && sw.shares && sw.shares.length > 0) {
             noWindow.style.display = "none";
+            document.getElementById("window-count").textContent = String(sw.shares.length);
             sw.shares.slice(0, 200).forEach((share, i) => {
                 const tr = document.createElement("tr");
                 [String(i + 1),
@@ -113,7 +128,7 @@ async function refreshExplorer() {
             rows.forEach(([k, v]) => {
                 const tr = document.createElement("tr");
                 const tdK = document.createElement("td");
-                tdK.style.color = "var(--text-dim)";
+                tdK.style.color = "var(--text-muted)";
                 tdK.textContent = k;
                 const tdV = document.createElement("td");
                 tdV.style.fontFamily = "var(--mono)";
@@ -128,8 +143,8 @@ async function refreshExplorer() {
                 const headerTr = document.createElement("tr");
                 const headerTd = document.createElement("td");
                 headerTd.colSpan = 2;
-                headerTd.style.cssText = "color:var(--text-dim);padding-top:16px";
-                headerTd.innerHTML = "<strong>Miners by share count</strong>";
+                headerTd.style.cssText = "color:var(--text-muted);padding-top:16px;font-weight:600";
+                headerTd.textContent = "Miners by share count";
                 headerTr.appendChild(headerTd);
                 statsTable.appendChild(headerTr);
                 const sorted = Object.entries(sc.shares_by_miner).sort((a, b) => b[1] - a[1]);
@@ -145,6 +160,12 @@ async function refreshExplorer() {
                     statsTable.appendChild(tr);
                 });
             }
+        }
+
+        // Version footer
+        const ver = await C2PoolAPI.version();
+        if (ver && ver.version) {
+            document.getElementById("version-text").textContent = ver.version;
         }
 
     } catch (e) {
