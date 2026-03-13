@@ -53,6 +53,9 @@ doc/concepts/TestIdeaProtocolWithMessages.pdb
 doc/concepts/TestIdeaProtocolWithMessages.ilk
 vc140.pdb
 
+# Design docs (tracked in frstrtr/the)
+doc/EMBEDDED_COIN_NODE_DESIGN.md
+
 #c2pool
 /logs
 /data
