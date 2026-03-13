@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <impl/ltc/config_coin.hpp>
+#include <impl/ltc/coin/p2p_messages.hpp>
 #include <c2pool/merged/coin_peer_manager.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
+
+#include <core/pack.hpp>
 
 #include <boost/asio.hpp>
 #include <set>
@@ -13,6 +16,7 @@
 #include <unistd.h>
 
 using namespace c2pool::merged;
+using namespace ltc::coin::p2p;
 
 // ─── PeerInfo unit tests ─────────────────────────────────────────────────────
 
@@ -531,6 +535,277 @@ TEST(PeerManagerConfig, ValidPorts_LTC)
     EXPECT_TRUE(cfg.valid_ports.count(9333));
     EXPECT_TRUE(cfg.valid_ports.count(19335));
     EXPECT_FALSE(cfg.valid_ports.count(22556));
+}
+
+// ─── Phase 0: inventory_type tests ───────────────────────────────────────────
+
+TEST(InventoryType, BaseType_PlainTx)
+{
+    inventory_type inv(inventory_type::tx, uint256());
+    EXPECT_EQ(inv.base_type(), inventory_type::tx);
+    EXPECT_FALSE(inv.is_witness());
+}
+
+TEST(InventoryType, BaseType_PlainBlock)
+{
+    inventory_type inv(inventory_type::block, uint256());
+    EXPECT_EQ(inv.base_type(), inventory_type::block);
+    EXPECT_FALSE(inv.is_witness());
+}
+
+TEST(InventoryType, BaseType_WitnessTx)
+{
+    inventory_type inv(inventory_type::witness_tx, uint256());
+    EXPECT_EQ(inv.base_type(), inventory_type::tx);
+    EXPECT_TRUE(inv.is_witness());
+}
+
+TEST(InventoryType, BaseType_WitnessBlock)
+{
+    inventory_type inv(inventory_type::witness_block, uint256());
+    EXPECT_EQ(inv.base_type(), inventory_type::block);
+    EXPECT_TRUE(inv.is_witness());
+}
+
+TEST(InventoryType, BaseType_FilteredBlock)
+{
+    inventory_type inv(inventory_type::filtered_block, uint256());
+    EXPECT_EQ(inv.base_type(), inventory_type::filtered_block);
+    EXPECT_FALSE(inv.is_witness());
+}
+
+TEST(InventoryType, BaseType_CmpctBlock)
+{
+    inventory_type inv(inventory_type::cmpct_block, uint256());
+    EXPECT_EQ(inv.base_type(), inventory_type::cmpct_block);
+    EXPECT_FALSE(inv.is_witness());
+}
+
+TEST(InventoryType, SerializeRoundTrip_PlainBlock)
+{
+    uint256 hash;
+    hash.SetHex("00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72f8ca4");
+    inventory_type orig(inventory_type::block, hash);
+
+    auto ps = pack(orig);
+    inventory_type decoded;
+    ps >> decoded;
+
+    EXPECT_EQ(decoded.m_type, inventory_type::block);
+    EXPECT_EQ(decoded.m_hash, hash);
+}
+
+TEST(InventoryType, SerializeRoundTrip_WitnessTx)
+{
+    uint256 hash;
+    hash.SetHex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+    inventory_type orig(inventory_type::witness_tx, hash);
+
+    auto ps = pack(orig);
+    inventory_type decoded;
+    ps >> decoded;
+
+    EXPECT_EQ(decoded.m_type, inventory_type::witness_tx);
+    EXPECT_EQ(decoded.m_hash, hash);
+    EXPECT_EQ(decoded.base_type(), inventory_type::tx);
+    EXPECT_TRUE(decoded.is_witness());
+}
+
+TEST(InventoryType, WitnessFlag_Value)
+{
+    EXPECT_EQ(inventory_type::MSG_WITNESS_FLAG, 0x40000000u);
+    EXPECT_EQ(static_cast<uint32_t>(inventory_type::witness_tx),
+              static_cast<uint32_t>(inventory_type::tx) | inventory_type::MSG_WITNESS_FLAG);
+    EXPECT_EQ(static_cast<uint32_t>(inventory_type::witness_block),
+              static_cast<uint32_t>(inventory_type::block) | inventory_type::MSG_WITNESS_FLAG);
+}
+
+// ─── Phase 0: New message serialization tests ────────────────────────────────
+
+TEST(P2PMessages, RejectRoundTrip)
+{
+    uint256 hash;
+    hash.SetHex("1111111111111111111111111111111111111111111111111111111111111111");
+
+    auto ps = message_reject::make("block", 0x10, "duplicate", hash);
+    auto msg = message_reject::make(ps);
+
+    EXPECT_EQ(msg->m_message, "block");
+    EXPECT_EQ(msg->m_ccode, 0x10);
+    EXPECT_EQ(msg->m_reason, "duplicate");
+    EXPECT_EQ(msg->m_data, hash);
+}
+
+TEST(P2PMessages, NotfoundRoundTrip)
+{
+    uint256 h1, h2;
+    h1.SetHex("aaaa000000000000000000000000000000000000000000000000000000000001");
+    h2.SetHex("bbbb000000000000000000000000000000000000000000000000000000000002");
+
+    std::vector<inventory_type> invs = {
+        {inventory_type::block, h1},
+        {inventory_type::witness_tx, h2}
+    };
+    auto ps = message_notfound::make(invs);
+    auto msg = message_notfound::make(ps);
+
+    ASSERT_EQ(msg->m_invs.size(), 2u);
+    EXPECT_EQ(msg->m_invs[0].m_type, inventory_type::block);
+    EXPECT_EQ(msg->m_invs[0].m_hash, h1);
+    EXPECT_EQ(msg->m_invs[1].m_type, inventory_type::witness_tx);
+    EXPECT_EQ(msg->m_invs[1].m_hash, h2);
+}
+
+TEST(P2PMessages, FeefilterRoundTrip)
+{
+    uint64_t feerate = 1000; // 1000 sat/kB
+    auto ps = message_feefilter::make(feerate);
+    auto msg = message_feefilter::make(ps);
+
+    EXPECT_EQ(msg->m_feerate, 1000u);
+}
+
+TEST(P2PMessages, FeefilterRoundTrip_LargeValue)
+{
+    uint64_t feerate = 0xFFFFFFFFFFFFFFFFULL;
+    auto ps = message_feefilter::make(feerate);
+    auto msg = message_feefilter::make(ps);
+
+    EXPECT_EQ(msg->m_feerate, feerate);
+}
+
+TEST(P2PMessages, SendheadersConstruction)
+{
+    auto rmsg = message_sendheaders::make_raw();
+    EXPECT_EQ(rmsg->m_command, "sendheaders");
+}
+
+TEST(P2PMessages, MempoolConstruction)
+{
+    auto rmsg = message_mempool::make_raw();
+    EXPECT_EQ(rmsg->m_command, "mempool");
+}
+
+TEST(P2PMessages, InvWithWitnessTypes_RoundTrip)
+{
+    uint256 h1, h2, h3;
+    h1.SetHex("1000000000000000000000000000000000000000000000000000000000000001");
+    h2.SetHex("2000000000000000000000000000000000000000000000000000000000000002");
+    h3.SetHex("3000000000000000000000000000000000000000000000000000000000000003");
+
+    std::vector<inventory_type> invs = {
+        {inventory_type::tx, h1},
+        {inventory_type::witness_block, h2},
+        {inventory_type::witness_tx, h3}
+    };
+    auto ps = message_inv::make(invs);
+    auto msg = message_inv::make(ps);
+
+    ASSERT_EQ(msg->m_invs.size(), 3u);
+    EXPECT_EQ(msg->m_invs[0].m_type, inventory_type::tx);
+    EXPECT_EQ(msg->m_invs[0].m_hash, h1);
+    EXPECT_EQ(msg->m_invs[1].m_type, inventory_type::witness_block);
+    EXPECT_EQ(msg->m_invs[1].m_hash, h2);
+    EXPECT_EQ(msg->m_invs[1].base_type(), inventory_type::block);
+    EXPECT_EQ(msg->m_invs[2].m_type, inventory_type::witness_tx);
+    EXPECT_EQ(msg->m_invs[2].m_hash, h3);
+    EXPECT_EQ(msg->m_invs[2].base_type(), inventory_type::tx);
+}
+
+// ─── Phase 0: Handler can parse new messages ─────────────────────────────────
+
+TEST(P2PHandler, ParseReject)
+{
+    uint256 hash;
+    hash.SetHex("deadbeef00000000000000000000000000000000000000000000000000000000");
+    auto rmsg = message_reject::make_raw("tx", 0x12, "bad-txns-inputs-missingorspent", hash);
+
+    Handler handler;
+    auto result = handler.parse(rmsg);
+    auto* msg_ptr = std::get_if<std::unique_ptr<message_reject>>(&result);
+    ASSERT_NE(msg_ptr, nullptr);
+    EXPECT_EQ((*msg_ptr)->m_message, "tx");
+    EXPECT_EQ((*msg_ptr)->m_ccode, 0x12);
+    EXPECT_EQ((*msg_ptr)->m_reason, "bad-txns-inputs-missingorspent");
+    EXPECT_EQ((*msg_ptr)->m_data, hash);
+}
+
+TEST(P2PHandler, ParseNotfound)
+{
+    uint256 hash;
+    hash.SetHex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+    auto rmsg = message_notfound::make_raw(
+        std::vector<inventory_type>{{inventory_type::witness_block, hash}});
+
+    Handler handler;
+    auto result = handler.parse(rmsg);
+    auto* msg_ptr = std::get_if<std::unique_ptr<message_notfound>>(&result);
+    ASSERT_NE(msg_ptr, nullptr);
+    ASSERT_EQ((*msg_ptr)->m_invs.size(), 1u);
+    EXPECT_EQ((*msg_ptr)->m_invs[0].m_type, inventory_type::witness_block);
+}
+
+TEST(P2PHandler, ParseFeefilter)
+{
+    auto rmsg = message_feefilter::make_raw(static_cast<uint64_t>(5000));
+
+    Handler handler;
+    auto result = handler.parse(rmsg);
+    auto* msg_ptr = std::get_if<std::unique_ptr<message_feefilter>>(&result);
+    ASSERT_NE(msg_ptr, nullptr);
+    EXPECT_EQ((*msg_ptr)->m_feerate, 5000u);
+}
+
+TEST(P2PHandler, ParseSendheaders)
+{
+    auto rmsg = message_sendheaders::make_raw();
+
+    Handler handler;
+    auto result = handler.parse(rmsg);
+    auto* msg_ptr = std::get_if<std::unique_ptr<message_sendheaders>>(&result);
+    ASSERT_NE(msg_ptr, nullptr);
+}
+
+TEST(P2PHandler, ParseMempool)
+{
+    auto rmsg = message_mempool::make_raw();
+
+    Handler handler;
+    auto result = handler.parse(rmsg);
+    auto* msg_ptr = std::get_if<std::unique_ptr<message_mempool>>(&result);
+    ASSERT_NE(msg_ptr, nullptr);
+}
+
+// ─── Phase 0: Broadcaster event callback wiring ──────────────────────────────
+
+TEST(CoinBroadcaster, EventCallbackSetters)
+{
+    boost::asio::io_context ioc;
+    std::vector<std::byte> prefix = {std::byte{0xfb}, std::byte{0xc0},
+                                     std::byte{0xb6}, std::byte{0xdb}};
+    NetService addr{"127.0.0.1", 19335};
+
+    CoinBroadcaster bc(ioc, "LTC", prefix, addr);
+
+    bool block_fired = false;
+    bool tx_fired = false;
+    bool headers_fired = false;
+
+    bc.set_on_new_block([&](const std::string& peer, const uint256& hash) {
+        block_fired = true;
+    });
+    bc.set_on_new_tx([&](const std::string& peer, const ltc::coin::Transaction& tx) {
+        tx_fired = true;
+    });
+    bc.set_on_new_headers([&](const std::string& peer,
+                              const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+        headers_fired = true;
+    });
+
+    // Callbacks are set but not fired yet (no peers connected)
+    EXPECT_FALSE(block_fired);
+    EXPECT_FALSE(tx_fired);
+    EXPECT_FALSE(headers_fired);
 }
 
 int main(int argc, char** argv)

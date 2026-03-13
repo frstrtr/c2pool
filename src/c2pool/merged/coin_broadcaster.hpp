@@ -102,6 +102,16 @@ public:
         m_peer_manager.set_getpeerinfo_fn(std::move(fn));
     }
 
+    // Event callbacks — wired to every peer's coin_node events.
+    // Initially just logging; later phases feed into HeaderChain / Mempool.
+    using BlockCallback   = std::function<void(const std::string& peer, const uint256&)>;
+    using TxCallback      = std::function<void(const std::string& peer, const ltc::coin::Transaction&)>;
+    using HeadersCallback = std::function<void(const std::string& peer, const std::vector<ltc::coin::BlockHeaderType>&)>;
+
+    void set_on_new_block(BlockCallback cb)     { m_on_new_block = std::move(cb); }
+    void set_on_new_tx(TxCallback cb)           { m_on_new_tx = std::move(cb); }
+    void set_on_new_headers(HeadersCallback cb)  { m_on_new_headers = std::move(cb); }
+
     /// Start: register local node, start peer manager, begin connection loop.
     void start()
     {
@@ -215,6 +225,28 @@ private:
                     }
                 });
 
+            // Wire coin_node events so received P2P data feeds upward
+            auto peer_key = key;
+            peer->coin_node.new_block.subscribe(
+                [this, peer_key](const uint256& hash) {
+                    LOG_DEBUG_COIND << "[" << m_symbol << "] Peer " << peer_key
+                                   << " announced block " << hash.GetHex();
+                    if (m_on_new_block)
+                        m_on_new_block(peer_key, hash);
+                });
+            peer->coin_node.new_tx.subscribe(
+                [this, peer_key](const ltc::coin::Transaction& tx) {
+                    if (m_on_new_tx)
+                        m_on_new_tx(peer_key, tx);
+                });
+            peer->coin_node.new_headers.subscribe(
+                [this, peer_key](const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                    LOG_DEBUG_COIND << "[" << m_symbol << "] Peer " << peer_key
+                                   << " sent " << hdrs.size() << " headers";
+                    if (m_on_new_headers)
+                        m_on_new_headers(peer_key, hdrs);
+                });
+
             peer->node_p2p.connect(addr);
 
             // Send getaddr after connection for peer discovery
@@ -284,6 +316,10 @@ private:
     mutable std::mutex m_mutex;
     std::map<std::string, std::unique_ptr<BroadcastPeer>> m_peers;
     bool m_running{true};
+
+    BlockCallback   m_on_new_block;
+    TxCallback      m_on_new_tx;
+    HeadersCallback m_on_new_headers;
 };
 
 } // namespace merged

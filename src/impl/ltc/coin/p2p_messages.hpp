@@ -83,17 +83,34 @@ END_MESSAGE()
 
 struct inventory_type
 {
-    enum inv_type
+    enum inv_type : uint32_t
     {
-        tx = 1,
-        block = 2
+        tx              = 1,
+        block           = 2,
+        filtered_block  = 3,
+        cmpct_block     = 4,
+        witness_tx      = 0x40000001,   // MSG_WITNESS_TX  (BIP 144)
+        witness_block   = 0x40000002,   // MSG_WITNESS_BLOCK (BIP 144)
     };
+
+    static constexpr uint32_t MSG_WITNESS_FLAG = 0x40000000;
 
     inv_type m_type;
     uint256 m_hash;
 
     inventory_type() { }
     inventory_type(inv_type type, uint256 hash) : m_type(type), m_hash(hash) { }
+
+    /// Strip the witness flag to get the base type (tx or block).
+    inv_type base_type() const
+    {
+        return static_cast<inv_type>(static_cast<uint32_t>(m_type) & ~MSG_WITNESS_FLAG);
+    }
+
+    bool is_witness() const
+    {
+        return (static_cast<uint32_t>(m_type) & MSG_WITNESS_FLAG) != 0;
+    }
 
     SERIALIZE_METHODS(inventory_type) {READWRITE(Using<EnumType<IntType<32>>>(obj.m_type), obj.m_hash);}
 };
@@ -187,6 +204,52 @@ BEGIN_MESSAGE(addr)
     }
 END_MESSAGE()
 
+// BIP 61 — reject message (deprecated in Bitcoin Core 0.20 but still sent by some peers)
+BEGIN_MESSAGE(reject)
+    MESSAGE_FIELDS
+    (
+        (std::string, m_message),
+        (uint8_t, m_ccode),
+        (std::string, m_reason),
+        (uint256, m_data)
+    )
+    {
+        READWRITE(obj.m_message, obj.m_ccode, obj.m_reason, obj.m_data);
+    }
+END_MESSAGE()
+
+// BIP 130 — sendheaders (empty, signals header-first block announcements)
+BEGIN_MESSAGE(sendheaders)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
+// notfound — same layout as inv; response when getdata items are unavailable
+BEGIN_MESSAGE(notfound)
+    MESSAGE_FIELDS
+    (
+        (std::vector<inventory_type>, m_invs)
+    )
+    {
+        READWRITE(obj.m_invs);
+    }
+END_MESSAGE()
+
+// BIP 133 — feefilter (minimum feerate for tx relay, in sat/kB)
+BEGIN_MESSAGE(feefilter)
+    MESSAGE_FIELDS
+    (
+        (uint64_t, m_feerate)
+    )
+    {
+        READWRITE(obj.m_feerate);
+    }
+END_MESSAGE()
+
+// BIP 35 — mempool (empty, requests peer to send inv for all mempool txs)
+BEGIN_MESSAGE(mempool)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -198,7 +261,12 @@ using Handler = MessageHandler<
     message_block,
     message_headers,
     message_getaddr,
-    message_addr
+    message_addr,
+    message_reject,
+    message_sendheaders,
+    message_notfound,
+    message_feefilter,
+    message_mempool
 >;
 
 } // namespace p2p

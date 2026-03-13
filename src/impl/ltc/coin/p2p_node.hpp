@@ -317,6 +317,10 @@ private:
         m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
             send_ping();
         });
+
+        // BIP 130: request header-first block announcements
+        auto msg_sendheaders = message_sendheaders::make_raw();
+        m_peer->write(msg_sendheaders);
     }
 
     ADD_P2P_HANDLER(ping)
@@ -341,7 +345,7 @@ private:
         
         for (auto& inv : msg->m_invs)
         {
-            switch (inv.m_type)
+            switch (inv.base_type())
             {
             case inventory_type::tx:
                 vinv.push_back(inv);
@@ -349,8 +353,13 @@ private:
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
                 break;
+            case inventory_type::filtered_block:
+            case inventory_type::cmpct_block:
+                // Recognized but not requested — ignore
+                break;
             default:
-                LOG_WARNING << "Unknown inv type " << (int)inv.m_type;
+                LOG_WARNING << "Unknown inv type 0x" << std::hex
+                            << static_cast<uint32_t>(inv.m_type) << std::dec;
                 break;
             }
         }
@@ -406,6 +415,55 @@ private:
             }
             m_addr_callback(addrs);
         }
+    }
+
+    ADD_P2P_HANDLER(reject)
+    {
+        LOG_WARNING << "Peer rejected " << msg->m_message
+                    << " (code=" << static_cast<int>(msg->m_ccode)
+                    << "): " << msg->m_reason
+                    << " hash=" << msg->m_data.GetHex();
+    }
+
+    ADD_P2P_HANDLER(sendheaders)
+    {
+        // Peer prefers header announcements — acknowledged
+        LOG_DEBUG_COIND << "Peer supports sendheaders (BIP 130)";
+    }
+
+    ADD_P2P_HANDLER(notfound)
+    {
+        for (auto& inv : msg->m_invs)
+        {
+            switch (inv.base_type())
+            {
+            case inventory_type::block:
+                // Complete the ReplyMatcher with a default (empty) response
+                // so we don't wait for the 15s timeout.
+                try {
+                    m_peer->get_block(inv.m_hash, BlockType{});
+                } catch (...) {}
+                try {
+                    m_peer->get_header(inv.m_hash, BlockHeaderType{});
+                } catch (...) {}
+                break;
+            default:
+                break;
+            }
+            LOG_DEBUG_COIND << "Peer does not have inv 0x" << std::hex
+                            << static_cast<uint32_t>(inv.m_type) << std::dec
+                            << " " << inv.m_hash.GetHex();
+        }
+    }
+
+    ADD_P2P_HANDLER(feefilter)
+    {
+        LOG_DEBUG_COIND << "Peer feefilter: " << msg->m_feerate << " sat/kB";
+    }
+
+    ADD_P2P_HANDLER(mempool)
+    {
+        // We don't serve mempool — ignore incoming request
     }
 
     #undef ADD_P2P_HANDLER
