@@ -31,6 +31,70 @@ static std::string to_hex(const std::vector<unsigned char>& data)
     return HexStr(std::span<const unsigned char>(data.data(), data.size()));
 }
 
+// ── Security helpers ───────────────────────────────────────────────────
+// URL-decode percent-encoded strings (%20 → space, etc.)
+static std::string url_decode(const std::string& str)
+{
+    std::string result;
+    result.reserve(str.size());
+    for (size_t i = 0; i < str.size(); ++i) {
+        if (str[i] == '%' && i + 2 < str.size()) {
+            int hi = 0, lo = 0;
+            auto hexval = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            hi = hexval(str[i + 1]);
+            lo = hexval(str[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                result += static_cast<char>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        } else if (str[i] == '+') {
+            result += ' ';
+            continue;
+        }
+        result += str[i];
+    }
+    return result;
+}
+
+// Validate that a string is a hex hash (exactly 64 hex chars)
+static bool is_valid_hex_hash(const std::string& s)
+{
+    if (s.size() != 64) return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+// Validate that a string looks like a cryptocurrency address (base58/bech32 charset, reasonable length)
+static bool is_valid_address_chars(const std::string& s)
+{
+    if (s.empty() || s.size() > 128) return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+            return false;
+    }
+    return true;
+}
+
+// Validate graph source/view against allowed charset (alphanumeric + underscore, max 64 chars)
+static bool is_valid_graph_param(const std::string& s)
+{
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'))
+            return false;
+    }
+    return true;
+}
+
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
 
@@ -71,9 +135,19 @@ void HttpSession::process_request()
     http::response<http::string_body> response{http::status::ok, request_.version()};
     response.set(http::field::server, "c2pool/0.0.1");
     response.set(http::field::content_type, "application/json");
-    response.set(http::field::access_control_allow_origin, mining_interface_->get_cors_origin());
-    response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
-    response.set(http::field::access_control_allow_headers, "Content-Type");
+
+    // CORS — only set if operator configured an origin
+    const auto& cors_origin = mining_interface_->get_cors_origin();
+    if (!cors_origin.empty()) {
+        response.set(http::field::access_control_allow_origin, cors_origin);
+        response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
+        response.set(http::field::access_control_allow_headers, "Content-Type");
+    }
+
+    // Security headers
+    response.set("X-Content-Type-Options", "nosniff");
+    response.set("X-Frame-Options", "DENY");
+    response.set("Referrer-Policy", "no-referrer");
 
     try {
         std::string response_body;
@@ -106,8 +180,25 @@ void HttpSession::process_request()
                 if (end == std::string::npos) {
                     end = query.size();
                 }
-                return query.substr(pos, end - pos);
+                return url_decode(query.substr(pos, end - pos));
             };
+
+            // ── Auth gate for sensitive endpoints ──────────────────────
+            if (mining_interface_->auth_required()) {
+                bool needs_auth = (target.substr(0, 9) == "/control/"
+                                || target == "/web/log"
+                                || target == "/logs/export");
+                if (needs_auth) {
+                    const std::string token = getQueryParam("token");
+                    if (!mining_interface_->verify_auth_token(token)) {
+                        response.result(http::status::unauthorized);
+                        response.body() = R"({"error":"Unauthorized – supply ?token=<auth_token>"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                }
+            }
 
             nlohmann::json rest_result;
             if (target == "/local_rate")
@@ -259,27 +350,79 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_web_log_json();
 
             // Path-parameterised endpoints (starts_with matching)
-            else if (target.substr(0, 13) == "/miner_stats/")
-                rest_result = mining_interface_->rest_miner_stats(target.substr(13));
-            else if (target.substr(0, 15) == "/miner_payouts/")
-                rest_result = mining_interface_->rest_miner_payouts(target.substr(15));
+            // Each path parameter is URL-decoded and validated before use.
+            else if (target.substr(0, 13) == "/miner_stats/") {
+                std::string addr = url_decode(target.substr(13));
+                if (!is_valid_address_chars(addr)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid address parameter"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_miner_stats(addr);
+            }
+            else if (target.substr(0, 15) == "/miner_payouts/") {
+                std::string addr = url_decode(target.substr(15));
+                if (!is_valid_address_chars(addr)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid address parameter"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_miner_payouts(addr);
+            }
             else if (target.substr(0, 18) == "/patron_sendmany/") {
+                std::string total = url_decode(target.substr(18));
+                if (!is_valid_address_chars(total)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid parameter"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
                 response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_patron_sendmany(target.substr(18)).dump();
+                response.body() = mining_interface_->rest_patron_sendmany(total).dump();
                 response.prepare_payload();
                 send_response(std::move(response));
                 return;
             }
-            else if (target.substr(0, 11) == "/web/share/")
-                rest_result = mining_interface_->rest_web_share(target.substr(11));
-            else if (target.substr(0, 20) == "/web/payout_address/")
-                rest_result = mining_interface_->rest_web_payout_address(target.substr(20));
+            else if (target.substr(0, 11) == "/web/share/") {
+                std::string hash = url_decode(target.substr(11));
+                if (!is_valid_hex_hash(hash)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_web_share(hash);
+            }
+            else if (target.substr(0, 20) == "/web/payout_address/") {
+                std::string hash = url_decode(target.substr(20));
+                if (!is_valid_hex_hash(hash)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_web_payout_address(hash);
+            }
             else if (target.substr(0, 16) == "/web/graph_data/") {
                 // /web/graph_data/<source>/<view>
-                std::string rest_path = target.substr(16);
+                std::string rest_path = url_decode(target.substr(16));
                 auto slash_pos = rest_path.find('/');
                 std::string source = (slash_pos != std::string::npos) ? rest_path.substr(0, slash_pos) : rest_path;
                 std::string view   = (slash_pos != std::string::npos) ? rest_path.substr(slash_pos + 1) : "";
+                if (!is_valid_graph_param(source) || (!view.empty() && !is_valid_graph_param(view))) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid graph source/view parameter"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
                 rest_result = mining_interface_->rest_web_graph_data(source, view);
             }
 

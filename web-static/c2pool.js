@@ -69,10 +69,10 @@ const C2PoolAPI = (() => {
     const trackerDebug     = () => fetchJSON("/tracker_debug");
     const networkDifficulty = () => fetchJSON("/network_difficulty");
 
-    // Per-miner endpoints
-    const minerStats       = (addr) => fetchJSON("/miner_stats/" + addr);
-    const minerPayouts     = (addr) => fetchJSON("/miner_payouts/" + addr);
-    const patronSendmany   = (total) => fetchText("/patron_sendmany/" + total);
+    // Per-miner endpoints (sanitize path parameters)
+    const minerStats       = (addr) => fetchJSON("/miner_stats/" + encodeURIComponent(addr));
+    const minerPayouts     = (addr) => fetchJSON("/miner_payouts/" + encodeURIComponent(addr));
+    const patronSendmany   = (total) => fetchText("/patron_sendmany/" + encodeURIComponent(total));
 
     // Merged mining endpoints
     const mergedStats           = () => fetchJSON("/merged_stats");
@@ -90,10 +90,10 @@ const C2PoolAPI = (() => {
     const webVerifiedTails = () => fetchJSON("/web/verified_tails");
     const webMyShareHashes = () => fetchJSON("/web/my_share_hashes");
     const webMyShareHashes50 = () => fetchJSON("/web/my_share_hashes50");
-    const webShare         = (hash) => fetchJSON("/web/share/" + hash);
-    const webPayoutAddress = (hash) => fetchJSON("/web/payout_address/" + hash);
+    const webShare         = (hash) => fetchJSON("/web/share/" + encodeURIComponent(hash));
+    const webPayoutAddress = (hash) => fetchJSON("/web/payout_address/" + encodeURIComponent(hash));
     const webLogJson       = () => fetchJSON("/web/log_json");
-    const webGraphData     = (source, view) => fetchJSON("/web/graph_data/" + source + "/" + view);
+    const webGraphData     = (source, view) => fetchJSON("/web/graph_data/" + encodeURIComponent(source) + "/" + encodeURIComponent(view));
 
     // ── Control endpoints ──────────────────────────────────────
     const controlStart   = () => fetchJSON("/control/mining/start");
@@ -124,6 +124,24 @@ const C2PoolAPI = (() => {
     }
 
     // ── Helpers ────────────────────────────────────────────────
+    function escapeHtml(str) {
+        if (str == null) return "";
+        return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    // Validate that a URL uses http/https protocol only
+    function isSafeUrl(url) {
+        try {
+            const u = new URL(url);
+            return u.protocol === "http:" || u.protocol === "https:";
+        } catch (e) { return false; }
+    }
+
+    // Validate a URL path segment (alphanumeric, dots, hyphens, underscores only)
+    function sanitizePathSegment(seg) {
+        return String(seg).replace(/[^a-zA-Z0-9._\-]/g, "");
+    }
+
     function formatHashrate(h) {
         if (h == null || isNaN(h)) return "—";
         const units = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
@@ -184,6 +202,7 @@ const C2PoolAPI = (() => {
         fetchAll,
         // Helpers
         formatHashrate, formatDuration, formatCoins, timeAgo,
+        escapeHtml, isSafeUrl, sanitizePathSegment,
         // Low-level
         fetchJSON, fetchText
     };

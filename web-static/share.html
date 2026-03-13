@@ -82,11 +82,16 @@ async function refreshExplorer() {
             noWindow.style.display = "none";
             sw.shares.slice(0, 200).forEach((share, i) => {
                 const tr = document.createElement("tr");
-                tr.innerHTML =
-                    '<td>' + (i + 1) + '</td>' +
-                    '<td style="font-family:var(--mono)">' + (share.hash ? share.hash.substring(share.hash.length - 12) : "—") + '</td>' +
-                    '<td>' + (share.miner || share.payout_address || "—") + '</td>' +
-                    '<td>' + (share.version || "—") + '</td>';
+                [String(i + 1),
+                 share.hash ? share.hash.substring(share.hash.length - 12) : "—",
+                 share.miner || share.payout_address || "—",
+                 String(share.version || "—")
+                ].forEach((text, ci) => {
+                    const td = document.createElement("td");
+                    if (ci === 1) td.style.fontFamily = "var(--mono)";
+                    td.textContent = text;
+                    tr.appendChild(td);
+                });
                 windowTable.appendChild(tr);
             });
         } else {
@@ -104,20 +109,41 @@ async function refreshExplorer() {
                 ["Fork count", sc.fork_count != null ? sc.fork_count : "—"],
                 ["Average difficulty", sc.average_difficulty != null ? sc.average_difficulty.toFixed(4) : "—"],
             ];
-            statsTable.innerHTML = rows.map(([k, v]) =>
-                '<tr><td style="color:var(--text-dim)">' + k + '</td>' +
-                '<td style="font-family:var(--mono)">' + v + '</td></tr>'
-            ).join("");
+            statsTable.textContent = "";
+            rows.forEach(([k, v]) => {
+                const tr = document.createElement("tr");
+                const tdK = document.createElement("td");
+                tdK.style.color = "var(--text-dim)";
+                tdK.textContent = k;
+                const tdV = document.createElement("td");
+                tdV.style.fontFamily = "var(--mono)";
+                tdV.textContent = String(v);
+                tr.appendChild(tdK);
+                tr.appendChild(tdV);
+                statsTable.appendChild(tr);
+            });
 
             // Miner distribution
             if (sc.shares_by_miner && Object.keys(sc.shares_by_miner).length > 0) {
-                let minerHtml = '<tr><td colspan="2" style="color:var(--text-dim);padding-top:16px"><strong>Miners by share count</strong></td></tr>';
+                const headerTr = document.createElement("tr");
+                const headerTd = document.createElement("td");
+                headerTd.colSpan = 2;
+                headerTd.style.cssText = "color:var(--text-dim);padding-top:16px";
+                headerTd.innerHTML = "<strong>Miners by share count</strong>";
+                headerTr.appendChild(headerTd);
+                statsTable.appendChild(headerTr);
                 const sorted = Object.entries(sc.shares_by_miner).sort((a, b) => b[1] - a[1]);
                 sorted.forEach(([miner, count]) => {
-                    minerHtml += '<tr><td style="font-family:var(--mono);max-width:300px;overflow:hidden;text-overflow:ellipsis">'
-                        + miner + '</td><td>' + count + '</td></tr>';
+                    const tr = document.createElement("tr");
+                    const tdM = document.createElement("td");
+                    tdM.style.cssText = "font-family:var(--mono);max-width:300px;overflow:hidden;text-overflow:ellipsis";
+                    tdM.textContent = miner;
+                    const tdC = document.createElement("td");
+                    tdC.textContent = String(count);
+                    tr.appendChild(tdM);
+                    tr.appendChild(tdC);
+                    statsTable.appendChild(tr);
                 });
-                statsTable.innerHTML += minerHtml;
             }
         }
 

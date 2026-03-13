@@ -548,12 +548,21 @@ private:
 
     // Stratum tuning (shared with all StratumSessions via pointer)
     StratumConfig m_stratum_config;
-    std::string m_cors_origin = "*";
+    std::string m_cors_origin;  // empty = no CORS header; set explicitly if needed
+    std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
     const StratumConfig& get_stratum_config() const { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
+
+    // Authentication token for sensitive endpoints (/control/*, /web/log, /logs/export)
+    // Empty = no auth required (NOT recommended for production)
+    void set_auth_token(const std::string& token) { m_auth_token = token; }
+    bool verify_auth_token(const std::string& token) const {
+        return !m_auth_token.empty() && token == m_auth_token;
+    }
+    bool auth_required() const { return !m_auth_token.empty(); }
 
     // Dashboard static file serving directory
     void set_dashboard_dir(const std::string& dir) { m_dashboard_dir = dir; }

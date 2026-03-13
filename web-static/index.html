@@ -181,9 +181,14 @@
         const pays = data.payouts;
         if (addr) {
             const addrEl = document.getElementById("payout-addr-display");
-            if (ci && ci.address_explorer_url_prefix) {
-                addrEl.innerHTML = '<a href="' + ci.address_explorer_url_prefix + encodeURIComponent(addr)
-                    + '" target="_blank">' + addr + '</a>';
+            if (ci && ci.address_explorer_url_prefix && C2PoolAPI.isSafeUrl(ci.address_explorer_url_prefix + "test")) {
+                const a = document.createElement("a");
+                a.href = ci.address_explorer_url_prefix + encodeURIComponent(addr);
+                a.target = "_blank";
+                a.rel = "noopener noreferrer";
+                a.textContent = addr;
+                addrEl.textContent = "";
+                addrEl.appendChild(a);
             } else {
                 addrEl.textContent = addr;
             }
@@ -221,10 +226,13 @@
                 const tdHeight = document.createElement("td");
                 tdHeight.textContent = b.height;
                 const tdHash = document.createElement("td");
-                if (ci && ci.block_explorer_url_prefix) {
-                    tdHash.innerHTML = '<a href="' + ci.block_explorer_url_prefix
-                        + encodeURIComponent(b.hash) + '" target="_blank">'
-                        + b.hash.substring(0, 16) + '…</a>';
+                if (ci && ci.block_explorer_url_prefix && C2PoolAPI.isSafeUrl(ci.block_explorer_url_prefix + "test")) {
+                    const a = document.createElement("a");
+                    a.href = ci.block_explorer_url_prefix + encodeURIComponent(b.hash);
+                    a.target = "_blank";
+                    a.rel = "noopener noreferrer";
+                    a.textContent = b.hash.substring(0, 16) + "…";
+                    tdHash.appendChild(a);
                 } else {
                     tdHash.textContent = b.hash.substring(0, 16) + "…";
                 }
@@ -277,11 +285,14 @@
             noPeers.style.display = "none";
             peers.forEach(p => {
                 const tr = document.createElement("tr");
-                tr.innerHTML = "<td>" + (p.address || "—") + "</td>"
-                    + "<td>" + (p.version || "—") + "</td>"
-                    + "<td>" + (p.incoming ? "in" : "out") + "</td>"
-                    + "<td>" + C2PoolAPI.formatDuration(p.uptime || 0) + "</td>"
-                    + "<td>" + (p.txpool_size != null ? p.txpool_size : "—") + "</td>";
+                [p.address || "—", p.version || "—", p.incoming ? "in" : "out",
+                 C2PoolAPI.formatDuration(p.uptime || 0),
+                 p.txpool_size != null ? String(p.txpool_size) : "—"
+                ].forEach(text => {
+                    const td = document.createElement("td");
+                    td.textContent = text;
+                    tr.appendChild(td);
+                });
                 peersTable.appendChild(tr);
             });
         } else {

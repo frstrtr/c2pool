@@ -149,17 +149,38 @@ function drawMinerBars(data) {
 function drawTimeline(timeline) {
     const el = document.getElementById("timeline");
     if (!timeline || timeline.length === 0) {
-        el.innerHTML = '<span style="color:var(--text-dim);font-size:0.85rem">No timeline data.</span>';
+        el.textContent = "";
+        const span = document.createElement("span");
+        span.style.cssText = "color:var(--text-dim);font-size:0.85rem";
+        span.textContent = "No timeline data.";
+        el.appendChild(span);
         return;
     }
-    let html = '<table><thead><tr><th>Time</th><th>Shares</th><th>Miners</th></tr></thead><tbody>';
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    ["Time", "Shares", "Miners"].forEach(h => {
+        const th = document.createElement("th");
+        th.textContent = h;
+        headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
     timeline.forEach(slot => {
+        const tr = document.createElement("tr");
         const time = new Date(slot.timestamp * 1000).toLocaleTimeString();
         const miners = slot.miner_distribution ? Object.keys(slot.miner_distribution).length : 0;
-        html += '<tr><td>' + time + '</td><td>' + slot.share_count + '</td><td>' + miners + '</td></tr>';
+        [time, String(slot.share_count), String(miners)].forEach(text => {
+            const td = document.createElement("td");
+            td.textContent = text;
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
     });
-    html += '</tbody></table>';
-    el.innerHTML = html;
+    table.appendChild(tbody);
+    el.textContent = "";
+    el.appendChild(table);
 }
 
 async function refreshGraphs() {
@@ -200,9 +221,18 @@ async function refreshGraphs() {
             stats.push(["Chain height", data.sharechainStats.chain_height || "—"]);
         }
         const tbody = document.getElementById("stats-table");
-        tbody.innerHTML = stats.map(([k, v]) =>
-            '<tr><td style="color:var(--text-dim)">' + k + '</td><td>' + v + '</td></tr>'
-        ).join("");
+        tbody.textContent = "";
+        stats.forEach(([k, v]) => {
+            const tr = document.createElement("tr");
+            const tdK = document.createElement("td");
+            tdK.style.color = "var(--text-dim)";
+            tdK.textContent = k;
+            const tdV = document.createElement("td");
+            tdV.textContent = String(v);
+            tr.appendChild(tdK);
+            tr.appendChild(tdV);
+            tbody.appendChild(tr);
+        });
 
         // Currency info
         const ci = data.currencyInfo;
