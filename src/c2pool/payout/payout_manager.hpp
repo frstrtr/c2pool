@@ -239,7 +239,9 @@ private:
     std::string execute_core_rpc(const std::string& method, const std::string& params = "") const;
     
     // Constants
-    static constexpr uint64_t MINIMUM_PAYOUT_SATOSHIS = 100000; // 0.001 LTC
+    // Coinbase outputs have no dust relay limit (they're part of the block, not relayed
+    // as standalone transactions). Any amount >= 1 sat is valid. Match Python p2pool behavior.
+    static constexpr uint64_t MINIMUM_PAYOUT_SATOSHIS = 1; // 1 satoshi — no artificial floor
     static constexpr size_t MAX_COINBASE_OUTPUTS = 10; // Limit coinbase outputs
 };
 
