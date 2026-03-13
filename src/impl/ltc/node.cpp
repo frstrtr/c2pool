@@ -24,7 +24,7 @@ static long get_rss_mb() {
     return 0;
 }
 
-static constexpr long RSS_LIMIT_MB = 4000;  // abort if RSS exceeds 4GB
+static long g_rss_limit_mb = 4000;  // abort if RSS exceeds this (configurable)
 
 namespace ltc
 {
@@ -226,8 +226,8 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
 	    // Safety: abort if RSS exceeds limit
 	    if (i % 100 == 0) {
 	        long rss_now = get_rss_mb();
-	        if (rss_now > RSS_LIMIT_MB) {
-	            LOG_ERROR << "RSS LIMIT EXCEEDED (" << rss_now << "MB > " << RSS_LIMIT_MB << "MB) — aborting!";
+	        if (rss_now > g_rss_limit_mb) {
+	            LOG_ERROR << "RSS LIMIT EXCEEDED (" << rss_now << "MB > " << g_rss_limit_mb << "MB) — aborting!";
 	            std::abort();
 	        }
 	    }
@@ -584,7 +584,7 @@ void NodeImpl::start_outbound_connections()
     // Try to connect to peers right away
     auto try_connect_peers = [this]() {
         size_t outbound = m_outbound_addrs.size();
-        if (outbound >= m_target_outbound_peers || m_connections.size() >= MAX_PEERS)
+        if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
             return;
 
         size_t needed = m_target_outbound_peers - outbound;
@@ -642,7 +642,7 @@ void NodeImpl::run_think()
         for (const auto& bad_addr : result.bad_peer_addresses) {
             LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
                         << " for unverifiable shares";
-            m_ban_list[bad_addr] = now + std::chrono::seconds(300);
+            m_ban_list[bad_addr] = now + m_ban_duration;
         }
     }
 
@@ -697,16 +697,12 @@ void NodeImpl::run_think()
     // Then trim chain (destructive: it owns the share data)
     trim_chain(m_tracker.chain, "chain");
 
-    // Prune caches — fixed caps safe for variable chain_length (v37+)
-    constexpr size_t MAX_SHARED_HASHES  = 50000;
-    constexpr size_t MAX_KNOWN_TXS      = 10000;
-    constexpr size_t MAX_RAW_CACHE      = 50000;
-
-    if (m_shared_share_hashes.size() > MAX_SHARED_HASHES)
+    // Prune caches — configurable caps safe for variable chain_length (v37+)
+    if (m_shared_share_hashes.size() > m_max_shared_hashes)
         m_shared_share_hashes.clear();
-    if (m_known_txs.size() > MAX_KNOWN_TXS)
+    if (m_known_txs.size() > m_max_known_txs)
         m_known_txs.clear();
-    if (m_raw_share_cache.size() > MAX_RAW_CACHE)
+    if (m_raw_share_cache.size() > m_max_raw_shares)
         m_raw_share_cache.clear();
 
   } catch (const std::exception& e) {
@@ -721,6 +717,11 @@ bool NodeImpl::is_banned(const NetService& addr) const
     auto it = m_ban_list.find(addr);
     if (it == m_ban_list.end()) return false;
     return it->second > std::chrono::steady_clock::now();
+}
+
+void NodeImpl::set_rss_limit_mb(long mb)
+{
+    g_rss_limit_mb = mb;
 }
 
 } // namespace ltc

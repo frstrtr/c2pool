@@ -495,9 +495,12 @@ private:
 
     // Stratum tuning (shared with all StratumSessions via pointer)
     StratumConfig m_stratum_config;
+    std::string m_cors_origin = "*";
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
     const StratumConfig& get_stratum_config() const { return m_stratum_config; }
+    void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
+    const std::string& get_cors_origin() const { return m_cors_origin; }
 private:
 
     // Lightweight runtime state for MVP mining controls.

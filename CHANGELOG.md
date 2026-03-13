@@ -39,6 +39,37 @@
 ## [Unreleased] - 2025-07-06
 
 ### Added
+- **Comprehensive operational config** — 13 new CLI flags and matching YAML
+  keys for logging, P2P, memory, cache, CORS, storage, and payout tuning
+  (`--log-file`, `--log-level`, `--log-rotation-mb`, `--log-max-mb`,
+  `--p2p-max-peers`, `--ban-duration`, `--rss-limit-mb`, `--cors-origin`,
+  `--payout-window`, `--storage-save-interval`, `--max-coinbase-outputs`)
+- `Logger::init()` now accepts file name, rotation MB, max total MB, and
+  log level string (trace/debug/info/warning/error); old init() delegates
+- Node P2P params (`MAX_PEERS`, `BAN_DURATION`, cache sizes, RSS limit) are
+  now runtime-configurable via setter methods
+- CORS `Access-Control-Allow-Origin` reads from `MiningInterface` config
+  instead of hardcoded `"*"`
+- `config/c2pool_testnet.yaml` rewritten — dead keys removed, all wired keys
+  documented with inline comments
+- Full configuration reference table in `README.md`
+- Vardiff (variable difficulty) for stratum sessions: automatic share
+  difficulty targeting via `--stratum-min-diff`, `--stratum-max-diff`,
+  `--stratum-target-time`, `--no-vardiff`
+- `StratumConfig` struct with CLI and YAML pipeline
+- Bech32 (native SegWit) address support in payout validation
+
+### Fixed
+- `MAX_COINBASE_OUTPUTS` raised from 10 to 4000 (matching Python p2pool);
+  eliminates silent payout truncation on busy pools
+- `MINIMUM_PAYOUT_SATOSHIS` fixed from 100 000 to 1 — coinbase outputs are
+  exempt from the dust limit
+- P2P default ports corrected: mainnet 9326 → 9338
+- YAML testnet ports corrected: p2p 9333 → 19338, stratum 8084 → 19327
+- Ghost share tracker silenced via `vardiff_enabled_` flag
+- Stale sharechain view crash on missing shares
+
+### Added
 - FreeBSD build support and compatibility
 - CMake 3.30+ compatibility (automatic FindBoost fallback)
 - Enhanced mining pool web server with HTTP/JSON-RPC and Stratum protocols

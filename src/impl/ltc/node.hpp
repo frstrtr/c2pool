@@ -144,6 +144,22 @@ public:
     /// A value of 0 disables outbound dialing.
     void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
 
+    /// Set max total P2P peers (inbound + outbound).
+    void set_max_peers(size_t count) { m_max_peers = count; }
+
+    /// Set P2P ban duration (seconds).
+    void set_ban_duration(int seconds) { m_ban_duration = std::chrono::seconds(seconds); }
+
+    /// Set cache size limits for memory control.
+    void set_cache_limits(size_t max_shared, size_t max_known_txs, size_t max_raw) {
+        m_max_shared_hashes = max_shared;
+        m_max_known_txs = max_known_txs;
+        m_max_raw_shares = max_raw;
+    }
+
+    /// Set RSS memory limit in MB (abort if exceeded). Static because checked in process_shares.
+    static void set_rss_limit_mb(long mb);
+
     /// Run the share tracker think() cycle: verifies chains, scores heads,
     /// identifies bad peers, and requests needed shares.
     /// Should be called periodically (e.g. after processing_shares or on a timer).
@@ -166,7 +182,7 @@ protected:
 
     // Connection maintenance
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
-    static constexpr size_t MAX_PEERS = 30;
+    size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
@@ -174,11 +190,16 @@ protected:
 
     // Peer banning: maps address → ban expiry time
     std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
-    static constexpr std::chrono::seconds BAN_DURATION{300}; // 5 minutes
+    std::chrono::seconds m_ban_duration{300}; // 5 minutes (configurable)
 
     // Rate-limit run_think(): minimum interval between calls
     std::chrono::steady_clock::time_point m_last_think_time{};
     static constexpr std::chrono::seconds THINK_MIN_INTERVAL{5};
+
+    // Cache limits (configurable)
+    size_t m_max_shared_hashes = 50000;
+    size_t m_max_known_txs     = 10000;
+    size_t m_max_raw_shares    = 50000;
 
     // Block depth function for chain scoring (set via set_block_rel_height_fn)
     block_rel_height_fn_t m_block_rel_height_fn;

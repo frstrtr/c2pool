@@ -102,6 +102,60 @@ See [util/README.md](util/README.md) for full documentation.
 
 ---
 
+## Configuration
+
+c2pool supports configuration via CLI arguments, YAML config file, or both.
+CLI arguments always take priority over YAML values.
+
+```bash
+# Use a YAML config file
+./src/c2pool/c2pool --config config/c2pool_testnet.yaml
+
+# Or pass everything via CLI
+./src/c2pool/c2pool --integrated --testnet --net litecoin \
+    --p2pool-port 19338 -w 19327 --web-port 8080 ...
+```
+
+### Configuration reference
+
+| CLI flag | YAML key | Default | Description |
+|----------|----------|---------|-------------|
+| `--net` | — | — | Blockchain: `litecoin`, `bitcoin`, `dogecoin` |
+| `--testnet` | — | off | Enable testnet mode |
+| `--p2pool-port` | `port` | 9338 | P2P sharechain port |
+| `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
+| `--web-port` | `http_port` | 8080 | HTTP API / dashboard port |
+| `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
+| `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
+| `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
+| `--rpcuser` | `ltc_rpc_user` | — | RPC username |
+| `--rpcpassword` | `ltc_rpc_password` | — | RPC password |
+| `--address` | — | — | Payout address |
+| `--give-author` | `donation_percentage` | 0 | Developer donation % |
+| `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee % |
+| `--node-owner-address` | `node_owner_address` | — | Node owner payout addr |
+| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate |
+| `--max-conns` | — | 8 | Target outbound P2P peers |
+| `--stratum-min-diff` | `min_difficulty` | 0.001 | Vardiff floor |
+| `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
+| `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
+| `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
+| `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
+| `--log-file` | `log_file` | debug.log | Log filename |
+| `--log-level` | `log_level` | trace | trace/debug/info/warning/error |
+| `--log-rotation-mb` | `log_rotation_size_mb` | 10 | Log rotation threshold (MB) |
+| `--log-max-mb` | `log_max_total_mb` | 50 | Max rotated log space (MB) |
+| `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
+| `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
+| `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
+| `--cors-origin` | `cors_origin` | * | CORS Allow-Origin header |
+| `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
+| `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
+
+See [config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) for a complete example.
+
+---
+
 ## Build targets
 
 | Target | Description |

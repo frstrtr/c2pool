@@ -1,67 +1,57 @@
 # C2Pool Litecoin Testnet Configuration
 # P2P: 19338, Stratum: 19327, HTTP: 8080
+#
+# All keys below are optional. CLI arguments always take priority over YAML values.
+# Unrecognized keys are silently ignored.
 
-# Network Configuration
-network: litecoin_testnet
-testnet: true
-port: 19338                   # P2P p2pool sharechain port (testnet)
-stratum_port: 19327           # Stratum mining port (testnet)
-http_port: 8080               # HTTP/JSON-RPC port for monitoring
+# ─── Network ────────────────────────────────────────────────────────────────
+port: 19338                    # P2P p2pool sharechain port (testnet)
+stratum_port: 19327            # Stratum mining port (testnet)
+http_port: 8080                # HTTP/JSON-RPC API port
+http_host: "0.0.0.0"          # HTTP bind address
 
-# Litecoin Node Connection
+# ─── Coin Daemon RPC ────────────────────────────────────────────────────────
 ltc_rpc_host: 127.0.0.1
-ltc_rpc_port: 19332          # Litecoin testnet RPC port
+ltc_rpc_port: 19332            # Litecoin testnet RPC port
 ltc_rpc_user: ltctest
 ltc_rpc_password: ltctest123
-ltc_rpc_timeout: 30
 
-# Mining Configuration
-# Stratum per-connection vardiff tuning
-min_difficulty: 0.001         # Floor for per-connection difficulty (smallest ASICs)
-max_difficulty: 65536.0       # Ceiling for per-connection difficulty (large farms)
-target_time: 10.0             # Target seconds between pseudoshares
-vardiff_enabled: true         # Auto-adjust per-connection difficulty
-max_coinbase_outputs: 4000    # Max coinbase outputs (Python p2pool: 4000; no consensus limit)
+# ─── Coin Daemon P2P (fast block relay) ──────────────────────────────────────
+# coind_p2p_port: 19335        # auto-detected from chain if omitted
+# coind_p2p_address: 127.0.0.1 # defaults to ltc_rpc_host
 
-# Storage Configuration
-data_dir: ./data/testnet
-leveldb_enabled: true
-leveldb_cache_size: 64        # MB
-save_interval: 100            # Save every 100 shares
+# ─── Payout & Fees ──────────────────────────────────────────────────────────
+# donation_percentage: 0.0     # Developer donation %
+# node_owner_fee: 0.0          # Node owner fee %
+# node_owner_address: ""       # Node owner payout address
+# redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
+# payout_window_seconds: 86400  # PPLNS payout window (default: 24h)
 
-# Monitoring & Logging
-log_level: INFO
-log_file: c2pool_testnet.log
-log_shares: true              # Log share submissions
-log_mining_shares: true       # Log mining_shares specifically
-log_p2p_shares: true          # Log p2p_shares specifically
+# ─── Stratum per-connection vardiff tuning ───────────────────────────────────
+min_difficulty: 0.001          # Floor for per-connection difficulty (smallest ASICs)
+max_difficulty: 65536.0        # Ceiling for per-connection difficulty (large farms)
+target_time: 10.0              # Target seconds between pseudoshares
+vardiff_enabled: true          # Auto-adjust per-connection difficulty
+max_coinbase_outputs: 4000     # Max coinbase outputs (p2pool: 4000; no consensus limit)
 
-# Pool Configuration
-pool_name: "C2Pool Testnet"
-pool_description: "C2Pool Litecoin Testnet with Mining/P2P Share Separation"
-pool_website: "http://localhost:8080"
-donation_percentage: 0.0      # No donation for testing
+# ─── P2P Sharechain ─────────────────────────────────────────────────────────
+p2p_max_peers: 30              # Max total P2P peers (inbound + outbound)
+ban_duration: 300              # P2P ban duration in seconds (5 min default)
 
-# Performance Tuning
-max_connections: 50
-worker_threads: 4
-io_threads: 2
-share_cache_size: 1000
+# ─── Logging ────────────────────────────────────────────────────────────────
+log_level: INFO                # trace, debug, info, warning, error
+log_file: c2pool_testnet.log   # Log filename (in data dir)
+log_rotation_size_mb: 10       # Rotate log file at N MB
+log_max_total_mb: 50           # Max total rotated log space in MB
 
-# Security (relaxed for testing)
-allow_local_miners: true
-require_worker_auth: false
-ban_threshold: 1000           # High threshold for testing
-ban_duration: 300             # 5 minutes
+# ─── Memory & Caches ────────────────────────────────────────────────────────
+rss_limit_mb: 4000             # Abort if RSS exceeds N MB (default: 4GB)
+# cache_max_shared_hashes: 50000
+# cache_max_known_txs: 10000
+# cache_max_raw_shares: 50000
 
-# Features
-enable_getwork: false         # Only Stratum for testing
-enable_stratum: true
-enable_http_api: true
-enable_web_interface: true
+# ─── Storage ────────────────────────────────────────────────────────────────
+storage_save_interval: 300     # Periodic sharechain save interval (seconds)
 
-# Debug Features for Testing
-debug_mode: true
-verbose_logging: true
-track_share_sources: true     # Track mining_shares vs p2p_shares separately
-detailed_statistics: true
+# ─── HTTP API / Security ────────────────────────────────────────────────────
+cors_origin: "*"               # Access-Control-Allow-Origin header

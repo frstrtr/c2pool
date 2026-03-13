@@ -196,7 +196,19 @@ void print_help() {
     std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
     std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
     std::cout << "                            to embed in locally created V36 shares\n\n";
-    
+
+    std::cout << "OPERATIONAL TUNING:\n";
+    std::cout << "  --log-file FILE           Log filename (default: debug.log in data dir)\n";
+    std::cout << "  --log-rotation-mb N       Rotate log file at N MB (default: 10)\n";
+    std::cout << "  --log-max-mb N            Max total rotated log space in MB (default: 50)\n";
+    std::cout << "  --log-level LEVEL         Log level: trace, debug, info, warning, error (default: trace)\n";
+    std::cout << "  --p2p-max-peers N         Max total P2P peers (default: 30)\n";
+    std::cout << "  --ban-duration N          P2P ban duration in seconds (default: 300)\n";
+    std::cout << "  --rss-limit-mb N          Abort if RSS exceeds N MB (default: 4000)\n";
+    std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: *)\n";
+    std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
+    std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n\n";
+
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  Litecoin (LTC)    ✅ Full support with merged mining (parent)\n";
@@ -305,6 +317,21 @@ int main(int argc, char* argv[]) {
 
     // Stratum tuning (configurable via CLI or YAML)
     core::StratumConfig stratum_config;  // defaults: min=0.001, max=65536, target=10s, vardiff=true
+
+    // Operational tuning (configurable via CLI or YAML)
+    std::string log_file;                        // empty = default "debug.log"
+    int         log_rotation_size_mb = 10;       // rotate log at N MB
+    int         log_max_total_mb     = 50;       // keep ≤N MB of rotated logs
+    std::string log_level_str;                   // empty = default (trace)
+    int         p2p_max_peers        = 30;       // max total P2P peers
+    int         p2p_ban_duration     = 300;      // ban duration in seconds
+    long        rss_limit_mb         = 4000;     // abort if RSS exceeds N MB
+    std::string http_cors_origin     = "*";      // Access-Control-Allow-Origin
+    int         payout_window_seconds = 86400;   // PPLNS payout window (24h)
+    int         cache_max_shared_hashes = 50000; // de-dup set cap
+    int         cache_max_known_txs     = 10000; // known TX cache cap
+    int         cache_max_raw_shares    = 50000; // raw share cache cap
+    int         storage_save_interval   = 300;   // periodic save interval (seconds)
 
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
@@ -552,6 +579,47 @@ int main(int argc, char* argv[]) {
             stratum_config.max_coinbase_outputs = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_coinbase_outputs");
         }
+        // Operational tuning
+        else if (arg == "--log-file" && i + 1 < argc) {
+            log_file = argv[++i];
+            cli_explicit.insert("log_file");
+        }
+        else if (arg == "--log-rotation-mb" && i + 1 < argc) {
+            log_rotation_size_mb = std::stoi(argv[++i]);
+            cli_explicit.insert("log_rotation_size_mb");
+        }
+        else if (arg == "--log-max-mb" && i + 1 < argc) {
+            log_max_total_mb = std::stoi(argv[++i]);
+            cli_explicit.insert("log_max_total_mb");
+        }
+        else if (arg == "--log-level" && i + 1 < argc) {
+            log_level_str = argv[++i];
+            cli_explicit.insert("log_level");
+        }
+        else if (arg == "--p2p-max-peers" && i + 1 < argc) {
+            p2p_max_peers = std::stoi(argv[++i]);
+            cli_explicit.insert("p2p_max_peers");
+        }
+        else if (arg == "--ban-duration" && i + 1 < argc) {
+            p2p_ban_duration = std::stoi(argv[++i]);
+            cli_explicit.insert("ban_duration");
+        }
+        else if (arg == "--rss-limit-mb" && i + 1 < argc) {
+            rss_limit_mb = std::stol(argv[++i]);
+            cli_explicit.insert("rss_limit_mb");
+        }
+        else if (arg == "--cors-origin" && i + 1 < argc) {
+            http_cors_origin = argv[++i];
+            cli_explicit.insert("cors_origin");
+        }
+        else if (arg == "--payout-window" && i + 1 < argc) {
+            payout_window_seconds = std::stoi(argv[++i]);
+            cli_explicit.insert("payout_window_seconds");
+        }
+        else if (arg == "--storage-save-interval" && i + 1 < argc) {
+            storage_save_interval = std::stoi(argv[++i]);
+            cli_explicit.insert("storage_save_interval");
+        }
         // Seed node: -n HOST:PORT (p2pool compat)
         else if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
@@ -668,10 +736,50 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("max_coinbase_outputs") && cfg["max_coinbase_outputs"])
                 stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
 
+            // Operational tuning
+            if (!cli_explicit.count("log_file") && cfg["log_file"])
+                log_file = cfg["log_file"].as<std::string>();
+            if (!cli_explicit.count("log_rotation_size_mb") && cfg["log_rotation_size_mb"])
+                log_rotation_size_mb = cfg["log_rotation_size_mb"].as<int>();
+            if (!cli_explicit.count("log_max_total_mb") && cfg["log_max_total_mb"])
+                log_max_total_mb = cfg["log_max_total_mb"].as<int>();
+            if (!cli_explicit.count("log_level") && cfg["log_level"])
+                log_level_str = cfg["log_level"].as<std::string>();
+            if (!cli_explicit.count("p2p_max_peers") && cfg["p2p_max_peers"])
+                p2p_max_peers = cfg["p2p_max_peers"].as<int>();
+            if (!cli_explicit.count("ban_duration") && cfg["ban_duration"])
+                p2p_ban_duration = cfg["ban_duration"].as<int>();
+            if (!cli_explicit.count("rss_limit_mb") && cfg["rss_limit_mb"])
+                rss_limit_mb = cfg["rss_limit_mb"].as<long>();
+            if (!cli_explicit.count("cors_origin") && cfg["cors_origin"])
+                http_cors_origin = cfg["cors_origin"].as<std::string>();
+            if (!cli_explicit.count("payout_window_seconds") && cfg["payout_window_seconds"])
+                payout_window_seconds = cfg["payout_window_seconds"].as<int>();
+            if (!cli_explicit.count("storage_save_interval") && cfg["storage_save_interval"])
+                storage_save_interval = cfg["storage_save_interval"].as<int>();
+            if (cfg["cache_max_shared_hashes"])
+                cache_max_shared_hashes = cfg["cache_max_shared_hashes"].as<int>();
+            if (cfg["cache_max_known_txs"])
+                cache_max_known_txs = cfg["cache_max_known_txs"].as<int>();
+            if (cfg["cache_max_raw_shares"])
+                cache_max_raw_shares = cfg["cache_max_raw_shares"].as<int>();
+
         } catch (const YAML::Exception& e) {
             LOG_ERROR << "Failed to load config file '" << config_file << "': " << e.what();
             return 1;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-parse: re-initialize logger if custom log params were set
+    // -----------------------------------------------------------------------
+    if (!log_file.empty() || log_rotation_size_mb != 10 || log_max_total_mb != 50 || !log_level_str.empty()) {
+        boost::log::core::get()->remove_all_sinks();
+        core::log::Logger::init(log_file, log_rotation_size_mb, log_max_total_mb, log_level_str);
+        LOG_INFO << "Logger re-initialized: file=" << (log_file.empty() ? "debug.log" : log_file)
+                 << " rotation=" << log_rotation_size_mb << "MB"
+                 << " max=" << log_max_total_mb << "MB"
+                 << " level=" << (log_level_str.empty() ? "trace" : log_level_str);
     }
 
     // -----------------------------------------------------------------------
@@ -841,11 +949,18 @@ int main(int argc, char* argv[]) {
 
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
             LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
                      << " max_diff=" << stratum_config.max_difficulty
                      << " target_time=" << stratum_config.target_time << "s"
                      << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
                      << " max_cb_outputs=" << stratum_config.max_coinbase_outputs;
+            LOG_INFO << "Operational config: p2p_max_peers=" << p2p_max_peers
+                     << " ban_duration=" << p2p_ban_duration << "s"
+                     << " rss_limit=" << rss_limit_mb << "MB"
+                     << " cors=" << http_cors_origin
+                     << " payout_window=" << payout_window_seconds << "s"
+                     << " save_interval=" << storage_save_interval << "s";
             
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             web_server.set_coin_rpc(node_rpc.get(), &coin_node);
@@ -886,6 +1001,13 @@ int main(int argc, char* argv[]) {
                 p2p_node->set_target_outbound_peers(static_cast<size_t>(max_outgoing_conns));
                 LOG_INFO << "Configured outbound peer target: " << max_outgoing_conns;
             }
+            p2p_node->set_max_peers(static_cast<size_t>(p2p_max_peers));
+            p2p_node->set_ban_duration(p2p_ban_duration);
+            p2p_node->set_cache_limits(
+                static_cast<size_t>(cache_max_shared_hashes),
+                static_cast<size_t>(cache_max_known_txs),
+                static_cast<size_t>(cache_max_raw_shares));
+            ltc::Node::set_rss_limit_mb(rss_limit_mb);
             p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
             LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 

@@ -47,15 +47,28 @@ const std::map<std::string, core::log::flags> categories =
 
 void Logger::init()
 {
+    init("", 10, 50, "");
+}
+
+void Logger::init(const std::string& log_file_name, int rotation_size_mb, int max_total_mb, const std::string& level)
+{
     // common attributes
     boost::log::add_common_attributes();
     boost::log::core::get()->add_global_attribute(
         "Scope", boost::log::attributes::named_scope()
     );
-    // set trace log filter
+
+    // set log level filter
+    auto severity = logging::trivial::trace;
+    if (level == "debug")        severity = logging::trivial::debug;
+    else if (level == "info" || level == "INFO")
+                                 severity = logging::trivial::info;
+    else if (level == "warning" || level == "WARNING" || level == "warn")
+                                 severity = logging::trivial::warning;
+    else if (level == "error" || level == "ERROR")
+                                 severity = logging::trivial::error;
     boost::log::core::get()->set_filter(
-        // boost::log::trivial::severity >= logging::trivial::debug
-        boost::log::trivial::severity >= logging::trivial::trace
+        boost::log::trivial::severity >= severity
     );
     
     /* log formatter:
@@ -80,19 +93,19 @@ void Logger::init()
     auto consoleSink = boost::log::add_console_log(std::clog);
     consoleSink->set_formatter(logFmt);
 
-    /* file sink — fixed debug.log in data directory (Bitcoin-style)
+    /* file sink — data directory (Bitcoin-style)
      * tail -f ~/.c2pool/debug.log
      */
     auto log_dir = core::filesystem::config_path();
     std::filesystem::create_directories(log_dir);
-    auto debug_log = log_dir / "debug.log";
+    auto debug_log = log_dir / (log_file_name.empty() ? "debug.log" : log_file_name);
 
     auto fsSink = boost::log::add_file_log(
         boost::log::keywords::file_name = debug_log.string(),
-        boost::log::keywords::rotation_size = 10 * 1024 * 1024,  /* rotate at 10 MB */
+        boost::log::keywords::rotation_size = rotation_size_mb * 1024 * 1024,
         boost::log::keywords::open_mode = std::ios_base::app,
-        keywords::target = log_dir / "logs",                       /* rotated copies go here */
-        keywords::max_size = 50 * 1024 * 1024,                    /* keep ≤50 MB of rotated logs */
+        keywords::target = log_dir / "logs",
+        keywords::max_size = max_total_mb * 1024 * 1024,
         boost::log::keywords::min_free_space = 30 * 1024 * 1024
     );
     fsSink->set_formatter(logFmt);

@@ -71,7 +71,7 @@ void HttpSession::process_request()
     http::response<http::string_body> response{http::status::ok, request_.version()};
     response.set(http::field::server, "c2pool/0.0.1");
     response.set(http::field::content_type, "application/json");
-    response.set(http::field::access_control_allow_origin, "*");
+    response.set(http::field::access_control_allow_origin, mining_interface_->get_cors_origin());
     response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
     response.set(http::field::access_control_allow_headers, "Content-Type");
 

@@ -37,6 +37,7 @@ private:
 public:
 
     static void init();
+    static void init(const std::string& log_file, int rotation_size_mb, int max_total_mb, const std::string& level);
 
     static void add_category(const std::string& category);
     static void remove_category(const std::string& category);
