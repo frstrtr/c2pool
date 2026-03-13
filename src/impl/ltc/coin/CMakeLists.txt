@@ -13,6 +13,7 @@ set(ltc_coin_interface
     node_interface.hpp
     block.hpp
     transaction.hpp transaction.cpp
+    header_chain.hpp
 )
 
 

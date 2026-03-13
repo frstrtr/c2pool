@@ -84,3 +84,4 @@ ref/
 # Local test launch scripts (contain credentials)
 /run-testnet.sh
 CLAUDE.md
+.claudeignore

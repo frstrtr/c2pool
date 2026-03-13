@@ -124,6 +124,20 @@ public:
         m_peer.reset();
     }
 
+    /// Send a getheaders request to the connected peer.
+    /// @param version  Protocol version (typically 70015 or 70017).
+    /// @param locator  Block locator hashes (tip-to-genesis order).
+    /// @param stop     Stop hash (uint256::ZERO to request up to tip).
+    void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
+    {
+        if (!m_peer) return;
+        auto msg = message_getheaders::make_raw(version, locator, stop);
+        m_peer->write(msg);
+    }
+
+    /// Whether the handshake with the peer is complete.
+    bool is_handshake_complete() const { return m_handshake_complete; }
+
     // ICommmunicator
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
@@ -395,7 +409,14 @@ private:
             auto header = (BlockHeaderType)block;
             auto packed_header = pack(header);
             auto blockhash = Hash(packed_header.get_span());
-            m_peer->get_header(blockhash, header);
+            // Feed to ReplyMatcher if there's a pending individual request;
+            // ignore if not (batch headers from getheaders won't have one).
+            try {
+                m_peer->get_header(blockhash, header);
+            } catch (const std::invalid_argument&) {
+                // No pending request for this hash — expected for getheaders batches
+            }
+            vheaders.push_back(header);
         }
 
         m_coin->new_headers.happened(vheaders);
