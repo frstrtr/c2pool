@@ -2980,8 +2980,9 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
-    hashrate_tracker_.set_difficulty_bounds(0.0000001, 65536.0);  // TEST: very low min diff for CPU miner
-    hashrate_tracker_.set_target_time_per_mining_share(15.0);
+    hashrate_tracker_.set_difficulty_bounds(0.001, 65536.0);
+    hashrate_tracker_.set_target_time_per_mining_share(10.0);  // 10 sec/pseudoshare like Python p2pool
+    hashrate_tracker_.enable_vardiff();  // Only per-connection trackers should auto-adjust
 }
 
 void StratumSession::start()
@@ -3253,29 +3254,30 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         extranonce1_, extranonce2, ntime, nonce,
         job.version, job.gbt_prevhash, job.nbits, job.merkle_branches);
     double required_difficulty = hashrate_tracker_.get_current_difficulty();
-    
-    if (share_difficulty < required_difficulty) {
-        ++rejected_shares_;
-        LOG_WARNING << "Low difficulty share from " << username_
-                    << ": got " << share_difficulty << ", need " << required_difficulty;
-        nlohmann::json response;
-        response["id"] = request_id;
-        response["result"] = false;
-        response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
-        return response;
-    }
-    
-    // Valid share — record and adjust VARDIFF
-    ++accepted_shares_;
+
+    // Record ALL submissions for vardiff timing (accepted + rejected), like Python p2pool.
+    // This lets vardiff discover the miner's actual hashrate even when shares are below target.
     double old_difficulty = required_difficulty;
-    hashrate_tracker_.record_mining_share_submission(share_difficulty, true);
-    
+    hashrate_tracker_.record_mining_share_submission(share_difficulty, share_difficulty >= required_difficulty);
+
     double new_difficulty = hashrate_tracker_.get_current_difficulty();
     if (new_difficulty != old_difficulty) {
         send_set_difficulty(new_difficulty);
         LOG_INFO << "VARDIFF adjustment for " << username_ << ": "
                  << old_difficulty << " -> " << new_difficulty;
     }
+
+    if (share_difficulty < required_difficulty) {
+        ++rejected_shares_;
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
+        return response;
+    }
+
+    // Valid share
+    ++accepted_shares_;
     
     // Forward the accepted share to MiningInterface for block-level checking.
     // Convert per-chain merged addresses (Base58Check strings) to scriptPubKeys.

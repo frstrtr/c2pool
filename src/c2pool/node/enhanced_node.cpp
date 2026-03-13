@@ -6,6 +6,7 @@ namespace node {
 
 EnhancedC2PoolNode::EnhancedC2PoolNode(bool testnet) {
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
+    m_hashrate_tracker->set_difficulty_bounds(0.001, 65536.0);
     std::string network = testnet ? "testnet" : "mainnet";
     m_storage = std::make_unique<storage::SharechainStorage>(network);
     
@@ -20,6 +21,7 @@ EnhancedC2PoolNode::EnhancedC2PoolNode(boost::asio::io_context* ctx, ltc::Config
 {
     // Initialize components
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
+    m_hashrate_tracker->set_difficulty_bounds(0.001, 65536.0);
     
     // Initialize storage
     std::string network = config ? (config->m_testnet ? "testnet" : "mainnet") : "testnet";
