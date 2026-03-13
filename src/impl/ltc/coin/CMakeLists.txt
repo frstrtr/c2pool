@@ -15,6 +15,7 @@ set(ltc_coin_interface
     transaction.hpp transaction.cpp
     header_chain.hpp
     mempool.hpp
+    template_builder.hpp
 )
 
 
