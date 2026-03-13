@@ -138,6 +138,21 @@ public:
     /// Whether the handshake with the peer is complete.
     bool is_handshake_complete() const { return m_handshake_complete; }
 
+    /// Send BIP 35 mempool request — ask peer to announce all mempool txs via inv.
+    void send_mempool() {
+        if (!m_peer) return;
+        auto msg = message_mempool::make_raw();
+        m_peer->write(msg);
+    }
+
+    /// Send BIP 133 feefilter — advise peer of minimum feerate we accept (sat/kB).
+    /// Pass 0 to request all transactions (no filtering).
+    void send_feefilter(uint64_t min_feerate_sat_per_kb = 0) {
+        if (!m_peer) return;
+        auto msg = message_feefilter::make_raw(min_feerate_sat_per_kb);
+        m_peer->write(msg);
+    }
+
     // ICommmunicator
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
@@ -336,6 +351,14 @@ private:
         // BIP 130: request header-first block announcements
         auto msg_sendheaders = message_sendheaders::make_raw();
         m_peer->write(msg_sendheaders);
+
+        // BIP 133: advertise minimum feerate (0 = accept all transactions)
+        send_feefilter(0);
+
+        // NOTE: send_mempool() (BIP 35) is NOT called automatically here.
+        // It requires NODE_BLOOM service flags on both sides or the daemon
+        // may disconnect. Callers must invoke send_mempool() explicitly after
+        // confirming the peer supports it.
     }
 
     ADD_P2P_HANDLER(ping)
