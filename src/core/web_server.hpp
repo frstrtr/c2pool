@@ -148,6 +148,50 @@ public:
     nlohmann::json rest_payout_addrs();
     nlohmann::json rest_web_best_share_hash();
 
+    // Additional p2pool-compatible REST endpoints (peer network, stale rates, mining details)
+    nlohmann::json rest_rate();                     // /rate — pool hashrate (single number)
+    nlohmann::json rest_difficulty();               // /difficulty — share difficulty (single number)
+    nlohmann::json rest_user_stales();              // /user_stales — per-user stale proportions
+    std::string    rest_peer_addresses();           // /peer_addresses — space-separated peer list (text)
+    nlohmann::json rest_peer_versions();            // /peer_versions — p2pool version per peer
+    nlohmann::json rest_peer_txpool_sizes();        // /peer_txpool_sizes — txpool size per peer
+    nlohmann::json rest_peer_list();                // /peer_list — detailed peer list [{address,version,incoming,uptime,...}]
+    nlohmann::json rest_pings();                    // /pings — ping latency per peer (stub)
+    nlohmann::json rest_stale_rates();              // /stale_rates — {good,orphan,dead} rate breakdown
+    nlohmann::json rest_node_info();                // /node_info — {external_ip,worker_port,p2p_port,network,symbol}
+    nlohmann::json rest_luck_stats();               // /luck_stats — pool luck statistics
+    nlohmann::json rest_ban_stats();                // /ban_stats — current ban statistics
+    nlohmann::json rest_stratum_security();         // /stratum_security — DDoS detection metrics (stub)
+    nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
+    nlohmann::json rest_best_share();               // /best_share — node-wide best share (BitAxe style)
+    nlohmann::json rest_miner_payouts(const std::string& address); // /miner_payouts/<addr> — payout history per miner
+    nlohmann::json rest_version_signaling();         // /version_signaling — V36 version tracking
+    nlohmann::json rest_v36_status();                // /v36_status — V36 diagnostic
+    nlohmann::json rest_patron_sendmany(const std::string& total); // /patron_sendmany/<total> — sendmany text
+    nlohmann::json rest_tracker_debug();             // /tracker_debug — debug sharechain info
+
+    // Merged mining endpoints
+    nlohmann::json rest_merged_stats();              // /merged_stats — merged mining statistics
+    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — merged payouts
+    nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
+    nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
+    nlohmann::json rest_discovered_merged_blocks();  // /discovered_merged_blocks — merged block proofs
+    nlohmann::json rest_broadcaster_status();        // /broadcaster_status — parent chain broadcaster
+    nlohmann::json rest_merged_broadcaster_status(); // /merged_broadcaster_status — merged broadcaster
+    nlohmann::json rest_network_difficulty();         // /network_difficulty — historical network diff
+
+    // /web/ sub-endpoints (share chain inspection)
+    nlohmann::json rest_web_heads();                 // /web/heads
+    nlohmann::json rest_web_verified_heads();        // /web/verified_heads
+    nlohmann::json rest_web_tails();                 // /web/tails
+    nlohmann::json rest_web_verified_tails();        // /web/verified_tails
+    nlohmann::json rest_web_my_share_hashes();       // /web/my_share_hashes
+    nlohmann::json rest_web_my_share_hashes50();     // /web/my_share_hashes50
+    nlohmann::json rest_web_share(const std::string& hash); // /web/share/<hash>
+    nlohmann::json rest_web_payout_address(const std::string& hash); // /web/payout_address/<hash>
+    nlohmann::json rest_web_log_json();              // /web/log — JSON array (p2pool stat_log format)
+    nlohmann::json rest_web_graph_data(const std::string& source, const std::string& view); // /web/graph_data/<source>/<view>
+
     // Log endpoints for Qt PageLogs — read directly from debug.log
     std::string rest_web_log();
     std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
@@ -518,6 +562,20 @@ public:
     // Primary payout address (for legacy /payout_addr endpoint)
     void set_payout_address(const std::string& addr) { m_payout_address = addr; }
     const std::string& get_payout_address() const { return m_payout_address; }
+
+    // P2P peer info callback — returns JSON array of peer objects [{address,version,incoming,uptime,txpool_size}]
+    using peer_info_fn_t = std::function<nlohmann::json()>;
+    void set_peer_info_fn(peer_info_fn_t fn) { m_peer_info_fn = std::move(fn); }
+
+    // Port configuration for /node_info
+    void set_p2p_port(uint16_t port) { m_p2p_port = port; }
+    void set_worker_port(uint16_t port) { m_worker_port = port; }
+
+    // Best share difficulty tracking (for /best_share, /miner_stats)
+    void record_share_difficulty(double difficulty, const std::string& miner);
+
+    // Stat log entry (appended every 5 minutes, rolling 24h window for /web/log JSON)
+    void update_stat_log();
 private:
 
     // Lightweight runtime state for MVP mining controls.
@@ -532,6 +590,47 @@ private:
     std::string m_dashboard_dir;
     // Primary payout address for legacy API
     std::string m_payout_address;
+
+    // P2P peer info callback
+    peer_info_fn_t m_peer_info_fn;
+
+    // Port configuration
+    uint16_t m_p2p_port{9338};
+    uint16_t m_worker_port{9327};
+
+    // Best share difficulty tracking
+    struct BestDifficulty {
+        double all_time{0.0};
+        double session{0.0};
+        double round{0.0};
+        std::string miner;
+        uint64_t timestamp{0};
+        uint64_t round_start{0};
+    };
+    BestDifficulty m_best_difficulty;
+    mutable std::mutex m_best_diff_mutex;
+
+    // Stat log for /web/log JSON endpoint (rolling 24h window)
+    struct StatLogEntry {
+        double time;
+        double pool_hash_rate;
+        double pool_stale_prop;
+        nlohmann::json local_hash_rates;
+        uint64_t shares;
+        uint64_t stale_shares;
+        double current_payout;
+        nlohmann::json peers;         // {incoming, outgoing}
+        double attempts_to_share;
+        double attempts_to_block;
+        double block_value;
+    };
+    std::vector<StatLogEntry> m_stat_log;
+    mutable std::mutex m_stat_log_mutex;
+
+    // Network difficulty history for /network_difficulty
+    struct NetDiffSample { double ts; double difficulty; std::string source; };
+    std::vector<NetDiffSample> m_netdiff_history;  // newest-first, capped at 10000
+    mutable std::mutex m_netdiff_mutex;
 };
 
 /// Main Web Server class

@@ -391,23 +391,181 @@ Hash of the sharechain tip (best share).
 
 ### Endpoints NOT implemented (yet)
 
-The following p2pool-era endpoints require time-series data collection
-infrastructure that is not yet implemented in c2pool. They return
-empty arrays or null:
+All p2pool-era endpoints from the jtoomim fork are now routed and return
+data.  Some endpoints return stub/placeholder values where deep
+infrastructure is not yet wired (e.g., per-miner hashrate history,
+full share inspection).  Contributions welcome.
 
-| Endpoint | Status |
-|----------|--------|
-| `/web/graph_data/*` | Not implemented (empty) |
-| `/web/share/<hash>` | Not implemented |
-| `/web/verified_heads` | Not implemented |
-| `/web/verified_tails` | Not implemented |
-| `/web/heads` | Not implemented |
-| `/web/tails` | Not implemented |
-| `/web/my_share_hashes` | Not implemented |
+---
 
-Contributions welcome — these would require adding a `GraphDataCollector`
-that samples time-series data every few seconds and stores the last
-Hour/Day/Week/Month/Year of data points.
+## API Reference — Additional p2pool-compatible Endpoints
+
+These endpoints match the JSON shapes from jtoomim/p2pool's `web.py`,
+giving full backward-compatibility with classic p2pool dashboards.
+
+### GET `/rate`
+Returns the pool hashrate as a single number (float).
+
+### GET `/difficulty`
+Returns the current share difficulty as a single number (float).
+
+### GET `/user_stales`
+Returns `{ "address": stale_proportion, ... }` (currently stub: empty object).
+
+### GET `/peer_addresses`
+Returns a **plain text** space-separated list of peer addresses.
+Content-Type: `text/plain`.
+
+### GET `/peer_versions`
+```json
+{ "ip:port": "version_string", ... }
+```
+
+### GET `/peer_txpool_sizes`
+```json
+{ "ip:port": txpool_size_int, ... }
+```
+
+### GET `/peer_list`
+```json
+[
+  {
+    "address": "ip:port",
+    "version": "string",
+    "incoming": bool,
+    "uptime": float,
+    "txpool_size": int
+  }
+]
+```
+
+### GET `/pings`
+```json
+{ "ip:port": ping_ms, ... }
+```
+
+### GET `/stale_rates`
+```json
+{ "good": 0.95, "orphan": 0.03, "dead": 0.02 }
+```
+
+### GET `/node_info`
+```json
+{
+  "external_ip": "0.0.0.0",
+  "worker_port": 9327,
+  "p2p_port": 9338,
+  "network": "litecoin_testnet",
+  "symbol": "LTC"
+}
+```
+
+### GET `/luck_stats`
+```json
+{
+  "luck_available": bool,
+  "current_luck_trend": float,
+  "blocks": [ { "ts": unix_ts, "hash": "hex", "luck": float } ]
+}
+```
+
+### GET `/ban_stats`
+```json
+{ "total_banned": int, "banned_targets": ["target1", ...] }
+```
+
+### GET `/stratum_security`
+DDoS detection metrics (stub).
+```json
+{ "connections_per_second": 0.0, "potential_ddos": false, "blacklisted_ips": [] }
+```
+
+### GET `/best_share`
+Node-wide best share difficulty statistics.
+```json
+{
+  "network_difficulty": float,
+  "all_time": { "difficulty": float, "pct_of_block": float, "miner": "addr", "timestamp": int },
+  "session": { "difficulty": float, "pct_of_block": float, "miner": "addr", "timestamp": int, "started": int },
+  "round": { "difficulty": float, "pct_of_block": float, "miner": "addr", "timestamp": int, "started": int },
+  "median_pct": float
+}
+```
+
+### GET `/miner_stats/<address>`
+Detailed per-miner statistics.
+```json
+{
+  "address": "string",
+  "active": bool,
+  "hashrate": float,
+  "dead_hashrate": float,
+  "current_payout": float,
+  "network_difficulty": float,
+  "best_difficulty_all_time": float,
+  "best_difficulty_session": float,
+  "best_difficulty_round": float,
+  "hashrate_periods": { "1m": {...}, "10m": {...}, "1h": {...} },
+  "total_shares": int,
+  "unstale_shares": int,
+  "dead_shares": int,
+  "orphan_shares": int
+}
+```
+
+### GET `/miner_payouts/<address>`
+Payout history per miner.
+```json
+{
+  "address": "string",
+  "current_payout": float,
+  "blocks_found": int,
+  "total_estimated_rewards": float,
+  "confirmed_rewards": float,
+  "maturing_rewards": float,
+  "blocks": []
+}
+```
+
+### GET `/version_signaling`
+Share version tracking (V36 transition support).
+
+### GET `/v36_status`
+V36 diagnostic information.
+
+### GET `/patron_sendmany/<total>`
+Builds a sendmany text splitting `<total>` among current miners.
+
+### GET `/tracker_debug`
+Debug sharechain information (forwarded from sharechain_stats callback).
+
+### Merged Mining Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/merged_stats` | Merged mining block statistics |
+| `/current_merged_payouts` | Current merged mining payouts |
+| `/recent_merged_blocks` | Recent merged-mined blocks |
+| `/all_merged_blocks` | All merged-mined blocks |
+| `/discovered_merged_blocks` | Merged block proofs |
+| `/broadcaster_status` | Parent chain broadcaster status |
+| `/merged_broadcaster_status` | Merged chain broadcaster status |
+| `/network_difficulty` | Historical network difficulty samples |
+
+### Web Sub-Endpoints (Share Chain Inspection)
+
+| Endpoint | Description |
+|----------|-------------|
+| `/web/heads` | Share chain head hashes |
+| `/web/verified_heads` | Verified share chain head hashes |
+| `/web/tails` | Share chain tail hashes |
+| `/web/verified_tails` | Verified share chain tail hashes |
+| `/web/my_share_hashes` | Hashes of locally produced shares |
+| `/web/my_share_hashes50` | First 50 locally produced share hashes |
+| `/web/share/<hash>` | Full share details for a given hash |
+| `/web/payout_address/<hash>` | Payout address for a share |
+| `/web/log_json` | Rolling stat log as JSON array |
+| `/web/graph_data/<source>/<view>` | Time-series graph data |
 
 ---
 
@@ -493,6 +651,44 @@ every endpoint plus helper functions.
 | `payoutAddr()` | string | `/payout_addr` |
 | `payoutAddrs()` | array | `/payout_addrs` |
 | `bestShareHash()` | string | `/web/best_share_hash` |
+| `rate()` | number | `/rate` |
+| `difficulty()` | number | `/difficulty` |
+| `userStales()` | object | `/user_stales` |
+| `peerAddresses()` | string | `/peer_addresses` |
+| `peerVersions()` | object | `/peer_versions` |
+| `peerTxpoolSizes()` | object | `/peer_txpool_sizes` |
+| `peerList()` | array | `/peer_list` |
+| `pings()` | object | `/pings` |
+| `staleRates()` | object | `/stale_rates` |
+| `nodeInfo()` | object | `/node_info` |
+| `luckStats()` | object | `/luck_stats` |
+| `banStats()` | object | `/ban_stats` |
+| `stratumSecurity()` | object | `/stratum_security` |
+| `bestShare()` | object | `/best_share` |
+| `versionSignaling()` | object | `/version_signaling` |
+| `v36Status()` | object | `/v36_status` |
+| `trackerDebug()` | object | `/tracker_debug` |
+| `networkDifficulty()` | array | `/network_difficulty` |
+| `minerStats(addr)` | object | `/miner_stats/<addr>` |
+| `minerPayouts(addr)` | object | `/miner_payouts/<addr>` |
+| `patronSendmany(total)` | string | `/patron_sendmany/<total>` |
+| `mergedStats()` | object | `/merged_stats` |
+| `currentMergedPayouts()` | object | `/current_merged_payouts` |
+| `recentMergedBlocks()` | array | `/recent_merged_blocks` |
+| `allMergedBlocks()` | array | `/all_merged_blocks` |
+| `discoveredMergedBlocks()` | array | `/discovered_merged_blocks` |
+| `broadcasterStatus()` | object | `/broadcaster_status` |
+| `mergedBroadcasterStatus()` | object | `/merged_broadcaster_status` |
+| `webHeads()` | array | `/web/heads` |
+| `webVerifiedHeads()` | array | `/web/verified_heads` |
+| `webTails()` | array | `/web/tails` |
+| `webVerifiedTails()` | array | `/web/verified_tails` |
+| `webMyShareHashes()` | array | `/web/my_share_hashes` |
+| `webMyShareHashes50()` | array | `/web/my_share_hashes50` |
+| `webShare(hash)` | object | `/web/share/<hash>` |
+| `webPayoutAddress(hash)` | string | `/web/payout_address/<hash>` |
+| `webLogJson()` | array | `/web/log_json` |
+| `webGraphData(source, view)` | object | `/web/graph_data/<source>/<view>` |
 | `fetchAll()` | object | All major endpoints in parallel |
 
 ### Helper functions

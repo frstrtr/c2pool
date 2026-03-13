@@ -49,6 +49,52 @@ const C2PoolAPI = (() => {
     const payoutAddrs      = () => fetchJSON("/payout_addrs");
     const bestShareHash    = () => fetchJSON("/web/best_share_hash");
 
+    // ── Additional p2pool-compatible endpoints ─────────────────
+    const rate             = () => fetchJSON("/rate");
+    const difficulty       = () => fetchJSON("/difficulty");
+    const userStales       = () => fetchJSON("/user_stales");
+    const peerAddresses    = () => fetchText("/peer_addresses");
+    const peerVersions     = () => fetchJSON("/peer_versions");
+    const peerTxpoolSizes  = () => fetchJSON("/peer_txpool_sizes");
+    const peerList         = () => fetchJSON("/peer_list");
+    const pings            = () => fetchJSON("/pings");
+    const staleRates       = () => fetchJSON("/stale_rates");
+    const nodeInfo         = () => fetchJSON("/node_info");
+    const luckStats        = () => fetchJSON("/luck_stats");
+    const banStats         = () => fetchJSON("/ban_stats");
+    const stratumSecurity  = () => fetchJSON("/stratum_security");
+    const bestShare        = () => fetchJSON("/best_share");
+    const versionSignaling = () => fetchJSON("/version_signaling");
+    const v36Status        = () => fetchJSON("/v36_status");
+    const trackerDebug     = () => fetchJSON("/tracker_debug");
+    const networkDifficulty = () => fetchJSON("/network_difficulty");
+
+    // Per-miner endpoints
+    const minerStats       = (addr) => fetchJSON("/miner_stats/" + addr);
+    const minerPayouts     = (addr) => fetchJSON("/miner_payouts/" + addr);
+    const patronSendmany   = (total) => fetchText("/patron_sendmany/" + total);
+
+    // Merged mining endpoints
+    const mergedStats           = () => fetchJSON("/merged_stats");
+    const currentMergedPayouts  = () => fetchJSON("/current_merged_payouts");
+    const recentMergedBlocks    = () => fetchJSON("/recent_merged_blocks");
+    const allMergedBlocks       = () => fetchJSON("/all_merged_blocks");
+    const discoveredMergedBlocks = () => fetchJSON("/discovered_merged_blocks");
+    const broadcasterStatus     = () => fetchJSON("/broadcaster_status");
+    const mergedBroadcasterStatus = () => fetchJSON("/merged_broadcaster_status");
+
+    // /web/ sub-endpoints (share chain inspection)
+    const webHeads         = () => fetchJSON("/web/heads");
+    const webVerifiedHeads = () => fetchJSON("/web/verified_heads");
+    const webTails         = () => fetchJSON("/web/tails");
+    const webVerifiedTails = () => fetchJSON("/web/verified_tails");
+    const webMyShareHashes = () => fetchJSON("/web/my_share_hashes");
+    const webMyShareHashes50 = () => fetchJSON("/web/my_share_hashes50");
+    const webShare         = (hash) => fetchJSON("/web/share/" + hash);
+    const webPayoutAddress = (hash) => fetchJSON("/web/payout_address/" + hash);
+    const webLogJson       = () => fetchJSON("/web/log_json");
+    const webGraphData     = (source, view) => fetchJSON("/web/graph_data/" + source + "/" + view);
+
     // ── Control endpoints ──────────────────────────────────────
     const controlStart   = () => fetchJSON("/control/mining/start");
     const controlStop    = () => fetchJSON("/control/mining/stop");
@@ -117,6 +163,21 @@ const C2PoolAPI = (() => {
         // Legacy p2pool endpoints
         localStats, p2poolGlobalStats: p2poolGlobalStats, version, currencyInfo,
         payoutAddr, payoutAddrs, bestShareHash,
+        // Additional p2pool-compatible endpoints
+        rate, difficulty, userStales, peerAddresses, peerVersions,
+        peerTxpoolSizes, peerList, pings, staleRates, nodeInfo, luckStats,
+        banStats, stratumSecurity, bestShare, versionSignaling, v36Status,
+        trackerDebug, networkDifficulty,
+        // Per-miner endpoints
+        minerStats, minerPayouts, patronSendmany,
+        // Merged mining endpoints
+        mergedStats, currentMergedPayouts, recentMergedBlocks,
+        allMergedBlocks, discoveredMergedBlocks,
+        broadcasterStatus, mergedBroadcasterStatus,
+        // /web/ sub-endpoints
+        webHeads, webVerifiedHeads, webTails, webVerifiedTails,
+        webMyShareHashes, webMyShareHashes50, webShare, webPayoutAddress,
+        webLogJson, webGraphData,
         // Control
         controlStart, controlStop, controlRestart,
         // Batch

@@ -107,6 +107,32 @@
         </div>
     </div>
 
+    <!-- ── Peers ─────────────────────────────────────── -->
+    <div class="card wide" style="margin-top:16px">
+        <h3>Connected Peers</h3>
+        <table style="margin-top:8px">
+            <thead>
+                <tr><th>Address</th><th>Version</th><th>Direction</th><th>Uptime</th><th>TxPool</th></tr>
+            </thead>
+            <tbody id="peers-table"></tbody>
+        </table>
+        <div id="no-peers" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
+            No peers connected.
+        </div>
+    </div>
+
+    <!-- ── Node Info ─────────────────────────────────── -->
+    <div class="card wide" style="margin-top:16px">
+        <h3>Node Info</h3>
+        <div style="display:flex;flex-wrap:wrap;gap:24px;margin-top:8px;font-size:0.9rem">
+            <div><strong>Network:</strong> <span id="node-network">—</span></div>
+            <div><strong>Symbol:</strong> <span id="node-symbol">—</span></div>
+            <div><strong>P2P Port:</strong> <span id="node-p2p-port">—</span></div>
+            <div><strong>Worker Port:</strong> <span id="node-worker-port">—</span></div>
+            <div><strong>Stale Rates:</strong> Good <span id="stale-good">—</span> / Orphan <span id="stale-orphan">—</span> / Dead <span id="stale-dead">—</span></div>
+        </div>
+    </div>
+
 </div>
 
 <div class="footer">
@@ -240,6 +266,45 @@
     } catch (e) {
         console.error("Dashboard refresh error:", e);
     }
+
+    // Peers table
+    try {
+        const peers = await C2PoolAPI.peerList();
+        const peersTable = document.getElementById("peers-table");
+        const noPeers = document.getElementById("no-peers");
+        peersTable.innerHTML = "";
+        if (peers && peers.length > 0) {
+            noPeers.style.display = "none";
+            peers.forEach(p => {
+                const tr = document.createElement("tr");
+                tr.innerHTML = "<td>" + (p.address || "—") + "</td>"
+                    + "<td>" + (p.version || "—") + "</td>"
+                    + "<td>" + (p.incoming ? "in" : "out") + "</td>"
+                    + "<td>" + C2PoolAPI.formatDuration(p.uptime || 0) + "</td>"
+                    + "<td>" + (p.txpool_size != null ? p.txpool_size : "—") + "</td>";
+                peersTable.appendChild(tr);
+            });
+        } else {
+            noPeers.style.display = "block";
+        }
+    } catch (e) {}
+
+    // Node info + stale rates
+    try {
+        const ni = await C2PoolAPI.nodeInfo();
+        if (ni) {
+            setText("node-network", ni.network || "—");
+            setText("node-symbol", ni.symbol || "—");
+            setText("node-p2p-port", ni.p2p_port || "—");
+            setText("node-worker-port", ni.worker_port || "—");
+        }
+        const sr = await C2PoolAPI.staleRates();
+        if (sr) {
+            setText("stale-good", (sr.good * 100).toFixed(1) + "%");
+            setText("stale-orphan", (sr.orphan * 100).toFixed(1) + "%");
+            setText("stale-dead", (sr.dead * 100).toFixed(1) + "%");
+        }
+    } catch (e) {}
 
     // Auto-refresh every 10 seconds
     setTimeout(refresh, 10000);
