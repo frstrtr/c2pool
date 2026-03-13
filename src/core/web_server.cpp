@@ -1427,8 +1427,20 @@ void MiningInterface::refresh_work()
                     wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
                 double net_diff = chain::target_to_difficulty(
                     chain::bits_to_target(nbits_val));
-                if (net_diff > 0)
+                if (net_diff > 0) {
                     m_on_network_difficulty_fn(net_diff);
+                    m_network_difficulty.store(net_diff, std::memory_order_relaxed);
+                }
+            } catch (...) {}
+        } else {
+            // Even without callback, store network difficulty for API endpoints
+            try {
+                uint32_t nbits_val = std::stoul(
+                    wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
+                double net_diff = chain::target_to_difficulty(
+                    chain::bits_to_target(nbits_val));
+                if (net_diff > 0)
+                    m_network_difficulty.store(net_diff, std::memory_order_relaxed);
             } catch (...) {}
         }
     } catch (const std::exception& e) {
@@ -1986,6 +1998,11 @@ nlohmann::json MiningInterface::rest_local_rate()
 
 nlohmann::json MiningInterface::rest_global_rate()
 {
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    if (net_diff > 0) {
+        // network_hashrate = net_difficulty * 2^32 / block_period (150s for LTC)
+        return net_diff * 4294967296.0 / 150.0;
+    }
     double rate = 0.0;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
@@ -2054,62 +2071,141 @@ nlohmann::json MiningInterface::rest_uptime()
 
 nlohmann::json MiningInterface::rest_connected_miners()
 {
-    // Return count of connected miners and active sessions
     nlohmann::json result = nlohmann::json::object();
-    auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
-    
-    result["total_connected"] = pm ? pm->get_active_miners_count() : 0;
-    result["active_workers"] = pm ? pm->get_active_miners_count() : 0;
-    result["stale_count"] = 0;  // Will be populated by actual stratum session tracking
-    
+    auto workers = get_stratum_workers();
+
+    result["total_connected"] = static_cast<int>(workers.size());
+    result["active_workers"] = static_cast<int>(workers.size());
+    uint64_t total_stale = 0;
+    for (const auto& [sid, w] : workers)
+        total_stale += w.stale;
+    result["stale_count"] = total_stale;
+
     return result;
 }
 
 nlohmann::json MiningInterface::rest_stratum_stats()
 {
-    // Return stratum protocol statistics
     nlohmann::json result = nlohmann::json::object();
-    
-    // Mining share metrics
+    auto workers = get_stratum_workers();
+
+    double total_hashrate = 0.0;
+    uint64_t total_accepted = 0, total_rejected = 0, total_stale = 0;
+    std::set<std::string> unique_addrs;
+
+    nlohmann::json workers_json = nlohmann::json::object();
+    for (const auto& [sid, w] : workers) {
+        total_hashrate += w.hashrate;
+        total_accepted += w.accepted;
+        total_rejected += w.rejected;
+        total_stale += w.stale;
+        unique_addrs.insert(w.username);
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - w.connected_at).count();
+
+        // Key by worker name (address or address.worker)
+        workers_json[w.username + "." + sid] = {
+            {"hashrate", w.hashrate},
+            {"difficulty", w.difficulty},
+            {"accepted", w.accepted},
+            {"rejected", w.rejected},
+            {"stale", w.stale},
+            {"connected_seconds", elapsed},
+            {"remote_endpoint", w.remote_endpoint}
+        };
+    }
+
     result["difficulty"] = 1.0;
-    result["accepted_shares"] = 0;
-    result["rejected_shares"] = 0;
-    result["stale_shares"] = 0;
-    result["hashrate"] = 0.0;
-    
-    // Worker diversity
-    result["active_workers"] = 0;
-    result["unique_addresses"] = 0;
-    
-    // Recent submissions
-    result["shares_per_minute"] = 0.0;
+    if (!workers.empty())
+        result["difficulty"] = workers.begin()->second.difficulty;
+    result["accepted_shares"] = total_accepted;
+    result["rejected_shares"] = total_rejected;
+    result["stale_shares"] = total_stale;
+    result["hashrate"] = total_hashrate;
+    result["active_workers"] = static_cast<int>(workers.size());
+    result["unique_addresses"] = static_cast<int>(unique_addrs.size());
+    result["workers"] = workers_json;
+
+    double total_shares = static_cast<double>(total_accepted + total_rejected + total_stale);
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - m_stratum_start_time).count();
+    result["shares_per_minute"] = (uptime > 0) ? (total_shares * 60.0 / uptime) : 0.0;
     result["last_share_time"] = static_cast<uint64_t>(std::time(nullptr));
+    result["uptime_seconds"] = static_cast<double>(uptime);
 
     {
         std::lock_guard<std::mutex> lock(m_control_mutex);
         result["mining_enabled"] = m_mining_enabled;
         result["banned_count"] = static_cast<uint64_t>(m_banned_targets.size());
     }
-    
+
     return result;
 }
 
 nlohmann::json MiningInterface::rest_global_stats()
 {
-    // Return comprehensive node statistics
+    // Return p2pool-compatible pool statistics
     nlohmann::json result = nlohmann::json::object();
     
-    // Pool stats
-    result["pool_hashrate"] = 0.0;
-    result["network_hashrate"] = 0.0;
-    result["pool_stale_ratio"] = 0.0;
+    double pool_rate = 0.0;
+    double share_diff = 1.0;
+    int unique_miners = 0;
+    int total_shares = 0;
+    int chain_height = 0;
+
+    // Populate from sharechain
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("total_shares"))
+            total_shares = sc["total_shares"].get<int>();
+        if (sc.contains("chain_height"))
+            chain_height = sc["chain_height"].get<int>();
+        if (sc.contains("average_difficulty"))
+            share_diff = sc["average_difficulty"].get<double>();
+        if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
+            unique_miners = static_cast<int>(sc["shares_by_miner"].size());
+
+        // Estimate pool hashrate from sharechain timeline
+        if (sc.contains("timeline") && sc["timeline"].is_array() && sc["timeline"].size() >= 2) {
+            auto& tl = sc["timeline"];
+            double first_ts = tl.front().value("timestamp", 0.0);
+            double last_ts  = tl.back().value("timestamp", 0.0);
+            double time_span = last_ts - first_ts;
+            if (time_span > 0 && total_shares > 0) {
+                // pool_hashrate = total_work / time_span
+                // total_work = total_shares * share_difficulty * 2^32
+                pool_rate = total_shares * share_diff * 4294967296.0 / time_span;
+            }
+        }
+    }
+
+    // Also consider local miner hashrate from node
+    if (pool_rate == 0.0 && m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            pool_rate = hs["global_hashrate"].get<double>();
+    }
     
-    // Share chain
-    result["shares_in_chain"] = 0;
-    result["unique_miners"] = 0;
-    result["current_height"] = 0;
+    // Network difficulty and hashrate
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    double net_hashrate = 0.0;
+    if (net_diff > 0) {
+        // network_hashrate = net_difficulty * 2^32 / block_period
+        double block_period = 150.0;  // LTC default 2.5 min
+        net_hashrate = net_diff * 4294967296.0 / block_period;
+    }
+
+    // p2pool field names the dashboard expects
+    result["pool_hash_rate"] = pool_rate;
+    result["pool_stale_prop"] = 0.0;
+    result["min_difficulty"] = share_diff;
     
-    // Uptime and health
+    // Additional fields
+    result["network_hashrate"] = net_hashrate;
+    result["shares_in_chain"] = total_shares;
+    result["unique_miners"] = unique_miners;
+    result["current_height"] = chain_height;
     result["uptime_seconds"] = rest_uptime();
     result["status"] = "operational";
     result["last_block"] = 0;
@@ -2248,28 +2344,47 @@ nlohmann::json MiningInterface::rest_local_stats()
             result["peers"]["outgoing"] = hs["peer_count"];
     }
 
-    // miner_hash_rates / miner_dead_hash_rates — map<address, H/s>
-    result["miner_hash_rates"] = nlohmann::json::object();
-    result["miner_dead_hash_rates"] = nlohmann::json::object();
-    // Populate from local hashrate
-    double local_rate = 0.0;
-    if (m_node) {
-        auto hs = m_node->get_hashrate_stats();
-        if (hs.contains("global_hashrate"))
-            local_rate = hs["global_hashrate"];
+    // miner_hash_rates / miner_dead_hash_rates — from stratum worker registry
+    nlohmann::json miner_rates = nlohmann::json::object();
+    nlohmann::json miner_dead  = nlohmann::json::object();
+    {
+        auto workers = get_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            // Aggregate by username (address) — multiple workers may share same address
+            std::string key = w.username;
+            double existing = miner_rates.value(key, 0.0);
+            miner_rates[key] = existing + w.hashrate;
+            double existing_dead = miner_dead.value(key, 0.0);
+            miner_dead[key] = existing_dead + w.dead_hashrate;
+        }
     }
-    if (!m_payout_address.empty() && local_rate > 0)
-        result["miner_hash_rates"][m_payout_address] = local_rate;
+    result["miner_hash_rates"] = miner_rates;
+    result["miner_dead_hash_rates"] = miner_dead;
 
     // shares — {total, orphan, dead}
-    result["shares"] = {{"total", 0}, {"orphan", 0}, {"dead", 0}};
+    int total_shares = 0, orphan_shares = 0, dead_shares = 0;
+    double share_diff = 1.0;
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
         if (sc.contains("total_shares"))
-            result["shares"]["total"] = sc["total_shares"];
+            total_shares = sc["total_shares"].get<int>();
+        if (sc.contains("orphan_shares"))
+            orphan_shares = sc["orphan_shares"].get<int>();
+        if (sc.contains("dead_shares"))
+            dead_shares = sc["dead_shares"].get<int>();
+        if (sc.contains("average_difficulty"))
+            share_diff = sc["average_difficulty"].get<double>();
+    }
+    result["shares"] = {{"total", total_shares}, {"orphan", orphan_shares}, {"dead", dead_shares}};
+
+    // efficiency = valid / total (null if no shares)
+    if (total_shares > 0) {
+        int valid = total_shares - orphan_shares - dead_shares;
+        result["efficiency"] = static_cast<double>(valid) / total_shares;
+    } else {
+        result["efficiency"] = nullptr;
     }
 
-    result["efficiency"] = nullptr;
     result["uptime"] = rest_uptime();
 
     // block_value in coins (not satoshis)
@@ -2280,13 +2395,27 @@ nlohmann::json MiningInterface::rest_local_stats()
             block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
     }
     result["block_value"] = block_value;
+    result["block_value_miner"] = block_value;    // miner portion (same for now)
+    result["block_value_payments"] = block_value;  // total with payments
 
     result["warnings"] = nlohmann::json::array();
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
+    result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
 
-    // attempts_to_{share,block} — estimate
-    result["attempts_to_share"] = 0;
-    result["attempts_to_block"] = 0;
+    // attempts_to_{share,block} — estimate from difficulty
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    result["attempts_to_share"] = static_cast<int64_t>(share_diff * 4294967296.0);
+    result["attempts_to_block"] = static_cast<int64_t>(net_diff * 4294967296.0);
+
+    // attempts_to_merged_block — from aux chain difficulty
+    int64_t merged_attempts = 0;
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        if (!chain_infos.empty() && chain_infos.front().difficulty > 0) {
+            merged_attempts = static_cast<int64_t>(chain_infos.front().difficulty * 4294967296.0);
+        }
+    }
+    result["attempts_to_merged_block"] = merged_attempts;
 
     return result;
 }
@@ -2319,6 +2448,8 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     switch (m_blockchain) {
     case Blockchain::LITECOIN:
         result["symbol"] = "LTC";
+        result["name"] = "Litecoin";
+        result["block_period"] = 150;  // 2.5 min average
         if (m_testnet) {
             result["address_explorer_url_prefix"] = "https://litecoinspace.org/testnet/address/";
             result["block_explorer_url_prefix"]   = "https://litecoinspace.org/testnet/block/";
@@ -2331,12 +2462,16 @@ nlohmann::json MiningInterface::rest_web_currency_info()
         break;
     case Blockchain::BITCOIN:
         result["symbol"] = "BTC";
+        result["name"] = "Bitcoin";
+        result["block_period"] = 600;  // 10 min average
         result["address_explorer_url_prefix"] = "https://mempool.space/address/";
         result["block_explorer_url_prefix"]   = "https://mempool.space/block/";
         result["tx_explorer_url_prefix"]      = "https://mempool.space/tx/";
         break;
     case Blockchain::DOGECOIN:
         result["symbol"] = "DOGE";
+        result["name"] = "Dogecoin";
+        result["block_period"] = 60;   // 1 min average
         result["address_explorer_url_prefix"] = "https://dogechain.info/address/";
         result["block_explorer_url_prefix"]   = "https://dogechain.info/block/";
         result["tx_explorer_url_prefix"]      = "https://dogechain.info/tx/";
@@ -2460,8 +2595,8 @@ nlohmann::json MiningInterface::rest_rate()
 
 nlohmann::json MiningInterface::rest_difficulty()
 {
-    double diff = 1.0;
-    {
+    double diff = m_network_difficulty.load(std::memory_order_relaxed);
+    if (diff <= 0.0) {
         std::lock_guard<std::mutex> lock(m_work_mutex);
         if (!m_cached_template.is_null() && m_cached_template.contains("difficulty"))
             diff = m_cached_template["difficulty"].get<double>();
@@ -2665,12 +2800,7 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     }
 
     // Network difficulty
-    double net_diff = 0.0;
-    {
-        std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (!m_cached_template.is_null() && m_cached_template.contains("difficulty"))
-            net_diff = m_cached_template["difficulty"].get<double>();
-    }
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     result["network_difficulty"] = net_diff;
     result["chance_to_find_block"] = 0.0;
     result["total_shares"] = 0;
@@ -2686,17 +2816,24 @@ nlohmann::json MiningInterface::rest_best_share()
 {
     nlohmann::json result = nlohmann::json::object();
 
-    double net_diff = 0.0;
-    {
-        std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (!m_cached_template.is_null() && m_cached_template.contains("difficulty"))
-            net_diff = m_cached_template["difficulty"].get<double>();
-    }
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     result["network_difficulty"] = net_diff;
 
     {
         std::lock_guard<std::mutex> lock(m_best_diff_mutex);
         auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+
+        // If no local best share, use sharechain average difficulty as baseline
+        double best_all = m_best_difficulty.all_time;
+        double best_sess = m_best_difficulty.session;
+        double best_round = m_best_difficulty.round;
+        if (best_all == 0.0 && m_sharechain_stats_fn) {
+            auto sc = m_sharechain_stats_fn();
+            double avg = sc.value("average_difficulty", 0.0);
+            best_all = avg;
+            best_sess = avg;
+            best_round = avg;
+        }
 
         auto make_entry = [&](double diff, const std::string& miner, uint64_t ts) {
             nlohmann::json e;
@@ -2707,11 +2844,11 @@ nlohmann::json MiningInterface::rest_best_share()
             return e;
         };
 
-        result["all_time"] = make_entry(m_best_difficulty.all_time, m_best_difficulty.miner, m_best_difficulty.timestamp);
-        auto session = make_entry(m_best_difficulty.session, m_best_difficulty.miner, m_best_difficulty.timestamp);
+        result["all_time"] = make_entry(best_all, m_best_difficulty.miner, m_best_difficulty.timestamp);
+        auto session = make_entry(best_sess, m_best_difficulty.miner, m_best_difficulty.timestamp);
         session["started"] = m_start_time.time_since_epoch().count() / 1000000000ULL;
         result["session"] = session;
-        auto round = make_entry(m_best_difficulty.round, m_best_difficulty.miner, m_best_difficulty.timestamp);
+        auto round = make_entry(best_round, m_best_difficulty.miner, m_best_difficulty.timestamp);
         round["started"] = m_best_difficulty.round_start;
         result["round"] = round;
     }
@@ -2777,8 +2914,32 @@ nlohmann::json MiningInterface::rest_version_signaling()
         auto sc = m_sharechain_stats_fn();
         if (sc.contains("chain_height"))
             result["chain_height"] = sc["chain_height"];
-        if (sc.contains("shares_by_version"))
+        if (sc.contains("shares_by_version")) {
             result["versions"] = sc["shares_by_version"];
+            // Populate share_types and full_chain_versions from version data
+            // Both map version → {count: N}
+            auto& sv = sc["shares_by_version"];
+            if (sv.is_object()) {
+                nlohmann::json st = nlohmann::json::object();
+                nlohmann::json fcv = nlohmann::json::object();
+                for (auto& [ver, count] : sv.items()) {
+                    st[ver] = {{"count", count}};
+                    fcv[ver] = {{"count", count}};  // desired = actual for now
+                }
+                result["share_types"] = st;
+                result["full_chain_versions"] = fcv;
+                // Set current share type to the highest version
+                if (!sv.empty()) {
+                    auto last = sv.items().begin();
+                    for (auto it = sv.items().begin(); it != sv.items().end(); ++it)
+                        last = it;
+                    result["current_share_type"] = std::stoi((*last).key());
+                    result["current_share_name"] = "V" + (*last).key();
+                }
+            }
+        }
+        if (sc.contains("total_shares"))
+            result["total_weight"] = sc["total_shares"];
     }
     return result;
 }
@@ -2835,49 +2996,175 @@ nlohmann::json MiningInterface::rest_tracker_debug()
 nlohmann::json MiningInterface::rest_merged_stats()
 {
     nlohmann::json result = nlohmann::json::object();
-    result["total_blocks"] = 0;
-    result["verified_blocks"] = 0;
-    result["pending_blocks"] = 0;
-    result["orphaned_blocks"] = 0;
-    result["networks"] = nlohmann::json::object();
-    result["recent"] = nlohmann::json::array();
+    if (!m_mm_manager || !m_mm_manager->has_chains()) {
+        result["total_blocks"] = 0;
+        result["networks"] = nlohmann::json::object();
+        result["recent"] = nlohmann::json::array();
+        return result;
+    }
+
+    result["total_blocks"] = m_mm_manager->get_total_blocks();
+
+    // Primary chain block_value + symbol for dashboard card
+    auto chain_infos = m_mm_manager->get_chain_infos();
+    if (!chain_infos.empty()) {
+        const auto& primary = chain_infos.front();
+        // block_value in coins (coinbase_value is in satoshis; 1e8 sat/coin)
+        result["block_value"] = primary.coinbase_value / 1e8;
+        result["symbol"] = primary.symbol;
+        result["difficulty"] = primary.difficulty;
+    }
+
+    // Per-network stats
+    nlohmann::json networks = nlohmann::json::object();
+    for (const auto& ci : chain_infos) {
+        nlohmann::json net;
+        net["chain_id"]       = ci.chain_id;
+        net["blocks_found"]   = m_mm_manager->get_chain_block_count(ci.chain_id);
+        net["current_height"] = ci.current_height;
+        net["current_tip"]    = ci.current_tip;
+        net["rpc_host"]       = ci.rpc_host;
+        net["rpc_port"]       = ci.rpc_port;
+        net["p2p_port"]       = ci.p2p_port;
+        net["multiaddress"]   = ci.multiaddress;
+        net["block_value"]    = ci.coinbase_value / 1e8;
+        net["difficulty"]     = ci.difficulty;
+        networks[ci.symbol]   = std::move(net);
+    }
+    result["networks"] = std::move(networks);
+
+    // Recent blocks (last 20) – field names match dashboard renderMergedBlocks()
+    nlohmann::json recent = nlohmann::json::array();
+    for (const auto& blk : m_mm_manager->get_recent_blocks(20)) {
+        nlohmann::json j;
+        j["ts"]          = blk.timestamp;
+        j["symbol"]      = blk.symbol;
+        j["network"]     = blk.symbol;
+        j["chainid"]     = blk.chain_id;
+        j["pow_hash"]    = blk.block_hash;
+        j["parent_hash"] = blk.parent_hash;
+        j["height"]      = blk.height;
+        j["miner"]       = nullptr;
+        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        recent.push_back(std::move(j));
+    }
+    result["recent"] = std::move(recent);
+
     return result;
 }
 
 nlohmann::json MiningInterface::rest_current_merged_payouts()
 {
-    return nlohmann::json::object();
+    // Return null so the dashboard falls back to current_payouts endpoint.
+    // The current_merged_payouts format requires per-address payout breakdown
+    // with {addr: {amount, merged: [{symbol, address, amount}]}} which needs
+    // ShareTracker PPLNS data we don't have wired here yet.
+    return nlohmann::json(nullptr);
 }
 
 nlohmann::json MiningInterface::rest_recent_merged_blocks()
 {
-    return nlohmann::json::array();
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_mm_manager) return arr;
+
+    for (const auto& blk : m_mm_manager->get_recent_blocks(50)) {
+        nlohmann::json j;
+        // Field names match dashboard.html renderMergedBlocks() expectations
+        j["ts"]          = blk.timestamp;
+        j["symbol"]      = blk.symbol;
+        j["network"]     = blk.symbol;
+        j["chainid"]     = blk.chain_id;
+        j["pow_hash"]    = blk.block_hash;
+        j["parent_hash"] = blk.parent_hash;
+        j["height"]      = blk.height;
+        j["miner"]       = nullptr;  // not tracked per-block yet
+        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        arr.push_back(std::move(j));
+    }
+    return arr;
 }
 
 nlohmann::json MiningInterface::rest_all_merged_blocks()
 {
-    return nlohmann::json::array();
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_mm_manager) return arr;
+
+    for (const auto& blk : m_mm_manager->get_discovered_blocks()) {
+        nlohmann::json j;
+        j["ts"]          = blk.timestamp;
+        j["symbol"]      = blk.symbol;
+        j["chainid"]     = blk.chain_id;
+        j["pow_hash"]    = blk.block_hash;
+        j["parent_hash"] = blk.parent_hash;
+        j["height"]      = blk.height;
+        j["miner"]       = nullptr;
+        j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
+        arr.push_back(std::move(j));
+    }
+    return arr;
 }
 
 nlohmann::json MiningInterface::rest_discovered_merged_blocks()
 {
-    return nlohmann::json::array();
+    // Field names match dashboard.html renderDiscoveredMerged() expectations
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_mm_manager) return arr;
+
+    for (const auto& blk : m_mm_manager->get_discovered_blocks()) {
+        nlohmann::json j;
+        j["ts"]               = blk.timestamp;
+        j["number"]           = 0;  // parent height not tracked
+        j["hash"]             = blk.parent_hash;
+        j["aux_block_height"] = blk.height;
+        j["aux_hash"]         = blk.block_hash;
+        j["aux_symbol"]       = blk.symbol;
+        j["aux_reward"]       = blk.coinbase_value / 1e8;
+        j["miner"]            = nullptr;
+        j["peer_addr"]        = "local";
+        j["status"]           = blk.accepted ? "confirmed" : "orphaned";
+        arr.push_back(std::move(j));
+    }
+    return arr;
 }
 
 nlohmann::json MiningInterface::rest_broadcaster_status()
 {
     nlohmann::json result = nlohmann::json::object();
-    result["running"] = false;
-    result["last_broadcast"] = nullptr;
+    if (!m_mm_manager || !m_mm_manager->has_chains()) {
+        result["running"] = false;
+        result["last_broadcast"] = nullptr;
+        return result;
+    }
+    result["running"] = true;
+    result["chains"] = m_mm_manager->chain_count();
+    result["total_blocks_found"] = m_mm_manager->get_total_blocks();
     return result;
 }
 
 nlohmann::json MiningInterface::rest_merged_broadcaster_status()
 {
     nlohmann::json result = nlohmann::json::object();
-    result["running"] = false;
-    result["last_broadcast"] = nullptr;
-    result["chains"] = nlohmann::json::object();
+    if (!m_mm_manager || !m_mm_manager->has_chains()) {
+        result["running"] = false;
+        result["last_broadcast"] = nullptr;
+        result["chains"] = nlohmann::json::object();
+        return result;
+    }
+
+    result["running"] = true;
+
+    nlohmann::json chains = nlohmann::json::object();
+    for (const auto& ci : m_mm_manager->get_chain_infos()) {
+        nlohmann::json ch;
+        ch["chain_id"]       = ci.chain_id;
+        ch["current_height"] = ci.current_height;
+        ch["current_tip"]    = ci.current_tip;
+        ch["p2p_port"]       = ci.p2p_port;
+        ch["blocks_found"]   = m_mm_manager->get_chain_block_count(ci.chain_id);
+        chains[ci.symbol]    = std::move(ch);
+    }
+    result["chains"] = std::move(chains);
+
     return result;
 }
 
@@ -2891,12 +3178,7 @@ nlohmann::json MiningInterface::rest_network_difficulty()
     }
     // If empty, at least return current
     if (arr.empty()) {
-        double diff = 0.0;
-        {
-            std::lock_guard<std::mutex> lock(m_work_mutex);
-            if (!m_cached_template.is_null() && m_cached_template.contains("difficulty"))
-                diff = m_cached_template["difficulty"].get<double>();
-        }
+        double diff = m_network_difficulty.load(std::memory_order_relaxed);
         arr.push_back({
             {"ts", static_cast<double>(std::time(nullptr))},
             {"network_diff", diff},
@@ -2904,6 +3186,42 @@ nlohmann::json MiningInterface::rest_network_difficulty()
         });
     }
     return arr;
+}
+
+// ──────────── Stratum worker session tracking ───────────────────────────
+
+void MiningInterface::register_stratum_worker(const std::string& session_id, const WorkerInfo& info)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    m_stratum_workers[session_id] = info;
+}
+
+void MiningInterface::unregister_stratum_worker(const std::string& session_id)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    m_stratum_workers.erase(session_id);
+}
+
+void MiningInterface::update_stratum_worker(const std::string& session_id,
+                                             double hashrate, double dead_hashrate, double difficulty,
+                                             uint64_t accepted, uint64_t rejected, uint64_t stale)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end()) {
+        it->second.hashrate = hashrate;
+        it->second.dead_hashrate = dead_hashrate;
+        it->second.difficulty = difficulty;
+        it->second.accepted = accepted;
+        it->second.rejected = rejected;
+        it->second.stale = stale;
+    }
+}
+
+std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::get_stratum_workers() const
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    return m_stratum_workers;
 }
 
 // ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
@@ -3015,30 +3333,38 @@ nlohmann::json MiningInterface::rest_web_log_json()
 
 nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, const std::string& view)
 {
-    // Graph data endpoint — returns time-series data points
-    // source: "local_hash_rate", "pool_hash_rate", "local_share_rate", etc.
-    // view: "last_hour", "last_day", "last_week"
-    nlohmann::json result = nlohmann::json::object();
-    result["source"] = source;
-    result["view"] = view;
-    result["data"] = nlohmann::json::array();
+    // Graph data endpoint — returns p2pool-compatible time-series
+    // Format: array of [timestamp, value] tuples
+    // For pool_rates: [timestamp, {good: X, orphan: Y, null: Z}]
+    // For others:     [timestamp, scalar]
+    nlohmann::json result = nlohmann::json::array();
 
-    // Populate from stat_log if available
     std::lock_guard<std::mutex> lock(m_stat_log_mutex);
     auto now = std::time(nullptr);
     double window = 3600.0; // default: last hour
     if (view == "last_day") window = 86400.0;
     else if (view == "last_week") window = 604800.0;
+    else if (view == "last_month") window = 2592000.0;
+    else if (view == "last_year") window = 31536000.0;
 
     for (const auto& entry : m_stat_log) {
-        if (entry.time < (now - window))
+        if (entry.time < (now - static_cast<time_t>(window)))
             continue;
-        nlohmann::json point;
-        point["time"] = entry.time;
-        if (source == "pool_hash_rate")
-            point["value"] = entry.pool_hash_rate;
-        else if (source == "pool_stale_prop")
-            point["value"] = entry.pool_stale_prop;
+
+        if (source == "pool_rates") {
+            // p2pool format: [timestamp, {good, orphan, null}]
+            nlohmann::json val = nlohmann::json::object();
+            val["good"] = entry.pool_hash_rate;
+            val["orphan"] = entry.pool_hash_rate * entry.pool_stale_prop;
+            val["null"] = 0.0;
+            result.push_back({entry.time, val});
+        }
+        else if (source == "pool_hash_rate") {
+            result.push_back({entry.time, entry.pool_hash_rate});
+        }
+        else if (source == "pool_stale_prop") {
+            result.push_back({entry.time, entry.pool_stale_prop});
+        }
         else if (source == "local_hash_rate") {
             double total = 0.0;
             if (entry.local_hash_rates.is_object()) {
@@ -3047,11 +3373,61 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
                         total += v.get<double>();
                 }
             }
-            point["value"] = total;
+            result.push_back({entry.time, total});
         }
-        else
-            point["value"] = 0.0;
-        result["data"].push_back(point);
+        else if (source == "local_dead_hash_rate") {
+            result.push_back({entry.time, 0.0});
+        }
+        else if (source == "worker_count" || source == "connected_miners") {
+            // Dashboard expects [ts, number], not [ts, {incoming, outgoing}]
+            int total = 0;
+            if (entry.peers.is_number()) {
+                total = entry.peers.get<int>();
+            } else if (entry.peers.is_object()) {
+                total = entry.peers.value("incoming", 0) + entry.peers.value("outgoing", 0);
+            }
+            result.push_back({entry.time, total});
+        }
+        else if (source == "unique_miner_count") {
+            int count = 0;
+            if (entry.local_hash_rates.is_object())
+                count = static_cast<int>(entry.local_hash_rates.size());
+            result.push_back({entry.time, count});
+        }
+        else if (source == "current_payout") {
+            result.push_back({entry.time, entry.current_payout});
+        }
+        else if (source == "peers") {
+            result.push_back({entry.time, entry.peers});
+        }
+        else if (source == "local_share_hash_rates") {
+            // Return per-miner data as object
+            result.push_back({entry.time, entry.local_hash_rates});
+        }
+        else if (source == "miner_hash_rates") {
+            result.push_back({entry.time, entry.local_hash_rates});
+        }
+        else if (source == "miner_dead_hash_rates") {
+            result.push_back({entry.time, nlohmann::json::object()});
+        }
+        else if (source == "current_payouts") {
+            result.push_back({entry.time, nlohmann::json::object()});
+        }
+        else if (source == "desired_version_rates") {
+            result.push_back({entry.time, nlohmann::json::object()});
+        }
+        else if (source == "traffic_rate") {
+            result.push_back({entry.time, 0.0});
+        }
+        else if (source == "getwork_latency") {
+            result.push_back({entry.time, 0.0});
+        }
+        else if (source == "memory_usage") {
+            result.push_back({entry.time, 0.0});
+        }
+        else {
+            result.push_back({entry.time, 0.0});
+        }
     }
     return result;
 }
@@ -3080,20 +3456,38 @@ void MiningInterface::update_stat_log()
     StatLogEntry entry;
     entry.time = static_cast<double>(std::time(nullptr));
 
-    // Pool hash rate
-    if (m_node) {
-        auto hs = m_node->get_hashrate_stats();
-        entry.pool_hash_rate = hs.value("global_hashrate", 0.0);
-    } else {
+    // Pool hash rate — compute from sharechain
+    double share_diff = 1.0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        entry.pool_hash_rate = 0.0;
+        if (sc.contains("average_difficulty"))
+            share_diff = sc["average_difficulty"].get<double>();
+        int total_shares = sc.value("total_shares", 0);
+        // Estimate from sharechain timeline
+        if (sc.contains("timeline") && sc["timeline"].is_array() && sc["timeline"].size() >= 2) {
+            auto& tl = sc["timeline"];
+            double first_ts = tl.front().value("timestamp", 0.0);
+            double last_ts  = tl.back().value("timestamp", 0.0);
+            double time_span = last_ts - first_ts;
+            if (time_span > 0 && total_shares > 0)
+                entry.pool_hash_rate = total_shares * share_diff * 4294967296.0 / time_span;
+        }
+    } else if (m_node) {
         entry.pool_hash_rate = 0.0;
     }
 
     entry.pool_stale_prop = 0.0;
 
-    // Local hash rates by address
+    // Local hash rates by address — from stratum worker registry
     entry.local_hash_rates = nlohmann::json::object();
-    if (!m_payout_address.empty())
-        entry.local_hash_rates[m_payout_address] = entry.pool_hash_rate;
+    {
+        auto workers = get_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            double existing = entry.local_hash_rates.value(w.username, 0.0);
+            entry.local_hash_rates[w.username] = existing + w.hashrate;
+        }
+    }
 
     entry.shares = 0;
     entry.stale_shares = 0;
@@ -3133,8 +3527,9 @@ void MiningInterface::update_stat_log()
     }
     entry.peers = {{"incoming", incoming}, {"outgoing", outgoing}};
 
-    entry.attempts_to_share = 0.0;
-    entry.attempts_to_block = 0.0;
+    entry.attempts_to_share = share_diff * 4294967296.0;
+    double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    entry.attempts_to_block = net_diff * 4294967296.0;
 
     // Block value
     entry.block_value = 0.0;
@@ -3867,6 +4262,23 @@ bool WebServer::start()
             timer->async_wait(*fn);
             LOG_INFO << "Work-refresh timer scheduled (every 5 s)";
         }
+
+        // Schedule stat_log timer (every 60 seconds for graph data)
+        {
+            auto stat_timer = std::make_shared<net::steady_timer>(ioc_);
+            auto stat_fn = std::make_shared<std::function<void(beast::error_code)>>();
+            *stat_fn = [this, stat_timer, stat_fn](beast::error_code ec) {
+                if (ec || !running_) return;
+                try { mining_interface_->update_stat_log(); }
+                catch (const std::exception& e) { LOG_WARNING << "update_stat_log failed: " << e.what(); }
+                catch (...) {}
+                stat_timer->expires_after(std::chrono::seconds(60));
+                stat_timer->async_wait(*stat_fn);
+            };
+            stat_timer->expires_after(std::chrono::seconds(10)); // first sample after 10s
+            stat_timer->async_wait(*stat_fn);
+            LOG_INFO << "Stat-log timer scheduled (every 60 s)";
+        }
         
         running_ = true;
         return true;
@@ -4135,9 +4547,11 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
 StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
     : socket_(std::move(socket))
     , mining_interface_(mining_interface)
+    , connected_at_(std::chrono::steady_clock::now())
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
+    session_id_ = subscription_id_;  // unique session key
 
     // Apply stratum tuning from MiningInterface config (populated from CLI/YAML)
     const auto& cfg = mining_interface_->get_stratum_config();
@@ -4170,6 +4584,10 @@ void StratumSession::read_message()
                 self->process_message(bytes_read);
                 self->read_message();  // Continue reading
             } else {
+                // Session disconnected — unregister from worker tracking
+                if (self->authorized_ && self->mining_interface_) {
+                    self->mining_interface_->unregister_stratum_worker(self->session_id_);
+                }
                 LOG_INFO << "StratumSession ended: " << ec.message();
             }
         });
@@ -4321,6 +4739,19 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         
         // Start periodic work push (every SHARE_PERIOD) to keep miner on fresh work
         start_periodic_work_push();
+
+        // Register this session in the worker tracker
+        if (mining_interface_) {
+            MiningInterface::WorkerInfo wi;
+            wi.username = username_;
+            wi.difficulty = hashrate_tracker_.get_current_difficulty();
+            wi.connected_at = connected_at_;
+            try {
+                wi.remote_endpoint = socket_.remote_endpoint().address().to_string()
+                    + ":" + std::to_string(socket_.remote_endpoint().port());
+            } catch (...) {}
+            mining_interface_->register_stratum_worker(session_id_, wi);
+        }
         
         nlohmann::json response;
         response["id"] = request_id;
@@ -4479,6 +4910,15 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
              << ", rejected=" << rejected_shares_ << ")";
+
+    // Update worker tracker with latest stats
+    if (mining_interface_) {
+        mining_interface_->update_stratum_worker(session_id_,
+            hashrate_tracker_.get_current_hashrate(),
+            0.0,  // dead hashrate — tracked separately if needed
+            hashrate_tracker_.get_current_difficulty(),
+            accepted_shares_, rejected_shares_, stale_shares_);
+    }
     
     nlohmann::json response;
     response["id"] = request_id;

@@ -77,3 +77,6 @@ boost_1_78_0.tar.bz2
 /.ai-memory.md
 /docs/ARCHITECTURE_AND_ENHANCEMENTS.md
 ref/
+
+# Local test launch scripts (contain credentials)
+/run-testnet.sh

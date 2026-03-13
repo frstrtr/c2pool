@@ -211,3 +211,29 @@ cd build && ctest --output-on-failure -j$(nproc)
 - [Ubuntu / Debian / Linux](doc/build-unix.md)
 - [FreeBSD](doc/build-freebsd.md)
 - [Windows](doc/build-windows.md)
+
+---
+
+## API endpoints
+
+See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the complete HTTP API reference, including:
+
+- Native c2pool endpoints (hashrate, payouts, stats, blocks, miners)
+- p2pool legacy endpoints (local_stats, web/version, etc.)
+- Merged mining endpoints (merged_stats, recent_merged_blocks, discovered_merged_blocks, current_merged_payouts, etc.)
+- JSON-RPC methods (getinfo, getminerstats, getpayoutinfo, submitblock, etc.)
+
+**Merged mining endpoints:**
+
+| Endpoint                   | Description                       |
+|---------------------------|-----------------------------------|
+| `/merged_stats`           | Merged mining block statistics     |
+| `/current_merged_payouts` | Current merged mining payouts      |
+| `/recent_merged_blocks`   | Recent merged-mined blocks         |
+| `/all_merged_blocks`      | All merged-mined blocks            |
+| `/discovered_merged_blocks` | Merged block proofs               |
+| `/broadcaster_status`     | Parent chain broadcaster status    |
+| `/merged_broadcaster_status` | Merged chain broadcaster status |
+| `/network_difficulty`     | Historical network difficulty      |
+
+For full field details and dashboard integration, see [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md).

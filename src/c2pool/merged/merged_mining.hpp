@@ -140,6 +140,19 @@ private:
     bool m_connected{false};
 };
 
+// ─── Discovered merged block record ──────────────────────────────────────────
+struct DiscoveredMergedBlock
+{
+    uint32_t    chain_id{0};
+    std::string symbol;
+    int         height{0};        // aux chain height
+    std::string block_hash;       // aux block hash
+    std::string parent_hash;      // parent (LTC) block hash
+    int64_t     timestamp{0};     // unix epoch seconds
+    bool        accepted{true};   // RPC returned success
+    uint64_t    coinbase_value{0}; // aux block reward in satoshis
+};
+
 // ─── Integrated Merged Mining Manager ────────────────────────────────────────
 // Replaces the standalone mm-adapter Python process.
 // Polls aux chain daemons, builds commitments for parent coinbase,
@@ -187,6 +200,28 @@ public:
     // Get RPC client for a chain (for wiring broadcaster getpeerinfo)
     AuxChainRPC* get_chain_rpc(uint32_t chain_id);
 
+    // ─── Block tracking ──────────────────────────────────────────────────
+    // Thread-safe accessors for discovered merged blocks.
+    std::vector<DiscoveredMergedBlock> get_discovered_blocks() const;
+    std::vector<DiscoveredMergedBlock> get_recent_blocks(size_t limit = 20) const;
+    uint64_t get_total_blocks() const;
+    uint64_t get_chain_block_count(uint32_t chain_id) const;
+
+    // Per-chain config snapshots (for REST)
+    struct ChainInfo {
+        std::string symbol;
+        uint32_t    chain_id{0};
+        std::string rpc_host;
+        uint16_t    rpc_port{0};
+        bool        multiaddress{false};
+        uint16_t    p2p_port{0};
+        int         current_height{0};
+        std::string current_tip;
+        uint64_t    coinbase_value{0};  // satoshis
+        double      difficulty{0.0};    // from target
+    };
+    std::vector<ChainInfo> get_chain_infos() const;
+
     // ─── Multiaddress payout provider ────────────────────────────────────
     // Callback: given (chain_id, coinbase_value) returns sorted payout list
     //   vector<(scriptPubKey, satoshis)>.
@@ -226,7 +261,8 @@ private:
     std::vector<ChainState> m_chains;
 
     // Submit via submitauxblock and relay the accepted block via P2P
-    void submit_aux_and_relay(ChainState& chain, const std::string& auxpow);
+    void submit_aux_and_relay(ChainState& chain, const std::string& auxpow,
+                              const std::string& parent_hash_hex = "");
 
     // Current AuxPoW tree (rebuilt when chains change)
     AuxPowTree m_tree;
@@ -239,6 +275,14 @@ private:
 
     // P2P block relay callback (set by integration layer)
     BlockRelayFn m_block_relay_fn;
+
+    // Discovered merged blocks history
+    std::vector<DiscoveredMergedBlock> m_discovered_blocks;
+    std::map<uint32_t, uint64_t>       m_blocks_per_chain;
+
+    // Helper: record a discovered block (caller must hold m_mutex)
+    void record_discovered_block(const ChainState& chain, bool accepted,
+                                 const std::string& parent_hash = "");
 
     mutable std::mutex m_mutex;
 };

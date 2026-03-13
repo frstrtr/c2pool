@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <map>
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
@@ -538,6 +539,9 @@ private:
     std::string m_node_fee_address;                 // node operator address (display/logging)
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
 
+    // Cached network difficulty (computed from bits in refresh_work)
+    std::atomic<double> m_network_difficulty{0.0};
+
     // Recently found blocks for /recent_blocks
     struct FoundBlock { uint64_t height; std::string hash; uint64_t ts; };
     std::vector<FoundBlock> m_found_blocks;   // newest first, capped at 100
@@ -640,6 +644,32 @@ private:
     struct NetDiffSample { double ts; double difficulty; std::string source; };
     std::vector<NetDiffSample> m_netdiff_history;  // newest-first, capped at 10000
     mutable std::mutex m_netdiff_mutex;
+
+    // ── Stratum worker session tracking ──────────────────────────────────
+public:
+    struct WorkerInfo {
+        std::string username;      // miner address (after parsing)
+        double hashrate{0.0};      // measured H/s from HashrateTracker
+        double dead_hashrate{0.0}; // DOA H/s
+        double difficulty{1.0};    // current vardiff difficulty
+        uint64_t accepted{0};
+        uint64_t rejected{0};
+        uint64_t stale{0};
+        std::chrono::steady_clock::time_point connected_at;
+        std::string remote_endpoint;  // "ip:port"
+    };
+
+    void register_stratum_worker(const std::string& session_id, const WorkerInfo& info);
+    void unregister_stratum_worker(const std::string& session_id);
+    void update_stratum_worker(const std::string& session_id,
+                               double hashrate, double dead_hashrate, double difficulty,
+                               uint64_t accepted, uint64_t rejected, uint64_t stale);
+    std::map<std::string, WorkerInfo> get_stratum_workers() const;
+
+private:
+    std::map<std::string, WorkerInfo> m_stratum_workers;
+    mutable std::mutex m_stratum_workers_mutex;
+    std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
 };
 
 /// Main Web Server class
@@ -765,6 +795,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     uint64_t accepted_shares_ = 0;
     uint64_t rejected_shares_ = 0;
     uint64_t stale_shares_    = 0;
+    std::chrono::steady_clock::time_point connected_at_;
+    std::string session_id_;  // unique key for worker tracking
 
     // Merged mining: per-chain payout addresses set by the miner.
     // Maps chain_id → address string (e.g. 98 → "DQkw...").

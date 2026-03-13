@@ -4,6 +4,7 @@
 #include <core/hash.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 #include <iomanip>
@@ -684,25 +685,29 @@ void MergedMiningManager::try_submit_merged_blocks(
                 auto block_hex = build_multiaddress_block(
                     chain.current_work.block_template, payouts, auxpow);
                 if (!block_hex.empty()) {
-                    chain.rpc->submit_block(block_hex);
+                    bool ok = chain.rpc->submit_block(block_hex);
+                    record_discovered_block(chain, ok, parent_hash.GetHex());
                     // Also relay via P2P for fast propagation
                     if (m_block_relay_fn)
                         m_block_relay_fn(chain.config.chain_id, block_hex);
                 } else {
-                    submit_aux_and_relay(chain, auxpow);
+                    submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
                 }
             } else {
-                submit_aux_and_relay(chain, auxpow);
+                submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
             }
         } else {
-            submit_aux_and_relay(chain, auxpow);
+            submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
         }
     }
 }
 
-void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::string& auxpow)
+void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::string& auxpow,
+                                                const std::string& parent_hash_hex)
 {
-    if (chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow)) {
+    bool ok = chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+    record_discovered_block(chain, ok, parent_hash_hex);
+    if (ok) {
         // Fetch the accepted block and relay via P2P for fast propagation
         if (m_block_relay_fn) {
             auto best = chain.rpc->get_best_block_hash();
@@ -895,6 +900,93 @@ std::string MergedMiningManager::build_multiaddress_block(
         blk << txd;            // template transactions
 
     return blk.str();
+}
+
+// ─── Block tracking implementation ───────────────────────────────────────────
+
+void MergedMiningManager::record_discovered_block(
+    const ChainState& chain, bool accepted, const std::string& parent_hash)
+{
+    // Caller must hold m_mutex
+    DiscoveredMergedBlock blk;
+    blk.chain_id    = chain.config.chain_id;
+    blk.symbol      = chain.config.symbol;
+    blk.height      = chain.current_work.height;
+    blk.block_hash  = chain.current_work.block_hash.GetHex();
+    blk.parent_hash = parent_hash;
+    blk.timestamp      = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+    blk.accepted       = accepted;
+    blk.coinbase_value = chain.current_work.coinbase_value;
+
+    m_discovered_blocks.push_back(std::move(blk));
+    m_blocks_per_chain[chain.config.chain_id]++;
+}
+
+std::vector<DiscoveredMergedBlock> MergedMiningManager::get_discovered_blocks() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_discovered_blocks;
+}
+
+std::vector<DiscoveredMergedBlock> MergedMiningManager::get_recent_blocks(size_t limit) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_discovered_blocks.size() <= limit)
+        return m_discovered_blocks;
+    return std::vector<DiscoveredMergedBlock>(
+        m_discovered_blocks.end() - static_cast<ptrdiff_t>(limit),
+        m_discovered_blocks.end());
+}
+
+uint64_t MergedMiningManager::get_total_blocks() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_discovered_blocks.size();
+}
+
+uint64_t MergedMiningManager::get_chain_block_count(uint32_t chain_id) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_blocks_per_chain.find(chain_id);
+    return (it != m_blocks_per_chain.end()) ? it->second : 0;
+}
+
+std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<ChainInfo> result;
+    result.reserve(m_chains.size());
+    for (const auto& c : m_chains) {
+        ChainInfo info;
+        info.symbol         = c.config.symbol;
+        info.chain_id       = c.config.chain_id;
+        info.rpc_host       = c.config.rpc_host;
+        info.rpc_port       = c.config.rpc_port;
+        info.multiaddress   = c.config.multiaddress;
+        info.p2p_port       = c.config.p2p_port;
+        info.current_height = c.current_work.height;
+        info.current_tip    = c.last_tip;
+        info.coinbase_value = c.current_work.coinbase_value;
+        // Compute difficulty from target: diff = 2^256 / (target+1)
+        // Simplified: diff ≈ 0x00000000FFFF... / target  (Dogecoin uses scrypt diff1)
+        if (!c.current_work.target.IsNull()) {
+            // Use compact diff1 target (0x00000000FFFF << 208)
+            // diff = diff1_target / current_target
+            double target_d = c.current_work.target.IsNull() ? 1.0 :
+                c.current_work.target.getdouble();
+            if (target_d > 0) {
+                // diff1 for scrypt = 0x0000FFFF << 224 * 2^-256 ≈ 0.99998
+                double diff1 = 65535.0 / 256.0;  // ≈ 255.996
+                // Actually: diff = pdiff_1_target / target
+                // pdiff_1_target for scrypt = 2^224 * 0xFFFF / 0x10000 ≈ 2^224 * 0.99998
+                // Simpler: target_to_diff = 2^256 / 2^32 / target_as_double ≈ 2^224 / target_d
+                info.difficulty = std::ldexp(1.0, 224) / target_d;
+            }
+        }
+        result.push_back(std::move(info));
+    }
+    return result;
 }
 
 } // namespace merged
