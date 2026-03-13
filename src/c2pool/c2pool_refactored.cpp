@@ -205,7 +205,7 @@ void print_help() {
     std::cout << "  --p2p-max-peers N         Max total P2P peers (default: 30)\n";
     std::cout << "  --ban-duration N          P2P ban duration in seconds (default: 300)\n";
     std::cout << "  --rss-limit-mb N          Abort if RSS exceeds N MB (default: 4000)\n";
-    std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: *)\n";
+    std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: disabled)\n";
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
     std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n\n";
@@ -327,7 +327,7 @@ int main(int argc, char* argv[]) {
     int         p2p_max_peers        = 30;       // max total P2P peers
     int         p2p_ban_duration     = 300;      // ban duration in seconds
     long        rss_limit_mb         = 4000;     // abort if RSS exceeds N MB
-    std::string http_cors_origin     = "*";      // Access-Control-Allow-Origin
+    std::string http_cors_origin     = "";       // Access-Control-Allow-Origin (empty = disabled)
     int         payout_window_seconds = 86400;   // PPLNS payout window (24h)
     int         cache_max_shared_hashes = 50000; // de-dup set cap
     int         cache_max_known_txs     = 10000; // known TX cache cap
