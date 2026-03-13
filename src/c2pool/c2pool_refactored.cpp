@@ -53,6 +53,9 @@
 // Coin daemon RPC
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
+#include <impl/ltc/coin/header_chain.hpp>
+#include <impl/ltc/coin/mempool.hpp>
+#include <impl/ltc/coin/template_builder.hpp>
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
@@ -290,6 +293,7 @@ int main(int argc, char* argv[]) {
     bool auto_detect_wallet = true;     // Auto-detect wallet address
     bool integrated_mode = false;
     bool sharechain_mode = false;
+    bool embedded_ltc    = false;    // Phase 4: use embedded coin node instead of daemon RPC
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
 
     // Coin daemon P2P connection (for fast block relay alongside RPC)
@@ -442,6 +446,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--sharechain") {
             sharechain_mode = true;
             cli_explicit.insert("sharechain");
+        }
+        else if (arg == "--embedded-ltc") {
+            embedded_ltc = true;
+            cli_explicit.insert("embedded_ltc");
         }
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
@@ -940,18 +948,73 @@ int main(int argc, char* argv[]) {
             // Create enhanced node with default constructor to avoid nullptr issues
             auto enhanced_node = std::make_shared<c2pool::node::EnhancedC2PoolNode>(settings->m_testnet);
             
-            // Set up coin daemon RPC for live block template generation.
-            // The coin_node is kept alive for the duration of the integrated mode loop.
+            // ── Coin node: embedded (Phase 4) or RPC (legacy) ─────────────────
             ltc::interfaces::Node  coin_node;
-            auto node_rpc = std::make_unique<ltc::coin::NodeRPC>(&ioc, &coin_node, settings->m_testnet);
+            std::unique_ptr<ltc::coin::NodeRPC> node_rpc;
 
-            // Adjust default RPC port based on testnet flag when user didn't override
-            if (rpc_port == 19332 && !settings->m_testnet)
-                rpc_port = 9332; // mainnet LTC
+            // Phase 4 embedded objects (alive for the duration of integrated mode)
+            std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
+            std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
+            std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
+            std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
 
-            LOG_INFO << "Connecting to coin daemon RPC at " << rpc_host << ":" << rpc_port;
-            node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
-                              rpc_user + ":" + rpc_pass);
+            if (embedded_ltc) {
+                LOG_INFO << "Phase 4: embedded LTC coin node mode (no daemon required)";
+
+                auto ltc_params = settings->m_testnet
+                    ? ltc::coin::LTCChainParams::testnet()
+                    : ltc::coin::LTCChainParams::mainnet();
+
+                // LevelDB-backed header chain for persistence across restarts
+                std::string chain_db_path = (settings->m_testnet ? "ltc_testnet" : "ltc")
+                                            + std::string("/embedded_headers");
+                embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
+                if (!embedded_chain->init())
+                    LOG_WARNING << "HeaderChain LevelDB init failed — running in-memory only";
+
+                embedded_pool  = std::make_unique<ltc::coin::Mempool>();
+                embedded_node  = std::make_unique<ltc::coin::EmbeddedCoinNode>(
+                    *embedded_chain, *embedded_pool, settings->m_testnet);
+
+                // Auto-detect P2P port for the embedded broadcaster
+                if (coind_p2p_port == -1)
+                    coind_p2p_port = get_coin_p2p_port(blockchain_to_symbol(blockchain), settings->m_testnet);
+                std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
+                auto parent_symbol   = blockchain_to_symbol(blockchain);
+                auto p2p_prefix      = get_chain_p2p_prefix(parent_symbol, settings->m_testnet);
+
+                NetService embedded_p2p_addr(p2p_host, static_cast<uint16_t>(
+                    coind_p2p_port > 0 ? coind_p2p_port : 19335));
+
+                embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                    ioc, parent_symbol, p2p_prefix, embedded_p2p_addr,
+                    "/tmp/c2pool_embedded_pm", c2pool::merged::PeerManagerConfig{});
+
+                // Feed mempool transactions into Mempool
+                embedded_broadcaster->set_on_new_tx(
+                    [pool = embedded_pool.get()](const std::string& /*key*/,
+                                                  const ltc::coin::Transaction& tx) {
+                        ltc::coin::MutableTransaction mtx(tx);
+                        pool->add_tx(mtx);
+                    });
+
+                embedded_broadcaster->start();
+                LOG_INFO << "Embedded LTC broadcaster started, connecting to "
+                         << p2p_host << ":" << (coind_p2p_port > 0 ? coind_p2p_port : 19335);
+                // NOTE: set_on_new_headers and set_embedded_node are wired after web_server is created below
+
+            } else {
+                // Legacy RPC mode
+                node_rpc = std::make_unique<ltc::coin::NodeRPC>(&ioc, &coin_node, settings->m_testnet);
+
+                // Adjust default RPC port based on testnet flag when user didn't override
+                if (rpc_port == 19332 && !settings->m_testnet)
+                    rpc_port = 9332; // mainnet LTC
+
+                LOG_INFO << "Connecting to coin daemon RPC at " << rpc_host << ":" << rpc_port;
+                node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
+                                  rpc_user + ":" + rpc_pass);
+            }
 
             // Create web server with explicit port configuration
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
@@ -977,7 +1040,21 @@ int main(int argc, char* argv[]) {
                      << " save_interval=" << storage_save_interval << "s";
             
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
-            web_server.set_coin_rpc(node_rpc.get(), &coin_node);
+            if (!embedded_ltc) {
+                web_server.set_coin_rpc(node_rpc.get(), &coin_node);
+            } else if (embedded_broadcaster && embedded_chain) {
+                // Wire embedded node + header-sync callback (now that web_server is alive)
+                web_server.set_embedded_node(embedded_node.get());
+                embedded_broadcaster->set_on_new_headers(
+                    [chain = embedded_chain.get(), &web_server](
+                        const std::string& /*key*/,
+                        const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                        int accepted = chain->add_headers(hdrs);
+                        if (accepted > 0)
+                            web_server.trigger_work_refresh();
+                    });
+                LOG_INFO << "Embedded coin node wired to web server";
+            }
 
             // Feed real network difficulty from block templates to the adjustment engine
             web_server.get_mining_interface()->set_on_network_difficulty(
@@ -1028,13 +1105,14 @@ int main(int argc, char* argv[]) {
             // --- Parent chain P2P broadcaster (fast block relay) ---
             // Auto-detect P2P port from chain type if not explicitly set.
             // P2P address defaults to the same host as RPC (coin daemon).
-            if (coind_p2p_port == -1) {
+            // In embedded mode the broadcaster was already started above — skip.
+            if (!embedded_ltc && coind_p2p_port == -1) {
                 coind_p2p_port = get_coin_p2p_port(blockchain_to_symbol(blockchain), settings->m_testnet);
                 if (coind_p2p_port > 0)
                     LOG_INFO << "Auto-detected parent coin P2P port: " << coind_p2p_port;
             }
             std::unique_ptr<ltc::coin::p2p::NodeP2P<ltc::Config>> coin_p2p;
-            if (coind_p2p_port > 0) {
+            if (!embedded_ltc && coind_p2p_port > 0) {
                 std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
                 // Override coin config P2P prefix + address with correct values
                 auto parent_symbol = blockchain_to_symbol(blockchain);
@@ -1049,17 +1127,30 @@ int main(int argc, char* argv[]) {
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)
             auto whale_detector = std::make_unique<ltc::WhaleDepartureDetector>();
 
-            // Wire block_rel_height for chain scoring: queries coin daemon for block depth
-            p2p_node->set_block_rel_height_fn(
-                [rpc = node_rpc.get()](uint256 block_hash) -> int32_t {
-                    if (!rpc || block_hash.IsNull()) return 0;
-                    try {
-                        auto reply = rpc->getblock(block_hash, 1);
-                        if (reply.contains("confirmations"))
-                            return reply["confirmations"].get<int32_t>();
-                    } catch (...) {}
-                    return 0; // RPC error or not found — safe default
-                });
+            // Wire block_rel_height for chain scoring.
+            // Embedded mode: use HeaderChain height diff. RPC mode: query daemon.
+            if (embedded_ltc) {
+                p2p_node->set_block_rel_height_fn(
+                    [chain = embedded_chain.get()](uint256 block_hash) -> int32_t {
+                        if (!chain || block_hash.IsNull()) return 0;
+                        auto entry = chain->get_header(block_hash);
+                        if (!entry) return 0;
+                        int32_t tip_h = static_cast<int32_t>(chain->height());
+                        int32_t blk_h = static_cast<int32_t>(entry->height);
+                        return tip_h - blk_h + 1; // confirmations-style depth
+                    });
+            } else {
+                p2p_node->set_block_rel_height_fn(
+                    [rpc = node_rpc.get()](uint256 block_hash) -> int32_t {
+                        if (!rpc || block_hash.IsNull()) return 0;
+                        try {
+                            auto reply = rpc->getblock(block_hash, 1);
+                            if (reply.contains("confirmations"))
+                                return reply["confirmations"].get<int32_t>();
+                        } catch (...) {}
+                        return 0; // RPC error or not found — safe default
+                    });
+            }
 
             // Begin actively connecting to outbound peers from bootstrap list / addr store
             p2p_node->start_outbound_connections();
@@ -1074,7 +1165,7 @@ int main(int argc, char* argv[]) {
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
-            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc](const std::string& header_hex, int stale_info) {
+            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc](const std::string& header_hex, int stale_info) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -1128,8 +1219,8 @@ int main(int argc, char* argv[]) {
                          << stale_str
                          << " — broadcast bestblock to P2P peers";
 
-                // Schedule post-submission orphan check at +30s and +120s
-                if (stale_info == 0)
+                // Schedule post-submission orphan check at +30s and +120s (RPC mode only)
+                if (stale_info == 0 && !embedded_ltc)
                 {
                     auto check_block = [&ioc, &node_rpc, block_hash](int delay_sec) {
                         auto timer = std::make_shared<boost::asio::steady_timer>(ioc);
@@ -1163,9 +1254,18 @@ int main(int argc, char* argv[]) {
             });
             
             // Wire P2P block relay for fast parent block propagation.
-            // When a block is accepted by the daemon, also send it via P2P
-            // for near-instant propagation to the coin network.
-            if (coin_p2p) {
+            if (embedded_ltc && embedded_broadcaster) {
+                // Embedded mode: relay directly via CoinBroadcaster (no daemon needed)
+                web_server.set_on_block_relay([&embedded_broadcaster](const std::string& full_block_hex) {
+                    try {
+                        auto block_bytes = ParseHex(full_block_hex);
+                        embedded_broadcaster->submit_block_raw(block_bytes);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "Embedded P2P block relay failed: " << e.what();
+                    }
+                });
+            } else if (coin_p2p) {
+                // RPC mode: relay via NodeP2P after daemon accepts the block
                 web_server.set_on_block_relay([&coin_p2p](const std::string& full_block_hex) {
                     try {
                         auto block_bytes = ParseHex(full_block_hex);

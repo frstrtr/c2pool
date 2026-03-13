@@ -3,6 +3,8 @@
 // Real coin daemon RPC (optional - only linked when set_coin_rpc() is called)
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
+// Phase 4: embedded coin node interface
+#include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/share_messages.hpp>
 
 #include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
@@ -669,6 +671,12 @@ void MiningInterface::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Nod
     LOG_INFO << "MiningInterface: coin RPC " << (rpc ? "connected" : "disconnected");
 }
 
+void MiningInterface::set_embedded_node(ltc::coin::CoinNodeInterface* node)
+{
+    m_embedded_node = node;
+    LOG_INFO << "MiningInterface: embedded coin node " << (node ? "connected" : "disconnected");
+}
+
 void MiningInterface::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
 {
     m_on_block_submitted = std::move(fn);
@@ -1262,9 +1270,11 @@ static std::string base58check_to_hash160(const std::string& address)
 
 void MiningInterface::refresh_work()
 {
-    if (!m_coin_rpc) return;
+    if (!m_coin_rpc && !m_embedded_node) return;
     try {
-        auto wd = m_coin_rpc->getwork();
+        // Phase 4: prefer embedded node; fall back to RPC (HybridCoinNode pattern)
+        auto wd = m_embedded_node ? m_embedded_node->getwork()
+                                  : m_coin_rpc->getwork();
 
         // Update the coin node's Variable<WorkData> so submit_block() can read it
         if (m_coin_node)
@@ -1759,8 +1769,16 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
             return {{"error", std::string(e.what())}};
         }
+    } else if (m_embedded_node) {
+        // Phase 4 embedded mode: no daemon — relay the block directly via P2P.
+        // on_block_relay is wired to CoinBroadcaster::submit_block_raw().
+        LOG_INFO << "submitblock: embedded mode — relaying " << hex_data.size()/2 << " bytes via P2P";
+        if (m_on_block_relay)
+            m_on_block_relay(hex_data);
+        if (m_on_block_submitted && hex_data.size() >= 160)
+            m_on_block_submitted(hex_data.substr(0, 160), 0);
     } else {
-        LOG_WARNING << "submitblock: no coin RPC connected, block discarded";
+        LOG_WARNING << "submitblock: no coin RPC or embedded node connected, block discarded";
     }
 
     return nullptr; // null = accepted in getblocktemplate spec
@@ -4310,6 +4328,12 @@ void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coi
     m_coin_node_ = coin;
     mining_interface_->set_coin_rpc(rpc, coin);
     LOG_INFO << "WebServer: coin RPC " << (rpc ? "attached" : "detached");
+}
+
+void WebServer::set_embedded_node(ltc::coin::CoinNodeInterface* node)
+{
+    mining_interface_->set_embedded_node(node);
+    LOG_INFO << "WebServer: embedded coin node " << (node ? "attached" : "detached");
 }
 
 void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)

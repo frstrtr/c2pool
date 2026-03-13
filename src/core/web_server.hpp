@@ -37,6 +37,7 @@ using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
 
 // Forward declarations for optional coin daemon integration (avoid layering violation)
 namespace ltc { namespace coin { class NodeRPC; } }
+namespace ltc { namespace coin { class CoinNodeInterface; } }
 namespace ltc { namespace interfaces { struct Node; } }
 
 namespace core {
@@ -388,6 +389,9 @@ public:
 
     // Wire a live coin-daemon RPC connection so getblocktemplate/submitblock use real data
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
+    // Wire an embedded coin node (Phase 4) — used instead of RPC when set.
+    // refresh_work() will call node->getwork(); block submissions relay via on_block_relay.
+    void set_embedded_node(ltc::coin::CoinNodeInterface* node);
     // Fetch a fresh block template from the coin daemon and cache it
     void refresh_work();
     // Return the most recently cached block template (empty json if unavailable)
@@ -473,8 +477,10 @@ private:
     c2pool::payout::PayoutManager* m_payout_manager_ptr = nullptr;
 
     // Real coin daemon connection (replaces mock LitecoinRpcClient)
-    ltc::coin::NodeRPC*     m_coin_rpc  = nullptr;
-    ltc::interfaces::Node*  m_coin_node = nullptr;
+    ltc::coin::NodeRPC*          m_coin_rpc       = nullptr;
+    ltc::interfaces::Node*       m_coin_node      = nullptr;
+    // Phase 4: embedded coin node (preferred over RPC when set)
+    ltc::coin::CoinNodeInterface* m_embedded_node = nullptr;
     std::atomic<bool>       m_work_valid{false};
     nlohmann::json          m_cached_template;
     std::vector<std::string> m_cached_merkle_branches;   // Stratum merkle branches
@@ -731,6 +737,8 @@ public:
 
     // Wire a live coin-daemon RPC connection for block template generation
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
+    // Wire an embedded coin node (Phase 4 — preferred over RPC when set)
+    void set_embedded_node(ltc::coin::CoinNodeInterface* node);
     // Forward block-found callback to the underlying MiningInterface
     void set_on_block_submitted(std::function<void(const std::string&, int)> fn);
     // Forward P2P block relay callback to the underlying MiningInterface

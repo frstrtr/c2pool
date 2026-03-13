@@ -93,6 +93,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
 
+    add_executable(test_phase4_embedded test_phase4_embedded.cpp)
+    target_link_libraries(test_phase4_embedded PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+
+    add_executable(test_phase4_live test_phase4_live.cpp)
+    target_link_libraries(test_phase4_live PRIVATE
+        GTest::gtest_main GTest::gtest
+        c2pool_merged_mining
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+
     include(GoogleTest)
     gtest_add_tests(test_coin_broadcaster "" AUTO)
     gtest_add_tests(test_share_messages "" AUTO)
@@ -105,4 +122,6 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(test_phase2_live "" AUTO)
     gtest_add_tests(test_template_builder "" AUTO)
     gtest_add_tests(test_phase3_live "" AUTO)
+    gtest_add_tests(test_phase4_embedded "" AUTO)
+    gtest_add_tests(test_phase4_live "" AUTO)
 endif()
