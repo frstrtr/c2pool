@@ -18,12 +18,16 @@ namespace coin
 namespace p2p
 {
 
-//[+] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
-//[+] void handle_message_verack(std::shared_ptr<coind::messages::message_verack> msg, CoindProtocol* protocol); //
-//[+] void handle_message_ping(std::shared_ptr<coind::messages::message_ping> msg, CoindProtocol* protocol); //
-//[+] void handle_message_pong(std::shared_ptr<coind::messages::message_pong> msg, CoindProtocol* protocol); //
-//[+] void handle_message_alert(std::shared_ptr<coind::messages::message_alert> msg, CoindProtocol* protocol); // 
-//[+] void handle_message_inv(std::shared_ptr<coind::messages::message_inv> msg, CoindProtocol* protocol); //
+// Bitcoin wire protocol uses uint32_t timestamp in addr messages,
+// unlike the pool protocol which uses uint64_t.
+struct btc_addr_record_t : addr_t
+{
+    uint32_t m_timestamp{};
+
+    btc_addr_record_t() : addr_t() {}
+
+    SERIALIZE_METHODS(btc_addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
+};
 //[+] void handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, CoindProtocol* protocol); //
 //[+] void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol); //
 //[+] void handle_message_headers(std::shared_ptr<coind::messages::message_headers> msg, CoindProtocol* protocol); //
@@ -197,7 +201,7 @@ END_MESSAGE()
 BEGIN_MESSAGE(addr)
     MESSAGE_FIELDS
     (
-        (std::vector<addr_record_t>, m_addrs)
+        (std::vector<btc_addr_record_t>, m_addrs)
     )
     {
         READWRITE(obj.m_addrs);
@@ -250,6 +254,28 @@ BEGIN_MESSAGE(mempool)
     WITHOUT_MESSAGE_FIELDS() { }
 END_MESSAGE()
 
+// BIP 152 — sendcmpct (compact block negotiation)
+BEGIN_MESSAGE(sendcmpct)
+    MESSAGE_FIELDS
+    (
+        (bool, m_announce),
+        (uint64_t, m_version)
+    )
+    {
+        READWRITE(obj.m_announce, obj.m_version);
+    }
+END_MESSAGE()
+
+// BIP 339 — wtxidrelay (empty, signals wtxid-based tx relay; sent before verack)
+BEGIN_MESSAGE(wtxidrelay)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
+// BIP 155 — sendaddrv2 (empty, signals addrv2 support; sent before verack)
+BEGIN_MESSAGE(sendaddrv2)
+    WITHOUT_MESSAGE_FIELDS() { }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -257,6 +283,9 @@ using Handler = MessageHandler<
     message_pong,
     message_alert,
     message_inv,
+    message_getdata,
+    message_getblocks,
+    message_getheaders,
     message_tx,
     message_block,
     message_headers,
@@ -266,7 +295,10 @@ using Handler = MessageHandler<
     message_sendheaders,
     message_notfound,
     message_feefilter,
-    message_mempool
+    message_mempool,
+    message_sendcmpct,
+    message_wtxidrelay,
+    message_sendaddrv2
 >;
 
 } // namespace p2p

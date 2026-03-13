@@ -160,7 +160,8 @@ public:
             result = m_handler.parse(rmsg);
         } catch (const std::runtime_error& ec)
         {
-            LOG_ERROR << "NodeP2P handle: " << ec.what();
+            LOG_ERROR << "NodeP2P handle(" << rmsg->m_command << ", "
+                      << rmsg->m_data.size() << " bytes): " << ec.what();
             // todo: error
             return;
         } catch (const std::out_of_range& ec)
@@ -464,6 +465,42 @@ private:
     ADD_P2P_HANDLER(mempool)
     {
         // We don't serve mempool — ignore incoming request
+    }
+
+    ADD_P2P_HANDLER(sendcmpct)
+    {
+        // BIP 152: Compact block negotiation — acknowledge but don't use yet
+        LOG_DEBUG_COIND << "Peer sendcmpct: announce=" << msg->m_announce
+                        << " version=" << msg->m_version;
+    }
+
+    ADD_P2P_HANDLER(wtxidrelay)
+    {
+        // BIP 339: Peer wants wtxid-based tx relay — acknowledged
+        LOG_DEBUG_COIND << "Peer supports wtxidrelay (BIP 339)";
+    }
+
+    ADD_P2P_HANDLER(sendaddrv2)
+    {
+        // BIP 155: Peer wants addrv2 messages — acknowledged
+        LOG_DEBUG_COIND << "Peer supports sendaddrv2 (BIP 155)";
+    }
+
+    ADD_P2P_HANDLER(getdata)
+    {
+        // Peer requesting data from us — we don't serve blocks/txs
+        LOG_DEBUG_COIND << "Peer getdata with " << msg->m_requests.size() << " items (ignored)";
+    }
+
+    ADD_P2P_HANDLER(getblocks)
+    {
+        // Peer requesting block locator — we don't serve blocks
+    }
+
+    ADD_P2P_HANDLER(getheaders)
+    {
+        // Peer requesting headers — we don't serve headers
+        LOG_DEBUG_COIND << "Peer getheaders (ignored, we don't serve headers)";
     }
 
     #undef ADD_P2P_HANDLER
