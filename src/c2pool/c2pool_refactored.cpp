@@ -1044,7 +1044,14 @@ int main(int argc, char* argv[]) {
             web_server.get_mining_interface()->set_sharechain_stats_fn([&p2p_node]() {
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
-                auto best = p2p_node->best_share_hash();
+
+                // Use tallest chain head (not verified best) so stats stay current during sync
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
 
                 result["total_shares"]    = static_cast<int>(chain.size());
                 result["fork_count"]      = static_cast<int>(chain.get_heads().size());
@@ -1133,7 +1140,14 @@ int main(int argc, char* argv[]) {
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
                 auto& verified = p2p_node->tracker().verified;
-                auto best = p2p_node->best_share_hash();
+
+                // Use tallest chain head (not verified best) so the grid stays current during sync
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
 
                 result["best_hash"] = best.IsNull() ? "" : best.GetHex();
                 result["chain_length"] = static_cast<int>(chain.size());
