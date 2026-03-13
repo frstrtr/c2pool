@@ -75,11 +75,28 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 **API endpoints** (integrated mode)
 
 ```
-GET  /api/stats          pool statistics and hashrate
-POST /api/getinfo        pool information
-POST /api/getminerstats  per-miner statistics
-POST /api/getpayoutinfo  payout balances
+GET  /local_rate          local pool hashrate
+GET  /global_rate         network hashrate
+GET  /current_payouts     PPLNS expected payouts
+GET  /recent_blocks       blocks found by pool
+GET  /global_stats        comprehensive pool stats
+GET  /sharechain/stats    sharechain tracker data
+GET  /local_stats         p2pool-compatible local stats
+POST {jsonrpc}            getinfo, getminerstats, getpayoutinfo, ...
 ```
+
+**Web dashboard** — served by default from `web-static/`:
+
+```bash
+# Built-in dashboard
+xdg-open http://localhost:8080/
+
+# Custom dashboard directory
+./src/c2pool/c2pool --dashboard-dir /path/to/my-dashboard ...
+```
+
+See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the
+complete API reference and custom dashboard development guide.
 
 ---
 
@@ -151,6 +168,7 @@ CLI arguments always take priority over YAML values.
 | `--cors-origin` | `cors_origin` | * | CORS Allow-Origin header |
 | `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
+| `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
 
 See [config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) for a complete example.
 

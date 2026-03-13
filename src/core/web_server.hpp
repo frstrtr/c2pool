@@ -139,6 +139,15 @@ public:
     nlohmann::json rest_control_mining_ban(const std::string& target);
     nlohmann::json rest_control_mining_unban(const std::string& target);
 
+    // p2pool-compatible legacy REST endpoints (enable original p2pool dashboards)
+    nlohmann::json rest_local_stats();
+    nlohmann::json rest_p2pool_global_stats();
+    nlohmann::json rest_web_version();
+    nlohmann::json rest_web_currency_info();
+    nlohmann::json rest_payout_addr();
+    nlohmann::json rest_payout_addrs();
+    nlohmann::json rest_web_best_share_hash();
+
     // Log endpoints for Qt PageLogs — read directly from debug.log
     std::string rest_web_log();
     std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
@@ -501,6 +510,14 @@ public:
     const StratumConfig& get_stratum_config() const { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
+
+    // Dashboard static file serving directory
+    void set_dashboard_dir(const std::string& dir) { m_dashboard_dir = dir; }
+    const std::string& get_dashboard_dir() const { return m_dashboard_dir; }
+
+    // Primary payout address (for legacy /payout_addr endpoint)
+    void set_payout_address(const std::string& addr) { m_payout_address = addr; }
+    const std::string& get_payout_address() const { return m_payout_address; }
 private:
 
     // Lightweight runtime state for MVP mining controls.
@@ -510,6 +527,11 @@ private:
 
     // Fallback address resolver for invalid/empty miner addresses (redistribute / DOGE→LTC)
     address_fallback_fn_t m_address_fallback_fn;
+
+    // Dashboard static file serving directory (empty = disabled)
+    std::string m_dashboard_dir;
+    // Primary payout address for legacy API
+    std::string m_payout_address;
 };
 
 /// Main Web Server class
@@ -565,6 +587,9 @@ public:
     bool is_stratum_running() const;
     void set_stratum_port(uint16_t port);
     uint16_t get_stratum_port() const;
+
+    // Dashboard directory for static file serving
+    void set_dashboard_dir(const std::string& dir);
 
     // Wire a live coin-daemon RPC connection for block template generation
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);

@@ -207,7 +207,8 @@ void print_help() {
     std::cout << "  --rss-limit-mb N          Abort if RSS exceeds N MB (default: 4000)\n";
     std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: *)\n";
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
-    std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n\n";
+    std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
+    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -332,6 +333,9 @@ int main(int argc, char* argv[]) {
     int         cache_max_known_txs     = 10000; // known TX cache cap
     int         cache_max_raw_shares    = 50000; // raw share cache cap
     int         storage_save_interval   = 300;   // periodic save interval (seconds)
+
+    // Dashboard directory (web-static/ by default, relative to CWD)
+    std::string dashboard_dir = "web-static";
 
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
@@ -620,6 +624,10 @@ int main(int argc, char* argv[]) {
             storage_save_interval = std::stoi(argv[++i]);
             cli_explicit.insert("storage_save_interval");
         }
+        else if (arg == "--dashboard-dir" && i + 1 < argc) {
+            dashboard_dir = argv[++i];
+            cli_explicit.insert("dashboard_dir");
+        }
         // Seed node: -n HOST:PORT (p2pool compat)
         else if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
@@ -757,6 +765,8 @@ int main(int argc, char* argv[]) {
                 payout_window_seconds = cfg["payout_window_seconds"].as<int>();
             if (!cli_explicit.count("storage_save_interval") && cfg["storage_save_interval"])
                 storage_save_interval = cfg["storage_save_interval"].as<int>();
+            if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
+                dashboard_dir = cfg["dashboard_dir"].as<std::string>();
             if (cfg["cache_max_shared_hashes"])
                 cache_max_shared_hashes = cfg["cache_max_shared_hashes"].as<int>();
             if (cfg["cache_max_known_txs"])
@@ -950,6 +960,10 @@ int main(int argc, char* argv[]) {
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
+
+            // Dashboard serving directory and payout address for legacy API
+            web_server.set_dashboard_dir(dashboard_dir);
+            web_server.get_mining_interface()->set_payout_address(payout_address);
             LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
                      << " max_diff=" << stratum_config.max_difficulty
                      << " target_time=" << stratum_config.target_time << "s"

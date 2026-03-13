@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>c2pool Share Explorer</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="c2pool.js"></script>
+</head>
+<body>
+
+<div class="header">
+    <h1>&#x26CF; c2pool <span class="coin-symbol">LTC</span></h1>
+    <nav>
+        <a href="index.html">Dashboard</a>
+        <a href="graphs.html">Graphs</a>
+        <a href="share.html" class="active">Share Explorer</a>
+    </nav>
+</div>
+
+<div class="container">
+
+    <!-- ── Best share ────────────────────────────────── -->
+    <div class="card wide">
+        <h3>Chain Tip</h3>
+        <div class="explorer-field">
+            <div class="label">Best Share Hash</div>
+            <div class="val" id="best-hash">Loading…</div>
+        </div>
+    </div>
+
+    <!-- ── Sharechain window (last N shares) ─────────── -->
+    <div class="card wide" style="margin-top:16px">
+        <h3>Recent Shares (Sharechain Window)</h3>
+        <table style="margin-top:8px">
+            <thead>
+                <tr><th>#</th><th>Hash (short)</th><th>Miner</th><th>Version</th></tr>
+            </thead>
+            <tbody id="window-table"></tbody>
+        </table>
+        <div id="no-window" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
+            No share window data available.
+        </div>
+    </div>
+
+    <!-- ── Sharechain stats summary ──────────────────── -->
+    <div class="card wide" style="margin-top:16px">
+        <h3>Sharechain Overview</h3>
+        <table style="margin-top:8px">
+            <tbody id="sc-stats-table"></tbody>
+        </table>
+    </div>
+
+</div>
+
+<div class="footer">
+    <a href="https://github.com/frstrtr/c2pool" target="_blank">c2pool</a>
+</div>
+
+<script>
+async function refreshExplorer() {
+    try {
+        // Currency info
+        const ci = await C2PoolAPI.currencyInfo();
+        if (ci) document.querySelectorAll(".coin-symbol").forEach(el => el.textContent = ci.symbol);
+
+        // Best share hash
+        const bsh = await C2PoolAPI.bestShareHash();
+        const bestEl = document.getElementById("best-hash");
+        if (bsh && bsh !== "0000000000000000000000000000000000000000000000000000000000000000")
+            bestEl.textContent = bsh;
+        else
+            bestEl.textContent = "(no shares yet)";
+
+        // Sharechain window
+        const sw = await C2PoolAPI.sharechainWindow();
+        const windowTable = document.getElementById("window-table");
+        const noWindow = document.getElementById("no-window");
+        windowTable.innerHTML = "";
+
+        if (sw && sw.shares && sw.shares.length > 0) {
+            noWindow.style.display = "none";
+            sw.shares.slice(0, 200).forEach((share, i) => {
+                const tr = document.createElement("tr");
+                tr.innerHTML =
+                    '<td>' + (i + 1) + '</td>' +
+                    '<td style="font-family:var(--mono)">' + (share.hash ? share.hash.substring(share.hash.length - 12) : "—") + '</td>' +
+                    '<td>' + (share.miner || share.payout_address || "—") + '</td>' +
+                    '<td>' + (share.version || "—") + '</td>';
+                windowTable.appendChild(tr);
+            });
+        } else {
+            noWindow.style.display = "block";
+        }
+
+        // Sharechain stats
+        const sc = await C2PoolAPI.sharechainStats();
+        const statsTable = document.getElementById("sc-stats-table");
+        if (sc) {
+            const rows = [
+                ["Total shares", sc.total_shares || 0],
+                ["Chain height", sc.chain_height || 0],
+                ["Chain tip hash", sc.chain_tip_hash || "—"],
+                ["Fork count", sc.fork_count != null ? sc.fork_count : "—"],
+                ["Average difficulty", sc.average_difficulty != null ? sc.average_difficulty.toFixed(4) : "—"],
+            ];
+            statsTable.innerHTML = rows.map(([k, v]) =>
+                '<tr><td style="color:var(--text-dim)">' + k + '</td>' +
+                '<td style="font-family:var(--mono)">' + v + '</td></tr>'
+            ).join("");
+
+            // Miner distribution
+            if (sc.shares_by_miner && Object.keys(sc.shares_by_miner).length > 0) {
+                let minerHtml = '<tr><td colspan="2" style="color:var(--text-dim);padding-top:16px"><strong>Miners by share count</strong></td></tr>';
+                const sorted = Object.entries(sc.shares_by_miner).sort((a, b) => b[1] - a[1]);
+                sorted.forEach(([miner, count]) => {
+                    minerHtml += '<tr><td style="font-family:var(--mono);max-width:300px;overflow:hidden;text-overflow:ellipsis">'
+                        + miner + '</td><td>' + count + '</td></tr>';
+                });
+                statsTable.innerHTML += minerHtml;
+            }
+        }
+
+    } catch (e) {
+        console.error("Explorer refresh error:", e);
+    }
+
+    setTimeout(refreshExplorer, 15000);
+}
+
+refreshExplorer();
+</script>
+
+</body>
+</html>

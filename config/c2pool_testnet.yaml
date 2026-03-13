@@ -55,3 +55,6 @@ storage_save_interval: 300     # Periodic sharechain save interval (seconds)
 
 # ─── HTTP API / Security ────────────────────────────────────────────────────
 cors_origin: "*"               # Access-Control-Allow-Origin header
+
+# ─── Web Dashboard ──────────────────────────────────────────────────────────
+dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)

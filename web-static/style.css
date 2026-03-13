@@ -1,0 +1,193 @@
+/* c2pool dashboard — universal gate stylesheet
+   Works with p2pool/p2pool → jtoomim → frstrtr/c2pool lineage.
+   Designed for easy override / theme swapping by community dashboards. */
+
+:root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent-dim: #1f6feb;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --radius: 8px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 15px; }
+
+body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Layout ────────────────────────────────────────────── */
+.header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+.header h1 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.header .badge {
+    font-size: 0.7rem;
+    background: var(--accent-dim);
+    color: #fff;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+.header nav { margin-left: auto; display: flex; gap: 16px; }
+.header nav a { color: var(--text-dim); font-size: 0.9rem; }
+.header nav a:hover, .header nav a.active { color: var(--accent); }
+
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+/* ── Cards / Grid ─────────────────────────────────────── */
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+}
+.card h3 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+}
+.card .value {
+    font-size: 1.6rem;
+    font-weight: 600;
+    font-family: var(--mono);
+}
+.card .sub {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-top: 2px;
+}
+
+.wide { grid-column: 1 / -1; }
+
+/* ── Status indicator ─────────────────────────────────── */
+.status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 4px;
+}
+.status-dot.green { background: var(--green); }
+.status-dot.red { background: var(--red); }
+.status-dot.orange { background: var(--orange); }
+
+/* ── Tables ───────────────────────────────────────────── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+}
+th {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+}
+td { font-family: var(--mono); font-size: 0.82rem; }
+tr:hover { background: rgba(88, 166, 255, 0.04); }
+
+/* ── Warnings ─────────────────────────────────────────── */
+.warning {
+    background: rgba(210, 153, 34, 0.1);
+    border: 1px solid var(--orange);
+    color: var(--orange);
+    padding: 10px 16px;
+    border-radius: var(--radius);
+    margin-bottom: 16px;
+    font-size: 0.9rem;
+}
+
+/* ── Charts (svg containers) ──────────────────────────── */
+.chart-container {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 24px;
+}
+.chart-container h2 {
+    font-size: 1rem;
+    margin-bottom: 12px;
+}
+.chart-container svg {
+    width: 100%;
+    height: 200px;
+}
+
+/* ── Explorer ─────────────────────────────────────────── */
+.explorer-field {
+    margin-bottom: 10px;
+}
+.explorer-field .label {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.explorer-field .val {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    word-break: break-all;
+}
+
+/* ── Footer ───────────────────────────────────────────── */
+.footer {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 48px;
+}
+.footer a { color: var(--accent); }
+
+/* ── Responsive ───────────────────────────────────────── */
+@media (max-width: 640px) {
+    .container { padding: 12px; }
+    .grid { grid-template-columns: 1fr 1fr; }
+    .card .value { font-size: 1.2rem; }
+    .header { flex-wrap: wrap; }
+    .header nav { margin-left: 0; width: 100%; }
+}

@@ -167,8 +167,66 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
-            else
+            // ── p2pool legacy compatibility endpoints ──────────────────────
+            else if (target == "/local_stats")
+                rest_result = mining_interface_->rest_local_stats();
+            else if (target == "/web/version")
+                rest_result = mining_interface_->rest_web_version();
+            else if (target == "/web/currency_info")
+                rest_result = mining_interface_->rest_web_currency_info();
+            else if (target == "/payout_addr")
+                rest_result = mining_interface_->rest_payout_addr();
+            else if (target == "/payout_addrs")
+                rest_result = mining_interface_->rest_payout_addrs();
+            else if (target == "/web/best_share_hash")
+                rest_result = mining_interface_->rest_web_best_share_hash();
+            else if (target == "/p2pool_global_stats")
+                rest_result = mining_interface_->rest_p2pool_global_stats();
+            else {
+                // ── Static file serving (dashboard gate) ───────────────────
+                const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
+                if (!dashboard_dir.empty()) {
+                    std::string file_path = target;
+                    if (file_path == "/" || file_path.empty()) file_path = "/index.html";
+
+                    std::error_code fec;
+                    std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
+                    std::filesystem::path requested = base / file_path.substr(1);
+                    auto resolved = std::filesystem::canonical(requested, fec);
+
+                    if (!fec && resolved.string().substr(0, base.string().size()) == base.string()
+                             && std::filesystem::is_regular_file(resolved))
+                    {
+                        // MIME type detection
+                        std::string ext = resolved.extension().string();
+                        std::string mime = "application/octet-stream";
+                        if (ext == ".html" || ext == ".htm") mime = "text/html; charset=utf-8";
+                        else if (ext == ".js")   mime = "application/javascript; charset=utf-8";
+                        else if (ext == ".css")  mime = "text/css; charset=utf-8";
+                        else if (ext == ".json") mime = "application/json; charset=utf-8";
+                        else if (ext == ".ico")  mime = "image/x-icon";
+                        else if (ext == ".png")  mime = "image/png";
+                        else if (ext == ".svg")  mime = "image/svg+xml";
+                        else if (ext == ".txt")  mime = "text/plain; charset=utf-8";
+                        else if (ext == ".woff2") mime = "font/woff2";
+                        else if (ext == ".woff") mime = "font/woff";
+                        else if (ext == ".map")  mime = "application/json";
+
+                        std::ifstream file(resolved, std::ios::binary);
+                        std::string contents((std::istreambuf_iterator<char>(file)),
+                                             std::istreambuf_iterator<char>());
+
+                        response.set(http::field::content_type, mime);
+                        response.set(http::field::cache_control, "public, max-age=3600");
+                        response.body() = std::move(contents);
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                }
+                // Fallback to getinfo JSON
                 rest_result = mining_interface_->getinfo();
+            }
 
             response_body = rest_result.dump();
         }
@@ -1929,6 +1987,143 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         m_found_blocks.resize(100);
 }
 
+// ──────────── p2pool legacy compatibility REST endpoints ─────────────────
+// These endpoints reproduce the exact JSON shape that the original p2pool
+// dashboard (Forrest Voight) and jtoomim fork expect, enabling third-party
+// dashboards built for the classic p2pool lineage to work unchanged.
+
+nlohmann::json MiningInterface::rest_local_stats()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // peers — legacy format: {incoming, outgoing}
+    result["peers"] = {{"incoming", 0}, {"outgoing", 0}};
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("peer_count"))
+            result["peers"]["outgoing"] = hs["peer_count"];
+    }
+
+    // miner_hash_rates / miner_dead_hash_rates — map<address, H/s>
+    result["miner_hash_rates"] = nlohmann::json::object();
+    result["miner_dead_hash_rates"] = nlohmann::json::object();
+    // Populate from local hashrate
+    double local_rate = 0.0;
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            local_rate = hs["global_hashrate"];
+    }
+    if (!m_payout_address.empty() && local_rate > 0)
+        result["miner_hash_rates"][m_payout_address] = local_rate;
+
+    // shares — {total, orphan, dead}
+    result["shares"] = {{"total", 0}, {"orphan", 0}, {"dead", 0}};
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("total_shares"))
+            result["shares"]["total"] = sc["total_shares"];
+    }
+
+    result["efficiency"] = nullptr;
+    result["uptime"] = rest_uptime();
+
+    // block_value in coins (not satoshis)
+    double block_value = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null())
+            block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
+    }
+    result["block_value"] = block_value;
+
+    result["warnings"] = nlohmann::json::array();
+    result["donation_proportion"] = m_pool_fee_percent / 100.0;
+
+    // attempts_to_{share,block} — estimate
+    result["attempts_to_share"] = 0;
+    result["attempts_to_block"] = 0;
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_p2pool_global_stats()
+{
+    // Original p2pool /global_stats shape
+    nlohmann::json result = nlohmann::json::object();
+    double pool_rate = 0.0;
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("global_hashrate"))
+            pool_rate = hs["global_hashrate"];
+    }
+    result["pool_hash_rate"] = pool_rate;
+    result["pool_stale_prop"] = 0.0;
+    result["min_difficulty"] = 1.0;
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_web_version()
+{
+    return "c2pool/0.8.0";
+}
+
+nlohmann::json MiningInterface::rest_web_currency_info()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN:
+        result["symbol"] = "LTC";
+        if (m_testnet) {
+            result["address_explorer_url_prefix"] = "https://litecoinspace.org/testnet/address/";
+            result["block_explorer_url_prefix"]   = "https://litecoinspace.org/testnet/block/";
+            result["tx_explorer_url_prefix"]      = "https://litecoinspace.org/testnet/tx/";
+        } else {
+            result["address_explorer_url_prefix"] = "https://litecoinspace.org/address/";
+            result["block_explorer_url_prefix"]   = "https://litecoinspace.org/block/";
+            result["tx_explorer_url_prefix"]      = "https://litecoinspace.org/tx/";
+        }
+        break;
+    case Blockchain::BITCOIN:
+        result["symbol"] = "BTC";
+        result["address_explorer_url_prefix"] = "https://mempool.space/address/";
+        result["block_explorer_url_prefix"]   = "https://mempool.space/block/";
+        result["tx_explorer_url_prefix"]      = "https://mempool.space/tx/";
+        break;
+    case Blockchain::DOGECOIN:
+        result["symbol"] = "DOGE";
+        result["address_explorer_url_prefix"] = "https://dogechain.info/address/";
+        result["block_explorer_url_prefix"]   = "https://dogechain.info/block/";
+        result["tx_explorer_url_prefix"]      = "https://dogechain.info/tx/";
+        break;
+    }
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_payout_addr()
+{
+    return m_payout_address;
+}
+
+nlohmann::json MiningInterface::rest_payout_addrs()
+{
+    nlohmann::json arr = nlohmann::json::array();
+    if (!m_payout_address.empty())
+        arr.push_back(m_payout_address);
+    return arr;
+}
+
+nlohmann::json MiningInterface::rest_web_best_share_hash()
+{
+    if (m_best_share_hash_fn) {
+        uint256 h = m_best_share_hash_fn();
+        return h.GetHex();
+    }
+    return "0000000000000000000000000000000000000000000000000000000000000000";
+}
+
 // ── Log endpoints (read directly from debug.log) ───────────────────────
 
 static std::string tail_file(const std::filesystem::path& path, size_t max_lines)
@@ -2762,6 +2957,13 @@ void WebServer::set_pplns_fn(MiningInterface::pplns_fn_t fn)
 void WebServer::set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr)
 {
     mining_interface_->set_merged_mining_manager(mgr);
+}
+
+void WebServer::set_dashboard_dir(const std::string& dir)
+{
+    mining_interface_->set_dashboard_dir(dir);
+    if (!dir.empty())
+        LOG_INFO << "Dashboard serving from: " << dir;
 }
 
 bool WebServer::start_solo()

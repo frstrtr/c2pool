@@ -36,6 +36,25 @@
   verified apt package list, PEP 668 note for pip, exact build sequence,
   test suite section, runtime examples, troubleshooting
 
+## [Unreleased] - 2025-07-14
+
+### Added
+- **Web dashboard gate** — built-in static file serving from configurable
+  `--dashboard-dir` (default `web-static/`); modern dark-theme dashboard
+  with pool stats, graphs, share explorer, and auto-refresh
+- **p2pool legacy API compatibility** — 7 new REST endpoints (`/local_stats`,
+  `/p2pool_global_stats`, `/web/version`, `/web/currency_info`,
+  `/payout_addr`, `/payout_addrs`, `/web/best_share_hash`) returning the
+  exact JSON shapes the original p2pool/p2pool and jtoomim/p2pool dashboards
+  expect; existing community dashboards work without modification
+- **c2pool.js SDK** — universal JavaScript API client library bundled in
+  `web-static/c2pool.js` with helpers for hashrate formatting, duration,
+  coin display, and parallel data fetching
+- **Dashboard integration guide** — comprehensive developer documentation
+  in `docs/DASHBOARD_INTEGRATION.md` covering full API reference, migration
+  from p2pool dashboards, custom dashboard creation, theming, and security
+- `--dashboard-dir` CLI flag and `dashboard_dir` YAML key
+
 ## [Unreleased] - 2025-07-06
 
 ### Added

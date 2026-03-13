@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>c2pool Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="c2pool.js"></script>
+</head>
+<body>
+
+<div class="header">
+    <h1>
+        &#x26CF; c2pool <span class="coin-symbol">LTC</span>
+        <span class="badge" id="net-badge">testnet</span>
+    </h1>
+    <nav>
+        <a href="index.html" class="active">Dashboard</a>
+        <a href="graphs.html">Graphs</a>
+        <a href="share.html">Share Explorer</a>
+    </nav>
+</div>
+
+<div class="container">
+
+    <div id="warnings"></div>
+
+    <!-- ── Key metrics ───────────────────────────────── -->
+    <div class="grid">
+        <div class="card">
+            <h3>Pool Hashrate</h3>
+            <div class="value" id="pool-rate">—</div>
+            <div class="sub"><span class="status-dot green"></span>Local</div>
+        </div>
+        <div class="card">
+            <h3>Network Hashrate</h3>
+            <div class="value" id="net-rate">—</div>
+            <div class="sub">Global difficulty</div>
+        </div>
+        <div class="card">
+            <h3>Connected Miners</h3>
+            <div class="value" id="miner-count">—</div>
+            <div class="sub" id="miner-sub">Active workers</div>
+        </div>
+        <div class="card">
+            <h3>Block Value</h3>
+            <div class="value" id="block-value">—</div>
+            <div class="sub"><span class="coin-symbol">LTC</span></div>
+        </div>
+        <div class="card">
+            <h3>Uptime</h3>
+            <div class="value" id="uptime">—</div>
+            <div class="sub">Node running</div>
+        </div>
+        <div class="card">
+            <h3>Pool Fee</h3>
+            <div class="value" id="pool-fee">—</div>
+            <div class="sub">Operator fee</div>
+        </div>
+        <div class="card">
+            <h3>Shares</h3>
+            <div class="value" id="shares-total">—</div>
+            <div class="sub" id="shares-sub">in chain</div>
+        </div>
+        <div class="card">
+            <h3>Best Share</h3>
+            <div class="value" id="best-share">—</div>
+            <div class="sub">Chain tip</div>
+        </div>
+    </div>
+
+    <!-- ── Payout info ───────────────────────────────── -->
+    <div class="card wide">
+        <h3>Your Payout (if a block were found now)</h3>
+        <div style="margin-top:8px">
+            <span id="payout-addr-display" style="font-family:var(--mono);font-size:0.85rem;color:var(--accent)"></span>
+            <span id="payout-amount" style="font-family:var(--mono);font-size:1.2rem;margin-left:12px;font-weight:600"></span>
+            <span class="coin-symbol" style="font-size:0.9rem;color:var(--text-dim)">LTC</span>
+        </div>
+    </div>
+
+    <!-- ── Recent blocks ─────────────────────────────── -->
+    <div class="card wide" style="margin-top:16px">
+        <h3>Blocks Found Recently</h3>
+        <table style="margin-top:8px">
+            <thead>
+                <tr><th>Time</th><th>Height</th><th>Hash</th></tr>
+            </thead>
+            <tbody id="blocks-table"></tbody>
+        </table>
+        <div id="no-blocks" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
+            No blocks found yet.
+        </div>
+    </div>
+
+    <!-- ── Payouts table ─────────────────────────────── -->
+    <div class="card wide" style="margin-top:16px">
+        <h3>PPLNS Payouts (current window)</h3>
+        <table style="margin-top:8px">
+            <thead>
+                <tr><th>Script / Address</th><th>Amount</th></tr>
+            </thead>
+            <tbody id="payouts-table"></tbody>
+        </table>
+        <div id="no-payouts" style="padding:12px;color:var(--text-dim);font-size:0.85rem;display:none">
+            No payout data available.
+        </div>
+    </div>
+
+</div>
+
+<div class="footer">
+    <span id="version-text">c2pool</span> &mdash;
+    p2pool/p2pool &rarr; jtoomim/p2pool &rarr; frstrtr/c2pool &mdash;
+    <a href="https://github.com/frstrtr/c2pool" target="_blank">GitHub</a>
+</div>
+
+<script>
+(async function refresh() {
+    try {
+        const data = await C2PoolAPI.fetchAll();
+
+        // Currency info
+        const ci = data.currencyInfo;
+        if (ci) {
+            document.querySelectorAll(".coin-symbol").forEach(el => el.textContent = ci.symbol);
+            document.title = "c2pool " + ci.symbol + " Dashboard";
+        }
+
+        // Key metrics
+        setText("pool-rate", C2PoolAPI.formatHashrate(data.localRate));
+        setText("net-rate", C2PoolAPI.formatHashrate(data.globalRate));
+        setText("miner-count", data.users != null ? data.users : "—");
+        setText("uptime", C2PoolAPI.formatDuration(data.uptime));
+        setText("pool-fee", data.fee != null ? data.fee + "%" : "—");
+
+        // Block value (from local_stats or sharechain_stats)
+        const ls = await C2PoolAPI.localStats();
+        if (ls && ls.block_value != null)
+            setText("block-value", parseFloat(ls.block_value).toFixed(4));
+
+        // Shares
+        if (data.sharechainStats) {
+            const sc = data.sharechainStats;
+            setText("shares-total", sc.total_shares != null ? sc.total_shares : "—");
+        }
+
+        // Best share hash
+        const bsh = await C2PoolAPI.bestShareHash();
+        if (bsh && bsh !== "0000000000000000000000000000000000000000000000000000000000000000")
+            setText("best-share", bsh.substring(bsh.length - 12));
+
+        // Payout addr + amount
+        const addr = await C2PoolAPI.payoutAddr();
+        const pays = data.payouts;
+        if (addr) {
+            const addrEl = document.getElementById("payout-addr-display");
+            if (ci && ci.address_explorer_url_prefix) {
+                addrEl.innerHTML = '<a href="' + ci.address_explorer_url_prefix + encodeURIComponent(addr)
+                    + '" target="_blank">' + addr + '</a>';
+            } else {
+                addrEl.textContent = addr;
+            }
+        }
+        if (pays && typeof pays === "object") {
+            let total = 0;
+            for (const k in pays) total += pays[k];
+            if (total > 0)
+                setText("payout-amount", C2PoolAPI.formatCoins(total, 6));
+        }
+
+        // Warnings (from local_stats)
+        const warningsEl = document.getElementById("warnings");
+        warningsEl.innerHTML = "";
+        if (ls && ls.warnings && ls.warnings.length > 0) {
+            ls.warnings.forEach(w => {
+                const div = document.createElement("div");
+                div.className = "warning";
+                div.textContent = "Warning: " + w;
+                warningsEl.appendChild(div);
+            });
+        }
+
+        // Recent blocks
+        const blocks = data.recentBlocks;
+        const blocksTable = document.getElementById("blocks-table");
+        const noBlocks = document.getElementById("no-blocks");
+        blocksTable.innerHTML = "";
+        if (blocks && blocks.length > 0) {
+            noBlocks.style.display = "none";
+            blocks.forEach(b => {
+                const tr = document.createElement("tr");
+                const tdTime = document.createElement("td");
+                tdTime.textContent = new Date(b.ts * 1000).toLocaleString();
+                const tdHeight = document.createElement("td");
+                tdHeight.textContent = b.height;
+                const tdHash = document.createElement("td");
+                if (ci && ci.block_explorer_url_prefix) {
+                    tdHash.innerHTML = '<a href="' + ci.block_explorer_url_prefix
+                        + encodeURIComponent(b.hash) + '" target="_blank">'
+                        + b.hash.substring(0, 16) + '…</a>';
+                } else {
+                    tdHash.textContent = b.hash.substring(0, 16) + "…";
+                }
+                tr.appendChild(tdTime);
+                tr.appendChild(tdHeight);
+                tr.appendChild(tdHash);
+                blocksTable.appendChild(tr);
+            });
+        } else {
+            noBlocks.style.display = "block";
+        }
+
+        // Payouts table
+        if (pays && typeof pays === "object") {
+            const payoutsTable = document.getElementById("payouts-table");
+            const noPayouts = document.getElementById("no-payouts");
+            const entries = Object.entries(pays).sort((a, b) => b[1] - a[1]);
+            payoutsTable.innerHTML = "";
+            if (entries.length > 0) {
+                noPayouts.style.display = "none";
+                entries.forEach(([script, amount]) => {
+                    const tr = document.createElement("tr");
+                    const tdAddr = document.createElement("td");
+                    tdAddr.textContent = script;
+                    tdAddr.style.maxWidth = "400px";
+                    tdAddr.style.overflow = "hidden";
+                    tdAddr.style.textOverflow = "ellipsis";
+                    const tdAmt = document.createElement("td");
+                    tdAmt.textContent = C2PoolAPI.formatCoins(amount, 8);
+                    tr.appendChild(tdAddr);
+                    tr.appendChild(tdAmt);
+                    payoutsTable.appendChild(tr);
+                });
+            } else {
+                noPayouts.style.display = "block";
+            }
+        }
+
+    } catch (e) {
+        console.error("Dashboard refresh error:", e);
+    }
+
+    // Auto-refresh every 10 seconds
+    setTimeout(refresh, 10000);
+})();
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+}
+</script>
+
+</body>
+</html>
