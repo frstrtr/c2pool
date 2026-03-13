@@ -1,12 +1,12 @@
 # C2Pool Litecoin Testnet Configuration
-# For testing with physical miners via Stratum on port 8084
+# P2P: 19338, Stratum: 19327, HTTP: 8080
 
 # Network Configuration
 network: litecoin_testnet
 testnet: true
-port: 9333                    # P2P port for sharechain communication
-stratum_port: 8084            # Stratum port for physical miners (temporarily using 8084)
-http_port: 8083               # HTTP/JSON-RPC port for monitoring (C2Pool standard)
+port: 19338                   # P2P p2pool sharechain port (testnet)
+stratum_port: 19327           # Stratum mining port (testnet)
+http_port: 8080               # HTTP/JSON-RPC port for monitoring
 
 # Litecoin Node Connection
 ltc_rpc_host: 127.0.0.1
@@ -16,11 +16,12 @@ ltc_rpc_password: ltctest123
 ltc_rpc_timeout: 30
 
 # Mining Configuration
-difficulty_target: 30.0       # Target 30 seconds per share for testing
-min_difficulty: 0.001         # Minimum difficulty for testing
-max_difficulty: 1000.0        # Maximum difficulty
-vardiff_enabled: true         # Enable variable difficulty
-vardiff_interval: 120         # Adjust difficulty every 2 minutes
+# Stratum per-connection vardiff tuning
+min_difficulty: 0.001         # Floor for per-connection difficulty (smallest ASICs)
+max_difficulty: 65536.0       # Ceiling for per-connection difficulty (large farms)
+target_time: 10.0             # Target seconds between pseudoshares
+vardiff_enabled: true         # Auto-adjust per-connection difficulty
+max_coinbase_outputs: 4000    # Max coinbase outputs (Python p2pool: 4000; no consensus limit)
 
 # Storage Configuration
 data_dir: ./data/testnet

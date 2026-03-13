@@ -69,7 +69,7 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 
 | Port | Purpose |
 |------|--------|
-| 9326 | P2Pool sharechain (peer-to-peer) |
+| 9338 | P2Pool sharechain (peer-to-peer) |
 | 9327 | Stratum mining + HTTP API |
 
 **API endpoints** (integrated mode)

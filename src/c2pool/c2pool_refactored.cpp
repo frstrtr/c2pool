@@ -154,7 +154,7 @@ void print_help() {
     std::cout << "  --redistribute MODE       Redistribution mode: pplns, fee, boost, donate\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
-    std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
+    std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9338)\n";
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
     std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
@@ -186,6 +186,13 @@ void print_help() {
     std::cout << "  --outgoing-conns N        Alias for --max-conns\n";
     std::cout << "  --disable-upnp            Disable UPnP port forwarding\n\n";
 
+    std::cout << "STRATUM TUNING:\n";
+    std::cout << "  --stratum-min-diff N      Minimum per-connection difficulty (default: 0.001)\n";
+    std::cout << "  --stratum-max-diff N      Maximum per-connection difficulty (default: 65536)\n";
+    std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 10)\n";
+    std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
+    std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n\n";
+
     std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
     std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
     std::cout << "                            to embed in locally created V36 shares\n\n";
@@ -199,7 +206,7 @@ void print_help() {
     
     std::cout << "DEFAULT NETWORK PORTS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  P2P Sharechain:           9326  (for P2Pool network communication)\n";
+    std::cout << "  P2P Sharechain:           9338  (for P2Pool network communication)\n";
     std::cout << "  Stratum / HTTP API:       9327  (for miners and monitoring)\n\n";
     
     std::cout << "USAGE EXAMPLES:\n";
@@ -247,7 +254,7 @@ int main(int argc, char* argv[]) {
     settings->m_testnet = false;
     
     // Port configuration with p2pool-compatible defaults
-    int p2p_port = 9326;           // P2Pool P2P sharechain port (p2pool default)
+    int p2p_port = 9338;           // P2Pool P2P sharechain port (p2pool LTC mainnet default)
     int stratum_port = 9327;       // Stratum mining port (p2pool: -w / --worker-port)
     int http_port = 8080;          // Web dashboard / JSON-RPC API port
     std::string http_host = "0.0.0.0";  // HTTP server host
@@ -295,6 +302,9 @@ int main(int argc, char* argv[]) {
 
     // Redistribute mode for shares from unnamed/broken miners
     std::string redistribute_mode_str = "pplns";
+
+    // Stratum tuning (configurable via CLI or YAML)
+    core::StratumConfig stratum_config;  // defaults: min=0.001, max=65536, target=10s, vardiff=true
 
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
@@ -521,6 +531,27 @@ int main(int argc, char* argv[]) {
             redistribute_mode_str = argv[++i];
             cli_explicit.insert("redistribute");
         }
+        // Stratum tuning
+        else if (arg == "--stratum-min-diff" && i + 1 < argc) {
+            stratum_config.min_difficulty = std::stod(argv[++i]);
+            cli_explicit.insert("stratum_min_diff");
+        }
+        else if (arg == "--stratum-max-diff" && i + 1 < argc) {
+            stratum_config.max_difficulty = std::stod(argv[++i]);
+            cli_explicit.insert("stratum_max_diff");
+        }
+        else if (arg == "--stratum-target-time" && i + 1 < argc) {
+            stratum_config.target_time = std::stod(argv[++i]);
+            cli_explicit.insert("stratum_target_time");
+        }
+        else if (arg == "--no-vardiff") {
+            stratum_config.vardiff_enabled = false;
+            cli_explicit.insert("vardiff_enabled");
+        }
+        else if (arg == "--max-coinbase-outputs" && i + 1 < argc) {
+            stratum_config.max_coinbase_outputs = static_cast<size_t>(std::stoul(argv[++i]));
+            cli_explicit.insert("max_coinbase_outputs");
+        }
         // Seed node: -n HOST:PORT (p2pool compat)
         else if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
@@ -624,6 +655,18 @@ int main(int argc, char* argv[]) {
             // Optional operator-provided V36 message_data blob
             if (!cli_explicit.count("message_blob_hex") && cfg["message_blob_hex"])
                 operator_message_blob_hex = cfg["message_blob_hex"].as<std::string>();
+
+            // Stratum tuning
+            if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
+                stratum_config.min_difficulty = cfg["min_difficulty"].as<double>();
+            if (!cli_explicit.count("stratum_max_diff") && cfg["max_difficulty"])
+                stratum_config.max_difficulty = cfg["max_difficulty"].as<double>();
+            if (!cli_explicit.count("stratum_target_time") && cfg["target_time"])
+                stratum_config.target_time = cfg["target_time"].as<double>();
+            if (!cli_explicit.count("vardiff_enabled") && cfg["vardiff_enabled"])
+                stratum_config.vardiff_enabled = cfg["vardiff_enabled"].as<bool>();
+            if (!cli_explicit.count("max_coinbase_outputs") && cfg["max_coinbase_outputs"])
+                stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
 
         } catch (const YAML::Exception& e) {
             LOG_ERROR << "Failed to load config file '" << config_file << "': " << e.what();
@@ -795,6 +838,14 @@ int main(int argc, char* argv[]) {
             // Create web server with explicit port configuration
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, enhanced_node, blockchain);
+
+            // Apply stratum tuning from CLI/YAML to the MiningInterface
+            web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
+                     << " max_diff=" << stratum_config.max_difficulty
+                     << " target_time=" << stratum_config.target_time << "s"
+                     << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
+                     << " max_cb_outputs=" << stratum_config.max_coinbase_outputs;
             
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             web_server.set_coin_rpc(node_rpc.get(), &coin_node);
@@ -1801,6 +1852,7 @@ int main(int argc, char* argv[]) {
             // Configure for solo mining mode
             solo_server.set_solo_mode(true);
             solo_server.set_stratum_port(static_cast<uint16_t>(stratum_port));  // Set the correct Stratum port
+            solo_server.get_mining_interface()->set_stratum_config(stratum_config);
             if (!solo_address.empty()) {
                 solo_server.set_solo_address(solo_address);
             }

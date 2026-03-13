@@ -158,7 +158,7 @@ All examples assume you are in the repository root.
 
 | Port | Purpose |
 |------|--------|
-| 9326 | P2Pool sharechain peer-to-peer |
+| 9338 | P2Pool sharechain peer-to-peer |
 | 9327 | Stratum mining server + HTTP API |
 
 ---

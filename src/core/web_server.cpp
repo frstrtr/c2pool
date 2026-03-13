@@ -1039,7 +1039,7 @@ void MiningInterface::refresh_work()
                                 if (a.second != b.second) return a.second < b.second;
                                 return a.first < b.first;
                             });
-                        constexpr size_t MAX_PPLNS = 4000;
+                        const size_t MAX_PPLNS = m_stratum_config.max_coinbase_outputs;
                         if (pplns_outputs.size() > MAX_PPLNS)
                             pplns_outputs.erase(pplns_outputs.begin(),
                                                 pplns_outputs.end() - MAX_PPLNS);
@@ -2980,9 +2980,13 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
-    hashrate_tracker_.set_difficulty_bounds(0.001, 65536.0);
-    hashrate_tracker_.set_target_time_per_mining_share(10.0);  // 10 sec/pseudoshare like Python p2pool
-    hashrate_tracker_.enable_vardiff();  // Only per-connection trackers should auto-adjust
+
+    // Apply stratum tuning from MiningInterface config (populated from CLI/YAML)
+    const auto& cfg = mining_interface_->get_stratum_config();
+    hashrate_tracker_.set_difficulty_bounds(cfg.min_difficulty, cfg.max_difficulty);
+    hashrate_tracker_.set_target_time_per_mining_share(cfg.target_time);
+    if (cfg.vardiff_enabled)
+        hashrate_tracker_.enable_vardiff();
 }
 
 void StratumSession::start()

@@ -92,6 +92,15 @@ private:
     void handle_error(beast::error_code ec, char const* what);
 };
 
+/// Stratum mining configuration — tuneable from CLI, YAML, or API.
+struct StratumConfig {
+    double min_difficulty       = 0.001;    // floor for per-connection vardiff
+    double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
+    double target_time          = 10.0;     // seconds between pseudoshares
+    bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
+    size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
+};
+
 /// Mining interface that provides RPC methods for miners
 class MiningInterface : public jsonrpccxx::JsonRpc2Server
 {
@@ -483,6 +492,13 @@ private:
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
+
+    // Stratum tuning (shared with all StratumSessions via pointer)
+    StratumConfig m_stratum_config;
+public:
+    void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
+    const StratumConfig& get_stratum_config() const { return m_stratum_config; }
+private:
 
     // Lightweight runtime state for MVP mining controls.
     bool m_mining_enabled{true};

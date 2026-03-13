@@ -242,7 +242,9 @@ private:
     // Coinbase outputs have no dust relay limit (they're part of the block, not relayed
     // as standalone transactions). Any amount >= 1 sat is valid. Match Python p2pool behavior.
     static constexpr uint64_t MINIMUM_PAYOUT_SATOSHIS = 1; // 1 satoshi — no artificial floor
-    static constexpr size_t MAX_COINBASE_OUTPUTS = 10; // Limit coinbase outputs
+    // Match Python p2pool's [-4000:] cap — no blockchain consensus limit exists,
+    // only block size/weight constrains output count (~34 bytes per output).
+    static constexpr size_t MAX_COINBASE_OUTPUTS = 4000;
 };
 
 } // namespace payout
