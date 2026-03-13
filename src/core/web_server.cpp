@@ -21,6 +21,7 @@
 #include <boost/process.hpp>
 #include <boost/algorithm/string.hpp>
 #include "btclibs/base58.h"
+#include "btclibs/bech32.h"
 #include "filesystem.hpp"
 
 namespace core {
@@ -2007,33 +2008,63 @@ void MiningInterface::set_pool_fee_percent(double fee_percent)
     m_pool_fee_percent = fee_percent;
 }
 
+// Try to build a scriptPubKey from either a Base58Check or Bech32 address.
+// Returns empty vector on failure.
+static std::vector<unsigned char> address_to_script(const std::string& address)
+{
+    // Try Bech32 first (tltc1..., ltc1..., bc1..., tb1...)
+    static const std::vector<std::string> bech32_hrps = {
+        "tltc", "ltc", "bc", "tb"
+    };
+    for (const auto& hrp : bech32_hrps) {
+        std::string prefix = hrp + "1";
+        if (address.size() > prefix.size() &&
+            address.substr(0, prefix.size()) == prefix)
+        {
+            int witver = -1;
+            std::vector<uint8_t> prog;
+            if (bech32::decode_segwit(hrp, address, witver, prog)) {
+                // P2WPKH: OP_0 0x14 <20 bytes>   P2WSH: OP_0 0x20 <32 bytes>
+                std::vector<unsigned char> script;
+                script.push_back(static_cast<unsigned char>(witver == 0 ? 0x00 : (0x50 + witver)));
+                script.push_back(static_cast<unsigned char>(prog.size()));
+                script.insert(script.end(), prog.begin(), prog.end());
+                return script;
+            }
+            break; // matched prefix but decode failed
+        }
+    }
+
+    // Try Base58Check (P2PKH)
+    auto h160 = base58check_to_hash160(address);
+    if (h160.size() == 40) {
+        std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+        for (size_t i = 0; i < h160.size(); i += 2)
+            script.push_back(static_cast<unsigned char>(
+                std::stoul(h160.substr(i, 2), nullptr, 16)));
+        script.push_back(0x88);
+        script.push_back(0xac);
+        return script;
+    }
+
+    return {}; // unrecognised format
+}
+
 void MiningInterface::set_node_fee_from_address(double percent, const std::string& address)
 {
-    auto h160 = base58check_to_hash160(address);
-    if (h160.size() != 40) {
+    auto script = address_to_script(address);
+    if (script.empty()) {
         LOG_WARNING << "set_node_fee_from_address: invalid address " << address;
         return;
     }
-    std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-    for (size_t i = 0; i < h160.size(); i += 2)
-        script.push_back(static_cast<unsigned char>(
-            std::stoul(h160.substr(i, 2), nullptr, 16)));
-    script.push_back(0x88);
-    script.push_back(0xac);
     set_node_fee(percent, script);
     m_node_fee_address = address;
 }
 
 void MiningInterface::set_donation_script_from_address(const std::string& address)
 {
-    auto h160 = base58check_to_hash160(address);
-    if (h160.size() != 40) return;
-    std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-    for (size_t i = 0; i < h160.size(); i += 2)
-        script.push_back(static_cast<unsigned char>(
-            std::stoul(h160.substr(i, 2), nullptr, 16)));
-    script.push_back(0x88);
-    script.push_back(0xac);
+    auto script = address_to_script(address);
+    if (script.empty()) return;
     set_donation_script(script);
 }
 

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,71 @@ inline std::string encode_segwit(const std::string&          hrp,
     result.reserve(result.size() + data.size());
     for (uint8_t d : data) result += detail::CHARSET[d];
     return result;
+}
+
+/// Decode a segwit native address.
+/// @param hrp    Expected human-readable part (e.g. "ltc", "tltc", "bc", "tb")
+/// @param addr   Bech32-encoded address
+/// @param witver [out] Witness version (0 for P2WPKH / P2WSH)
+/// @param prog   [out] Witness program bytes
+/// @returns      true on success
+inline bool decode_segwit(const std::string& hrp,
+                          const std::string& addr,
+                          int& witver,
+                          std::vector<uint8_t>& prog)
+{
+    // Lowercase the address for decoding
+    std::string lower;
+    lower.reserve(addr.size());
+    for (char c : addr) {
+        if (c >= 'A' && c <= 'Z')
+            lower += static_cast<char>(c - 'A' + 'a');
+        else
+            lower += c;
+    }
+
+    // Find the separator '1' (last occurrence)
+    auto sep = lower.rfind('1');
+    if (sep == std::string::npos || sep < 1 || sep + 7 > lower.size())
+        return false;
+
+    std::string got_hrp = lower.substr(0, sep);
+    if (got_hrp != hrp) return false;
+
+    // Decode data characters to 5-bit values
+    std::vector<uint8_t> data;
+    data.reserve(lower.size() - sep - 1);
+    for (size_t i = sep + 1; i < lower.size(); ++i) {
+        const char* p = std::strchr(detail::CHARSET, lower[i]);
+        if (!p) return false;
+        data.push_back(static_cast<uint8_t>(p - detail::CHARSET));
+    }
+
+    // Verify checksum (bech32: polymod == 1)
+    auto values = detail::hrp_expand(got_hrp);
+    values.insert(values.end(), data.begin(), data.end());
+    if (detail::polymod(values) != 1) return false;
+
+    // Strip 6-byte checksum
+    if (data.size() < 7) return false;  // witness version + at least 1 data char + 6 checksum
+    data.resize(data.size() - 6);
+
+    // First 5-bit value is witness version
+    witver = data[0];
+    if (witver > 16) return false;
+
+    // Convert remaining 5-bit values to 8-bit witness program
+    std::vector<uint8_t> dp(data.begin() + 1, data.end());
+    prog.clear();
+    if (!detail::convertbits(dp, 5, 8, /*pad=*/false, prog))
+        return false;
+
+    // BIP-141: witness program must be 2-40 bytes
+    if (prog.size() < 2 || prog.size() > 40) return false;
+    // For v0: must be exactly 20 (P2WPKH) or 32 (P2WSH)
+    if (witver == 0 && prog.size() != 20 && prog.size() != 32) return false;
+
+    return true;
 }
 
 } // namespace bech32

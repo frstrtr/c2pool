@@ -1769,7 +1769,11 @@ uint256 create_local_share(
                 LOG_ERROR << "create_local_share: GENTX MISMATCH!"
                           << "\n  expected=" << expected_gentx.GetHex()
                           << "\n  actual  =" << actual_gentx.GetHex()
-                          << "\n  share=" << share_hash.GetHex();
+                          << "\n  share=" << share_hash.GetHex()
+                          << "\n  prev_share=" << prev_share.GetHex()
+                          << "\n  height=" << share.m_absheight
+                          << "\n  subsidy=" << subsidy
+                          << "\n  donation=" << donation;
                 return uint256();
             }
             LOG_INFO << "create_local_share: GENTX comparison PASSED";
