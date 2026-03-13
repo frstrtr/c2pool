@@ -1,278 +1,593 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>c2pool Graphs</title>
-    <link rel="stylesheet" href="style.css">
-    <script src="c2pool.js"></script>
-</head>
-<body>
-
-<header>
-    <div class="header-content">
-        <div class="logo">
-            <h1>c2pool</h1>
-            <span class="symbol-badge" id="header-symbol">LTC</span>
-        </div>
-        <nav>
-            <a href="index.html">Dashboard</a>
-            <a href="graphs.html" class="active">Graphs</a>
-            <a href="share.html">Share Explorer</a>
-        </nav>
-    </div>
-</header>
-
-<div class="container">
-
-    <!-- ── Hashrate chart ────────────────────────────── -->
-    <div class="table-container">
-        <div class="section-header">
-            <h2>&#x1F4C8; Pool Hashrate</h2>
-        </div>
-        <div style="padding:16px">
-            <canvas id="chart-hashrate" height="200"></canvas>
-            <div class="empty-state" id="chart-hashrate-fallback">
-                Collecting data points… The chart will appear once enough samples are available.
-            </div>
-        </div>
-    </div>
-
-    <!-- ── Miner distribution chart ──────────────────── -->
-    <div class="table-container" style="margin-top:16px">
-        <div class="section-header">
-            <h2>&#x26CF; Sharechain — Miners by Share Count</h2>
-        </div>
-        <div style="padding:16px">
-            <canvas id="chart-miners" height="200"></canvas>
-            <div class="empty-state" id="chart-miners-fallback">
-                Loading sharechain data…
-            </div>
-        </div>
-    </div>
-
-    <!-- ── Sharechain timeline ───────────────────────── -->
-    <div class="table-container" style="margin-top:16px">
-        <div class="section-header">
-            <h2>&#x23F1; Sharechain Timeline</h2>
-        </div>
-        <div id="timeline" style="overflow-x:auto;padding:8px"></div>
-    </div>
-
-    <!-- ── Live stats table ──────────────────────────── -->
-    <div class="table-container" style="margin-top:16px">
-        <div class="section-header">
-            <h2>&#x1F4CA; Live Statistics</h2>
-        </div>
-        <table>
-            <tbody id="stats-table"></tbody>
-        </table>
-    </div>
-
-</div>
-
-<footer>
-    <span id="version-text">c2pool</span> &mdash;
-    <a href="https://github.com/frstrtr/c2pool" target="_blank" rel="noopener noreferrer">GitHub</a>
-</footer>
-
-<script>
-// Simple in-memory time-series for hashrate (no backend graph_data endpoints needed)
-const MAX_POINTS = 120; // 20 minutes at 10s interval
-let hashrateHistory = [];
-
-function drawSimpleChart(canvasId, data, label, unit) {
-    const canvas = document.getElementById(canvasId);
-    if (!canvas || !canvas.getContext) return;
-    const ctx = canvas.getContext("2d");
-    const W = canvas.parentElement.clientWidth - 32;
-    const H = 200;
-    canvas.width = W;
-    canvas.height = H;
-    ctx.clearRect(0, 0, W, H);
-
-    if (data.length < 2) return;
-
-    const maxVal = Math.max(...data.map(d => d.value)) * 1.1 || 1;
-    const minVal = 0;
-
-    // Grid
-    ctx.strokeStyle = "rgba(58, 58, 90, 0.6)";
-    ctx.lineWidth = 0.5;
-    for (let i = 0; i <= 4; i++) {
-        const y = H - (i / 4) * H;
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(W, y);
-        ctx.stroke();
-    }
-
-    // Line
-    ctx.strokeStyle = "#008de4";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    data.forEach((d, i) => {
-        const x = (i / (data.length - 1)) * W;
-        const y = H - ((d.value - minVal) / (maxVal - minVal || 1)) * H;
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-
-    // Fill
-    ctx.lineTo(W, H);
-    ctx.lineTo(0, H);
-    ctx.closePath();
-    ctx.fillStyle = "rgba(0, 141, 228, 0.08)";
-    ctx.fill();
-
-    // Y-axis label
-    ctx.fillStyle = "#8888a0";
-    ctx.font = "11px sans-serif";
-    ctx.fillText(C2PoolAPI.formatHashrate(maxVal), 4, 14);
-    ctx.fillText("0", 4, H - 4);
-}
-
-function drawMinerBars(data) {
-    const canvas = document.getElementById("chart-miners");
-    if (!canvas || !canvas.getContext) return;
-    const ctx = canvas.getContext("2d");
-    const W = canvas.parentElement.clientWidth - 32;
-    const H = 200;
-    canvas.width = W;
-    canvas.height = H;
-    ctx.clearRect(0, 0, W, H);
-
-    const entries = Object.entries(data).sort((a, b) => b[1] - a[1]).slice(0, 20);
-    if (entries.length === 0) return;
-
-    const maxVal = entries[0][1] || 1;
-    const barH = Math.min(30, (H - 20) / entries.length);
-    const colors = ["#008de4", "#28a745", "#ffc107", "#dc3545", "#a371f7",
-                    "#79c0ff", "#56d364", "#e3b341", "#ffa198", "#bc8cff"];
-
-    entries.forEach(([miner, count], i) => {
-        const w = (count / maxVal) * (W - 160);
-        ctx.fillStyle = colors[i % colors.length];
-        ctx.fillRect(4, i * barH + 2, w, barH - 4);
-        ctx.fillStyle = "#e0e0e0";
-        ctx.font = "11px monospace";
-        const label = miner.length > 16 ? miner.substring(0, 16) + "…" : miner;
-        ctx.fillText(label + " (" + count + ")", w + 10, i * barH + barH / 2 + 4);
-    });
-
-    document.getElementById("chart-miners-fallback").style.display = "none";
-}
-
-function drawTimeline(timeline) {
-    const el = document.getElementById("timeline");
-    if (!timeline || timeline.length === 0) {
-        el.textContent = "";
-        const span = document.createElement("span");
-        span.className = "empty-state";
-        span.textContent = "No timeline data.";
-        el.appendChild(span);
-        return;
-    }
-    const table = document.createElement("table");
-    const thead = document.createElement("thead");
-    const headRow = document.createElement("tr");
-    ["Time", "Shares", "Miners"].forEach(h => {
-        const th = document.createElement("th");
-        th.textContent = h;
-        headRow.appendChild(th);
-    });
-    thead.appendChild(headRow);
-    table.appendChild(thead);
-    const tbody = document.createElement("tbody");
-    timeline.forEach(slot => {
-        const tr = document.createElement("tr");
-        const time = new Date(slot.timestamp * 1000).toLocaleTimeString();
-        const miners = slot.miner_distribution ? Object.keys(slot.miner_distribution).length : 0;
-        [time, String(slot.share_count), String(miners)].forEach(text => {
-            const td = document.createElement("td");
-            td.textContent = text;
-            tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-    el.textContent = "";
-    el.appendChild(table);
-}
-
-async function refreshGraphs() {
-    try {
-        // Hashrate history
-        const lr = await C2PoolAPI.localRate();
-        if (lr != null) {
-            hashrateHistory.push({ time: Date.now(), value: lr });
-            if (hashrateHistory.length > MAX_POINTS) hashrateHistory.shift();
-        }
-
-        if (hashrateHistory.length >= 2) {
-            document.getElementById("chart-hashrate-fallback").style.display = "none";
-            drawSimpleChart("chart-hashrate", hashrateHistory, "Pool hashrate", "H/s");
-        }
-
-        // Sharechain stats — miner distribution + timeline
-        const sc = await C2PoolAPI.sharechainStats();
-        if (sc) {
-            if (sc.shares_by_miner && Object.keys(sc.shares_by_miner).length > 0) {
-                drawMinerBars(sc.shares_by_miner);
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <title>c2pool Graphs</title>
+        <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
+        <script type="text/javascript" src="d3.v2.min.js"></script>
+        <script type="text/javascript" src="multipool.js"></script>
+        
+        <style type="text/css">
+            line {
+                stroke: black;
+                stroke-width: 1;
+                shape-rendering: crispEdges;
             }
-            if (sc.timeline) {
-                drawTimeline(sc.timeline);
+            
+            .plotline {
+                stroke-width: 1.4;
+                fill: none;
             }
-        }
+            
+            text {
+                font-family: Sans-serif;
+                font-size: 12px;
+            }
 
-        // Live stats table
-        const data = await C2PoolAPI.fetchAll();
-        const stats = [];
-        stats.push(["Pool hashrate", C2PoolAPI.formatHashrate(data.localRate)]);
-        stats.push(["Network hashrate", C2PoolAPI.formatHashrate(data.globalRate)]);
-        stats.push(["Connected miners", data.users != null ? data.users : "—"]);
-        stats.push(["Pool fee", data.fee != null ? data.fee + "%" : "—"]);
-        stats.push(["Uptime", C2PoolAPI.formatDuration(data.uptime)]);
-        if (data.sharechainStats) {
-            stats.push(["Shares in chain", data.sharechainStats.total_shares || "—"]);
-            stats.push(["Chain height", data.sharechainStats.chain_height || "—"]);
-        }
-        const tbody = document.getElementById("stats-table");
-        tbody.textContent = "";
-        stats.forEach(([k, v]) => {
-            const tr = document.createElement("tr");
-            const tdK = document.createElement("td");
-            tdK.style.color = "var(--text-muted)";
-            tdK.textContent = k;
-            const tdV = document.createElement("td");
-            tdV.textContent = String(v);
-            tr.appendChild(tdK);
-            tr.appendChild(tdV);
-            tbody.appendChild(tr);
-        });
+            .pool-tab { background: rgba(255,255,255,0.08); color: #8888a0; padding: 4px 12px; border-radius: 6px; font-size: 0.9rem; font-weight: 700; cursor: pointer; transition: all 0.2s; border: 1px solid transparent; user-select: none; }
+            .pool-tab:hover { background: rgba(255,255,255,0.15); color: #e0e0e0; }
+            .pool-tab.active { background: #008de4; color: white; border-color: rgba(255,255,255,0.15); box-shadow: 0 2px 8px rgba(0,141,228,0.3); }
+            .pool-tab-add { background: transparent !important; color: #8888a0 !important; border: 1px dashed #3a3a5a !important; font-size: 1rem; padding: 2px 10px; opacity: 0.6; box-shadow: none !important; }
+            .pool-tab-add:hover { opacity: 1; border-color: #008de4 !important; color: #008de4 !important; }
+        </style>
+    </head>
+    
+    <body style="margin: 0;">
+        <header style="background: #252540; border-bottom: 1px solid #3a3a5a; padding: 15px 0; margin-bottom: 20px;">
+            <div style="max-width: 1400px; margin: 0 auto; padding: 0 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <h1 style="font-size: 1.5rem; font-weight: 600; color: #008de4; margin: 0;">c2pool Graphs</h1>
+                        <div id="pool-tabs" style="display:flex;gap:4px;align-items:center;"></div>
+                    </div>
+                    <nav style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <a href="dashboard.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Dashboard</a>
+                        <a href="graphs.html" style="color: white; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #008de4; transition: all 0.2s;">Graphs</a>
+                        <a href="stratum.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Stratum</a>
+                        <a href="miners.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Miners</a>
+                        <a href="index.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Classic</a>
+                    </nav>
+                </div>
+            </div>
+        </header>
+        <div style="max-width: 1400px; margin: 0 auto; padding: 0 20px;">
+        
+        <p>Periods: <span id="period_chooser"></span> Current: <span id="period_current"></span></p>
+        
+        <div id="warnings"></div>
+        
+        <h2>Local rate</h2>
+        <svg id="local"></svg>
+        
+        <h2>Local rate reflected in shares</h2>
+        <svg id="local_shares"></svg>
+        
+        <h2>Current payout to default address</h2>
+        <svg id="payout"></svg>
+        
+        <h2>Pool rate</h2>
+        <svg id="pool"></svg>
+        
+        <h2>Peers</h2>
+        <svg id="peers"></svg>
+        
+        <h2>Miners</h2>
+        <div id="miners"></div>
+        
+        <h2>Desired version rates</h2>
+        <svg id="desired_version_rates"></svg>
+        
+        <h2>Traffic rate</h2>
+        <svg id="traffic_rate"></svg>
+        
+        <h2>Bitcoind GetBlockTemplate Latency</h2>
+        <svg id="getwork_latency"></svg>
+        
+        <h2>Memory Usage</h2>
+        <svg id="memory_usage"></svg>
+        
+        <script type="text/javascript">
+            function compose() {
+                var funcs = arguments;
+                return function(x) {
+                    for(var i = funcs.length-1; i >= 0; i--) {
+                        x = funcs[i](x);
+                    }
+                    return x;
+                }
+            }
+            function itemgetter(i) { return function(x) { return x[i]; } }
+            function as_date(x) { return new Date(1000*x); }
+            function not_null(x) { return x != null; }
+            var cloneOf = (function() {
+              function F(){}
+              return function(o) {
+                F.prototype = o;
+                return new F();
+              }
+            }());
+            
+            function get_area_mean(data) {
+                var top = 0;
+                var bottom = 0;
+                for(var i = 0; i < data.length; i++) {
+                    if(data[i][1] == null) continue; // no data for bin
+                    top += data[i][1] * data[i][2];
+                    bottom += data[i][2];
+                }
+                return {"area": top, "mean": bottom==0?null:top/bottom};
+            }
+            
+            function plot(g, unit, total_unit, lines, stack, proportion_view) {
+                // lines is a list of objects which have attributes data, color, and label
+                
+                var orig_unit = unit;
+                var orig_total_unit = total_unit;
+                var orig_lines = lines;
+                if(proportion_view) {
+                    var totals = {};
+                    for(var i = 0; i < lines.length; ++i) {
+                        var line = lines[i];
+                        for(var j = 0; j < line.data.length; ++j) {
+                            var time_str = JSON.stringify(line.data[j][0]);
+                            if(!totals.hasOwnProperty(time_str)) totals[time_str] = 0;
+                            totals[time_str] += line.data[j][1];
+                        }
+                    }
+                    
+                    var new_lines = [];
+                    for(var i = 0; i < lines.length; ++i) {
+                        var line = lines[i];
+                        var new_line = cloneOf(line);
+                        
+                        new_line.data = [];
+                        for(var j = 0; j < line.data.length; ++j) {
+                            var time_str = JSON.stringify(line.data[j][0]);
+                            new_line.data.push([line.data[j][0], totals[time_str] ? line.data[j][1]*100/totals[time_str] : null, line.data[j][2]]);
+                        }
+                        
+                        new_lines.push(new_line)
+                    }
+                    var lines = new_lines;
+                    var unit = '%';
+                    var total_unit = null;
+                }
+                
+                var table_div = document.createElement("div");
+                g.node().parentNode.insertBefore(table_div, g.node().nextSibling);
+                table_div.style.display = "none";
+                
+                var showhide = document.createElement("p");
+                g.node().parentNode.insertBefore(showhide, g.node().nextSibling);
+                d3.select(showhide).append("a")
+                    .text('Show/hide table')
+                    .on('click', function() { table_div.style.display = table_div.style.display == "block" ? "none" : "block" })
+                    .attr("style", "color:blue;text-decoration:underline;cursor:pointer");
 
-        // Currency info
-        const ci = data.currencyInfo;
-        if (ci && ci.symbol) {
-            document.getElementById("header-symbol").textContent = ci.symbol;
-            document.title = "c2pool " + ci.symbol + " Graphs";
-        }
+                var checkbox_div = document.createElement("div");
+                g.node().parentNode.insertBefore(checkbox_div, g.node().nextSibling);
 
-        // Version footer
-        if (data.version && data.version.version) {
-            document.getElementById("version-text").textContent = data.version.version;
-        }
-
-    } catch (e) {
-        console.error("Graphs refresh error:", e);
-    }
-
-    setTimeout(refreshGraphs, 10000);
-}
-
-refreshGraphs();
-</script>
-
-</body>
+                if(stack) {
+                    d3.select(showhide).append('span').text(' ');
+                    d3.select(showhide).append("a")
+                        .text('Switch to/from proportion view')
+                        .on('click', function() {
+                            table_div.parentNode.removeChild(table_div);
+                            showhide.parentNode.removeChild(showhide);
+                            plot(g, orig_unit, orig_total_unit, orig_lines, stack, !proportion_view);
+                        })
+                        .attr("style", "color:blue;text-decoration:underline;cursor:pointer");
+                }
+                
+                for(var i = 0; i < lines.length; ++i) {
+                    var line = lines[i];
+                    var table_sel = d3.select(table_div).append('table').attr('border', 1).attr('style', 'float:left');
+                    
+                    var first_tr = table_sel.insert('tr');
+                    first_tr.append('th').text('Date');
+                    first_tr.append('th').text(line.label + '/(' + unit + ')');
+                    
+                    var new_data = []
+                    for(var j = 0; j < line.data.length; ++j)
+                        if(j % 7 == 3)
+                            new_data.push(line.data[j]);
+                    var tr = table_sel.selectAll().data(new_data).enter().append('tr');
+                    tr.append('td').text(function(datum){return new Date(1000*datum[0]).toString()});
+                    tr.append('td').text(function(datum){return d3.format(".3s")(datum[1])});
+                }
+                d3.select(table_div).append('div').attr('style', 'clear:both');
+                var enabled = {}
+                for(var l in lines) {
+                    enabled[lines[l].label] = true;
+                    // fixme: finish this code (make the checkboxes do something)
+                    // d3.select(checkbox_div).append("input")
+                    //     .attr("type", "checkbox", "name", lines[l].label)
+                    //     .property("checked", true)
+                    //     .on('change', function() {enabled[lines[l].label] = !enabled[lines[l].label]})
+                    // d3.select(checkbox_div).append("label")
+                    //     .attr("for", lines[l].label)
+                    //     .text(lines[l].label)
+                }
+                var p_after = d3.select(table_div).append('p');
+                p_after.append("a")
+                    .text('Show/hide table')
+                    .on('click', function() { table_div.style.display = table_div.style.display == "block" ? "none" : "block" })
+                    .attr("style", "color:blue;text-decoration:underline;cursor:pointer");
+				
+                // Calculate width respecting container constraints
+                var containerMaxWidth = 1400;
+                var containerPadding = 40; // 20px left + 20px right
+                var currwidth = Math.min(document.documentElement.clientWidth, containerMaxWidth) - containerPadding;
+                var timeOut = null;
+                window.onresize = function(){
+                    if (timeOut != null) 
+                        clearTimeout(timeOut);
+                    timeOut = setTimeout(function(){
+                        var newWidth = Math.min(document.documentElement.clientWidth, containerMaxWidth) - containerPadding;
+                        if (currwidth != newWidth){
+                             window.location.href=window.location.href;
+                        };
+                    currwidth = newWidth;
+                    }, 250);
+                }; 
+				
+                var w = currwidth;
+                var h = 300;
+                if (lines.length*18 > h) h = lines.length*18;
+                var margin_v = 40;
+                var margin_l = 100;
+                var margin_r = 240;
+                
+                var x = d3.time.scale().domain([
+                    as_date(d3.min(lines, function(line) { return d3.min(line.data, itemgetter(0)); })),
+                    as_date(d3.max(lines, function(line) { return d3.max(line.data, itemgetter(0)); }))
+                ]).range([0 + margin_l, w - margin_r]);
+                
+                
+                g.attr("width", w).attr("height", h);
+                g.selectAll("*").remove();
+                
+                if(stack) {                   
+                    var data = d3.layout.stack()
+                        .x(itemgetter(0))
+                        .y(itemgetter(1))
+                        .values(function(line){ return line.data })
+                        (lines);
+                    
+                    var y = d3.scale.linear().domain([
+                        0,
+                        d3.max(data, function(d) { return d3.max(d.data, function(d) { return d.y0 + d.y; }) })
+                    ]).range([h - margin_v, margin_v]);
+                    
+                    var y_abs = d3.scale.linear().domain([0, 1]).range([h - margin_v, margin_v]);
+                    
+                    g.selectAll().data(lines).enter().append("svg:path")
+                        .attr("d", function(line){
+                            return d3.svg.area()
+                                .x(function(d) { return x(as_date(d[0])) })
+                                .y0(function(d) { return y(d.y0) })
+                                .y1(function(d) { return y(d.y0 + d.y) })
+                                .defined(compose(not_null, itemgetter(1)))
+                                (line.data)
+                        })
+                        .style("fill", function(line){return line.color})
+                        .attr("stroke", function(line){return line.color})
+                        .attr("class", "plotline");
+                    
+                    var total = 0;
+                    var total_area = 0;
+                    for(var i = 0; i < lines.length; ++i) {
+                        if (!enabled[lines[i].label]) continue;
+                        var line = lines[i];
+                        var stats = get_area_mean(line.data);
+                        if(stats.mean != null) {
+                            total += stats.mean;
+                            total_area += stats.area;
+                        }
+                    }
+                    
+                    for(var i = 0; i < lines.length; ++i) {
+                        if (!enabled[lines[i].label]) continue;
+                        var line = lines[i];
+                        var stats = get_area_mean(line.data);
+                        if(stats.mean != null) {
+                            var num = 0;
+                            var denom = 0;
+                            for(var j = 0; j < line.data.length; j++)
+                                if(line.data[j] != null) {
+                                    var d = line.data[j];
+                                    num += (d.y+1)*((d.y0 + d.y) + (d.y0))/2;
+                                    denom += (d.y+1);
+                                }
+                            g.append("svg:line")
+                                .style("stroke", line.color)
+                                .attr("x1", w - margin_r + 3)
+                                .attr("y1", y(num/denom))
+                                .attr("x2", w - margin_r + 10)
+                                .attr("y2", y_abs(i/lines.length));
+                            g.append("svg:text")
+                                .text(line.label + " " + d3.format(".3s")(stats.mean) + unit + ((total_unit != null) ? " (" + d3.format(".3s")(stats.area) + total_unit + ") " : " ") + d3.format(".2p")(stats.area/total_area))
+                                .attr("text-anchor", "start")
+                                .attr("dominant-baseline", "central")
+                                .attr("fill", line.color)
+                                .attr("x", w - margin_r + 10)
+                                .attr("y", y_abs(i/lines.length));
+                        }
+                    }
+                    g.append("svg:line")
+                        .style("stroke", "black")
+                        .attr("x1", w - margin_r + 3)
+                        .attr("y1", y(total))
+                        .attr("x2", w - margin_r + 10)
+                        .attr("y2", y_abs(1));
+                    g.append("svg:text")
+                        .text("Total: " + d3.format(".3s")(total) + unit + ((total_unit != null) ? " (" + d3.format(".3s")(total_area) + total_unit + ")" : ""))
+                        .attr("text-anchor", "start")
+                        .attr("dominant-baseline", "central")
+                        .attr("fill", "black")
+                        .attr("x", w - margin_r + 10)
+                        .attr("y", y_abs(1));
+                } else {
+                    var y = d3.scale.linear().domain([
+                        0,
+                        d3.max(lines, function(line) { return d3.max(line.data, itemgetter(1)); } )
+                    ]).range([h - margin_v, margin_v]);
+                    
+                    var y_abs = d3.scale.linear().domain([0, 1]).range([h - margin_v, margin_v]);
+                    
+                    g.selectAll().data(lines).enter().append("svg:path")
+                        .attr("d", function(line) {
+                            return d3.svg.line()
+                                .x(compose(x, as_date, itemgetter(0)))
+                                .y(compose(y, itemgetter(1)))
+                                .defined(compose(not_null, itemgetter(1)))
+                                (line.data)
+                        })
+                        .style("stroke", function(line) { return line.color })
+                        .attr("class", "plotline");
+                    
+                    lines.sort(function(a, b) { return get_area_mean(a.data).mean > get_area_mean(b.data).mean; });
+                    
+                    var total_area = 0;
+                    for(var i = 0; i < lines.length; ++i) {
+                        if (!enabled[lines[i].label]) continue;
+                        total_area += get_area_mean(lines[i].data).area;
+                    }
+                    for(var i = 0; i < lines.length; ++i) {
+                        if (!enabled[lines[i].label]) continue;
+                        var line = lines[i];
+                        var stats = get_area_mean(line.data);
+                        if(stats.mean != null) {
+                            g.append("svg:line")
+                                .style("stroke", line.color)
+                                .attr("x1", w - margin_r + 3)
+                                .attr("y1", y(stats.mean))
+                                .attr("x2", w - margin_r + 10)
+                                .attr("y2", y_abs(i/lines.length));
+                            g.append("svg:text")
+                                .text(line.label + " " + d3.format(".3s")(stats.mean) + unit + ((total_unit != null) ? " (" + d3.format(".3s")(stats.area) + total_unit + ") " : " ") + d3.format(".2p")(stats.area/total_area))
+                                //.text(line.label)
+                                .attr("text-anchor", "start")
+                                .attr("dominant-baseline", "central")
+                                .attr("fill", line.color)
+                                .attr("x", w - margin_r + 10)
+                                .attr("y", y_abs(i/lines.length) - 12);
+                            /*g.append("svg:text")
+                                .text("Mean: " + d3.format(".3s")(stats.mean) + unit + " (" + d3.format(".2p")(stats.area/total_area) + ")")
+                                .attr("text-anchor", "start")
+                                .attr("dominant-baseline", "central")
+                                .attr("fill", line.color)
+                                .attr("x", w - margin_r + 10)
+                                .attr("y", y_abs(i/lines.length));*/
+                            /*if(total_unit != null)
+                                g.append("svg:text")
+                                    .text("Area: " + d3.format(".3s")(stats.area) + total_unit)
+                                    .attr("text-anchor", "start")
+                                    .attr("dominant-baseline", "central")
+                                    .attr("fill", line.color)
+                                    .attr("x", w - margin_r + 10)
+                                    .attr("y", y_abs(i/lines.length) + 12);*/
+                        }
+                    }
+                }
+                
+                // x axis
+                
+                g.append("svg:line")
+                    .attr("x1", margin_l)
+                    .attr("y1", h - margin_v)
+                    .attr("x2", w - margin_r)
+                    .attr("y2", h - margin_v);
+                
+                g.selectAll()
+                    .data(x.ticks(13))
+                    .enter().append("svg:g")
+                    .attr("transform", function(d) { return "translate(" + x(d) + "," + (h-margin_v/2) + ")"; })
+                    .append("svg:text")
+                    .attr("transform", "rotate(45)")
+                    .attr("text-anchor", "middle")
+                    .attr("dominant-baseline", "central")
+                    .text(x.tickFormat(13));
+                
+                g.selectAll()
+                    .data(x.ticks(13))
+                    .enter().append("svg:line")
+                    .attr("x1", x)
+                    .attr("y1", h - margin_v)
+                    .attr("x2", x)
+                    .attr("y2", h - margin_v + 5);
+                
+                // y axis
+                
+                g.append("svg:line")
+                    .attr("x1", margin_l)
+                    .attr("y1", h - margin_v)
+                    .attr("x2", margin_l)
+                    .attr("y2", margin_v);
+                
+                g.selectAll()
+                    .data(y.ticks(6))
+                    .enter().append("svg:line")
+                    .attr("x1", margin_l - 5)
+                    .attr("y1", y)
+                    .attr("x2", margin_l)
+                    .attr("y2", y);
+                
+                g.selectAll()
+                    .data(y.ticks(6))
+                    .enter().append("svg:text")
+                    .text(compose(function(x) { return x + unit; }, d3.format(".2s")))
+                    .attr("x", margin_l/2)
+                    .attr("y", y)
+                    .attr("dominant-baseline", "central")
+                    .attr("text-anchor", "middle");
+            }
+            function plot_later(g, unit, total_unit, lines, stack) { // takes lines with url attribute instead of data attribute
+                var callbacks_left = lines.length;
+                lines.map(function(line) {
+                    d3.json(line.url, function(line_data) {
+                        line.data = line_data;
+                        callbacks_left--;
+                        if(callbacks_left == 0)
+                            plot(g, unit, total_unit, lines, stack);
+                    });
+                });
+            }
+            
+            function data_to_lines(data, sort_key) {
+                var vers = {}; for(var i = 0; i < data.length; ++i) if(data[i][1] != null) for(var v in data[i][1]) if(data[i][1][v] != data[i][3]) vers[v] = null;
+                var verlist = []; for(var v in vers) verlist.push(v);
+                verlist.sort();
+                
+                lines = [];
+                for(var i = 0; i < verlist.length; i++) {
+                    lines.push({
+                        data: data.map(function(d){ return [d[0], d[1] == null ? null : (verlist[i] in d[1] ? d[1][verlist[i]] : d[3]), d[2]] }),
+                        color: d3.hsl(i/verlist.length*360, 0.5, 0.5),
+                        label: verlist[i]
+                    });
+                }
+                if(sort_key == undefined)
+                    var sort_key = function(x) { return d3.max(x.data, function(d){ return d[1] }) }
+                lines.sort(function(a, b){ return sort_key(a) - sort_key(b) });
+                return lines;
+            }
+            function mov_avg(datalist, w) {
+                var newdata = [];
+                for(var i = 0; i < datalist.length - w + 1; i++) {
+                   var l = datalist[i].length;
+                   var d = new Array(l).fill(0);
+                   for (var j = 0; j < w; j++) {
+                       for (var k = 0; k < l; k++) {
+                           d[k] += datalist[i+j][k]/w;
+                       }
+                   }
+                   newdata[i] = d;
+                }
+                return newdata;
+            }
+            var avg = 10;
+            
+            function change_period(period, currency_info) {
+                d3.select("#period_current").text(period);
+                var lowerperiod = period.toLowerCase();
+                plot_later(d3.select("#local"), "H/s", "H", [
+                    {"url": "../web/graph_data/local_hash_rate/last_" + lowerperiod, "color": "#0000FF", "label": "Total"},
+                    {"url": "../web/graph_data/local_dead_hash_rate/last_" + lowerperiod, "color": "#FF0000", "label": "Dead"}
+                ]);
+                d3.json("../web/graph_data/local_share_hash_rates/last_" + lowerperiod, function(data) {
+                    plot(d3.select('#local_shares'), 'H/s', 'H', data_to_lines(data), true);
+                });
+                plot_later(d3.select("#payout"), currency_info.symbol, null, [
+                    {"url": "../web/graph_data/current_payout/last_" + lowerperiod, "color": "#0000FF", "label": "Current"}
+                ]);
+                d3.json("../web/graph_data/pool_rates/last_" + lowerperiod, function(data) {
+                    plot(d3.select('#pool'), 'H/s', 'H', data_to_lines(data), true);
+                });
+                d3.json("../web/graph_data/peers/last_" + lowerperiod, function(data) {
+                    plot(d3.select('#peers'), 'Total', null, data_to_lines(data, function(line){ return line.label == "incoming" }), true);
+                });
+                
+                d3.json("../web/graph_data/miner_hash_rates/last_" + lowerperiod, function(data) {
+                    d3.json("../web/graph_data/miner_dead_hash_rates/last_" + lowerperiod, function(dead_data) {
+                        d3.json("../web/graph_data/current_payouts/last_" + lowerperiod, function(current_payouts) {
+                            var users = {}; for(var i = 0; i < data.length; ++i) for(var u in data[i][1]) users[u] = null; for(var i = 0; i < dead_data.length; ++i) for(var u in dead_data[i][1]) users[u] = null;
+                            var userlist = []; for(var u in users) {
+                                var un = u.split(".", 1)[0];
+                                if (userlist.indexOf(un) === -1) userlist.push(un);
+                            }
+                            userlist.sort();
+                            var workerlist = {}; for(var u of userlist) workerlist[u] = [];
+                            for(var u in users) if (u.includes(".")) workerlist[u.split(".", 1)].push(u.split(".", 2)[1]); 
+                            for(var u in users) if (u.split(".", 1) in workerlist) {workerlist[u.split(".", 1)].sort(); workerlist[u.split(".", 1)].reverse(); }
+                            d3.select("#miners").selectAll("*").remove();
+                            var div = d3.select("#miners").selectAll().data(userlist).enter().append("div");
+                            div.append("h3").text(function(u) { return u });
+                            div.append("svg:svg").each(function(u) {
+                                datalist = []
+                                if (workerlist[u].length == 0) {
+                                    datalist = [{"data": mov_avg(dead_data.map(function(d){ return [d[0], u in d[1] ? d[1][u] : d[3], d[2]] }), avg), "color": "#FF0000", "label": "Dead"},
+                                                {"data": mov_avg(data.map(function(d){ return [d[0], u in d[1] ? d[1][u] : d[3], d[2]] }), avg), "color": "#0000FF", "label": "Good"}];
+                                } else {
+                                    var i = 0;
+                                    datalist.push({"data": mov_avg(dead_data.map(function(d){ return [d[0],
+                                        Object.keys(d[1]).reduce((sum,key)=> sum + (key.includes(u) ? d[1][key] : 0), 0),
+                                        d[2]] }), avg), "color": "#FF0000", "label": "Dead"});
+                                    
+                                    var i = 1;
+                                    for(var w of workerlist[u]) {
+                                       datalist.push({"data": mov_avg(data.map(function(d){ return [d[0], u+"."+w in d[1] ? d[1][u+"."+w] : d[3], d[2]] }), avg), "color": d3.hsl(i/Math.min(workerlist[u].length, 6)*300, 0.5, 0.5), "label": w})
+                                       i += 1;
+                                    }
+                                }
+                                plot(d3.select(this), "H/s", "H", datalist, true);
+                            });
+                            div.append("svg:svg").each(function(u) {
+                                plot(d3.select(this), currency_info.symbol, null, [
+                                    {"data": current_payouts.map(function(d){ return [d[0], u in d[1] ? d[1][u] : d[3], d[2]] }), "color": "#0000FF", "label": "Current"}
+                                ]);
+                            });
+                        });
+                    });
+                });
+                
+                d3.json("../web/graph_data/desired_version_rates/last_" + lowerperiod, function(data) {
+                    plot(d3.select('#desired_version_rates'), 'H/s', 'H', data_to_lines(data, function(line){ return parseInt(line.label) }), true);
+                });
+                
+                d3.json("../web/graph_data/traffic_rate/last_" + lowerperiod, function(data) {
+                    plot(d3.select('#traffic_rate'), 'B/s', 'B', data_to_lines(data, function(line){ return parseInt(line.label) }), true);
+                });
+                
+                plot_later(d3.select("#getwork_latency"), "s", null, [
+                    {"url": "../web/graph_data/getwork_latency/last_" + lowerperiod, "color": "#FF0000", "label": "Getwork Latency"}
+                ], false);
+                
+                plot_later(d3.select("#memory_usage"), "B", null, [
+                    {"url": "../web/graph_data/memory_usage/last_" + lowerperiod, "color": "#FF0000", "label": "Memory Usage"}
+                ], false);
+            }
+            
+            d3.json('../local_stats', function(local_stats) {
+                d3.select('#warnings').selectAll().data(local_stats.warnings).enter().append('p')
+                    .text(function(w){ return 'Warning: ' + w })
+                    .attr('style', 'color:red;border:1px solid red;padding:5px');
+            })
+            
+            periods = ["Hour", "Day", "Week", "Month", "Year"];
+            d3.select("#period_chooser").selectAll().data(periods).enter().append("a")
+                .text(function(period) { return period })
+                .attr('href', function(period){ return "?" + period })
+                .attr("style", function(d, i) { return (i == 0 ? "" : "margin-left:.4em;") + "color:blue;text-decoration:underline;cursor:pointer" });
+            period = window.location.search.substr(1);
+            if(period.length < 3) {
+                window.location.search = "Day";
+            } else {
+                d3.json('../web/currency_info', function(currency_info) {
+                    change_period(period, currency_info);
+                });
+            }
+        </script>
+        </div>
+    </body>
 </html>
