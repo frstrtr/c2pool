@@ -594,14 +594,16 @@ public:
         if (pre_target2 > hi) pre_target2 = hi;
 
         // Step 5: Clamp to network limits [MIN_TARGET, MAX_TARGET]
-        // MIN_TARGET = 0 → no lower clamp needed
+        // Ensure target is never zero (would produce bits=0 → "share target is zero" error)
         uint256 pre_target3 = pre_target2;
+        if (pre_target3.IsNull()) pre_target3 = uint256(1);
         if (pre_target3 > MAX_TARGET) pre_target3 = MAX_TARGET;
 
         auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
 
         // bits = from_target_upper_bound(clip(desired_target, (pre_target3/30, pre_target3)))
         uint256 bits_lo = pre_target3 / 30;
+        if (bits_lo.IsNull()) bits_lo = uint256(1);
         uint256 bits_target = desired_target;
         if (bits_target < bits_lo) bits_target = bits_lo;
         if (bits_target > pre_target3) bits_target = pre_target3;
