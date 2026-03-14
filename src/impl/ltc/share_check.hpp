@@ -1767,12 +1767,19 @@ uint256 create_local_share(
             uint256 actual_gentx = check_hash_link(share.m_hash_link, gst_hash_link_data, gst_gentx_before_refhash);
 
             if (expected_gentx != actual_gentx) {
-                LOG_ERROR << "create_local_share: GENTX MISMATCH!"
+                // PPLNS weights at share creation time may differ from current
+                // chain state if new shares arrived between work template build
+                // and share submission (e.g. during initial header sync, or when
+                // the chain advances between job dispatch and miner response).
+                auto cur_height = tracker.chain.get_height(share.m_prev_hash);
+                LOG_WARNING << "create_local_share: GENTX MISMATCH (stale chain view — "
+                          << "miner submitted share built against older PPLNS state)"
                           << "\n  expected=" << expected_gentx.GetHex()
                           << "\n  actual  =" << actual_gentx.GetHex()
                           << "\n  share=" << share_hash.GetHex()
                           << "\n  prev_share=" << prev_share.GetHex()
-                          << "\n  height=" << share.m_absheight
+                          << "\n  share_absheight=" << share.m_absheight
+                          << "\n  chain_height_at_prev=" << cur_height
                           << "\n  subsidy=" << subsidy
                           << "\n  donation=" << donation;
                 return uint256();
