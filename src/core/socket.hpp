@@ -94,17 +94,20 @@ public:
         return m_status;
     }
 
-    // todo:
     void cancel()
     {
         m_status = false;
-        m_socket->cancel();
+        boost::system::error_code ec;
+        m_socket->cancel(ec);
+        // ignore ec: canceling a reset/closed socket is benign
     }
 
     void close()
     {
         m_status = false;
-        m_socket->close();
+        boost::system::error_code ec;
+        m_socket->close(ec);
+        // ignore ec: closing an already-closed socket is benign
     }
 
     auto raw()
