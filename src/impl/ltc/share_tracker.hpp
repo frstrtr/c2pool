@@ -721,12 +721,21 @@ public:
     // Matches Python: get_decayed_cumulative_weights()
     // half_life = CHAIN_LENGTH // 4
     // Each share's weight is multiplied by 2^(-depth/half_life)
-    // Fixed-point arithmetic with 40-bit precision
+    // Fixed-point arithmetic with 40-bit precision.
+    //
+    // Result is cached keyed by (start_hash, max_shares) — invalidated
+    // when the chain head changes.  This makes repeated calls for the
+    // same share (e.g. during verify_share + get_expected_payouts) O(1).
     CumulativeWeights get_v36_decayed_cumulative_weights(
         const uint256& start, int32_t max_shares, const uint288& desired_weight)
     {
         if (start.IsNull())
             return {};
+
+        // Cache check — valid while chain head hasn't changed
+        if (m_decayed_cache_valid && m_decayed_cache_start == start
+            && m_decayed_cache_shares == max_shares)
+            return m_decayed_cache_result;
 
         static constexpr uint64_t DECAY_PRECISION = 40;
         static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
@@ -739,13 +748,14 @@ public:
         int32_t share_count = 0;
         uint64_t decay_fp = DECAY_SCALE; // starts at 1.0
 
-        uint256 cur = start;
-        while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
-        {
-            auto& share_data = chain.get_share(cur);
-            uint256 next_cur;
+        // Use get_chain() view for linear walk — avoids per-iteration
+        // contains() + get_share() hash lookups.  O(1) per step.
+        auto walk_count = std::min(max_shares, chain.get_height(start));
+        auto walk_view = chain.get_chain(start, walk_count);
 
-            share_data.invoke([&](auto* obj) {
+        for (auto& [hash, data] : walk_view)
+        {
+            data.share.invoke([&](auto* obj) {
                 auto att = chain::target_to_average_attempts(
                     chain::bits_to_target(obj->m_bits));
                 uint32_t don = obj->m_donation;
@@ -767,25 +777,31 @@ public:
                     this_total = remaining;
                 }
 
-                std::vector<unsigned char> script = get_share_script(obj);
+                // Use pointer to existing script data — avoid allocation.
+                // get_share_script returns by value, but for V36 shares with
+                // m_address, the data is already in the share object.
+                auto script = get_share_script(obj);
 
-                result.weights[script] = result.weights[script] + addr_w;
-                result.total_weight = result.total_weight + this_total;
-                result.total_donation_weight = result.total_donation_weight + don_w;
-                next_cur = obj->m_prev_hash;
+                result.weights[script] += addr_w;
+                result.total_weight += this_total;
+                result.total_donation_weight += don_w;
             });
 
             ++share_count;
             if (result.total_weight >= desired_weight)
                 break;
 
-            cur = next_cur;
-            // Decay for next (older) share
-            // Use 128-bit multiply to avoid overflow: decay_fp and decay_per are both ~2^40,
-            // their product is ~2^80 which overflows uint64_t (max 2^64).
+            // Decay for next (older) share.
+            // 128-bit multiply avoids overflow: decay_fp × decay_per ≈ 2^80.
             decay_fp = static_cast<uint64_t>(
                 (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
         }
+
+        // Cache result
+        m_decayed_cache_start = start;
+        m_decayed_cache_shares = max_shares;
+        m_decayed_cache_result = result;
+        m_decayed_cache_valid = true;
 
         return result;
     }
@@ -1236,7 +1252,17 @@ private:
         if (m_weights_skiplist) m_weights_skiplist->forget(hash);
         if (m_v36_weights_skiplist) m_v36_weights_skiplist->forget(hash);
         for (auto& [_, sl] : m_merged_skiplists) sl.forget(hash);
+        m_decayed_cache_valid = false; // chain changed — decayed cache stale
     }
+
+    // -- Decayed weights result cache --
+    // Avoids recomputing the O(chain_length) walk when the same
+    // (start, max_shares) is queried multiple times between chain changes
+    // (e.g. verify_share + get_expected_payouts for the same share).
+    bool m_decayed_cache_valid{false};
+    uint256 m_decayed_cache_start;
+    int32_t m_decayed_cache_shares{0};
+    CumulativeWeights m_decayed_cache_result;
 };
 
 } // namespace ltc
