@@ -112,6 +112,9 @@ public:
     void set_on_new_tx(TxCallback cb)           { m_on_new_tx = std::move(cb); }
     void set_on_new_headers(HeadersCallback cb)  { m_on_new_headers = std::move(cb); }
 
+    using PeerHeightCallback = std::function<void(uint32_t)>;
+    void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
+
     /// Start: register local node, start peer manager, begin connection loop.
     void start()
     {
@@ -265,6 +268,12 @@ private:
                         m_on_new_headers(peer_key, hdrs);
                 });
 
+            // Wire peer height callback (for fast-sync scrypt skip)
+            if (m_on_peer_height) {
+                peer->node_p2p.set_on_peer_height(
+                    [this](uint32_t h) { m_on_peer_height(h); });
+            }
+
             peer->node_p2p.connect(addr);
 
             // Send getaddr after connection for peer discovery
@@ -335,9 +344,10 @@ private:
     std::map<std::string, std::unique_ptr<BroadcastPeer>> m_peers;
     bool m_running{true};
 
-    BlockCallback   m_on_new_block;
-    TxCallback      m_on_new_tx;
-    HeadersCallback m_on_new_headers;
+    BlockCallback       m_on_new_block;
+    TxCallback          m_on_new_tx;
+    HeadersCallback     m_on_new_headers;
+    PeerHeightCallback  m_on_peer_height;
 };
 
 } // namespace merged

@@ -1028,6 +1028,14 @@ int main(int argc, char* argv[]) {
                         pool->add_tx(mtx);
                     });
 
+                // Wire peer height callback for fast-sync: skip scrypt on old headers
+                embedded_broadcaster->set_on_peer_height(
+                    [chain = embedded_chain.get()](uint32_t h) {
+                        chain->set_peer_tip_height(h);
+                        LOG_INFO << "Peer reports chain height " << h
+                                 << " — fast-sync: scrypt skip below " << (h > 2100 ? h - 2100 : 0);
+                    });
+
                 embedded_broadcaster->start();
                 LOG_INFO << "Embedded LTC broadcaster started, connecting to "
                          << p2p_host << ":" << (coind_p2p_port > 0 ? coind_p2p_port : 19335);

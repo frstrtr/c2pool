@@ -64,6 +64,8 @@ private:
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
     AddrCallback m_addr_callback;
+    using PeerHeightCallback = std::function<void(uint32_t)>;
+    PeerHeightCallback m_on_peer_height;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config) 
@@ -222,6 +224,8 @@ public:
 
     /// Set callback for received addr messages (peer discovery).
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+    /// Set callback for peer's reported chain height (from version message).
+    void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -319,7 +323,11 @@ private:
 
     ADD_P2P_HANDLER(version)
     {
-        LOG_INFO << "version is?: " << msg->m_command;
+        LOG_INFO << "version is?: " << msg->m_command
+                 << " start_height=" << msg->m_start_height;
+        // Notify header chain of peer's tip height for fast-sync scrypt skip.
+        if (m_on_peer_height && msg->m_start_height > 0)
+            m_on_peer_height(msg->m_start_height);
         auto verack_msg = message_verack::make_raw();
         m_peer->write(verack_msg);
     }

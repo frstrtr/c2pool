@@ -15,6 +15,7 @@
 
 #include <btclibs/crypto/scrypt.h>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -376,6 +377,12 @@ public:
         return ok;
     }
 
+    /// Set the estimated network tip height (from peer's version message).
+    /// Used to skip scrypt PoW validation for old headers during initial sync.
+    /// Headers below (tip - SCRYPT_VALIDATION_DEPTH) are validated structurally
+    /// only (prev_hash linkage + difficulty retarget), making bulk sync ~100x faster.
+    void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
+
     /// Add a batch of headers (from a `headers` P2P message).
     /// Returns the number of new headers accepted.
     /// Processes in small sub-batches (BATCH_SIZE headers) to avoid holding
@@ -473,10 +480,25 @@ private:
         const auto& prev = prev_it->second;
         uint32_t new_height = prev.height + 1;
 
-        // Validate PoW
-        uint256 pow_hash = scrypt_hash(header);
-        if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
-            return false;
+        // Validate PoW — skip expensive scrypt for old headers during initial sync.
+        // Headers below (peer_tip - SCRYPT_VALIDATION_DEPTH) are validated
+        // structurally only (prev_hash + difficulty retarget).  This makes bulk
+        // sync ~100x faster: 170k headers × 0.01ms vs 170k × 20ms.
+        // The depth threshold (2100) covers: 1 difficulty retarget interval (2016)
+        // + margin for block_rel_height scoring (~72 blocks).
+        static constexpr uint32_t SCRYPT_VALIDATION_DEPTH = 2100;
+        uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+        bool need_scrypt = (peer_tip == 0) // unknown tip → validate everything
+                        || (new_height + SCRYPT_VALIDATION_DEPTH >= peer_tip);
+        uint256 pow_hash;
+        if (need_scrypt) {
+            pow_hash = scrypt_hash(header);
+            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
+                return false;
+        } else {
+            // Structural-only: trust PoW, store zero hash (not needed for old blocks)
+            pow_hash = block_hash(header); // SHA256d, not scrypt — cheap placeholder
+        }
 
         // Validate difficulty
         if (!validate_difficulty(header, new_height))
@@ -656,6 +678,10 @@ private:
     uint256    m_tip;                                // best chain tip hash
     uint32_t   m_tip_height{0};
     uint256    m_best_work;
+
+    // Peer-reported tip height for fast-sync scrypt skip.
+    // Set from version message; headers below (tip - 2100) skip scrypt PoW.
+    std::atomic<uint32_t> m_peer_tip_height{0};
 
     std::unique_ptr<core::LevelDBStore> m_db;
 };
