@@ -1740,57 +1740,18 @@ uint256 create_local_share(
         return uint256();
     }
 
-    // Phase 2: GENTX comparison — checks that our coinbase matches what
-    // generate_share_transaction would produce from PPLNS weights.
-    // This is the check Python peers perform in check().
-    // (We skip share_check's version/timestamp checks since the share isn't in
-    // the tracker yet, and those checks aren't relevant for locally created shares.)
-    if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
-    {
-        try {
-            uint256 expected_gentx = generate_share_transaction(share, tracker);
-
-            // Compute actual gentx_hash via the same hash_link path that Python uses
-            auto gst_gentx_before_refhash = compute_gentx_before_refhash(int64_t(36));
-            std::vector<unsigned char> gst_hash_link_data;
-            {
-                uint256 ref_hash_chk = check_merkle_link(ref_hash, share.m_ref_merkle_link);
-                gst_hash_link_data.insert(gst_hash_link_data.end(),
-                    ref_hash_chk.data(), ref_hash_chk.data() + 32);
-                uint64_t nonce = share.m_last_txout_nonce;
-                auto* p = reinterpret_cast<const unsigned char*>(&nonce);
-                gst_hash_link_data.insert(gst_hash_link_data.end(), p, p + 8);
-                uint32_t zero = 0;
-                auto* z = reinterpret_cast<const unsigned char*>(&zero);
-                gst_hash_link_data.insert(gst_hash_link_data.end(), z, z + 4);
-            }
-            uint256 actual_gentx = check_hash_link(share.m_hash_link, gst_hash_link_data, gst_gentx_before_refhash);
-
-            if (expected_gentx != actual_gentx) {
-                // PPLNS weights at share creation time may differ from current
-                // chain state if new shares arrived between work template build
-                // and share submission (e.g. during initial header sync, or when
-                // the chain advances between job dispatch and miner response).
-                auto cur_height = tracker.chain.get_height(share.m_prev_hash);
-                LOG_WARNING << "create_local_share: GENTX MISMATCH (stale chain view — "
-                          << "miner submitted share built against older PPLNS state)"
-                          << "\n  expected=" << expected_gentx.GetHex()
-                          << "\n  actual  =" << actual_gentx.GetHex()
-                          << "\n  share=" << share_hash.GetHex()
-                          << "\n  prev_share=" << prev_share.GetHex()
-                          << "\n  share_absheight=" << share.m_absheight
-                          << "\n  chain_height_at_prev=" << cur_height
-                          << "\n  subsidy=" << subsidy
-                          << "\n  donation=" << donation;
-                return uint256();
-            }
-            LOG_INFO << "create_local_share: GENTX comparison PASSED";
-        } catch (const std::exception& e) {
-            LOG_ERROR << "create_local_share: GENTX comparison FAILED: " << e.what()
-                      << " share=" << share_hash.GetHex();
-            return uint256();
-        }
-    }
+    // Note: we do NOT re-verify the gentx against the current chain state here.
+    // Python p2pool's get_share() is a closure that captures share_info + gentx
+    // at template build time — it never re-runs generate_transaction().
+    //
+    // The coinbase (gentx) was built by refresh_work() using the chain state at
+    // template creation time.  The chain may have grown since then (new shares
+    // from peers, new blocks), so re-running generate_share_transaction() against
+    // the CURRENT chain would produce different PPLNS weights → false mismatch.
+    //
+    // Remote peers will verify the share using verify_share() / share_check()
+    // against their own chain view when they receive it via P2P.  If the share's
+    // PPLNS distribution doesn't match their view, they'll reject it.
 
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);
