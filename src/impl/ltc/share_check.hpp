@@ -1155,8 +1155,9 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 {
     // share_init_verify computes gentx_hash along the way — we need it
     // for the GenerateShareTransaction comparison in share_check.
-    // Re-extract gentx_hash by running the hash-link path.
-    uint256 hash = share_init_verify(share);
+    // Skip scrypt PoW re-check when hash was already computed in Phase 1
+    // (processing_shares offloads scrypt to m_verify_pool; no need to repeat).
+    uint256 hash = share_init_verify(share, share.m_hash.IsNull());
 
     // Re-derive gentx_hash for the check phase
     constexpr int64_t ver = ShareT::version;
