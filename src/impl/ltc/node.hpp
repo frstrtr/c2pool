@@ -13,6 +13,8 @@
 #include <sharechain/prepared_list.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 
+#include <atomic>
+#include <mutex>
 #include <random>
 
 namespace ltc
@@ -47,6 +49,14 @@ protected:
     // Thread pool for parallel share_init_verify (scrypt CPU work).
     // Keeps expensive crypto off the io_context thread.
     boost::asio::thread_pool m_verify_pool{4};
+
+    // Dedicated single thread for think() validation (Litecoin Core pattern:
+    // validation runs on its own thread, never blocking the net/ioc thread).
+    // m_cs_tracker serializes access to m_tracker between think_pool and ioc,
+    // matching Litecoin Core's cs_main mutex pattern.
+    boost::asio::thread_pool m_think_pool{1};
+    std::atomic<bool> m_think_running{false};
+    std::recursive_mutex m_cs_tracker;
 
 public:
     NodeImpl()

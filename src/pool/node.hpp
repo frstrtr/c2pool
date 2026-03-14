@@ -194,6 +194,10 @@ public:
 
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
+        // Guard: peer may have been removed by a prior error/timeout while
+        // an async_read callback was still in-flight for the same socket.
+        if (!Base::m_connections.contains(service))
+            return;
         auto peer = Base::m_connections[service];
         peer->m_timeout->restart();
 

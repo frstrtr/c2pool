@@ -225,6 +225,21 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
 
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
+    // Guard: if think() is running on m_think_pool, defer phase2 to avoid
+    // concurrent tracker mutations.  Re-post ourselves to ioc to retry shortly.
+    if (m_think_running.load())
+    {
+        auto data_ptr = std::make_shared<HandleSharesData>(std::move(data));
+        auto retry_timer = std::make_shared<boost::asio::steady_timer>(
+            *m_context, std::chrono::milliseconds(200));
+        retry_timer->async_wait(
+            [this, data_ptr, addr, retry_timer](const boost::system::error_code& ec)
+            {
+                if (!ec) processing_shares_phase2(*data_ptr, addr);
+            });
+        return;
+    }
+
     // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
     // All shared state (m_tracker, m_chain, m_raw_share_cache, m_storage) touched here.
 
@@ -652,95 +667,108 @@ void NodeImpl::run_think()
         return;
     m_last_think_time = now;
 
+    // Skip if a think() is already running on the think pool.
+    // Litecoin Core pattern: validation runs on its own thread, never blocking
+    // the net/ioc thread.  The atomic flag prevents concurrent think + phase2.
+    if (m_think_running.exchange(true))
+        return;
+
     LOG_INFO << "run_think(): chain=" << m_tracker.chain.size()
              << " verified=" << m_tracker.verified.size()
              << " heads=" << m_tracker.chain.get_heads().size();
 
-  try {
-    // Use the wired block_rel_height function, or a safe default stub
+    // Capture block_rel_height fn by value for thread safety
     auto block_rel_height = m_block_rel_height_fn
         ? m_block_rel_height_fn
-        : [](uint256) -> int32_t { return 0; };
+        : std::function<int32_t(uint256)>([](uint256) -> int32_t { return 0; });
 
-    uint256 prev_block;  // zero — not used in basic think()
-    uint32_t bits = 0;
+    boost::asio::post(m_think_pool,
+        [this, block_rel_height]()
+        {
+          try {
+            uint256 prev_block;
+            uint32_t bits = 0;
 
-    auto result = m_tracker.think(block_rel_height, prev_block, bits);
+            auto result = m_tracker.think(block_rel_height, prev_block, bits);
 
-    // Ban peers that provided invalid/unverifiable shares
-    auto now = std::chrono::steady_clock::now();
-    if (!result.bad_peer_addresses.empty()) {
-        for (const auto& bad_addr : result.bad_peer_addresses) {
-            LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
-                        << " for unverifiable shares";
-            m_ban_list[bad_addr] = now + m_ban_duration;
-        }
-    }
+            // Trim stale shares (safe: phase2 defers while m_think_running).
+            const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+            auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
+                if (sc.size() <= keep_per_head)
+                    return;
+                auto heads_copy = sc.get_heads();
+                size_t total_removed = 0;
+                for (auto& [head_hash, tail_hash] : heads_copy) {
+                    auto removed = sc.trim(head_hash, keep_per_head, owns_data);
+                    total_removed += removed;
+                }
+                if (total_removed > 0)
+                    LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
+                             << " (now " << sc.size() << ")";
+            };
+            trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
+            trim_chain(m_tracker.chain, "chain");
 
-    // Expire old bans
-    for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
-        if (it->second <= now)
-            it = m_ban_list.erase(it);
-        else
-            ++it;
-    }
+            // Post results to ioc for peer/connection updates.
 
-    // Request desired shares from peers
-    for (const auto& [peer_addr, hash] : result.desired) {
-        for (auto& [nonce, peer] : m_peers) {
-            if (peer->addr() == peer_addr) {
-                download_shares(peer, hash);
-                break;
-            }
-        }
-    }
+            boost::asio::post(*m_context,
+                [this, result = std::move(result)]()
+                {
+                    // Ban peers that provided invalid/unverifiable shares
+                    auto now = std::chrono::steady_clock::now();
+                    for (const auto& bad_addr : result.bad_peer_addresses) {
+                        LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
+                                    << " for unverifiable shares";
+                        m_ban_list[bad_addr] = now + m_ban_duration;
+                    }
 
-    // Update best share
-    if (!result.best.IsNull()) {
-        m_best_share_hash = result.best;
-        LOG_INFO << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
-    } else {
-        LOG_WARNING << "think(): result.best is NULL — verified_tails="
-                    << m_tracker.verified.get_tails().size()
-                    << " verified_heads=" << m_tracker.verified.get_heads().size();
-    }
+                    // Expire old bans
+                    for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
+                        if (it->second <= now)
+                            it = m_ban_list.erase(it);
+                        else
+                            ++it;
+                    }
 
-    // Trim stale shares to prevent unbounded memory growth.
-    // Keep 2 * chain_length per head (matches Python p2pool behavior).
-    // Must trim even when result.best is null (during initial sync).
-    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
-    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
-        if (sc.size() <= keep_per_head)
-            return;
-        // Copy heads since trim may modify the heads map
-        auto heads_copy = sc.get_heads();
-        size_t total_removed = 0;
-        for (auto& [head_hash, tail_hash] : heads_copy) {
-            auto removed = sc.trim(head_hash, keep_per_head, owns_data);
-            total_removed += removed;
-        }
-        if (total_removed > 0)
-            LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
-                     << " (now " << sc.size() << ")";
-    };
-    // Trim verified FIRST (non-destructive: it borrows share data from chain)
-    trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
-    // Then trim chain (destructive: it owns the share data)
-    trim_chain(m_tracker.chain, "chain");
+                    // Request desired shares from peers
+                    for (const auto& [peer_addr, hash] : result.desired) {
+                        for (auto& [nonce, peer] : m_peers) {
+                            if (peer->addr() == peer_addr) {
+                                download_shares(peer, hash);
+                                break;
+                            }
+                        }
+                    }
 
-    // Prune caches — configurable caps safe for variable chain_length (v37+)
-    if (m_shared_share_hashes.size() > m_max_shared_hashes)
-        m_shared_share_hashes.clear();
-    if (m_known_txs.size() > m_max_known_txs)
-        m_known_txs.clear();
-    if (m_raw_share_cache.size() > m_max_raw_shares)
-        m_raw_share_cache.clear();
+                    // Update best share
+                    if (!result.best.IsNull()) {
+                        m_best_share_hash = result.best;
+                        LOG_INFO << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
+                    } else {
+                        LOG_WARNING << "think(): result.best is NULL — verified_tails="
+                                    << m_tracker.verified.get_tails().size()
+                                    << " verified_heads=" << m_tracker.verified.get_heads().size();
+                    }
 
-  } catch (const std::exception& e) {
-    LOG_ERROR << "run_think() failed: " << e.what();
-  } catch (...) {
-    LOG_ERROR << "run_think() failed: unknown error";
-  }
+                    // Prune caches
+                    if (m_shared_share_hashes.size() > m_max_shared_hashes)
+                        m_shared_share_hashes.clear();
+                    if (m_known_txs.size() > m_max_known_txs)
+                        m_known_txs.clear();
+                    if (m_raw_share_cache.size() > m_max_raw_shares)
+                        m_raw_share_cache.clear();
+
+                    m_think_running.store(false);
+                });
+
+          } catch (const std::exception& e) {
+            LOG_ERROR << "run_think() failed: " << e.what();
+            m_think_running.store(false);
+          } catch (...) {
+            LOG_ERROR << "run_think() failed: unknown error";
+            m_think_running.store(false);
+          }
+        });
 }
 
 bool NodeImpl::is_banned(const NetService& addr) const

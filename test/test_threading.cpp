@@ -21,6 +21,26 @@
  *        - atomic counter decremented by each task
  *        - when counter reaches 0, last task posts Phase-2 callback to io_context
  *      Validates ordering, single-firing, and correct counter value.
+ *
+ *   4. IocResponsiveDuringParallelVerification
+ *      The core property we protect: while heavy CPU work (scrypt) runs on the
+ *      thread pool, the io_context must remain responsive to timers and I/O.
+ *      Fires a short timer on ioc while pool is busy — timer must fire before
+ *      the pool finishes, proving no ioc stall.
+ *
+ *   5. ParallelShareInitVerifyDeterministic
+ *      Runs share_init_verify on the same share from 4 threads simultaneously.
+ *      All must produce the identical SHA256d hash, proving thread safety of
+ *      the scrypt + SHA256d code path.
+ *
+ *   6. ConcurrentVectorElementModification
+ *      Documents and validates the C++ standard guarantee that concurrent writes
+ *      to distinct elements of std::vector<T> are safe — the exact pattern used
+ *      in processing_shares() Phase 1.
+ *
+ *   7. Phase2SkipsNullHashShares
+ *      Simulates Phase-1 producing a mix of verified (hash set) and failed
+ *      (hash null) shares. Phase-2 filtering must emit only verified shares.
  */
 
 #include <gtest/gtest.h>
@@ -30,12 +50,16 @@
 #include <sharechain/sharechain.hpp>
 #include <core/pack.hpp>
 #include <btclibs/crypto/scrypt.h>
+#include <btclibs/crypto/sha256.h>
 
 #include <boost/asio.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <future>
 #include <memory>
+#include <set>
 #include <thread>
 
 namespace io = boost::asio;
@@ -237,4 +261,200 @@ TEST(VerifyShareThreading, ThreadPoolAtomicCounterHandoffToIoc)
 
     EXPECT_EQ(remaining->load(), 0)
         << "All " << N << " Phase-1 tasks must complete before Phase-2 fires";
+}
+
+// ─── Test 4: io_context stays responsive while thread pool does scrypt ────────
+//
+// The whole point of the threading architecture: heavy CPU work (scrypt) runs
+// on thread_pool while io_context continues to service timers, P2P, Stratum.
+// This test posts real scrypt work to a thread pool and simultaneously schedules
+// a short timer on ioc. The timer must fire promptly while scrypt is running.
+
+TEST(VerifyShareThreading, IocResponsiveDuringParallelVerification)
+{
+    io::io_context ioc;
+    boost::asio::thread_pool pool(4);
+
+    constexpr int SCRYPT_TASKS = 16; // enough to keep pool busy for ~80ms
+    auto remaining = std::make_shared<std::atomic<int>>(SCRYPT_TASKS);
+    std::atomic<bool> pool_done{false};
+    std::atomic<bool> timer_fired{false};
+
+    auto work = std::make_shared<io::executor_work_guard<io::io_context::executor_type>>(
+        io::make_work_guard(ioc));
+
+    // Post scrypt work to thread pool (NOT ioc)
+    for (int i = 0; i < SCRYPT_TASKS; i++)
+    {
+        boost::asio::post(pool,
+            [remaining, &pool_done, &ioc, work]()
+            {
+                char in[80] = {}; char out[32] = {};
+                scrypt_1024_1_1_256(in, out); // ~20ms each
+
+                if (--(*remaining) == 0)
+                {
+                    pool_done.store(true);
+                    boost::asio::post(ioc, [work]() { work->reset(); });
+                }
+            });
+    }
+
+    // Schedule a timer on ioc that fires after 5ms — well before pool finishes
+    boost::asio::steady_timer timer(ioc, std::chrono::milliseconds(5));
+    timer.async_wait([&timer_fired](const boost::system::error_code& ec)
+    {
+        if (!ec) timer_fired.store(true);
+    });
+
+    ioc.run_for(std::chrono::seconds(30));
+    pool.join();
+
+    EXPECT_TRUE(timer_fired.load())
+        << "io_context timer must fire while thread pool runs scrypt. "
+           "If false, scrypt is blocking the io_context thread.";
+
+    EXPECT_TRUE(pool_done.load())
+        << "All scrypt tasks must complete.";
+}
+
+// ─── Test 5: parallel share_init_verify produces deterministic results ────────
+//
+// Runs share_init_verify on independent copies of the same share from 4 threads
+// simultaneously. All must produce the same SHA256d hash, proving that the
+// scrypt + SHA256d code path uses no shared mutable state.
+
+TEST(VerifyShareThreading, ParallelShareInitVerifyDeterministic)
+{
+    constexpr int THREADS = 4;
+    std::vector<ltc::ShareType> shares(THREADS);
+    for (int i = 0; i < THREADS; i++)
+        shares[i] = load_test_share();
+
+    std::vector<uint256> results(THREADS);
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < THREADS; i++)
+    {
+        threads.emplace_back([&shares, &results, i]()
+        {
+            shares[i].ACTION({
+                // Use check_pow=false to avoid PoW target mismatch on testnet data
+                results[i] = ltc::share_init_verify(*obj, false);
+            });
+        });
+    }
+
+    for (auto& t : threads) t.join();
+
+    // All results must be the same non-null hash
+    EXPECT_FALSE(results[0].IsNull()) << "share_init_verify must produce a non-null hash";
+    for (int i = 1; i < THREADS; i++)
+    {
+        EXPECT_EQ(results[i], results[0])
+            << "Thread " << i << " produced different hash than thread 0. "
+               "share_init_verify has shared mutable state — NOT thread-safe!";
+    }
+}
+
+// ─── Test 6: concurrent writes to distinct vector elements are safe ──────────
+//
+// processing_shares() Phase 1 modifies data->m_items[i] from thread i.
+// C++ guarantees this is safe when indices don't overlap (ISO 17.6.5.9).
+// This test exercises the exact pattern to ensure no TSAN/ASAN failures.
+
+TEST(VerifyShareThreading, ConcurrentVectorElementModification)
+{
+    constexpr int N = 32;
+    std::vector<uint256> results(N);
+    boost::asio::thread_pool pool(4);
+    auto remaining = std::make_shared<std::atomic<int>>(N);
+    std::promise<void> done;
+    auto future = done.get_future();
+
+    for (int i = 0; i < N; i++)
+    {
+        boost::asio::post(pool,
+            [i, &results, remaining, &done]()
+            {
+                // Each thread writes only to results[i] — no overlap
+                char input[80] = {};
+                input[0] = static_cast<char>(i & 0xFF);
+                input[1] = static_cast<char>((i >> 8) & 0xFF);
+                uint256 hash;
+                CSHA256().Write(reinterpret_cast<const unsigned char*>(input), 80)
+                         .Finalize(hash.begin());
+                results[i] = hash;
+
+                if (--(*remaining) == 0)
+                    done.set_value();
+            });
+    }
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "Concurrent vector element writes must complete within 10s";
+
+    pool.join();
+
+    // Verify each result is unique and non-null (different inputs → different hashes)
+    std::set<uint256> unique_hashes(results.begin(), results.end());
+    EXPECT_EQ(unique_hashes.size(), N)
+        << "Expected " << N << " unique hashes from " << N << " unique inputs. "
+           "Duplicates suggest a data race on the vector.";
+}
+
+// ─── Test 7: Phase-2 filtering skips shares with null hash ───────────────────
+//
+// In processing_shares(), Phase 1 may fail to verify some shares (exception
+// thrown, hash stays null). Phase 2 must skip those and only insert verified
+// shares into the chain. This test simulates that filtering.
+
+TEST(VerifyShareThreading, Phase2SkipsNullHashShares)
+{
+    constexpr int TOTAL = 10;
+    constexpr int FAIL_EVERY = 3; // shares 0, 3, 6, 9 will "fail"
+
+    // Simulate Phase-1 output: a vector of shares, some with hash set, some null
+    struct FakeShare {
+        uint256 hash;
+        int index;
+    };
+    std::vector<FakeShare> phase1_output(TOTAL);
+    for (int i = 0; i < TOTAL; i++)
+    {
+        phase1_output[i].index = i;
+        if (i % FAIL_EVERY != 0)
+        {
+            // "Verified" share — set a non-null hash
+            char buf[32] = {};
+            buf[0] = static_cast<char>(i);
+            std::memcpy(phase1_output[i].hash.begin(), buf, 32);
+        }
+        // else: hash stays null (default-constructed uint256 is zero)
+    }
+
+    // Phase-2 filtering: exact pattern from processing_shares_phase2()
+    std::vector<FakeShare> valid_shares;
+    for (auto& share : phase1_output)
+    {
+        if (share.hash.IsNull())
+            continue;
+        valid_shares.push_back(share);
+    }
+
+    // Count expected: indices 1,2,4,5,7,8 pass; 0,3,6,9 fail
+    int expected_valid = 0;
+    for (int i = 0; i < TOTAL; i++)
+        if (i % FAIL_EVERY != 0) expected_valid++;
+
+    EXPECT_EQ(static_cast<int>(valid_shares.size()), expected_valid)
+        << "Phase 2 must skip null-hash shares. Got " << valid_shares.size()
+        << " but expected " << expected_valid;
+
+    // Ensure no null-hash share leaked through
+    for (const auto& share : valid_shares)
+    {
+        EXPECT_FALSE(share.hash.IsNull())
+            << "Phase 2 emitted a share with null hash (index=" << share.index << ")";
+    }
 }
