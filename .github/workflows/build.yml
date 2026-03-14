@@ -82,6 +82,10 @@ jobs:
             --target test_hardening test_share_messages test_coin_broadcaster \
                     test_redistribute_address \
                     core_test sharechain_test share_test \
+                    test_threading test_weights \
+                    test_header_chain test_mempool test_template_builder \
+                    test_phase0_live test_phase1_live test_phase2_live \
+                    test_phase3_live test_phase4_embedded test_phase4_live \
             -j$(nproc)
 
       # ── 9. Run test suite ─────────────────────────────────────────────────
