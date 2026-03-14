@@ -60,6 +60,10 @@ doc/EMBEDDED_COIN_NODE_DESIGN.md
 /logs
 /data
 /legacy
+/ltc_testnet/
+/ltc/
+/stress-test-logs/
+/stress_test_embedded.sh
 
 #private configs
 /test/coind_tests/pass.h

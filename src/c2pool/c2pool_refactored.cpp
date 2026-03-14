@@ -1075,19 +1075,32 @@ int main(int argc, char* argv[]) {
             } else if (embedded_broadcaster && embedded_chain) {
                 // Wire embedded node + header-sync callback (now that web_server is alive)
                 web_server.set_embedded_node(embedded_node.get());
+
+                // Header validation thread pool (1 thread) — keeps scrypt off io_context.
+                // Shared_ptr so it stays alive for the lifetime of the callbacks.
+                auto hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+
                 // Header sync: self-propelling chain catch-up.
-                // Each batch of headers triggers the next getheaders request.
-                // A 60s periodic fallback timer keeps us in sync when no new headers arrive.
+                // add_headers() runs scrypt for each header (~20ms each), so we offload
+                // it to a background thread and post the follow-up back to ioc.
                 embedded_broadcaster->set_on_new_headers(
-                    [chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(), &web_server](
+                    [chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(),
+                     &web_server, &ioc, hdr_pool](
                         const std::string& /*key*/,
                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
-                        int accepted = chain->add_headers(hdrs);
-                        if (accepted > 0) {
-                            web_server.trigger_work_refresh();
-                            // Request next batch immediately (self-propelling sync)
-                            bcaster->request_headers(chain->get_locator(), uint256::ZERO);
-                        }
+                        // Copy batch — caller's vector may be freed after return
+                        auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
+                        boost::asio::post(*hdr_pool,
+                            [batch, chain, bcaster, &web_server, &ioc]() {
+                                int accepted = chain->add_headers(*batch);
+                                if (accepted > 0) {
+                                    // Post follow-up back onto io_context thread
+                                    boost::asio::post(ioc, [accepted, chain, bcaster, &web_server]() {
+                                        web_server.trigger_work_refresh();
+                                        bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                                    });
+                                }
+                            });
                     });
                 LOG_INFO << "Embedded coin node wired to web server";
 
