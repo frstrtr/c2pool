@@ -110,7 +110,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
 
+    add_executable(test_threading test_threading.cpp)
+    target_link_libraries(test_threading PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+
     include(GoogleTest)
+    gtest_add_tests(test_threading "" AUTO)
     gtest_add_tests(test_coin_broadcaster "" AUTO)
     gtest_add_tests(test_share_messages "" AUTO)
     gtest_add_tests(test_hardening "" AUTO)
