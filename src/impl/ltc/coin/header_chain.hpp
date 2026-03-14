@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <functional>
 #include <string>
 #include <vector>
@@ -384,12 +385,19 @@ public:
         static constexpr size_t BATCH_SIZE = 50; // ~1s of scrypt per batch
         int accepted = 0;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            size_t end = std::min(offset + BATCH_SIZE, headers.size());
-            for (size_t i = offset; i < end; ++i) {
-                if (add_header_internal(headers[i]))
-                    ++accepted;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                size_t end = std::min(offset + BATCH_SIZE, headers.size());
+                for (size_t i = offset; i < end; ++i) {
+                    if (add_header_internal(headers[i]))
+                        ++accepted;
+                }
             }
+            // Yield between batches so ioc-thread callers (get_height,
+            // is_synced, get_tip) can acquire the mutex.  Without this,
+            // the hdr_pool thread immediately re-acquires the lock.
+            if (offset + BATCH_SIZE < headers.size())
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         if (accepted > 0) {
             std::lock_guard<std::mutex> lock(m_mutex);

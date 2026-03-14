@@ -303,9 +303,21 @@ public:
             LOG_WARNING << "Removed bad share " << bad.GetHex().substr(0, 16) << "... from chain";
         }
 
-        // Phase 2: Extend verification from verified heads
+        // Phase 2: Extend verification from verified heads.
+        // Cap per-cycle verification to VERIFY_BATCH_SIZE shares to avoid
+        // freezing the think thread for minutes on first startup.
+        // Python p2pool stays responsive because generate_transaction() uses
+        // a WeightsSkipList (O(log n) cached PPLNS walk).  Our full O(n)
+        // walk makes each verify_share ~250ms, so 20 shares ≈ 5s per cycle.
+        // Verification spreads across multiple think() cycles incrementally.
+        static constexpr int32_t VERIFY_BATCH_SIZE = 20;
+        int32_t verify_budget = VERIFY_BATCH_SIZE;
+
         for (auto& [head_hash, tail_hash] : verified.get_heads())
         {
+            if (verify_budget <= 0)
+                break;
+
             if (!chain.contains(head_hash))
                 continue;
 
@@ -319,7 +331,7 @@ public:
             auto can = last_last_hash.IsNull()
                 ? last_height
                 : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
-            auto to_get = std::min(want, can);
+            auto to_get = std::min({want, can, verify_budget});
 
             if (to_get > 0)
             {
@@ -328,6 +340,7 @@ public:
                 {
                     if (!attempt_verify(hash))
                         break;
+                    --verify_budget;
                 }
             }
 
