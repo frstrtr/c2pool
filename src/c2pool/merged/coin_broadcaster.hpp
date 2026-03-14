@@ -202,6 +202,24 @@ public:
         return static_cast<int>(m_peers.size());
     }
 
+    /// Send getheaders to all connected peers using the supplied block locator.
+    /// Used by the embedded node to request initial header sync after seeding genesis.
+    void request_headers(const std::vector<uint256>& locator, const uint256& stop_hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int sent = 0;
+        for (auto& [key, peer] : m_peers) {
+            try {
+                peer->node_p2p.send_getheaders(70017, locator, stop_hash);
+                ++sent;
+            } catch (const std::exception& e) {
+                LOG_DEBUG_COIND << "[" << m_symbol << "] getheaders to "
+                                << key << " failed: " << e.what();
+            }
+        }
+        LOG_DEBUG_COIND << "[" << m_symbol << "] getheaders sent to " << sent << " peer(s)";
+    }
+
     const std::string& symbol() const { return m_symbol; }
     CoinPeerManager& peer_manager() { return m_peer_manager; }
 

@@ -972,6 +972,36 @@ int main(int argc, char* argv[]) {
                 if (!embedded_chain->init())
                     LOG_WARNING << "HeaderChain LevelDB init failed — running in-memory only";
 
+                // Pre-seed the genesis block so getheaders can proceed from block 0.
+                // Headers are rejected by the chain if they don't connect to a known ancestor,
+                // so the genesis must be present before any peer headers can be accepted.
+                if (embedded_chain->size() == 0) {
+                    ltc::coin::BlockHeaderType genesis;
+                    genesis.m_previous_block.SetNull();
+                    if (settings->m_testnet) {
+                        // LTC testnet genesis (block 0)
+                        genesis.m_version   = 1;
+                        genesis.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
+                        genesis.m_timestamp = 1486949366;
+                        genesis.m_bits      = 0x1e0ffff0;
+                        genesis.m_nonce     = 293345;
+                    } else {
+                        // LTC mainnet genesis (block 0)
+                        genesis.m_version   = 1;
+                        genesis.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
+                        genesis.m_timestamp = 1317972665;
+                        genesis.m_bits      = 0x1e0ffff0;
+                        genesis.m_nonce     = 2084524493;
+                    }
+                    if (embedded_chain->add_header(genesis))
+                        LOG_INFO << "HeaderChain: genesis block seeded (height 0)";
+                    else
+                        LOG_WARNING << "HeaderChain: genesis seed rejected — wrong genesis hash?";
+                } else {
+                    LOG_INFO << "HeaderChain: loaded " << embedded_chain->size()
+                             << " headers from LevelDB (height=" << embedded_chain->height() << ")";
+                }
+
                 embedded_pool  = std::make_unique<ltc::coin::Mempool>();
                 embedded_node  = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet);
@@ -1045,15 +1075,38 @@ int main(int argc, char* argv[]) {
             } else if (embedded_broadcaster && embedded_chain) {
                 // Wire embedded node + header-sync callback (now that web_server is alive)
                 web_server.set_embedded_node(embedded_node.get());
+                // Header sync: self-propelling chain catch-up.
+                // Each batch of headers triggers the next getheaders request.
+                // A 60s periodic fallback timer keeps us in sync when no new headers arrive.
                 embedded_broadcaster->set_on_new_headers(
-                    [chain = embedded_chain.get(), &web_server](
+                    [chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(), &web_server](
                         const std::string& /*key*/,
                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                         int accepted = chain->add_headers(hdrs);
-                        if (accepted > 0)
+                        if (accepted > 0) {
                             web_server.trigger_work_refresh();
+                            // Request next batch immediately (self-propelling sync)
+                            bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                        }
                     });
                 LOG_INFO << "Embedded coin node wired to web server";
+
+                // Periodic fallback: re-request headers every 60s even if no batch arrived.
+                // Uses shared_ptr self-capture so the lambda stays alive for the run duration.
+                auto sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                auto sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                *sync_fn = [sync_fn, sync_timer,
+                            chain   = embedded_chain.get(),
+                            bcaster = embedded_broadcaster.get()](boost::system::error_code ec) {
+                    if (ec) return; // cancelled (ioc stopped)
+                    bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                    sync_timer->expires_after(std::chrono::seconds(60));
+                    sync_timer->async_wait(*sync_fn);
+                };
+                // Kick off first getheaders after 3s (allow handshake to complete)
+                sync_timer->expires_after(std::chrono::seconds(3));
+                sync_timer->async_wait(*sync_fn);
+                LOG_INFO << "Embedded header sync timer started (60s interval)";
             }
 
             // Feed real network difficulty from block templates to the adjustment engine
