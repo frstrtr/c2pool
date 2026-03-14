@@ -44,6 +44,10 @@ protected:
     // Protocol handlers look up tx hashes here when processing shares.
     std::map<uint256, coin::Transaction> m_known_txs;
 
+    // Thread pool for parallel share_init_verify (scrypt CPU work).
+    // Keeps expensive crypto off the io_context thread.
+    boost::asio::thread_pool m_verify_pool{4};
+
 public:
     NodeImpl()
         : m_share_getter(nullptr,
@@ -88,7 +92,8 @@ public:
 
     // ltc
     void send_version(peer_ptr peer);
-    void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
+    void processing_shares(HandleSharesData& data, NetService addr);
+    void processing_shares_phase2(HandleSharesData& data, NetService addr);
     ShareTracker& tracker() { return m_tracker; }
 
     // Async share download — response delivered to callback when sharereply arrives

@@ -180,31 +180,63 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         return pool::PeerConnectionType::legacy;
 }
 
-void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
+void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
 {
-    // Step 1: Compute hashes for all shares FIRST so PreparedList can sort them.
-    // Shares arrive with m_hash = 0 (hash is computed, not serialized).
-    // Without valid hashes, PreparedList cannot topologically order shares.
-    int32_t verify_fail_count = 0;
+    // Take ownership immediately so the caller can return/free its local.
+    auto data = std::make_shared<HandleSharesData>(std::move(data_ref));
+    size_t n = data->m_items.size();
+    if (n == 0) return;
+
+    // Phase 1 (thread pool, parallel): run share_init_verify() for each share.
+    // share_init_verify() does scrypt-1024 (~20ms each) — must NOT block io_context.
+    // Each share's hash computation is independent, so we can fully parallelize.
+    auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(n));
+    for (size_t i = 0; i < n; i++)
+    {
+        boost::asio::post(m_verify_pool,
+            [i, data, remaining, this, addr]()
+            {
+                auto& share = data->m_items[i];
+                if (share.hash().IsNull())
+                {
+                    try
+                    {
+                        share.ACTION({
+                            obj->m_hash = share_init_verify(*obj, true);
+                        });
+                    }
+                    catch (const std::exception&)
+                    {
+                        // leave hash null — phase 2 will skip this share
+                    }
+                }
+                // When all verifications are done, schedule phase 2 on io_context
+                if (--(*remaining) == 0)
+                {
+                    boost::asio::post(*m_context,
+                        [data, this, addr]()
+                        {
+                            processing_shares_phase2(*data, addr);
+                        });
+                }
+            });
+    }
+}
+
+void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
+{
+    // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
+    // All shared state (m_tracker, m_chain, m_raw_share_cache, m_storage) touched here.
+
+    // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
     valid_shares.reserve(data.m_items.size());
     for (size_t idx = 0; idx < data.m_items.size(); ++idx)
     {
         auto& share = data.m_items[idx];
         if (share.hash().IsNull())
-        {
-            try
-            {
-                share.ACTION({
-                    obj->m_hash = share_init_verify(*obj, true);
-                });
-            }
-            catch (const std::exception& e)
-            {
-                ++verify_fail_count;
-                continue;
-            }
-        }
+            continue; // verification failed in phase 1
+
         // Cache original raw bytes for relay (keyed by computed hash)
         if (idx < data.m_raw_items.size() && !data.m_raw_items[idx].contents.m_data.empty())
             m_raw_share_cache[share.hash()] = std::move(data.m_raw_items[idx]);
@@ -218,48 +250,47 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
     // Step 3: Process sorted shares
     int32_t new_count = 0;
     int32_t dup_count = 0;
-	std::map<uint256, coin::MutableTransaction> all_new_txs;
-	for (int i = 0; i < (int)shares.size(); ++i)
-	{
-	    auto& share = shares[i];
-	    
-	    // Safety: abort if RSS exceeds limit
-	    if (i % 100 == 0) {
-	        long rss_now = get_rss_mb();
-	        if (rss_now > g_rss_limit_mb) {
-	            LOG_ERROR << "RSS LIMIT EXCEEDED (" << rss_now << "MB > " << g_rss_limit_mb << "MB) — aborting!";
-	            std::abort();
-	        }
-	    }
+    std::map<uint256, coin::MutableTransaction> all_new_txs;
+    for (int i = 0; i < (int)shares.size(); ++i)
+    {
+        auto& share = shares[i];
+
+        // Safety: abort if RSS exceeds limit
+        if (i % 100 == 0) {
+            long rss_now = get_rss_mb();
+            if (rss_now > g_rss_limit_mb) {
+                LOG_ERROR << "RSS LIMIT EXCEEDED (" << rss_now << "MB > " << g_rss_limit_mb << "MB) — aborting!";
+                std::abort();
+            }
+        }
 
         auto& new_txs = data.m_txs[share.hash()];
-		if (!new_txs.empty())
-		{
-			for (auto& new_tx : new_txs)
-			{
+        if (!new_txs.empty())
+        {
+            for (auto& new_tx : new_txs)
+            {
                 PackStream packed_tx = pack(coin::TX_WITH_WITNESS(new_tx));
-				all_new_txs[Hash(packed_tx.get_span())] = new_tx;
-			}
-		}
+                all_new_txs[Hash(packed_tx.get_span())] = new_tx;
+            }
+        }
 
-		if (m_chain->contains(share.hash()))
-		{
-		    ++dup_count;
-			continue;
-		}
+        if (m_chain->contains(share.hash()))
+        {
+            ++dup_count;
+            continue;
+        }
 
-		new_count++;
+        ++new_count;
+        m_tracker.add(share);
 
-		m_tracker.add(share);
+        // NOTE: Do NOT trim inside the processing loop. The trim in run_think()
+        // handles pruning between batches. Trimming here is unsafe because
+        // shares added at the tail can be freed while the loop still holds
+        // dangling raw pointers to them (use-after-free).
 
-		// NOTE: Do NOT trim inside the processing loop. The trim in run_think()
-		// handles pruning between batches. Trimming here is unsafe because
-		// shares added at the tail can be freed while the loop still holds
-		// dangling raw pointers to them (use-after-free).
-
-		// Persist to LevelDB
-		if (m_storage && m_storage->is_available())
-		{
+        // Persist to LevelDB
+        if (m_storage && m_storage->is_available())
+        {
             std::vector<uint8_t> bytes;
             auto raw_it = m_raw_share_cache.find(share.hash());
             if (raw_it != m_raw_share_cache.end() &&
@@ -276,23 +307,23 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
                 bytes.assign(reinterpret_cast<const uint8_t*>(span.data()),
                              reinterpret_cast<const uint8_t*>(span.data()) + span.size());
             }
-			uint64_t ver = share.version();
-			std::vector<uint8_t> versioned;
-			versioned.resize(8 + bytes.size());
-			std::memcpy(versioned.data(), &ver, 8);
-			std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
+            uint64_t ver = share.version();
+            std::vector<uint8_t> versioned;
+            versioned.resize(8 + bytes.size());
+            std::memcpy(versioned.data(), &ver, 8);
+            std::memcpy(versioned.data() + 8, bytes.data(), bytes.size());
 
-			share.ACTION({
-				uint256 target = chain::bits_to_target(obj->m_bits);
-				// Convert m_abswork (uint128) to uint256 by zero-padding high 128 bits
-				uint256 abswork_256;
-				std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
-				m_storage->store_share(obj->m_hash, versioned, obj->m_prev_hash,
-				                       obj->m_absheight, obj->m_timestamp,
-				                       abswork_256, target);
-			});
-		}
-	}
+            share.ACTION({
+                uint256 target = chain::bits_to_target(obj->m_bits);
+                // Convert m_abswork (uint128) to uint256 by zero-padding high 128 bits
+                uint256 abswork_256;
+                std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
+                m_storage->store_share(obj->m_hash, versioned, obj->m_prev_hash,
+                                       obj->m_absheight, obj->m_timestamp,
+                                       abswork_256, target);
+            });
+        }
+    }
 
     // NOTE: Do NOT call run_think() here. During download sync, the chain is
     // incomplete and run_think would mark verifiable shares as "bad" and ban

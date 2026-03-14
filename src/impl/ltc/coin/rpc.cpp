@@ -39,42 +39,53 @@ void NodeRPC::connect(NetService address, std::string userpass)
 
     m_http_request.set(http::field::authorization, m_auth->authorization);
 
-    auto const results = m_resolver.resolve(address.address(), address.port_str());
-	boost::asio::ip::tcp::endpoint endpoint = *results;
+    // Async DNS resolve — must NOT use the blocking m_resolver.resolve() overload
+    // as that stalls the entire io_context thread for the DNS round-trip.
+    m_resolver.async_resolve(address.address(), address.port_str(),
+        [this](boost::system::error_code ec, boost::asio::ip::tcp::resolver::results_type results)
+        {
+            if (ec)
+            {
+                LOG_ERROR << "CoindRPC DNS resolve failed: " << ec.message() << ", retrying in 15s";
+                m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+                m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
+                return;
+            }
+            boost::asio::ip::tcp::endpoint endpoint = *results;
+            m_stream.async_connect(endpoint,
+                [this](boost::system::error_code ec)
+                {
+                    if (ec)
+                    {
+                        if (ec == boost::system::errc::operation_canceled)
+                            return;
 
-    m_stream.async_connect(endpoint, 
-		[&](boost::system::error_code ec)
-		{
-			if (ec)
-			{
-				if (ec == boost::system::errc::operation_canceled)
-					return;
-				
-				LOG_ERROR << "CoindRPC error when try connect: [" << ec.message() << "].";
-			} else 
-			{
-				try
-				{
-					if (check())
-					{
-						m_connected = true;
-						LOG_INFO << "...CoindRPC connected!";
-						return;
-					}
-				}
-				catch(const std::runtime_error& ec)
-				{
-					LOG_ERROR << "Error when try check CoindRPC: " << ec.what();
-				}
-			}
-			
-			LOG_INFO << "Retry after 15 seconds...";
-			m_connected = false;
-			m_stream.close();
-			m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
-			m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
-		}
-	);
+                        LOG_ERROR << "CoindRPC error when try connect: [" << ec.message() << "].";
+                    } else
+                    {
+                        try
+                        {
+                            if (check())
+                            {
+                                m_connected = true;
+                                LOG_INFO << "...CoindRPC connected!";
+                                return;
+                            }
+                        }
+                        catch(const std::runtime_error& ec)
+                        {
+                            LOG_ERROR << "Error when try check CoindRPC: " << ec.what();
+                        }
+                    }
+
+                    LOG_INFO << "Retry after 15 seconds...";
+                    m_connected = false;
+                    m_stream.close();
+                    m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
+                    m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
+                }
+            );
+        });
 }
 
 NodeRPC::~NodeRPC()
