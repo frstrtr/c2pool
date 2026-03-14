@@ -292,11 +292,27 @@ public:
         const std::vector<uint256>& merkle_branches)>;
     void set_ref_hash_fn(ref_hash_fn_t fn) { m_ref_hash_fn = std::move(fn); }
 
+    // Atomically snapshot work-related fields under m_work_mutex.
+    // Used by StratumSession to freeze consistent state matching the coinbase.
+    struct WorkSnapshot {
+        bool segwit_active{false};
+        std::string mweb;
+        uint64_t subsidy{0};
+        std::string witness_commitment_hex;
+        uint256 witness_root;
+    };
+
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
     // then generates coinb1/coinb2 with full output set including OP_RETURN.
     // prev_share_hash is frozen at the caller and passed in to avoid race conditions.
+    // Also returns work snapshot atomically (under same lock) to prevent race with refresh_work.
     // Returns (coinb1, coinb2) or empty strings if not possible.
-    std::pair<std::string, std::string> build_connection_coinbase(
+    struct CoinbaseResult {
+        std::string coinb1;
+        std::string coinb2;
+        WorkSnapshot snapshot;
+    };
+    CoinbaseResult build_connection_coinbase(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
@@ -409,6 +425,8 @@ public:
     std::string get_cached_witness_commitment() const;
     // Return the raw wtxid merkle root (computed in refresh_work)
     uint256 get_cached_witness_root() const;
+
+    WorkSnapshot get_work_snapshot() const;
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).

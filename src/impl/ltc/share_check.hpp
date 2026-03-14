@@ -1136,7 +1136,32 @@ bool share_check(const ShareT& share,
             LOG_WARNING << "  PPLNS chain_len=" << chain_len
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
-            
+
+            // Diagnostic: dump PPLNS output amounts for comparison with Python p2pool
+            {
+                auto block_target_dbg = chain::bits_to_target(share.m_min_header.m_bits);
+                auto max_weight_dbg = chain::target_to_average_attempts(block_target_dbg)
+                                      * PoolConfig::SPREAD * 65535;
+                auto result_dbg = tracker.get_v36_decayed_cumulative_weights(
+                    share.m_prev_hash, chain_len, max_weight_dbg);
+                LOG_WARNING << "  bits=0x" << std::hex << share.m_min_header.m_bits << std::dec
+                            << " total_weight=" << result_dbg.total_weight.GetHex().substr(0, 32)
+                            << " total_don=" << result_dbg.total_donation_weight.GetHex().substr(0, 32)
+                            << " n_addrs=" << result_dbg.weights.size();
+                for (auto& [scr, w] : result_dbg.weights) {
+                    uint288 num = uint288(share.m_subsidy) * w;
+                    uint64_t amt = (num / result_dbg.total_weight).GetLow64();
+                    // Show first 8 bytes of script as hex
+                    std::string scr_hex;
+                    for (size_t i = 0; i < std::min(scr.size(), size_t(10)); ++i) {
+                        char buf[4]; snprintf(buf, 4, "%02x", scr[i]);
+                        scr_hex += buf;
+                    }
+                    LOG_WARNING << "    script=" << scr_hex << " weight=" << w.GetHex().substr(0,24)
+                                << " amount=" << amt;
+                }
+            }
+
             throw std::invalid_argument("GenerateShareTransaction mismatch — coinbase does not match PPLNS payouts");
         }
     }
@@ -1740,18 +1765,52 @@ uint256 create_local_share(
         return uint256();
     }
 
-    // Note: we do NOT re-verify the gentx against the current chain state here.
-    // Python p2pool's get_share() is a closure that captures share_info + gentx
-    // at template build time — it never re-runs generate_transaction().
-    //
-    // The coinbase (gentx) was built by refresh_work() using the chain state at
-    // template creation time.  The chain may have grown since then (new shares
-    // from peers, new blocks), so re-running generate_share_transaction() against
-    // the CURRENT chain would produce different PPLNS weights → false mismatch.
-    //
-    // Remote peers will verify the share using verify_share() / share_check()
-    // against their own chain view when they receive it via P2P.  If the share's
-    // PPLNS distribution doesn't match their view, they'll reject it.
+    // Cross-check: verify our gentx matches what generate_share_transaction produces.
+    // This catches PPLNS weight bugs immediately at creation time rather than
+    // waiting for remote peers to reject the share.
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+    {
+        try {
+            uint256 expected_gentx = generate_share_transaction(share, tracker);
+            // Compute actual gentx_hash from ACTUAL mined coinbase
+            uint256 actual_gentx;
+            if (!actual_coinbase_bytes.empty()) {
+                auto actual_span = std::span<const unsigned char>(
+                    actual_coinbase_bytes.data(), actual_coinbase_bytes.size());
+                actual_gentx = Hash(actual_span);
+            } else {
+                auto gentx_span = std::span<const unsigned char>(
+                    reinterpret_cast<const unsigned char*>(gentx.data()), gentx.size());
+                actual_gentx = Hash(gentx_span);
+            }
+            if (expected_gentx != actual_gentx) {
+                // Dump first 80 bytes of both for comparison
+                auto to_hex = [](const unsigned char* d, size_t n) {
+                    std::string h; h.reserve(n*2);
+                    for (size_t i = 0; i < n; i++) { char buf[3]; snprintf(buf,3,"%02x",d[i]); h+=buf; }
+                    return h;
+                };
+                // Re-compute the expected gentx raw bytes
+                auto recomp_span = std::span<const unsigned char>(
+                    reinterpret_cast<const unsigned char*>(gentx.data()), gentx.size());
+                size_t dump_len = std::min(size_t(120), gentx.size());
+                size_t actual_dump = std::min(size_t(120), actual_coinbase_bytes.size());
+                LOG_ERROR << "create_local_share: GENTX CROSS-CHECK FAILED!"
+                          << " expected=" << expected_gentx.GetHex().substr(0, 32)
+                          << " actual=" << actual_gentx.GetHex().substr(0, 32)
+                          << " share=" << share_hash.GetHex().substr(0, 32)
+                          << " prev=" << prev_share.GetHex().substr(0, 16)
+                          << " height=" << share.m_absheight;
+                LOG_ERROR << "  recomp[0:" << dump_len << "]="
+                          << to_hex(reinterpret_cast<const unsigned char*>(gentx.data()), dump_len);
+                if (!actual_coinbase_bytes.empty())
+                    LOG_ERROR << "  actual[0:" << actual_dump << "]="
+                              << to_hex(actual_coinbase_bytes.data(), actual_dump);
+                LOG_ERROR << "  recomp_size=" << gentx.size()
+                          << " actual_size=" << actual_coinbase_bytes.size();
+            }
+        } catch (...) {} // Don't fail share creation on diagnostics
+    }
 
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);

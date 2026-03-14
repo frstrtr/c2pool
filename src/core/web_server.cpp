@@ -1139,7 +1139,7 @@ MiningInterface::build_coinbase_parts(
     return { coinb1.str(), coinb2 };
 }
 
-std::pair<std::string, std::string>
+MiningInterface::CoinbaseResult
 MiningInterface::build_connection_coinbase(
     const uint256& prev_share_hash,
     const std::string& extranonce1_hex,
@@ -1218,7 +1218,7 @@ MiningInterface::build_connection_coinbase(
 
     // Call build_coinbase_parts with ref_hash
     // The last_txout_nonce will be filled by en1+en2 at mining time
-    return build_coinbase_parts(
+    auto [cb1, cb2] = build_coinbase_parts(
         m_cached_template,
         subsidy,
         m_cached_pplns_outputs,
@@ -1226,6 +1226,15 @@ MiningInterface::build_connection_coinbase(
         m_cached_mm_commitment,
         m_cached_witness_commitment,
         ref_hash_hex);
+
+    // Return coinbase parts + work snapshot atomically (still under m_work_mutex)
+    WorkSnapshot snap;
+    snap.segwit_active = m_segwit_active;
+    snap.mweb = m_cached_mweb;
+    snap.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+    snap.witness_commitment_hex = m_cached_witness_commitment;
+    snap.witness_root = m_cached_witness_root;
+    return {std::move(cb1), std::move(cb2), std::move(snap)};
 }
 
 // Decode a Base58Check‐encoded address (P2PKH or P2SH) and return the
@@ -1499,6 +1508,19 @@ uint256 MiningInterface::get_cached_witness_root() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
     return m_cached_witness_root;
+}
+
+MiningInterface::WorkSnapshot MiningInterface::get_work_snapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    WorkSnapshot s;
+    s.segwit_active = m_segwit_active;
+    s.mweb = m_cached_mweb;
+    s.subsidy = m_cached_template.is_null() ? 0
+                : m_cached_template.value("coinbasevalue", uint64_t(0));
+    s.witness_commitment_hex = m_cached_witness_commitment;
+    s.witness_root = m_cached_witness_root;
+    return s;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5081,6 +5103,7 @@ void StratumSession::send_notify_work(bool force_clean)
     // Freeze share chain tip ONCE — used for both ref_hash computation
     // and the job's stored prev_share_hash to avoid race conditions.
     uint256 frozen_prev_share;
+    MiningInterface::CoinbaseResult cbr;
     if (auto fn = mining_interface_->get_best_share_hash_fn())
         frozen_prev_share = fn();
     {
@@ -5113,11 +5136,11 @@ void StratumSession::send_notify_work(bool force_clean)
             }
         }
 
-        auto [cb1, cb2] = mining_interface_->build_connection_coinbase(
+        cbr = mining_interface_->build_connection_coinbase(
             frozen_prev_share, extranonce1_, payout_script, merged_addrs);
-        if (!cb1.empty()) {
-            coinb1 = std::move(cb1);
-            coinb2 = std::move(cb2);
+        if (!cbr.coinb1.empty()) {
+            coinb1 = std::move(cbr.coinb1);
+            coinb2 = std::move(cbr.coinb2);
         } else {
             // Fallback to global coinbase (no ref_hash callback wired)
             auto [gcb1, gcb2] = mining_interface_->get_coinbase_parts();
@@ -5142,20 +5165,20 @@ void StratumSession::send_notify_work(bool force_clean)
     // Store the SAME frozen prev_share_hash that was used for ref_hash computation
     active_jobs_[job_id].prev_share_hash = frozen_prev_share;
 
-    // Populate tx_data, mweb, segwit_active, subsidy, witness_commitment from snapshot
+    // Populate tx_data, mweb, segwit_active, subsidy, witness_commitment from snapshot.
+    // CRITICAL: witness_commitment and witness_root MUST be read atomically with
+    // the coinbase parts (coinb1 contains the witness commitment bytes).
+    // We snapshot them under the work mutex via get_work_snapshot() to prevent
+    // refresh_work() from changing them between coinbase build and job storage.
     {
         auto& je = active_jobs_[job_id];
-        je.segwit_active = mining_interface_->get_segwit_active();
-        je.mweb = mining_interface_->get_cached_mweb();
-
-        // Freeze subsidy and witness commitment at job creation time
-        auto cur_tmpl = mining_interface_->get_current_work_template();
-        if (!cur_tmpl.empty() && !cur_tmpl.is_null()) {
-            je.subsidy = cur_tmpl.value("coinbasevalue", uint64_t(0));
-        }
-        // Use the P2Pool witness commitment and root computed in refresh_work()
-        je.witness_commitment_hex = mining_interface_->get_cached_witness_commitment();
-        je.witness_root = mining_interface_->get_cached_witness_root();
+        // Use the snapshot captured atomically with coinbase parts
+        // to prevent race with refresh_work() changing witness data.
+        je.segwit_active = cbr.snapshot.segwit_active;
+        je.mweb = std::move(cbr.snapshot.mweb);
+        je.subsidy = cbr.snapshot.subsidy;
+        je.witness_commitment_hex = std::move(cbr.snapshot.witness_commitment_hex);
+        je.witness_root = cbr.snapshot.witness_root;
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {
             for (const auto& tx : tmpl["transactions"]) {
