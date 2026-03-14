@@ -104,10 +104,19 @@ public:
         LOG_ERROR << "\twhere: " << where.function_name();
         if (m_connections.contains(service))
         {
-            auto peer = m_connections.extract(service);
-            peer.mapped()->m_timeout->stop(); // for case: peer stored somewhere (or leak)
-            peer.mapped()->cancel();
-            peer.mapped()->close();
+            auto node = m_connections.extract(service);
+            auto peer = std::move(node.mapped());
+            peer->m_timeout->stop();
+            peer->cancel();
+            peer->close();
+            // Defer peer destruction to the next ioc iteration.
+            // The timeout callback may still be on the call stack —
+            // destroying the peer (and its Timer) now would be a
+            // use-after-free.  The posted lambda captures the shared_ptr
+            // keeping the peer alive until the current handler returns.
+            boost::asio::post(*m_context, [p = std::move(peer)]() mutable {
+                p.reset();
+            });
         }
         else
         {
@@ -131,10 +140,15 @@ public:
     {
         if (m_connections.contains(service))
         {
-            auto peer = m_connections.extract(service);
-            peer.mapped()->m_timeout->stop();
-            peer.mapped()->cancel();
-            peer.mapped()->close();
+            auto node = m_connections.extract(service);
+            auto peer = std::move(node.mapped());
+            peer->m_timeout->stop();
+            peer->cancel();
+            peer->close();
+            // Defer destruction — same reason as error()
+            boost::asio::post(*m_context, [p = std::move(peer)]() mutable {
+                p.reset();
+            });
         }
     }
 

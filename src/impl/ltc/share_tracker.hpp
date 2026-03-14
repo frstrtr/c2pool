@@ -180,7 +180,9 @@ public:
     }
 
     // -- Score a chain from share_hash to CHAIN_LENGTH*15/16 ancestor --
-    // Returns (chain_len, hashrate_score) — higher is better
+    // Returns (chain_len, hashrate_score) — higher is better.
+    // May throw if the chain is concurrently modified (think runs on a
+    // background thread).  Callers should catch or use the safe wrapper.
     TailScore score(const uint256& share_hash,
                     const std::function<int32_t(uint256)>& block_rel_height_func)
     {
@@ -218,7 +220,9 @@ public:
         if (!block_height.has_value() || block_height.value() >= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
-        // Get accumulated work between share_hash and end_point on the verified chain
+        // Get accumulated work between share_hash and end_point on the verified chain.
+        // May throw if concurrent trim removed end_point between the
+        // get_nth_parent_key call above and this point.
         auto interval = verified.get_interval(share_hash, end_point);
         auto time_span = (-block_height.value() + 1) * 150; // LTC BLOCK_PERIOD = 150s
         if (time_span <= 0)
@@ -359,8 +363,13 @@ public:
 
             if (!best_head.IsNull())
             {
-                auto s = score(best_head, block_rel_height_func);
-                decorated_tails.push_back({s, tail_hash});
+                try {
+                    auto s = score(best_head, block_rel_height_func);
+                    decorated_tails.push_back({s, tail_hash});
+                } catch (const std::exception&) {
+                    // Chain was concurrently modified (trim removed an
+                    // ancestor).  Skip this tail — will be scored next cycle.
+                }
             }
         }
         std::sort(decorated_tails.begin(), decorated_tails.end());

@@ -2078,7 +2078,11 @@ int main(int argc, char* argv[]) {
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
-                ioc.run_for(std::chrono::milliseconds(100));
+                try {
+                    ioc.run_for(std::chrono::milliseconds(100));
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "ioc handler exception (non-fatal): " << e.what();
+                }
             }
             work_guard.reset();
 
@@ -2113,7 +2117,11 @@ int main(int argc, char* argv[]) {
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
-                ioc.run_for(std::chrono::milliseconds(100));
+                try {
+                    ioc.run_for(std::chrono::milliseconds(100));
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "ioc handler exception (non-fatal): " << e.what();
+                }
             }
             work_guard.reset();
 
@@ -2196,7 +2204,11 @@ int main(int argc, char* argv[]) {
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
-                ioc.run_for(std::chrono::milliseconds(100));
+                try {
+                    ioc.run_for(std::chrono::milliseconds(100));
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "ioc handler exception (non-fatal): " << e.what();
+                }
             }
             work_guard.reset();
         }
