@@ -118,7 +118,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
 
+    add_executable(test_weights test_weights.cpp)
+    target_link_libraries(test_weights PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+
     include(GoogleTest)
+    gtest_add_tests(test_weights "" AUTO)
     gtest_add_tests(test_threading "" AUTO)
     gtest_add_tests(test_coin_broadcaster "" AUTO)
     gtest_add_tests(test_share_messages "" AUTO)

@@ -310,6 +310,10 @@ public:
         // a WeightsSkipList (O(log n) cached PPLNS walk).  Our full O(n)
         // walk makes each verify_share ~250ms, so 20 shares ≈ 5s per cycle.
         // Verification spreads across multiple think() cycles incrementally.
+        //
+        // TODO: make dynamic based on chain_length for mainnet (8640) and
+        // future variable window sizes.  Testnet (400) works well with 20;
+        // mainnet may need 3-5 per cycle to keep think() under 5s.
         static constexpr int32_t VERIFY_BATCH_SIZE = 20;
         int32_t verify_budget = VERIFY_BATCH_SIZE;
 
