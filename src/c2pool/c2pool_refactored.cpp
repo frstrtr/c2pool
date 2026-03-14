@@ -2068,13 +2068,20 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "  ✓ Automatic difficulty adjustment";
             LOG_INFO << "  ✓ Real-time hashrate tracking";
             LOG_INFO << "  ✓ Persistent storage";
-            
+
+            // Work guard prevents ioc from draining when all async handlers
+            // complete (e.g., all peers disconnect).  Timers and accept loops
+            // continue firing on schedule.  Matches Litecoin Core's approach
+            // where the event loop never exits until explicit shutdown.
+            auto work_guard = boost::asio::make_work_guard(ioc);
+
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
                 ioc.run_for(std::chrono::milliseconds(100));
             }
-            
+            work_guard.reset();
+
             enhanced_node->shutdown();
         }
         else if (sharechain_mode) {
@@ -2100,13 +2107,16 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "  ✓ Real-time hashrate tracking";
             LOG_INFO << "  ✓ LevelDB persistent storage";
             LOG_INFO << "  ✓ LTC protocol compatibility";
-            
+
+            auto work_guard = boost::asio::make_work_guard(ioc);
+
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
                 ioc.run_for(std::chrono::milliseconds(100));
             }
-            
+            work_guard.reset();
+
             enhanced_node->shutdown();
         }
         else {
@@ -2181,11 +2191,14 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "Use your payout address as the username when connecting miners";
             }
             
+            auto work_guard = boost::asio::make_work_guard(ioc);
+
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
                 ioc.run_for(std::chrono::milliseconds(100));
             }
+            work_guard.reset();
         }
         
         LOG_INFO << "c2pool shutdown complete";
