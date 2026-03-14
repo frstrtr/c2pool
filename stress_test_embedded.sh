@@ -30,7 +30,7 @@ exec "$BINARY" \
     --p2pool-port 19338 \
     --worker-port 19327 \
     --web-port 8080 \
-    --dashboard-dir web-static \
+    --dashboard-dir /home/user0/Github/c2pool/web-static \
     --cors-origin '*' \
     --p2p-max-peers 20 \
     --stratum-min-diff 0.001 \
