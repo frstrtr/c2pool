@@ -225,13 +225,14 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
 
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
-    // Guard: if think() is running on m_think_pool, defer phase2 to avoid
-    // concurrent tracker mutations.  Re-post ourselves to ioc to retry shortly.
+    // Guard: if think() is running on m_think_pool, defer phase2.
+    // think() and phase2 both access m_tracker — the internal data
+    // structures are not thread-safe for concurrent mutation.
     if (m_think_running.load())
     {
         auto data_ptr = std::make_shared<HandleSharesData>(std::move(data));
         auto retry_timer = std::make_shared<boost::asio::steady_timer>(
-            *m_context, std::chrono::milliseconds(200));
+            *m_context, std::chrono::milliseconds(500));
         retry_timer->async_wait(
             [this, data_ptr, addr, retry_timer](const boost::system::error_code& ec)
             {
@@ -691,29 +692,31 @@ void NodeImpl::run_think()
 
             auto result = m_tracker.think(block_rel_height, prev_block, bits);
 
-            // Trim stale shares (safe: phase2 defers while m_think_running).
-            const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
-            auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
-                if (sc.size() <= keep_per_head)
-                    return;
-                auto heads_copy = sc.get_heads();
-                size_t total_removed = 0;
-                for (auto& [head_hash, tail_hash] : heads_copy) {
-                    auto removed = sc.trim(head_hash, keep_per_head, owns_data);
-                    total_removed += removed;
-                }
-                if (total_removed > 0)
-                    LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
-                             << " (now " << sc.size() << ")";
-            };
-            trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
-            trim_chain(m_tracker.chain, "chain");
-
-            // Post results to ioc for peer/connection updates.
-
+            // Post results + trim to ioc thread.
+            // Trim MUST run on ioc to avoid racing with phase2's add().
+            // think() itself only reads chain and adds to verified — both
+            // tolerate concurrent phase2 chain inserts.
             boost::asio::post(*m_context,
                 [this, result = std::move(result)]()
                 {
+                    // Trim stale shares (on ioc thread — safe with phase2)
+                    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+                    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
+                        if (sc.size() <= keep_per_head)
+                            return;
+                        auto heads_copy = sc.get_heads();
+                        size_t total_removed = 0;
+                        for (auto& [head_hash, tail_hash] : heads_copy) {
+                            auto removed = sc.trim(head_hash, keep_per_head, owns_data);
+                            total_removed += removed;
+                        }
+                        if (total_removed > 0)
+                            LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
+                                     << " (now " << sc.size() << ")";
+                    };
+                    trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
+                    trim_chain(m_tracker.chain, "chain");
+
                     // Ban peers that provided invalid/unverifiable shares
                     auto now = std::chrono::steady_clock::now();
                     for (const auto& bad_addr : result.bad_peer_addresses) {

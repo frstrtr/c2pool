@@ -377,15 +377,24 @@ public:
 
     /// Add a batch of headers (from a `headers` P2P message).
     /// Returns the number of new headers accepted.
+    /// Processes in small sub-batches (BATCH_SIZE headers) to avoid holding
+    /// the mutex for the entire batch — each header requires ~20ms of scrypt,
+    /// so releasing between batches keeps ioc-thread callers responsive.
     int add_headers(const std::vector<BlockHeaderType>& headers) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        static constexpr size_t BATCH_SIZE = 50; // ~1s of scrypt per batch
         int accepted = 0;
-        for (auto& hdr : headers) {
-            if (add_header_internal(hdr))
-                ++accepted;
+        for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            size_t end = std::min(offset + BATCH_SIZE, headers.size());
+            for (size_t i = offset; i < end; ++i) {
+                if (add_header_internal(headers[i]))
+                    ++accepted;
+            }
         }
-        if (accepted > 0)
+        if (accepted > 0) {
+            std::lock_guard<std::mutex> lock(m_mutex);
             persist_tip();
+        }
         return accepted;
     }
 
