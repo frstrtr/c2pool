@@ -4587,7 +4587,10 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
 
 void StratumSession::start()
 {
-    LOG_INFO << "StratumSession started for client: " << socket_.remote_endpoint();
+    boost::system::error_code ec;
+    auto ep = socket_.remote_endpoint(ec);
+    if (ec) return; // socket closed before start() was dispatched
+    LOG_INFO << "StratumSession started for client: " << ep;
     read_message();
 }
 

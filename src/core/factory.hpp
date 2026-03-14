@@ -42,9 +42,12 @@ protected:
 				auto tcp_socket = std::make_unique<io::ip::tcp::socket>(std::move(io_socket));
 				auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::incoming, m_node);
 				socket->init();
-				
-				m_node->connected(socket);
-				
+				// Guard: if init() closed the socket (peer disconnected immediately),
+				// skip connected() to avoid storing a dead socket in m_connections.
+				if (socket->status()) {
+					m_node->connected(socket);
+				}
+
 				// continue accept connections
 				accept();
 			}

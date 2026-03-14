@@ -67,9 +67,13 @@ public:
 
     void init()
     {
-        // init addrs
-        m_addr_local = NetService(m_socket->local_endpoint());
-        m_addr = NetService(m_socket->remote_endpoint());
+        // init addrs — guard against socket being closed before init() dispatched
+        boost::system::error_code ec;
+        auto ep_local  = m_socket->local_endpoint(ec);
+        auto ep_remote = m_socket->remote_endpoint(ec);
+        if (ec) { m_status = false; m_socket->close(); return; }
+        m_addr_local = NetService(ep_local);
+        m_addr       = NetService(ep_remote);
 
         // start for reading socket data
         read();

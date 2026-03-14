@@ -22,7 +22,9 @@ void NetAddress::Write_IPV4(PackStream& os) const
         boost::algorithm::split(split_res, ip, boost::is_any_of("."));
         if (split_res.size() != 4)
         {
-            throw (std::runtime_error("Invalid address in IPV6AddressType"));
+            // Not a dotted-decimal IPv4 address (e.g. "localhost") — use loopback 127.0.0.1
+            LOG_WARNING << "Write_IPV4: non-dotted address '" << ip << "', substituting 127.0.0.1";
+            split_res = {"127", "0", "0", "1"};
         }
 
         std::vector<unsigned int> bits;
