@@ -1101,27 +1101,26 @@ int main(int argc, char* argv[]) {
                         boost::asio::post(*hdr_pool,
                             [batch, chain, bcaster, &web_server, &ioc]() {
                                 int accepted = chain->add_headers(*batch);
-                                // Use the LAST header in the batch as the locator base for
-                                // the next request.  This advances past known-but-duplicate
-                                // headers that were loaded from LevelDB persistence.
-                                // Without this, the locator stays at chain tip and the peer
-                                // keeps re-sending the same batch of already-known headers.
-                                uint256 next_locator_tip;
+                                // Always use the LAST header in the batch as locator for the
+                                // next getheaders — this advances past known-but-duplicate
+                                // headers loaded from LevelDB.  The peer recognises the hash
+                                // (it sent it) and continues from there.
+                                uint256 last_hash;
                                 if (!batch->empty()) {
-                                    // Hash of the last header in the batch — use it as locator
                                     auto& last_hdr = batch->back();
                                     auto packed = pack(last_hdr);
-                                    next_locator_tip = Hash(packed.get_span());
+                                    last_hash = Hash(packed.get_span());
                                 }
                                 bool full_batch = (batch->size() >= 2000);
                                 if (accepted > 0 || full_batch) {
-                                    boost::asio::post(ioc, [accepted, next_locator_tip, chain, bcaster, &web_server]() {
+                                    boost::asio::post(ioc, [accepted, last_hash, chain, bcaster, &web_server]() {
                                         if (accepted > 0)
                                             web_server.trigger_work_refresh();
-                                        // If we have a last-batch hash, use it as single-entry locator
-                                        // to advance past duplicates.  Fall back to chain locator.
-                                        if (!next_locator_tip.IsNull() && chain->get_header(next_locator_tip).has_value()) {
-                                            bcaster->request_headers({next_locator_tip}, uint256::ZERO);
+                                        // Use last received hash as locator to advance past
+                                        // LevelDB duplicates.  On fresh sync (no LevelDB),
+                                        // this naturally follows the chain tip.
+                                        if (!last_hash.IsNull()) {
+                                            bcaster->request_headers({last_hash}, uint256::ZERO);
                                         } else {
                                             bcaster->request_headers(chain->get_locator(), uint256::ZERO);
                                         }
