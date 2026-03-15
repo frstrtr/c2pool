@@ -1129,38 +1129,12 @@ bool share_check(const ShareT& share,
             LOG_WARNING << "  expected_gentx=" << expected_gentx.ToString().substr(0,32)
                         << " actual_gentx=" << gentx_hash.ToString().substr(0,32);
             
-            // Log PPLNS chain depth available
             auto chain_len = std::min(
                 tracker.chain.get_height(share.m_prev_hash),
                 static_cast<int32_t>(PoolConfig::real_chain_length()));
             LOG_WARNING << "  PPLNS chain_len=" << chain_len
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
-
-            // Diagnostic: dump PPLNS output amounts for comparison with Python p2pool
-            {
-                auto block_target_dbg = chain::bits_to_target(share.m_min_header.m_bits);
-                auto max_weight_dbg = chain::target_to_average_attempts(block_target_dbg)
-                                      * PoolConfig::SPREAD * 65535;
-                auto result_dbg = tracker.get_v36_decayed_cumulative_weights(
-                    share.m_prev_hash, chain_len, max_weight_dbg);
-                LOG_WARNING << "  bits=0x" << std::hex << share.m_min_header.m_bits << std::dec
-                            << " total_weight=" << result_dbg.total_weight.GetHex().substr(0, 32)
-                            << " total_don=" << result_dbg.total_donation_weight.GetHex().substr(0, 32)
-                            << " n_addrs=" << result_dbg.weights.size();
-                for (auto& [scr, w] : result_dbg.weights) {
-                    uint288 num = uint288(share.m_subsidy) * w;
-                    uint64_t amt = (num / result_dbg.total_weight).GetLow64();
-                    // Show first 8 bytes of script as hex
-                    std::string scr_hex;
-                    for (size_t i = 0; i < std::min(scr.size(), size_t(10)); ++i) {
-                        char buf[4]; snprintf(buf, 4, "%02x", scr[i]);
-                        scr_hex += buf;
-                    }
-                    LOG_WARNING << "    script=" << scr_hex << " weight=" << w.GetHex().substr(0,24)
-                                << " amount=" << amt;
-                }
-            }
 
             throw std::invalid_argument("GenerateShareTransaction mismatch — coinbase does not match PPLNS payouts");
         }
@@ -1529,164 +1503,103 @@ uint256 create_local_share(
     uint256 hash_ref = Hash(ref_span_v);
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
-    // --- Build the full coinbase TX (non-witness) ---
-    // This MUST match generate_share_transaction() exactly so that remote peers
-    // can verify the share.  We compute the same PPLNS outputs here.
-
-    // 1. Compute PPLNS weights (V36: exponential depth-decay matching Python)
-    std::map<std::vector<unsigned char>, uint288> weights;
-    uint288 total_weight;
-    uint288 total_donation_weight;
-
-    if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
-    {
-        auto chain_len = std::min(
-            tracker.chain.get_height(prev_share),
-            static_cast<int32_t>(PoolConfig::real_chain_length()));
-        // block_target from block header bits (matches Python: self.header['bits'].target)
-        auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
-        auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
-
-        // V36: use exponential depth-decay
-        auto result = tracker.get_v36_decayed_cumulative_weights(prev_share, chain_len, max_weight);
-        weights = std::move(result.weights);
-        total_weight = result.total_weight;
-        total_donation_weight = result.total_donation_weight;
-    }
-
-    // 2. Convert weights to integer payout amounts (V36 formula)
-    std::map<std::vector<unsigned char>, uint64_t> amounts;
-    if (!total_weight.IsNull())
-    {
-        for (auto& [script, weight] : weights)
-        {
-            uint64_t amount = (uint288(subsidy) * weight / total_weight).GetLow64();
-            if (amount > 0)
-                amounts[script] = amount;
-        }
-    }
-
-    uint64_t sum_amounts = 0;
-    for (auto& [s, a] : amounts)
-        sum_amounts += a;
-    uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
-
-    // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
-    if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
-        auto largest = std::max_element(amounts.begin(), amounts.end(),
-            [](const auto& a, const auto& b) { return a.second < b.second; });
-        if (largest != amounts.end() && largest->second > 0) {
-            largest->second -= 1;
-            sum_amounts -= 1;
-            donation_amount = subsidy - sum_amounts;
-        }
-    }
-
-    // 3. Build sorted output list: ascending by (amount, script)
-    // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-        amounts.begin(), amounts.end());
-    std::sort(payout_outputs.begin(), payout_outputs.end(),
-        [](const auto& a, const auto& b) {
-            if (a.second != b.second) return a.second < b.second;
-            return a.first < b.first;
-        });
-    constexpr size_t MAX_OUTPUTS = 4000;
-    if (payout_outputs.size() > MAX_OUTPUTS)
-        payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_OUTPUTS);
-
-    // 4. Serialize the coinbase TX (matches generate_share_transaction exactly)
-    PackStream gentx;
-    { uint32_t v = 1; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&v), 4)); }
-    { unsigned char one = 1; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&one), 1)); }
-    // vin[0]
-    { uint256 z; gentx << z; }
-    { uint32_t idx = 0xffffffff; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&idx), 4)); }
-    gentx << share.m_coinbase;
-    { uint32_t seq = 0xffffffff; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&seq), 4)); }
-
-    // Count total outputs
-    size_t n_outs = payout_outputs.size() + 1 /* donation */ + 1 /* OP_RETURN */;
-    bool has_segwit = share.m_segwit_data.has_value();
-    if (has_segwit) n_outs += 1;
-
-    // vout count
-    if (n_outs < 253) {
-        uint8_t cnt = static_cast<uint8_t>(n_outs);
-        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1));
-    } else {
-        uint8_t marker = 0xfd;
-        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&marker), 1));
-        uint16_t cnt = static_cast<uint16_t>(n_outs);
-        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2));
-    }
-
-    auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script, const std::string& = "") {
-        gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
-        BaseScript bs;
-        bs.m_data = script;
-        gentx << bs;
-    };
-
-    // Segwit commitment output (FIRST, if present)
-    if (has_segwit)
-    {
-        auto& sd = share.m_segwit_data.value();
-        std::vector<unsigned char> wscript;
-        wscript.push_back(0x6a);
-        wscript.push_back(0x24);
-        wscript.push_back(0xaa);
-        wscript.push_back(0x21);
-        wscript.push_back(0xa9);
-        wscript.push_back(0xed);
-        // Compute P2Pool witness commitment: SHA256d(wtxid_merkle_root || '[P2Pool]'*4)
-        uint256 commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
-        auto commitment_bytes = commitment.GetChars();
-        wscript.insert(wscript.end(), commitment_bytes.begin(), commitment_bytes.end());
-        write_txout(0, wscript, "segwit_commitment");
-    }
-
-    // PPLNS payout outputs (sorted)
-    for (auto& [script, amount] : payout_outputs)
-        write_txout(amount, script, "pplns");
-
-    // Donation output
-    auto donation_script_v = PoolConfig::get_donation_script(int64_t(36));
-    write_txout(donation_amount, donation_script_v, "donation");
-
-    // OP_RETURN commitment (LAST)
-    {
-        std::vector<unsigned char> op_return_data;
-        op_return_data.push_back(0x6a);
-        op_return_data.push_back(0x28);
-        op_return_data.insert(op_return_data.end(), ref_hash.data(), ref_hash.data() + 32);
-        { uint64_t n = share.m_last_txout_nonce;
-          auto* p = reinterpret_cast<const unsigned char*>(&n);
-          op_return_data.insert(op_return_data.end(), p, p + 8); }
-        write_txout(0, op_return_data, "op_return");
-    }
-
-    // locktime
-    { uint32_t lt = 0; gentx.write(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(&lt), 4)); }
-
-    // --- Compute hash_link from the coinbase prefix ---
+    // --- Derive hash_link from the actual mined coinbase ---
+    // Python p2pool captures the gentx at template creation time in a closure
+    // and NEVER re-computes PPLNS.  We follow the same pattern: the coinbase
+    // bytes from refresh_work() are the single source of truth.
+    //
+    // When actual_coinbase_bytes is provided (normal mining path), we use it
+    // directly.  This eliminates the race where the share chain changes between
+    // template creation and share submission, which caused GENTX mismatches
+    // and p2pool peer bans.
     auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(36));
 
-    // P2Pool-compatible hash_link: the extranonce (en1+en2) is now in the
-    // last_txout_nonce position (part of the suffix / last 44 bytes), NOT in
-    // the scriptSig.  So the prefix (everything before the last 44 bytes)
-    // is the SAME regardless of extranonce values — it matches what
-    // generate_transaction() would produce from share.m_coinbase.
     std::vector<unsigned char> coinbase_bytes_for_hashlink;
     if (!actual_coinbase_bytes.empty()) {
+        // Use the actual mined coinbase — matches exactly what the miner solved.
         coinbase_bytes_for_hashlink = actual_coinbase_bytes;
     } else {
+        // Fallback (no actual bytes): must reconstruct from PPLNS.
+        // This path is only used in unit tests or if the caller doesn't
+        // provide actual_coinbase_bytes.
+        std::map<std::vector<unsigned char>, uint288> weights;
+        uint288 total_weight;
+
+        if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+        {
+            auto chain_len = std::min(
+                tracker.chain.get_height(prev_share),
+                static_cast<int32_t>(PoolConfig::real_chain_length()));
+            auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
+            auto max_weight = chain::target_to_average_attempts(block_target)
+                              * PoolConfig::SPREAD * 65535;
+            auto result = tracker.get_v36_decayed_cumulative_weights(prev_share, chain_len, max_weight);
+            weights = std::move(result.weights);
+            total_weight = result.total_weight;
+        }
+
+        std::map<std::vector<unsigned char>, uint64_t> amounts;
+        if (!total_weight.IsNull()) {
+            for (auto& [script, weight] : weights) {
+                uint64_t amount = (uint288(subsidy) * weight / total_weight).GetLow64();
+                if (amount > 0)
+                    amounts[script] = amount;
+            }
+        }
+        uint64_t sum_amounts = 0;
+        for (auto& [s, a] : amounts) sum_amounts += a;
+        uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
+        if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
+            auto largest = std::max_element(amounts.begin(), amounts.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+            if (largest != amounts.end() && largest->second > 0) {
+                largest->second -= 1; sum_amounts -= 1;
+                donation_amount = subsidy - sum_amounts;
+            }
+        }
+
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
+            amounts.begin(), amounts.end());
+        std::sort(payout_outputs.begin(), payout_outputs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        if (payout_outputs.size() > 4000)
+            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+
+        PackStream gentx;
+        { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
+        { unsigned char one = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&one), 1)); }
+        { uint256 z; gentx << z; }
+        { uint32_t idx = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&idx), 4)); }
+        gentx << share.m_coinbase;
+        { uint32_t seq = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&seq), 4)); }
+        size_t n_outs = payout_outputs.size() + 1 + 1;
+        bool has_segwit_fb = share.m_segwit_data.has_value();
+        if (has_segwit_fb) n_outs += 1;
+        if (n_outs < 253) { uint8_t cnt = (uint8_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1)); }
+        else { uint8_t m = 0xfd; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&m), 1)); uint16_t cnt = (uint16_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2)); }
+        auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script) {
+            gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
+            BaseScript bs; bs.m_data = script; gentx << bs;
+        };
+        if (has_segwit_fb) {
+            auto& sd = share.m_segwit_data.value();
+            std::vector<unsigned char> wscript = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+            uint256 commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
+            auto cb = commitment.GetChars();
+            wscript.insert(wscript.end(), cb.begin(), cb.end());
+            write_txout(0, wscript);
+        }
+        for (auto& [script, amount] : payout_outputs) write_txout(amount, script);
+        write_txout(donation_amount, PoolConfig::get_donation_script(int64_t(36)));
+        { std::vector<unsigned char> op; op.push_back(0x6a); op.push_back(0x28);
+          op.insert(op.end(), ref_hash.data(), ref_hash.data() + 32);
+          uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
+          op.insert(op.end(), p, p + 8); write_txout(0, op); }
+        { uint32_t lt = 0; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&lt), 4)); }
+
         coinbase_bytes_for_hashlink.assign(
             reinterpret_cast<const unsigned char*>(gentx.data()),
             reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
@@ -1723,10 +1636,10 @@ uint256 create_local_share(
             actual_coinbase_bytes.data(), actual_coinbase_bytes.size());
         gentx_hash_for_header = Hash(actual_span);
     } else {
-        auto gentx_span = std::span<const unsigned char>(
-            reinterpret_cast<const unsigned char*>(gentx.data()),
-            reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
-        gentx_hash_for_header = Hash(gentx_span);
+        // Use the coinbase bytes we already computed for hash_link (either actual or reconstructed)
+        auto cb_span = std::span<const unsigned char>(
+            coinbase_bytes_for_hashlink.data(), coinbase_bytes_for_hashlink.size());
+        gentx_hash_for_header = Hash(cb_span);
     }
     uint256 merkle_root;
     if (share.m_segwit_data.has_value())
@@ -1765,52 +1678,10 @@ uint256 create_local_share(
         return uint256();
     }
 
-    // Cross-check: verify our gentx matches what generate_share_transaction produces.
-    // This catches PPLNS weight bugs immediately at creation time rather than
-    // waiting for remote peers to reject the share.
-    if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
-    {
-        try {
-            uint256 expected_gentx = generate_share_transaction(share, tracker);
-            // Compute actual gentx_hash from ACTUAL mined coinbase
-            uint256 actual_gentx;
-            if (!actual_coinbase_bytes.empty()) {
-                auto actual_span = std::span<const unsigned char>(
-                    actual_coinbase_bytes.data(), actual_coinbase_bytes.size());
-                actual_gentx = Hash(actual_span);
-            } else {
-                auto gentx_span = std::span<const unsigned char>(
-                    reinterpret_cast<const unsigned char*>(gentx.data()), gentx.size());
-                actual_gentx = Hash(gentx_span);
-            }
-            if (expected_gentx != actual_gentx) {
-                // Dump first 80 bytes of both for comparison
-                auto to_hex = [](const unsigned char* d, size_t n) {
-                    std::string h; h.reserve(n*2);
-                    for (size_t i = 0; i < n; i++) { char buf[3]; snprintf(buf,3,"%02x",d[i]); h+=buf; }
-                    return h;
-                };
-                // Re-compute the expected gentx raw bytes
-                auto recomp_span = std::span<const unsigned char>(
-                    reinterpret_cast<const unsigned char*>(gentx.data()), gentx.size());
-                size_t dump_len = std::min(size_t(120), gentx.size());
-                size_t actual_dump = std::min(size_t(120), actual_coinbase_bytes.size());
-                LOG_ERROR << "create_local_share: GENTX CROSS-CHECK FAILED!"
-                          << " expected=" << expected_gentx.GetHex().substr(0, 32)
-                          << " actual=" << actual_gentx.GetHex().substr(0, 32)
-                          << " share=" << share_hash.GetHex().substr(0, 32)
-                          << " prev=" << prev_share.GetHex().substr(0, 16)
-                          << " height=" << share.m_absheight;
-                LOG_ERROR << "  recomp[0:" << dump_len << "]="
-                          << to_hex(reinterpret_cast<const unsigned char*>(gentx.data()), dump_len);
-                if (!actual_coinbase_bytes.empty())
-                    LOG_ERROR << "  actual[0:" << actual_dump << "]="
-                              << to_hex(actual_coinbase_bytes.data(), actual_dump);
-                LOG_ERROR << "  recomp_size=" << gentx.size()
-                          << " actual_size=" << actual_coinbase_bytes.size();
-            }
-        } catch (...) {} // Don't fail share creation on diagnostics
-    }
+    // No cross-check needed: the hash_link is derived from actual_coinbase_bytes
+    // (the exact bytes the miner solved), not from a re-computed PPLNS gentx.
+    // Python p2pool follows the same pattern — the gentx is captured once at
+    // template creation time and never re-derived.
 
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);
