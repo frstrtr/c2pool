@@ -2010,7 +2010,15 @@ int main(int argc, char* argv[]) {
                         auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
                             *doge_chain, *doge_pool, *doge_params_ptr, cfg);
                         mm_manager->add_chain(cfg, std::move(backend));
-                        LOG_INFO << "Merged mining: DOGE embedded (no daemon) chain_id=" << cfg.chain_id;
+                        LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
+
+                        // Set RPC as fallback if connection details are available
+                        if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                            auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
+                            mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
+                            LOG_INFO << "Merged mining: DOGE RPC fallback at "
+                                     << cfg.rpc_host << ":" << cfg.rpc_port;
+                        }
                     } else {
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added " << cfg.symbol

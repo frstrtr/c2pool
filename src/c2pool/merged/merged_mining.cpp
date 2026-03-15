@@ -614,13 +614,12 @@ void MergedMiningManager::refresh_aux_work()
                 lw = now;
                 LOG_WARNING << "[MM:" << chain.config.symbol << "] Failed to refresh: " << e.what();
             }
-            // Fallback: switch to embedded backend if available
-            if (!chain.using_fallback && chain.fallback) {
-                LOG_INFO << "[MM:" << chain.config.symbol
-                         << "] Primary backend failed — switching to fallback (embedded)";
+            // Fallback: try the other backend.
+            // RPC is used as jumpstart while embedded syncs headers.
+            // Once embedded has a tip, we switch back to embedded (preferred).
+            if (chain.fallback) {
                 chain.rpc.swap(chain.fallback);
-                chain.using_fallback = true;
-                // Retry immediately with fallback
+                chain.using_fallback = !chain.using_fallback;
                 try {
                     auto tip = chain.rpc->get_best_block_hash();
                     chain.last_tip = tip;
@@ -628,11 +627,30 @@ void MergedMiningManager::refresh_aux_work()
                         ? chain.rpc->get_work_template()
                         : chain.rpc->create_aux_block(chain.config.aux_payout_address);
                     any_changed = true;
-                    LOG_INFO << "[MM:" << chain.config.symbol << "] Fallback succeeded — height "
-                             << chain.current_work.height;
+                    LOG_INFO << "[MM:" << chain.config.symbol
+                             << "] Using " << (chain.using_fallback ? "RPC (jumpstart)" : "embedded (preferred)")
+                             << " — height " << chain.current_work.height;
                 } catch (const std::exception& e2) {
-                    LOG_WARNING << "[MM:" << chain.config.symbol << "] Fallback also failed: " << e2.what();
+                    // Both failed — swap back, wait for next cycle
+                    chain.rpc.swap(chain.fallback);
+                    chain.using_fallback = !chain.using_fallback;
                 }
+            }
+        }
+
+        // Auto-promote: if using RPC fallback but embedded (primary) now has a tip,
+        // switch back to embedded (preferred backend).
+        if (chain.using_fallback && chain.fallback) {
+            try {
+                auto embedded_tip = chain.fallback->get_best_block_hash();
+                if (!embedded_tip.empty()) {
+                    chain.rpc.swap(chain.fallback);
+                    chain.using_fallback = false;
+                    LOG_INFO << "[MM:" << chain.config.symbol
+                             << "] Embedded node synced — promoting to primary";
+                }
+            } catch (...) {
+                // Embedded not ready yet — keep using RPC
             }
         }
     }
