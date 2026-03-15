@@ -294,6 +294,7 @@ int main(int argc, char* argv[]) {
     bool integrated_mode = false;
     bool sharechain_mode = false;
     bool embedded_ltc    = false;    // Phase 4: use embedded coin node instead of daemon RPC
+    std::string header_checkpoint_str;  // --header-checkpoint HEIGHT:HASH
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
 
     // Coin daemon P2P connection (for fast block relay alongside RPC)
@@ -450,6 +451,11 @@ int main(int argc, char* argv[]) {
         else if (arg == "--embedded-ltc") {
             embedded_ltc = true;
             cli_explicit.insert("embedded_ltc");
+        }
+        else if (arg == "--header-checkpoint" && i + 1 < argc) {
+            // Format: HEIGHT:HASH (e.g., 4600000:da433fe7ca00...)
+            header_checkpoint_str = argv[++i];
+            cli_explicit.insert("header_checkpoint");
         }
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
@@ -972,21 +978,30 @@ int main(int argc, char* argv[]) {
                 if (!embedded_chain->init())
                     LOG_WARNING << "HeaderChain LevelDB init failed — running in-memory only";
 
-                // Pre-seed the genesis block so getheaders can proceed from block 0.
-                // Headers are rejected by the chain if they don't connect to a known ancestor,
-                // so the genesis must be present before any peer headers can be accepted.
+                // Apply CLI checkpoint (--header-checkpoint HEIGHT:HASH) if provided.
+                // This lets operators skip millions of old headers on any chain.
+                if (!header_checkpoint_str.empty()) {
+                    auto colon = header_checkpoint_str.find(':');
+                    if (colon != std::string::npos) {
+                        uint32_t cp_height = static_cast<uint32_t>(std::stoul(header_checkpoint_str.substr(0, colon)));
+                        uint256 cp_hash;
+                        cp_hash.SetHex(header_checkpoint_str.substr(colon + 1));
+                        if (!cp_hash.IsNull())
+                            embedded_chain->set_dynamic_checkpoint(cp_height, cp_hash);
+                    }
+                }
+
+                // If chain is still empty after checkpoint, seed the genesis block.
                 if (embedded_chain->size() == 0) {
                     ltc::coin::BlockHeaderType genesis;
                     genesis.m_previous_block.SetNull();
                     if (settings->m_testnet) {
-                        // LTC testnet genesis (block 0)
                         genesis.m_version   = 1;
                         genesis.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
                         genesis.m_timestamp = 1486949366;
                         genesis.m_bits      = 0x1e0ffff0;
                         genesis.m_nonce     = 293345;
                     } else {
-                        // LTC mainnet genesis (block 0)
                         genesis.m_version   = 1;
                         genesis.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
                         genesis.m_timestamp = 1317972665;

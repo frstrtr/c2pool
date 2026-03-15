@@ -99,6 +99,12 @@ struct LTCChainParams {
     uint256 pow_limit;
     uint256 genesis_hash;      // SHA256d genesis block hash (for identification)
 
+    // Fast-start checkpoint: skip syncing from genesis, start from a recent height.
+    // The header chain seeds this checkpoint as if it were the genesis block.
+    // All headers before this height are implicitly trusted.
+    struct Checkpoint { uint32_t height{0}; uint256 hash; };
+    std::optional<Checkpoint> fast_start_checkpoint;
+
     /// Standard LTC mainnet params
     static LTCChainParams mainnet() {
         LTCChainParams p;
@@ -120,6 +126,8 @@ struct LTCChainParams {
         p.no_retargeting = false;
         p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         p.genesis_hash.SetHex("4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0");
+        // No hardcoded checkpoint — use --header-checkpoint CLI arg or
+        // set_dynamic_checkpoint() from RPC for any chain/network.
         return p;
     }
 
@@ -317,6 +325,31 @@ public:
                 return false;
             load_from_db();
         }
+        // Fast-start checkpoint: if chain is empty and a checkpoint is configured,
+        // seed it as the starting point.  All headers before this height are
+        // implicitly trusted.  The chain will sync forward from this point.
+        if (m_tip.IsNull() && m_params.fast_start_checkpoint.has_value()) {
+            auto& cp = m_params.fast_start_checkpoint.value();
+            IndexEntry entry;
+            entry.block_hash = cp.hash;
+            entry.height = cp.height;
+            entry.chain_work = uint256::ONE;  // minimal non-zero work
+            entry.prev_hash = uint256::ZERO;  // no parent (checkpoint is trusted root)
+            entry.status = HEADER_VALID_CHAIN;
+            // Minimal header — we don't have the actual header data, but we
+            // have the hash.  Peers will send headers AFTER this point.
+            entry.header.m_previous_block.SetNull();
+
+            m_headers[cp.hash] = entry;
+            m_height_index[cp.height] = cp.hash;
+            m_tip = cp.hash;
+            m_tip_height = cp.height;
+            m_best_work = entry.chain_work;
+            persist_header(entry);
+            persist_tip();
+            LOG_INFO << "HeaderChain: fast-start from checkpoint height="
+                     << cp.height << " hash=" << cp.hash.GetHex().substr(0, 16) << "...";
+        }
         return true;
     }
 
@@ -383,15 +416,44 @@ public:
     /// Used to skip scrypt PoW validation for old headers during initial sync.
     /// Headers below (tip - SCRYPT_VALIDATION_DEPTH) are validated structurally
     /// only (prev_hash linkage + difficulty retarget), making bulk sync ~100x faster.
+    /// Set the estimated network tip height (from peer's version message).
     void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
+
+    /// Dynamically seed a checkpoint at runtime (e.g., from RPC getblockhash).
+    /// Only applied if the chain is still at or below the hardcoded checkpoint.
+    /// This allows an accessible daemon to provide a more recent starting point.
+    void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (height > m_tip_height) {
+            IndexEntry entry;
+            entry.block_hash = hash;
+            entry.height = height;
+            entry.chain_work = uint256::ONE;
+            entry.prev_hash = uint256::ZERO;
+            entry.status = HEADER_VALID_CHAIN;
+            entry.header.m_previous_block.SetNull();
+            m_headers[hash] = entry;
+            m_height_index[height] = hash;
+            m_tip = hash;
+            m_tip_height = height;
+            m_best_work = entry.chain_work;
+            persist_header(entry);
+            persist_tip();
+            LOG_INFO << "HeaderChain: dynamic checkpoint at height="
+                     << height << " hash=" << hash.GetHex().substr(0, 16) << "...";
+        }
+    }
 
     /// Add a batch of headers (from a `headers` P2P message).
     /// Returns the number of new headers accepted.
-    /// Processes in small sub-batches (BATCH_SIZE headers) to avoid holding
-    /// the mutex for the entire batch — each header requires ~20ms of scrypt,
-    /// so releasing between batches keeps ioc-thread callers responsive.
+    /// Processes in sub-batches to avoid holding the mutex for the entire batch.
+    /// With fast-sync (scrypt skipped for old headers), structural validation
+    /// is microseconds per header, so large batches are fine.  Near the tip
+    /// (scrypt active), each header takes ~20ms, so we use smaller batches.
     int add_headers(const std::vector<BlockHeaderType>& headers) {
-        static constexpr size_t BATCH_SIZE = 50; // ~1s of scrypt per batch
+        uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+        // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
+        size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
         int accepted = 0;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
             {
@@ -403,10 +465,12 @@ public:
                 }
             }
             // Yield between batches so ioc-thread callers (get_height,
-            // is_synced, get_tip) can acquire the mutex.  Without this,
-            // the hdr_pool thread immediately re-acquires the lock.
-            if (offset + BATCH_SIZE < headers.size())
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // is_synced, get_tip) can acquire the mutex.
+            if (offset + BATCH_SIZE < headers.size()) {
+                // Short yield during fast-sync (structural only), longer near tip (scrypt)
+                auto ms = (BATCH_SIZE >= 500) ? 1 : 10;
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
         }
         if (accepted > 0) {
             std::lock_guard<std::mutex> lock(m_mutex);
