@@ -36,4 +36,5 @@ exec "$BINARY" \
     --stratum-min-diff 0.001 \
     --stratum-max-diff 65536 \
     --stratum-target-time 10 \
+    --merged DOGE:2:192.168.86.27:44555:dogecoinrpc:testpass:44556 \
     2>&1 | tee -a "$LOGFILE"
