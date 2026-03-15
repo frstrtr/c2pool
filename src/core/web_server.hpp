@@ -428,6 +428,13 @@ public:
 
     WorkSnapshot get_work_snapshot() const;
 
+    // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
+    // The verify callback returns: >0=confirmed, <0=orphaned, 0=pending.
+    using block_verify_fn_t = std::function<int(const std::string& hash)>;
+    void set_block_verify_fn(block_verify_fn_t fn);
+    void set_io_context(boost::asio::io_context* ctx) { m_context = ctx; }
+    void schedule_block_verification(const std::string& block_hash);
+
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
@@ -499,6 +506,8 @@ private:
     ltc::interfaces::Node*       m_coin_node      = nullptr;
     // Phase 4: embedded coin node (preferred over RPC when set)
     ltc::coin::CoinNodeInterface* m_embedded_node = nullptr;
+    // io_context for scheduling async verification timers
+    boost::asio::io_context*     m_context        = nullptr;
     std::atomic<bool>       m_work_valid{false};
     nlohmann::json          m_cached_template;
     std::vector<std::string> m_cached_merkle_branches;   // Stratum merkle branches
@@ -567,9 +576,24 @@ private:
     std::atomic<double> m_network_difficulty{0.0};
 
     // Recently found blocks for /recent_blocks
-    struct FoundBlock { uint64_t height; std::string hash; uint64_t ts; };
+    enum class BlockStatus : uint8_t {
+        pending   = 0,  // submitted, awaiting confirmation
+        confirmed = 1,  // in best chain (confirmations > 0)
+        orphaned  = 2,  // replaced by another block at same height
+        stale     = 3,  // submitted with stale prev_block
+    };
+    struct FoundBlock {
+        uint64_t    height;
+        std::string hash;
+        uint64_t    ts;
+        BlockStatus status{BlockStatus::pending};
+        uint8_t     check_count{0};   // how many verification attempts
+    };
     std::vector<FoundBlock> m_found_blocks;   // newest first, capped at 100
     mutable std::mutex      m_blocks_mutex;
+
+    block_verify_fn_t m_block_verify_fn;
+    void verify_found_block(size_t index);
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};

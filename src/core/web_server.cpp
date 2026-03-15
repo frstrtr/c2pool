@@ -2093,10 +2093,18 @@ nlohmann::json MiningInterface::rest_fee()
 
 nlohmann::json MiningInterface::rest_recent_blocks()
 {
+    static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
     nlohmann::json arr = nlohmann::json::array();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    for (const auto& b : m_found_blocks)
-        arr.push_back({{"height", b.height}, {"hash", b.hash}, {"ts", b.ts}});
+    for (const auto& b : m_found_blocks) {
+        arr.push_back({
+            {"height", b.height},
+            {"hash", b.hash},
+            {"ts", b.ts},
+            {"status", status_str[static_cast<int>(b.status)]},
+            {"checks", b.check_count}
+        });
+    }
     return arr;
 }
 
@@ -2362,9 +2370,74 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    m_found_blocks.insert(m_found_blocks.begin(), FoundBlock{height, hash.GetHex(), ts});
+    m_found_blocks.insert(m_found_blocks.begin(),
+        FoundBlock{height, hash.GetHex(), ts, BlockStatus::pending, 0});
     if (m_found_blocks.size() > 100)
         m_found_blocks.resize(100);
+}
+
+void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
+
+void MiningInterface::verify_found_block(size_t index)
+{
+    std::string hash;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (index >= m_found_blocks.size()) return;
+        auto& blk = m_found_blocks[index];
+        if (blk.status != BlockStatus::pending) return;
+        blk.check_count++;
+        hash = blk.hash;
+    }
+
+    if (!m_block_verify_fn) return;
+
+    // Callback returns: >0 confirmed, <0 orphaned, 0 unknown/pending
+    int result = 0;
+    try { result = m_block_verify_fn(hash); } catch (...) {}
+
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    if (index >= m_found_blocks.size()) return;
+    auto& blk = m_found_blocks[index];
+    if (blk.status != BlockStatus::pending) return;
+
+    if (result > 0) {
+        blk.status = BlockStatus::confirmed;
+        LOG_INFO << "Block CONFIRMED: height=" << blk.height
+                 << " hash=" << blk.hash.substr(0, 16) << "..."
+                 << " (check #" << (int)blk.check_count << ")";
+    } else if (result < 0 || blk.check_count >= 3) {
+        blk.status = BlockStatus::orphaned;
+        LOG_WARNING << "Block ORPHANED: height=" << blk.height
+                    << " hash=" << blk.hash.substr(0, 16) << "..."
+                    << " (check #" << (int)blk.check_count << ")";
+    }
+}
+
+void MiningInterface::schedule_block_verification(const std::string& block_hash)
+{
+    // Find the block index by hash
+    size_t idx = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+            if (m_found_blocks[i].hash == block_hash) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx == SIZE_MAX) return;
+
+    // Schedule checks at +10s, +30s, +120s after block submission
+    auto& ioc = *m_context;
+    for (int delay : {10, 30, 120}) {
+        auto timer = std::make_shared<boost::asio::steady_timer>(
+            ioc, std::chrono::seconds(delay));
+        timer->async_wait([this, idx, timer](boost::system::error_code ec) {
+            if (!ec) verify_found_block(idx);
+        });
+    }
 }
 
 // ──────────── p2pool legacy compatibility REST endpoints ─────────────────

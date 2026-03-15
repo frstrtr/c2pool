@@ -1099,6 +1099,19 @@ int main(int argc, char* argv[]) {
                 // Wire embedded node + header-sync callback (now that web_server is alive)
                 web_server.set_embedded_node(embedded_node.get());
 
+                // Wire block verification: check header chain for found blocks
+                auto* mi = web_server.get_mining_interface();
+                mi->set_io_context(&ioc);
+                mi->set_block_verify_fn(
+                    [chain = embedded_chain.get()](const std::string& hash_hex) -> int {
+                        uint256 h;
+                        h.SetHex(hash_hex);
+                        auto entry = chain->get_header(h);
+                        if (entry.has_value())
+                            return 1;  // confirmed — in our chain
+                        return 0;      // unknown — still pending
+                    });
+
                 // Header validation thread pool (1 thread) — keeps scrypt off io_context.
                 // Shared_ptr so it stays alive for the lifetime of the callbacks.
                 auto hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
@@ -1338,6 +1351,9 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 web_server.get_mining_interface()->record_found_block(height, block_hash);
+                // Schedule async verification at +10s, +30s, +120s
+                if (stale_info == 0)
+                    web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
 
                 const char* stale_str = (stale_info == 253) ? " [ORPHAN — stale prev]"
                                       : (stale_info == 254) ? " [DOA — daemon rejected]"
