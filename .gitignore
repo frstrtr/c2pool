@@ -89,3 +89,6 @@ ref/
 /run-testnet.sh
 CLAUDE.md
 .claudeignore
+/doge_testnet/
+/doge/
+.claude/
