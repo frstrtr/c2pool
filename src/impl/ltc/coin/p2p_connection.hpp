@@ -64,7 +64,6 @@ public:
 
     void write(std::unique_ptr<RawMessage>& rmsg)
     {
-        LOG_TRACE << "connection writed " << rmsg->m_command;
         m_socket->write(std::move(rmsg));
     }
 

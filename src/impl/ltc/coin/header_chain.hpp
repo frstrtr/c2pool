@@ -10,6 +10,7 @@
 
 #include <core/uint256.hpp>
 #include <core/leveldb_store.hpp>
+#include <core/log.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
