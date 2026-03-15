@@ -717,9 +717,13 @@ void NodeImpl::run_think()
                     trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
                     trim_chain(m_tracker.chain, "chain");
 
-                    // Ban peers that provided invalid/unverifiable shares
+                    // Ban peers that provided invalid/unverifiable shares.
+                    // Skip localhost:0 — that's our own locally created shares
+                    // which can fail GENTX during chain growth (timing race, not a bug).
                     auto now = std::chrono::steady_clock::now();
                     for (const auto& bad_addr : result.bad_peer_addresses) {
+                        if (bad_addr.port() == 0)
+                            continue; // local share — don't ban ourselves
                         LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
                                     << " for unverifiable shares";
                         m_ban_list[bad_addr] = now + m_ban_duration;

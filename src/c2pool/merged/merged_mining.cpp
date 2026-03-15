@@ -426,7 +426,7 @@ bool AuxChainRPC::submit_aux_block(const uint256& block_hash, const std::string&
 {
     try {
         call("submitauxblock", nlohmann::json::array({block_hash.GetHex(), auxpow_hex}));
-        LOG_INFO << "[MM:" << m_config.symbol << "] Aux block submitted successfully!";
+        LOG_INFO << "[MM:" << m_config.symbol << "] Aux block ACCEPTED by daemon!";
         return true;
     } catch (const std::exception& e) {
         LOG_WARNING << "[MM:" << m_config.symbol << "] submitauxblock failed: " << e.what();
@@ -662,7 +662,13 @@ void MergedMiningManager::try_submit_merged_blocks(
             continue;  // doesn't meet this chain's target
         }
 
-        LOG_INFO << "[MM:" << chain.config.symbol << "] Parent PoW meets aux target! Submitting merged block...";
+        LOG_INFO << "\n"
+                 << "  ###  MERGED BLOCK FOUND! " << chain.config.symbol << "  ###\n"
+                 << "  Chain:      " << chain.config.symbol << " (chain_id=" << chain.config.chain_id << ")\n"
+                 << "  Height:     " << chain.current_work.height << "\n"
+                 << "  Aux hash:   " << chain.current_work.block_hash.GetHex().substr(0, 32) << "...\n"
+                 << "  Aux target: " << chain.current_work.target.GetHex().substr(0, 32) << "...\n"
+                 << "  Parent PoW: " << parent_hash.GetHex().substr(0, 32) << "...";
 
         // Build aux merkle proof for this chain's slot
         auto proof = m_tree.compute_root(slot_hashes, slot);

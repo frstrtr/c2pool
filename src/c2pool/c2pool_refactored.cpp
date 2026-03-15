@@ -1258,7 +1258,8 @@ int main(int argc, char* argv[]) {
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
-            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc](const std::string& header_hex, int stale_info) {
+            bool is_testnet = settings->m_testnet;
+            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc, is_testnet](const std::string& header_hex, int stale_info) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -1304,13 +1305,16 @@ int main(int argc, char* argv[]) {
                     height = tmpl["height"].get<uint64_t>();
                 web_server.get_mining_interface()->record_found_block(height, block_hash);
 
-                const char* stale_str = (stale_info == 253) ? " [ORPHAN]"
-                                      : (stale_info == 254) ? " [DOA]"
+                const char* stale_str = (stale_info == 253) ? " [ORPHAN — stale prev]"
+                                      : (stale_info == 254) ? " [DOA — daemon rejected]"
                                       : "";
-                LOG_INFO << "Block found! height=" << height
-                         << " hash=" << block_hash.GetHex()
-                         << stale_str
-                         << " — broadcast bestblock to P2P peers";
+                LOG_INFO << "\n"
+                         << "  ###  PARENT NETWORK BLOCK FOUND!  ###\n"
+                         << "  Network:    Litecoin (" << (is_testnet ? "tLTC" : "LTC") << ")\n"
+                         << "  Height:     " << height << "\n"
+                         << "  Block hash: " << block_hash.GetHex() << "\n"
+                         << "  Status:     " << (stale_info == 0 ? "ACCEPTED" : stale_str) << "\n"
+                         << "  Broadcast:  bestblock sent to P2P peers";
 
                 // Schedule post-submission orphan check at +30s and +120s (RPC mode only)
                 if (stale_info == 0 && !embedded_ltc)
