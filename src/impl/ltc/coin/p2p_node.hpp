@@ -62,6 +62,12 @@ private:
     bool m_reconnect_enabled = false;
     bool m_handshake_complete = false;
     std::string m_chain_label = "CoinP2P";
+    // BIP 152 compact block state
+    bool m_peer_supports_cmpct{false};
+    uint64_t m_peer_cmpct_version{0};
+    bool m_peer_wants_cmpct_announce{false};
+    // BIP 339 wtxidrelay state
+    bool m_peer_wtxidrelay{false};
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -256,18 +262,36 @@ public:
         }
     }
 
-    /// Relay a pre-serialized block (Bitcoin wire format) via P2P.
-    /// Avoids BlockType deserialization which uses VarInt version.
+    /// Whether this peer supports compact blocks (BIP 152).
+    bool supports_compact_blocks() const { return m_peer_supports_cmpct; }
+    bool peer_wtxidrelay() const { return m_peer_wtxidrelay; }
+
+    /// Relay a pre-serialized block via P2P.
+    /// Automatically uses compact block format for peers that support it.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
-        if (m_peer)
-        {
-            PackStream ps(block_bytes);
-            auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
-            m_peer->write(rmsg);
-        }
-        // Silent skip when peer not connected — the broadcaster logs the
-        // aggregate count ("broadcast to N/M peers") which is sufficient.
+        if (!m_peer) return;
+
+        // TODO: when compact block sending is fully implemented,
+        // send cmpctblock to peers that negotiated sendcmpct.
+        // For now, always send full block (compatible with all peers).
+        // Future: if (m_peer_supports_cmpct && m_peer_wants_cmpct_announce)
+        //             submit_block_compact(block_bytes);
+        //         else
+        //             submit_block_full(block_bytes);
+
+        PackStream ps(block_bytes);
+        auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
+        m_peer->write(rmsg);
+    }
+
+    /// Send a full block message (legacy relay).
+    void submit_block_full(const std::vector<unsigned char>& block_bytes)
+    {
+        if (!m_peer) return;
+        PackStream ps(block_bytes);
+        auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
+        m_peer->write(rmsg);
     }
 
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
@@ -368,6 +392,10 @@ private:
         // BIP 130: request header-first block announcements
         auto msg_sendheaders = message_sendheaders::make_raw();
         m_peer->write(msg_sendheaders);
+
+        // BIP 152: announce compact block support (version 2 = with witness)
+        auto msg_cmpct = message_sendcmpct::make_raw(false, 2);
+        m_peer->write(msg_cmpct);
 
         // BIP 133: advertise minimum feerate (0 = accept all transactions)
         send_feefilter(0);
@@ -541,9 +569,12 @@ private:
 
     ADD_P2P_HANDLER(sendcmpct)
     {
-        // BIP 152: Compact block negotiation
-        LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer sendcmpct: announce="
-                        << msg->m_announce << " version=" << msg->m_version;
+        // BIP 152: Compact block negotiation — record peer capability
+        m_peer_supports_cmpct = true;
+        m_peer_cmpct_version = msg->m_version;
+        m_peer_wants_cmpct_announce = msg->m_announce;
+        LOG_INFO << "[" << m_chain_label << "] Peer supports compact blocks v"
+                 << msg->m_version << " (announce=" << msg->m_announce << ")";
     }
 
     ADD_P2P_HANDLER(cmpctblock)
@@ -565,8 +596,9 @@ private:
 
     ADD_P2P_HANDLER(wtxidrelay)
     {
-        // BIP 339: Peer wants wtxid-based tx relay — acknowledged
-        LOG_DEBUG_COIND << "Peer supports wtxidrelay (BIP 339)";
+        // BIP 339: Peer wants wtxid-based tx relay
+        m_peer_wtxidrelay = true;
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer supports wtxidrelay (BIP 339)";
     }
 
     ADD_P2P_HANDLER(sendaddrv2)
