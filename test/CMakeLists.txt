@@ -142,4 +142,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(test_phase3_live "" AUTO)
     gtest_add_tests(test_phase4_embedded "" AUTO)
     gtest_add_tests(test_phase4_live "" AUTO)
+
+    add_executable(test_doge_chain test_doge_chain.cpp)
+    target_link_libraries(test_doge_chain PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_doge_chain "" AUTO)
 endif()
