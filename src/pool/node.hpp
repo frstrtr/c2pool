@@ -65,9 +65,9 @@ protected:
     std::unique_ptr<core::Timer> m_ping_timer;
 
 public:
-    BaseNode() : Factory<Server, Client>(nullptr, this), m_addrs("") {}
-    BaseNode(boost::asio::io_context* context, config_t* config) 
-        : Factory<Server, Client>(context, this), m_context(context), m_addrs(config->m_name), m_config(config) 
+    BaseNode() : Factory<Server, Client>(nullptr, this, "Pool"), m_addrs("") {}
+    BaseNode(boost::asio::io_context* context, config_t* config)
+        : Factory<Server, Client>(context, this, "Pool"), m_context(context), m_addrs(config->m_name), m_config(config)
     {
         // ping timer for all peers
         m_ping_timer = std::make_unique<core::Timer>(m_context, true);

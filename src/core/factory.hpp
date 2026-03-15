@@ -55,9 +55,9 @@ protected:
     }
 
 public:
-	Server(io::io_context* context, INetwork* node) : m_acceptor(*context), m_node(node)
+	Server(io::io_context* context, INetwork* node, const std::string& /*label*/ = "")
+		: m_acceptor(*context), m_node(node)
 	{
-
 	}
 
 	void listen(auto listen_port)
@@ -82,6 +82,7 @@ private:
 	INetwork* m_node;
 	io::io_context* m_context;
     io::ip::tcp::resolver m_resolver;
+    std::string m_label = "Net";  // chain/protocol label for log messages
 
 	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints)
 	{
@@ -95,13 +96,13 @@ private:
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
-						LOG_TRACE << "[Net] Connection failed: " << ec.message();
+						LOG_TRACE << "[" << m_label << "] Connection failed: " << ec.message();
 					else
 						LOG_DEBUG_COIND << "Factory::Client::connect_socket canceled";
 					return;
 				}
 
-				LOG_TRACE << "[Net] Handshake with " << ep.address() << ":" << ep.port();
+				LOG_TRACE << "[" << m_label << "] Handshake with " << ep.address() << ":" << ep.port();
 				socket->init();
 
 				m_node->connected(socket);
@@ -118,7 +119,7 @@ private:
 				{
 					
 					if (ec != boost::system::errc::operation_canceled)
-						LOG_TRACE << "[Net] DNS resolve failed: " << ec.message();
+						LOG_TRACE << "[" << m_label << "] DNS resolve failed: " << ec.message();
 					else
 						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";
 					return;
@@ -130,7 +131,8 @@ private:
 	}
 
 public:
-	Client(io::io_context* context, INetwork* node) : m_context(context), m_resolver(*context), m_node(node)
+	Client(io::io_context* context, INetwork* node, const std::string& label = "Net")
+		: m_context(context), m_resolver(*context), m_node(node), m_label(label)
 	{
 	}
 
@@ -151,7 +153,8 @@ class Factory : public Components...
 	INetwork* m_node;
 	
 public:
-	Factory(io::io_context* context, INetwork* node) : m_context(context), m_node(node), Components(context, node)...
+	Factory(io::io_context* context, INetwork* node, const std::string& label = "Net")
+		: m_context(context), m_node(node), Components(context, node, label)...
 	{
 
 	}

@@ -76,7 +76,8 @@ private:
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config,
             const std::string& chain_label = "CoinP2P")
-        : core::Factory<core::Client>(context, this), m_context(context), m_coin(coin), m_config(config)
+        : core::Factory<core::Client>(context, this, chain_label)
+        , m_context(context), m_coin(coin), m_config(config)
         , m_chain_label(chain_label)
     {
     }
