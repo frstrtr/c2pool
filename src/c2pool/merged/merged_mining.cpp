@@ -989,6 +989,13 @@ void MergedMiningManager::record_discovered_block(
 
     m_discovered_blocks.push_back(std::move(blk));
     m_blocks_per_chain[chain.config.chain_id]++;
+
+    // Notify MiningInterface for unified block verification
+    if (m_on_merged_block_found) {
+        m_on_merged_block_found(chain.config.symbol,
+            chain.current_work.height,
+            chain.current_work.block_hash.GetHex(), accepted);
+    }
 }
 
 std::vector<DiscoveredMergedBlock> MergedMiningManager::get_discovered_blocks() const

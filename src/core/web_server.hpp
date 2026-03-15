@@ -436,6 +436,9 @@ public:
     void set_io_context(boost::asio::io_context* ctx) { m_context = ctx; }
     void schedule_block_verification(const std::string& block_hash);
 
+    // Per-chain verify function: register additional verifiers for merged chains
+    void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
+
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
@@ -595,7 +598,8 @@ private:
     std::vector<FoundBlock> m_found_blocks;   // newest first, capped at 100
     mutable std::mutex      m_blocks_mutex;
 
-    block_verify_fn_t m_block_verify_fn;
+    block_verify_fn_t m_block_verify_fn;  // default (parent chain)
+    std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
     void verify_found_block(size_t index);
 
     // Pool start time for /uptime

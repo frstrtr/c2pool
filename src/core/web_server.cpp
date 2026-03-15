@@ -2383,6 +2383,10 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
 
 void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
 
+void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn) {
+    m_chain_verify_fns[chain] = std::move(fn);
+}
+
 void MiningInterface::verify_found_block(size_t index)
 {
     std::string hash;
@@ -2395,11 +2399,25 @@ void MiningInterface::verify_found_block(size_t index)
         hash = blk.hash;
     }
 
-    if (!m_block_verify_fn) return;
+    // Select chain-specific verifier, fall back to default
+    std::string chain;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (index < m_found_blocks.size())
+            chain = m_found_blocks[index].chain;
+    }
+    block_verify_fn_t verify_fn;
+    auto it = m_chain_verify_fns.find(chain);
+    if (it != m_chain_verify_fns.end())
+        verify_fn = it->second;
+    else
+        verify_fn = m_block_verify_fn;
+
+    if (!verify_fn) return;
 
     // Callback returns: >0 confirmed, <0 orphaned, 0 unknown/pending
     int result = 0;
-    try { result = m_block_verify_fn(hash); } catch (...) {}
+    try { result = verify_fn(hash); } catch (...) {}
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     if (index >= m_found_blocks.size()) return;
@@ -2445,9 +2463,26 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     }
     if (idx == SIZE_MAX) return;
 
-    // Schedule checks at +10s, +30s, +120s after block submission
+    // Schedule checks based on chain's block time:
+    // LTC (2.5 min): +30s, +150s (1 block), +300s (2 blocks)
+    // DOGE (1 min):  +10s, +60s (1 block), +120s (2 blocks)
+    // Default:       +10s, +60s, +120s
+    std::string chain_name;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (idx < m_found_blocks.size())
+            chain_name = m_found_blocks[idx].chain;
+    }
+    std::vector<int> delays;
+    if (chain_name == "LTC" || chain_name == "tLTC")
+        delays = {30, 150, 300};
+    else if (chain_name == "DOGE")
+        delays = {10, 60, 120};
+    else
+        delays = {10, 60, 120};
+
     auto& ioc = *m_context;
-    for (int delay : {10, 30, 120}) {
+    for (int delay : delays) {
         auto timer = std::make_shared<boost::asio::steady_timer>(
             ioc, std::chrono::seconds(delay));
         timer->async_wait([this, idx, timer](boost::system::error_code ec) {

@@ -244,6 +244,12 @@ public:
     using BlockRelayFn = std::function<void(uint32_t chain_id, const std::string& block_hex)>;
     void set_block_relay_fn(BlockRelayFn fn);
 
+    /// Callback when a merged block is found: (symbol, height, block_hash, accepted)
+    /// Used by MiningInterface to record in FoundBlock list for unified verification.
+    using MergedBlockFoundFn = std::function<void(const std::string& symbol, int height,
+                                                   const std::string& block_hash, bool accepted)>;
+    void set_on_merged_block_found(MergedBlockFoundFn fn) { m_on_merged_block_found = std::move(fn); }
+
 private:
     void poll_loop();
     void refresh_aux_work();
@@ -285,6 +291,7 @@ private:
 
     // P2P block relay callback (set by integration layer)
     BlockRelayFn m_block_relay_fn;
+    MergedBlockFoundFn m_on_merged_block_found;
 
     // Discovered merged blocks history
     std::vector<DiscoveredMergedBlock> m_discovered_blocks;
