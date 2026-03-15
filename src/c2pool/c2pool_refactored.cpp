@@ -1101,10 +1101,15 @@ int main(int argc, char* argv[]) {
                         boost::asio::post(*hdr_pool,
                             [batch, chain, bcaster, &web_server, &ioc]() {
                                 int accepted = chain->add_headers(*batch);
-                                if (accepted > 0) {
-                                    // Post follow-up back onto io_context thread
+                                // Always request more if we got a full batch (2000 headers) —
+                                // even if all were duplicates (from LevelDB), the next batch
+                                // may have new ones.  Without this, header sync stalls when
+                                // the chain is partially loaded from persistence.
+                                bool full_batch = (batch->size() >= 2000);
+                                if (accepted > 0 || full_batch) {
                                     boost::asio::post(ioc, [accepted, chain, bcaster, &web_server]() {
-                                        web_server.trigger_work_refresh();
+                                        if (accepted > 0)
+                                            web_server.trigger_work_refresh();
                                         bcaster->request_headers(chain->get_locator(), uint256::ZERO);
                                     });
                                 }

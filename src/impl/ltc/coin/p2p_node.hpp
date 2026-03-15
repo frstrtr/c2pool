@@ -133,6 +133,9 @@ public:
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
     {
         if (!m_peer) return;
+        LOG_INFO << "getheaders: locator_size=" << locator.size()
+                 << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16))
+                 << " stop=" << (stop.IsNull() ? "0" : stop.GetHex().substr(0, 16));
         auto msg = message_getheaders::make_raw(version, locator, stop);
         m_peer->write(msg);
     }

@@ -1,4 +1,5 @@
 #include "socket.hpp"
+#include "log.hpp"
 #include <btclibs/util/strencodings.h>
 
 namespace core
@@ -122,6 +123,7 @@ void Socket::message_processing(std::shared_ptr<Packet> packet)
     }
     
     auto msg = packet->to_message();
+    LOG_INFO << "P2P recv cmd=" << msg->m_command << " len=" << packet->payload.size() << " from=" << m_addr.to_string();
     m_node->handle(std::move(msg), m_addr);
 }
 
