@@ -4877,11 +4877,14 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     std::string ntime       = params[3].get<std::string>();
     std::string nonce       = params[4].get<std::string>();
     
-    // Stale detection: check if job_id is still active
+    // Stale detection: check if job_id is still active.
     auto job_it = active_jobs_.find(job_id);
-    if (job_it == active_jobs_.end()) {
+    bool is_stale = (job_it == active_jobs_.end());
+    if (is_stale) {
         ++stale_shares_;
         LOG_INFO << "Stale share from " << username_ << " for expired job " << job_id;
+        // Return stale response to the miner, but DON'T skip block checking.
+        // With MAX_ACTIVE_JOBS=32, most "stale" shares still have job data.
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = false;
