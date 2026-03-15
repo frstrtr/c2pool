@@ -1034,11 +1034,11 @@ int main(int argc, char* argv[]) {
                         genesis.m_nonce     = 2084524493;
                     }
                     if (embedded_chain->add_header(genesis))
-                        LOG_INFO << "HeaderChain: genesis block seeded (height 0)";
+                        LOG_INFO << "[LTC] HeaderChain: genesis block seeded (height 0)";
                     else
                         LOG_WARNING << "HeaderChain: genesis seed rejected — wrong genesis hash?";
                 } else {
-                    LOG_INFO << "HeaderChain: loaded " << embedded_chain->size()
+                    LOG_INFO << "[LTC] HeaderChain: loaded " << embedded_chain->size()
                              << " headers from LevelDB (height=" << embedded_chain->height() << ")";
                 }
 
@@ -1304,7 +1304,7 @@ int main(int argc, char* argv[]) {
             // When a peer announces a new best block, refresh our mining template
             p2p_node->set_on_bestblock([&web_server]() {
                 web_server.trigger_work_refresh();
-                LOG_INFO << "bestblock received from P2P peer — work template refreshed";
+                LOG_INFO << "[LTC] bestblock received from P2P peer — work template refreshed";
             });
 
             // When a block submission is attempted, broadcast bestblock to all P2P peers
@@ -1844,7 +1844,7 @@ int main(int argc, char* argv[]) {
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
                         if (now - s_last_warn.load() > 30'000'000'000LL) {
                             s_last_warn.store(now);
-                            LOG_WARNING << "Skipping share creation: chain not ready (waiting for shares from peers)";
+                            LOG_WARNING << "[P2Pool] Skipping share creation: chain not ready (waiting for shares from peers)";
                         }
                         return;
                     }

@@ -1317,7 +1317,7 @@ void MiningInterface::refresh_work()
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
                 if (!best.IsNull()) {
-                    LOG_INFO << "refresh_work: PPLNS active, best_share=" << best.GetHex().substr(0,16) << "..."
+                    LOG_INFO << "[P2Pool] refresh_work: PPLNS active, best_share=" << best.GetHex().substr(0,16) << "..."
                              << " donation_script_len=" << m_donation_script.size();
                     uint32_t nbits = std::stoul(
                         wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
@@ -1374,7 +1374,7 @@ void MiningInterface::refresh_work()
                             pplns_outputs.push_back(donation_entry);
 
                         pplns_raw_scripts = true;
-                        LOG_INFO << "refresh_work: V36 PPLNS coinbase with "
+                        LOG_INFO << "[P2Pool] refresh_work: V36 PPLNS coinbase with "
                                  << pplns_outputs.size() << " outputs (donation_last="
                                  << found_donation << ")";
                     }
@@ -1437,7 +1437,7 @@ void MiningInterface::refresh_work()
                                   ? wd.m_data["mweb"].get<std::string>() : "";
         m_work_valid              = true;
 
-        LOG_INFO << "refresh_work: height=" << wd.m_data.value("height", 0)
+        LOG_INFO << "[LTC] refresh_work: height=" << wd.m_data.value("height", 0)
                  << " txs=" << wd.m_hashes.size()
                  << " latency=" << wd.m_latency << "ms"
                  << " merkle_branches=" << m_cached_merkle_branches.size();
@@ -4994,7 +4994,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     bool is_stale = (job_it == active_jobs_.end());
     if (is_stale) {
         ++stale_shares_;
-        LOG_INFO << "Stale share from " << username_ << " for expired job " << job_id;
+        LOG_INFO << "[Stratum] Stale share from " << username_ << " for expired job " << job_id;
         // Return stale response to the miner, but DON'T skip block checking.
         // With MAX_ACTIVE_JOBS=32, most "stale" shares still have job data.
         nlohmann::json response;
@@ -5075,7 +5075,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // Valid share — meets pool difficulty target
     ++accepted_shares_;
 
-    LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
+    LOG_INFO << "[Stratum] Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
              << ", rejected=" << rejected_shares_ << ")";
 

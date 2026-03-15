@@ -483,7 +483,7 @@ public:
                 static uint32_t s_last_logged = 0;
                 if (m_tip_height - s_last_logged >= 2000 || pct >= 99.9) {
                     s_last_logged = m_tip_height;
-                    LOG_INFO << "Header sync: " << m_tip_height << "/" << peer_tip
+                    LOG_INFO << "[LTC] Header sync: " << m_tip_height << "/" << peer_tip
                              << " (" << std::fixed << std::setprecision(1) << pct << "%)";
                 }
             }
