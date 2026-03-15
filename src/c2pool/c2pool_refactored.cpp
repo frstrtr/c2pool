@@ -1259,7 +1259,8 @@ int main(int argc, char* argv[]) {
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
             bool is_testnet = settings->m_testnet;
-            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc, is_testnet](const std::string& header_hex, int stale_info) {
+            auto* embedded_chain_ptr = embedded_chain.get();
+            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc, is_testnet, embedded_chain_ptr](const std::string& header_hex, int stale_info) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -1297,12 +1298,31 @@ int main(int argc, char* argv[]) {
                     p2p_node->broadcast_bestblock(hdr);
                 }
 
-                // Record found block for REST /recent_blocks
+                // Record found block for REST /recent_blocks.
+                // Extract height from the block header's prev_block hash by looking it
+                // up in the header chain — this gives the ACTUAL block height, not the
+                // live template height (which changes rapidly during sync).
                 uint256 block_hash = Hash(ParseHex(header_hex.substr(0, 160)));
                 uint64_t height = 0;
-                auto tmpl = web_server.get_mining_interface()->get_current_work_template();
-                if (!tmpl.is_null() && tmpl.contains("height"))
-                    height = tmpl["height"].get<uint64_t>();
+                {
+                    // prev_block is at bytes 4..36 of the 80-byte header (LE uint256)
+                    auto hdr_bytes = ParseHex(header_hex.substr(0, 160));
+                    if (hdr_bytes.size() >= 36) {
+                        uint256 prev_block;
+                        std::memcpy(prev_block.data(), hdr_bytes.data() + 4, 32);
+                        if (embedded_chain_ptr) {
+                            auto entry = embedded_chain_ptr->get_header(prev_block);
+                            if (entry.has_value())
+                                height = entry->height + 1;
+                        }
+                    }
+                    // Fallback to template height if header chain lookup fails
+                    if (height == 0) {
+                        auto tmpl = web_server.get_mining_interface()->get_current_work_template();
+                        if (!tmpl.is_null() && tmpl.contains("height"))
+                            height = tmpl["height"].get<uint64_t>();
+                    }
+                }
                 web_server.get_mining_interface()->record_found_block(height, block_hash);
 
                 const char* stale_str = (stale_info == 253) ? " [ORPHAN — stale prev]"
