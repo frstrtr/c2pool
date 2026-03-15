@@ -2403,14 +2403,22 @@ void MiningInterface::verify_found_block(size_t index)
 
     if (result > 0) {
         blk.status = BlockStatus::confirmed;
-        LOG_INFO << "Block CONFIRMED: height=" << blk.height
-                 << " hash=" << blk.hash.substr(0, 16) << "..."
-                 << " (check #" << (int)blk.check_count << ")";
+        auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+        LOG_INFO << "\n"
+                 << "  +++  BLOCK CONFIRMED  +++\n"
+                 << "  Height:     " << blk.height << "\n"
+                 << "  Block hash: " << blk.hash << "\n"
+                 << "  Verified:   check #" << (int)blk.check_count
+                 << " (" << age_sec << "s after submission)";
     } else if (result < 0 || blk.check_count >= 3) {
         blk.status = BlockStatus::orphaned;
-        LOG_WARNING << "Block ORPHANED: height=" << blk.height
-                    << " hash=" << blk.hash.substr(0, 16) << "..."
-                    << " (check #" << (int)blk.check_count << ")";
+        auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+        LOG_WARNING << "\n"
+                    << "  ---  BLOCK ORPHANED  ---\n"
+                    << "  Height:     " << blk.height << "\n"
+                    << "  Block hash: " << blk.hash << "\n"
+                    << "  Checked:    " << (int)blk.check_count
+                    << " times over " << age_sec << "s — not in best chain";
     }
 }
 
