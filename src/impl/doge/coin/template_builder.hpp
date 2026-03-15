@@ -38,7 +38,6 @@ using ltc::coin::compute_merkle_root;
 using ltc::coin::compute_txid;
 using ltc::coin::bits_to_hex;
 using ltc::coin::TX_WITH_WITNESS;
-using IndexEntry = ltc::coin::IndexEntry;
 
 // ─── DOGE TemplateBuilder ────────────────────────────────────────────────────
 

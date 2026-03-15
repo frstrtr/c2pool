@@ -33,6 +33,12 @@
 namespace doge {
 namespace coin {
 
+// Reuse LTC block types — DOGE uses identical Bitcoin wire format
+using ltc::coin::BlockHeaderType;
+using ltc::coin::BlockType;
+// PoW functions (scrypt_hash, check_pow, block_hash, get_block_proof) are
+// defined inline below — copied from LTC since they're header-local.
+
 // ─── Index Entry ────────────────────────────────────────────────────────────
 
 /// Status flags for header validation state

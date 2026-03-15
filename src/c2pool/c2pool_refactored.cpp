@@ -44,6 +44,11 @@
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
+// Phase 5: Embedded DOGE node for daemonless merged mining
+#include <impl/doge/coin/chain_params.hpp>
+#include <impl/doge/coin/header_chain.hpp>
+#include <impl/doge/coin/template_builder.hpp>
+#include <impl/doge/coin/aux_chain_embedded.hpp>
 
 // V36-compatible operational features
 #include <impl/ltc/pool_monitor.hpp>
@@ -294,7 +299,11 @@ int main(int argc, char* argv[]) {
     bool integrated_mode = false;
     bool sharechain_mode = false;
     bool embedded_ltc    = false;    // Phase 4: use embedded coin node instead of daemon RPC
-    std::string header_checkpoint_str;  // --header-checkpoint HEIGHT:HASH
+    bool embedded_doge   = false;    // Phase 5: use embedded DOGE node for merged mining
+    std::string header_checkpoint_str;       // --header-checkpoint HEIGHT:HASH (LTC)
+    std::string doge_header_checkpoint_str;  // --doge-header-checkpoint HEIGHT:HASH
+    std::string doge_p2p_address;            // --doge-p2p-address HOST
+    int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
 
     // Coin daemon P2P connection (for fast block relay alongside RPC)
@@ -452,10 +461,25 @@ int main(int argc, char* argv[]) {
             embedded_ltc = true;
             cli_explicit.insert("embedded_ltc");
         }
+        else if (arg == "--embedded-doge") {
+            embedded_doge = true;
+            cli_explicit.insert("embedded_doge");
+        }
         else if (arg == "--header-checkpoint" && i + 1 < argc) {
-            // Format: HEIGHT:HASH (e.g., 4600000:da433fe7ca00...)
             header_checkpoint_str = argv[++i];
             cli_explicit.insert("header_checkpoint");
+        }
+        else if (arg == "--doge-header-checkpoint" && i + 1 < argc) {
+            doge_header_checkpoint_str = argv[++i];
+            cli_explicit.insert("doge_header_checkpoint");
+        }
+        else if (arg == "--doge-p2p-address" && i + 1 < argc) {
+            doge_p2p_address = argv[++i];
+            cli_explicit.insert("doge_p2p_address");
+        }
+        else if (arg == "--doge-p2p-port" && i + 1 < argc) {
+            doge_p2p_port = std::stoi(argv[++i]);
+            cli_explicit.insert("doge_p2p_port");
         }
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
@@ -1900,6 +1924,11 @@ int main(int argc, char* argv[]) {
             // Merged chain P2P broadcasters (one per chain with P2P configured)
             std::map<uint32_t, std::unique_ptr<c2pool::merged::CoinBroadcaster>> merged_broadcasters;
 
+            // Phase 5: Embedded DOGE chain objects (created before mm_manager)
+            std::unique_ptr<doge::coin::HeaderChain>  doge_chain;
+            std::unique_ptr<ltc::coin::Mempool>       doge_pool;
+            std::unique_ptr<doge::coin::DOGEChainParams> doge_params_ptr;
+
             if (!merged_chain_specs.empty()) {
                 mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
                 for (const auto& spec : merged_chain_specs) {
@@ -1909,17 +1938,17 @@ int main(int argc, char* argv[]) {
                     std::istringstream ss(spec);
                     while (std::getline(ss, token, ':'))
                         parts.push_back(token);
-                    if (parts.size() < 6) {
+                    if (parts.size() < 6 && !(embedded_doge && parts.size() >= 2)) {
                         LOG_ERROR << "Invalid --merged spec (expected SYMBOL:CHAIN_ID:HOST:PORT:USER:PASS[:P2P_PORT]): " << spec;
                         continue;
                     }
                     c2pool::merged::AuxChainConfig cfg;
                     cfg.symbol       = parts[0];
                     cfg.chain_id     = static_cast<uint32_t>(std::stoul(parts[1]));
-                    cfg.rpc_host     = parts[2];
-                    cfg.rpc_port     = static_cast<uint16_t>(std::stoul(parts[3]));
-                    cfg.rpc_userpass = parts[4] + ":" + parts[5];
-                    cfg.multiaddress = false;  // Use createauxblock/submitauxblock for now
+                    if (parts.size() >= 4) cfg.rpc_host = parts[2];
+                    if (parts.size() >= 4) cfg.rpc_port = static_cast<uint16_t>(std::stoul(parts[3]));
+                    if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
+                    cfg.multiaddress = false;
 
                     // DOGE testnet burn address (version 0x71, hash160 = zeros)
                     // Used as payout address for createauxblock RPC
@@ -1940,10 +1969,53 @@ int main(int argc, char* argv[]) {
                     }
                     cfg.p2p_address = cfg.rpc_host;  // same host as RPC daemon
 
-                    mm_manager->add_chain(cfg);
-                    LOG_INFO << "Merged mining: added " << cfg.symbol
-                             << " (chain_id=" << cfg.chain_id << ") at "
-                             << cfg.rpc_host << ":" << cfg.rpc_port;
+                    // Phase 5: use embedded backend for DOGE if --embedded-doge
+                    if (embedded_doge && cfg.symbol == "DOGE") {
+                        auto dp = settings->m_testnet
+                            ? doge::coin::DOGEChainParams::testnet4alpha()
+                            : doge::coin::DOGEChainParams::mainnet();
+                        doge_params_ptr = std::make_unique<doge::coin::DOGEChainParams>(dp);
+
+                        std::string doge_db = (settings->m_testnet ? "doge_testnet" : "doge")
+                                            + std::string("/embedded_headers");
+                        doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
+                        if (!doge_chain->init())
+                            LOG_WARNING << "DOGE HeaderChain LevelDB init failed — in-memory only";
+
+                        // Apply DOGE checkpoint if provided
+                        if (!doge_header_checkpoint_str.empty()) {
+                            auto colon = doge_header_checkpoint_str.find(':');
+                            if (colon != std::string::npos) {
+                                uint32_t cp_h = static_cast<uint32_t>(std::stoul(
+                                    doge_header_checkpoint_str.substr(0, colon)));
+                                uint256 cp_hash;
+                                cp_hash.SetHex(doge_header_checkpoint_str.substr(colon + 1));
+                                if (!cp_hash.IsNull())
+                                    doge_chain->set_dynamic_checkpoint(cp_h, cp_hash);
+                            }
+                        }
+
+                        // Seed genesis if empty
+                        if (doge_chain->size() == 0) {
+                            LOG_INFO << "DOGE HeaderChain: starting from "
+                                     << (doge_chain->height() > 0 ? "checkpoint" : "genesis");
+                        } else {
+                            LOG_INFO << "DOGE HeaderChain: loaded " << doge_chain->size()
+                                     << " headers (height=" << doge_chain->height() << ")";
+                        }
+
+                        doge_pool = std::make_unique<ltc::coin::Mempool>();
+
+                        auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
+                            *doge_chain, *doge_pool, *doge_params_ptr, cfg);
+                        mm_manager->add_chain(cfg, std::move(backend));
+                        LOG_INFO << "Merged mining: DOGE embedded (no daemon) chain_id=" << cfg.chain_id;
+                    } else {
+                        mm_manager->add_chain(cfg);
+                        LOG_INFO << "Merged mining: added " << cfg.symbol
+                                 << " (chain_id=" << cfg.chain_id << ") at "
+                                 << cfg.rpc_host << ":" << cfg.rpc_port;
+                    }
 
                     // Create multi-peer P2P broadcaster if P2P port is configured
                     if (cfg.p2p_port > 0) {

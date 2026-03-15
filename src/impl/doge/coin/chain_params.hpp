@@ -150,47 +150,22 @@ inline uint32_t calculate_doge_next_work(
     if (negative || target.IsNull() || overflow)
         return prev_bits;
 
-    // Use 512-bit arithmetic to avoid overflow: target * modulated / retarget
-    // Since uint256 doesn't have native multiply-by-int64, we use shift+add.
-    // For DigiShield, modulated is close to retarget_timespan (45-90 seconds),
-    // so we can safely multiply a uint256 by a small int64.
-    uint256 new_target = target;
-    // Multiply: new_target *= modulated
-    {
-        uint256 t = new_target;
-        new_target.SetNull();
-        int64_t m = modulated;
-        for (int bit = 0; m > 0 && bit < 64; ++bit) {
-            if (m & 1) {
-                uint256 shifted = t;
-                shifted <<= bit;
-                new_target = new_target + shifted;
-            }
-            m >>= 1;
-        }
-    }
-    // Divide: new_target /= retarget_timespan
-    {
-        // Simple long division for uint256 / int64
-        uint256 quotient;
-        uint256 remainder;
-        uint64_t divisor = static_cast<uint64_t>(retarget_timespan);
-        for (int i = 255; i >= 0; --i) {
-            remainder <<= 1;
-            if (new_target.IsSet(i))
-                remainder = remainder + uint256::ONE;
-            if (remainder >= uint256(divisor)) {
-                remainder = remainder - uint256(divisor);
-                quotient.SetBit(i);
-            }
-        }
-        new_target = quotient;
-    }
+    // For DigiShield, modulated and retarget_timespan are small values (< 2^32),
+    // so we can use uint256's existing *= and /= operators safely.
+    // Same approach as LTC's calculate_next_work_required().
+    const uint256 bn_pow_limit = params.pow_limit;
+    bool shift = target.bits() > bn_pow_limit.bits() - 1;
+    if (shift)
+        target >>= 1;
+    target *= static_cast<uint32_t>(modulated);
+    target /= uint256(static_cast<uint64_t>(retarget_timespan));
+    if (shift)
+        target <<= 1;
 
-    if (new_target > params.pow_limit)
-        new_target = params.pow_limit;
+    if (target > params.pow_limit)
+        target = params.pow_limit;
 
-    return new_target.GetCompact();
+    return target.GetCompact();
 }
 
 // ─── DOGE subsidy schedule ────────────────────────────────────────────────
