@@ -480,7 +480,8 @@ private:
                                          const JobSnapshot* job = nullptr) const;
 
     // Try submitting to merged-mined aux chains if their target is met
-    void check_merged_mining(const std::string& block_hex,
+    // Returns true if a merged block was found (for twin block detection)
+    bool check_merged_mining(const std::string& block_hex,
                              const std::string& extranonce1,
                              const std::string& extranonce2,
                              const JobSnapshot* job = nullptr);

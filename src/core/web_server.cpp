@@ -708,15 +708,15 @@ std::string MiningInterface::get_node_fee_hash160() const
     return h160;
 }
 
-void MiningInterface::check_merged_mining(const std::string& block_hex,
+bool MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
                                           const JobSnapshot* job)
 {
-    if (!m_mm_manager) return;
+    if (!m_mm_manager) return false;
 
     // Extract 80-byte parent header (first 160 hex chars)
-    if (block_hex.size() < 160) return;
+    if (block_hex.size() < 160) return false;
     std::string parent_header_hex = block_hex.substr(0, 160);
 
     // Compute parent block hash (scrypt for LTC)
@@ -736,12 +736,15 @@ void MiningInterface::check_merged_mining(const std::string& block_hex,
         merkle_branches_copy = job ? job->merkle_branches : m_cached_merkle_branches;
     }
 
+    auto before = m_mm_manager->get_discovered_blocks().size();
     m_mm_manager->try_submit_merged_blocks(
         parent_header_hex,
         coinbase_hex,
         merkle_branches_copy,
         0,  // coinbase is always at index 0
         parent_hash);
+    auto after = m_mm_manager->get_discovered_blocks().size();
+    return after > before; // true if a merged block was found
 }
 
 // ─── Witness merkle root computation ──────────────────────────────────────────
@@ -3845,7 +3848,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                check_merged_mining(block_hex, extranonce1, extranonce2, job);
+                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
 
                 // Check PoW hash against the blockchain target before submitting
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
@@ -4103,7 +4106,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                check_merged_mining(block_hex, extranonce1, extranonce2, job);
+                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
 
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 if (block_bytes.size() == 80) {
@@ -4123,6 +4126,14 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     }
 
                     if (!block_target.IsNull() && pow_hash <= block_target) {
+                        // Twin block: same PoW hash meets BOTH parent and merged targets!
+                        if (merged_found) {
+                            LOG_INFO << "\n"
+                                     << "  ***  TWIN BLOCK!  ***\n"
+                                     << "  Parent + merged chain targets met by same PoW hash\n"
+                                     << "  PoW hash: " << pow_hash.GetHex().substr(0, 32) << "...";
+                        }
+
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
 
