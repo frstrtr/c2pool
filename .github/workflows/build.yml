@@ -84,6 +84,7 @@ jobs:
                     core_test sharechain_test share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
+                    test_doge_chain \
                     test_phase0_live test_phase1_live test_phase2_live \
                     test_phase3_live test_phase4_embedded test_phase4_live \
             -j$(nproc)
