@@ -172,6 +172,9 @@ public:
     // Register with a pre-built backend (for embedded DOGE node)
     void add_chain(const AuxChainConfig& config, std::unique_ptr<IAuxChainBackend> backend);
 
+    // Set a fallback backend for a chain — auto-switch when primary fails
+    void set_fallback_backend(uint32_t chain_id, std::unique_ptr<IAuxChainBackend> fallback);
+
     // Start polling aux daemons for new work (call after add_chain)
     void start();
     void stop();
@@ -259,9 +262,11 @@ private:
     // Registered aux chains
     struct ChainState {
         AuxChainConfig                       config;
-        std::unique_ptr<IAuxChainBackend>    rpc;  // RPC or embedded backend
+        std::unique_ptr<IAuxChainBackend>    rpc;       // primary backend (RPC or embedded)
+        std::unique_ptr<IAuxChainBackend>    fallback;  // fallback backend (embedded if primary is RPC)
         AuxWork                              current_work;
         std::string                          last_tip;
+        bool                                 using_fallback{false};
     };
     std::vector<ChainState> m_chains;
 

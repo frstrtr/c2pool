@@ -522,6 +522,18 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config, std::unique_pt
              << m_tree.slot_map[config.chain_id] << "/" << m_tree.size << ")";
 }
 
+void MergedMiningManager::set_fallback_backend(uint32_t chain_id, std::unique_ptr<IAuxChainBackend> fallback)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& chain : m_chains) {
+        if (chain.config.chain_id == chain_id) {
+            chain.fallback = std::move(fallback);
+            LOG_INFO << "[MM:" << chain.config.symbol << "] Fallback backend set (auto-switch on primary failure)";
+            return;
+        }
+    }
+}
+
 IAuxChainBackend* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -596,6 +608,26 @@ void MergedMiningManager::refresh_aux_work()
                      << " target=" << chain.current_work.target.GetHex().substr(0, 16) << "...";
         } catch (const std::exception& e) {
             LOG_WARNING << "[MM:" << chain.config.symbol << "] Failed to refresh: " << e.what();
+            // Fallback: switch to embedded backend if available
+            if (!chain.using_fallback && chain.fallback) {
+                LOG_INFO << "[MM:" << chain.config.symbol
+                         << "] Primary backend failed — switching to fallback (embedded)";
+                chain.rpc.swap(chain.fallback);
+                chain.using_fallback = true;
+                // Retry immediately with fallback
+                try {
+                    auto tip = chain.rpc->get_best_block_hash();
+                    chain.last_tip = tip;
+                    chain.current_work = chain.config.multiaddress
+                        ? chain.rpc->get_work_template()
+                        : chain.rpc->create_aux_block(chain.config.aux_payout_address);
+                    any_changed = true;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Fallback succeeded — height "
+                             << chain.current_work.height;
+                } catch (const std::exception& e2) {
+                    LOG_WARNING << "[MM:" << chain.config.symbol << "] Fallback also failed: " << e2.what();
+                }
+            }
         }
     }
 
