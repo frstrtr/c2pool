@@ -541,9 +541,26 @@ private:
 
     ADD_P2P_HANDLER(sendcmpct)
     {
-        // BIP 152: Compact block negotiation — acknowledge but don't use yet
-        LOG_DEBUG_COIND << "Peer sendcmpct: announce=" << msg->m_announce
-                        << " version=" << msg->m_version;
+        // BIP 152: Compact block negotiation
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer sendcmpct: announce="
+                        << msg->m_announce << " version=" << msg->m_version;
+    }
+
+    ADD_P2P_HANDLER(cmpctblock)
+    {
+        // BIP 152: Received compact block — parse header for block announcement
+        // Full compact block reconstruction requires mempool matching (future)
+        LOG_INFO << "[" << m_chain_label << "] Received compact block announcement";
+    }
+
+    ADD_P2P_HANDLER(getblocktxn)
+    {
+        // BIP 152: Peer requests missing transactions — we don't serve blocks
+    }
+
+    ADD_P2P_HANDLER(blocktxn)
+    {
+        // BIP 152: Received missing transactions — future: complete block reconstruction
     }
 
     ADD_P2P_HANDLER(wtxidrelay)

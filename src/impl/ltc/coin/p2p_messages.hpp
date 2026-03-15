@@ -267,6 +267,21 @@ BEGIN_MESSAGE(sendcmpct)
     }
 END_MESSAGE()
 
+// BIP 152 — cmpctblock (compact block — parsed manually from raw payload)
+BEGIN_MESSAGE(cmpctblock)
+    WITHOUT_MESSAGE_FIELDS() {}
+END_MESSAGE()
+
+// BIP 152 — getblocktxn (request missing transactions)
+BEGIN_MESSAGE(getblocktxn)
+    WITHOUT_MESSAGE_FIELDS() {}
+END_MESSAGE()
+
+// BIP 152 — blocktxn (missing transactions response)
+BEGIN_MESSAGE(blocktxn)
+    WITHOUT_MESSAGE_FIELDS() {}
+END_MESSAGE()
+
 // BIP 339 — wtxidrelay (empty, signals wtxid-based tx relay; sent before verack)
 BEGIN_MESSAGE(wtxidrelay)
     WITHOUT_MESSAGE_FIELDS() { }
@@ -298,6 +313,9 @@ using Handler = MessageHandler<
     message_feefilter,
     message_mempool,
     message_sendcmpct,
+    message_cmpctblock,
+    message_getblocktxn,
+    message_blocktxn,
     message_wtxidrelay,
     message_sendaddrv2
 >;
