@@ -608,9 +608,22 @@ private:
 
     /// Validate that the header's nBits matches the expected difficulty.
     bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) {
-        // For the first few blocks or when we don't have enough history, skip validation
         int64_t interval = m_params.difficulty_adjustment_interval();
         if (new_height < 2) return true; // genesis + first block
+
+        // After a fast-start checkpoint, skip difficulty validation until we have
+        // enough headers for the retarget lookback (interval = 2016).
+        // Without this, get_ancestor() fails because the checkpoint doesn't have
+        // the previous 2016 headers needed for difficulty calculation.
+        if (m_params.fast_start_checkpoint.has_value()) {
+            uint32_t cp_h = m_params.fast_start_checkpoint->height;
+            if (new_height > cp_h && new_height < cp_h + static_cast<uint32_t>(interval) + 10)
+                return true; // trust difficulty within first retarget window after checkpoint
+        }
+        // Also skip when we have a dynamic checkpoint (no fast_start_checkpoint set
+        // but chain started at a non-zero height)
+        if (m_headers.size() < static_cast<size_t>(interval + 10))
+            return true;
 
         // Get tip (the block we're building on)
         auto prev_it = m_headers.find(header.m_previous_block);
