@@ -94,37 +94,39 @@ std::string build_auxpow_proof(
     uint32_t aux_merkle_index,
     const std::string& parent_header_hex);     // 80-byte parent block header
 
+// ─── Abstract interface for auxiliary chain backend ──────────────────────────
+// Supports both RPC-based (external daemon) and embedded node implementations.
+class IAuxChainBackend
+{
+public:
+    virtual ~IAuxChainBackend() = default;
+    virtual bool connect() = 0;
+    virtual AuxWork get_work_template() = 0;
+    virtual AuxWork create_aux_block(const std::string& address) = 0;
+    virtual bool submit_block(const std::string& block_hex) = 0;
+    virtual bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex) = 0;
+    virtual std::string get_block_hex(const std::string& block_hash) = 0;
+    virtual std::string get_best_block_hash() = 0;
+    virtual std::vector<NetService> getpeerinfo() = 0;
+    virtual const AuxChainConfig& config() const = 0;
+};
+
 // ─── RPC client for one auxiliary chain daemon ───────────────────────────────
-class AuxChainRPC : public jsonrpccxx::IClientConnector
+class AuxChainRPC : public IAuxChainBackend, public jsonrpccxx::IClientConnector
 {
 public:
     AuxChainRPC(boost::asio::io_context& ioc, const AuxChainConfig& config);
     ~AuxChainRPC();
 
-    bool connect();
-
-    // Multiaddress mode: getblocktemplate with auxpow capabilities
-    AuxWork get_work_template();
-
-    // Single-address fallback: createauxblock
-    AuxWork create_aux_block(const std::string& address);
-
-    // Submit a complete block (multiaddress)
-    bool submit_block(const std::string& block_hex);
-
-    // Submit auxpow proof (single-address)
-    bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex);
-
-    // Fetch raw serialized block by hash (verbosity=0 → hex string)
-    std::string get_block_hex(const std::string& block_hash);
-
-    // Tip detection
-    std::string get_best_block_hash();
-
-    // Get connected peers from daemon (for broadcaster bootstrap)
-    std::vector<NetService> getpeerinfo();
-
-    const AuxChainConfig& config() const { return m_config; }
+    bool connect() override;
+    AuxWork get_work_template() override;
+    AuxWork create_aux_block(const std::string& address) override;
+    bool submit_block(const std::string& block_hex) override;
+    bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex) override;
+    std::string get_block_hex(const std::string& block_hash) override;
+    std::string get_best_block_hash() override;
+    std::vector<NetService> getpeerinfo() override;
+    const AuxChainConfig& config() const override { return m_config; }
 
 private:
     std::string Send(const std::string& request) override;
@@ -164,8 +166,11 @@ public:
     explicit MergedMiningManager(boost::asio::io_context& ioc);
     ~MergedMiningManager();
 
-    // Register an auxiliary chain
+    // Register an auxiliary chain (creates AuxChainRPC internally)
     void add_chain(const AuxChainConfig& config);
+
+    // Register with a pre-built backend (for embedded DOGE node)
+    void add_chain(const AuxChainConfig& config, std::unique_ptr<IAuxChainBackend> backend);
 
     // Start polling aux daemons for new work (call after add_chain)
     void start();
@@ -198,7 +203,7 @@ public:
     size_t chain_count() const { return m_chains.size(); }
 
     // Get RPC client for a chain (for wiring broadcaster getpeerinfo)
-    AuxChainRPC* get_chain_rpc(uint32_t chain_id);
+    IAuxChainBackend* get_chain_rpc(uint32_t chain_id);
 
     // ─── Block tracking ──────────────────────────────────────────────────
     // Thread-safe accessors for discovered merged blocks.
@@ -253,10 +258,10 @@ private:
 
     // Registered aux chains
     struct ChainState {
-        AuxChainConfig                   config;
-        std::unique_ptr<AuxChainRPC>     rpc;
-        AuxWork                          current_work;
-        std::string                      last_tip;   // for change detection
+        AuxChainConfig                       config;
+        std::unique_ptr<IAuxChainBackend>    rpc;  // RPC or embedded backend
+        AuxWork                              current_work;
+        std::string                          last_tip;
     };
     std::vector<ChainState> m_chains;
 

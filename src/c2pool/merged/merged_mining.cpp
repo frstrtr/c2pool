@@ -498,11 +498,17 @@ MergedMiningManager::~MergedMiningManager()
 
 void MergedMiningManager::add_chain(const AuxChainConfig& config)
 {
+    // Default: create RPC backend
+    add_chain(config, std::make_unique<AuxChainRPC>(m_ioc, config));
+}
+
+void MergedMiningManager::add_chain(const AuxChainConfig& config, std::unique_ptr<IAuxChainBackend> backend)
+{
     std::lock_guard<std::mutex> lock(m_mutex);
 
     ChainState state;
     state.config = config;
-    state.rpc = std::make_unique<AuxChainRPC>(m_ioc, config);
+    state.rpc = std::move(backend);
     m_chains.push_back(std::move(state));
 
     // Rebuild the AuxPoW tree
@@ -516,7 +522,7 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config)
              << m_tree.slot_map[config.chain_id] << "/" << m_tree.size << ")";
 }
 
-AuxChainRPC* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
+IAuxChainBackend* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& chain : m_chains) {
