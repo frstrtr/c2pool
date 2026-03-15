@@ -3758,7 +3758,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         LOG_INFO << "Solo mining share accepted - primary payout address: " << payout_address;
         
         // Check if share meets network difficulty and attempt block submission
-        if (m_coin_rpc && !extranonce1.empty()) {
+        if ((m_coin_rpc || m_embedded_node) && !extranonce1.empty()) {
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
@@ -4008,7 +4008,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         }
         
         // Attempt block construction + submission only when PoW meets blockchain target.
-        if (m_coin_rpc && !extranonce1.empty()) {
+        if ((m_coin_rpc || m_embedded_node) && !extranonce1.empty()) {
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
