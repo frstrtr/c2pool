@@ -5043,7 +5043,14 @@ void StratumSession::send_notify_work(bool force_clean)
     // Don't send work until a valid block template is available
     auto tmpl = mining_interface_->get_current_work_template();
     if (tmpl.empty() || tmpl.is_null()) {
-        LOG_WARNING << "send_notify_work: no live template yet, retrying in 1s";
+        // Rate-limit "no template" log to avoid spam during header sync
+        static std::atomic<int64_t> s_last_warn{0};
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto prev = s_last_warn.load();
+        if (now - prev > 30'000'000'000LL) { // 30 seconds
+            if (s_last_warn.compare_exchange_strong(prev, now))
+                LOG_WARNING << "send_notify_work: waiting for block template (header sync in progress)...";
+        }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
         timer->expires_after(std::chrono::seconds(1));
         timer->async_wait([this, self = shared_from_this(), timer](boost::system::error_code ec) {
