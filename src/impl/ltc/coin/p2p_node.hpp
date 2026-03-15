@@ -167,9 +167,8 @@ public:
     // ICommmunicator
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        LOG_ERROR << "" << "[" << m_chain_label << "] <NetName>[" << service.to_string() << "]:";
-        LOG_ERROR << "\terror: " << err;
-        LOG_ERROR << "\twhere: " << where.function_name();
+        LOG_WARNING << "[" << m_chain_label << "] Peer " << service.to_string()
+                    << " disconnected: " << err;
         if (m_peer)
         {
             m_peer.reset();
