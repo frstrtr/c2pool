@@ -199,7 +199,8 @@ public:
     std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
 
     // Track a found block for the /recent_blocks endpoint
-    void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
+    void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0,
+                            const std::string& chain = "LTC");
     
     // Stratum-style methods (for advanced miners)
     // Job snapshot: holds all template data frozen at the time a mining job was sent.
@@ -588,6 +589,7 @@ private:
         uint64_t    ts;
         BlockStatus status{BlockStatus::pending};
         uint8_t     check_count{0};   // how many verification attempts
+        std::string chain;            // "LTC"/"tLTC"/"DOGE" etc — for log display
     };
     std::vector<FoundBlock> m_found_blocks;   // newest first, capped at 100
     mutable std::mutex      m_blocks_mutex;

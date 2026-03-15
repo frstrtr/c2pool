@@ -2102,7 +2102,8 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"hash", b.hash},
             {"ts", b.ts},
             {"status", status_str[static_cast<int>(b.status)]},
-            {"checks", b.check_count}
+            {"checks", b.check_count},
+            {"chain", b.chain}
         });
     }
     return arr;
@@ -2366,12 +2367,13 @@ nlohmann::json MiningInterface::rest_control_mining_unban(const std::string& tar
     });
 }
 
-void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts)
+void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts,
+                                          const std::string& chain)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     m_found_blocks.insert(m_found_blocks.begin(),
-        FoundBlock{height, hash.GetHex(), ts, BlockStatus::pending, 0});
+        FoundBlock{height, hash.GetHex(), ts, BlockStatus::pending, 0, chain});
     if (m_found_blocks.size() > 100)
         m_found_blocks.resize(100);
 }
@@ -2405,7 +2407,7 @@ void MiningInterface::verify_found_block(size_t index)
         blk.status = BlockStatus::confirmed;
         auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
         LOG_INFO << "\n"
-                 << "  +++  BLOCK CONFIRMED  +++\n"
+                 << "  +++  BLOCK CONFIRMED (" << blk.chain << ")  +++\n"
                  << "  Height:     " << blk.height << "\n"
                  << "  Block hash: " << blk.hash << "\n"
                  << "  Verified:   check #" << (int)blk.check_count
@@ -2414,7 +2416,7 @@ void MiningInterface::verify_found_block(size_t index)
         blk.status = BlockStatus::orphaned;
         auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
         LOG_WARNING << "\n"
-                    << "  ---  BLOCK ORPHANED  ---\n"
+                    << "  ---  BLOCK ORPHANED (" << blk.chain << ")  ---\n"
                     << "  Height:     " << blk.height << "\n"
                     << "  Block hash: " << blk.hash << "\n"
                     << "  Checked:    " << (int)blk.check_count

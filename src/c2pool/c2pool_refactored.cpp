@@ -1350,7 +1350,8 @@ int main(int argc, char* argv[]) {
                             height = tmpl["height"].get<uint64_t>();
                     }
                 }
-                web_server.get_mining_interface()->record_found_block(height, block_hash);
+                web_server.get_mining_interface()->record_found_block(
+                    height, block_hash, 0, is_testnet ? "tLTC" : "LTC");
                 // Schedule async verification at +10s, +30s, +120s
                 if (stale_info == 0)
                     web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
