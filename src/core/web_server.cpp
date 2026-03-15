@@ -3802,14 +3802,22 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                       << " header=" << header_merkle.GetHex()
                                       << " expected=" << expected_merkle.GetHex();
                         } else {
-                            LOG_INFO << "Block meets blockchain target! Submitting to coin daemon";
-                            submitblock(block_hex);
+                            // Skip duplicate blocks at the same prev_block
+                            // (multiple shares can meet the target at the same height)
+                            uint256 prev_block;
+                            std::memcpy(prev_block.data(), block_bytes.data() + 4, 32);
+                            static uint256 s_last_submitted_prev;
+                            if (prev_block != s_last_submitted_prev) {
+                                s_last_submitted_prev = prev_block;
+                                LOG_INFO << "Block meets blockchain target! Submitting to coin daemon";
+                                submitblock(block_hex);
+                            }
                         }
                     }
                 }
             }
         }
-        
+
         return nlohmann::json{{"result", true}};
     } else {
         // Standard pool mode - track shares for sharechain and payouts
@@ -4050,8 +4058,15 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                       << " header=" << header_merkle.GetHex()
                                       << " expected=" << expected_merkle.GetHex();
                         } else {
-                            LOG_INFO << "Pool block merkle_root validated, submitting to coin daemon";
-                            submitblock(block_hex);
+                            // Skip duplicate blocks at the same prev_block
+                            uint256 prev_block;
+                            std::memcpy(prev_block.data(), block_bytes.data() + 4, 32);
+                            static uint256 s_last_pool_submitted_prev;
+                            if (prev_block != s_last_pool_submitted_prev) {
+                                s_last_pool_submitted_prev = prev_block;
+                                LOG_INFO << "Pool block merkle_root validated, submitting to coin daemon";
+                                submitblock(block_hex);
+                            }
                         }
                     }
                 }
