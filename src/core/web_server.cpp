@@ -2406,11 +2406,13 @@ void MiningInterface::verify_found_block(size_t index)
     auto& blk = m_found_blocks[index];
     if (blk.status != BlockStatus::pending) return;
 
+    const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
     if (result > 0) {
         blk.status = BlockStatus::confirmed;
         auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
         LOG_INFO << "\n"
-                 << "  +++  BLOCK CONFIRMED (" << blk.chain << ")  +++\n"
+                 << "  +++  BLOCK CONFIRMED — " << cn << " height " << blk.height << "  +++\n"
+                 << "  Chain:      " << cn << "\n"
                  << "  Height:     " << blk.height << "\n"
                  << "  Block hash: " << blk.hash << "\n"
                  << "  Verified:   check #" << (int)blk.check_count
@@ -2419,7 +2421,8 @@ void MiningInterface::verify_found_block(size_t index)
         blk.status = BlockStatus::orphaned;
         auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
         LOG_WARNING << "\n"
-                    << "  ---  BLOCK ORPHANED (" << blk.chain << ")  ---\n"
+                    << "  ---  BLOCK ORPHANED — " << cn << " height " << blk.height << "  ---\n"
+                    << "  Chain:      " << cn << "\n"
                     << "  Height:     " << blk.height << "\n"
                     << "  Block hash: " << blk.hash << "\n"
                     << "  Checked:    " << (int)blk.check_count
