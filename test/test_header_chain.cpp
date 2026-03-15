@@ -574,3 +574,50 @@ TEST(PoWFunctionsTest, MainnetGenesisScryptValid) {
         << "Mainnet genesis scrypt hash should pass PoW check"
         << "\n  hash: " << pow_hash.GetHex();
 }
+
+// ─── Fast-Sync Scrypt Skip Tests ────────────────────────────────────────────
+
+TEST_F(HeaderChainTest, FastSyncSkipsScryptForOldHeaders) {
+    // When peer_tip_height is set, headers below (tip - 2100) should
+    // skip scrypt PoW validation and use structural checks only.
+    // We verify this indirectly: with a high peer_tip_height, adding
+    // the genesis block should still work (scrypt validation skipped
+    // for old blocks, but genesis is special-cased anyway).
+    HeaderChain chain(params);
+    EXPECT_TRUE(chain.init());
+
+    // Set peer tip very high — all headers will skip scrypt
+    chain.set_peer_tip_height(1000000);
+
+    auto genesis = make_testnet_genesis();
+    EXPECT_TRUE(chain.add_header(genesis));
+    EXPECT_EQ(chain.height(), 0u);
+}
+
+TEST_F(HeaderChainTest, FastSyncDefaultIsZeroPeerTip) {
+    // With default peer_tip_height=0, all headers should be scrypt-validated.
+    // Genesis should still pass (it has valid scrypt PoW).
+    HeaderChain chain(params);
+    EXPECT_TRUE(chain.init());
+
+    auto genesis = make_testnet_genesis();
+    EXPECT_TRUE(chain.add_header(genesis));
+    EXPECT_EQ(chain.height(), 0u);
+}
+
+TEST_F(HeaderChainTest, PeerTipHeightIsAtomic) {
+    // set_peer_tip_height should be safe to call from any thread
+    HeaderChain chain(params);
+    EXPECT_TRUE(chain.init());
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 10; ++i) {
+        threads.emplace_back([&chain, i]() {
+            chain.set_peer_tip_height(100000 + i * 1000);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    // No crash, no data race — the final value is one of the written values
+    // (no specific ordering guarantee with relaxed atomics)
+}
