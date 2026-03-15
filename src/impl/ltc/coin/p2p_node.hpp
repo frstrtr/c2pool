@@ -9,6 +9,7 @@
 #include <boost/asio.hpp>
 
 #include <core/config.hpp>
+#include <core/log.hpp>
 #include <core/random.hpp>
 #include <core/factory.hpp>
 #include <core/reply_matcher.hpp>
@@ -133,9 +134,9 @@ public:
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
     {
         if (!m_peer) return;
-        LOG_INFO << "getheaders: locator_size=" << locator.size()
-                 << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16))
-                 << " stop=" << (stop.IsNull() ? "0" : stop.GetHex().substr(0, 16));
+        LOG_TRACE << "getheaders: locator_size=" << locator.size()
+                  << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16))
+                  << " stop=" << (stop.IsNull() ? "0" : stop.GetHex().substr(0, 16));
         auto msg = message_getheaders::make_raw(version, locator, stop);
         m_peer->write(msg);
     }
@@ -257,11 +258,9 @@ public:
             PackStream ps(block_bytes);
             auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
             m_peer->write(rmsg);
-            LOG_INFO << "Block relayed via P2P (raw, " << block_bytes.size() << " bytes)";
-        } else
-        {
-            LOG_ERROR << "No bitcoind connection for P2P block relay";
         }
+        // Silent skip when peer not connected — the broadcaster logs the
+        // aggregate count ("broadcast to N/M peers") which is sufficient.
     }
 
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //

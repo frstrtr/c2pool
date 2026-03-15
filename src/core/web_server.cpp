@@ -1712,7 +1712,7 @@ nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, c
 
 nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
 {
-    LOG_INFO << "Block submission received - size: " << hex_data.length() << " chars";
+    LOG_TRACE << "submitblock: received " << hex_data.length() / 2 << " bytes";
 
     // Block header is 80 bytes = 160 hex chars minimum
     if (hex_data.size() < 160) {
@@ -1757,7 +1757,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
 
             // Reconstruct expected merkle_root from coinbase + merkle branches
             if (!is_stale && !m_cached_coinb1.empty() && !m_cached_coinb2.empty()) {
-                LOG_INFO << "submitblock: merkle_root=" << submitted_merkle_root.GetHex();
+                LOG_TRACE << "submitblock: merkle_root=" << submitted_merkle_root.GetHex();
             }
         }
         // Fire stale callback OUTSIDE the lock to avoid deadlock
@@ -1794,7 +1794,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
     } else if (m_embedded_node) {
         // Phase 4 embedded mode: no daemon — relay the block directly via P2P.
         // on_block_relay is wired to CoinBroadcaster::submit_block_raw().
-        LOG_INFO << "submitblock: embedded mode — relaying " << hex_data.size()/2 << " bytes via P2P";
+        LOG_TRACE << "submitblock: embedded relay " << hex_data.size()/2 << " bytes";
         if (m_on_block_relay)
             m_on_block_relay(hex_data);
         if (m_on_block_submitted && hex_data.size() >= 160)
@@ -3695,8 +3695,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
     const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
     const JobSnapshot* job)
 {
-    LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id 
-             << " - nonce: " << nonce << ", extranonce2: " << extranonce2 << ", ntime: " << ntime;
+    LOG_TRACE << "mining.submit " << username << " job=" << job_id
+              << " nonce=" << nonce << " en2=" << extranonce2;
     
     // Basic share validation
     bool share_valid = true;
@@ -4653,7 +4653,7 @@ void StratumSession::process_message(std::size_t bytes_read)
             line.pop_back();  // Remove \r if present
         }
         
-        LOG_INFO << "Stratum message received: " << line;
+        LOG_TRACE << "Stratum message received: " << line;
         
         auto request = nlohmann::json::parse(line);
         std::string method = request.value("method", "");

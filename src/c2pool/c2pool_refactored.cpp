@@ -1760,7 +1760,12 @@ int main(int argc, char* argv[]) {
                     // Without chain data, the coinbase won't have correct PPLNS outputs
                     // and Python peers will reject and ban us.
                     if (p.prev_share_hash.IsNull()) {
-                        LOG_WARNING << "Skipping share creation: no prev_share (chain not ready)";
+                        static std::atomic<int64_t> s_last_warn{0};
+                        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                        if (now - s_last_warn.load() > 30'000'000'000LL) {
+                            s_last_warn.store(now);
+                            LOG_WARNING << "Skipping share creation: chain not ready (waiting for shares from peers)";
+                        }
                         return;
                     }
 
