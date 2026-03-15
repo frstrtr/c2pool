@@ -5095,8 +5095,8 @@ void StratumSession::send_notify_work(bool force_clean)
         if (tmpl.contains("curtime"))
             curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());
 
-        LOG_INFO << "send_notify_work: live template height="
-                 << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
+        LOG_TRACE << "send_notify_work: live template height="
+                  << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
     }
 
     // Encode curtime as 8-hex-char (4-byte big-endian)

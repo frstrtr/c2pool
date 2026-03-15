@@ -21,6 +21,7 @@
 #include <optional>
 #include <thread>
 #include <functional>
+#include <iomanip>
 #include <string>
 #include <vector>
 
@@ -409,6 +410,18 @@ public:
         if (accepted > 0) {
             std::lock_guard<std::mutex> lock(m_mutex);
             persist_tip();
+            // Progress indicator for header sync
+            uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+            if (peer_tip > 0 && m_tip_height > 0) {
+                double pct = 100.0 * m_tip_height / peer_tip;
+                // Log every 1% or every 2000 blocks
+                static uint32_t s_last_logged = 0;
+                if (m_tip_height - s_last_logged >= 2000 || pct >= 99.9) {
+                    s_last_logged = m_tip_height;
+                    LOG_INFO << "Header sync: " << m_tip_height << "/" << peer_tip
+                             << " (" << std::fixed << std::setprecision(1) << pct << "%)";
+                }
+            }
         }
         return accepted;
     }
