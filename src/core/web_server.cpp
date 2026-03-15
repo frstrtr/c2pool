@@ -4909,20 +4909,11 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                  << old_difficulty << " -> " << new_difficulty;
     }
 
-    if (share_difficulty < required_difficulty) {
-        ++rejected_shares_;
-        nlohmann::json response;
-        response["id"] = request_id;
-        response["result"] = false;
-        response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
-        return response;
-    }
-
-    // Valid share
-    ++accepted_shares_;
-    
-    // Forward the accepted share to MiningInterface for block-level checking.
-    // Convert per-chain merged addresses (Base58Check strings) to scriptPubKeys.
+    // Build JobSnapshot BEFORE the rejection gate — needed for block-level
+    // checking which must run on ALL submissions, not just accepted ones.
+    // P2Pool checks every share against the block target regardless of
+    // pool-level difficulty acceptance.  Missing this check means ~75% of
+    // valid blocks are silently discarded.
     std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
     for (const auto& [chain_id, addr] : merged_addresses_) {
         auto h160 = base58check_to_hash160(addr);
@@ -4937,7 +4928,6 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         }
     }
 
-    // Build a JobSnapshot from the frozen JobEntry data
     MiningInterface::JobSnapshot snapshot;
     snapshot.coinb1          = job.coinb1;
     snapshot.coinb2          = job.coinb2;
@@ -4953,9 +4943,23 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.witness_commitment_hex = job.witness_commitment_hex;
     snapshot.witness_root            = job.witness_root;
 
+    // Check EVERY submission for block-level PoW — even rejected shares
+    // can meet the blockchain target and must be submitted as blocks.
     mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
         &snapshot);
-    
+
+    if (share_difficulty < required_difficulty) {
+        ++rejected_shares_;
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = false;
+        response["error"] = nlohmann::json::array({23, "Low difficulty share", nullptr});
+        return response;
+    }
+
+    // Valid share — meets pool difficulty target
+    ++accepted_shares_;
+
     LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
              << ", rejected=" << rejected_shares_ << ")";
