@@ -148,6 +148,43 @@ At 308K shares × ~4.5 KB/share = **~1.39 GB RAM**. Three-tier architecture:
 Epoch size: 720 shares (~3 hours). Each epoch summary replaces 720 full
 share objects (~216 KB) with one ~100-byte record — **2,160× compression**.
 
+#### P1: Compact Share Relay (BIP 152 Inspired)
+
+Applying compact block concepts to sharechain relay. Since all peers maintain
+similar PPLNS window state, redundancy across consecutive shares is extreme:
+
+**Problem:** Each share ~4.5 KB includes a full coinbase transaction with all
+PPLNS payout outputs. Consecutive shares have ~95% identical coinbase data
+(same output scripts, slightly different amounts).
+
+**Approach** — three complementary techniques:
+
+| Technique | Savings | How |
+|-----------|---------|-----|
+| **Short-ID transaction refs** | ~80% of tx data | SipHash-2-4 short IDs for share coinbase inputs/outputs, reconstruct from PPLNS state |
+| **Delta-encoded coinbases** | ~90% of coinbase | Only transmit changed amount deltas vs. previous share's coinbase |
+| **Prefilled-only new outputs** | Variable | New miners entering PPLNS window get full output; existing miners referenced by index |
+
+**Wire format sketch:**
+
+```
+CompactShare {
+    share_header      // ~200 bytes (same as today)
+    coinbase_delta    // varint-encoded amount deltas per output index
+    new_outputs[]     // PrefilledOutput { index, script, amount } for new PPLNS entrants
+    removed_indexes[] // output indexes dropped from PPLNS window
+    nonce             // SipHash key derivation (reuse BIP 152 pattern)
+}
+```
+
+**Expected compression:** ~4.5 KB → ~300-500 bytes per share relay (~90%).
+At 308K window and 30-second share period, reduces sustained relay bandwidth
+from ~150 bytes/s to ~15 bytes/s per peer.
+
+**Dependency:** Requires all peers to maintain synchronized PPLNS state to
+reconstruct full shares. Fallback: request full share via `getsharedata`
+(analogous to `getblocktxn`).
+
 #### P1: Adaptive Window Consensus Integration
 
 - Share validation must agree on `adaptive_chain_length` given the same
@@ -204,9 +241,12 @@ delivery to a configurable URL (`--block-webhook URL`).
 ### Historical Worker Stats DB — Not Started
 Persist per-worker statistics to SQLite with configurable retention.
 
-### Direct Peer Block Broadcast — Not Started
-Parallel P2P broadcast of found blocks to multiple full nodes to reduce
-orphan rate. High impact for solo miners.
+### Direct Peer Block Broadcast — In Progress (BIP 152)
+Compact block relay via BIP 152 (sendcmpct/cmpctblock/getblocktxn/blocktxn).
+Reduces block relay bandwidth by ~90-95% using SipHash-2-4 short transaction
+IDs. Foundation committed: data structures, SipHash, peer negotiation.
+Remaining: wire send path (BuildCompactBlock → cmpctblock), receive path
+(reconstruct from mempool), multi-peer broadcast.
 
 ---
 

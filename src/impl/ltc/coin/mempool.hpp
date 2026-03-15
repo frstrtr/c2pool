@@ -211,6 +211,15 @@ public:
         return out;
     }
 
+    /// Snapshot of all transactions as a txid→tx map (for compact block reconstruction).
+    std::map<uint256, MutableTransaction> all_txs_map() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::map<uint256, MutableTransaction> out;
+        for (const auto& [txid, entry] : m_pool)
+            out[txid] = entry.tx;
+        return out;
+    }
+
 private:
     // ─── Internal (caller holds mutex) ───────────────────────────────────
 

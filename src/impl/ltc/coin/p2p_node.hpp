@@ -3,6 +3,8 @@
 #include "p2p_messages.hpp"
 #include "p2p_connection.hpp"
 #include "node_interface.hpp"
+#include "compact_blocks.hpp"
+#include "mempool.hpp"
 
 #include <memory>
 
@@ -68,6 +70,11 @@ private:
     bool m_peer_wants_cmpct_announce{false};
     // BIP 339 wtxidrelay state
     bool m_peer_wtxidrelay{false};
+    // Compact block reconstruction state: pending compact block awaiting blocktxn
+    std::unique_ptr<CompactBlock> m_pending_cmpct;
+    std::vector<uint32_t> m_pending_missing_indexes;
+    // External mempool for compact block tx matching
+    Mempool* m_mempool{nullptr};
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -266,23 +273,42 @@ public:
     bool supports_compact_blocks() const { return m_peer_supports_cmpct; }
     bool peer_wtxidrelay() const { return m_peer_wtxidrelay; }
 
+    /// Set mempool reference for compact block reconstruction.
+    void set_mempool(Mempool* mp) { m_mempool = mp; }
+
     /// Relay a pre-serialized block via P2P.
     /// Automatically uses compact block format for peers that support it.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
         if (!m_peer) return;
 
-        // TODO: when compact block sending is fully implemented,
-        // send cmpctblock to peers that negotiated sendcmpct.
-        // For now, always send full block (compatible with all peers).
-        // Future: if (m_peer_supports_cmpct && m_peer_wants_cmpct_announce)
-        //             submit_block_compact(block_bytes);
-        //         else
-        //             submit_block_full(block_bytes);
+        if (m_peer_supports_cmpct && m_peer_cmpct_version >= 2) {
+            // Deserialize the block to build a compact representation
+            try {
+                PackStream ps(block_bytes);
+                BlockType block;
+                ps >> block;
+                auto cb = BuildCompactBlock(
+                    static_cast<BlockHeaderType&>(block), block.m_txs);
+                auto rmsg = message_cmpctblock::make_raw(cb);
+                m_peer->write(rmsg);
 
-        PackStream ps(block_bytes);
-        auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
-        m_peer->write(rmsg);
+                auto packed_hdr = pack(static_cast<BlockHeaderType&>(block));
+                auto blockhash = Hash(packed_hdr.get_span());
+                LOG_INFO << "[" << m_chain_label << "] Sent compact block "
+                         << blockhash.GetHex()
+                         << " (" << cb.short_ids.size() << " short IDs, "
+                         << cb.prefilled_txns.size() << " prefilled)";
+                return;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_chain_label
+                            << "] Compact block build failed, sending full block: "
+                            << e.what();
+            }
+        }
+
+        // Fallback: send full block
+        submit_block_full(block_bytes);
     }
 
     /// Send a full block message (legacy relay).
@@ -579,19 +605,148 @@ private:
 
     ADD_P2P_HANDLER(cmpctblock)
     {
-        // BIP 152: Received compact block — parse header for block announcement
-        // Full compact block reconstruction requires mempool matching (future)
-        LOG_INFO << "[" << m_chain_label << "] Received compact block announcement";
+        auto& cb = msg->m_compact_block;
+        auto packed_hdr = pack(cb.header);
+        auto blockhash = Hash(packed_hdr.get_span());
+
+        LOG_INFO << "[" << m_chain_label << "] Received compact block "
+                 << blockhash.GetHex()
+                 << " (" << cb.short_ids.size() << " short IDs, "
+                 << cb.prefilled_txns.size() << " prefilled)";
+
+        // Always announce the new block to the node (header-based)
+        m_coin->new_block.happened(blockhash);
+
+        // Attempt reconstruction from mempool + known_txs
+        std::map<uint256, MutableTransaction> known;
+
+        // Gather from node's known_txs
+        for (const auto& [txid, tx] : m_coin->known_txs) {
+            known[txid] = MutableTransaction(tx);
+        }
+
+        // Gather from mempool
+        if (m_mempool) {
+            auto mp_txs = m_mempool->all_txs_map();
+            known.merge(mp_txs);
+        }
+
+        auto result = ReconstructBlock(cb, known);
+
+        if (result.complete) {
+            LOG_INFO << "[" << m_chain_label << "] Compact block reconstructed: "
+                     << blockhash.GetHex();
+            // Deliver as a full block
+            m_peer->get_block(blockhash, result.block);
+            auto header = static_cast<BlockHeaderType>(result.block);
+            m_peer->get_header(blockhash, header);
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
+                     << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";
+            // Save pending state and request missing transactions
+            m_pending_cmpct = std::make_unique<CompactBlock>(cb);
+            m_pending_missing_indexes = result.missing_indexes;
+
+            BlockTransactionsRequest req;
+            req.blockhash = blockhash;
+            req.indexes = result.missing_indexes;
+            auto req_msg = message_getblocktxn::make_raw(req);
+            m_peer->write(req_msg);
+        }
     }
 
     ADD_P2P_HANDLER(getblocktxn)
     {
         // BIP 152: Peer requests missing transactions — we don't serve blocks
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer requests "
+                        << msg->m_request.indexes.size() << " txs via getblocktxn for "
+                        << msg->m_request.blockhash.GetHex() << " (ignored, we don't serve blocks)";
     }
 
     ADD_P2P_HANDLER(blocktxn)
     {
-        // BIP 152: Received missing transactions — future: complete block reconstruction
+        auto& resp = msg->m_response;
+
+        if (!m_pending_cmpct || m_pending_missing_indexes.empty()) {
+            LOG_WARNING << "[" << m_chain_label << "] Received blocktxn without pending compact block";
+            return;
+        }
+
+        if (resp.txs.size() != m_pending_missing_indexes.size()) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn size mismatch: got "
+                        << resp.txs.size() << ", expected " << m_pending_missing_indexes.size();
+            m_pending_cmpct.reset();
+            m_pending_missing_indexes.clear();
+            return;
+        }
+
+        // Reconstruct the full block with the missing transactions
+        auto& cb = *m_pending_cmpct;
+        size_t total_txs = cb.short_ids.size() + cb.prefilled_txns.size();
+        std::vector<MutableTransaction> txs(total_txs);
+        std::vector<bool> filled(total_txs, false);
+
+        // Place prefilled transactions
+        for (const auto& pt : cb.prefilled_txns) {
+            if (pt.index < total_txs) {
+                txs[pt.index] = pt.tx;
+                filled[pt.index] = true;
+            }
+        }
+
+        // Re-match from mempool (same as cmpctblock handler)
+        std::map<uint256, MutableTransaction> known;
+        for (const auto& [txid, tx] : m_coin->known_txs)
+            known[txid] = MutableTransaction(tx);
+        if (m_mempool) {
+            auto mp_txs = m_mempool->all_txs_map();
+            known.merge(mp_txs);
+        }
+
+        uint64_t k0, k1;
+        cb.GetSipHashKeys(k0, k1);
+        std::map<uint64_t, const MutableTransaction*> sid_map;
+        for (const auto& [txid, tx] : known) {
+            ShortTxID sid = CompactBlock::GetShortID(k0, k1, txid);
+            sid_map[sid.to_uint64()] = &tx;
+        }
+
+        size_t sid_idx = 0;
+        for (size_t i = 0; i < total_txs; ++i) {
+            if (filled[i]) continue;
+            if (sid_idx < cb.short_ids.size()) {
+                auto it = sid_map.find(cb.short_ids[sid_idx].to_uint64());
+                if (it != sid_map.end() && it->second)
+                    txs[i] = *(it->second);
+                // else: will be filled from blocktxn response below
+            }
+            ++sid_idx;
+        }
+
+        // Fill in the missing transactions from blocktxn response
+        for (size_t i = 0; i < m_pending_missing_indexes.size(); ++i) {
+            uint32_t idx = m_pending_missing_indexes[i];
+            if (idx < total_txs)
+                txs[idx] = resp.txs[i];
+        }
+
+        // Build and deliver the full block
+        auto packed_hdr = pack(cb.header);
+        auto blockhash = Hash(packed_hdr.get_span());
+
+        BlockType block;
+        static_cast<BlockHeaderType&>(block) = cb.header;
+        block.m_txs = std::move(txs);
+
+        m_peer->get_block(blockhash, block);
+        auto header = static_cast<BlockHeaderType>(block);
+        m_peer->get_header(blockhash, header);
+
+        LOG_INFO << "[" << m_chain_label << "] Compact block completed via blocktxn: "
+                 << blockhash.GetHex();
+
+        m_pending_cmpct.reset();
+        m_pending_missing_indexes.clear();
     }
 
     ADD_P2P_HANDLER(wtxidrelay)
