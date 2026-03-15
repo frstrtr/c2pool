@@ -607,7 +607,13 @@ void MergedMiningManager::refresh_aux_work()
                      << " hash=" << chain.current_work.block_hash.GetHex().substr(0, 16) << "..."
                      << " target=" << chain.current_work.target.GetHex().substr(0, 16) << "...";
         } catch (const std::exception& e) {
-            LOG_WARNING << "[MM:" << chain.config.symbol << "] Failed to refresh: " << e.what();
+            static std::map<uint32_t, int64_t> s_last_warn;
+            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto& lw = s_last_warn[chain.config.chain_id];
+            if (now - lw > 30'000'000'000LL) { // 30s rate limit
+                lw = now;
+                LOG_WARNING << "[MM:" << chain.config.symbol << "] Failed to refresh: " << e.what();
+            }
             // Fallback: switch to embedded backend if available
             if (!chain.using_fallback && chain.fallback) {
                 LOG_INFO << "[MM:" << chain.config.symbol

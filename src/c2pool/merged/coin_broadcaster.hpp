@@ -115,6 +115,11 @@ public:
     using PeerHeightCallback = std::function<void(uint32_t)>;
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
 
+    // Set custom raw headers parser for AuxPoW chains (DOGE).
+    // Applied to every new peer connection.
+    using RawHeadersParser = std::function<std::vector<ltc::coin::BlockHeaderType>(const uint8_t*, size_t)>;
+    void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
+
     /// Start: register local node, start peer manager, begin connection loop.
     void start()
     {
@@ -274,6 +279,11 @@ private:
                     [this](uint32_t h) { m_on_peer_height(h); });
             }
 
+            // Wire AuxPoW raw headers parser (DOGE)
+            if (m_raw_headers_parser) {
+                peer->node_p2p.set_raw_headers_parser(m_raw_headers_parser);
+            }
+
             peer->node_p2p.connect(addr);
 
             // Send getaddr after connection for peer discovery
@@ -344,10 +354,11 @@ private:
     std::map<std::string, std::unique_ptr<BroadcastPeer>> m_peers;
     bool m_running{true};
 
-    BlockCallback       m_on_new_block;
-    TxCallback          m_on_new_tx;
-    HeadersCallback     m_on_new_headers;
-    PeerHeightCallback  m_on_peer_height;
+    BlockCallback        m_on_new_block;
+    TxCallback           m_on_new_tx;
+    HeadersCallback      m_on_new_headers;
+    PeerHeightCallback   m_on_peer_height;
+    RawHeadersParser     m_raw_headers_parser;
 };
 
 } // namespace merged

@@ -84,19 +84,17 @@ case "$MODE" in
             2>&1 | tee -a "$LOGFILE"
         ;;
     *)
-        echo "=== Mode: DEFAULT (both embedded + both RPC, auto-fallback) ===" | tee "$LOGFILE"
-        echo "Embedded: LTC P2P + DOGE P2P (always running)" | tee -a "$LOGFILE"
-        echo "RPC: LTC 192.168.86.26:19332 + DOGE 192.168.86.27:44555 (optional)" | tee -a "$LOGFILE"
-        echo "If daemons fail → embedded keeps working" | tee -a "$LOGFILE"
+        echo "=== Mode: DEFAULT (LTC embedded + DOGE RPC, auto-fallback) ===" | tee "$LOGFILE"
+        echo "LTC: embedded P2P (primary)" | tee -a "$LOGFILE"
+        echo "DOGE: RPC 192.168.86.27:44555 (primary) → embedded fallback if daemon dies" | tee -a "$LOGFILE"
+        # Note: --embedded-doge requires AuxPoW header parser wired into P2P handler.
+        # Until that's done, DOGE uses RPC as primary with embedded as auto-fallback.
         exec "$BINARY" "${COMMON_ARGS[@]}" \
             --embedded-ltc \
             --coind-p2p-address 192.168.86.26 \
             --coind-p2p-port 19335 \
             --header-checkpoint 4600000:da433fe7ca00dcb6ccdeda8a1e0a1e0f0111aaf081385da85a3b40d7708d410e \
-            --embedded-doge \
             --merged DOGE:2:192.168.86.27:44555:dogecoinrpc:testpass:44556 \
-            --doge-p2p-address 192.168.86.27 \
-            --doge-p2p-port 44556 \
             2>&1 | tee -a "$LOGFILE"
         ;;
 esac

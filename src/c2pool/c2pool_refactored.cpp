@@ -49,6 +49,7 @@
 #include <impl/doge/coin/header_chain.hpp>
 #include <impl/doge/coin/template_builder.hpp>
 #include <impl/doge/coin/aux_chain_embedded.hpp>
+#include <impl/doge/coin/auxpow_header.hpp>
 
 // V36-compatible operational features
 #include <impl/ltc/pool_monitor.hpp>
@@ -2056,6 +2057,12 @@ int main(int argc, char* argv[]) {
                                     return rpc_ptr->getpeerinfo();
                                 });
                             }
+                            // Phase 5.8: wire AuxPoW header parser for DOGE P2P
+                            if (cfg.symbol == "DOGE") {
+                                broadcaster->set_raw_headers_parser(
+                                    doge::coin::parse_doge_headers_message);
+                            }
+
                             // Phase 5: wire DOGE header sync via AuxPoW parser
                             if (embedded_doge && cfg.symbol == "DOGE" && doge_chain) {
                                 auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);

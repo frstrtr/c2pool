@@ -186,7 +186,8 @@ END_MESSAGE()
 BEGIN_MESSAGE(headers)
     MESSAGE_FIELDS
     (
-        (std::vector<BlockType>, m_headers)
+        (std::vector<BlockType>, m_headers),
+        (std::vector<uint8_t>, m_raw_payload)
     )
     {
         READWRITE(obj.m_headers);

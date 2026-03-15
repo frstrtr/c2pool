@@ -67,6 +67,10 @@ private:
     AddrCallback m_addr_callback;
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
+    // Raw headers parser: if set, called with raw payload data instead of
+    // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
+    using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
+    RawHeadersParser m_raw_headers_parser;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config) 
@@ -229,6 +233,8 @@ public:
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
     /// Set callback for peer's reported chain height (from version message).
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
+    /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
+    void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -436,22 +442,33 @@ private:
     {
         std::vector<BlockHeaderType> vheaders;
 
-        for (auto block : msg->m_headers)
-        {
-            auto header = (BlockHeaderType)block;
-            auto packed_header = pack(header);
-            auto blockhash = Hash(packed_header.get_span());
-            // Feed to ReplyMatcher if there's a pending individual request;
-            // ignore if not (batch headers from getheaders won't have one).
-            try {
-                m_peer->get_header(blockhash, header);
-            } catch (const std::invalid_argument&) {
-                // No pending request for this hash — expected for getheaders batches
+        if (!msg->m_headers.empty()) {
+            // Standard path: headers parsed successfully as 80-byte BlockType
+            for (auto block : msg->m_headers)
+            {
+                auto header = (BlockHeaderType)block;
+                auto packed_header = pack(header);
+                auto blockhash = Hash(packed_header.get_span());
+                try {
+                    m_peer->get_header(blockhash, header);
+                } catch (const std::invalid_argument&) {}
+                vheaders.push_back(header);
             }
-            vheaders.push_back(header);
         }
 
-        m_coin->new_headers.happened(vheaders);
+        // If standard parsing yielded 0 headers but raw parser is available,
+        // the message contains AuxPoW extended headers (DOGE).
+        if (vheaders.empty() && m_raw_headers_parser && !msg->m_raw_payload.empty()) {
+            try {
+                vheaders = m_raw_headers_parser(
+                    msg->m_raw_payload.data(), msg->m_raw_payload.size());
+            } catch (const std::exception& e) {
+                LOG_WARNING << "AuxPoW headers parser failed: " << e.what();
+            }
+        }
+
+        if (!vheaders.empty())
+            m_coin->new_headers.happened(vheaders);
     }
 
     ADD_P2P_HANDLER(getaddr)

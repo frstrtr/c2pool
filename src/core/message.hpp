@@ -41,7 +41,20 @@ private:
     static void add_handlers()
     {
         MsgT msg; // tip for get Message::m_command
-        m_handlers[msg.m_command] = [](std::unique_ptr<RawMessage>& rmsg){ auto res = std::make_unique<MsgT>(); rmsg->m_data >> *res; return res; };
+        m_handlers[msg.m_command] = [](std::unique_ptr<RawMessage>& rmsg){
+            auto res = std::make_unique<MsgT>();
+            // Save raw bytes before parsing (for AuxPoW fallback in headers handler)
+            if constexpr (requires { res->m_raw_payload; }) {
+                auto* raw = reinterpret_cast<const uint8_t*>(rmsg->m_data.data());
+                res->m_raw_payload.assign(raw, raw + rmsg->m_data.size());
+            }
+            try {
+                rmsg->m_data >> *res;
+            } catch (...) {
+                // Parse failure (e.g., DOGE AuxPoW headers) — m_raw_payload has the data
+            }
+            return res;
+        };
     }
 
     static handlers_t init_handlers()
