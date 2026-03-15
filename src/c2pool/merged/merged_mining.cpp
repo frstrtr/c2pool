@@ -604,8 +604,8 @@ void MergedMiningManager::refresh_aux_work()
             any_changed = true;
             LOG_INFO << "[MM:" << chain.config.symbol << "] New aux work at height "
                      << chain.current_work.height
-                     << " hash=" << chain.current_work.block_hash.GetHex().substr(0, 16) << "..."
-                     << " target=" << chain.current_work.target.GetHex().substr(0, 16) << "...";
+                     << " hash=" << chain.current_work.block_hash.GetHex()
+                     << " target=" << chain.current_work.target.GetHex();
         } catch (const std::exception& e) {
             static std::map<uint32_t, int64_t> s_last_warn;
             auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -716,8 +716,8 @@ void MergedMiningManager::try_submit_merged_blocks(
         ++mm_check_count;
         if (mm_check_count <= 3 || mm_check_count % 50 == 0) {
             LOG_INFO << "[MM:" << chain.config.symbol << "] Check #" << mm_check_count
-                     << " parent_hash=" << parent_hash.GetHex().substr(0, 20) << "..."
-                     << " aux_target=" << chain.current_work.target.GetHex().substr(0, 20) << "..."
+                     << " parent_hash=" << parent_hash.GetHex()
+                     << " aux_target=" << chain.current_work.target.GetHex()
                      << " meets=" << (parent_hash <= chain.current_work.target ? "YES" : "no");
         }
         if (!(parent_hash <= chain.current_work.target)) {
@@ -728,9 +728,9 @@ void MergedMiningManager::try_submit_merged_blocks(
                  << "  ###  MERGED BLOCK FOUND! " << chain.config.symbol << "  ###\n"
                  << "  Chain:      " << chain.config.symbol << " (chain_id=" << chain.config.chain_id << ")\n"
                  << "  Height:     " << chain.current_work.height << "\n"
-                 << "  Aux hash:   " << chain.current_work.block_hash.GetHex().substr(0, 32) << "...\n"
-                 << "  Aux target: " << chain.current_work.target.GetHex().substr(0, 32) << "...\n"
-                 << "  Parent PoW: " << parent_hash.GetHex().substr(0, 32) << "...";
+                 << "  Aux hash:   " << chain.current_work.block_hash.GetHex() << "\n"
+                 << "  Aux target: " << chain.current_work.target.GetHex() << "\n"
+                 << "  Parent PoW: " << parent_hash.GetHex();
 
         // Build aux merkle proof for this chain's slot
         auto proof = m_tree.compute_root(slot_hashes, slot);

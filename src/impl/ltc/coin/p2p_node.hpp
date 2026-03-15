@@ -61,6 +61,7 @@ private:
     NetService m_target_addr;
     bool m_reconnect_enabled = false;
     bool m_handshake_complete = false;
+    std::string m_chain_label = "CoinP2P";
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -73,10 +74,11 @@ private:
     RawHeadersParser m_raw_headers_parser;
 
 public:
-    NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config) 
-        : core::Factory<core::Client>(context, this), m_context(context), m_coin(coin), m_config(config) 
+    NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config,
+            const std::string& chain_label = "CoinP2P")
+        : core::Factory<core::Client>(context, this), m_context(context), m_coin(coin), m_config(config)
+        , m_chain_label(chain_label)
     {
-        
     }
 
     /// Connect with automatic reconnection on failure/disconnect (30s interval).
@@ -90,7 +92,7 @@ public:
         m_reconnect_timer = std::make_unique<core::Timer>(m_context, true);
         m_reconnect_timer->start(30, [this]() {
             if (!m_peer && m_reconnect_enabled) {
-                LOG_INFO << "P2P reconnecting to " << m_target_addr.to_string() << "...";
+                LOG_INFO << "" << "[" << m_chain_label << "] Reconnecting to " << m_target_addr.to_string() << "...";
                 core::Factory<core::Client>::connect(m_target_addr);
             }
         });
@@ -101,7 +103,7 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
-        LOG_INFO << "P2P connected to " << m_target_addr.to_string();
+        LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
         // Require version/verack progress soon after connect.
         ensure_timeout_timer();
@@ -165,7 +167,7 @@ public:
     // ICommmunicator
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        LOG_ERROR << "CoinNode <NetName>[" << service.to_string() << "]:";
+        LOG_ERROR << "" << "[" << m_chain_label << "] <NetName>[" << service.to_string() << "]:";
         LOG_ERROR << "\terror: " << err;
         LOG_ERROR << "\twhere: " << where.function_name();
         if (m_peer)
@@ -330,7 +332,7 @@ private:
 
     ADD_P2P_HANDLER(version)
     {
-        LOG_INFO << "version is?: " << msg->m_command
+        LOG_INFO << "" << "[" << m_chain_label << "] version: " << msg->m_command
                  << " start_height=" << msg->m_start_height;
         // Notify header chain of peer's tip height for fast-sync scrypt skip.
         if (m_on_peer_height && msg->m_start_height > 0)

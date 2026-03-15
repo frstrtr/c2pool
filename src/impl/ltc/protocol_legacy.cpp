@@ -215,7 +215,7 @@ void Legacy::HANDLER(sharereply)
 void Legacy::HANDLER(bestblock)
 {
     auto header_hash = Hash(pack(msg->m_header).get_span());
-    LOG_INFO << "New best block from peer " << peer->addr().to_string()
+    LOG_INFO << "[Pool] New best block from peer " << peer->addr().to_string()
              << ": " << header_hash.ToString();
 
     // Relay to all other connected peers so the block notification propagates

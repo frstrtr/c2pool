@@ -57,10 +57,11 @@ struct BroadcastPeer
     BroadcastPeer(boost::asio::io_context* ioc,
                   const std::string& peer_key,
                   const std::vector<std::byte>& prefix,
-                  const NetService& addr)
+                  const NetService& addr,
+                  const std::string& chain_label = "CoinP2P")
         : key(peer_key)
         , config(prefix, addr)
-        , node_p2p(ioc, &coin_node, &config)
+        , node_p2p(ioc, &coin_node, &config, chain_label)
     {
     }
 };
@@ -240,7 +241,7 @@ private:
             if (m_peers.count(key)) return; // already connected
 
             auto peer = std::make_unique<BroadcastPeer>(
-                &m_ioc, key, m_prefix, addr);
+                &m_ioc, key, m_prefix, addr, m_symbol);
 
             // Wire addr callback for peer discovery
             bool should_discover = m_peer_manager.discovery_enabled();

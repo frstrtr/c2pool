@@ -178,7 +178,7 @@ void HashrateTracker::adjust_difficulty() {
     new_difficulty = std::max(min_difficulty_, std::min(max_difficulty_, new_difficulty));
 
     if (std::abs(new_difficulty - current_difficulty_) / std::max(current_difficulty_, 0.001) > 0.05) {
-        LOG_INFO << "VARDIFF: " << current_difficulty_ << " -> " << new_difficulty
+        LOG_INFO << "[Stratum] VARDIFF: " << current_difficulty_ << " -> " << new_difficulty
                  << " (" << num_shares << " shares in " << elapsed << "s"
                  << ", actual_rate=" << actual_rate << "s"
                  << ", target=" << target_time_per_mining_share_ << "s)";

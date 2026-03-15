@@ -95,13 +95,13 @@ private:
 				if (ec)
 				{
 					if (ec != boost::system::errc::operation_canceled)
-						LOG_WARNING << "Factory::Client::connect_socket failed: " << ec.message();
+						LOG_TRACE << "[Net] Connection failed: " << ec.message();
 					else
 						LOG_DEBUG_COIND << "Factory::Client::connect_socket canceled";
 					return;
 				}
 
-				LOG_INFO << "Factory::Client::connect_socket try handshake with " << ep.address() << ":" << ep.port();
+				LOG_TRACE << "[Net] Handshake with " << ep.address() << ":" << ep.port();
 				socket->init();
 
 				m_node->connected(socket);
@@ -118,7 +118,7 @@ private:
 				{
 					
 					if (ec != boost::system::errc::operation_canceled)
-						LOG_WARNING << "Factory::Client::resolve failed: " << ec.message();
+						LOG_TRACE << "[Net] DNS resolve failed: " << ec.message();
 					else
 						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";
 					return;

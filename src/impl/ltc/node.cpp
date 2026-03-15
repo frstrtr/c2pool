@@ -49,7 +49,7 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
     // Reject banned peers
     if (is_banned(addr))
     {
-        LOG_INFO << "Rejecting connection from banned peer " << addr.to_string();
+        LOG_INFO << "[Pool] Rejecting connection from banned peer " << addr.to_string();
         socket->close();
         return;
     }
@@ -112,7 +112,7 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         std::unique_ptr<ltc::message_version> msg;
         msg = ltc::message_version::make(rmsg->m_data);
 
-        LOG_INFO << "Peer "
+        LOG_INFO << "[Pool] Peer "
                  << msg->m_addr_from.m_endpoint.to_string()
                  << " says protocol version is "
                  << msg->m_version
@@ -131,7 +131,7 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
 
         if (m_nonce == msg->m_nonce)
         {
-                LOG_WARNING << "was connected to self";
+                LOG_WARNING << "[Pool] was connected to self";
                 return std::nullopt;
         }
 
@@ -366,7 +366,7 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 
 	if (!shares.empty())
 	{
-		LOG_INFO << "Sending " << shares.size() << " shares to " << peer_addr.to_string();
+		LOG_INFO << "[Pool] Sending " << shares.size() << " shares to " << peer_addr.to_string();
 	}
 	return shares;
 }
@@ -461,7 +461,7 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         peer->write(std::move(ftx_msg));
     }
 
-    LOG_INFO << "Sent " << shares.size() << " shares (+" << needed_txs.size()
+    LOG_INFO << "[Pool] Sent " << shares.size() << " shares (+" << needed_txs.size()
              << " txs) to " << peer->addr().to_string();
 }
 
@@ -526,7 +526,7 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
     std::vector<uint256> hashes = { target_hash };
     std::vector<uint256> stops;  // empty — don't stop early, let handle_get_share apply limits
 
-    LOG_INFO << "Requesting shares from " << peer->addr().to_string()
+    LOG_INFO << "[Pool] Requesting shares from " << peer->addr().to_string()
              << " starting at " << target_hash.ToString()
              << " (parents=" << PARENTS_PER_REQUEST << ")";
 
@@ -544,7 +544,7 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
                 return;
             }
 
-            LOG_INFO << "Received " << reply.m_items.size() << " shares for download request";
+            LOG_INFO << "[Pool] Received " << reply.m_items.size() << " shares for download request";
 
             // Feed into processing pipeline
             HandleSharesData data;
@@ -617,7 +617,7 @@ void NodeImpl::load_persisted_shares()
         }
     }
 
-    LOG_INFO << "Loaded " << loaded << " shares from LevelDB storage";
+    LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage";
 }
 
 void NodeImpl::start_outbound_connections()
@@ -645,7 +645,7 @@ void NodeImpl::start_outbound_connections()
             if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr) || is_banned(ap.addr))
                 continue;
 
-            LOG_INFO << "Dialing outbound peer " << ap.addr.to_string();
+            LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
             m_pending_outbound.insert(ap.addr);
             core::Client::connect(ap.addr);
             --needed;
@@ -674,7 +674,7 @@ void NodeImpl::run_think()
     if (m_think_running.exchange(true))
         return;
 
-    LOG_INFO << "run_think(): chain=" << m_tracker.chain.size()
+    LOG_INFO << "[Pool] run_think(): chain=" << m_tracker.chain.size()
              << " verified=" << m_tracker.verified.size()
              << " heads=" << m_tracker.chain.get_heads().size();
 
@@ -711,7 +711,7 @@ void NodeImpl::run_think()
                             total_removed += removed;
                         }
                         if (total_removed > 0)
-                            LOG_INFO << "Trimmed " << total_removed << " old shares from " << label
+                            LOG_INFO << "[Pool] Trimmed " << total_removed << " old shares from " << label
                                      << " (now " << sc.size() << ")";
                     };
                     trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
@@ -750,9 +750,9 @@ void NodeImpl::run_think()
                     // Update best share
                     if (!result.best.IsNull()) {
                         m_best_share_hash = result.best;
-                        LOG_INFO << "think(): best=" << result.best.GetHex().substr(0, 16) << "...";
+                        LOG_INFO << "[Pool] think(): best=" << result.best.GetHex();
                     } else {
-                        LOG_WARNING << "think(): result.best is NULL — verified_tails="
+                        LOG_WARNING << "[Pool] think(): result.best is NULL — verified_tails="
                                     << m_tracker.verified.get_tails().size()
                                     << " verified_heads=" << m_tracker.verified.get_heads().size();
                     }

@@ -190,7 +190,7 @@ void Actual::HANDLER(sharereply)
 void Actual::HANDLER(bestblock)
 {
     auto header_hash = Hash(pack(msg->m_header).get_span());
-    LOG_INFO << "New best block from peer " << peer->addr().to_string()
+    LOG_INFO << "[Pool] New best block from peer " << peer->addr().to_string()
              << ": " << header_hash.ToString();
 
     for (auto& [nonce, wpeer] : m_peers)

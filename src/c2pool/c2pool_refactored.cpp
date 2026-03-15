@@ -990,7 +990,7 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
 
             if (embedded_ltc) {
-                LOG_INFO << "Phase 4: embedded LTC coin node mode (no daemon required)";
+                LOG_INFO << "[LTC] Phase 4: embedded coin node mode (no daemon required)";
 
                 auto ltc_params = settings->m_testnet
                     ? ltc::coin::LTCChainParams::testnet()
@@ -1072,12 +1072,12 @@ int main(int argc, char* argv[]) {
                 embedded_broadcaster->set_on_peer_height(
                     [chain = embedded_chain.get()](uint32_t h) {
                         chain->set_peer_tip_height(h);
-                        LOG_INFO << "Peer reports chain height " << h
+                        LOG_INFO << "[LTC] Peer reports chain height " << h
                                  << " — fast-sync: scrypt skip below " << (h > 2100 ? h - 2100 : 0);
                     });
 
                 embedded_broadcaster->start();
-                LOG_INFO << "Embedded LTC broadcaster started, connecting to "
+                LOG_INFO << "[LTC] Embedded broadcaster started, connecting to "
                          << p2p_host << ":" << (coind_p2p_port > 0 ? coind_p2p_port : 19335);
                 // NOTE: set_on_new_headers and set_embedded_node are wired after web_server is created below
 
@@ -1089,7 +1089,7 @@ int main(int argc, char* argv[]) {
                 if (rpc_port == 19332 && !settings->m_testnet)
                     rpc_port = 9332; // mainnet LTC
 
-                LOG_INFO << "Connecting to coin daemon RPC at " << rpc_host << ":" << rpc_port;
+                LOG_INFO << "[LTC] Connecting to coin daemon RPC at " << rpc_host << ":" << rpc_port;
                 node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
                                   rpc_user + ":" + rpc_pass);
             }
@@ -1844,7 +1844,7 @@ int main(int argc, char* argv[]) {
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
                         if (now - s_last_warn.load() > 30'000'000'000LL) {
                             s_last_warn.store(now);
-                            LOG_WARNING << "[P2Pool] Skipping share creation: chain not ready (waiting for shares from peers)";
+                            LOG_WARNING << "[Pool] Skipping share creation: chain not ready (waiting for shares from peers)";
                         }
                         return;
                     }
@@ -1910,8 +1910,8 @@ int main(int argc, char* argv[]) {
                         LOG_ERROR << "broadcast_share failed: " << e.what();
                     }
 
-                    LOG_INFO << "Share created and broadcast: "
-                             << share_hash.GetHex().substr(0, 16) << "..."
+                    LOG_INFO << "[Pool] Share created and broadcast: "
+                             << share_hash.GetHex()
                              << " subsidy=" << p.subsidy
                              << " merged_chains=" << merged_addrs.size();
                 } catch (const std::exception& e) {

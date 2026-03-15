@@ -94,12 +94,12 @@ public:
         peer->m_timeout = std::make_unique<core::Timer>(m_context, true);
         peer->m_timeout->start(NEW_PEER_TIMEOUT_TIME, [&, addr = peer->addr()](){ timeout(addr); });
 
-        LOG_INFO << socket->get_addr().to_string() << " try to connect!";
+        LOG_INFO << "[Pool] " << socket->get_addr().to_string() << " connected";
     }
 
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        LOG_ERROR << "PoolNode <NetName>[" << service.to_string() << "]:";
+        LOG_ERROR << "[Pool] <NetName>[" << service.to_string() << "]:";
         LOG_ERROR << "\terror: " << err;
         LOG_ERROR << "\twhere: " << where.function_name();
         if (m_connections.contains(service))

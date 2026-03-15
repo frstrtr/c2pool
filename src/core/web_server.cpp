@@ -763,7 +763,7 @@ static uint256 compute_witness_merkle_root(std::vector<uint256> hashes) {
     return hashes[0];
 }
 
-// P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
+// P2Pool witness nonce: '[Pool]' repeated 4 times = 32 bytes
 static const unsigned char P2POOL_WITNESS_NONCE_BYTES[32] = {
     0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
     0x5b, 0x50, 0x32, 0x50, 0x6f, 0x6f, 0x6c, 0x5d,
@@ -772,7 +772,7 @@ static const unsigned char P2POOL_WITNESS_NONCE_BYTES[32] = {
 };
 
 // Compute the P2Pool witness commitment hex from a raw witness merkle root.
-// Returns the full script hex: "6a24aa21a9ed" + SHA256d(root || '[P2Pool]'*4)
+// Returns the full script hex: "6a24aa21a9ed" + SHA256d(root || '[Pool]'*4)
 static std::string compute_p2pool_witness_commitment_hex(const uint256& witness_root) {
     uint256 nonce;
     std::memcpy(nonce.data(), P2POOL_WITNESS_NONCE_BYTES, 32);
@@ -956,7 +956,7 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
               << coinbase_hex.substr(8, coinbase_hex.size() - 16) // inputs + outputs
               << "01"                          // 1 stack item for the single coinbase input
               << "20"                          // 32 bytes
-              // P2Pool witness nonce: '[P2Pool]' * 4
+              // P2Pool witness nonce: '[Pool]' * 4
               << "5b5032506f6f6c5d5b5032506f6f6c5d5b5032506f6f6c5d5b5032506f6f6c5d"
               << coinbase_hex.substr(coinbase_hex.size() - 8); // locktime
     } else {
@@ -1317,7 +1317,7 @@ void MiningInterface::refresh_work()
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
                 if (!best.IsNull()) {
-                    LOG_INFO << "[P2Pool] refresh_work: PPLNS active, best_share=" << best.GetHex().substr(0,16) << "..."
+                    LOG_INFO << "[Pool] refresh_work: PPLNS active, best_share=" << best.GetHex()
                              << " donation_script_len=" << m_donation_script.size();
                     uint32_t nbits = std::stoul(
                         wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
@@ -1374,7 +1374,7 @@ void MiningInterface::refresh_work()
                             pplns_outputs.push_back(donation_entry);
 
                         pplns_raw_scripts = true;
-                        LOG_INFO << "[P2Pool] refresh_work: V36 PPLNS coinbase with "
+                        LOG_INFO << "[Pool] refresh_work: V36 PPLNS coinbase with "
                                  << pplns_outputs.size() << " outputs (donation_last="
                                  << found_donation << ")";
                     }
@@ -1409,7 +1409,7 @@ void MiningInterface::refresh_work()
                     wtxids.push_back(wtxid);
                 }
                 witness_root = compute_witness_merkle_root(std::move(wtxids));
-                // P2Pool commitment: SHA256d(witness_root || '[P2Pool]'*4)
+                // P2Pool commitment: SHA256d(witness_root || '[Pool]'*4)
                 witness_commitment = compute_p2pool_witness_commitment_hex(witness_root);
             }
 
@@ -1552,7 +1552,7 @@ nlohmann::json MiningInterface::getwork(const std::string& request_id)
         uint256 work_target = max_target / static_cast<uint64_t>(current_difficulty * 1000000); // Scale for precision
         target_hex = work_target.GetHex();
         
-        LOG_INFO << "Using pool difficulty: " << current_difficulty << ", target: " << target_hex.substr(0, 16) << "...";
+        LOG_INFO << "Using pool difficulty: " << current_difficulty << ", target: " << target_hex;
     } else {
         LOG_WARNING << "No c2pool node connected, using default difficulty: " << current_difficulty;
     }
@@ -1614,7 +1614,7 @@ nlohmann::json MiningInterface::getwork(const std::string& request_id)
 
 nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id)
 {
-    LOG_INFO << "Work submission received - nonce: " << nonce << ", header: " << header.substr(0, 32) << "...";
+    LOG_INFO << "Work submission received - nonce: " << nonce << ", header: " << header;
     
     // Validate the submitted work by computing scrypt PoW hash
     bool work_valid = false;
@@ -1669,7 +1669,7 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
         
         m_node->add_local_mining_share(share_hash, prev_hash, target);
         
-        LOG_INFO << "Mining share submitted and added to sharechain: " << share_hash.ToString().substr(0, 16) << "...";
+        LOG_INFO << "Mining share submitted and added to sharechain: " << share_hash.ToString();
         LOG_INFO << "Work submission accepted";
         return true;
     } else if (work_valid) {
@@ -1715,11 +1715,11 @@ nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, c
 
 nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
 {
-    LOG_TRACE << "submitblock: received " << hex_data.length() / 2 << " bytes";
+    LOG_TRACE << "[LTC] submitblock: received " << hex_data.length() / 2 << " bytes";
 
     // Block header is 80 bytes = 160 hex chars minimum
     if (hex_data.size() < 160) {
-        LOG_ERROR << "submitblock: hex data too short for a valid block header";
+        LOG_ERROR << "[LTC] submitblock: hex data too short for a valid block header";
         return {{"error", "block data too short"}};
     }
 
@@ -1751,7 +1751,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 uint256 expected_prev;
                 expected_prev.SetHex(m_cached_template["previousblockhash"].get<std::string>());
                 if (submitted_prev_hash != expected_prev) {
-                    LOG_WARNING << "submitblock: stale block — prev_hash mismatch"
+                    LOG_WARNING << "[LTC] submitblock: stale block — prev_hash mismatch"
                                 << " submitted=" << submitted_prev_hash.GetHex()
                                 << " expected=" << expected_prev.GetHex();
                     is_stale = true;
@@ -1760,7 +1760,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
 
             // Reconstruct expected merkle_root from coinbase + merkle branches
             if (!is_stale && !m_cached_coinb1.empty() && !m_cached_coinb2.empty()) {
-                LOG_TRACE << "submitblock: merkle_root=" << submitted_merkle_root.GetHex();
+                LOG_TRACE << "[LTC] submitblock: merkle_root=" << submitted_merkle_root.GetHex();
             }
         }
         // Fire stale callback OUTSIDE the lock to avoid deadlock
@@ -1797,13 +1797,13 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
     } else if (m_embedded_node) {
         // Phase 4 embedded mode: no daemon — relay the block directly via P2P.
         // on_block_relay is wired to CoinBroadcaster::submit_block_raw().
-        LOG_TRACE << "submitblock: embedded relay " << hex_data.size()/2 << " bytes";
+        LOG_TRACE << "[LTC] submitblock: embedded relay " << hex_data.size()/2 << " bytes";
         if (m_on_block_relay)
             m_on_block_relay(hex_data);
         if (m_on_block_submitted && hex_data.size() >= 160)
             m_on_block_submitted(hex_data.substr(0, 160), 0);
     } else {
-        LOG_WARNING << "submitblock: no coin RPC or embedded node connected, block discarded";
+        LOG_WARNING << "[LTC] submitblock: no coin RPC or embedded node connected, block discarded";
     }
 
     return nullptr; // null = accepted in getblocktemplate spec
@@ -3784,7 +3784,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
     const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
     const JobSnapshot* job)
 {
-    LOG_TRACE << "mining.submit " << username << " job=" << job_id
+    LOG_TRACE << "[Stratum] mining.submit " << username << " job=" << job_id
               << " nonce=" << nonce << " en2=" << extranonce2;
     
     // Basic share validation
@@ -3898,7 +3898,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             static uint256 s_last_submitted_prev;
                             if (prev_block != s_last_submitted_prev) {
                                 s_last_submitted_prev = prev_block;
-                                LOG_INFO << "Block meets blockchain target! Submitting to coin daemon";
+                                LOG_INFO << "[LTC] Block meets blockchain target! Submitting to coin daemon";
                                 submitblock(block_hex);
                             }
                         }
@@ -4134,7 +4134,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             LOG_INFO << "\n"
                                      << "  ***  TWIN BLOCK!  ***\n"
                                      << "  Parent + merged chain targets met by same PoW hash\n"
-                                     << "  PoW hash: " << pow_hash.GetHex().substr(0, 32) << "...";
+                                     << "  PoW hash: " << pow_hash.GetHex();
                         }
 
                         uint256 header_merkle;
@@ -4161,7 +4161,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             static uint256 s_last_pool_submitted_prev;
                             if (prev_block != s_last_pool_submitted_prev) {
                                 s_last_pool_submitted_prev = prev_block;
-                                LOG_INFO << "Pool block merkle_root validated, submitting to coin daemon";
+                                LOG_INFO << "[LTC] Pool block merkle_root validated, submitting to coin daemon";
                                 submitblock(block_hex);
                             }
                         }
@@ -4765,7 +4765,7 @@ void StratumSession::process_message(std::size_t bytes_read)
             line.pop_back();  // Remove \r if present
         }
         
-        LOG_TRACE << "Stratum message received: " << line;
+        LOG_TRACE << "[Stratum] Received: " << line;
         
         auto request = nlohmann::json::parse(line);
         std::string method = request.value("method", "");
@@ -5020,7 +5020,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     double new_difficulty = hashrate_tracker_.get_current_difficulty();
     if (new_difficulty != old_difficulty) {
         send_set_difficulty(new_difficulty);
-        LOG_INFO << "VARDIFF adjustment for " << username_ << ": "
+        LOG_INFO << "[Stratum] VARDIFF adjustment for " << username_ << ": "
                  << old_difficulty << " -> " << new_difficulty;
     }
 
@@ -5102,7 +5102,7 @@ void StratumSession::send_response(const nlohmann::json& response)
         std::string message = response.dump() + "\n";
         boost::asio::write(socket_, boost::asio::buffer(message));
     } catch (const std::exception& e) {
-        LOG_ERROR << "Error sending Stratum response: " << e.what();
+        LOG_ERROR << "[Stratum] Error sending response: " << e.what();
     }
 }
 
@@ -5164,7 +5164,7 @@ void StratumSession::send_notify_work(bool force_clean)
         auto prev = s_last_warn.load();
         if (now - prev > 30'000'000'000LL) { // 30 seconds
             if (s_last_warn.compare_exchange_strong(prev, now))
-                LOG_WARNING << "send_notify_work: waiting for block template (header sync in progress)...";
+                LOG_WARNING << "[LTC] Waiting for block template (header sync in progress)...";
         }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
         timer->expires_after(std::chrono::seconds(1));
@@ -5210,8 +5210,8 @@ void StratumSession::send_notify_work(bool force_clean)
         if (tmpl.contains("curtime"))
             curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());
 
-        LOG_TRACE << "send_notify_work: live template height="
-                  << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
+        LOG_TRACE << "[Stratum] send_notify_work: height="
+                  << tmpl.value("height", 0) << " prevhash=" << prevhash;
     }
 
     // Encode curtime as 8-hex-char (4-byte big-endian)
