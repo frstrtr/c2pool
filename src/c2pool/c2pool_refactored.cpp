@@ -2320,11 +2320,11 @@ int main(int argc, char* argv[]) {
             // Phase 3L: Pool monitor — periodic log-based diagnostics
             auto pool_monitor = std::make_unique<ltc::PoolMonitor>();
 
-            // Redistribute mode for invalid/empty miner addresses
-            auto redistribute_mode = ltc::parse_redistribute_mode(redistribute_mode_str);
+            // Redistribute mode for invalid/empty miner addresses (V2: hybrid support)
+            auto hybrid_weights = ltc::parse_redistribute_spec(redistribute_mode_str);
             auto redistributor = std::make_unique<ltc::Redistributor>();
-            redistributor->set_mode(redistribute_mode);
-            LOG_INFO << "Redistribute mode: " << ltc::redistribute_mode_str(redistribute_mode);
+            redistributor->set_hybrid_weights(hybrid_weights);
+            LOG_INFO << "Redistribute mode: " << ltc::format_hybrid_weights(hybrid_weights);
 
             // Set operator identity for "fee" and "boost" modes.
             // get_node_fee_hash160() extracts the hash160 from the P2PKH fee scriptPubKey
