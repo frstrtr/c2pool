@@ -160,4 +160,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_compact_blocks "" AUTO)
+
+    add_executable(test_redistribute test_redistribute.cpp)
+    target_link_libraries(test_redistribute PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_redistribute "" AUTO)
 endif()
