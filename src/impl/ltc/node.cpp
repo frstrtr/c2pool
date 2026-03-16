@@ -576,17 +576,32 @@ void NodeImpl::load_persisted_shares()
     if (!m_storage || !m_storage->is_available())
         return;
 
-    // load_sharechain iterates the height index and loads each share
-    auto hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
-    if (hashes.empty())
+    // load_sharechain iterates the height index and loads each share.
+    // Limit to keep_per_head shares to avoid loading unbounded history
+    // into memory (LevelDB is never pruned, so it accumulates forever).
+    auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+    if (all_hashes.empty())
     {
         LOG_INFO << "No persisted shares found in LevelDB";
         return;
     }
 
-    int loaded = 0;
-    for (const auto& hash : hashes)
+    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+    const size_t total_in_db = all_hashes.size();
+
+    // Only load the most recent shares (highest height = end of vector)
+    size_t skip = 0;
+    if (total_in_db > keep_per_head)
     {
+        skip = total_in_db - keep_per_head;
+        LOG_INFO << "[Pool] LevelDB has " << total_in_db << " shares, loading only newest "
+                 << keep_per_head << " (skipping " << skip << " old shares)";
+    }
+
+    int loaded = 0;
+    for (size_t i = skip; i < total_in_db; ++i)
+    {
+        const auto& hash = all_hashes[i];
         std::vector<uint8_t> data;
         uint256 prev; uint64_t height, ts; uint256 work, target; bool orphan;
         if (!m_storage->load_share(hash, data, prev, height, ts, work, target, orphan))
@@ -612,12 +627,25 @@ void NodeImpl::load_persisted_shares()
         }
         catch (const std::exception& e)
         {
-            LOG_WARNING << "Failed to load share " << hash.ToString().substr(0, 16)
-                        << "... from LevelDB: " << e.what();
+            LOG_WARNING << "Failed to load share " << hash.ToString()
+                        << " from LevelDB: " << e.what();
         }
     }
 
-    LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage";
+    LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
+             << " (DB total: " << total_in_db << ", limit: " << keep_per_head << ")";
+
+    // Prune old shares from LevelDB that we skipped
+    if (skip > 0)
+    {
+        size_t pruned = 0;
+        for (size_t i = 0; i < skip; ++i)
+        {
+            if (m_storage->remove_share(all_hashes[i]))
+                ++pruned;
+        }
+        LOG_INFO << "[Pool] Pruned " << pruned << " old shares from LevelDB";
+    }
 }
 
 void NodeImpl::start_outbound_connections()
@@ -676,7 +704,8 @@ void NodeImpl::run_think()
 
     LOG_INFO << "[Pool] run_think(): chain=" << m_tracker.chain.size()
              << " verified=" << m_tracker.verified.size()
-             << " heads=" << m_tracker.chain.get_heads().size();
+             << " heads=" << m_tracker.chain.get_heads().size()
+             << " rss=" << get_rss_mb() << "MB";
 
     // Capture block_rel_height fn by value for thread safety
     auto block_rel_height = m_block_rel_height_fn
@@ -701,13 +730,15 @@ void NodeImpl::run_think()
                 {
                     // Trim stale shares (on ioc thread — safe with phase2)
                     const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
-                    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
+                    std::vector<uint256> evicted_from_chain;
+                    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true,
+                                          std::vector<uint256>* evicted = nullptr) {
                         if (sc.size() <= keep_per_head)
                             return;
                         auto heads_copy = sc.get_heads();
                         size_t total_removed = 0;
                         for (auto& [head_hash, tail_hash] : heads_copy) {
-                            auto removed = sc.trim(head_hash, keep_per_head, owns_data);
+                            auto removed = sc.trim(head_hash, keep_per_head, owns_data, evicted);
                             total_removed += removed;
                         }
                         if (total_removed > 0)
@@ -715,7 +746,20 @@ void NodeImpl::run_think()
                                      << " (now " << sc.size() << ")";
                     };
                     trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
-                    trim_chain(m_tracker.chain, "chain");
+                    trim_chain(m_tracker.chain, "chain", /*owns_data=*/true, &evicted_from_chain);
+
+                    // Prune evicted shares from LevelDB
+                    if (!evicted_from_chain.empty() && m_storage && m_storage->is_available())
+                    {
+                        size_t pruned = 0;
+                        for (const auto& h : evicted_from_chain)
+                        {
+                            if (m_storage->remove_share(h))
+                                ++pruned;
+                        }
+                        if (pruned > 0)
+                            LOG_INFO << "[Pool] Pruned " << pruned << " evicted shares from LevelDB";
+                    }
 
                     // Ban peers that provided invalid/unverifiable shares.
                     // Skip localhost:0 — that's our own locally created shares

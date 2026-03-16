@@ -155,8 +155,17 @@ bool SharechainStorage::has_share(const uint256& hash)
     if (!m_leveldb_store) {
         return false;
     }
-    
+
     return m_leveldb_store->has_share(hash);
+}
+
+bool SharechainStorage::remove_share(const uint256& hash)
+{
+    if (!m_leveldb_store) {
+        return false;
+    }
+
+    return m_leveldb_store->remove_share(hash);
 }
 
 void SharechainStorage::log_storage_stats()

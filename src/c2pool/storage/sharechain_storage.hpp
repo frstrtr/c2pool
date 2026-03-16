@@ -98,6 +98,13 @@ public:
      * @return True if share exists
      */
     bool has_share(const uint256& hash);
+
+    /**
+     * @brief Remove a share from storage
+     * @param hash Share hash to remove
+     * @return True if successfully removed
+     */
+    bool remove_share(const uint256& hash);
     
     /**
      * @brief Log storage statistics

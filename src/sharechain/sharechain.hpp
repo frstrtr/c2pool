@@ -426,7 +426,9 @@ public:
     /// @param owns_data When true (default) the evicted share data is
     ///        destroyed.  Set to false for chains that borrow share
     ///        pointers from another chain (e.g. verified borrows from chain).
-    size_t trim(const hash_t& head, size_t max_size, bool owns_data = true)
+    /// @param evicted_hashes If non-null, hashes of removed shares are appended here.
+    size_t trim(const hash_t& head, size_t max_size, bool owns_data = true,
+                std::vector<hash_t>* evicted_hashes = nullptr)
     {
         if (!m_shares.contains(head) || max_size == 0)
             return 0;
@@ -493,6 +495,10 @@ public:
                 m_shares.erase(it);
             }
         }
+
+        // Collect evicted hashes for caller (e.g. LevelDB pruning)
+        if (evicted_hashes)
+            evicted_hashes->insert(evicted_hashes->end(), to_remove.begin(), to_remove.end());
 
         return to_remove.size();
     }
