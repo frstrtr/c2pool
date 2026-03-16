@@ -3897,6 +3897,151 @@ void MiningInterface::set_pool_fee_percent(double fee_percent)
     m_pool_fee_percent = fee_percent;
 }
 
+// Extract hash160 from any address type and return the address category.
+// Returns 40-char hex hash160 on success, empty string on failure.
+// Sets addr_type to: "p2pkh", "p2wpkh", "p2sh", or "" (unconvertible).
+static std::string address_to_hash160(const std::string& address, std::string& addr_type)
+{
+    addr_type.clear();
+
+    // Try Bech32 first (tltc1..., ltc1..., bc1..., tb1...)
+    static const std::vector<std::string> bech32_hrps = {"tltc", "ltc", "bc", "tb"};
+    for (const auto& hrp : bech32_hrps) {
+        std::string prefix = hrp + "1";
+        if (address.size() > prefix.size() &&
+            address.substr(0, prefix.size()) == prefix)
+        {
+            int witver = -1;
+            std::vector<uint8_t> prog;
+            if (bech32::decode_segwit(hrp, address, witver, prog)) {
+                if (witver == 0 && prog.size() == 20) {
+                    // P2WPKH — 20-byte hash160
+                    addr_type = "p2wpkh";
+                    static const char* HEX = "0123456789abcdef";
+                    std::string hex;
+                    hex.reserve(40);
+                    for (uint8_t b : prog) { hex += HEX[b >> 4]; hex += HEX[b & 0x0f]; }
+                    return hex;
+                }
+                // P2WSH (32 bytes) or P2TR — unconvertible
+            }
+            return "";
+        }
+    }
+
+    // Try DOGE bech32 (not used yet, but future-proof)
+    // DOGE doesn't have bech32 addresses — fall through to base58
+
+    // Base58Check: decode to version byte + 20-byte hash160
+    auto h160 = base58check_to_hash160(address);
+    if (h160.size() == 40) {
+        // Decode version byte to determine type
+        // base58check_to_hash160 strips the version byte, but we need it
+        // to tell P2PKH from P2SH. Re-decode the first byte.
+        static constexpr const char* B58 =
+            "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        uint8_t decoded[25] = {};
+        for (unsigned char ch : address) {
+            const char* p = std::strchr(B58, static_cast<char>(ch));
+            if (!p) return "";
+            int carry = static_cast<int>(p - B58);
+            for (int i = 24; i >= 0; --i) {
+                carry += 58 * static_cast<int>(decoded[i]);
+                decoded[i] = static_cast<uint8_t>(carry & 0xFF);
+                carry >>= 8;
+            }
+        }
+        uint8_t version = decoded[0];
+        // LTC mainnet: P2PKH=0x30, P2SH=0x32 or 0x05
+        // LTC testnet: P2PKH=0x6f, P2SH=0xc4 or 0x3a
+        // DOGE mainnet: P2PKH=0x1e, P2SH=0x16
+        // DOGE testnet: P2PKH=0x71, P2SH=0xc4
+        // BTC mainnet: P2PKH=0x00, P2SH=0x05
+        // BTC testnet: P2PKH=0x6f, P2SH=0xc4
+        if (version == 0x32 || version == 0x05 || version == 0x3a ||
+            version == 0xc4 || version == 0x16) {
+            addr_type = "p2sh";
+        } else {
+            addr_type = "p2pkh";
+        }
+        return h160;
+    }
+
+    return "";
+}
+
+// Build merged chain script from hash160 and address type.
+// P2PKH/P2WPKH → P2PKH script (76 a9 14 <hash> 88 ac)
+// P2SH → P2SH script (a9 14 <hash> 87)
+static std::vector<unsigned char> hash160_to_merged_script(
+    const std::string& h160_hex, const std::string& addr_type)
+{
+    if (h160_hex.size() != 40) return {};
+    std::vector<unsigned char> hash_bytes;
+    hash_bytes.reserve(20);
+    for (size_t i = 0; i < h160_hex.size(); i += 2)
+        hash_bytes.push_back(static_cast<unsigned char>(
+            std::stoul(h160_hex.substr(i, 2), nullptr, 16)));
+
+    std::vector<unsigned char> script;
+    if (addr_type == "p2sh") {
+        // OP_HASH160 <20> OP_EQUAL
+        script.reserve(23);
+        script.push_back(0xa9);
+        script.push_back(0x14);
+        script.insert(script.end(), hash_bytes.begin(), hash_bytes.end());
+        script.push_back(0x87);
+    } else {
+        // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        script.reserve(25);
+        script.push_back(0x76);
+        script.push_back(0xa9);
+        script.push_back(0x14);
+        script.insert(script.end(), hash_bytes.begin(), hash_bytes.end());
+        script.push_back(0x88);
+        script.push_back(0xac);
+    }
+    return script;
+}
+
+// Check if an address belongs to a specific chain by testing version bytes.
+// Returns true if the address is native to the chain identified by hrp/version.
+static bool is_address_for_chain(const std::string& address,
+    const std::vector<std::string>& chain_hrps,   // bech32 HRPs for this chain
+    const std::vector<uint8_t>& chain_versions)    // base58 version bytes for this chain
+{
+    // Check bech32
+    for (const auto& hrp : chain_hrps) {
+        std::string prefix = hrp + "1";
+        if (address.size() > prefix.size() &&
+            address.substr(0, prefix.size()) == prefix)
+            return true;
+    }
+    // Check base58 version byte
+    if (address.size() >= 25) {
+        static constexpr const char* B58 =
+            "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        uint8_t decoded[25] = {};
+        bool valid = true;
+        for (unsigned char ch : address) {
+            const char* p = std::strchr(B58, static_cast<char>(ch));
+            if (!p) { valid = false; break; }
+            int carry = static_cast<int>(p - B58);
+            for (int i = 24; i >= 0; --i) {
+                carry += 58 * static_cast<int>(decoded[i]);
+                decoded[i] = static_cast<uint8_t>(carry & 0xFF);
+                carry >>= 8;
+            }
+        }
+        if (valid) {
+            for (uint8_t ver : chain_versions) {
+                if (decoded[0] == ver) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Try to build a scriptPubKey from either a Base58Check or Bech32 address.
 // Returns empty vector on failure.
 static std::vector<unsigned char> address_to_script(const std::string& address)
@@ -5047,16 +5192,30 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         username_ = params[0];
         authorized_ = true;
 
-        // Strip worker name suffix (e.g., ".r1c")
+        // Strip worker name suffix: both "." and "_" separators (Python compat)
         auto dot_pos = username_.rfind('.');
         if (dot_pos != std::string::npos && dot_pos > 20)
             username_ = username_.substr(0, dot_pos);
+        auto underscore_pos = username_.rfind('_');
+        if (underscore_pos != std::string::npos && underscore_pos > 20)
+            username_ = username_.substr(0, underscore_pos);
 
         // Parse merged addresses — two supported formats:
         //   Slash format: PRIMARY/CHAIN_ID:ADDR/CHAIN_ID:ADDR
-        //   Comma format: PRIMARY,MERGED_ADDR  (chain_id from MM manager)
+        //   Comma format: PRIMARY,MERGED_ADDR  (auto-resolved to chain_id)
+        static constexpr uint32_t DOGE_CHAIN_ID = 98;
+
+        // Chain identification tables
+        // LTC: bech32 "ltc"/"tltc", base58 versions 0x30(P2PKH), 0x32/0x05(P2SH), 0x6f(testnet P2PKH), 0xc4/0x3a(testnet P2SH)
+        static const std::vector<std::string> LTC_HRPS = {"ltc", "tltc"};
+        static const std::vector<uint8_t> LTC_VERSIONS = {0x30, 0x32, 0x05, 0x6f, 0xc4, 0x3a};
+        // DOGE: no bech32, base58 versions 0x1e(P2PKH), 0x16(P2SH), 0x71(testnet P2PKH)
+        static const std::vector<std::string> DOGE_HRPS = {};
+        static const std::vector<uint8_t> DOGE_VERSIONS = {0x1e, 0x16, 0x71};
+
         auto slash_pos = username_.find('/');
         auto comma_pos = username_.find(',');
+        std::string merged_addr_raw;  // raw merged address from comma format
         if (slash_pos != std::string::npos) {
             std::string remainder = username_.substr(slash_pos + 1);
             username_ = username_.substr(0, slash_pos);
@@ -5068,39 +5227,69 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                     try {
                         uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
                         merged_addresses_[chain_id] = token.substr(colon + 1);
-                    } catch (...) {
-                        // skip malformed entries
-                    }
+                    } catch (...) {}
                 }
             }
         } else if (comma_pos != std::string::npos) {
-            // Comma-separated: "LTC_ADDR,DOGE_ADDR[,ADDR2...]"
-            // First address is primary; subsequent are merged chains.
-            // Use chain_id=0 as placeholder (MM manager resolves actual chain).
-            std::string merged_part = username_.substr(comma_pos + 1);
+            merged_addr_raw = username_.substr(comma_pos + 1);
             username_ = username_.substr(0, comma_pos);
-            // For single merged chain (common case: LTC+DOGE), assign chain_id=0
-            if (!merged_part.empty()) {
-                merged_addresses_[0] = merged_part;
+            // Strip worker name from merged address too
+            auto mdot = merged_addr_raw.rfind('.');
+            if (mdot != std::string::npos && mdot > 20) merged_addr_raw = merged_addr_raw.substr(0, mdot);
+            auto mus = merged_addr_raw.rfind('_');
+            if (mus != std::string::npos && mus > 20) merged_addr_raw = merged_addr_raw.substr(0, mus);
+        }
+
+        // Resolve comma-format merged address to actual chain_id
+        if (!merged_addr_raw.empty()) {
+            bool resolved = false;
+
+            // Try: second address is DOGE (expected order: LTC,DOGE)
+            if (is_address_for_chain(merged_addr_raw, DOGE_HRPS, DOGE_VERSIONS)) {
+                merged_addresses_[DOGE_CHAIN_ID] = merged_addr_raw;
+                resolved = true;
+            }
+
+            // Swap detection: first addr is DOGE, second is LTC (wrong order)
+            if (!resolved &&
+                is_address_for_chain(username_, DOGE_HRPS, DOGE_VERSIONS) &&
+                is_address_for_chain(merged_addr_raw, LTC_HRPS, LTC_VERSIONS))
+            {
+                LOG_WARNING << "[Stratum] Detected swapped address order '"
+                            << username_ << "," << merged_addr_raw
+                            << "' (expected LTC,DOGE). Auto-correcting.";
+                std::string doge_addr = username_;
+                username_ = merged_addr_raw;           // LTC address
+                merged_addresses_[DOGE_CHAIN_ID] = doge_addr; // DOGE address
+                resolved = true;
+            }
+
+            // Fallback: if we couldn't identify the chain, try hash160 extraction
+            // and assign to first available merged chain
+            if (!resolved) {
+                std::string mtype;
+                auto mh = address_to_hash160(merged_addr_raw, mtype);
+                if (mh.size() == 40 && mining_interface_ && mining_interface_->has_merged_chain(DOGE_CHAIN_ID)) {
+                    merged_addresses_[DOGE_CHAIN_ID] = merged_addr_raw;
+                    LOG_INFO << "[Stratum] Assigned comma-format merged address to DOGE chain (chain_id=" << DOGE_CHAIN_ID << ")";
+                    resolved = true;
+                }
             }
         }
         if (!merged_addresses_.empty())
-            LOG_INFO << "Merged addresses from username: " << merged_addresses_.size() << " chain(s)";
-        
-        LOG_INFO << "Mining authorization successful for: " << username_;
+            LOG_INFO << "[Stratum] Merged addresses from login: " << merged_addresses_.size() << " chain(s)";
+
+        LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
 
         // Case 2 (Python work.py): if LTC address is valid but no explicit DOGE merged
-        // address provided, auto-derive DOGE merged address from the same hash160.
-        // LTC and DOGE use identical secp256k1 keys → same pubkey_hash, different version byte.
-        // We store the LTC address under DOGE_CHAIN_ID; base58check_to_hash160() is
-        // version-byte-agnostic, so the script produced will be hash160-identical.
-        static constexpr uint32_t DOGE_CHAIN_ID = 98;
+        // address provided, auto-derive DOGE P2PKH from the same hash160.
         if (mining_interface_ && mining_interface_->has_merged_chain(DOGE_CHAIN_ID)) {
             if (merged_addresses_.find(DOGE_CHAIN_ID) == merged_addresses_.end()) {
-                auto h160 = base58check_to_hash160(username_);
-                if (h160.size() == 40) {
+                std::string atype;
+                auto h160 = address_to_hash160(username_, atype);
+                if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
                     merged_addresses_[DOGE_CHAIN_ID] = username_;
-                    LOG_INFO << "Case 2: auto-generated DOGE merged address from LTC address for " << username_;
+                    LOG_INFO << "[Stratum] Case 2: auto-derived DOGE merged address from " << atype << " LTC address";
                 }
             }
         }
@@ -5245,15 +5434,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // valid blocks are silently discarded.
     std::map<uint32_t, std::vector<unsigned char>> merged_scripts;
     for (const auto& [chain_id, addr] : merged_addresses_) {
-        auto h160 = base58check_to_hash160(addr);
+        std::string atype;
+        auto h160 = address_to_hash160(addr, atype);
         if (h160.size() == 40) {
-            std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-            for (size_t i = 0; i < h160.size(); i += 2)
-                script.push_back(static_cast<unsigned char>(
-                    std::stoul(h160.substr(i, 2), nullptr, 16)));
-            script.push_back(0x88);
-            script.push_back(0xac);
-            merged_scripts[chain_id] = std::move(script);
+            auto script = hash160_to_merged_script(h160, atype);
+            if (!script.empty())
+                merged_scripts[chain_id] = std::move(script);
         }
     }
 
@@ -5461,18 +5647,15 @@ void StratumSession::send_notify_work(bool force_clean)
             }
         }
 
-        // Build merged address entries
+        // Build merged address entries (bech32+base58, P2PKH+P2SH)
         std::vector<std::pair<uint32_t, std::vector<unsigned char>>> merged_addrs;
         for (const auto& [chain_id, addr] : merged_addresses_) {
-            auto h160 = base58check_to_hash160(addr);
+            std::string atype;
+            auto h160 = address_to_hash160(addr, atype);
             if (h160.size() == 40) {
-                std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-                for (size_t i = 0; i < h160.size(); i += 2)
-                    script.push_back(static_cast<unsigned char>(
-                        std::stoul(h160.substr(i, 2), nullptr, 16)));
-                script.push_back(0x88);
-                script.push_back(0xac);
-                merged_addrs.push_back({chain_id, std::move(script)});
+                auto script = hash160_to_merged_script(h160, atype);
+                if (!script.empty())
+                    merged_addrs.push_back({chain_id, std::move(script)});
             }
         }
 
