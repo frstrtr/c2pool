@@ -1203,8 +1203,13 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    auto addr_bytes = get_share_script(obj);
-                    delta.weights[addr_bytes] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    // Normalize for merged chain compatibility:
+                    // P2WPKH→P2PKH so payout hash matches Python p2pool
+                    auto raw_script = get_share_script(obj);
+                    auto merged_script = normalize_script_for_merged(raw_script);
+                    // Tier 3: unconvertible (P2WSH/P2TR) — skip, weight redistributed
+                    if (merged_script.empty()) return;
+                    delta.weights[merged_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },
@@ -1233,6 +1238,7 @@ private:
                         delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
 
                         std::vector<unsigned char> weight_key;
+                        // Tier 1: explicit merged_addresses for this chain
                         if constexpr (requires { obj->m_merged_addresses; })
                         {
                             for (const auto& entry : obj->m_merged_addresses)
@@ -1244,8 +1250,14 @@ private:
                                 }
                             }
                         }
+                        // Tier 2: auto-convert parent script (P2WPKH→P2PKH etc.)
                         if (weight_key.empty())
-                            weight_key = get_share_script(obj);
+                        {
+                            auto raw = get_share_script(obj);
+                            weight_key = normalize_script_for_merged(raw);
+                        }
+                        // Tier 3: unconvertible — skip, weight redistributed
+                        if (weight_key.empty()) return;
                         delta.weights[weight_key] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                     });
                     return delta;

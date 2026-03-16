@@ -651,6 +651,49 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
 }
 
 // ============================================================================
+// Normalize a parent chain script to merged chain P2PKH script.
+//
+// P2WPKH (00 14 <hash>) → P2PKH (76 a9 14 <hash> 88 ac)  [same pubkey_hash]
+// P2PKH  (76 a9 14 <hash> 88 ac) → passed through
+// P2SH   (a9 14 <hash> 87)       → P2SH (passed through)
+// P2WSH  (00 20 <hash>)          → empty (unconvertible)
+// P2TR   (51 20 <key>)           → empty (unconvertible)
+//
+// Returns empty vector for unconvertible scripts (Tier 3: redistributed).
+// Matches Python data.py:build_canonical_merged_coinbase() conversion logic.
+// ============================================================================
+inline std::vector<unsigned char> normalize_script_for_merged(
+    const std::vector<unsigned char>& script)
+{
+    // P2PKH (25 bytes: 76 a9 14 <20> 88 ac) — already correct
+    if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 &&
+        script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
+        return script;
+
+    // P2WPKH (22 bytes: 00 14 <20>) — convert to P2PKH using same hash
+    if (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14)
+    {
+        std::vector<unsigned char> p2pkh;
+        p2pkh.reserve(25);
+        p2pkh.push_back(0x76); // OP_DUP
+        p2pkh.push_back(0xa9); // OP_HASH160
+        p2pkh.push_back(0x14); // PUSH 20
+        p2pkh.insert(p2pkh.end(), script.begin() + 2, script.end()); // <hash160>
+        p2pkh.push_back(0x88); // OP_EQUALVERIFY
+        p2pkh.push_back(0xac); // OP_CHECKSIG
+        return p2pkh;
+    }
+
+    // P2SH (23 bytes: a9 14 <20> 87) — pass through (DOGE supports P2SH)
+    if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14 &&
+        script[22] == 0x87)
+        return script;
+
+    // P2WSH (34 bytes: 00 20 <32>) or P2TR (34 bytes: 51 20 <32>) — unconvertible
+    return {};
+}
+
+// ============================================================================
 // Helper: extract full scriptPubKey from a share variant
 // ============================================================================
 inline std::vector<unsigned char> get_share_script(const auto* obj)
