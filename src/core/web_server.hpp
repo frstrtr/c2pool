@@ -429,15 +429,40 @@ public:
 
     WorkSnapshot get_work_snapshot() const;
 
+    // Found block status and record (Layer +2 — blockchain-accepted blocks)
+    enum class BlockStatus : uint8_t {
+        pending   = 0,  // submitted, awaiting confirmation
+        confirmed = 1,  // in best chain (confirmations > 0)
+        orphaned  = 2,  // replaced by another block at same height
+        stale     = 3,  // submitted with stale prev_block
+    };
+    struct FoundBlock {
+        uint64_t    height;
+        std::string hash;
+        uint64_t    ts;
+        BlockStatus status{BlockStatus::pending};
+        uint8_t     check_count{0};   // how many verification attempts
+        std::string chain;            // "LTC"/"tLTC"/"DOGE" etc — for log display
+        uint32_t    confirmations{0}; // last known confirmation count
+    };
+
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
     // The verify callback returns: >0=confirmed, <0=orphaned, 0=pending.
     using block_verify_fn_t = std::function<int(const std::string& hash)>;
+    using block_store_fn_t = std::function<bool(const FoundBlock& blk)>;
+    using block_load_fn_t  = std::function<std::vector<FoundBlock>()>;
     void set_block_verify_fn(block_verify_fn_t fn);
     void set_io_context(boost::asio::io_context* ctx) { m_context = ctx; }
     void schedule_block_verification(const std::string& block_hash);
 
     // Per-chain verify function: register additional verifiers for merged chains
     void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
+
+    /// Set persistence callbacks for found blocks (Layer +2).
+    void set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn);
+
+    /// Load persisted found blocks from storage (call once after persistence is set)
+    void load_persisted_found_blocks();
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
@@ -580,23 +605,13 @@ private:
     // Cached network difficulty (computed from bits in refresh_work)
     std::atomic<double> m_network_difficulty{0.0};
 
-    // Recently found blocks for /recent_blocks
-    enum class BlockStatus : uint8_t {
-        pending   = 0,  // submitted, awaiting confirmation
-        confirmed = 1,  // in best chain (confirmations > 0)
-        orphaned  = 2,  // replaced by another block at same height
-        stale     = 3,  // submitted with stale prev_block
-    };
-    struct FoundBlock {
-        uint64_t    height;
-        std::string hash;
-        uint64_t    ts;
-        BlockStatus status{BlockStatus::pending};
-        uint8_t     check_count{0};   // how many verification attempts
-        std::string chain;            // "LTC"/"tLTC"/"DOGE" etc — for log display
-    };
-    std::vector<FoundBlock> m_found_blocks;   // newest first, capped at 100
+    // Found block list (persistent via Layer +2 callbacks)
+    std::vector<FoundBlock> m_found_blocks;   // newest first, no cap (persistent)
     mutable std::mutex      m_blocks_mutex;
+
+    // Persistent found block storage (Layer +2) — functional callbacks
+    block_store_fn_t m_persist_block_fn;   // called on record + status change
+    block_load_fn_t  m_load_blocks_fn;     // called on startup
 
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
