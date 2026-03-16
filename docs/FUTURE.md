@@ -195,6 +195,66 @@ reconstruct full shares. Fallback: request full share via `getsharedata`
   chains use `max(V36_CHAIN_LENGTH, adaptive_chain_length)` during
   transition.
 
+#### P1: Unified Share Retention (Design Complete, V36 Foundation Implemented)
+
+> Reference: `the/p2poolv36/SHARE_RETENTION_DESIGN.md`
+
+Single `prune_shares()` function replacing 5 independent pruning passes.
+V36 foundation implemented on master. V37 extension points:
+
+- **retention_depth** = `3 * pplns_depth` (pplns + vesting + reorg buffer)
+  — currently uses fixed `CHAIN_LENGTH`, V37 plugs in `adaptive_chain_length`
+- **Dead head detection** — work-based (height proxy in V36, actual work
+  comparison in V37 via `get_delta()`)
+- **Reference-counted TX cleanup** — replaces 10K cap with per-share TX
+  tracking (deferred to V37, cap sufficient for V36 window sizes)
+- **RSS-derived hardware cap** — `max_retention = RSS_LIMIT * 0.5 / share_size`
+  (eliminates the only magic number in the retention policy)
+
+#### P2: THE Temporal Layers
+
+> Reference: `the/docs/the_design_1.md`, `the/p2poolv36/SHARE_RETENTION_DESIGN.md §5`
+
+Five-layer temporal model for entropy-weighted share evaluation:
+
+| Layer | Shares | Retention |
+|-------|--------|-----------|
+| **-1 (Past)** | Stale/late, below difficulty | MMR accumulator, O(log n), never pruned |
+| **0 (Present)** | Current difficulty, active | Standard retention: `3 * pplns_depth` |
+| **+1 (Future)** | Above projected difficulty | Maturity lock until epoch reached |
+| **+2 (Accepted)** | Blockchain-found blocks | Permanent LevelDB record (implemented) |
+
+**V36 foundation already on master:**
+- Layer +2 persistence (found block store, maturity tracking)
+- THE state root committed in coinbase scriptSig (32 bytes after "/c2pool/")
+- `compute_the_state_root()`: Merkle(L-1=zero, L0=PPLNS_snapshot, L+1=zero, epoch_meta)
+- Every found block carries a temporal checkpoint on the blockchain
+
+**V37 additions:**
+- Layer -1 MMR accumulator (O(log n) per address)
+- Layer +1 maturity lock (retained until epoch reached)
+- Cross-layer settlement engine (epoch collapse every 2016 blocks)
+- WL-PPLNS 3D matrix (Miner × Leading Zeros × Temporal Layer)
+- Orphaned Layer +2 entropy recovery (blockchain-level work credited in PPLNS)
+- `the_state_root` verification against coinbase commitment
+- Requires TLA+ formal verification before activation
+
+#### P2: THE Coinbase State Commitment (Implemented on V36)
+
+> Reference: `the/p2poolv36/SHARE_RETENTION_DESIGN.md §5.0.1`
+
+Every found block embeds `the_state_root` in the coinbase scriptSig:
+```
+scriptSig: [BIP34 height][mm_commit]["/c2pool/"][the_state_root(32)]
+```
+
+Enables: trustless PPLNS verification, fast new-node sync via blockchain
+checkpoint scan, cross-chain temporal consistency for merged mining,
+dispute resolution via on-chain proof.
+
+Currently L-1 and L+1 are zero placeholders. When V37 activates, the
+commitment chain is already established on the blockchain.
+
 ---
 
 ## Stratum Protocol Enhancements (from p2pool-merged-v36)
