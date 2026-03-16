@@ -175,6 +175,12 @@ public:
     /// Set RSS memory limit in MB (abort if exceeded). Static because checked in process_shares.
     static void set_rss_limit_mb(long mb);
 
+    /// Unified share retention: single-pass prune of chain + verified + LevelDB.
+    /// Replaces multi-pass trim with work-based dead head detection and
+    /// deferred destruction for verified cascade safety.
+    /// Called from run_think() on the ioc thread.
+    void prune_shares(const uint256& best_share);
+
     /// Run the share tracker think() cycle: verifies chains, scores heads,
     /// identifies bad peers, and requests needed shares.
     /// Should be called periodically (e.g. after processing_shares or on a timer).

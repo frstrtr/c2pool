@@ -487,13 +487,21 @@ private:
     // Build Stratum-compatible coinb1/coinb2 from a live block template
     // Output ordering matches generate_share_transaction():
     //   segwit_commitment(first) → PPLNS payouts → donation → OP_RETURN(last)
+    /// Compute THE state root: Merkle(L-1, L0_pplns, L+1, epoch_meta).
+    /// L-1 and L+1 are zero (placeholders until THE activates).
+    /// L0 = SHA256d of sorted PPLNS output table. Epoch = SHA256d of metadata.
+    static uint256 compute_the_state_root(
+        const std::vector<std::pair<std::string,uint64_t>>& pplns_outputs,
+        uint32_t chain_length, uint32_t block_height, uint32_t bits);
+
     static std::pair<std::string, std::string> build_coinbase_parts(
         const nlohmann::json& tmpl, uint64_t coinbase_value,
         const std::vector<std::pair<std::string,uint64_t>>& outputs,
         bool raw_scripts = false,
         const std::vector<uint8_t>& mm_commitment = {},
         const std::string& witness_commitment_hex = {},
-        const std::string& ref_hash_hex = {});
+        const std::string& ref_hash_hex = {},
+        const uint256& the_state_root = uint256());
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches

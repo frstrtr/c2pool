@@ -1024,6 +1024,58 @@ static std::string p2pkh_script(const std::string& hash160_hex)
     return s.str();
 }
 
+/*static*/ uint256 MiningInterface::compute_the_state_root(
+    const std::vector<std::pair<std::string,uint64_t>>& pplns_outputs,
+    uint32_t chain_length, uint32_t block_height, uint32_t bits)
+{
+    // THE State Root = MerkleRoot(L-1, L0, L+1, epoch_meta)
+    // L-1 and L+1 are zero placeholders until THE activates.
+
+    // Layer 0: SHA256d of sorted PPLNS output table
+    uint256 layer_0;
+    {
+        PackStream ps;
+        for (const auto& [script, amount] : pplns_outputs)
+        {
+            ps << static_cast<uint64_t>(amount);
+            uint8_t len = static_cast<uint8_t>(std::min(script.size() / 2, size_t(255)));
+            ps << len;
+        }
+        auto span = ps.get_span();
+        if (span.size() > 0)
+            layer_0 = Hash(std::span<const unsigned char>(
+                reinterpret_cast<const unsigned char*>(span.data()), span.size()));
+    }
+
+    // Epoch metadata: SHA256d(chain_length || block_height || bits)
+    uint256 epoch_meta;
+    {
+        PackStream ps;
+        ps << chain_length;
+        ps << block_height;
+        ps << bits;
+        auto span = ps.get_span();
+        epoch_meta = Hash(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(span.data()), span.size()));
+    }
+
+    // Layer -1 and +1: zero (placeholders)
+    uint256 layer_m1; // zero
+    uint256 layer_p1; // zero
+
+    // 4-leaf Merkle tree: hash pairs, then hash the pair of pairs
+    // Concatenate each pair into a 64-byte buffer and SHA256d
+    auto hash_pair = [](const uint256& a, const uint256& b) -> uint256 {
+        unsigned char buf[64];
+        std::memcpy(buf, a.data(), 32);
+        std::memcpy(buf + 32, b.data(), 32);
+        return Hash(std::span<const unsigned char>(buf, 64));
+    };
+    uint256 left = hash_pair(layer_m1, layer_0);
+    uint256 right = hash_pair(layer_p1, epoch_meta);
+    return hash_pair(left, right);
+}
+
 /*static*/ std::pair<std::string, std::string>
 MiningInterface::build_coinbase_parts(
     const nlohmann::json& tmpl,
@@ -1032,7 +1084,8 @@ MiningInterface::build_coinbase_parts(
     bool raw_scripts,
     const std::vector<uint8_t>& mm_commitment,
     const std::string& witness_commitment_hex,
-    const std::string& ref_hash_hex)
+    const std::string& ref_hash_hex,
+    const uint256& the_state_root)
 {
     // P2Pool-compatible coinbase split: extranonce goes into last_txout_nonce,
     // NOT into the scriptSig.  This way:
@@ -1073,8 +1126,22 @@ MiningInterface::build_coinbase_parts(
     }
     const int mm_bytes = static_cast<int>(mm_commitment.size());
 
-    // ScriptSig: height + mm_commitment + pool_marker (NO extranonce!)
-    const int script_total = height_bytes + mm_bytes + pool_marker_bytes;
+    // THE state root: 32 bytes embedded in scriptSig (V37 prep — zero cost)
+    // Layout: [height][mm_commit]["/c2pool/"][the_state_root(32)][optional operator text]
+    std::string state_root_hex;
+    const int state_root_bytes = the_state_root.IsNull() ? 0 : 32;
+    if (state_root_bytes > 0) {
+        static const char* HEX = "0123456789abcdef";
+        state_root_hex.reserve(64);
+        for (int i = 0; i < 32; ++i) {
+            unsigned char c = the_state_root.data()[i];
+            state_root_hex += HEX[c >> 4];
+            state_root_hex += HEX[c & 0x0f];
+        }
+    }
+
+    // ScriptSig: height + mm_commitment + pool_marker + state_root (NO extranonce!)
+    const int script_total = height_bytes + mm_bytes + pool_marker_bytes + state_root_bytes;
 
     // Build coinb1: entire coinbase TX up to and including ref_hash in OP_RETURN
     std::ostringstream coinb1;
@@ -1085,11 +1152,13 @@ MiningInterface::build_coinbase_parts(
            << std::hex << std::setfill('0') << std::setw(2) << script_total
            << height_hex;
 
-    // scriptSig: mm + pool_marker (no en1/en2 — those go into last_txout_nonce)
+    // scriptSig: mm + pool_marker + state_root (no en1/en2 — those go into last_txout_nonce)
     if (!mm_hex.empty())
         coinb1 << mm_hex;
-    coinb1 << pool_marker_stripped
-           << "ffffffff";  // sequence = 0xFFFFFFFF
+    coinb1 << pool_marker_stripped;
+    if (!state_root_hex.empty())
+        coinb1 << state_root_hex;
+    coinb1 << "ffffffff";  // sequence = 0xFFFFFFFF
 
     // Count outputs: [segwit?] + PPLNS + OP_RETURN
     size_t num_outputs = outputs.size();
@@ -1221,6 +1290,19 @@ MiningInterface::build_connection_coinbase(
 
     // Call build_coinbase_parts with ref_hash
     // The last_txout_nonce will be filled by en1+en2 at mining time
+    // Compute THE state root for coinbase commitment (V37 prep)
+    uint32_t tmpl_height = m_cached_template.value("height", uint32_t(0));
+    uint32_t tmpl_bits = 0;
+    {
+        auto bits_str = m_cached_template.value("bits", std::string(""));
+        if (bits_str.size() == 8)
+            tmpl_bits = static_cast<uint32_t>(std::stoul(bits_str, nullptr, 16));
+    }
+    auto the_root = compute_the_state_root(
+        m_cached_pplns_outputs,
+        static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
+        tmpl_height, tmpl_bits);
+
     auto [cb1, cb2] = build_coinbase_parts(
         m_cached_template,
         subsidy,
@@ -1228,7 +1310,8 @@ MiningInterface::build_connection_coinbase(
         m_cached_raw_scripts,
         m_cached_mm_commitment,
         m_cached_witness_commitment,
-        ref_hash_hex);
+        ref_hash_hex,
+        the_root);
 
     // Return coinbase parts + work snapshot atomically (still under m_work_mutex)
     WorkSnapshot snap;
