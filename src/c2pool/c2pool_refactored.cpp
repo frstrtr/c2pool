@@ -2023,8 +2023,11 @@ int main(int argc, char* argv[]) {
                     }
                     cfg.p2p_address = cfg.rpc_host;  // same host as RPC daemon
 
-                    // Phase 5: use embedded backend for DOGE if --embedded-doge
-                    if (embedded_doge && cfg.symbol == "DOGE") {
+                    // Phase 5/Step 4: create DOGE HeaderChain when embedded OR P2P is available.
+                    // Even in RPC-primary mode, the HeaderChain enables live header sync
+                    // and acts as fallback if the daemon goes down.
+                    bool doge_has_p2p = (cfg.p2p_port > 0);
+                    if ((embedded_doge || doge_has_p2p) && cfg.symbol == "DOGE" && !doge_chain) {
                         auto dp = settings->m_testnet
                             ? doge::coin::DOGEChainParams::testnet4alpha()
                             : doge::coin::DOGEChainParams::mainnet();
@@ -2058,34 +2061,43 @@ int main(int argc, char* argv[]) {
                                      << " headers (height=" << doge_chain->height() << ")";
                         }
 
-                        doge_pool = std::make_unique<ltc::coin::Mempool>();
+                        if (!doge_pool)
+                            doge_pool = std::make_unique<ltc::coin::Mempool>();
 
-                        auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
-                            *doge_chain, *doge_pool, *doge_params_ptr, cfg);
-                        mm_manager->add_chain(cfg, std::move(backend));
-                        LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
+                        if (embedded_doge) {
+                            auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
+                                *doge_chain, *doge_pool, *doge_params_ptr, cfg);
+                            mm_manager->add_chain(cfg, std::move(backend));
+                            LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
 
-                        // Set RPC as fallback if connection details are available
-                        if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
-                            auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
-                            mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
-                            LOG_INFO << "Merged mining: DOGE RPC fallback at "
+                            // Set RPC as fallback if connection details are available
+                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                                auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
+                                mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
+                                LOG_INFO << "Merged mining: DOGE RPC fallback at "
+                                         << cfg.rpc_host << ":" << cfg.rpc_port;
+                            }
+                        } else {
+                            // P2P-only mode: HeaderChain available for sync, RPC is primary
+                            mm_manager->add_chain(cfg);
+                            LOG_INFO << "Merged mining: added " << cfg.symbol
+                                     << " (chain_id=" << cfg.chain_id << ") at "
                                      << cfg.rpc_host << ":" << cfg.rpc_port;
+
+                            // Set embedded node as fallback (auto-switch on RPC failure)
+                            if (doge_chain && doge_pool && doge_params_ptr) {
+                                auto fallback = std::make_unique<doge::coin::AuxChainEmbedded>(
+                                    *doge_chain, *doge_pool, *doge_params_ptr, cfg);
+                                mm_manager->set_fallback_backend(cfg.chain_id, std::move(fallback));
+                                LOG_INFO << "Merged mining: DOGE embedded fallback (auto-switch on RPC failure)";
+                            }
                         }
                     } else {
+                        // Non-DOGE chain or no P2P — standard RPC path
                         mm_manager->add_chain(cfg);
                         LOG_INFO << "Merged mining: added " << cfg.symbol
                                  << " (chain_id=" << cfg.chain_id << ") at "
                                  << cfg.rpc_host << ":" << cfg.rpc_port;
-
-                        // Set embedded node as fallback if DOGE chain objects exist
-                        // (user passed --doge-p2p-address without --embedded-doge)
-                        if (cfg.symbol == "DOGE" && doge_chain && doge_pool && doge_params_ptr) {
-                            auto fallback = std::make_unique<doge::coin::AuxChainEmbedded>(
-                                *doge_chain, *doge_pool, *doge_params_ptr, cfg);
-                            mm_manager->set_fallback_backend(cfg.chain_id, std::move(fallback));
-                            LOG_INFO << "Merged mining: DOGE embedded fallback configured (auto-switch on RPC failure)";
-                        }
                     }
 
                     // Create multi-peer P2P broadcaster if P2P port is configured
@@ -2124,8 +2136,10 @@ int main(int argc, char* argv[]) {
                                     doge::coin::parse_doge_headers_message);
                             }
 
-                            // Phase 5: wire DOGE header sync via AuxPoW parser
-                            if (embedded_doge && cfg.symbol == "DOGE" && doge_chain) {
+                            // Step 4: wire DOGE header sync via AuxPoW parser.
+                            // Always active when HeaderChain + broadcaster exist
+                            // (not gated on --embedded-doge anymore).
+                            if (cfg.symbol == "DOGE" && doge_chain) {
                                 auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
 
                                 // Wire peer tip height for fast-sync scrypt skip
