@@ -28,7 +28,7 @@ public:
     // -----------------------------------------------------------------------
     // Static LTC p2pool network constants (must match frstrtr/p2pool-merged-v36)
     // -----------------------------------------------------------------------
-    static constexpr uint16_t P2P_PORT                  = 9338;
+    static constexpr uint16_t P2P_PORT                  = 9326;  // must match p2pool-merged-v36
     static constexpr uint32_t SPREAD                    = 3;       // blocks (PPLNS window)
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3600;

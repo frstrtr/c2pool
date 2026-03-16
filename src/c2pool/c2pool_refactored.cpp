@@ -164,7 +164,7 @@ void print_help() {
     std::cout << "  --redistribute MODE       Redistribution mode: pplns, fee, boost, donate\n\n";
     
     std::cout << "PORT CONFIGURATION:\n";
-    std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9338)\n";
+    std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
     std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
     std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
@@ -229,7 +229,7 @@ void print_help() {
     
     std::cout << "DEFAULT NETWORK PORTS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  P2P Sharechain:           9338  (for P2Pool network communication)\n";
+    std::cout << "  P2P Sharechain:           9326  (for P2Pool network communication)\n";
     std::cout << "  Stratum / HTTP API:       9327  (for miners and monitoring)\n\n";
     
     std::cout << "USAGE EXAMPLES:\n";
@@ -277,7 +277,7 @@ int main(int argc, char* argv[]) {
     settings->m_testnet = false;
     
     // Port configuration with p2pool-compatible defaults
-    int p2p_port = 9338;           // P2Pool P2P sharechain port (p2pool LTC mainnet default)
+    int p2p_port = 9326;           // P2Pool P2P sharechain port (p2pool LTC mainnet default)
     int stratum_port = 9327;       // Stratum mining port (p2pool: -w / --worker-port)
     int http_port = 8080;          // Web dashboard / JSON-RPC API port
     std::string http_host = "0.0.0.0";  // HTTP server host
@@ -851,7 +851,7 @@ int main(int argc, char* argv[]) {
     // Auto-detect P2P and Stratum ports for testnet if not explicitly set
     if (settings->m_testnet) {
         if (!cli_explicit.count("p2p_port"))
-            p2p_port = 19338;    // p2pool testnet convention (mainnet + 10012)
+            p2p_port = 19326;    // p2pool testnet convention (mainnet + 10012)
         if (!cli_explicit.count("stratum_port"))
             stratum_port = 19327; // p2pool testnet convention (mainnet + 10000)
     }
