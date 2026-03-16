@@ -729,26 +729,72 @@ void NodeImpl::run_think()
                 [this, result = std::move(result)]()
                 {
                     // Trim stale shares (on ioc thread — safe with phase2)
+                    // Python p2pool pattern (node.py:355-398):
+                    // 1. Collect hashes to evict from chain (dry run)
+                    // 2. Remove from verified FIRST (borrows share data from chain)
+                    // 3. Remove from chain (frees share data)
+                    // This prevents use-after-free: verified must release its
+                    // borrowed references before chain destroys the share data.
                     const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
                     std::vector<uint256> evicted_from_chain;
-                    auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true,
-                                          std::vector<uint256>* evicted = nullptr) {
-                        if (sc.size() <= keep_per_head)
-                            return;
-                        auto heads_copy = sc.get_heads();
+                    std::vector<ltc::ShareType> deferred_shares;
+
+                    // Step 1: Trim chain, deferring share destruction
+                    // Share data is moved to deferred_shares instead of being freed,
+                    // because verified may still hold borrowed references to it.
+                    if (m_tracker.chain.size() > keep_per_head)
+                    {
+                        auto heads_copy = m_tracker.chain.get_heads();
                         size_t total_removed = 0;
                         for (auto& [head_hash, tail_hash] : heads_copy) {
-                            auto removed = sc.trim(head_hash, keep_per_head, owns_data, evicted);
+                            auto removed = m_tracker.chain.trim(head_hash, keep_per_head,
+                                /*owns_data=*/true, &evicted_from_chain, &deferred_shares);
                             total_removed += removed;
                         }
                         if (total_removed > 0)
-                            LOG_INFO << "[Pool] Trimmed " << total_removed << " old shares from " << label
-                                     << " (now " << sc.size() << ")";
-                    };
-                    trim_chain(m_tracker.verified, "verified", /*owns_data=*/false);
-                    trim_chain(m_tracker.chain, "chain", /*owns_data=*/true, &evicted_from_chain);
+                            LOG_INFO << "[Pool] Trimmed " << total_removed
+                                     << " old shares from chain (now " << m_tracker.chain.size() << ")";
+                    }
 
-                    // Prune evicted shares from LevelDB
+                    // Step 2: Cascade — remove evicted shares from verified BEFORE
+                    // destroying share data (Python p2pool pattern: node.py:396-398)
+                    if (!evicted_from_chain.empty())
+                    {
+                        size_t cascade_removed = 0;
+                        for (const auto& h : evicted_from_chain)
+                        {
+                            if (m_tracker.verified.contains(h))
+                            {
+                                m_tracker.verified.remove(h, /*owns_data=*/false);
+                                ++cascade_removed;
+                            }
+                        }
+                        if (cascade_removed > 0)
+                            LOG_INFO << "[Pool] Cascaded " << cascade_removed
+                                     << " evictions to verified (now " << m_tracker.verified.size() << ")";
+                    }
+
+                    // Step 3: Now safe to destroy deferred share data
+                    for (auto& share : deferred_shares)
+                        share.destroy();
+                    deferred_shares.clear();
+
+                    // Step 4: Also trim verified independently (may have excess)
+                    if (m_tracker.verified.size() > keep_per_head)
+                    {
+                        auto heads_copy = m_tracker.verified.get_heads();
+                        size_t total_removed = 0;
+                        for (auto& [head_hash, tail_hash] : heads_copy) {
+                            auto removed = m_tracker.verified.trim(head_hash, keep_per_head,
+                                /*owns_data=*/false);
+                            total_removed += removed;
+                        }
+                        if (total_removed > 0)
+                            LOG_INFO << "[Pool] Trimmed " << total_removed
+                                     << " old shares from verified (now " << m_tracker.verified.size() << ")";
+                    }
+
+                    // Step 5: Prune evicted shares from LevelDB
                     if (!evicted_from_chain.empty() && m_storage && m_storage->is_available())
                     {
                         size_t pruned = 0;
