@@ -39,6 +39,7 @@
 #include <c2pool/hashrate/tracker.hpp>
 #include <c2pool/difficulty/adjustment_engine.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
+#include <c2pool/storage/found_block_store.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 
 // Integrated merged mining
@@ -1127,14 +1128,66 @@ int main(int argc, char* argv[]) {
                 // Wire block verification: check header chain for found blocks
                 auto* mi = web_server.get_mining_interface();
                 mi->set_io_context(&ioc);
+
+                // --- Layer +2: Persistent found block storage ---
+                // Uses a dedicated LevelDB in the network data dir.
+                std::string net_label = settings->m_testnet ? "testnet" : "mainnet";
+                std::string fblk_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".") +
+                    "/.c2pool/" + net_label + "/found_blocks_db";
+                auto fblk_leveldb = std::make_shared<core::LevelDBStore>(
+                    fblk_db_path, core::LevelDBOptions{});
+                if (!fblk_leveldb->open()) {
+                    LOG_WARNING << "[Pool] Failed to open found blocks LevelDB at " << fblk_db_path;
+                } else {
+                    auto fblk_store = std::make_shared<c2pool::storage::FoundBlockStore>(*fblk_leveldb);
+                    using MI = core::MiningInterface;
+                    mi->set_found_block_persistence(
+                        // persist callback
+                        [fblk_store, fblk_leveldb](const MI::FoundBlock& blk) -> bool {
+                            c2pool::storage::FoundBlockRecord rec;
+                            rec.chain = blk.chain;
+                            rec.height = blk.height;
+                            rec.block_hash = blk.hash;
+                            rec.timestamp = blk.ts;
+                            rec.status = static_cast<uint8_t>(blk.status);
+                            rec.check_count = blk.check_count;
+                            rec.confirmations = blk.confirmations;
+                            rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
+                            return fblk_store->store(rec);
+                        },
+                        // load callback
+                        [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
+                            auto records = fblk_store->load_all();
+                            std::vector<MI::FoundBlock> result;
+                            result.reserve(records.size());
+                            for (const auto& rec : records) {
+                                MI::FoundBlock blk;
+                                blk.height = rec.height;
+                                blk.hash = rec.block_hash;
+                                blk.ts = rec.timestamp;
+                                blk.status = static_cast<MI::BlockStatus>(rec.status);
+                                blk.check_count = rec.check_count;
+                                blk.chain = rec.chain;
+                                blk.confirmations = rec.confirmations;
+                                result.push_back(std::move(blk));
+                            }
+                            return result;
+                        }
+                    );
+                    mi->load_persisted_found_blocks();
+                    LOG_INFO << "[Pool] Found block persistence enabled at " << fblk_db_path;
+                }
                 mi->set_block_verify_fn(
                     [chain = embedded_chain.get()](const std::string& hash_hex) -> int {
                         uint256 h;
                         h.SetHex(hash_hex);
                         auto entry = chain->get_header(h);
-                        if (entry.has_value())
-                            return 1;  // confirmed — in our chain
-                        return 0;      // unknown — still pending
+                        if (!entry.has_value())
+                            return 0;  // not in our chain — still pending
+                        // Return actual confirmation count (tip_height - block_height + 1)
+                        int32_t tip_h = static_cast<int32_t>(chain->height());
+                        int32_t blk_h = static_cast<int32_t>(entry->height);
+                        return std::max(1, tip_h - blk_h + 1);
                     });
 
                 // Header validation thread pool (1 thread) — keeps scrypt off io_context.

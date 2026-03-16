@@ -2106,7 +2106,8 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"ts", b.ts},
             {"status", status_str[static_cast<int>(b.status)]},
             {"checks", b.check_count},
-            {"chain", b.chain}
+            {"chain", b.chain},
+            {"confirmations", b.confirmations}
         });
     }
     return arr;
@@ -2374,11 +2375,64 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                           const std::string& chain)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
-    std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    m_found_blocks.insert(m_found_blocks.begin(),
-        FoundBlock{height, hash.GetHex(), ts, BlockStatus::pending, 0, chain});
-    if (m_found_blocks.size() > 100)
-        m_found_blocks.resize(100);
+    FoundBlock blk{height, hash.GetHex(), ts, BlockStatus::pending, 0, chain, 0};
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        m_found_blocks.insert(m_found_blocks.begin(), blk);
+    }
+
+    // Persist to LevelDB (Layer +2 — never pruned)
+    if (m_persist_block_fn)
+    {
+        try { m_persist_block_fn(blk); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Pool] Failed to persist found block: " << e.what();
+        }
+    }
+}
+
+void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn)
+{
+    m_persist_block_fn = std::move(persist_fn);
+    m_load_blocks_fn = std::move(load_fn);
+}
+
+void MiningInterface::load_persisted_found_blocks()
+{
+    if (!m_load_blocks_fn) return;
+
+    try {
+        auto blocks = m_load_blocks_fn();
+        if (blocks.empty()) return;
+
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // Merge loaded blocks with any already in memory (avoid duplicates)
+        for (auto& blk : blocks)
+        {
+            bool exists = false;
+            for (const auto& existing : m_found_blocks)
+            {
+                if (existing.hash == blk.hash && existing.chain == blk.chain)
+                {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists)
+                m_found_blocks.push_back(std::move(blk));
+        }
+
+        // Sort newest first
+        std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+            [](const FoundBlock& a, const FoundBlock& b) {
+                return a.ts > b.ts;
+            });
+
+        LOG_INFO << "[Pool] Loaded " << blocks.size() << " found blocks from persistent storage";
+    }
+    catch (const std::exception& e) {
+        LOG_WARNING << "[Pool] Failed to load found blocks: " << e.what();
+    }
 }
 
 void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
@@ -2425,18 +2479,33 @@ void MiningInterface::verify_found_block(size_t index)
     if (blk.status != BlockStatus::pending) return;
 
     const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
+    auto prev_status = blk.status;
+
     if (result > 0) {
-        blk.status = BlockStatus::confirmed;
-        auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
-        LOG_INFO << "\n"
-                 << "  +++  BLOCK CONFIRMED — " << cn << " height " << blk.height << "  +++\n"
-                 << "  Chain:      " << cn << "\n"
-                 << "  Height:     " << blk.height << "\n"
-                 << "  Block hash: " << blk.hash << "\n"
-                 << "  Verified:   check #" << (int)blk.check_count
-                 << " (" << age_sec << "s after submission)";
-    } else if (result < 0 || blk.check_count >= 3) {
+        blk.confirmations = static_cast<uint32_t>(result);
+
+        if (blk.status == BlockStatus::pending) {
+            blk.status = BlockStatus::confirmed;
+            auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
+            LOG_INFO << "\n"
+                     << "  +++  BLOCK CONFIRMED — " << cn << " height " << blk.height << "  +++\n"
+                     << "  Chain:      " << cn << "\n"
+                     << "  Height:     " << blk.height << "\n"
+                     << "  Block hash: " << blk.hash << "\n"
+                     << "  Verified:   check #" << (int)blk.check_count
+                     << " (" << age_sec << "s after submission)"
+                     << " confirmations=" << blk.confirmations;
+        }
+        // Already confirmed — just update confirmation count silently
+    } else if (result < 0) {
+        // Explicit orphan signal from verifier
+        if (blk.status == BlockStatus::confirmed) {
+            // Deep reorg: was confirmed, now orphaned
+            LOG_WARNING << "[Pool] DEEP REORG — " << cn << " height " << blk.height
+                        << " was CONFIRMED but now ORPHANED (had " << blk.confirmations << " confs)";
+        }
         blk.status = BlockStatus::orphaned;
+        blk.confirmations = 0;
         auto age_sec = static_cast<uint64_t>(std::time(nullptr)) - blk.ts;
         LOG_WARNING << "\n"
                     << "  ---  BLOCK ORPHANED — " << cn << " height " << blk.height << "  ---\n"
@@ -2445,6 +2514,14 @@ void MiningInterface::verify_found_block(size_t index)
                     << "  Block hash: " << blk.hash << "\n"
                     << "  Checked:    " << (int)blk.check_count
                     << " times over " << age_sec << "s — not in best chain";
+    }
+    // result == 0: still pending, keep checking
+
+    // Persist any status/confirmation change to LevelDB
+    if ((blk.status != prev_status || blk.confirmations > 0) && m_persist_block_fn)
+    {
+        try { m_persist_block_fn(blk); }
+        catch (...) {}
     }
 }
 
@@ -2463,25 +2540,44 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     }
     if (idx == SIZE_MAX) return;
 
-    // Schedule checks based on chain's block time:
-    // LTC (2.5 min): +30s, +150s (1 block), +300s (2 blocks)
-    // DOGE (1 min):  +10s, +60s (1 block), +120s (2 blocks)
-    // Default:       +10s, +60s, +120s
+    // Schedule verification checks for block acceptance.
+    // Block acceptance (in best chain) typically confirmed within 6 blocks.
+    // This is NOT coinbase maturity (100/240 confs for spending) — just
+    // whether the block was accepted into the blockchain.
+    //
+    // Chain-specific block times:
+    //   LTC: 2.5 min/block → check at +30s, +150s, +300s, +450s, +750s, +1500s
+    //   DOGE: 1 min/block  → check at +10s, +60s, +120s, +180s, +360s, +600s
+    //
+    // After 6 confirmations the block is considered permanently accepted.
+    // If still pending after all checks, mark as orphaned.
     std::string chain_name;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
         if (idx < m_found_blocks.size())
             chain_name = m_found_blocks[idx].chain;
     }
-    std::vector<int> delays;
-    if (chain_name == "LTC" || chain_name == "tLTC")
-        delays = {30, 150, 300};
-    else if (chain_name == "DOGE")
-        delays = {10, 60, 120};
-    else
-        delays = {10, 60, 120};
 
+    int block_time_sec;
+    if (chain_name == "LTC" || chain_name == "tLTC")
+        block_time_sec = 150;   // 2.5 minutes
+    else if (chain_name == "DOGE")
+        block_time_sec = 60;    // 1 minute
+    else
+        block_time_sec = 60;
+
+    // Check at: first_check, then every block_time for 6 blocks,
+    // then one final check at 10 blocks
     auto& ioc = *m_context;
+    std::vector<int> delays = {
+        block_time_sec / 5,         // quick first check
+        block_time_sec,             // ~1 conf
+        block_time_sec * 2,         // ~2 confs
+        block_time_sec * 3,         // ~3 confs
+        block_time_sec * 5,         // ~5 confs
+        block_time_sec * 10,        // ~10 confs (final)
+    };
+
     for (int delay : delays) {
         auto timer = std::make_shared<boost::asio::steady_timer>(
             ioc, std::chrono::seconds(delay));
