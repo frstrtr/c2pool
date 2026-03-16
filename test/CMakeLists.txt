@@ -151,4 +151,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_doge_chain "" AUTO)
+
+    add_executable(test_compact_blocks test_compact_blocks.cpp)
+    target_link_libraries(test_compact_blocks PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_compact_blocks "" AUTO)
 endif()

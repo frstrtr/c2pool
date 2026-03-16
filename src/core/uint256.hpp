@@ -63,6 +63,14 @@ public:
        return &pn[0];
    }
 
+   /// Get a 64-bit chunk at position pos (0-3 for uint256).
+   /// Used by SipHash (BIP 152 compact blocks).
+   uint64_t GetUint64(int pos) const
+   {
+       return static_cast<uint64_t>(pn[pos * 2])
+            | (static_cast<uint64_t>(pn[pos * 2 + 1]) << 32);
+   }
+
    uint32_t* end()
    {
        return &pn[WIDTH];

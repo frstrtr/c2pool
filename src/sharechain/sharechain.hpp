@@ -426,7 +426,12 @@ public:
     /// @param owns_data When true (default) the evicted share data is
     ///        destroyed.  Set to false for chains that borrow share
     ///        pointers from another chain (e.g. verified borrows from chain).
-    size_t trim(const hash_t& head, size_t max_size, bool owns_data = true)
+    /// @param evicted_hashes If non-null, hashes of removed shares are appended here.
+    /// @param deferred_destroy If non-null, share variants are moved here instead of
+    ///        destroyed. Caller must call destroy() on each after cascade cleanup.
+    size_t trim(const hash_t& head, size_t max_size, bool owns_data = true,
+                std::vector<hash_t>* evicted_hashes = nullptr,
+                std::vector<share_t>* deferred_destroy = nullptr)
     {
         if (!m_shares.contains(head) || max_size == 0)
             return 0;
@@ -487,12 +492,23 @@ public:
             auto it = m_shares.find(h);
             if (it != m_shares.end())
             {
-                if (owns_data)
+                if (deferred_destroy && owns_data)
+                {
+                    // Move share variant out for deferred destruction
+                    deferred_destroy->push_back(std::move(it->second.share));
+                }
+                else if (owns_data)
+                {
                     it->second.share.destroy();
+                }
                 delete it->second.index;
                 m_shares.erase(it);
             }
         }
+
+        // Collect evicted hashes for caller (e.g. LevelDB pruning)
+        if (evicted_hashes)
+            evicted_hashes->insert(evicted_hashes->end(), to_remove.begin(), to_remove.end());
 
         return to_remove.size();
     }
@@ -503,7 +519,7 @@ public:
     /// If the share is mid-chain, the chain is split: children above it
     /// become a separate fork whose tail now points past the removed share.
     /// Returns true if the share was found and removed.
-    bool remove(const hash_t& hash)
+    bool remove(const hash_t& hash, bool owns_data = true)
     {
         auto it = m_shares.find(hash);
         if (it == m_shares.end())
@@ -619,7 +635,8 @@ public:
         }
 
         // Free the share object and index, then remove from m_shares
-        it->second.share.destroy();
+        if (owns_data)
+            it->second.share.destroy();
         delete idx;
         m_shares.erase(it);
         return true;
