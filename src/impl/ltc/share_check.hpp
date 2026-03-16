@@ -1140,6 +1140,36 @@ bool share_check(const ShareT& share,
         }
     }
 
+    // 4. V36+ merged_payout_hash verification
+    // Verify that the share's committed merged PPLNS hash matches what we
+    // independently compute from the share chain. Without this, a malicious
+    // node could steal all merged chain (DOGE) rewards while appearing honest
+    // on the parent chain (LTC payouts are consensus-enforced via gentx above).
+    if constexpr (ShareT::version >= 36)
+    {
+        if constexpr (requires { share.m_merged_payout_hash; })
+        {
+            if (!share.m_merged_payout_hash.IsNull() &&
+                !share.m_prev_hash.IsNull() &&
+                tracker.chain.contains(share.m_prev_hash))
+            {
+                auto block_target = chain::bits_to_target(share.m_bits);
+                auto expected_hash = tracker.compute_merged_payout_hash(
+                    share.m_prev_hash, block_target);
+
+                // Only reject if we can actually compute the expected hash
+                // (i.e., we have enough chain history with V36 shares)
+                if (!expected_hash.IsNull() && share.m_merged_payout_hash != expected_hash)
+                {
+                    throw std::invalid_argument(
+                        "merged_payout_hash mismatch: claimed "
+                        + share.m_merged_payout_hash.GetHex()
+                        + " != expected " + expected_hash.GetHex());
+                }
+            }
+        }
+    }
+
     return true;
 }
 
