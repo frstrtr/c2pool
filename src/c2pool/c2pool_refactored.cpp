@@ -376,10 +376,16 @@ int main(int argc, char* argv[]) {
 
     // Well-known P2P ports for coin daemons (same machine as RPC by default)
     auto get_coin_p2p_port = [](const std::string& symbol, bool testnet) -> int {
-        if (symbol == "LTC" || symbol == "ltc") return testnet ? 19335 : 9333;
-        if (symbol == "DOGE" || symbol == "doge") return testnet ? 44556 : 22556;
-        if (symbol == "BTC" || symbol == "btc") return testnet ? 18333 : 8333;
-        if (symbol == "DGB" || symbol == "dgb") return testnet ? 12026 : 12024;
+        if (symbol == "LTC"   || symbol == "ltc")   return testnet ? 19335 : 9333;
+        if (symbol == "DOGE"  || symbol == "doge")  return testnet ? 44556 : 22556;
+        if (symbol == "BTC"   || symbol == "btc")   return testnet ? 18333 : 8333;
+        if (symbol == "DGB"   || symbol == "dgb")   return testnet ? 12026 : 12024;
+        if (symbol == "PEP"   || symbol == "pep")   return testnet ? 44874 : 33874;
+        if (symbol == "BELLS" || symbol == "bells")  return testnet ? 29919 : 19919;
+        if (symbol == "LKY"   || symbol == "lky")   return testnet ? 19917 : 9917;
+        if (symbol == "JKC"   || symbol == "jkc")   return testnet ? 19771 : 9771;
+        if (symbol == "SHIC"  || symbol == "shic")  return testnet ? 44864 : 33864;
+        if (symbol == "DINGO" || symbol == "dingo") return testnet ? 44117 : 33117;
         return 0;  // unknown chain — caller must specify explicitly
     };
     auto blockchain_to_symbol = [](Blockchain b) -> std::string {
@@ -393,24 +399,34 @@ int main(int argc, char* argv[]) {
     // Known P2P magic prefixes for common chains
     auto get_chain_p2p_prefix = [](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
         if (symbol == "DOGE" || symbol == "doge") {
-            return testnet
-                ? ParseHexBytes("d4a1f4a1")   // Dogecoin testnet4alpha
-                : ParseHexBytes("c0c0c0c0");  // Dogecoin mainnet
+            return testnet ? ParseHexBytes("d4a1f4a1") : ParseHexBytes("c0c0c0c0");
         }
         if (symbol == "LTC" || symbol == "ltc") {
-            return testnet
-                ? ParseHexBytes("fdd2c8f1")   // Litecoin testnet
-                : ParseHexBytes("fbc0b6db");  // Litecoin mainnet
+            return testnet ? ParseHexBytes("fdd2c8f1") : ParseHexBytes("fbc0b6db");
         }
         if (symbol == "BTC" || symbol == "btc") {
-            return testnet
-                ? ParseHexBytes("0b110907")   // Bitcoin testnet
-                : ParseHexBytes("f9beb4d9");  // Bitcoin mainnet
+            return testnet ? ParseHexBytes("0b110907") : ParseHexBytes("f9beb4d9");
         }
         if (symbol == "DGB" || symbol == "dgb") {
-            return testnet
-                ? ParseHexBytes("fdc8bddd")   // DigiByte testnet
-                : ParseHexBytes("fac3b6da");  // DigiByte mainnet
+            return testnet ? ParseHexBytes("fdc8bddd") : ParseHexBytes("fac3b6da");
+        }
+        if (symbol == "PEP" || symbol == "pep") {
+            return testnet ? ParseHexBytes("fec1dbcc") : ParseHexBytes("c0a0f0e0");
+        }
+        if (symbol == "BELLS" || symbol == "bells") {
+            return testnet ? ParseHexBytes("c3c3c3c3") : ParseHexBytes("c0c0c0c0");
+        }
+        if (symbol == "LKY" || symbol == "lky") {
+            return testnet ? ParseHexBytes("fcc1b7dc") : ParseHexBytes("fbc0b6db");
+        }
+        if (symbol == "JKC" || symbol == "jkc") {
+            return testnet ? ParseHexBytes("fcc1b7dc") : ParseHexBytes("fbc0b6db");
+        }
+        if (symbol == "SHIC" || symbol == "shic") {
+            return testnet ? ParseHexBytes("b1c1e1f1") : ParseHexBytes("b0c0e0f0");
+        }
+        if (symbol == "DINGO" || symbol == "dingo") {
+            return testnet ? ParseHexBytes("c2c2c2c2") : ParseHexBytes("c1c1c1c1");
         }
         return {};  // unknown chain — P2P broadcast disabled
     };
@@ -2008,12 +2024,25 @@ int main(int argc, char* argv[]) {
                     if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
                     cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
-                    // DOGE testnet burn address (version 0x71, hash160 = zeros)
-                    // Used as payout address for createauxblock RPC
+                    // Fallback payout address for createauxblock RPC.
+                    // Used when no per-miner address is available for a chain.
+                    // PPLNS payouts override this in multiaddress mode.
                     if (cfg.symbol == "DOGE" && settings->m_testnet)
                         cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
                     else if (cfg.symbol == "DOGE")
-                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";  // mainnet burn
+                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+                    else if (cfg.symbol == "PEP")
+                        cfg.aux_payout_address = "PSimbaxxxxxxxxxxxxxxxxxxxxUMbTDw";
+                    else if (cfg.symbol == "BELLS")
+                        cfg.aux_payout_address = solo_address;  // no well-known burn; use operator address
+                    else if (cfg.symbol == "LKY")
+                        cfg.aux_payout_address = solo_address;
+                    else if (cfg.symbol == "JKC")
+                        cfg.aux_payout_address = solo_address;
+                    else if (cfg.symbol == "SHIC")
+                        cfg.aux_payout_address = solo_address;
+                    else if (cfg.symbol == "DINGO")
+                        cfg.aux_payout_address = solo_address;
 
                     // P2P port: explicit (7th field) or auto-detected from symbol
                     if (parts.size() >= 7 && !parts[6].empty()) {
