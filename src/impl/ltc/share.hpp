@@ -294,6 +294,7 @@ public:
 
     // Per-share metadata (not accumulated)
     int64_t time_seen{0};
+    int32_t naughty{0};  // >0 = this share or ancestor would make invalid block (weight/size)
 
     ShareIndex() : base_index(), work(0), min_work(0), total_weight(0), total_donation_weight(0) {}
 
