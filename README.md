@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC).
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC). DigiByte Scrypt support planned as an additional parent chain.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>  
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
@@ -13,7 +13,8 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 | Area | Status |
 |---|---|
-| V36 share format (LTC) | Active development |
+| V36 share format (LTC parent chain) | Active development |
+| V36 share format (DGB Scrypt parent chain) | Planned |
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Coin daemon RPC/P2P | Hardened (softfork gate, keepalive, timeouts) |
 | Stratum mining server | Working |
@@ -92,7 +93,10 @@ Other chains need their daemon running externally.
 | SHIC | 74 | External (`shibacoind`) | `SHIC:74:127.0.0.1:33863:user:pass` |
 | DINGO | 98 | External (`dingocoind`) | Cannot run with DOGE (same chain_id) |
 
-All external chains use `createauxblock`/`submitauxblock` RPC.
+LTC and DOGE use built-in embedded SPV nodes — zero external dependencies for the core LTC+DOGE setup. External daemons use `createauxblock`/`submitauxblock` RPC.
+
+**DigiByte Scrypt** is planned as a second parent chain (`--net digibyte`), running its own P2Pool sharechain network. DGB Scrypt produces valid Scrypt PoW, so it can also merge-mine DOGE and the other AuxPoW coins.
+
 See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
 
 **API endpoints** (integrated mode)

@@ -99,12 +99,23 @@ Encrypted Stratum V1 connections for miners on untrusted networks.
 - `minimum-difficulty` — miner requests minimum diff floor
 - `mining.set_version_mask` — dynamic version mask updates mid-session
 
-## Not Planned
+## Priority 5 — Additional Parent Chains
 
-### DigiByte (DGB) Merged Mining
-DGB does NOT support AuxPoW with Litecoin despite using Scrypt as one
-of its five algorithms. It would require DGB protocol changes (DIP-0012
-proposes AuxPoW but for Verthash, not Scrypt).
+### DigiByte Scrypt (`--net digibyte`)
+DGB uses 5 algorithms; the Scrypt variant runs as an independent parent
+chain with its own P2Pool sharechain network. DGB Scrypt is already
+implemented in [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36).
+
+Implementation requires:
+- `impl/dgb/` — DGB share format, chain params, config_pool
+- DGB address validation (D-prefix mainnet, bech32 "dgb")
+- DGB block header format (same as LTC for Scrypt variant)
+- DGB merged mining: DOGE + DINGO (both Scrypt AuxPoW compatible)
+
+Note: DGB Scrypt as a PARENT chain is different from DGB AuxPoW merged
+mining. DGB does not support being an auxiliary chain (no `createauxblock`).
+
+## Not Planned
 
 ### Auto-Switch Tool
 Automatically switching hash to c2pool based on centralization metrics.
