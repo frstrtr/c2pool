@@ -887,6 +887,17 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // Populated via mining.set_merged_addresses or from username format.
     std::map<uint32_t, std::string> merged_addresses_;
 
+    // BIP 310 version-rolling (ASICBoost) state
+    static constexpr uint32_t POOL_VERSION_MASK = 0x1fffe000;
+    bool version_rolling_enabled_ = false;
+    uint32_t version_rolling_mask_ = 0;  // negotiated mask (pool_mask & miner_mask)
+
+    // Extranonce subscription (NiceHash + BIP 310 subscribe-extranonce)
+    bool extranonce_subscribe_ = false;
+
+    // Suggested difficulty from miner (mining.suggest_difficulty)
+    double suggested_difficulty_ = 0.0;
+
     // Periodic work-push timer (fires every SHARE_PERIOD to keep miners on fresh work)
     std::shared_ptr<boost::asio::steady_timer> work_push_timer_;
 
@@ -906,14 +917,21 @@ private:
     nlohmann::json handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id);
     nlohmann::json handle_submit(const nlohmann::json& params, const nlohmann::json& request_id);
     nlohmann::json handle_set_merged_addresses(const nlohmann::json& params, const nlohmann::json& request_id);
-    
+    nlohmann::json handle_configure(const nlohmann::json& params, const nlohmann::json& request_id);
+    nlohmann::json handle_extranonce_subscribe(const nlohmann::json& params, const nlohmann::json& request_id);
+    nlohmann::json handle_suggest_difficulty(const nlohmann::json& params, const nlohmann::json& request_id);
+
     void send_response(const nlohmann::json& response);
     void send_error(int code, const std::string& message, const nlohmann::json& request_id);
     void send_set_difficulty(double difficulty);
+    void send_set_extranonce(const std::string& extranonce1, int extranonce2_size);
     void send_notify_work(bool force_clean = false);
     void start_periodic_work_push();
-    
+
     std::string generate_extranonce1();
+
+    // Parse multi-chain addresses from username with multiple separator styles
+    void parse_address_separators(std::string& username, std::string& merged_addr_raw);
     
 
 };

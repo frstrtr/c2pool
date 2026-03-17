@@ -178,4 +178,14 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_auto_ratchet "" AUTO)
+
+    add_executable(test_stratum_extensions test_stratum_extensions.cpp)
+    target_link_libraries(test_stratum_extensions PRIVATE
+        GTest::gtest_main GTest::gtest
+        c2pool_hashrate
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_stratum_extensions "" AUTO)
 endif()

@@ -5280,6 +5280,12 @@ void StratumSession::process_message(std::size_t bytes_read)
             response = handle_authorize(params, id);
         } else if (method == "mining.submit") {
             response = handle_submit(params, id);
+        } else if (method == "mining.configure") {
+            response = handle_configure(params, id);
+        } else if (method == "mining.extranonce.subscribe") {
+            response = handle_extranonce_subscribe(params, id);
+        } else if (method == "mining.suggest_difficulty") {
+            response = handle_suggest_difficulty(params, id);
         } else if (method == "mining.set_merged_addresses") {
             response = handle_set_merged_addresses(params, id);
         } else {
@@ -5287,12 +5293,15 @@ void StratumSession::process_message(std::size_t bytes_read)
             send_error(-1, "Unknown method", id);
             return;
         }
-        
+
         send_response(response);
 
         // After subscribe response is sent, follow up with difficulty + work
         if (method == "mining.subscribe") {
-            send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+            double initial_diff = (suggested_difficulty_ > 0.0)
+                ? suggested_difficulty_
+                : hashrate_tracker_.get_current_difficulty();
+            send_set_difficulty(initial_diff);
             send_notify_work();
         }
         
@@ -5333,7 +5342,27 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         username_ = params[0];
         authorized_ = true;
 
-        // Strip worker name suffix: both "." and "_" separators (Python compat)
+        // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
+        // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
+        {
+            auto plus_pos = username_.rfind('+');
+            if (plus_pos != std::string::npos && plus_pos + 1 < username_.size()) {
+                std::string diff_str = username_.substr(plus_pos + 1);
+                try {
+                    double fixed_diff = std::stod(diff_str);
+                    if (fixed_diff > 0.0) {
+                        suggested_difficulty_ = fixed_diff;
+                        hashrate_tracker_.set_difficulty_hint(fixed_diff);
+                        LOG_INFO << "[Stratum] Fixed difficulty from username: " << fixed_diff;
+                    }
+                } catch (...) {}
+                username_ = username_.substr(0, plus_pos);
+            }
+        }
+
+        // ─── Step 2: Strip worker name suffix ───
+        // Separators: "." and "_" (Python compat)
+        // Worker name is always AFTER the last address, so strip from the end.
         auto dot_pos = username_.rfind('.');
         if (dot_pos != std::string::npos && dot_pos > 20)
             username_ = username_.substr(0, dot_pos);
@@ -5341,9 +5370,16 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         if (underscore_pos != std::string::npos && underscore_pos > 20)
             username_ = username_.substr(0, underscore_pos);
 
-        // Parse merged addresses — two supported formats:
-        //   Slash format: PRIMARY/CHAIN_ID:ADDR/CHAIN_ID:ADDR
-        //   Comma format: PRIMARY,MERGED_ADDR  (auto-resolved to chain_id)
+        // ─── Step 3: Parse multi-chain addresses ───
+        // Supported separator formats for merged mining addresses:
+        //   Slash+colon: PRIMARY/CHAIN_ID:ADDR/CHAIN_ID:ADDR   (explicit chain IDs)
+        //   Comma:       PRIMARY,MERGED_ADDR                    (standard Stratum)
+        //   Pipe:        PRIMARY|MERGED_ADDR                    (Vnish firmware)
+        //   Space:       PRIMARY MERGED_ADDR                    (some web UIs)
+        //   Semicolon:   PRIMARY;MERGED_ADDR                    (alternative separator)
+        //
+        // Vnish firmware and some ASIC control software cannot use commas in the
+        // login field, so we support pipe (|) and space as alternatives.
         static constexpr uint32_t DOGE_CHAIN_ID = 98;
 
         // Chain identification tables
@@ -5354,32 +5390,8 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         static const std::vector<std::string> DOGE_HRPS = {};
         static const std::vector<uint8_t> DOGE_VERSIONS = {0x1e, 0x16, 0x71};
 
-        auto slash_pos = username_.find('/');
-        auto comma_pos = username_.find(',');
-        std::string merged_addr_raw;  // raw merged address from comma format
-        if (slash_pos != std::string::npos) {
-            std::string remainder = username_.substr(slash_pos + 1);
-            username_ = username_.substr(0, slash_pos);
-            std::istringstream ss(remainder);
-            std::string token;
-            while (std::getline(ss, token, '/')) {
-                auto colon = token.find(':');
-                if (colon != std::string::npos && colon > 0 && colon + 1 < token.size()) {
-                    try {
-                        uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
-                        merged_addresses_[chain_id] = token.substr(colon + 1);
-                    } catch (...) {}
-                }
-            }
-        } else if (comma_pos != std::string::npos) {
-            merged_addr_raw = username_.substr(comma_pos + 1);
-            username_ = username_.substr(0, comma_pos);
-            // Strip worker name from merged address too
-            auto mdot = merged_addr_raw.rfind('.');
-            if (mdot != std::string::npos && mdot > 20) merged_addr_raw = merged_addr_raw.substr(0, mdot);
-            auto mus = merged_addr_raw.rfind('_');
-            if (mus != std::string::npos && mus > 20) merged_addr_raw = merged_addr_raw.substr(0, mus);
-        }
+        std::string merged_addr_raw;  // raw merged address from simple separator format
+        parse_address_separators(username_, merged_addr_raw);
 
         // Resolve comma-format merged address to actual chain_id
         if (!merged_addr_raw.empty()) {
@@ -5474,6 +5486,158 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// BIP 310: mining.configure — extension negotiation
+// ═══════════════════════════════════════════════════════════════════
+// params: [["version-rolling", "subscribe-extranonce", ...], {"version-rolling.mask": "1fffe000", ...}]
+// Returns: {"version-rolling": true, "version-rolling.mask": "1fffe000", "subscribe-extranonce": true}
+//
+// Coinbase safety: version-rolling only touches block header version bits.
+// subscribe-extranonce enables mining.set_extranonce notifications —
+// extranonce1/2 are in the OP_RETURN output (last 8 bytes), completely
+// separate from the scriptSig where merged mining markers (fabe6d6d) live.
+nlohmann::json StratumSession::handle_configure(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    if (params.size() < 2 || !params[0].is_array() || !params[1].is_object()) {
+        nlohmann::json response;
+        response["id"] = request_id;
+        response["result"] = result;
+        response["error"] = nullptr;
+        return response;
+    }
+
+    const auto& extensions = params[0];
+    const auto& ext_params = params[1];
+
+    for (const auto& ext : extensions) {
+        if (!ext.is_string()) continue;
+        std::string ext_name = ext.get<std::string>();
+
+        if (ext_name == "version-rolling") {
+            // Miner provides its mask and optional min-bit-count
+            std::string miner_mask_hex = "ffffffff";
+            if (ext_params.contains("version-rolling.mask") && ext_params["version-rolling.mask"].is_string())
+                miner_mask_hex = ext_params["version-rolling.mask"].get<std::string>();
+
+            uint32_t miner_mask = 0;
+            try {
+                miner_mask = static_cast<uint32_t>(std::stoul(miner_mask_hex, nullptr, 16));
+            } catch (...) {
+                LOG_WARNING << "[Stratum] Invalid version-rolling.mask from miner: " << miner_mask_hex;
+                miner_mask = 0;
+            }
+
+            // Negotiated mask = intersection of pool and miner masks
+            version_rolling_mask_ = POOL_VERSION_MASK & miner_mask;
+            version_rolling_enabled_ = true;
+
+            std::ostringstream mask_ss;
+            mask_ss << std::hex << std::setw(8) << std::setfill('0') << version_rolling_mask_;
+
+            result["version-rolling"] = true;
+            result["version-rolling.mask"] = mask_ss.str();
+
+            LOG_INFO << "[Stratum] Version-rolling enabled, negotiated mask: " << mask_ss.str()
+                     << " (pool=" << std::hex << POOL_VERSION_MASK
+                     << ", miner=" << miner_mask << ")" << std::dec;
+
+        } else if (ext_name == "subscribe-extranonce") {
+            // BIP 310 extranonce subscription — enables mining.set_extranonce notifications
+            extranonce_subscribe_ = true;
+            result["subscribe-extranonce"] = true;
+            LOG_INFO << "[Stratum] Extranonce subscription enabled (BIP 310)";
+
+        } else if (ext_name == "minimum-difficulty") {
+            // Optional extension — not implemented but acknowledge it
+            result["minimum-difficulty"] = false;
+        }
+    }
+
+    nlohmann::json response;
+    response["id"] = request_id;
+    response["result"] = result;
+    response["error"] = nullptr;
+    return response;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NiceHash: mining.extranonce.subscribe — extranonce change subscription
+// ═══════════════════════════════════════════════════════════════════
+// params: [] (no params)
+// Returns: true
+// After this, the server may send mining.set_extranonce notifications.
+nlohmann::json StratumSession::handle_extranonce_subscribe(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    extranonce_subscribe_ = true;
+    LOG_INFO << "[Stratum] Extranonce subscription enabled (NiceHash protocol)";
+
+    nlohmann::json response;
+    response["id"] = request_id;
+    response["result"] = true;
+    response["error"] = nullptr;
+    return response;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// mining.suggest_difficulty — miner suggests initial difficulty
+// ═══════════════════════════════════════════════════════════════════
+// params: [difficulty] (number)
+// Returns: true
+// The pool may use this as a hint for the initial set_difficulty.
+// If received BEFORE subscribe, we use it as starting difficulty.
+// If received AFTER, it feeds into VARDIFF as a hint.
+nlohmann::json StratumSession::handle_suggest_difficulty(const nlohmann::json& params, const nlohmann::json& request_id)
+{
+    double suggested = 0.0;
+    if (!params.empty()) {
+        if (params[0].is_number())
+            suggested = params[0].get<double>();
+        else if (params[0].is_string()) {
+            try { suggested = std::stod(params[0].get<std::string>()); } catch (...) {}
+        }
+    }
+
+    if (suggested > 0.0) {
+        suggested_difficulty_ = suggested;
+        // If already subscribed, apply immediately via VARDIFF hint
+        if (subscribed_) {
+            hashrate_tracker_.set_difficulty_hint(suggested);
+            send_set_difficulty(hashrate_tracker_.get_current_difficulty());
+        }
+        LOG_INFO << "[Stratum] Miner suggested difficulty: " << suggested;
+    }
+
+    nlohmann::json response;
+    response["id"] = request_id;
+    response["result"] = true;
+    response["error"] = nullptr;
+    return response;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// mining.set_extranonce notification (server → client)
+// ═══════════════════════════════════════════════════════════════════
+// Sent to miners that subscribed via mining.configure(subscribe-extranonce)
+// or mining.extranonce.subscribe.
+//
+// Coinbase safety analysis:
+//   - extranonce1/2 occupy the LAST 8 bytes of the OP_RETURN output
+//   - They are NOT in the scriptSig (where merged mining fabe6d6d markers live)
+//   - Changing extranonce1 requires rebuilding coinb1/coinb2 (which includes ref_hash)
+//   - We MUST send clean_jobs=true after set_extranonce to invalidate old jobs
+//   - The atomic counter in generate_extranonce1() prevents collisions
+void StratumSession::send_set_extranonce(const std::string& extranonce1, int extranonce2_size)
+{
+    nlohmann::json notification;
+    notification["id"] = nullptr;
+    notification["method"] = "mining.set_extranonce";
+    notification["params"] = nlohmann::json::array({extranonce1, extranonce2_size});
+
+    send_response(notification);
+}
+
 // mining.set_merged_addresses extension
 // params: [{ "chain_id": "address", ... }]  — keys are chain_id as strings
 // Example: [{"98": "DQkwFoo...", "2": "1btcAddr..."}]
@@ -5532,7 +5696,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     std::string extranonce2 = params[2].get<std::string>();
     std::string ntime       = params[3].get<std::string>();
     std::string nonce       = params[4].get<std::string>();
-    
+
+    // ASICBoost: optional 6th parameter is version_bits (hex mask of rolled bits)
+    std::string version_bits;
+    if (params.size() >= 6 && params[5].is_string())
+        version_bits = params[5].get<std::string>();
+
     // Stale detection: check if job_id is still active.
     auto job_it = active_jobs_.find(job_id);
     bool is_stale = (job_it == active_jobs_.end());
@@ -5550,10 +5719,35 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     
     // Calculate share difficulty using per-connection coinbase and job-specific template data
     const auto& job = job_it->second;
+
+    // ASICBoost: apply version rolling bits to the job version
+    uint32_t effective_version = job.version;
+    if (version_rolling_enabled_ && !version_bits.empty()) {
+        try {
+            uint32_t miner_version_bits = static_cast<uint32_t>(std::stoul(version_bits, nullptr, 16));
+            // Validate: miner must not modify bits outside the negotiated mask
+            if ((~version_rolling_mask_ & miner_version_bits) != 0) {
+                ++rejected_shares_;
+                LOG_WARNING << "[Stratum] Miner " << username_
+                            << " modified version bits outside negotiated mask: "
+                            << version_bits << " (mask=" << std::hex << version_rolling_mask_ << ")" << std::dec;
+                nlohmann::json response;
+                response["id"] = request_id;
+                response["result"] = false;
+                response["error"] = nlohmann::json::array({20, "Invalid version mask", nullptr});
+                return response;
+            }
+            // Apply: keep non-rolling bits from job, take rolling bits from miner
+            effective_version = (job.version & ~version_rolling_mask_) | (miner_version_bits & version_rolling_mask_);
+        } catch (...) {
+            LOG_WARNING << "[Stratum] Invalid version_bits hex from " << username_ << ": " << version_bits;
+        }
+    }
+
     double share_difficulty = MiningInterface::calculate_share_difficulty(
         job.coinb1, job.coinb2,
         extranonce1_, extranonce2, ntime, nonce,
-        job.version, job.gbt_prevhash, job.nbits, job.merkle_branches);
+        effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
     double required_difficulty = hashrate_tracker_.get_current_difficulty();
 
     // Record ALL submissions for vardiff timing (accepted + rejected), like Python p2pool.
@@ -5589,7 +5783,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.coinb2          = job.coinb2;
     snapshot.gbt_prevhash    = job.gbt_prevhash;
     snapshot.nbits           = job.nbits;
-    snapshot.version         = job.version;
+    snapshot.version         = effective_version;  // use rolled version for block construction
     snapshot.merkle_branches = job.merkle_branches;
     snapshot.tx_data         = job.tx_data;
     snapshot.mweb            = job.mweb;
@@ -5873,6 +6067,57 @@ void StratumSession::start_periodic_work_push()
     };
     work_push_timer_->expires_after(std::chrono::seconds(4));
     work_push_timer_->async_wait(*fn);
+}
+
+// Parse multi-chain addresses from username string.
+// Tries multiple separator formats for maximum miner compatibility:
+//   1. Slash+colon: "LTC_ADDR/98:DOGE_ADDR"  (explicit chain ID)
+//   2. Comma:       "LTC_ADDR,DOGE_ADDR"      (standard)
+//   3. Pipe:        "LTC_ADDR|DOGE_ADDR"       (Vnish firmware)
+//   4. Semicolon:   "LTC_ADDR;DOGE_ADDR"       (alternative)
+//   5. Space:       "LTC_ADDR DOGE_ADDR"        (some web UIs)
+//
+// Slash format populates merged_addresses_ directly.
+// Simple formats extract merged_addr_raw for chain auto-detection.
+void StratumSession::parse_address_separators(std::string& username, std::string& merged_addr_raw)
+{
+    // Priority 1: Slash format with explicit chain IDs
+    auto slash_pos = username.find('/');
+    if (slash_pos != std::string::npos) {
+        std::string remainder = username.substr(slash_pos + 1);
+        username = username.substr(0, slash_pos);
+        std::istringstream ss(remainder);
+        std::string token;
+        while (std::getline(ss, token, '/')) {
+            auto colon = token.find(':');
+            if (colon != std::string::npos && colon > 0 && colon + 1 < token.size()) {
+                try {
+                    uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
+                    merged_addresses_[chain_id] = token.substr(colon + 1);
+                } catch (...) {}
+            }
+        }
+        return;
+    }
+
+    // Priority 2-5: Simple two-address separators (comma, pipe, semicolon, space)
+    // Try each in order; first match wins.
+    for (char sep : {',', '|', ';', ' '}) {
+        auto sep_pos = username.find(sep);
+        if (sep_pos != std::string::npos && sep_pos > 20) {
+            merged_addr_raw = username.substr(sep_pos + 1);
+            username = username.substr(0, sep_pos);
+            // Strip worker name from merged address too
+            auto mdot = merged_addr_raw.rfind('.');
+            if (mdot != std::string::npos && mdot > 20) merged_addr_raw = merged_addr_raw.substr(0, mdot);
+            auto mus = merged_addr_raw.rfind('_');
+            if (mus != std::string::npos && mus > 20) merged_addr_raw = merged_addr_raw.substr(0, mus);
+
+            if (sep != ',')
+                LOG_INFO << "[Stratum] Parsed merged address using '" << sep << "' separator";
+            return;
+        }
+    }
 }
 
 std::string StratumSession::generate_extranonce1()

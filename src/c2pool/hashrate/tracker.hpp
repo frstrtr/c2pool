@@ -85,6 +85,10 @@ public:
         set_target_time_per_mining_share(target_seconds);
     }
 
+    /// Apply a difficulty hint from the miner (mining.suggest_difficulty).
+    /// Clamps to [min, max] bounds and updates current difficulty.
+    void set_difficulty_hint(double hint);
+
     /// Check if difficulty changed (caller should resend set_difficulty).
     /// Returns true if current_difficulty_ was updated.
     bool difficulty_changed_since(double old_difficulty) const;

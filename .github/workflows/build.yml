@@ -81,6 +81,7 @@ jobs:
           cmake --build build_ci \
             --target test_hardening test_share_messages test_coin_broadcaster \
                     test_redistribute_address test_redistribute test_auto_ratchet \
+                    test_stratum_extensions \
                     core_test sharechain_test share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
