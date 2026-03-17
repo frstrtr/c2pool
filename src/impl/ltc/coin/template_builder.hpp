@@ -225,7 +225,6 @@ public:
 
 /// Concrete CoinNodeInterface backed by a HeaderChain and Mempool.
 /// Calls TemplateBuilder::build_template() for getwork().
-/// submit_block() is a stub (Phase 4 will wire CoinBroadcaster).
 class EmbeddedCoinNode : public CoinNodeInterface {
 public:
     EmbeddedCoinNode(HeaderChain& chain, Mempool& pool, bool testnet = false)
@@ -243,11 +242,11 @@ public:
         return *result;
     }
 
-    /// Phase 3 stub — block relay is handled by CoinBroadcaster.
-    /// Phase 4 will wire this to CoinBroadcaster::submit_block().
-    void submit_block(BlockType& /*block*/) override {
-        // TODO(phase4): relay via CoinBroadcaster
-    }
+    /// Block relay in embedded mode is handled by CoinBroadcaster via
+    /// MiningInterface::on_block_relay, not through this interface.
+    /// This override is intentionally empty — the RPC-based NodeRPC path
+    /// uses its own submit_block_hex() directly.
+    void submit_block(BlockType& /*block*/) override { }
 
     /// Return basic chain state info (analogous to getblockchaininfo RPC).
     nlohmann::json getblockchaininfo() override {

@@ -11,12 +11,8 @@
 
 #include "common.h"
 
-//TODO:
-// skipped:
-// - generator nth
-// - geometric, reversed, flatten_linked_list [useless, for skiplist]
-// - perfect_round [lol]
-//  For tests:
+// Python p2pool utilities not ported (not needed for V36):
+// generator nth, geometric, reversed, flatten_linked_list, perfect_round
 //      - add_tuples
 //      - reversed
 //  For statistics:

@@ -7,7 +7,7 @@
 //#include <primitives/block.h>
 //#include <primitives/transaction.h>
 #include <btclibs/script/script.h>
-//#include <script/sign.h> //TODO: ???
+//#include <script/sign.h>  // not needed — signing not used in pool
 #include "serialize.h"
 //#include <streams.h>
 //#include <univalue.h>

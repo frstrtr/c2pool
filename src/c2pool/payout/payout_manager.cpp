@@ -1086,33 +1086,49 @@ std::string PayoutManager::get_node_owner_address() const {
 }
 
 bool PayoutManager::try_detect_wallet_address() {
-    // This method would typically connect to the wallet RPC and request a new address
-    // For now, we'll implement a placeholder that logs the attempt
-    
     LOG_INFO << "Attempting to detect wallet address for node owner payout...";
-    
-    // TODO: Implement actual wallet RPC connection
-    // Example implementation:
-    // 1. Connect to wallet RPC
-    // 2. Call getnewaddress or getaddressesbylabel
-    // 3. Set the address in node_owner_config_
-    // 4. Save to config if enabled
-    
-    // Placeholder logic - in real implementation this would make RPC calls
+
+    // Try RPC detection via litecoin-cli / bitcoin-cli
     try {
-        // Example: auto wallet_client = get_wallet_rpc_client();
-        // auto new_address = wallet_client.get_new_address("node_owner");
-        // node_owner_config_.set_payout_address(new_address, "wallet");
-        
-        LOG_WARNING << "Wallet RPC integration not yet implemented";
-        LOG_INFO << "To set a node owner address, use --node-owner-address or --node-owner-script";
-        
-        return false; // Could not detect wallet address
-        
+        std::string cli_cmd;
+        if (blockchain_ == Blockchain::LITECOIN)
+            cli_cmd = network_ == Network::TESTNET
+                ? "litecoin-cli -testnet" : "litecoin-cli";
+        else if (blockchain_ == Blockchain::BITCOIN)
+            cli_cmd = network_ == Network::TESTNET
+                ? "bitcoin-cli -testnet" : "bitcoin-cli";
+        else {
+            LOG_INFO << "Wallet auto-detection not supported for this blockchain. "
+                     << "Use --node-owner-address to set manually.";
+            return false;
+        }
+
+        namespace bp = boost::process;
+        bp::ipstream pipe_stream;
+        bp::child proc(cli_cmd + " getnewaddress \"c2pool_node_owner\"",
+                       bp::std_out > pipe_stream, bp::std_err > bp::null);
+
+        std::string address;
+        if (std::getline(pipe_stream, address) && !address.empty()) {
+            // Trim whitespace and quotes
+            address.erase(0, address.find_first_not_of(" \t\r\n\""));
+            address.erase(address.find_last_not_of(" \t\r\n\"") + 1);
+
+            proc.wait();
+            if (proc.exit_code() == 0 && !address.empty()) {
+                LOG_INFO << "Auto-detected wallet address from RPC: " << address;
+                node_owner_config_.payout_address = address;
+                node_owner_config_.address_source = NodeOwnerPayoutConfig::AddressSource::WALLET_RPC;
+                return true;
+            }
+        }
+        proc.wait();
     } catch (const std::exception& e) {
-        LOG_ERROR << "Failed to detect wallet address: " << e.what();
-        return false;
+        LOG_INFO << "Wallet RPC auto-detection failed: " << e.what();
     }
+
+    LOG_INFO << "Could not auto-detect wallet address. Use --node-owner-address to set manually.";
+    return false;
 }
 
 void PayoutManager::enable_auto_wallet_detection(bool enable) {

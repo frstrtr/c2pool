@@ -273,7 +273,7 @@ public:
         if (!new_items.empty())
         {
             added->happened(new_items);
-            //TODO: because todo in p2pool
+            // changed/transitioned events not needed (same as Python p2pool)
 //            this->changed->happened(*this->_value);
 //            this->transitioned->happened(old_value, *this->_value);
         }
@@ -306,7 +306,7 @@ public:
         if (!gone_items.empty())
         {
             removed->happened(gone_items);
-            //TODO: because todo in p2pool
+            // changed/transitioned events not needed (same as Python p2pool)
 //            this->changed->happened(*this->_value);
 //            this->transitioned->happened(old_value, *this->_value);
         }

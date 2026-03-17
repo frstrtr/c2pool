@@ -19,7 +19,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_hardening test_hardening.cpp)
     target_link_libraries(test_hardening PRIVATE
         GTest::gtest_main GTest::gtest
-        core
+        core ltc
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
