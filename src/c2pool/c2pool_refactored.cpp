@@ -152,7 +152,7 @@ void print_help() {
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
     std::cout << "  --integrated              Enable integrated mode (full mining pool)\n";
     std::cout << "  --sharechain              Enable sharechain mode (P2P node)\n";
-    std::cout << "  --net CHAIN               Blockchain network: litecoin, bitcoin, dogecoin\n";
+    std::cout << "  --net CHAIN               Blockchain: litecoin, digibyte, bitcoin, dogecoin\n";
     std::cout << "                            (alias: --blockchain; default: litecoin)\n";
     std::cout << "  --config FILE             Load configuration from YAML file\n";
     std::cout << "  --address ADDRESS         Payout address (alias: --solo-address)\n\n";
@@ -222,10 +222,11 @@ void print_help() {
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-    std::cout << "  Litecoin (LTC)    ✅ Full support with merged mining (parent)\n";
-    std::cout << "  Dogecoin (DOGE)   ✅ Full support as merged-mined aux chain\n";
-    std::cout << "  Bitcoin (BTC)     ✅ Protocol compatibility\n";
-    std::cout << "  Digibyte (DGB)    🔧 In development\n\n";
+    std::cout << "  Litecoin (LTC)    Parent chain with embedded SPV\n";
+    std::cout << "  DigiByte (DGB)    Parent chain (Scrypt algo, --net digibyte)\n";
+    std::cout << "  Dogecoin (DOGE)   Merged mining aux chain (embedded SPV)\n";
+    std::cout << "  PEP/BELLS/LKY/JKC/SHIC  Merged mining aux chains (external daemons)\n";
+    std::cout << "  Bitcoin (BTC)     Protocol compatibility (future)\n\n";
     
     std::cout << "DEFAULT NETWORK PORTS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -363,14 +364,15 @@ int main(int argc, char* argv[]) {
     // Helper function to parse blockchain string
     auto parse_blockchain = [](const std::string& blockchain_str) -> Blockchain {
         if (blockchain_str == "ltc" || blockchain_str == "litecoin") return Blockchain::LITECOIN;
+        if (blockchain_str == "dgb" || blockchain_str == "digibyte") return Blockchain::DIGIBYTE;
         if (blockchain_str == "btc" || blockchain_str == "bitcoin") return Blockchain::BITCOIN;
         if (blockchain_str == "eth" || blockchain_str == "ethereum") return Blockchain::ETHEREUM;
         if (blockchain_str == "xmr" || blockchain_str == "monero") return Blockchain::MONERO;
         if (blockchain_str == "zec" || blockchain_str == "zcash") return Blockchain::ZCASH;
         if (blockchain_str == "doge" || blockchain_str == "dogecoin") return Blockchain::DOGECOIN;
-        
+
         LOG_ERROR << "Unknown blockchain: " << blockchain_str;
-        LOG_INFO << "Supported blockchains: ltc, btc, eth, xmr, zec, doge";
+        LOG_INFO << "Supported blockchains: ltc, dgb, btc, doge";
         throw std::invalid_argument("Unknown blockchain type");
     };
 
@@ -391,6 +393,7 @@ int main(int argc, char* argv[]) {
     auto blockchain_to_symbol = [](Blockchain b) -> std::string {
         switch (b) {
             case Blockchain::LITECOIN: return "LTC";
+            case Blockchain::DIGIBYTE: return "DGB";
             case Blockchain::BITCOIN:  return "BTC";
             case Blockchain::DOGECOIN: return "DOGE";
             default: return "";

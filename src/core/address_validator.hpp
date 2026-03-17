@@ -15,11 +15,12 @@ namespace address {
 
 enum class Blockchain {
     LITECOIN,
-    BITCOIN, 
+    BITCOIN,
     ETHEREUM,
     MONERO,
     ZCASH,
     DOGECOIN,
+    DIGIBYTE,
     UNKNOWN
 };
 

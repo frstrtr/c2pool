@@ -2,18 +2,78 @@
 
 ## Current State (v36)
 
-- LTC sharechain: production-ready
-- DOGE merged mining: implemented (chain_id=98)
-- Stratum V1: full spec + ASICBoost + NiceHash/MRR compat
-- Web dashboard: full API
+- LTC parent chain: production-ready (embedded SPV — no external daemon needed)
+- DOGE merged mining: implemented, embedded SPV (chain_id=98)
+- Multi-chain merged mining: PEP, BELLS, LKY, JKC, SHIC, DINGO (external daemons)
+- Stratum V1: full spec + ASICBoost + NiceHash/MRR + suggest_difficulty
+- Address separators: comma, pipe, semicolon, space, slash (Vnish compatible)
+- Web dashboard: 80+ REST endpoints, full API
 - HiveOS/MinerStat/RaveOS: deploy templates ready
+- THE state root commitment: anchored in coinbase OP_RETURN across all MM chains
+- Code separated: stratum_server, address_utils, web_server (clean modules)
+- Test suite: 390 tests passing
+
+### Merged mining chains (all implemented)
+
+| Coin | chain_id | Daemon | Status |
+|------|----------|--------|--------|
+| DOGE | 98 | Embedded SPV or external | Done |
+| PEP | 63 | External (`pepecoind`) | Done |
+| BELLS | 16 | External (`bellsd`) | Done |
+| LKY | 8211 | External (`luckycoind`) | Done |
+| JKC | 8224 | External (`junkcoind`) | Done |
+| SHIC | 74 | External (`shibacoind`) | Done |
+| DINGO | 98 | External (conflicts with DOGE) | Done |
+
+## Phase 6 — DigiByte Scrypt Parent Chain
+
+DGB Scrypt runs as a second parent chain (`--net digibyte`) with its own
+P2Pool sharechain network. Already implemented in
+[p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36).
+
+### DGB chain params (from p2pool reference)
+
+| Parameter | Value |
+|-----------|-------|
+| Algorithm | Scrypt (1 of 5 DGB algos, 15s rotation) |
+| Block period | 15 seconds (75s total / 5 algos) |
+| P2Pool share period | 25 seconds |
+| Chain length | 8640 shares (~24 hours) |
+| P2P port (pool) | 5024 |
+| Stratum port (pool) | 5025 |
+| P2P port (DGB Core) | 12024 |
+| RPC port (DGB Core) | 14024 |
+| Address version | 0x1e (30) — D prefix |
+| P2SH version | 0x3f (63) — S prefix |
+| Bech32 HRP | "dgb" |
+| P2P magic | fac3b6da |
+| GBT_ALGO | "scrypt" (multi-algo requires algo specification) |
+
+### Implementation plan
+
+1. `impl/dgb/config_pool.hpp` — DGB Scrypt pool config (share period, chain length, etc.)
+2. `impl/dgb/config_coin.hpp` — DGB coin params (address versions, subsidy schedule)
+3. `impl/dgb/node.cpp` — DGB pool node orchestration (reuse LTC pattern)
+4. `impl/dgb/share_check.hpp` — Share validation (identical to LTC Scrypt)
+5. Address validation for DGB (0x1e P2PKH, 0x3f P2SH, bech32 "dgb")
+6. GBT_ALGO="scrypt" filter in getblocktemplate requests
+7. DGB subsidy schedule (3-phase decay: 72K→8K→2.4K→1 DGB minimum)
+8. DGB merged mining: DOGE, DINGO, PEP, BELLS, LKY, JKC, SHIC (same AuxPoW)
+
+### DGB subsidy schedule
+```
+Height < 67,200:     Pre-DigiShield fixed rewards (72K → 16K → 8K DGB)
+67,200 ≤ H < 400K:  8,000 DGB base, -0.5% decay every 10,080 blocks
+H ≥ 400,000:        2,459 DGB base, -1% decay every 80,160 blocks
+Minimum:             1 DGB
+```
 
 ## Priority 1 — Miner Adoption (v36.x)
 
 ### Public P2Pool Observer
 A public website showing all c2pool nodes, total network hashrate, recent
 blocks found, and payout history. Builds confidence that the network is
-alive and paying. This is the #1 thing that convinces miners to join.
+alive and paying.
 
 ### Payout History API
 `/miner_payouts/<address>` with historical block data, amounts, and
@@ -21,50 +81,14 @@ confirmation status. Miners need proof that payouts happen reliably.
 
 ### Block Luck Display
 Show "expected time to next block" on the dashboard based on current
-pool hashrate vs network difficulty. Helps miners set realistic
-expectations about variance.
+pool hashrate vs network difficulty.
 
 ### Real ASIC Validation
 Test the full flow with Antminer L7/L9 via HiveOS flight sheet on
 Litecoin testnet. Validate: connection, vardiff ramp-up, share
 acceptance, block finding, DOGE merged payout.
 
-## Priority 2 — Additional Merged Mining Coins
-
-All Scrypt AuxPoW coins use the same `createauxblock`/`submitauxblock`
-RPC interface. No embedded daemons needed — operators run the coin
-daemon alongside litecoind and pass RPC credentials via `--merged`.
-
-### Revenue ranking (March 2026 prices)
-
-| Coin | chain_id | Daily Network USD | Exchange Liquidity | Priority |
-|------|----------|-------------------|-------------------|----------|
-| DOGE | 98 | $1,440,000 | Excellent (all majors) | **DONE** |
-| PEP | 63 | $4,500 | CoinEx, MEXC | HIGH |
-| LKY | TBD | $4,100 | MEXC, Gate | HIGH |
-| JKC | TBD | $560 | CoinEx | MEDIUM |
-| BELLS | TBD | $170 | Gate, MEXC | MEDIUM |
-| SHIC | TBD | $780 (fake liq.) | CoinEx | LOW |
-| DINGO | TBD | negligible | MEXC | LOW |
-
-### Implementation per coin
-Each new coin requires:
-1. Chain params entry: chain_id, address version bytes, RPC port default
-2. Address validation rules (bech32 HRP if any, base58 version bytes)
-3. Test with the coin's daemon (`createauxblock` / `submitauxblock`)
-
-The existing `MergedMiningManager` handles AuxPoW construction, merkle
-tree building, and block submission generically. Estimated effort per
-coin: 1-2 hours for params + testing.
-
-### Embedded daemon strategy
-Only DOGE justifies an embedded SPV node (73% of total mining revenue).
-All other coins: operators run external daemons. Rationale:
-- DOGE embedded node removes the #1 setup friction point
-- Small coins have trivial daemon setup (`docker run pepecoin-core`)
-- Embedding 7 daemons would bloat the binary and maintenance burden
-
-## Priority 3 — Infrastructure
+## Priority 2 — Infrastructure
 
 ### Prometheus /metrics Endpoint
 Standard Prometheus exposition format for Grafana dashboards:
@@ -82,7 +106,7 @@ Telegram, monitoring) when the pool finds a block.
 ### WebSocket Real-Time Updates
 Replace HTTP polling with WebSocket push for live dashboard stats.
 
-## Priority 4 — Protocol Enhancements
+## Priority 3 — Protocol Enhancements
 
 ### Stratum V2 (Binary + Noise Encryption)
 Not needed for Litecoin/Scrypt ASICs (no firmware supports it). Only
@@ -95,25 +119,19 @@ Encrypted Stratum V1 connections for miners on untrusted networks.
 --stratum-ssl-port 3334 --ssl-cert cert.pem --ssl-key key.pem
 ```
 
-### mining.configure Extensions
-- `minimum-difficulty` — miner requests minimum diff floor
-- `mining.set_version_mask` — dynamic version mask updates mid-session
+## V37 — THE (Time Hybrid Evaluation)
 
-## Priority 5 — Additional Parent Chains
+THE extends V36 with temporal layer stratification. Foundation work
+(Steps 0-4) is complete in V36. V37 activation required for:
 
-### DigiByte Scrypt (`--net digibyte`)
-DGB uses 5 algorithms; the Scrypt variant runs as an independent parent
-chain with its own P2Pool sharechain network. DGB Scrypt is already
-implemented in [p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36).
+- Step 5: Adaptive window (pool_aps formula)
+- Step 6: IncrementalVestingCache (O(1) decay)
+- Step 7: Temporal layer settlement with TLA+ formal verification
 
-Implementation requires:
-- `impl/dgb/` — DGB share format, chain params, config_pool
-- DGB address validation (D-prefix mainnet, bech32 "dgb")
-- DGB block header format (same as LTC for Scrypt variant)
-- DGB merged mining: DOGE + DINGO (both Scrypt AuxPoW compatible)
+THE state root commitment is already anchored in coinbase OP_RETURN
+across all merged mining chains (LTC, DOGE, PEP, BELLS, LKY, JKC, SHIC).
 
-Note: DGB Scrypt as a PARENT chain is different from DGB AuxPoW merged
-mining. DGB does not support being an auxiliary chain (no `createauxblock`).
+See [frstrtr/the](https://github.com/frstrtr/the) for design documents.
 
 ## Not Planned
 
@@ -122,6 +140,5 @@ Automatically switching hash to c2pool based on centralization metrics.
 Niche use case — better served by a standalone monitoring tool.
 
 ### MEV Dashboard (Litecoin)
-Transaction fee analysis showing "how much more you'd earn picking your
-own transactions." On Litecoin, fees are ~0.001 LTC/block — not enough
-to motivate behavior change. Only relevant for future Bitcoin support.
+Transaction fee analysis. On Litecoin, fees are ~0.001 LTC/block — not
+enough to motivate behavior change. Only relevant for future BTC support.
