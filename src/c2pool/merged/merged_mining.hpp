@@ -227,6 +227,7 @@ public:
         std::string current_tip;
         uint64_t    coinbase_value{0};  // satoshis
         double      difficulty{0.0};    // from target
+        int64_t     last_update_age_s{0}; // seconds since last successful work refresh
     };
     std::vector<ChainInfo> get_chain_infos() const;
 
@@ -239,6 +240,14 @@ public:
             uint32_t chain_id, uint64_t coinbase_value)>;
 
     void set_payout_provider(PayoutProvider provider);
+    /// Get merged payouts for a chain (delegates to payout_provider)
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+    get_payouts(uint32_t chain_id, uint64_t coinbase_value) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_payout_provider) return m_payout_provider(chain_id, coinbase_value);
+        return {};
+    }
 
     /// Callback to get current THE state root for sharechain anchoring in merged coinbases.
     using StateRootProvider = std::function<uint256()>;
@@ -279,6 +288,7 @@ private:
         AuxWork                              current_work;
         std::string                          last_tip;
         bool                                 using_fallback{false};
+        int64_t                              last_update_time{0}; // monotonic seconds
     };
     std::vector<ChainState> m_chains;
 

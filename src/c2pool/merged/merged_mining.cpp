@@ -601,6 +601,8 @@ void MergedMiningManager::refresh_aux_work()
                 chain.current_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
             }
 
+            chain.last_update_time = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             any_changed = true;
             LOG_INFO << "[MM:" << chain.config.symbol << "] New aux work at height "
                      << chain.current_work.height
@@ -1131,6 +1133,11 @@ std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos
                 // Simpler: target_to_diff = 2^256 / 2^32 / target_as_double ≈ 2^224 / target_d
                 info.difficulty = std::ldexp(1.0, 224) / target_d;
             }
+        }
+        if (c.last_update_time > 0) {
+            auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            info.last_update_age_s = now_s - c.last_update_time;
         }
         result.push_back(std::move(info));
     }
