@@ -274,52 +274,81 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         //
         // Vnish firmware and some ASIC control software cannot use commas in the
         // login field, so we support pipe (|) and space as alternatives.
-        static constexpr uint32_t DOGE_CHAIN_ID = 98;
+        // ─── Merged chain address identification table ───
+        // Each entry: {chain_id, bech32_hrps, base58_version_bytes}
+        // Used to auto-detect which chain a merged address belongs to.
+        struct ChainAddrInfo {
+            uint32_t chain_id;
+            std::vector<std::string> hrps;
+            std::vector<uint8_t> versions;
+        };
+        static const std::vector<ChainAddrInfo> MERGED_CHAINS = {
+            // DOGE: D... (0x1e), 9/A... (0x16), testnet n... (0x71)
+            {98,   {},      {0x1e, 0x16, 0x71}},
+            // PEP:  P... (0x38), testnet n... (0x71)
+            {63,   {},      {0x38, 0x16, 0x71}},
+            // BELLS: B... (0x19), bech32 "bel"/"tbel"
+            {16,   {"bel", "tbel"}, {0x19, 0x1e, 0x21}},
+            // LKY:  L... (0x2f), testnet n... (0x71)
+            {8211, {},      {0x2f, 0x05, 0x71}},
+            // JKC:  7... (0x10), testnet m/n... (0x6f)
+            {8224, {},      {0x10, 0x05, 0x6f}},
+            // SHIC: S... (0x3f), testnet n... (0x71)
+            {74,   {},      {0x3f, 0x16, 0x71}},
+            // DINGO: same versions as DOGE (fork), chain_id=98 (conflicts with DOGE!)
+            // Cannot be used simultaneously with DOGE. Omitted from auto-detect.
+        };
 
-        // Chain identification tables
-        // LTC: bech32 "ltc"/"tltc", base58 versions 0x30(P2PKH), 0x32/0x05(P2SH), 0x6f(testnet P2PKH), 0xc4/0x3a(testnet P2SH)
+        // LTC identification (for swap detection)
         static const std::vector<std::string> LTC_HRPS = {"ltc", "tltc"};
         static const std::vector<uint8_t> LTC_VERSIONS = {0x30, 0x32, 0x05, 0x6f, 0xc4, 0x3a};
-        // DOGE: no bech32, base58 versions 0x1e(P2PKH), 0x16(P2SH), 0x71(testnet P2PKH)
-        static const std::vector<std::string> DOGE_HRPS = {};
-        static const std::vector<uint8_t> DOGE_VERSIONS = {0x1e, 0x16, 0x71};
 
-        std::string merged_addr_raw;  // raw merged address from simple separator format
+        std::string merged_addr_raw;
         parse_address_separators(username_, merged_addr_raw);
 
-        // Resolve comma-format merged address to actual chain_id
+        // Resolve simple-separator merged address to chain_id
         if (!merged_addr_raw.empty()) {
             bool resolved = false;
 
-            // Try: second address is DOGE (expected order: LTC,DOGE)
-            if (is_address_for_chain(merged_addr_raw, DOGE_HRPS, DOGE_VERSIONS)) {
-                merged_addresses_[DOGE_CHAIN_ID] = merged_addr_raw;
-                resolved = true;
+            // Try each configured merged chain
+            for (const auto& chain : MERGED_CHAINS) {
+                if (mining_interface_ && mining_interface_->has_merged_chain(chain.chain_id) &&
+                    is_address_for_chain(merged_addr_raw, chain.hrps, chain.versions)) {
+                    merged_addresses_[chain.chain_id] = merged_addr_raw;
+                    resolved = true;
+                    break;
+                }
             }
 
-            // Swap detection: first addr is DOGE, second is LTC (wrong order)
-            if (!resolved &&
-                is_address_for_chain(username_, DOGE_HRPS, DOGE_VERSIONS) &&
-                is_address_for_chain(merged_addr_raw, LTC_HRPS, LTC_VERSIONS))
-            {
-                LOG_WARNING << "[Stratum] Detected swapped address order '"
-                            << username_ << "," << merged_addr_raw
-                            << "' (expected LTC,DOGE). Auto-correcting.";
-                std::string doge_addr = username_;
-                username_ = merged_addr_raw;           // LTC address
-                merged_addresses_[DOGE_CHAIN_ID] = doge_addr; // DOGE address
-                resolved = true;
+            // Swap detection: first addr matches a merged chain, second is LTC
+            if (!resolved) {
+                for (const auto& chain : MERGED_CHAINS) {
+                    if (mining_interface_ && mining_interface_->has_merged_chain(chain.chain_id) &&
+                        is_address_for_chain(username_, chain.hrps, chain.versions) &&
+                        is_address_for_chain(merged_addr_raw, LTC_HRPS, LTC_VERSIONS)) {
+                        LOG_WARNING << "[Stratum] Detected swapped address order — auto-correcting.";
+                        std::string merged_addr = username_;
+                        username_ = merged_addr_raw;
+                        merged_addresses_[chain.chain_id] = merged_addr;
+                        resolved = true;
+                        break;
+                    }
+                }
             }
 
-            // Fallback: if we couldn't identify the chain, try hash160 extraction
-            // and assign to first available merged chain
+            // Fallback: assign to first configured merged chain
             if (!resolved) {
                 std::string mtype;
                 auto mh = address_to_hash160(merged_addr_raw, mtype);
-                if (mh.size() == 40 && mining_interface_ && mining_interface_->has_merged_chain(DOGE_CHAIN_ID)) {
-                    merged_addresses_[DOGE_CHAIN_ID] = merged_addr_raw;
-                    LOG_INFO << "[Stratum] Assigned comma-format merged address to DOGE chain (chain_id=" << DOGE_CHAIN_ID << ")";
-                    resolved = true;
+                if (mh.size() == 40 && mining_interface_) {
+                    for (const auto& chain : MERGED_CHAINS) {
+                        if (mining_interface_->has_merged_chain(chain.chain_id)) {
+                            merged_addresses_[chain.chain_id] = merged_addr_raw;
+                            LOG_INFO << "[Stratum] Assigned merged address to chain_id=" << chain.chain_id;
+                            resolved = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -328,15 +357,19 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
 
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
 
-        // Case 2 (Python work.py): if LTC address is valid but no explicit DOGE merged
-        // address provided, auto-derive DOGE P2PKH from the same hash160.
-        if (mining_interface_ && mining_interface_->has_merged_chain(DOGE_CHAIN_ID)) {
-            if (merged_addresses_.find(DOGE_CHAIN_ID) == merged_addresses_.end()) {
-                std::string atype;
-                auto h160 = address_to_hash160(username_, atype);
-                if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
-                    merged_addresses_[DOGE_CHAIN_ID] = username_;
-                    LOG_INFO << "[Stratum] Case 2: auto-derived DOGE merged address from " << atype << " LTC address";
+        // Auto-derive: for each configured merged chain without an explicit address,
+        // reuse the LTC address (works when chains share hash160 format).
+        if (mining_interface_) {
+            std::string atype;
+            auto h160 = address_to_hash160(username_, atype);
+            if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
+                for (const auto& chain : MERGED_CHAINS) {
+                    if (mining_interface_->has_merged_chain(chain.chain_id) &&
+                        merged_addresses_.find(chain.chain_id) == merged_addresses_.end()) {
+                        merged_addresses_[chain.chain_id] = username_;
+                        LOG_INFO << "[Stratum] Auto-derived merged address for chain_id="
+                                 << chain.chain_id << " from LTC address";
+                    }
                 }
             }
         }

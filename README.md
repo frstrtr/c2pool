@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + Dogecoin merged mining.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC).
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>  
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
@@ -14,13 +14,13 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 | Area | Status |
 |---|---|
 | V36 share format (LTC) | Active development |
-| Merged mining (LTC+DOGE) | Working |
+| Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Coin daemon RPC/P2P | Hardened (softfork gate, keepalive, timeouts) |
 | Stratum mining server | Working |
 | VARDIFF | Working |
 | Payout / PPLNS | Working |
 | Authority message blobs (V36) | Working |
-| Test suite | 94 tests, all passing |
+| Test suite | 390 tests, all passing |
 
 > **Need a pool running today?**  
 > [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
@@ -50,13 +50,15 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 ## Running
 
 ```bash
-# Integrated mode — full pool (LTC + DOGE merged mining)
+# Integrated mode — full pool (LTC + multi-chain merged mining)
 ./src/c2pool/c2pool --integrated --net litecoin \
   --coind-address 127.0.0.1 --coind-rpc-port 9332 \
-  --coind-p2p-port 9333 \
-  --merged DOGE:98:127.0.0.1:44556:rpcuser:rpcpass \
+  --rpcuser litecoinrpc --rpcpassword RPCPASSWORD \
   --address YOUR_LTC_ADDRESS \
-  litecoinrpc RPCPASSWORD
+  --merged DOGE:98:127.0.0.1:22555:dogerpc:dogepass \
+  --merged PEP:63:127.0.0.1:29377:peprpc:peppass \
+  --merged BELLS:16:127.0.0.1:19918:bellsrpc:bellspass \
+  --merged LKY:8211:127.0.0.1:9916:lkyrpc:lkypass
 
 # Testnet quick smoke-test
 ./src/c2pool/c2pool --integrated --testnet
@@ -71,6 +73,19 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 |------|--------|
 | 9338 | P2Pool sharechain (peer-to-peer) |
 | 9327 | Stratum mining + HTTP API |
+
+**Merged mining chains** — each requires its daemon running externally:
+
+| Coin | chain_id | `--merged` example |
+|------|----------|--------------------|
+| DOGE | 98 | `DOGE:98:127.0.0.1:22555:user:pass` |
+| PEP | 63 | `PEP:63:127.0.0.1:29377:user:pass` |
+| BELLS | 16 | `BELLS:16:127.0.0.1:19918:user:pass` |
+| LKY | 8211 | `LKY:8211:127.0.0.1:9916:user:pass` |
+| JKC | 8224 | `JKC:8224:127.0.0.1:9770:user:pass` |
+| SHIC | 74 | `SHIC:74:127.0.0.1:33863:user:pass` |
+
+All chains use `createauxblock`/`submitauxblock` RPC. See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
 
 **API endpoints** (integrated mode)
 
