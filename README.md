@@ -50,14 +50,17 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 ## Running
 
 ```bash
-# Integrated mode — full pool (LTC + multi-chain merged mining)
+# Integrated mode with embedded SPV (no separate LTC/DOGE daemons needed)
+./src/c2pool/c2pool --integrated --net litecoin --embedded-ltc --embedded-doge \
+  --address YOUR_LTC_ADDRESS
+
+# Or with external daemons + additional merged chains
 ./src/c2pool/c2pool --integrated --net litecoin \
   --coind-address 127.0.0.1 --coind-rpc-port 9332 \
   --rpcuser litecoinrpc --rpcpassword RPCPASSWORD \
   --address YOUR_LTC_ADDRESS \
   --merged DOGE:98:127.0.0.1:22555:dogerpc:dogepass \
   --merged PEP:63:127.0.0.1:29377:peprpc:peppass \
-  --merged BELLS:16:127.0.0.1:19918:bellsrpc:bellspass \
   --merged LKY:8211:127.0.0.1:9916:lkyrpc:lkypass
 
 # Testnet quick smoke-test
@@ -74,18 +77,23 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 | 9338 | P2Pool sharechain (peer-to-peer) |
 | 9327 | Stratum mining + HTTP API |
 
-**Merged mining chains** — each requires its daemon running externally:
+**Merged mining chains**
 
-| Coin | chain_id | `--merged` example |
-|------|----------|--------------------|
-| DOGE | 98 | `DOGE:98:127.0.0.1:22555:user:pass` |
-| PEP | 63 | `PEP:63:127.0.0.1:29377:user:pass` |
-| BELLS | 16 | `BELLS:16:127.0.0.1:19918:user:pass` |
-| LKY | 8211 | `LKY:8211:127.0.0.1:9916:user:pass` |
-| JKC | 8224 | `JKC:8224:127.0.0.1:9770:user:pass` |
-| SHIC | 74 | `SHIC:74:127.0.0.1:33863:user:pass` |
+LTC and DOGE have built-in embedded SPV nodes — no separate daemon required.
+Other chains need their daemon running externally.
 
-All chains use `createauxblock`/`submitauxblock` RPC. See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
+| Coin | chain_id | Daemon | `--merged` example |
+|------|----------|--------|--------------------|
+| DOGE | 98 | **Embedded SPV** (or external) | `DOGE:98:127.0.0.1:22555:user:pass` |
+| PEP | 63 | External (`pepecoind`) | `PEP:63:127.0.0.1:29377:user:pass` |
+| BELLS | 16 | External (`bellsd`) | `BELLS:16:127.0.0.1:19918:user:pass` |
+| LKY | 8211 | External (`luckycoind`) | `LKY:8211:127.0.0.1:9916:user:pass` |
+| JKC | 8224 | External (`junkcoind`) | `JKC:8224:127.0.0.1:9770:user:pass` |
+| SHIC | 74 | External (`shibacoind`) | `SHIC:74:127.0.0.1:33863:user:pass` |
+| DINGO | 98 | External (`dingocoind`) | Cannot run with DOGE (same chain_id) |
+
+All external chains use `createauxblock`/`submitauxblock` RPC.
+See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
 
 **API endpoints** (integrated mode)
 
