@@ -273,9 +273,29 @@ bool PayoutManager::detect_wallet_address_rpc() {
 }
 
 bool PayoutManager::detect_wallet_address_file() {
-    // This is a simplified approach - in a real implementation,
-    // you'd parse the wallet.dat file or look for address files
-    LOG_INFO << "File-based address detection not implemented yet";
+    // Look for a c2pool address file in standard locations.
+    // This avoids parsing wallet.dat (which requires BDB and is complex).
+    // Users can create ~/.c2pool/node_address.txt with their payout address.
+    const std::vector<std::string> paths = {
+        std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.c2pool/node_address.txt",
+        "node_address.txt",
+    };
+    for (const auto& path : paths) {
+        std::ifstream f(path);
+        if (f.is_open()) {
+            std::string address;
+            if (std::getline(f, address) && !address.empty()) {
+                // Trim whitespace
+                address.erase(0, address.find_first_not_of(" \t\r\n"));
+                address.erase(address.find_last_not_of(" \t\r\n") + 1);
+                if (address.size() >= 20) {
+                    LOG_INFO << "Loaded node owner address from " << path << ": " << address;
+                    set_node_owner_address(address);
+                    return true;
+                }
+            }
+        }
+    }
     return false;
 }
 

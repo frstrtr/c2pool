@@ -1633,7 +1633,11 @@ int main(int argc, char* argv[]) {
                 result["shares_by_version"] = by_version;
                 result["shares_by_miner"]   = by_miner;
                 result["average_difficulty"] = diff_count > 0 ? diff_sum / diff_count : 1.0;
-                result["heaviest_fork_weight"] = 0.0; // TODO: compute when multi-fork scoring is needed
+                // Heaviest fork weight: height of the tallest head (best_height)
+                // relative to total chain size. Value 1.0 = single fork (healthy).
+                result["heaviest_fork_weight"] = chain.size() > 0
+                    ? static_cast<double>(best_height) / static_cast<double>(chain.size())
+                    : 0.0;
                 result["difficulty_trend"] = nlohmann::json::array();
 
                 nlohmann::json tl = nlohmann::json::array();

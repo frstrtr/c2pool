@@ -88,7 +88,8 @@ public:
         load_persisted_shares();
     }
 
-    // INetwork:
+    // INetwork: Pool node does not initiate disconnect — peer connections
+    // manage their own lifecycle via close_connection()/error() below.
     void disconnect() override { }
     void connected(std::shared_ptr<core::Socket> socket) override;
 

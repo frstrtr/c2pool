@@ -193,24 +193,13 @@ public:
             }
         }
 
-        // Check if THIS share would make a naughty block (oversized gentx)
-        // Python data.py:1450-1454: compute gentx_size and gentx_weight
-        // Python data.py:1508-1511: check txs + gentx against BLOCK_MAX_WEIGHT/SIZE
-        {
-            uint32_t gentx_weight = 0;
-            share_var.invoke([&](auto* obj) {
-                // Estimate gentx weight: 4×(non-witness) + witness
-                // For V36+ shares, coinbase weight ≈ 4×base_size (no witness in coinbase)
-                // base_size from OP_RETURN+outputs ≈ subsidy/output_count × ~34 bytes/output
-                // Conservative estimate using the share's transaction count
-                // The actual check is against BLOCK_MAX_WEIGHT including all txs
-                gentx_weight = 0; // TODO: compute from actual gentx when available
-            });
-            // gentx_weight check deferred — requires full tx resolution which
-            // is expensive and only needed for pre-V34 shares. For V36, the
-            // generate_share_transaction comparison in share_check() already
-            // ensures the coinbase is correctly constructed.
-        }
+        // Block weight/size check: Python data.py:1508-1511 checks gentx + txs
+        // against BLOCK_MAX_WEIGHT/SIZE, but only when other_txs is available.
+        // For V34+ (including V36), other_txs is always None (shares use
+        // transaction_hash_refs, not embedded txs), so Python SKIPS this check.
+        // Therefore this is intentionally not computed for V36 shares.
+        // The coinbase correctness is already verified by share_check() via
+        // generate_share_transaction comparison.
 
         return true;
     }

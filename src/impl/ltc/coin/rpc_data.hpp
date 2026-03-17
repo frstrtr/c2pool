@@ -93,7 +93,7 @@ struct WorkData
                 _bits_stream >> _bits;
                 bits = _bits.bits;
             }
-            //TODO: ? else bitcoin_data.FloatingInteger(work['bits']),
+            // bits is parsed from GBT hex — FloatingInteger fallback not needed
 
             height = work["height"].get<int>();
             rules = work["rules"].get<std::vector<std::string>>();

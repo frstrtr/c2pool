@@ -178,10 +178,12 @@ void Legacy::HANDLER(sharereq)
     }
     catch (const std::invalid_argument &e)
     {
-		// TODO: check for too_long
+        // Serialization overflow: the packed shares exceeded the P2P message
+        // size limit (32 MB). Reply with too_long so the peer requests a
+        // smaller batch. This is the correct behavior per Python p2pool.
+        LOG_WARNING << "Share reply too large, sending too_long: " << e.what();
         auto reply_msg = message_sharereply::make_raw(msg->m_id, ltc::ShareReplyResult::too_long, {});
         peer->write(std::move(reply_msg));
-        LOG_INFO << "second try";
     }
 }
 

@@ -452,43 +452,16 @@ struct ListType
 template <typename StreamType, typename T>
 void Serialize(StreamType& os, const std::vector<T>& v)
 {
-    /*  TODO:
-    if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
-        WriteCompactSize(os, v.size());
-        if (!v.empty()) os.write(MakeByteSpan(v));
-    } else if constexpr (std::is_same_v<T, bool>) {
-        // A special case for std::vector<bool>, as dereferencing
-        // std::vector<bool>::const_iterator does not result in a const bool&
-        // due to std::vector's special casing for bool arguments.
-        WriteCompactSize(os, v.size());
-        for (bool elem : v) {
-            Serialize(os, elem);
-        }
-    } else */ 
-    {
-        Serialize(os, Using<ListType<DefaultFormat>>(v));
-    }
+    // Note: Bitcoin Core has a BasicByte<T> fast-path for raw byte vectors
+    // using MakeByteSpan. We don't port that concept — the generic
+    // ListType path is correct and sufficient for p2pool share formats.
+    Serialize(os, Using<ListType<DefaultFormat>>(v));
 }
 
 template <typename StreamType, typename T, typename A>
 void Unserialize(StreamType& is, std::vector<T, A>& v)
 {
-    /* TODO:
-    if constexpr (BasicByte<T>) { // Use optimized version for unformatted basic bytes
-        // Limit size per read so bogus size value won't cause out of memory
-        v.clear();
-        unsigned int nSize = ReadCompactSize(is);
-        unsigned int i = 0;
-        while (i < nSize) {
-            unsigned int blk = std::min(nSize - i, (unsigned int)(1 + 4999999 / sizeof(T)));
-            v.resize(i + blk);
-            is.read(AsWritableBytes(Span{&v[i], blk}));
-            i += blk;
-        }
-    } else */
-    {
-        Unserialize(is, Using<ListType<DefaultFormat>>(v));
-    }
+    Unserialize(is, Using<ListType<DefaultFormat>>(v));
 }
 
 template <typename ParamsType, typename T>

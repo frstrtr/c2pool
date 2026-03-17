@@ -13,8 +13,7 @@
 #include <btclibs/util/strencodings.h>
 #include <core/log.hpp>
 
-// TODO: Rework for std::span (c++20) + std::bytes!
-// check btc-core/util/serialize
+// Legacy V1 serialization — superseded by pack.hpp for V36 shares.
 
 namespace legacy
 {

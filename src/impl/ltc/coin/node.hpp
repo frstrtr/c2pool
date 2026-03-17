@@ -27,8 +27,6 @@ class Node : public ltc::interfaces::Node
     std::unique_ptr<NodeRPC> m_rpc;
     std::unique_ptr<NodeP2P<config_t>> m_p2p;
 
-    //TODO for async: std::thread m_thread_rpc;
-
     void init_p2p()
     {
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
