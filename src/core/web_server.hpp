@@ -391,6 +391,8 @@ public:
         m_donation_script = script;
     }
     const std::vector<unsigned char>& get_donation_script() const { return m_donation_script; }
+    // THE state root for sharechain anchoring (used by merged coinbase too)
+    uint256 get_the_state_root() const { std::lock_guard<std::mutex> l(m_work_mutex); return m_cached_the_state_root; }
     // String-based overload for donation script
     void set_donation_script_from_address(const std::string& address);
 
@@ -580,6 +582,7 @@ private:
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
+    uint256 m_cached_the_state_root;  // THE state root for sharechain anchoring
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
 
     // Share creation hook

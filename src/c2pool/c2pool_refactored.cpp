@@ -2002,7 +2002,7 @@ int main(int argc, char* argv[]) {
                     if (parts.size() >= 4) cfg.rpc_host = parts[2];
                     if (parts.size() >= 4) cfg.rpc_port = static_cast<uint16_t>(std::stoul(parts[3]));
                     if (parts.size() >= 6) cfg.rpc_userpass = parts[4] + ":" + parts[5];
-                    cfg.multiaddress = false;
+                    cfg.multiaddress = true;  // V36: canonical PPLNS coinbase for merged chains
 
                     // DOGE testnet burn address (version 0x71, hash160 = zeros)
                     // Used as payout address for createauxblock RPC
@@ -2247,6 +2247,15 @@ int main(int argc, char* argv[]) {
                     std::sort(result.begin(), result.end());
                     return result;
                 });
+
+                // Wire THE state root provider: anchors sharechain state in merged
+                // coinbase scriptSig. Critical when only a merged block is found (no
+                // LTC parent block anchor available).
+                mm_manager->set_state_root_provider(
+                    [mi]() -> uint256 {
+                        if (!mi) return uint256();
+                        return mi->get_the_state_root();
+                    });
 
                 mm_manager->start();
                 LOG_INFO << "Merged mining manager started with " << mm_manager->chain_count() << " chain(s)";

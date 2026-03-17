@@ -1298,7 +1298,7 @@ MiningInterface::build_connection_coinbase(
         if (bits_str.size() == 8)
             tmpl_bits = static_cast<uint32_t>(std::stoul(bits_str, nullptr, 16));
     }
-    auto the_root = compute_the_state_root(
+    uint256 the_root = compute_the_state_root(
         m_cached_pplns_outputs,
         static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
         tmpl_height, tmpl_bits);
@@ -1504,6 +1504,16 @@ void MiningInterface::refresh_work()
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
         }
 
+        // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
+        uint32_t tmpl_h = wd.m_data.value("height", 0);
+        uint32_t tmpl_b = 0;
+        {
+            auto bs = wd.m_data.value("bits", std::string(""));
+            if (bs.size() == 8) tmpl_b = static_cast<uint32_t>(std::stoul(bs, nullptr, 16));
+        }
+        auto the_root = compute_the_state_root(pplns_outputs,
+            static_cast<uint32_t>(pplns_outputs.size()), tmpl_h, tmpl_b);
+
         // Commit to cache under mutex
         std::lock_guard<std::mutex> lock(m_work_mutex);
         m_cached_template         = wd.m_data;
@@ -1516,6 +1526,7 @@ void MiningInterface::refresh_work()
         m_cached_witness_commitment = std::move(witness_commitment);
         m_cached_witness_root       = witness_root;
         m_cached_mm_commitment    = std::move(mm_commitment);
+        m_cached_the_state_root   = the_root;
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
         m_work_valid              = true;
