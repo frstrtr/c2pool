@@ -240,6 +240,10 @@ public:
 
     void set_payout_provider(PayoutProvider provider);
 
+    /// Callback to get current THE state root for sharechain anchoring in merged coinbases.
+    using StateRootProvider = std::function<uint256()>;
+    void set_state_root_provider(StateRootProvider provider);
+
     /// Callback for P2P block relay: (chain_id, block_hex) after successful RPC submission.
     using BlockRelayFn = std::function<void(uint32_t chain_id, const std::string& block_hex)>;
     void set_block_relay_fn(BlockRelayFn fn);
@@ -255,11 +259,13 @@ private:
     void refresh_aux_work();
 
     // Build a complete aux block in multiaddress mode from getblocktemplate
-    // result, PPLNS payout outputs and AuxPoW proof hex.
+    // result, PPLNS payout outputs, AuxPoW proof hex, and THE state root
+    // for sharechain anchoring (embedded in coinbase scriptSig).
     static std::string build_multiaddress_block(
         const nlohmann::json& block_template,
         const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
-        const std::string& auxpow_hex);
+        const std::string& auxpow_hex,
+        const uint256& the_state_root = uint256());
 
     boost::asio::io_context& m_ioc;
     boost::asio::steady_timer m_poll_timer;
@@ -288,6 +294,9 @@ private:
 
     // Per-chain payout provider (set by integration layer)
     PayoutProvider m_payout_provider;
+
+    // THE state root provider for sharechain anchoring
+    StateRootProvider m_state_root_provider;
 
     // P2P block relay callback (set by integration layer)
     BlockRelayFn m_block_relay_fn;

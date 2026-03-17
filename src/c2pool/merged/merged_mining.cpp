@@ -749,9 +749,12 @@ void MergedMiningManager::try_submit_merged_blocks(
             // Multiaddress mode: build a complete block with PPLNS payouts
             auto payouts = m_payout_provider(chain.config.chain_id,
                                              chain.current_work.coinbase_value);
+            // Get THE state root for sharechain anchoring in merged coinbase
+            uint256 state_root;
+            if (m_state_root_provider) state_root = m_state_root_provider();
             if (!payouts.empty()) {
                 auto block_hex = build_multiaddress_block(
-                    chain.current_work.block_template, payouts, auxpow);
+                    chain.current_work.block_template, payouts, auxpow, state_root);
                 if (!block_hex.empty()) {
                     bool ok = chain.rpc->submit_block(block_hex);
                     record_discovered_block(chain, ok, parent_hash.GetHex());
@@ -804,6 +807,12 @@ void MergedMiningManager::set_payout_provider(PayoutProvider provider)
     m_payout_provider = std::move(provider);
 }
 
+void MergedMiningManager::set_state_root_provider(StateRootProvider provider)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_state_root_provider = std::move(provider);
+}
+
 void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -824,7 +833,8 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
 std::string MergedMiningManager::build_multiaddress_block(
     const nlohmann::json& tmpl,
     const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
-    const std::string& auxpow_hex)
+    const std::string& auxpow_hex,
+    const uint256& the_state_root)
 {
     if (payouts.empty() || !tmpl.contains("previousblockhash"))
         return {};
@@ -848,42 +858,105 @@ std::string MergedMiningManager::build_multiaddress_block(
     cb << "0000000000000000000000000000000000000000000000000000000000000000"
        << "ffffffff";
 
-    // scriptSig: BIP34 height + some padding
-    // BIP34: push height as little-endian
+    // scriptSig: BIP34 height + canonical extra text (matches Python p2pool)
     std::ostringstream sig;
-    if (height < 17) {
-        sig << to_hex(reinterpret_cast<const uint8_t*>("\x51"), 1); // OP_1..OP_16
+    if (height > 0 && height <= 16) {
+        // OP_1..OP_16
+        uint8_t op = static_cast<uint8_t>(0x50 + height);
+        sig << to_hex(&op, 1);
     } else {
-        // Encode height as minimal LE bytes
+        // Encode height as minimal CScriptNum LE bytes
         std::vector<uint8_t> hbytes;
-        int h = height;
+        uint32_t h = static_cast<uint32_t>(height);
         while (h > 0) { hbytes.push_back(h & 0xff); h >>= 8; }
-        sig << to_hex(reinterpret_cast<const uint8_t*>(&hbytes[0]), 0); // push size
-        // Actually: PUSH_N <n bytes>
+        if (!hbytes.empty() && (hbytes.back() & 0x80))
+            hbytes.push_back(0);  // sign byte
         uint8_t push_len = static_cast<uint8_t>(hbytes.size());
-        sig.str("");
         sig << to_hex(&push_len, 1) << to_hex(hbytes.data(), hbytes.size());
     }
-    // Append 4 zero bytes as extra nonce space
-    sig << "00000000";
+    // Canonical extra in scriptSig: "/c2pool/" + THE state root (32 bytes)
+    // Layout: [BIP34 height]["/c2pool/"][the_state_root(32)]
+    // The state root anchors sharechain state into the merged blockchain —
+    // critical when only the merged block is found (no parent block anchor).
+    const std::string coinbase_extra = "/c2pool/";
+    for (char c : coinbase_extra) {
+        uint8_t b = static_cast<uint8_t>(c);
+        sig << to_hex(&b, 1);
+    }
+    if (!the_state_root.IsNull()) {
+        sig << to_hex(the_state_root.data(), 32);
+    }
     std::string sig_hex = sig.str();
     cb << varint_hex(sig_hex.size() / 2) << sig_hex;
 
     // sequence
     cb << "ffffffff";
 
-    // outputs
-    cb << varint_hex(payouts.size());
-    for (const auto& [script, amount] : payouts)
+    // Canonical output ordering (matches Python p2pool):
+    //   1. Miner outputs: sorted ascending by script bytes (already sorted by payout_provider)
+    //   2. OP_RETURN output (value=0, text "P2Pool merged mining")
+    //   3. Donation output (COMBINED_DONATION_SCRIPT) — always LAST
+
+    // Separate donation from miner outputs
+    static const std::vector<unsigned char> COMBINED_DONATION = {
+        0xa9, 0x14,
+        0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
+        0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
+        0x36, 0xbe, 0x8e, 0x85,
+        0x87
+    };
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> miner_outs;
+    uint64_t donation_amount = 0;
+    for (const auto& [script, amount] : payouts) {
+        if (script == COMBINED_DONATION)
+            donation_amount += amount;
+        else if (amount > 0)
+            miner_outs.emplace_back(script, amount);
+    }
+    // Ensure donation >= 1 satoshi (V36 consensus rule)
+    if (donation_amount < 1 && !miner_outs.empty()) {
+        miner_outs.back().second -= 1;
+        donation_amount += 1;
+    }
+
+    // OP_RETURN: "c2pool merged mining"
+    const std::string op_return_text = "c2pool merged mining";
+    std::vector<unsigned char> op_return_script;
+    op_return_script.push_back(0x6a); // OP_RETURN
+    op_return_script.push_back(static_cast<unsigned char>(op_return_text.size()));
+    op_return_script.insert(op_return_script.end(), op_return_text.begin(), op_return_text.end());
+
+    // Total output count: miners + OP_RETURN + donation
+    size_t out_count = miner_outs.size() + 1 + 1;
+    cb << varint_hex(out_count);
+
+    // Miner outputs (sorted by script — already sorted)
+    for (const auto& [script, amount] : miner_outs)
     {
-        // value: 8 bytes LE
         uint8_t vbuf[8];
         for (int i = 0; i < 8; ++i)
             vbuf[i] = (amount >> (8 * i)) & 0xFF;
         cb << to_hex(vbuf, 8);
-        // scriptPubKey
         cb << varint_hex(script.size())
            << to_hex(script.data(), script.size());
+    }
+
+    // OP_RETURN (value=0)
+    {
+        uint8_t vbuf[8] = {};
+        cb << to_hex(vbuf, 8);
+        cb << varint_hex(op_return_script.size())
+           << to_hex(op_return_script.data(), op_return_script.size());
+    }
+
+    // Donation (COMBINED_DONATION_SCRIPT, always LAST)
+    {
+        uint8_t vbuf[8];
+        for (int i = 0; i < 8; ++i)
+            vbuf[i] = (donation_amount >> (8 * i)) & 0xFF;
+        cb << to_hex(vbuf, 8);
+        cb << varint_hex(COMBINED_DONATION.size())
+           << to_hex(COMBINED_DONATION.data(), COMBINED_DONATION.size());
     }
 
     // locktime
