@@ -239,7 +239,10 @@ Connect via `stratum+tcp://host:worker_port` (default 9327).
 |--------|--------|---------|-------------|
 | `mining.subscribe` | `[user_agent]` | `[[subscriptions], extranonce1, extranonce2_size]` | Subscribe to work |
 | `mining.authorize` | `[username, password]` | `true/false` | Authorize worker. Username format: `LTC_ADDR[,DOGE_ADDR][.worker][+difficulty]` |
-| `mining.submit` | `[worker, job_id, extranonce2, ntime, nonce]` | `true/false` | Submit share |
+| `mining.configure` | `[extensions[], params{}]` | `{ext: result}` | BIP 310 extension negotiation (version-rolling, subscribe-extranonce) |
+| `mining.submit` | `[worker, job_id, extranonce2, ntime, nonce, version_bits?]` | `true/false` | Submit share (6th param = ASICBoost version bits) |
+| `mining.suggest_difficulty` | `[difficulty]` | `true` | Suggest initial difficulty |
+| `mining.extranonce.subscribe` | `[]` | `true` | NiceHash extranonce subscription |
 | `mining.set_merged_addresses` | `[{chain_id: address}]` | `true/false` | Set merged chain addresses (c2pool extension) |
 
 ### Server-to-Client (Notifications)
@@ -248,25 +251,56 @@ Connect via `stratum+tcp://host:worker_port` (default 9327).
 |--------|--------|-------------|
 | `mining.notify` | `[job_id, prevhash, coinb1, coinb2, merkle_branches, version, nbits, ntime, clean]` | New work |
 | `mining.set_difficulty` | `[difficulty]` | Difficulty update |
+| `mining.set_extranonce` | `[extranonce1, extranonce2_size]` | Extranonce change (requires subscription) |
+
+### BIP 310: mining.configure
+
+Negotiate extensions before subscribing. Pool mask: `0x1fffe000` (bits 13-28).
+
+```json
+// Request
+{"method": "mining.configure", "params": [
+  ["version-rolling", "subscribe-extranonce"],
+  {"version-rolling.mask": "1fffe000", "version-rolling.min-bit-count": 2}
+]}
+// Response
+{"result": {
+  "version-rolling": true, "version-rolling.mask": "1fffe000",
+  "subscribe-extranonce": true
+}}
+```
+
+After version-rolling is negotiated, miners pass rolled version bits as the 6th param in `mining.submit`:
+```json
+{"method": "mining.submit", "params": ["worker", "job_1", "deadbeef", "5f123456", "00000001", "1fffe000"]}
+```
+
+### NiceHash/MiningRigRentals Compatibility
+
+Subscribe to extranonce changes via either:
+- BIP 310: `mining.configure(["subscribe-extranonce"], {})`, or
+- NiceHash: `mining.extranonce.subscribe([])`
+
+After subscription, the server may send `mining.set_extranonce` followed by `mining.notify` with `clean_jobs=true`.
 
 ### Address Format in `mining.authorize`
+
+Multiple separator styles are supported for maximum firmware compatibility:
 
 | Format | Example | Behavior |
 |--------|---------|----------|
 | `LTC_ADDR` | `tltc1q...` | LTC payout, auto-derive DOGE from same pubkey_hash |
-| `LTC_ADDR,DOGE_ADDR` | `tltc1q...,nXyz...` | Explicit addresses for both chains |
+| `LTC_ADDR,DOGE_ADDR` | `tltc1q...,nXyz...` | Comma separator (standard Stratum) |
+| `LTC_ADDR\|DOGE_ADDR` | `tltc1q...\|nXyz...` | Pipe separator (Vnish firmware) |
+| `LTC_ADDR;DOGE_ADDR` | `tltc1q...;nXyz...` | Semicolon separator (alternative) |
+| `LTC_ADDR DOGE_ADDR` | `tltc1q... nXyz...` | Space separator (some web UIs) |
 | `LTC_ADDR/98:DOGE_ADDR` | `tltc1q.../98:nXyz...` | Slash format with explicit chain_id |
 | `DOGE_ADDR,LTC_ADDR` | `nXyz...,tltc1q...` | Auto-detected swap, corrected to LTC,DOGE |
 | `LTC_ADDR.worker` | `tltc1q....rig1` | Worker name (stripped, used for stats) |
 | `LTC_ADDR_worker` | `tltc1q..._rig1` | Underscore worker separator |
 | `LTC_ADDR+1024` | `tltc1q...+1024` | Fixed difficulty override |
 
-### Not Implemented (BIP 310 Extensions)
-
-| Method | Description | Impact |
-|--------|-------------|--------|
-| `mining.configure` | Version rolling extension negotiation | ASICs requiring version rolling will fall back to non-rolling mode |
-| `mining.set_version_mask` | Dynamic version mask updates | Same as above |
+Separator priority: slash (explicit chain IDs) > comma > pipe > semicolon > space.
 
 ## CORS
 

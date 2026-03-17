@@ -25,6 +25,7 @@
 #include <core/address_validator.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
+#include <core/address_utils.hpp>
 
 // Forward declaration for merged mining integration
 namespace c2pool { namespace merged { class MergedMiningManager; } }
@@ -836,112 +837,6 @@ private:
     void handle_accept(beast::error_code ec, tcp::socket socket);
 };
 
-/// Stratum Session handler for native Stratum protocol (TCP + line-delimited JSON)
-class StratumSession : public std::enable_shared_from_this<StratumSession>
-{
-    tcp::socket socket_;
-    boost::asio::streambuf buffer_;
-    std::shared_ptr<MiningInterface> mining_interface_;
-    std::string subscription_id_;
-    std::string extranonce1_;
-    std::string username_;
-    bool subscribed_ = false;
-    bool authorized_ = false;
-    bool need_initial_setup_ = false;
-    static std::atomic<uint64_t> job_counter_;
-    
-    // Per-connection VARDIFF via HashrateTracker
-    c2pool::hashrate::HashrateTracker hashrate_tracker_;
-    
-    // Active jobs for stale detection (job_id → prevhash at time of issue)
-    struct JobEntry {
-        std::string prevhash;      // Stratum-format (swapped) for stale detection
-        std::string gbt_prevhash;  // Raw GBT previousblockhash (BE display hex) for header reconstruction
-        std::string nbits;
-        uint32_t    ntime{};
-        std::string coinb1;
-        std::string coinb2;
-        uint32_t    version{};
-        std::vector<std::string> merkle_branches;
-        std::vector<std::string> tx_data;     // raw tx hex from GBT template
-        std::string mweb;                      // MWEB extension data
-        bool        segwit_active{false};
-        uint256     prev_share_hash;  // share chain tip when this job was built
-        uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
-        std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
-        uint256     witness_root;            // raw wtxid merkle root frozen at job creation
-    };
-    std::unordered_map<std::string, JobEntry> active_jobs_;
-    std::string last_prevhash_;  // track prevhash for clean_jobs detection
-    static constexpr size_t MAX_ACTIVE_JOBS = 32; // keep last N jobs for late shares + block target checking
-    
-    // Per-worker statistics
-    uint64_t accepted_shares_ = 0;
-    uint64_t rejected_shares_ = 0;
-    uint64_t stale_shares_    = 0;
-    std::chrono::steady_clock::time_point connected_at_;
-    std::string session_id_;  // unique key for worker tracking
-
-    // Merged mining: per-chain payout addresses set by the miner.
-    // Maps chain_id → address string (e.g. 98 → "DQkw...").
-    // Populated via mining.set_merged_addresses or from username format.
-    std::map<uint32_t, std::string> merged_addresses_;
-
-    // Periodic work-push timer (fires every SHARE_PERIOD to keep miners on fresh work)
-    std::shared_ptr<boost::asio::steady_timer> work_push_timer_;
-
-public:
-    explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
-    void start();
-
-    // Merged mining: return the per-chain payout addresses for share construction.
-    const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
-
-private:
-    std::string generate_subscription_id();
-    void read_message();
-    void process_message(std::size_t bytes_read);
-    
-    nlohmann::json handle_subscribe(const nlohmann::json& params, const nlohmann::json& request_id);
-    nlohmann::json handle_authorize(const nlohmann::json& params, const nlohmann::json& request_id);
-    nlohmann::json handle_submit(const nlohmann::json& params, const nlohmann::json& request_id);
-    nlohmann::json handle_set_merged_addresses(const nlohmann::json& params, const nlohmann::json& request_id);
-    
-    void send_response(const nlohmann::json& response);
-    void send_error(int code, const std::string& message, const nlohmann::json& request_id);
-    void send_set_difficulty(double difficulty);
-    void send_notify_work(bool force_clean = false);
-    void start_periodic_work_push();
-    
-    std::string generate_extranonce1();
-    
-
-};
-
-/// Stratum Server for native mining protocol (separate from HTTP)
-class StratumServer
-{
-    net::io_context& ioc_;
-    tcp::acceptor acceptor_;
-    std::shared_ptr<MiningInterface> mining_interface_;
-    std::string bind_address_;
-    uint16_t port_;
-    bool running_;
-
-public:
-    StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface);
-    ~StratumServer();
-
-    bool start();
-    void stop();
-    
-    std::string get_bind_address() const { return bind_address_; }
-    uint16_t get_port() const { return port_; }
-    bool is_running() const { return running_; }
-
-private:
-    void accept_connections();
-    void handle_accept(boost::system::error_code ec, tcp::socket socket);
-};
+// StratumSession and StratumServer — see stratum_server.hpp
 
 } // namespace core

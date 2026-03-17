@@ -120,6 +120,15 @@ void HashrateTracker::enable_vardiff(bool enabled) {
     vardiff_enabled_ = enabled;
 }
 
+void HashrateTracker::set_difficulty_hint(double hint) {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    double clamped = std::max(min_difficulty_, std::min(max_difficulty_, hint));
+    if (clamped != current_difficulty_) {
+        LOG_INFO << "[Stratum] Applying difficulty hint: " << current_difficulty_ << " -> " << clamped;
+        current_difficulty_ = clamped;
+    }
+}
+
 // Python-style aggressive vardiff.  Called after every share submission.
 // Three triggers:
 //   1) Normal: after VARDIFF_TRIGGER shares, scale by actual_rate / target_rate.
