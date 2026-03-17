@@ -549,6 +549,7 @@ private:
     // io_context for scheduling async verification timers
     boost::asio::io_context*     m_context        = nullptr;
     std::atomic<bool>       m_work_valid{false};
+    std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
     nlohmann::json          m_cached_template;
     std::vector<std::string> m_cached_merkle_branches;   // Stratum merkle branches
     std::string             m_cached_coinb1;

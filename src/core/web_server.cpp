@@ -1530,6 +1530,8 @@ void MiningInterface::refresh_work()
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
         m_work_valid              = true;
+        m_last_work_update_time   = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
 
         LOG_INFO << "[LTC] refresh_work: height=" << wd.m_data.value("height", 0)
                  << " txs=" << wd.m_hashes.size()
@@ -2752,7 +2754,69 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value_miner"] = block_value;    // miner portion (same for now)
     result["block_value_payments"] = block_value;  // total with payments
 
-    result["warnings"] = nlohmann::json::array();
+    // Warnings: daemon health, version alerts, merged chain status
+    {
+        auto warnings = nlohmann::json::array();
+
+        // 1. LTC daemon contact check (>60s since last work update)
+        auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (m_last_work_update_time > 0 && now_s - m_last_work_update_time > 60)
+            warnings.push_back("LOST CONTACT WITH LTC DAEMON for "
+                + std::to_string(now_s - m_last_work_update_time) + "s! "
+                "Check that it isn't frozen or dead!");
+
+        // 2. No work template yet
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_work_valid)
+                warnings.push_back("No block template received yet — waiting for daemon connection");
+        }
+
+        // 3. Merged chain daemon contact check
+        if (m_mm_manager) {
+            auto chain_infos = m_mm_manager->get_chain_infos();
+            for (const auto& ci : chain_infos) {
+                if (ci.last_update_age_s > 60)
+                    warnings.push_back("LOST CONTACT WITH " + ci.symbol + " DAEMON for "
+                        + std::to_string(ci.last_update_age_s) + "s!");
+            }
+        }
+
+        // 4. No peers connected
+        if (m_node) {
+            auto hs = m_node->get_hashrate_stats();
+            int peers = hs.value("peer_count", 0);
+            if (peers == 0)
+                warnings.push_back("No P2Pool peers connected — share propagation disabled");
+        }
+
+        // 5. No miners connected
+        if (get_stratum_workers().empty() && !m_solo_mode)
+            warnings.push_back("No miners connected — pool is idle");
+
+        // 6. Version signaling: majority voting for unsupported version
+        if (m_node) {
+            auto vs = rest_version_signaling();
+            if (vs.contains("versions") && vs["versions"].is_object()) {
+                int64_t total_votes = 0;
+                int64_t max_version = 0;
+                int64_t max_count = 0;
+                for (auto& [ver_str, count] : vs["versions"].items()) {
+                    int64_t v = std::stoll(ver_str);
+                    int64_t c = count.get<int64_t>();
+                    total_votes += c;
+                    if (c > max_count) { max_count = c; max_version = v; }
+                }
+                if (max_version > 36 && total_votes > 0 && max_count * 2 > total_votes)
+                    warnings.push_back("MAJORITY VOTING FOR V" + std::to_string(max_version)
+                        + " (" + std::to_string(max_count * 100 / total_votes)
+                        + "% support) — an upgrade may be necessary!");
+            }
+        }
+
+        result["warnings"] = warnings;
+    }
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
     result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
 
@@ -3409,11 +3473,77 @@ nlohmann::json MiningInterface::rest_merged_stats()
 
 nlohmann::json MiningInterface::rest_current_merged_payouts()
 {
-    // Return null so the dashboard falls back to current_payouts endpoint.
-    // The current_merged_payouts format requires per-address payout breakdown
-    // with {addr: {amount, merged: [{symbol, address, amount}]}} which needs
-    // ShareTracker PPLNS data we don't have wired here yet.
-    return nlohmann::json(nullptr);
+    // Format: { "LTC_ADDRESS": { "amount": 0.123, "merged": [{"symbol":"DOGE","address":"D...","amount":0.456}] } }
+    nlohmann::json result = nlohmann::json::object();
+
+    // Get parent chain (LTC) payouts
+    auto payouts_json = rest_current_payouts();
+    if (!payouts_json.is_object()) return result;
+
+    // Convert current_payouts {addr: amount_float} to merged format
+    for (auto& [addr, amount] : payouts_json.items()) {
+        result[addr] = {{"amount", amount}, {"merged", nlohmann::json::array()}};
+    }
+
+    // Add merged chain payouts via the payout_provider callback
+    if (m_mm_manager) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        for (const auto& ci : chain_infos) {
+            if (ci.coinbase_value == 0) continue;
+
+            // Use the same payout_provider that build_multiaddress_block uses
+            auto merged_payouts = m_mm_manager->get_payouts(ci.chain_id, ci.coinbase_value);
+            if (merged_payouts.empty()) continue;
+
+            for (auto& [script, amount] : merged_payouts) {
+                // Extract hash160 from merged script for matching to parent address
+                std::string hash160_hex;
+                int h160_offset = -1;
+                if (script.size() == 25 && script[0] == 0x76) h160_offset = 3; // P2PKH
+                else if (script.size() == 23 && script[0] == 0xa9) h160_offset = 2; // P2SH
+                if (h160_offset >= 0) {
+                    static const char* HEX = "0123456789abcdef";
+                    hash160_hex.reserve(40);
+                    for (int i = h160_offset; i < h160_offset + 20; ++i) {
+                        hash160_hex += HEX[script[i] >> 4];
+                        hash160_hex += HEX[script[i] & 0x0f];
+                    }
+                }
+
+                // Find parent address with same hash160
+                bool attached = false;
+                if (!hash160_hex.empty()) {
+                    for (auto& [parent_addr, entry] : result.items()) {
+                        auto ps = address_to_script(parent_addr);
+                        int po = (ps.size() == 25) ? 3 : (ps.size() == 22) ? 2 : (ps.size() == 23) ? 2 : -1;
+                        if (po >= 0 && po + 20 <= static_cast<int>(ps.size())) {
+                            static const char* HEX = "0123456789abcdef";
+                            std::string ph;
+                            ph.reserve(40);
+                            for (int i = po; i < po + 20; ++i) { ph += HEX[ps[i] >> 4]; ph += HEX[ps[i] & 0x0f]; }
+                            if (ph == hash160_hex) {
+                                entry["merged"].push_back({
+                                    {"symbol", ci.symbol}, {"address", hash160_hex}, {"amount", amount / 1e8}
+                                });
+                                attached = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!attached && amount > 0) {
+                    std::string key = hash160_hex.empty() ? "unknown" : hash160_hex;
+                    if (!result.contains(key))
+                        result[key] = {{"amount", 0.0}, {"merged", nlohmann::json::array()}};
+                    result[key]["merged"].push_back({
+                        {"symbol", ci.symbol}, {"address", key}, {"amount", amount / 1e8}
+                    });
+                }
+            }
+        }
+    }
+
+    return result;
 }
 
 nlohmann::json MiningInterface::rest_recent_merged_blocks()
