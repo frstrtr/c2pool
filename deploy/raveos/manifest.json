@@ -1,0 +1,12 @@
+{
+  "package": "c2pool",
+  "name": "C2Pool",
+  "version": "1.0.0",
+  "description": "Decentralized P2Pool mining (Litecoin + merged DOGE)",
+  "maintainer": "c2pool",
+  "platforms": ["cpu"],
+  "dual_coin": true,
+  "algo": ["scrypt"],
+  "executable": ["c2pool"],
+  "rev": 1
+}
