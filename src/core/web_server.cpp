@@ -1511,6 +1511,8 @@ void MiningInterface::refresh_work()
         m_cached_witness_root       = witness_root;
         m_cached_mm_commitment    = std::move(mm_commitment);
         m_cached_the_state_root   = the_root;
+        m_cached_sharechain_height = tmpl_h;
+        m_cached_miner_count       = static_cast<uint16_t>(m_cached_pplns_outputs.size());
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
         m_work_valid              = true;

@@ -133,6 +133,22 @@ public:
     nlohmann::json rest_checkpoint();    // latest verified checkpoint
     nlohmann::json rest_checkpoints();   // all checkpoints
 
+    // Current work state for THE checkpoint creation
+    struct CurrentTheState {
+        uint256 the_state_root;
+        uint32_t sharechain_height{0};
+        uint16_t miner_count{0};
+        double pool_hashrate{0};
+    };
+    CurrentTheState get_current_work() const {
+        CurrentTheState s;
+        s.the_state_root = m_cached_the_state_root;
+        s.sharechain_height = m_cached_sharechain_height;
+        s.miner_count = m_cached_miner_count;
+        s.pool_hashrate = m_cached_pool_hashrate;
+        return s;
+    }
+
     // THE checkpoint management
     using checkpoint_store_fn_t = std::function<nlohmann::json()>;                  // get latest
     using checkpoints_all_fn_t = std::function<nlohmann::json()>;                   // get all
@@ -635,6 +651,11 @@ private:
 
     // Coinbase scriptSig customization
     std::string m_coinbase_text;  // empty = "/c2pool/" default tag
+
+    // Cached THE state for checkpoint creation (state_root already at line 639)
+    uint32_t m_cached_sharechain_height{0};
+    uint16_t m_cached_miner_count{0};
+    double m_cached_pool_hashrate{0};
 
     // THE checkpoint callbacks (set by node layer)
     checkpoint_store_fn_t m_checkpoint_latest_fn;

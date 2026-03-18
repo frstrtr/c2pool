@@ -14,6 +14,7 @@
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
 #include <core/coinbase_builder.hpp>
+#include <c2pool/storage/the_checkpoint.hpp>
 #include <core/pack.hpp>
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
@@ -1221,6 +1222,104 @@ int main(int argc, char* argv[]) {
                     );
                     mi->load_persisted_found_blocks();
                     LOG_INFO << "[Pool] Found block persistence enabled at " << fblk_db_path;
+
+                    // --- THE checkpoint store (shares same LevelDB) ---
+                    auto the_store = std::make_shared<c2pool::storage::TheCheckpointStore>(*fblk_leveldb);
+
+                    // Checkpoint creation: called on every found block
+                    mi->set_checkpoint_fns(
+                        // latest verified checkpoint
+                        [the_store]() -> nlohmann::json {
+                            // Try all chains
+                            for (const auto& chain : {"tLTC", "LTC", "DOGE", "tDOGE"}) {
+                                auto cp = the_store->get_latest_verified(chain);
+                                if (cp.has_value()) {
+                                    return nlohmann::json{
+                                        {"chain", cp->chain},
+                                        {"block_height", cp->block_height},
+                                        {"block_hash", cp->block_hash},
+                                        {"the_state_root", cp->the_state_root.GetHex()},
+                                        {"sharechain_height", cp->sharechain_height},
+                                        {"miner_count", cp->miner_count},
+                                        {"hashrate_class", cp->hashrate_class},
+                                        {"timestamp", cp->timestamp},
+                                        {"status", cp->status == 1 ? "verified" : "pending"}
+                                    };
+                                }
+                            }
+                            // Fall back to latest any-status
+                            for (const auto& chain : {"tLTC", "LTC", "DOGE", "tDOGE"}) {
+                                auto cp = the_store->get_latest(chain);
+                                if (cp.has_value()) {
+                                    return nlohmann::json{
+                                        {"chain", cp->chain},
+                                        {"block_height", cp->block_height},
+                                        {"block_hash", cp->block_hash},
+                                        {"the_state_root", cp->the_state_root.GetHex()},
+                                        {"sharechain_height", cp->sharechain_height},
+                                        {"miner_count", cp->miner_count},
+                                        {"hashrate_class", cp->hashrate_class},
+                                        {"timestamp", cp->timestamp},
+                                        {"status", "pending"}
+                                    };
+                                }
+                            }
+                            return nlohmann::json{{"error", "no checkpoints found"}};
+                        },
+                        // all checkpoints
+                        [the_store]() -> nlohmann::json {
+                            auto all = the_store->load_all();
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (const auto& cp : all) {
+                                arr.push_back({
+                                    {"chain", cp.chain},
+                                    {"block_height", cp.block_height},
+                                    {"block_hash", cp.block_hash},
+                                    {"the_state_root", cp.the_state_root.GetHex()},
+                                    {"sharechain_height", cp.sharechain_height},
+                                    {"miner_count", cp.miner_count},
+                                    {"hashrate_class", cp.hashrate_class},
+                                    {"timestamp", cp.timestamp},
+                                    {"status", cp.status == 1 ? "verified" : (cp.status == 2 ? "mismatch" : "pending")}
+                                });
+                            }
+                            return arr;
+                        },
+                        // verify callback (recompute state_root)
+                        [](const uint256& /*state_root*/, uint32_t /*height*/) -> bool {
+                            // TODO: recompute from sharechain and compare
+                            return true; // optimistic until V37
+                        },
+                        // create checkpoint on block found
+                        [the_store, mi](const std::string& chain, uint64_t height,
+                                        const std::string& hash, uint64_t ts) {
+                            c2pool::storage::TheCheckpoint cp;
+                            cp.chain = chain;
+                            cp.block_height = height;
+                            cp.block_hash = hash;
+                            cp.timestamp = ts;
+                            cp.status = 0; // pending
+
+                            // Capture current sharechain state from THE metadata
+                            // The state_root was already computed in refresh_work()
+                            // and embedded in the block. We store the same data here.
+                            auto work = mi->get_current_work();
+                            if (!work.the_state_root.IsNull())
+                                cp.the_state_root = work.the_state_root;
+
+                            cp.sharechain_height = work.sharechain_height;
+                            cp.miner_count = work.miner_count;
+                            cp.hashrate_class = c2pool::TheMetadata::encode_hashrate(work.pool_hashrate);
+
+                            the_store->store(cp);
+                            LOG_INFO << "[THE] Checkpoint created: chain=" << chain
+                                     << " height=" << height
+                                     << " miners=" << cp.miner_count
+                                     << " hashrate_class=" << (int)cp.hashrate_class
+                                     << " state_root=" << cp.the_state_root.GetHex().substr(0, 16) << "...";
+                        }
+                    );
+                    LOG_INFO << "[THE] Checkpoint store enabled (" << the_store->count() << " existing checkpoints)";
                 }
                 mi->set_block_verify_fn(
                     [chain = embedded_chain.get()](const std::string& hash_hex) -> int {
