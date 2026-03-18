@@ -5160,33 +5160,41 @@ double MiningInterface::calculate_share_difficulty(
     std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
     uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, merkle_branches);
 
-    uint256 prev_hash;
-    prev_hash.SetHex(prevhash_hex);
+    // The prevhash is in STRATUM format (swap4'd) — the miner uses these
+    // exact bytes in the header. ParseHex gives us the raw bytes directly.
+    // Do NOT use uint256::SetHex which does a full byte-reverse (different
+    // from swap4 for 32-byte values).
+    auto prevhash_bytes = ParseHex(prevhash_hex);
+    if (prevhash_bytes.size() != 32)
+        return 0.0;
 
     std::vector<unsigned char> header;
     header.reserve(80);
 
+    // Version: already in native uint32, pack as LE
     header.push_back(static_cast<unsigned char>((version      ) & 0xff));
     header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
     header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
     header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
 
-    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+    // Prevhash: stratum swap4'd bytes, used as-is in the header
+    header.insert(header.end(), prevhash_bytes.begin(), prevhash_bytes.end());
+
+    // Merkle root: internal byte order from reconstruct_merkle_root
     header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
 
-    // ntime: miner sends as BE hex, header needs LE bytes
+    // ntime: Stratum sends as swap4'd hex (for 4 bytes = reversed).
+    // The miner puts these bytes directly in the header.
+    // We parse the hex and use as-is — the bytes are already in header order.
     auto ntime_bytes = ParseHex(ntime);
-    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
     header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
 
-    // nbits: GBT sends as BE hex, header needs LE bytes
+    // nbits: same as ntime — Stratum format, already in header byte order
     auto bits_bytes = ParseHex(nbits_hex);
-    std::reverse(bits_bytes.begin(), bits_bytes.end());
     header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
 
-    // nonce: miner sends as BE hex, header needs LE bytes
+    // nonce: same — miner submits in header byte order
     auto nonce_bytes = ParseHex(nonce);
-    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
     header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
 
     if (header.size() != 80)

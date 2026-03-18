@@ -684,10 +684,14 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         }
     }
 
+    // Use stratum prevhash (swap4'd), NOT gbt_prevhash (BE display hex).
+    // The miner builds its header with the swap4'd prevhash bytes directly.
+    // Using gbt_prevhash produces a different byte order (full-reverse vs swap4)
+    // which gives a completely wrong scrypt hash.
     double share_difficulty = MiningInterface::calculate_share_difficulty(
         job.coinb1, job.coinb2,
         extranonce1_, extranonce2, ntime, nonce,
-        effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
+        effective_version, job.prevhash, job.nbits, job.merkle_branches);
     double required_difficulty = hashrate_tracker_.get_current_difficulty();
 
     // Record ALL submissions for vardiff timing (accepted + rejected), like Python p2pool.
