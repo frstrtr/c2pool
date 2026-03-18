@@ -41,7 +41,7 @@ struct TheCheckpoint {
     std::string block_hash;             // blockchain block hash
     uint64_t    timestamp{0};           // when found
     uint8_t     status{0};              // 0=pending, 1=verified, 2=mismatch
-    uint32_t    chain_id_val{0};        // 0 = public network, nonzero = private chain
+    // IDENTIFIER is never stored — it's the consensus secret
 
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> out;

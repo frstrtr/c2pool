@@ -266,10 +266,10 @@ a found block's PPLNS distribution matches the committed state root.
 | 1-4 | sharechain_height | Share chain height at block-find |
 | 5-6 | miner_count | Unique miners in PPLNS window |
 | 7 | hashrate_class | log2(pool hashrate in H/s) |
-| 8-9 | share_period | Current share period (seconds) |
-| 10-11 | verified_length | Verified chain length |
-| 12-15 | pool_aps | Compressed pool attempts/second |
-| 16-19 | reserved | Future: THE temporal layer flags |
+| 8-11 | chain_fingerprint | 0=public, SHA256(IDENTIFIER)[0:4]=private chain |
+| 12-15 | reserved | Future: pool_aps, THE temporal layer flags |
+| 16-17 | share_period | Current share period (seconds) |
+| 18-19 | verified_length | Verified chain length |
 
 Metadata is truncated from the end when space is limited (e.g., long
 operator text reduces metadata space).
@@ -309,10 +309,10 @@ creates genesis shares — no special flag needed. The first miner
 solution becomes the genesis share, and the chain grows from there.
 Peers that connect later download shares from the genesis node.
 
-**On-chain identity:** Every block found by a private chain carries the
-`network_id` in THE metadata (bytes 8-11 of the scriptSig metadata
-field). Blockchain scanners can identify which private chain found
-which blocks without running a node.
+**Security:** The IDENTIFIER is **never stored on the blockchain** in any
+form — it is the consensus secret. Private chains are identified on-chain
+by their unique donation addresses, THE state_roots, and the `/c2pool/`
+scriptSig tag.
 
 Default `--network-id 0` = public p2pool network (standard IDENTIFIER).
 

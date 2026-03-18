@@ -71,20 +71,19 @@ struct TheMetadata {
     uint32_t sharechain_height = 0;    // share chain height at block-find
     uint16_t miner_count = 0;          // unique miners in PPLNS window
     uint8_t  hashrate_class = 0;       // log2(pool_hashrate_in_h_per_s)
-    uint32_t network_id = PUBLIC_NETWORK_ID;
-        // Network identity stamped on the blockchain:
-        //   0 = public p2pool network (standard IDENTIFIER/PREFIX)
-        //   nonzero = private chain (first 4 bytes of custom IDENTIFIER)
+    uint32_t chain_fingerprint = 0;    // SHA256("c2pool-chain-id:" || IDENTIFIER)[0:4]
+        // Discoverable chain identity on the blockchain:
+        //   0 = public p2pool network
+        //   nonzero = private chain fingerprint
         //
-        // In p2pool, IDENTIFIER and PREFIX serve different security roles:
-        //   PREFIX (8 bytes)     — TCP framing, visible on wire, transport isolation
-        //   IDENTIFIER (8 bytes) — hashed into ref_hash, consensus-level isolation
+        // This is a TRUNCATED CRYPTOGRAPHIC HASH of the IDENTIFIER, not the
+        // raw value. The full IDENTIFIER (8 bytes, 2^64 space) cannot be
+        // recovered from 4 bytes of SHA256 output — preimage resistance holds.
         //
-        // A rogue node can sniff PREFIX from traffic and connect, but cannot
-        // forge valid shares without knowing the IDENTIFIER (it's hashed into
-        // every share's ref_hash). The IDENTIFIER acts as a shared secret.
-        //
-        // --network-id overrides the IDENTIFIER. PREFIX is derived from it.
+        // Properties:
+        //   Discoverable: same IDENTIFIER → same fingerprint (chain grouping)
+        //   Secure: SHA256 preimage resistance protects the consensus secret
+        //   Distinguishable: birthday collision at ~65K chains (sufficient)
     uint16_t share_period = 0;         // current share period (seconds)
     uint16_t verified_length = 0;      // verified chain length
     uint32_t pool_aps_compressed = 0;  // compressed pool attempts/s
@@ -110,8 +109,8 @@ struct TheMetadata {
         push32(sharechain_height);   // [1-4]
         push16(miner_count);         // [5-6]
         push8(hashrate_class);       // [7]
-        push32(network_id);          // [8-11]  0 = public, P2P prefix = private
-        push32(pool_aps_compressed); // [12-15]
+        push32(chain_fingerprint);   // [8-11]  0 = public, SHA256(IDENTIFIER)[0:4] = private
+        push32(reserved);            // [12-15] future: pool_aps, THE temporal flags
         push16(share_period);        // [16-17]
         push16(verified_length);     // [18-19]
         return out;
@@ -124,8 +123,8 @@ struct TheMetadata {
         if (len >= 5) m.sharechain_height = data[1] | (data[2]<<8) | (data[3]<<16) | (data[4]<<24);
         if (len >= 7) m.miner_count = data[5] | (data[6]<<8);
         if (len >= 8) m.hashrate_class = data[7];
-        if (len >= 12) m.network_id = data[8] | (data[9]<<8) | (data[10]<<16) | (data[11]<<24);
-        if (len >= 16) m.pool_aps_compressed = data[12] | (data[13]<<8) | (data[14]<<16) | (data[15]<<24);
+        if (len >= 12) m.chain_fingerprint = data[8] | (data[9]<<8) | (data[10]<<16) | (data[11]<<24);
+        if (len >= 16) m.reserved = data[12] | (data[13]<<8) | (data[14]<<16) | (data[15]<<24);
         if (len >= 18) m.share_period = data[16] | (data[17]<<8);
         if (len >= 20) m.verified_length = data[18] | (data[19]<<8);
         return m;

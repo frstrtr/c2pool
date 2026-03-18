@@ -1306,7 +1306,7 @@ int main(int argc, char* argv[]) {
                             return arr;
                         },
                         [](const uint256&, uint32_t) -> bool { return true; },
-                        [the_store, mi, network_id](const std::string& chain, uint64_t height,
+                        [the_store, mi](const std::string& chain, uint64_t height,
                                         const std::string& hash, uint64_t ts) {
                             c2pool::storage::TheCheckpoint cp;
                             cp.chain = chain; cp.block_height = height;
@@ -1316,7 +1316,6 @@ int main(int argc, char* argv[]) {
                             cp.sharechain_height = work.sharechain_height;
                             cp.miner_count = work.miner_count;
                             cp.hashrate_class = c2pool::TheMetadata::encode_hashrate(work.pool_hashrate);
-                            cp.chain_id_val = network_id;
                             the_store->store(cp);
                             LOG_INFO << "[THE] Checkpoint: " << chain << " height=" << height
                                      << " miners=" << cp.miner_count
