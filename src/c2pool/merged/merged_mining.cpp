@@ -784,6 +784,8 @@ void MergedMiningManager::try_submit_merged_blocks(
                              << payouts.size() << " payout outputs)";
                     bool ok = chain.rpc->submit_block(block_hex);
                     LOG_INFO << "[MM:" << chain.config.symbol << "] submit_block returned ok=" << ok;
+                    // Force aux work refresh on next poll — the tip may have changed
+                    chain.last_tip.clear();
                     try {
                         record_discovered_block(chain, ok, parent_hash.GetHex());
                         LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block OK";
@@ -827,6 +829,8 @@ void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::str
                                                 const std::string& parent_hash_hex)
 {
     bool ok = chain.rpc->submit_aux_block(chain.current_work.block_hash, auxpow);
+    // Force aux work refresh — tip has changed
+    chain.last_tip.clear();
     record_discovered_block(chain, ok, parent_hash_hex);
     if (ok) {
         // Fetch the accepted block and relay via P2P for fast propagation
