@@ -1392,11 +1392,22 @@ int main(int argc, char* argv[]) {
             // Set testnet flag for runtime constant selection (SHARE_PERIOD, CHAIN_LENGTH, etc.)
             ltc::PoolConfig::is_testnet = settings->m_testnet;
 
-            // Override P2P prefix for testnet (init() loads mainnet prefix from YAML)
-            if (settings->m_testnet) {
-                ltc_p2p_config->pool()->m_prefix = ParseHexBytes(ltc::PoolConfig::TESTNET_PREFIX_HEX);
-                LOG_INFO << "P2P prefix set to testnet: " << ltc::PoolConfig::TESTNET_PREFIX_HEX;
+            // Private chain: override IDENTIFIER and PREFIX before any P2P or share ops
+            if (network_id != 0) {
+                std::ostringstream hex;
+                hex << std::hex << std::setfill('0') << std::setw(8) << network_id;
+                // Pad to 16 hex chars (8 bytes) for full IDENTIFIER
+                std::string id_hex = hex.str();
+                while (id_hex.size() < 16) id_hex += "00";
+                ltc::PoolConfig::set_network_id(id_hex);
+                LOG_INFO << "[Private] Network ID: " << ltc::PoolConfig::identifier_hex()
+                         << " (PREFIX: " << ltc::PoolConfig::prefix_hex() << ")";
             }
+
+            // Set P2P prefix (respects private chain override)
+            ltc_p2p_config->pool()->m_prefix = ParseHexBytes(ltc::PoolConfig::prefix_hex());
+            LOG_INFO << "P2P prefix: " << ltc::PoolConfig::prefix_hex()
+                     << (network_id != 0 ? " (private chain)" : (settings->m_testnet ? " (testnet)" : " (mainnet)"));
 
             // For testnet, discard hardcoded mainnet bootstrap peers before Node construction
             // (Node constructor copies bootstrap_addrs into its addr store)

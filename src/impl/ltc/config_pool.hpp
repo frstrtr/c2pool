@@ -3,6 +3,7 @@
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
+#include <btclibs/util/strencodings.h>
 
 #include <array>
 #include <cstdint>
@@ -121,12 +122,61 @@ public:
     // Message framing prefix (testnet): ad 96 14 f6 46 6a 39 cf
     static inline const std::string TESTNET_PREFIX_HEX          = "ad9614f6466a39cf";
     // Network identifier (mainnet): e0 37 d5 b8 c6 92 34 10
-    static inline const std::string IDENTIFIER_HEX              = "e037d5b8c6923410";
+    static inline const std::string DEFAULT_IDENTIFIER_HEX      = "e037d5b8c6923410";
     // Network identifier (testnet): cc a5 e2 4e c6 40 8b 1e
     static inline const std::string TESTNET_IDENTIFIER_HEX      = "cca5e24ec6408b1e";
 
+    // Private chain overrides — set once at startup via --network-id
+    static inline std::string override_identifier_hex;
+    static inline std::string override_prefix_hex;
+
+    /// Set private network identity. IDENTIFIER is the consensus secret
+    /// (hashed into ref_hash). PREFIX is derived from it for transport framing.
+    /// Call once at startup before any P2P or share operations.
+    static void set_network_id(const std::string& network_id_hex) {
+        if (network_id_hex.empty() || network_id_hex == "0" || network_id_hex == "00000000")
+            return;  // public network, use defaults
+
+        // Pad to 16 hex chars (8 bytes) if shorter
+        std::string padded = network_id_hex;
+        while (padded.size() < 16) padded = "0" + padded;
+        if (padded.size() > 16) padded = padded.substr(0, 16);
+
+        override_identifier_hex = padded;
+
+        // Derive PREFIX from IDENTIFIER using simple XOR mixing
+        // PREFIX = IDENTIFIER bytes XOR-rotated (fast, deterministic, non-reversible enough
+        // for transport framing — the real security is in IDENTIFIER via ref_hash)
+        auto id_bytes = ParseHex(padded);
+        static const char* HEX = "0123456789abcdef";
+        override_prefix_hex.clear();
+        override_prefix_hex.reserve(16);
+        for (size_t i = 0; i < 8 && i < id_bytes.size(); ++i) {
+            // XOR with rotated byte + constant to ensure PREFIX != IDENTIFIER
+            uint8_t b = id_bytes[i] ^ id_bytes[(i + 3) % id_bytes.size()] ^ 0x5A;
+            override_prefix_hex += HEX[b >> 4];
+            override_prefix_hex += HEX[b & 0x0f];
+        }
+    }
+
     static const std::string& identifier_hex() {
-        return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX;
+        if (!override_identifier_hex.empty())
+            return override_identifier_hex;
+        return is_testnet ? TESTNET_IDENTIFIER_HEX : DEFAULT_IDENTIFIER_HEX;
+    }
+
+    static const std::string& prefix_hex() {
+        if (!override_prefix_hex.empty())
+            return override_prefix_hex;
+        return is_testnet ? TESTNET_PREFIX_HEX : DEFAULT_PREFIX_HEX;
+    }
+
+    /// Returns the network_id as uint32 (first 4 bytes of IDENTIFIER) for THE metadata
+    static uint32_t network_id_u32() {
+        if (override_identifier_hex.empty())
+            return 0;  // public network
+        auto bytes = ParseHex(override_identifier_hex.substr(0, 8));
+        return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
     }
 
     static inline const std::set<std::string> SOFTFORKS_REQUIRED = {

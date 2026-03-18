@@ -11,7 +11,7 @@ std::ofstream& PoolConfig::get_default(std::ofstream& file)
     YAML::Node out;
     
     // Use the canonical LTC p2pool mainnet prefix when no prefix is set yet
-    out["prefix"] = m_prefix.empty() ? DEFAULT_PREFIX_HEX : HexStr(m_prefix);
+    out["prefix"] = m_prefix.empty() ? prefix_hex() : HexStr(m_prefix);
     out["worker"] = m_worker;
 
     YAML::Node addrs_node;
