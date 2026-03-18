@@ -5160,25 +5160,21 @@ double MiningInterface::calculate_share_difficulty(
     std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
     uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, merkle_branches);
 
-    // The prevhash is in STRATUM format (swap4'd) — the miner uses these
-    // exact bytes in the header. ParseHex gives us the raw bytes directly.
-    // Do NOT use uint256::SetHex which does a full byte-reverse (different
-    // from swap4 for 32-byte values).
-    auto prevhash_bytes = ParseHex(prevhash_hex);
-    if (prevhash_bytes.size() != 32)
-        return 0.0;
+    // Prevhash: must match build_block_from_stratum exactly.
+    // GBT prevhash is BE display hex. SetHex converts to internal LE.
+    // .data() returns LE bytes — same as block header format.
+    uint256 prev_hash;
+    prev_hash.SetHex(prevhash_hex);
 
     std::vector<unsigned char> header;
     header.reserve(80);
 
-    // Version: already in native uint32, pack as LE
     header.push_back(static_cast<unsigned char>((version      ) & 0xff));
     header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
     header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
     header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
 
-    // Prevhash: stratum swap4'd bytes, used as-is in the header
-    header.insert(header.end(), prevhash_bytes.begin(), prevhash_bytes.end());
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
 
     // Merkle root: internal byte order from reconstruct_merkle_root
     header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
