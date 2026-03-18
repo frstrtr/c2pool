@@ -377,6 +377,20 @@ void PageLaunch::setupUi()
         privateStatusLabel_->setStyleSheet("color: green; font-weight: bold;");
         form->addRow("Status:", privateStatusLabel_);
 
+        // Startup mode
+        startupModeCombo_ = new QComboBox;
+        startupModeCombo_->addItem("Auto (wait 60s, then genesis)", "auto");
+        startupModeCombo_->addItem("Genesis (new chain immediately)", "genesis");
+        startupModeCombo_->addItem("Wait for peers (never genesis)", "wait");
+        startupModeCombo_->setToolTip(
+            "--startup-mode\n\n"
+            "auto: Wait for peers (60s timeout), create genesis if none found\n"
+            "genesis: Create new chain immediately, don't wait for peers\n"
+            "wait: Never create genesis, wait indefinitely for peers to sync");
+        connect(startupModeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int) { updateCommandPreview(); });
+        form->addRow("Startup mode:", startupModeCombo_);
+
         connect(privateChainCheck_, &QCheckBox::stateChanged, this, [this](int state) {
             bool enabled = (state == Qt::Checked);
             networkIdEdit_->setEnabled(enabled);
@@ -589,6 +603,13 @@ QString PageLaunch::buildCommand() const
         if (!nid.isEmpty())
             parts << "--network-id" << nid;
     }
+
+    // Startup mode
+    const QString smode = startupModeCombo_->currentData().toString();
+    if (smode == "genesis")
+        parts << "--genesis";
+    else if (smode == "wait")
+        parts << "--wait-for-peers";
 
     return parts.join(" ");
 }

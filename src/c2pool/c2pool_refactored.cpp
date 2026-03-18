@@ -225,7 +225,12 @@ void print_help() {
     std::cout << "                            Default: 0 (public p2pool network)\n";
     std::cout << "                            Nonzero: creates a private sharechain. P2P prefix\n";
     std::cout << "                            and THE metadata will carry this ID on the blockchain.\n";
-    std::cout << "                            Genesis shares are created automatically when chain is empty.\n\n";
+    std::cout << "                            Genesis shares are created automatically when chain is empty.\n";
+    std::cout << "  --startup-mode MODE       Sharechain startup behavior:\n";
+    std::cout << "                              auto    — wait for peers (60s), then genesis if none (default)\n";
+    std::cout << "                              genesis — create new chain immediately, don't wait for peers\n";
+    std::cout << "                              wait    — never create genesis, wait indefinitely for peers\n";
+    std::cout << "  --startup-timeout N       Seconds to wait for peers in auto mode (default: 60)\n\n";
 
     std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
     std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
@@ -401,6 +406,11 @@ int main(int argc, char* argv[]) {
 
     // Private sharechain
     uint32_t network_id = 0;        // 0 = public p2pool network, nonzero = private
+
+    // Startup mode: auto (default), genesis, wait
+    enum class StartupMode { AUTO, GENESIS, WAIT };
+    StartupMode startup_mode = StartupMode::AUTO;
+    int startup_timeout = 60;       // seconds to wait for peers in auto mode
 
     // Track which options were explicitly set via CLI so that --config file
     // values only fill in gaps (CLI always wins).
@@ -662,6 +672,25 @@ int main(int argc, char* argv[]) {
         else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
             network_id = static_cast<uint32_t>(std::stoul(argv[++i], nullptr, 16));
             cli_explicit.insert("network_id");
+        }
+        else if (arg == "--startup-mode" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "genesis") startup_mode = StartupMode::GENESIS;
+            else if (mode == "wait") startup_mode = StartupMode::WAIT;
+            else startup_mode = StartupMode::AUTO;
+            cli_explicit.insert("startup_mode");
+        }
+        else if (arg == "--genesis") {
+            startup_mode = StartupMode::GENESIS;
+            cli_explicit.insert("startup_mode");
+        }
+        else if (arg == "--wait-for-peers") {
+            startup_mode = StartupMode::WAIT;
+            cli_explicit.insert("startup_mode");
+        }
+        else if (arg == "--startup-timeout" && i + 1 < argc) {
+            startup_timeout = std::stoi(argv[++i]);
+            cli_explicit.insert("startup_timeout");
         }
         // Legacy support for old --port option
         else if (arg == "--port" && i + 1 < argc) {
@@ -2638,6 +2667,69 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "  ✓ Automatic difficulty adjustment";
             LOG_INFO << "  ✓ Real-time hashrate tracking";
             LOG_INFO << "  ✓ Persistent storage";
+
+            // ── Startup mode: genesis / auto / wait ──────────────────────────
+            // Determines behavior when sharechain is empty (no shares from
+            // LevelDB or peers). Logged clearly so operator knows what's happening.
+            {
+                auto best = p2p_node->best_share_hash();
+                bool chain_empty = best.IsNull();
+                const char* mode_str = startup_mode == StartupMode::GENESIS ? "genesis"
+                                     : startup_mode == StartupMode::WAIT ? "wait" : "auto";
+
+                if (chain_empty) {
+                    LOG_INFO << "[Sharechain] No shares loaded from storage";
+                    LOG_INFO << "[Sharechain] Startup mode: " << mode_str;
+
+                    if (startup_mode == StartupMode::GENESIS) {
+                        LOG_INFO << "[Sharechain] GENESIS MODE — creating new chain immediately";
+                        LOG_INFO << "[Sharechain] First share will have previous_share_hash=null";
+                        if (network_id != 0)
+                            LOG_INFO << "[Sharechain] Private chain network_id="
+                                     << std::hex << network_id << std::dec;
+                    }
+                    else if (startup_mode == StartupMode::WAIT) {
+                        LOG_INFO << "[Sharechain] WAIT MODE — waiting indefinitely for peers with shares";
+                        LOG_INFO << "[Sharechain] Will NOT create genesis. Use --genesis to override.";
+                        // Pump ioc until shares arrive or shutdown
+                        while (!g_shutdown_requested) {
+                            ioc.restart();
+                            ioc.run_for(std::chrono::seconds(1));
+                            best = p2p_node->best_share_hash();
+                            if (!best.IsNull()) {
+                                LOG_INFO << "[Sharechain] Received shares from peer! best="
+                                         << best.GetHex().substr(0, 16) << "...";
+                                break;
+                            }
+                        }
+                    }
+                    else {
+                        // AUTO mode: wait startup_timeout seconds for peers
+                        LOG_INFO << "[Sharechain] AUTO MODE — waiting " << startup_timeout
+                                 << "s for peers, then genesis if none";
+                        auto deadline = std::chrono::steady_clock::now()
+                                      + std::chrono::seconds(startup_timeout);
+                        while (!g_shutdown_requested
+                               && std::chrono::steady_clock::now() < deadline) {
+                            ioc.restart();
+                            ioc.run_for(std::chrono::seconds(1));
+                            best = p2p_node->best_share_hash();
+                            if (!best.IsNull()) {
+                                LOG_INFO << "[Sharechain] Received shares from peer! best="
+                                         << best.GetHex().substr(0, 16) << "...";
+                                break;
+                            }
+                        }
+                        if (best.IsNull() && !g_shutdown_requested) {
+                            LOG_INFO << "[Sharechain] No peers found after "
+                                     << startup_timeout << "s — entering GENESIS MODE";
+                        }
+                    }
+                } else {
+                    LOG_INFO << "[Sharechain] Shares available, best="
+                             << best.GetHex().substr(0, 16) << "...";
+                }
+            }
 
             // Work guard prevents ioc from draining when all async handlers
             // complete (e.g., all peers disconnect).  Timers and accept loops
