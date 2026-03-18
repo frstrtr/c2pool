@@ -24,6 +24,7 @@ struct FoundBlockRecord {
     uint32_t    confirmations{0};   // last known confirmation count
     std::string finder_address;     // miner who found the block (if known)
     uint64_t    reward_satoshis{0}; // coinbase reward amount (if known)
+    uint256     the_state_root;     // THE commitment embedded in coinbase scriptSig
 
     // Serialize to bytes for LevelDB storage
     std::vector<uint8_t> serialize() const
