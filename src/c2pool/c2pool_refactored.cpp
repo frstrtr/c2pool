@@ -221,12 +221,11 @@ void print_help() {
     std::cout << "                            Default: /c2pool/ (c2pool always identified by donation address)\n\n";
 
     std::cout << "PRIVATE SHARECHAIN:\n";
-    std::cout << "  --chain-id ID             Private chain identifier (hex, e.g. DEADBEEF)\n";
+    std::cout << "  --network-id ID           Private network identifier (hex, e.g. DEADBEEF)\n";
     std::cout << "                            Default: 0 (public p2pool network)\n";
-    std::cout << "  --chain-prefix PREFIX     P2P magic prefix (4 hex bytes, e.g. C2C2C2C2)\n";
-    std::cout << "                            Default: standard p2pool prefix for the coin\n";
-    std::cout << "  --no-persist              Create genesis share immediately (don't wait for peers)\n";
-    std::cout << "                            Required when starting a new private chain\n\n";
+    std::cout << "                            Nonzero: creates a private sharechain. P2P prefix\n";
+    std::cout << "                            and THE metadata will carry this ID on the blockchain.\n";
+    std::cout << "                            Genesis shares are created automatically when chain is empty.\n\n";
 
     std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
     std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
@@ -387,9 +386,7 @@ int main(int argc, char* argv[]) {
     std::string coinbase_text;  // --coinbase-text (replaces /c2pool/ tag)
 
     // Private sharechain
-    uint32_t chain_id = 0;          // 0 = public p2pool network
-    uint32_t chain_prefix = 0;      // 0 = use default p2pool prefix
-    bool no_persist = false;        // create genesis share immediately
+    uint32_t network_id = 0;        // 0 = public p2pool network, nonzero = private
 
     // Track which options were explicitly set via CLI so that --config file
     // values only fill in gaps (CLI always wins).
@@ -648,17 +645,9 @@ int main(int argc, char* argv[]) {
             coinbase_text = argv[++i];
             cli_explicit.insert("coinbase_text");
         }
-        else if (arg == "--chain-id" && i + 1 < argc) {
-            chain_id = static_cast<uint32_t>(std::stoul(argv[++i], nullptr, 16));
-            cli_explicit.insert("chain_id");
-        }
-        else if (arg == "--chain-prefix" && i + 1 < argc) {
-            chain_prefix = static_cast<uint32_t>(std::stoul(argv[++i], nullptr, 16));
-            cli_explicit.insert("chain_prefix");
-        }
-        else if (arg == "--no-persist") {
-            no_persist = true;
-            cli_explicit.insert("no_persist");
+        else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
+            network_id = static_cast<uint32_t>(std::stoul(argv[++i], nullptr, 16));
+            cli_explicit.insert("network_id");
         }
         // Legacy support for old --port option
         else if (arg == "--port" && i + 1 < argc) {
@@ -1274,7 +1263,7 @@ int main(int argc, char* argv[]) {
                             return arr;
                         },
                         [](const uint256&, uint32_t) -> bool { return true; },
-                        [the_store, mi, chain_id, chain_prefix](const std::string& chain, uint64_t height,
+                        [the_store, mi, network_id](const std::string& chain, uint64_t height,
                                         const std::string& hash, uint64_t ts) {
                             c2pool::storage::TheCheckpoint cp;
                             cp.chain = chain; cp.block_height = height;
@@ -1284,8 +1273,7 @@ int main(int argc, char* argv[]) {
                             cp.sharechain_height = work.sharechain_height;
                             cp.miner_count = work.miner_count;
                             cp.hashrate_class = c2pool::TheMetadata::encode_hashrate(work.pool_hashrate);
-                            cp.chain_id_val = chain_id;
-                            cp.chain_prefix_val = chain_prefix;
+                            cp.chain_id_val = network_id;
                             the_store->store(cp);
                             LOG_INFO << "[THE] Checkpoint: " << chain << " height=" << height
                                      << " miners=" << cp.miner_count

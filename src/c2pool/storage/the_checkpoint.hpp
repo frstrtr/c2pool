@@ -42,7 +42,6 @@ struct TheCheckpoint {
     uint64_t    timestamp{0};           // when found
     uint8_t     status{0};              // 0=pending, 1=verified, 2=mismatch
     uint32_t    chain_id_val{0};        // 0 = public network, nonzero = private chain
-    uint32_t    chain_prefix_val{0};    // P2P magic prefix (0 = default)
 
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> out;
