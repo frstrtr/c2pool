@@ -129,6 +129,25 @@ public:
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
 
+    // THE checkpoint endpoints
+    nlohmann::json rest_checkpoint();    // latest verified checkpoint
+    nlohmann::json rest_checkpoints();   // all checkpoints
+
+    // THE checkpoint management
+    using checkpoint_store_fn_t = std::function<nlohmann::json()>;                  // get latest
+    using checkpoints_all_fn_t = std::function<nlohmann::json()>;                   // get all
+    using checkpoint_verify_fn_t = std::function<bool(const uint256&, uint32_t)>;   // verify state_root
+    using checkpoint_create_fn_t = std::function<void(const std::string& chain, uint64_t height,
+                                                       const std::string& hash, uint64_t ts)>;
+    void set_checkpoint_fns(checkpoint_store_fn_t latest, checkpoints_all_fn_t all_fn,
+                            checkpoint_verify_fn_t verify_fn,
+                            checkpoint_create_fn_t create_fn = {}) {
+        m_checkpoint_latest_fn = std::move(latest);
+        m_checkpoints_all_fn = std::move(all_fn);
+        m_checkpoint_verify_fn = std::move(verify_fn);
+        m_checkpoint_create_fn = std::move(create_fn);
+    }
+
     // Monitoring endpoints for Qt control panel
     nlohmann::json rest_uptime();
     nlohmann::json rest_connected_miners();
@@ -616,6 +635,14 @@ private:
 
     // Coinbase scriptSig customization
     std::string m_coinbase_text;  // empty = "/c2pool/" default tag
+
+    // THE checkpoint callbacks (set by node layer)
+    checkpoint_store_fn_t m_checkpoint_latest_fn;
+    checkpoints_all_fn_t m_checkpoints_all_fn;
+    checkpoint_verify_fn_t m_checkpoint_verify_fn;
+
+    // Called when a block is found — creates a THE checkpoint
+    checkpoint_create_fn_t m_checkpoint_create_fn;
 
     // Segwit activation (from template rules)
     bool m_segwit_active{false};

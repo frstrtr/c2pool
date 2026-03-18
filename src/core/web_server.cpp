@@ -214,6 +214,10 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_fee();
             else if (target == "/recent_blocks")
                 rest_result = mining_interface_->rest_recent_blocks();
+            else if (target == "/checkpoint")
+                rest_result = mining_interface_->rest_checkpoint();
+            else if (target == "/checkpoints")
+                rest_result = mining_interface_->rest_checkpoints();
             else if (target == "/uptime")
                 rest_result = mining_interface_->rest_uptime();
             else if (target == "/connected_miners")
@@ -2189,6 +2193,20 @@ nlohmann::json MiningInterface::rest_recent_blocks()
     return arr;
 }
 
+nlohmann::json MiningInterface::rest_checkpoint()
+{
+    if (m_checkpoint_latest_fn)
+        return m_checkpoint_latest_fn();
+    return nlohmann::json::object({{"error", "checkpoint store not configured"}});
+}
+
+nlohmann::json MiningInterface::rest_checkpoints()
+{
+    if (m_checkpoints_all_fn)
+        return m_checkpoints_all_fn();
+    return nlohmann::json::array();
+}
+
 nlohmann::json MiningInterface::rest_uptime()
 {
     // Return daemon uptime in seconds
@@ -2463,6 +2481,17 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         try { m_persist_block_fn(blk); }
         catch (const std::exception& e) {
             LOG_WARNING << "[Pool] Failed to persist found block: " << e.what();
+        }
+    }
+
+    // Create THE checkpoint from current sharechain state
+    // The state_root is already embedded in the block's coinbase — record it
+    // so future nodes can verify sharechain integrity against the blockchain.
+    if (m_checkpoint_create_fn)
+    {
+        try { m_checkpoint_create_fn(chain, height, hash.GetHex(), ts); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[THE] Failed to create checkpoint: " << e.what();
         }
     }
 }
