@@ -198,6 +198,7 @@ void StratumSession::process_message(std::size_t bytes_read)
             // Floor initial difficulty at share target so miner doesn't waste
             // bandwidth submitting solutions that can never become real shares.
             uint32_t sb = mining_interface_->m_share_bits.load();
+            if (sb == 0) sb = mining_interface_->m_share_max_bits.load(); // bootstrap: use max target
             if (sb != 0) {
                 double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
                 if (initial_diff < share_diff)

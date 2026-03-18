@@ -4442,6 +4442,14 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.prev_share_hash = job->prev_share_hash;
             }
 
+            // Bootstrap: when chain is empty (bits==0), use max_target
+            // so miners can create genesis shares immediately.
+            // P2Pool sets desired_share_target = 2**256-1 when chain is empty.
+            if (params.bits == 0) {
+                params.bits = m_share_max_bits.load();
+                if (params.bits == 0)
+                    params.bits = 0x1e0fffff; // fallback: easiest LTC testnet target
+            }
             if (!params.payout_script.empty() && params.bits != 0) {
                 m_create_share_fn(params);
             }
