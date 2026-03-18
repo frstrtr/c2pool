@@ -30,6 +30,7 @@ void NodeRPC::connect(NetService address, std::string userpass)
 
     m_http_request.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     m_http_request.set(http::field::content_type, "application/json");
+    m_http_request.set(http::field::connection, "keep-alive");
 
 	std::string encoded_login2;
     encoded_login2.resize(boost::beast::detail::base64::encoded_size(userpass.size()));
@@ -109,38 +110,81 @@ void NodeRPC::reconnect()
 	m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
 }
 
+void NodeRPC::sync_reconnect()
+{
+	beast::error_code ec;
+	m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+	m_stream.close();
+
+	// Blocking resolve + connect for immediate retry
+	auto results = m_resolver.resolve(m_address.address(), m_address.port_str(), ec);
+	if (ec) {
+		LOG_WARNING << "CoindRPC sync_reconnect resolve failed: " << ec.message();
+		return;
+	}
+	m_stream.connect(*results, ec);
+	if (ec) {
+		LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message();
+		return;
+	}
+	LOG_INFO << "CoindRPC reconnected (sync)";
+}
+
 std::string NodeRPC::Send(const std::string &request)
 {
-	m_http_request.body() = request;
-	m_http_request.prepare_payload();
-	try
+	// Retry once after synchronous reconnect on write/read failure
+	for (int attempt = 0; attempt < 2; ++attempt)
 	{
-		http::write(m_stream, m_http_request);	
+		m_http_request.body() = request;
+		m_http_request.prepare_payload();
+		try
+		{
+			http::write(m_stream, m_http_request);
+		}
+		catch(const std::exception& e)
+		{
+			LOG_WARNING << "CoindRPC write failed: " << e.what()
+			            << (attempt == 0 ? " — reconnecting..." : "");
+			if (attempt == 0) {
+				sync_reconnect();
+				continue;
+			}
+			return {};
+		}
+
+		beast::flat_buffer buffer;
+		boost::beast::http::response<boost::beast::http::dynamic_body> response;
+
+		try
+		{
+			boost::beast::http::read(m_stream, buffer, response);
+		}
+		catch (const std::exception& ex)
+		{
+			LOG_WARNING << "CoindRPC read failed: " << ex.what()
+			            << (attempt == 0 ? " — reconnecting..." : "");
+			if (attempt == 0) {
+				sync_reconnect();
+				continue;
+			}
+			return {};
+		}
+
+		auto body = boost::beast::buffers_to_string(response.body().data());
+		if (body.empty()) {
+			static int _empty_count = 0;
+			if (_empty_count++ < 5)
+				LOG_WARNING << "CoindRPC empty response: HTTP " << response.result_int()
+				            << " content-length=" << response[http::field::content_length]
+				            << " connection=" << response[http::field::connection];
+			if (attempt == 0 && response.result_int() != 200) {
+				sync_reconnect();
+				continue;
+			}
+		}
+		return body;
 	}
-	catch(const std::exception& e)
-	{
-		LOG_WARNING << "error when try to send message in CoindRPC -> " << e.what();
-		reconnect();
-		return {};
-	}
-
-	beast::flat_buffer buffer;
-	boost::beast::http::response<boost::beast::http::dynamic_body> response;
-
-	try
-    {
-    	boost::beast::http::read(m_stream, buffer, response);
-    }
-    catch (const std::exception& ex)
-    {
-		LOG_WARNING << "error when try to read response -> " << ex.what();
-		reconnect();
-		return {};
-    }
-
-	std::string json_result = boost::beast::buffers_to_string(response.body().data());
-
-	return json_result;
+	return {};
 }
 
 nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)

@@ -210,7 +210,7 @@ public:
     struct JobSnapshot {
         std::string coinb1, coinb2;
         std::string gbt_prevhash;      // BE display hex
-        std::string nbits;             // BE hex e.g. "1e0fffff"
+        std::string nbits;             // BE hex e.g. "1e0fffff" (share target bits for header)
         uint32_t    version{0};
         std::vector<std::string> merkle_branches;
         std::vector<std::string> tx_data;   // raw tx hex from GBT
@@ -220,6 +220,9 @@ public:
         uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
         std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
         uint256     witness_root;            // raw wtxid merkle root frozen at job creation
+        uint32_t    share_bits{0};    // share target bits from compute_share_target()
+        uint32_t    share_max_bits{0}; // share max_bits from compute_share_target()
+        std::string block_nbits;      // original GBT block bits (for block target check)
     };
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
@@ -455,7 +458,8 @@ public:
     using block_store_fn_t = std::function<bool(const FoundBlock& blk)>;
     using block_load_fn_t  = std::function<std::vector<FoundBlock>()>;
     void set_block_verify_fn(block_verify_fn_t fn);
-    void set_io_context(boost::asio::io_context* ctx) { m_context = ctx; }
+    void set_io_context(boost::asio::io_context* ctx) { m_context = ctx;
+        LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx; }
     void schedule_block_verification(const std::string& block_hash);
 
     // Per-chain verify function: register additional verifiers for merged chains
@@ -552,6 +556,14 @@ private:
     std::atomic<bool>       m_work_valid{false};
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
     nlohmann::json          m_cached_template;
+
+public:
+    // Share target from compute_share_target() — set by ref_hash_fn, used by
+    // mining.notify (nbits) and share creation (params.bits).
+    // These are consensus-level share difficulty, NOT the block difficulty.
+    std::atomic<uint32_t>   m_share_bits{0};
+    std::atomic<uint32_t>   m_share_max_bits{0};
+private:
     std::vector<std::string> m_cached_merkle_branches;   // Stratum merkle branches
     std::string             m_cached_coinb1;
     std::string             m_cached_coinb2;

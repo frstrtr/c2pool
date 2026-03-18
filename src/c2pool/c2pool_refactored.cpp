@@ -41,6 +41,16 @@
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <c2pool/storage/found_block_store.hpp>
 #include <c2pool/payout/payout_manager.hpp>
+#include <execinfo.h>  // for backtrace()
+
+static void segfault_handler(int sig) {
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    fprintf(stderr, "\n=== SEGFAULT (signal %d) ===\n", sig);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    fprintf(stderr, "=== END SEGFAULT ===\n");
+    _exit(128 + sig);
+}
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
@@ -267,6 +277,7 @@ int main(int argc, char* argv[]) {
     // Install signal handlers
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    std::signal(SIGSEGV, segfault_handler);
     
     // Initialize logging
     core::log::Logger::init();
@@ -379,7 +390,7 @@ int main(int argc, char* argv[]) {
     // Well-known P2P ports for coin daemons (same machine as RPC by default)
     auto get_coin_p2p_port = [](const std::string& symbol, bool testnet) -> int {
         if (symbol == "LTC"   || symbol == "ltc")   return testnet ? 19335 : 9333;
-        if (symbol == "DOGE"  || symbol == "doge")  return testnet ? 44556 : 22556;
+        if (symbol == "DOGE"  || symbol == "doge")  return testnet ? 44557 : 22556;
         if (symbol == "BTC"   || symbol == "btc")   return testnet ? 18333 : 8333;
         if (symbol == "DGB"   || symbol == "dgb")   return testnet ? 12026 : 12024;
         if (symbol == "PEP"   || symbol == "pep")   return testnet ? 44874 : 33874;
@@ -1137,6 +1148,9 @@ int main(int argc, char* argv[]) {
                      << " payout_window=" << payout_window_seconds << "s"
                      << " save_interval=" << storage_save_interval << "s";
             
+            // io_context needed for block verification timers in all modes
+            web_server.get_mining_interface()->set_io_context(&ioc);
+
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             if (!embedded_ltc) {
                 web_server.set_coin_rpc(node_rpc.get(), &coin_node);
@@ -1144,9 +1158,8 @@ int main(int argc, char* argv[]) {
                 // Wire embedded node + header-sync callback (now that web_server is alive)
                 web_server.set_embedded_node(embedded_node.get());
 
-                // Wire block verification: check header chain for found blocks
+                // Wire block verification for embedded mode
                 auto* mi = web_server.get_mining_interface();
-                mi->set_io_context(&ioc);
 
                 // --- Layer +2: Persistent found block storage ---
                 // Uses a dedicated LevelDB in the network data dir.
@@ -1796,8 +1809,11 @@ int main(int argc, char* argv[]) {
 
             // Wire the ref_hash computation hook for per-connection coinbase generation.
             // This computes the p2pool ref_hash from share fields + tracker state.
+            // Also stores the computed share target so mining.notify and share
+            // creation use the share difficulty (not block difficulty).
+            auto* mi_for_share_bits = web_server.get_mining_interface();
             web_server.get_mining_interface()->set_ref_hash_fn(
-                [&p2p_node, &whale_detector](
+                [&p2p_node, &whale_detector, mi_for_share_bits](
                     const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
@@ -1823,6 +1839,17 @@ int main(int argc, char* argv[]) {
                     params.max_bits = share_max_bits;
                     params.bits = share_bits;
                     params.timestamp = timestamp;
+
+                    // Store share target for mining.notify and share creation
+                    mi_for_share_bits->m_share_bits.store(share_bits);
+                    mi_for_share_bits->m_share_max_bits.store(share_max_bits);
+                    {
+                        auto st = chain::bits_to_target(share_bits);
+                        double sd = chain::target_to_difficulty(st);
+                        LOG_INFO << "[ShareTarget] share_bits=" << std::hex << share_bits
+                                 << " max_bits=" << share_max_bits << std::dec
+                                 << " share_diff=" << sd;
+                    }
 
                     // Extract pubkey_hash and type from payout_script
                     if (payout_script.size() == 25 &&
@@ -2272,12 +2299,21 @@ int main(int argc, char* argv[]) {
                     auto payouts_map = p2p_node->tracker().get_merged_expected_payouts(
                         best, block_target, coinbase_value, chain_id, donation_script);
 
+                    LOG_INFO << "[MM-payout] chain_id=" << chain_id
+                             << " coinbase_value=" << coinbase_value
+                             << " payouts_map_size=" << payouts_map.size()
+                             << " chain_height=" << p2p_node->tracker().chain.get_height(best)
+                             << " block_target=" << block_target.GetHex().substr(0,16);
+
                     // Convert map → sorted vector for coinbase construction
                     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
                     result.reserve(payouts_map.size());
                     for (auto& [script, amount] : payouts_map) {
                         if (amount >= 1.0)
                             result.emplace_back(script, static_cast<uint64_t>(amount));
+                        else
+                            LOG_WARNING << "[MM-payout] Skipping script (len=" << script.size()
+                                        << ") with amount=" << amount;
                     }
                     // Sort by script for deterministic coinbase ordering
                     std::sort(result.begin(), result.end());

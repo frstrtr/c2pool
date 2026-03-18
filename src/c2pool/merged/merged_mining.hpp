@@ -267,6 +267,7 @@ private:
     void poll_loop();
     void refresh_aux_work();
 
+public:
     // Build a complete aux block in multiaddress mode from getblocktemplate
     // result, PPLNS payout outputs, AuxPoW proof hex, and THE state root
     // for sharechain anchoring (embedded in coinbase scriptSig).
@@ -275,6 +276,7 @@ private:
         const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
         const std::string& auxpow_hex,
         const uint256& the_state_root = uint256());
+private:
 
     boost::asio::io_context& m_ioc;
     boost::asio::steady_timer m_poll_timer;

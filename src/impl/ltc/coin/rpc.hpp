@@ -57,6 +57,7 @@ public:
 
     void connect(NetService address, std::string userpass);
     void reconnect();
+    void sync_reconnect();
     bool check();
     bool check_blockheader(uint256 header);
     rpc::WorkData getwork(); //coind::getwork_result getwork(coind::TXIDCache &txidcache, const map<uint256, coind::data::tx_type> &known_txs = map<uint256, coind::data::tx_type>());

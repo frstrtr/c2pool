@@ -195,6 +195,14 @@ void StratumSession::process_message(std::size_t bytes_read)
             double initial_diff = (suggested_difficulty_ > 0.0)
                 ? suggested_difficulty_
                 : hashrate_tracker_.get_current_difficulty();
+            // Floor initial difficulty at share target so miner doesn't waste
+            // bandwidth submitting solutions that can never become real shares.
+            uint32_t sb = mining_interface_->m_share_bits.load();
+            if (sb != 0) {
+                double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
+                if (initial_diff < share_diff)
+                    initial_diff = share_diff;
+            }
             send_set_difficulty(initial_diff);
             send_notify_work();
         }
@@ -527,13 +535,17 @@ nlohmann::json StratumSession::handle_suggest_difficulty(const nlohmann::json& p
     }
 
     if (suggested > 0.0) {
-        suggested_difficulty_ = suggested;
+        // Miners send Scrypt difficulty (multiplied by 65536).
+        // Convert to internal difficulty for the tracker.
+        double internal_diff = suggested / 65536.0;
+        suggested_difficulty_ = internal_diff;
         // If already subscribed, apply immediately via VARDIFF hint
         if (subscribed_) {
-            hashrate_tracker_.set_difficulty_hint(suggested);
+            hashrate_tracker_.set_difficulty_hint(internal_diff);
             send_set_difficulty(hashrate_tracker_.get_current_difficulty());
         }
-        LOG_INFO << "[Stratum] Miner suggested difficulty: " << suggested;
+        LOG_INFO << "[Stratum] Miner suggested difficulty: " << suggested
+                 << " (internal: " << internal_diff << ")";
     }
 
     nlohmann::json response;
@@ -683,6 +695,20 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     hashrate_tracker_.record_mining_share_submission(share_difficulty, share_difficulty >= required_difficulty);
 
     double new_difficulty = hashrate_tracker_.get_current_difficulty();
+
+    // Floor VARDIFF at the share target difficulty.
+    // Miners must work at least as hard as the share target, otherwise
+    // their solutions never become real p2pool shares (wasted bandwidth).
+    uint32_t sb = mining_interface_->m_share_bits.load();
+    if (sb != 0) {
+        auto share_target = chain::bits_to_target(sb);
+        double share_diff = chain::target_to_difficulty(share_target);
+        if (new_difficulty < share_diff) {
+            new_difficulty = share_diff;
+            hashrate_tracker_.set_difficulty_hint(share_diff);
+        }
+    }
+
     if (new_difficulty != old_difficulty) {
         send_set_difficulty(new_difficulty);
         LOG_INFO << "[Stratum] VARDIFF adjustment for " << username_ << ": "
@@ -709,7 +735,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.coinb1          = job.coinb1;
     snapshot.coinb2          = job.coinb2;
     snapshot.gbt_prevhash    = job.gbt_prevhash;
-    snapshot.nbits           = job.nbits;
+    snapshot.nbits           = job.nbits;           // share target bits (for header construction)
+    snapshot.block_nbits     = job.gbt_block_nbits; // original GBT block bits (for block target check)
     snapshot.version         = effective_version;  // use rolled version for block construction
     snapshot.merkle_branches = job.merkle_branches;
     snapshot.tx_data         = job.tx_data;
@@ -719,6 +746,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.subsidy         = job.subsidy;
     snapshot.witness_commitment_hex = job.witness_commitment_hex;
     snapshot.witness_root            = job.witness_root;
+    snapshot.share_bits      = mining_interface_->m_share_bits.load();
+    snapshot.share_max_bits  = mining_interface_->m_share_max_bits.load();
 
     // Check EVERY submission for block-level PoW — even rejected shares
     // can meet the blockchain target and must be submitted as blocks.
@@ -780,11 +809,20 @@ void StratumSession::send_error(int code, const std::string& message, const nloh
 
 void StratumSession::send_set_difficulty(double difficulty)
 {
+    // Scrypt pools must multiply by DUMB_SCRYPT_DIFF (2^16 = 65536) when
+    // sending mining.set_difficulty. Without this, Scrypt miners interpret
+    // the difficulty as near-zero and submit all solutions indiscriminately.
+    // Reference: p2pool stratum.py line 465:
+    //   target_to_difficulty(self.target) * self.wb.net.DUMB_SCRYPT_DIFF
+    static constexpr double DUMB_SCRYPT_DIFF = 65536.0;
+
     nlohmann::json notification;
     notification["id"] = nullptr;
     notification["method"] = "mining.set_difficulty";
-    notification["params"] = nlohmann::json::array({difficulty});
-    
+    notification["params"] = nlohmann::json::array({difficulty * DUMB_SCRYPT_DIFF});
+
+    LOG_INFO << "[Stratum] set_difficulty: internal=" << difficulty
+             << " wire=" << (difficulty * DUMB_SCRYPT_DIFF);
     send_response(notification);
 }
 
@@ -852,6 +890,7 @@ void StratumSession::send_notify_work(bool force_clean)
     std::vector<std::string> merkle_branches_vec;
     std::string coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
     std::string coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+    std::string gbt_block_nbits;  // original GBT block bits (preserved for block-level target check)
 
     // Populate from live block template
     {
@@ -864,16 +903,32 @@ void StratumSession::send_notify_work(bool force_clean)
            << version_u32;
         version = ss.str();
 
+        // Save original GBT block bits for block-level target check
+        std::string gbt_block_nbits;
         if (tmpl.contains("bits"))
-            nbits = tmpl["bits"].get<std::string>();
+            gbt_block_nbits = tmpl["bits"].get<std::string>();
         else
-            nbits = "1d00ffff";
+            gbt_block_nbits = "1d00ffff";
+
+        // Use share target bits for nbits in mining.notify.
+        // Miners hash the header with share bits (easier than block bits),
+        // so more solutions meet the share target → more real p2pool shares.
+        // This matches p2pool's approach: nbits in stratum = share chain difficulty.
+        uint32_t share_bits_val = mining_interface_->m_share_bits.load();
+        if (share_bits_val != 0) {
+            std::ostringstream sb;
+            sb << std::hex << std::setw(8) << std::setfill('0') << share_bits_val;
+            nbits = sb.str();
+        } else {
+            nbits = gbt_block_nbits;
+        }
 
         if (tmpl.contains("curtime"))
             curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());
 
         LOG_TRACE << "[Stratum] send_notify_work: height="
-                  << tmpl.value("height", 0) << " prevhash=" << prevhash;
+                  << tmpl.value("height", 0) << " prevhash=" << prevhash
+                  << " nbits=" << nbits;
     }
 
     // Encode curtime as 8-hex-char (4-byte big-endian)
@@ -944,8 +999,19 @@ void StratumSession::send_notify_work(bool force_clean)
     while (active_jobs_.size() >= MAX_ACTIVE_JOBS) {
         active_jobs_.erase(active_jobs_.begin());
     }
-    active_jobs_[job_id] = {prevhash, gbt_prevhash, nbits, curtime, coinb1, coinb2,
-                            version_u32, merkle_branches_vec, {}, "", false, {}, 0, ""};
+    {
+        JobEntry je;
+        je.prevhash = prevhash;
+        je.gbt_prevhash = gbt_prevhash;
+        je.nbits = nbits;
+        je.ntime = curtime;
+        je.coinb1 = coinb1;
+        je.coinb2 = coinb2;
+        je.version = version_u32;
+        je.merkle_branches = merkle_branches_vec;
+        je.gbt_block_nbits = gbt_block_nbits;
+        active_jobs_[job_id] = std::move(je);
+    }
 
     // Store the SAME frozen prev_share_hash that was used for ref_hash computation
     active_jobs_[job_id].prev_share_hash = frozen_prev_share;

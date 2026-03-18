@@ -2584,6 +2584,12 @@ void MiningInterface::verify_found_block(size_t index)
 
 void MiningInterface::schedule_block_verification(const std::string& block_hash)
 {
+    if (!m_context) {
+        LOG_WARNING << "schedule_block_verification: io_context not set (this=" << this
+                    << "), skipping hash=" << block_hash.substr(0,16);
+        return;
+    }
+
     // Find the block index by hash
     size_t idx = SIZE_MAX;
     {
@@ -4296,13 +4302,18 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             params.nonce = static_cast<uint32_t>(std::stoul(nonce, nullptr, 16));
             params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
 
-            // Extract block template fields — prefer job snapshot over live template
+            // Extract block template fields — prefer job snapshot over live template.
+            // Use SHARE target bits (from compute_share_target) for the share's m_bits,
+            // not the GBT block bits. This matches p2pool's behavior where each
+            // share's bits = share chain difficulty (consensus-determined).
             {
                 std::lock_guard<std::mutex> lock(m_work_mutex);
                 if (job) {
                     params.block_version = job->version;
                     params.prev_block_hash.SetHex(job->gbt_prevhash);
-                    params.bits = static_cast<uint32_t>(std::stoul(job->nbits, nullptr, 16));
+                    // Use share target bits — the miner's header has these as nbits
+                    params.bits = job->share_bits ? job->share_bits
+                        : static_cast<uint32_t>(std::stoul(job->nbits, nullptr, 16));
                     params.subsidy = job->subsidy;
                 } else if (m_work_valid) {
                     params.block_version = m_cached_template.value("version", 536870912U);
@@ -4310,7 +4321,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         params.prev_block_hash.SetHex(
                             m_cached_template["previousblockhash"].get<std::string>());
                     }
-                    if (m_cached_template.contains("bits")) {
+                    // Use share target if available, fallback to GBT bits
+                    uint32_t sb = m_share_bits.load();
+                    if (sb != 0) {
+                        params.bits = sb;
+                    } else if (m_cached_template.contains("bits")) {
                         params.bits = static_cast<uint32_t>(std::stoul(
                             m_cached_template["bits"].get<std::string>(), nullptr, 16));
                     }

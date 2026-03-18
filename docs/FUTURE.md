@@ -257,6 +257,131 @@ commitment chain is already established on the blockchain.
 
 ---
 
+## Multi-Parent Chain Architecture (LTC + DGB Simultaneous Operation)
+
+### Overview
+
+c2pool can serve both Litecoin and DigiByte Scrypt as parent chains simultaneously.
+Each parent chain runs its own independent P2Pool sharechain network with separate
+ports and validation rules.
+
+### Deployment Models
+
+#### Model A: Two Processes (recommended for first release)
+
+Two independent c2pool instances, each handling one parent chain. Zero code changes
+required — works today.
+
+```
+# Instance 1: LTC parent + DOGE/PEP/BELLS merged mining
+c2pool --integrated --net litecoin \
+  --p2pool-port 9326 --worker-port 9327 --web-port 8080 \
+  --coind-address 127.0.0.1 --coind-rpc-port 9332 --coind-p2p-port 9333 \
+  --merged DOGE:98:127.0.0.1:22555:user:pass \
+  --merged PEP:63:127.0.0.1:33874:user:pass
+
+# Instance 2: DGB parent + DOGE/PEP/BELLS merged mining
+c2pool --integrated --net digibyte \
+  --p2pool-port 5024 --worker-port 5025 --web-port 8081 \
+  --coind-address 127.0.0.1 --coind-rpc-port 14024 --coind-p2p-port 12024 \
+  --merged DOGE:98:127.0.0.1:22555:user:pass \
+  --merged PEP:63:127.0.0.1:33874:user:pass
+```
+
+Miners connect to port 9327 for LTC mining, port 5025 for DGB mining.
+
+**Port allocation:**
+
+| Service | LTC Instance | DGB Instance |
+|---------|-------------|-------------|
+| P2Pool P2P | 9326 | 5024 |
+| Stratum (miners) | 9327 | 5025 |
+| Web dashboard | 8080 | 8081 |
+
+**Pros:** Simple, crash-isolated, independent restarts, no code changes.
+**Cons:** Duplicate memory for shared state, separate dashboards, merged mining
+daemons contacted independently from each instance.
+
+#### Model B: Single Process, Multiple Networks (future optimization)
+
+One c2pool process hosting both parent chain networks. Shares a single `io_context`,
+`MergedMiningManager`, and web dashboard.
+
+```
+c2pool --integrated \
+  --net litecoin --worker-port 9327 --p2pool-port 9326 \
+  --net digibyte --worker-port 5025 --p2pool-port 5024 \
+  --merged DOGE:98:127.0.0.1:22555:user:pass \
+  --web-port 8080
+```
+
+**Architecture changes required:**
+
+1. **CLI parser** — allow multiple `--net` flags, each followed by its own
+   `--worker-port` and `--p2pool-port`. Current parser stores a single
+   `blockchain` variable; needs a vector of network configs.
+
+2. **EnhancedNode instantiation** — create one `EnhancedNode` per parent chain,
+   each with its own `StratumServer`, `ShareChain`, and `P2PNode`. Currently
+   `c2pool_refactored.cpp` creates exactly one.
+
+3. **Shared MergedMiningManager** — both parent chains submit aux work to the
+   same merged mining daemon. When either LTC or DGB finds a share meeting an
+   aux chain's target, it submits the merged block. DOGE blocks get found from
+   both LTC and DGB Scrypt work simultaneously, increasing aux chain hit rate.
+
+4. **Unified web dashboard** — single HTTP server on one port, with per-network
+   API prefix (`/api/ltc/stats`, `/api/dgb/stats`) and a combined overview page.
+
+5. **Shared io_context** — both networks run on the same Boost.ASIO thread pool,
+   reducing thread overhead.
+
+**Pros:** Single dashboard, shared merged mining state (DOGE contacted once, not
+twice), lower memory footprint, simpler operations.
+**Cons:** More complex startup/shutdown, single process crash affects both chains.
+
+### Merged Mining Overlap
+
+Both LTC and DGB are Scrypt chains that can merge-mine the same aux coins.
+When running both parent chains simultaneously, the merged mining situation:
+
+| Aux Coin | Merged via LTC | Merged via DGB | Notes |
+|----------|---------------|---------------|-------|
+| DOGE (chain_id=98) | Yes | Yes | Both parents submit DOGE blocks independently |
+| PEP (chain_id=63) | Yes | Yes | |
+| BELLS (chain_id=16) | Yes | Yes | |
+| LKY (chain_id=8211) | Yes | Yes | |
+| JKC (chain_id=8224) | Yes | Yes | |
+| SHIC (chain_id=74) | Yes | Yes | |
+| DINGO (chain_id=98) | Conflicts with DOGE | Conflicts with DOGE | Same chain_id, pick one |
+
+**Important:** Running both parents effectively doubles the hashrate attacking
+aux chain targets, since both LTC and DGB share submissions are evaluated against
+each aux chain's difficulty. This is especially valuable for low-difficulty aux
+chains where even DGB's smaller hashrate regularly finds blocks.
+
+### DGB Node Embedding Decision
+
+**Not planned.** DGB does NOT need embedded SPV because:
+
+- DGB is a parent chain, not an aux chain — miners need full `digibyte-core` for
+  `getblocktemplate` anyway
+- DOGE embedding was justified by DOGE being 73% of combined LTC+DOGE revenue
+  and requiring a 50GB+ blockchain sync
+- DGB miners are dedicated DGB miners who already run the full node
+- Embedding effort (header sync, fork handling, difficulty validation) is the same
+  as DOGE but benefits 100x fewer users
+
+### Implementation Phases
+
+| Phase | Scope | Effort |
+|-------|-------|--------|
+| **Now** | Model A (two processes) | Zero — works today |
+| **Next** | Unified web dashboard proxy | Small — nginx/traefik reverse proxy config |
+| **Later** | Model B (single process) | Medium — CLI parser + multi-EnhancedNode |
+
+---
+
 ## Stratum Protocol Enhancements (from p2pool-merged-v36)
 
 ### `mining.ping` — Not Started

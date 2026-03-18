@@ -372,10 +372,15 @@ AuxWork AuxChainRPC::get_work_template()
         }
     }
 
-    // Block hash — for multiaddress mode, we compute it from the header
-    // The daemon returns "hash" in some implementations
+    // Block hash for aux work identification:
+    // - createauxblock mode: daemon returns "hash" directly
+    // - getblocktemplate mode: no "hash" field; use previousblockhash as
+    //   work identifier so the refresh-skip logic works correctly.
+    //   The actual aux block hash is computed at submission time.
     if (tmpl.contains("hash")) {
         work.block_hash.SetHex(tmpl["hash"].get<std::string>());
+    } else if (!work.prev_block_hash.empty()) {
+        work.block_hash.SetHex(work.prev_block_hash);
     }
 
     return work;
@@ -387,7 +392,10 @@ AuxWork AuxChainRPC::create_aux_block(const std::string& address)
     work.chain_id = m_config.chain_id;
 
     auto result = call("createauxblock", nlohmann::json::array({address}));
-    work.block_hash.SetHex(result.value("hash", ""));
+    std::string hash_str = result.value("hash", "");
+    LOG_TRACE << "[MM:" << m_config.symbol << "] createauxblock raw hash: \"" << hash_str
+              << "\" height=" << result.value("height", 0);
+    work.block_hash.SetHex(hash_str);
     work.chain_id = result.value("chainid", m_config.chain_id);
     work.height = result.value("height", 0);
     work.coinbase_value = result.value("coinbasevalue", uint64_t(0));
@@ -593,12 +601,18 @@ void MergedMiningManager::refresh_aux_work()
             }
             chain.last_tip = tip;
 
-            // Fetch new work
+            // Fetch new work.
+            // Always call createauxblock to obtain the canonical block hash that
+            // the daemon expects back in submitauxblock.  In multiaddress mode we
+            // also fetch the full template (for PPLNS coinbase building), but the
+            // block_hash comes from createauxblock.
+            chain.current_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
             if (chain.config.multiaddress) {
-                chain.current_work = chain.rpc->get_work_template();
-            } else {
-                // Single-address mode: createauxblock gives us hash + target directly
-                chain.current_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
+                auto tmpl_work = chain.rpc->get_work_template();
+                // Keep the template data but preserve the createauxblock hash
+                chain.current_work.block_template = std::move(tmpl_work.block_template);
+                chain.current_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
+                chain.current_work.coinbase_value = tmpl_work.coinbase_value;
             }
 
             chain.last_update_time = std::chrono::duration_cast<std::chrono::seconds>(
@@ -625,9 +639,13 @@ void MergedMiningManager::refresh_aux_work()
                 try {
                     auto tip = chain.rpc->get_best_block_hash();
                     chain.last_tip = tip;
-                    chain.current_work = chain.config.multiaddress
-                        ? chain.rpc->get_work_template()
-                        : chain.rpc->create_aux_block(chain.config.aux_payout_address);
+                    chain.current_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
+                    if (chain.config.multiaddress) {
+                        auto tmpl_work = chain.rpc->get_work_template();
+                        chain.current_work.block_template = std::move(tmpl_work.block_template);
+                        chain.current_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
+                        chain.current_work.coinbase_value = tmpl_work.coinbase_value;
+                    }
                     any_changed = true;
                     LOG_INFO << "[MM:" << chain.config.symbol
                              << "] Using " << (chain.using_fallback ? "RPC (jumpstart)" : "embedded (preferred)")
@@ -754,25 +772,55 @@ void MergedMiningManager::try_submit_merged_blocks(
             // Get THE state root for sharechain anchoring in merged coinbase
             uint256 state_root;
             if (m_state_root_provider) state_root = m_state_root_provider();
-            if (!payouts.empty()) {
+            LOG_INFO << "[MM:" << chain.config.symbol << "] Multiaddress: payouts="
+                     << payouts.size() << " coinbase_value=" << chain.current_work.coinbase_value
+                     << " template_null=" << chain.current_work.block_template.is_null();
+            if (!payouts.empty() && !chain.current_work.block_template.is_null()) {
                 auto block_hex = build_multiaddress_block(
                     chain.current_work.block_template, payouts, auxpow, state_root);
                 if (!block_hex.empty()) {
+                    LOG_INFO << "[MM:" << chain.config.symbol
+                             << "] Multiaddress block built (" << block_hex.size()/2 << " bytes, "
+                             << payouts.size() << " payout outputs)";
                     bool ok = chain.rpc->submit_block(block_hex);
-                    record_discovered_block(chain, ok, parent_hash.GetHex());
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] submit_block returned ok=" << ok;
+                    try {
+                        record_discovered_block(chain, ok, parent_hash.GetHex());
+                        LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block OK";
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "[MM:" << chain.config.symbol
+                                  << "] record_discovered_block crashed: " << e.what();
+                    }
                     // Also relay via P2P for fast propagation
-                    if (m_block_relay_fn)
-                        m_block_relay_fn(chain.config.chain_id, block_hex);
+                    try {
+                        if (m_block_relay_fn) {
+                            LOG_INFO << "[MM:" << chain.config.symbol << "] calling block_relay_fn...";
+                            m_block_relay_fn(chain.config.chain_id, block_hex);
+                            LOG_INFO << "[MM:" << chain.config.symbol << "] block_relay_fn OK";
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "[MM:" << chain.config.symbol
+                                  << "] block_relay_fn crashed: " << e.what();
+                    }
                 } else {
+                    LOG_WARNING << "[MM:" << chain.config.symbol
+                                << "] Multiaddress block build FAILED — falling back to submitauxblock";
                     submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
                 }
             } else {
+                LOG_INFO << "[MM:" << chain.config.symbol
+                         << "] Multiaddress fallback: payouts=" << payouts.size()
+                         << " template=" << (chain.current_work.block_template.is_null() ? "null" : "present");
                 submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
             }
         } else {
+            LOG_INFO << "[MM:" << chain.config.symbol << "] Single-address mode (multiaddress="
+                     << chain.config.multiaddress << " payout_provider=" << !!m_payout_provider << ")";
             submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
         }
+        LOG_INFO << "[MM:" << chain.config.symbol << "] Post-submission processing complete";
     }
+    LOG_INFO << "[MM] try_submit_merged_blocks finished";
 }
 
 void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::string& auxpow,
@@ -842,7 +890,10 @@ std::string MergedMiningManager::build_multiaddress_block(
         return {};
 
     // --- Parse template fields ---
-    uint32_t version  = tmpl.value("version", 0x20000002u);
+    // Set AuxPoW flag (bit 8) so the aux daemon recognizes this as a
+    // merge-mined block and parses the AuxPoW proof after the header.
+    // Reference: p2pool work.py: version=template['version'] | (1 << 8)
+    uint32_t version  = tmpl.value("version", 0x20000002u) | 0x100;
     std::string prev_hash_hex = tmpl.value("previousblockhash", "");
     uint32_t curtime  = tmpl.value("curtime", 0u);
     std::string bits_hex = tmpl.value("bits", "1d00ffff");
@@ -876,10 +927,9 @@ std::string MergedMiningManager::build_multiaddress_block(
         uint8_t push_len = static_cast<uint8_t>(hbytes.size());
         sig << to_hex(&push_len, 1) << to_hex(hbytes.data(), hbytes.size());
     }
-    // Canonical extra in scriptSig: "/c2pool/" + THE state root (32 bytes)
+    // c2pool identity in scriptSig + THE state root (32 bytes)
     // Layout: [BIP34 height]["/c2pool/"][the_state_root(32)]
-    // The state root anchors sharechain state into the merged blockchain —
-    // critical when only the merged block is found (no parent block anchor).
+    // The state root anchors sharechain state into the merged blockchain.
     const std::string coinbase_extra = "/c2pool/";
     for (char c : coinbase_extra) {
         uint8_t b = static_cast<uint8_t>(c);
@@ -921,7 +971,7 @@ std::string MergedMiningManager::build_multiaddress_block(
         donation_amount += 1;
     }
 
-    // OP_RETURN: "c2pool merged mining"
+    // OP_RETURN: c2pool identity in merged block coinbase
     const std::string op_return_text = "c2pool merged mining";
     std::vector<unsigned char> op_return_script;
     op_return_script.push_back(0x6a); // OP_RETURN
@@ -1051,6 +1101,7 @@ void MergedMiningManager::record_discovered_block(
     const ChainState& chain, bool accepted, const std::string& parent_hash)
 {
     // Caller must hold m_mutex
+    LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block: building record...";
     DiscoveredMergedBlock blk;
     blk.chain_id    = chain.config.chain_id;
     blk.symbol      = chain.config.symbol;
@@ -1064,12 +1115,21 @@ void MergedMiningManager::record_discovered_block(
 
     m_discovered_blocks.push_back(std::move(blk));
     m_blocks_per_chain[chain.config.chain_id]++;
+    LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block: block stored, "
+             << "calling on_merged_block_found=" << !!m_on_merged_block_found;
 
     // Notify MiningInterface for unified block verification
     if (m_on_merged_block_found) {
-        m_on_merged_block_found(chain.config.symbol,
-            chain.current_work.height,
-            chain.current_work.block_hash.GetHex(), accepted);
+        try {
+            LOG_INFO << "[MM:" << chain.config.symbol << "] calling on_merged_block_found...";
+            m_on_merged_block_found(chain.config.symbol,
+                chain.current_work.height,
+                chain.current_work.block_hash.GetHex(), accepted);
+            LOG_INFO << "[MM:" << chain.config.symbol << "] on_merged_block_found returned OK";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[MM:" << chain.config.symbol
+                      << "] on_merged_block_found crashed: " << e.what();
+        }
     }
 }
 

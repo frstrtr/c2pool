@@ -188,4 +188,24 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_stratum_extensions "" AUTO)
+
+    add_executable(test_multiaddress_pplns test_multiaddress_pplns.cpp)
+    target_link_libraries(test_multiaddress_pplns PRIVATE
+        GTest::gtest_main GTest::gtest
+        c2pool_merged_mining
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_multiaddress_pplns "" AUTO)
+
+    add_executable(test_pplns_stress test_pplns_stress.cpp)
+    target_link_libraries(test_pplns_stress PRIVATE
+        GTest::gtest_main GTest::gtest
+        c2pool_merged_mining
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_pplns_stress "" AUTO)
 endif()

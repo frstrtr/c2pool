@@ -54,7 +54,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     struct JobEntry {
         std::string prevhash;      // Stratum-format (swapped) for stale detection
         std::string gbt_prevhash;  // Raw GBT previousblockhash (BE display hex) for header reconstruction
-        std::string nbits;
+        std::string nbits;         // share target bits (used in header the miner hashes)
         uint32_t    ntime{};
         std::string coinb1;
         std::string coinb2;
@@ -67,6 +67,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
         std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
         uint256     witness_root;            // raw wtxid merkle root frozen at job creation
+        std::string gbt_block_nbits; // original GBT block bits (for block target check)
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection

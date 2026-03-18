@@ -9,6 +9,7 @@
 #include <core/netaddress.hpp>
 #include <sharechain/weights_skiplist.hpp>
 #include <btclibs/base58.h>
+#include <btclibs/bech32.h>
 
 #include <algorithm>
 #include <chrono>
@@ -1056,9 +1057,17 @@ public:
             return result;
         };
 
-        // Convert script bytes to base58check address string,
-        // matching Python's share.address format used as dict key.
+        // Convert script bytes to address string (matching Python's share.address).
+        // Must handle P2PKH, P2SH, and P2WPKH (bech32) to produce identical
+        // keys as the reference p2pool for merged_payout_hash consensus.
         auto script_to_address = [](const std::vector<unsigned char>& script) -> std::string {
+            // P2WPKH: OP_0 PUSH_20 <20-byte-hash>
+            if (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14)
+            {
+                std::string hrp = PoolConfig::is_testnet ? "tltc" : "ltc";
+                std::vector<uint8_t> prog(script.begin() + 2, script.end());
+                return bech32::encode_segwit(hrp, 0, prog);
+            }
             // P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
             if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9
                 && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
@@ -1076,6 +1085,13 @@ public:
                 std::vector<unsigned char> data = {addr_ver};
                 data.insert(data.end(), script.begin() + 2, script.begin() + 22);
                 return EncodeBase58Check(data);
+            }
+            // P2WSH: OP_0 PUSH_32 <32-byte-hash>
+            if (script.size() == 34 && script[0] == 0x00 && script[1] == 0x20)
+            {
+                std::string hrp = PoolConfig::is_testnet ? "tltc" : "ltc";
+                std::vector<uint8_t> prog(script.begin() + 2, script.end());
+                return bech32::encode_segwit(hrp, 0, prog);
             }
             // Unknown script: fall back to hex encoding
             std::string hex;
@@ -1146,8 +1162,25 @@ public:
             }
         }
 
+        double donation_remainder = static_cast<double>(subsidy) - sum;
+
+        // V36 CONSENSUS RULE: Donation/marker output must be >= 1 satoshi.
+        // Even when --give-author is 0, the COMBINED_DONATION_SCRIPT output
+        // must be nonzero on-chain as an identifiable P2Pool marker.
+        // Reference: p2pool/data.py generate_transaction() V36 rule.
+        if (donation_remainder < 1.0 && subsidy > 0 && !result.empty())
+        {
+            // Deduct 1 satoshi from the largest miner payout
+            auto largest = std::max_element(result.begin(), result.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+            if (largest != result.end() && largest->second >= 2.0) {
+                largest->second -= 1.0;
+                donation_remainder += 1.0;
+            }
+        }
+
         result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
-                                  + static_cast<double>(subsidy) - sum;
+                                  + donation_remainder;
 
         return result;
     }
@@ -1232,13 +1265,13 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    // Normalize for merged chain compatibility:
-                    // P2WPKH→P2PKH so payout hash matches Python p2pool
+                    // Use the ORIGINAL script (not normalized) so that
+                    // compute_merged_payout_hash produces the correct address
+                    // encoding (bech32 for P2WPKH, base58 for P2PKH/P2SH) —
+                    // matching Python p2pool's share.address key format.
                     auto raw_script = get_share_script(obj);
-                    auto merged_script = normalize_script_for_merged(raw_script);
-                    // Tier 3: unconvertible (P2WSH/P2TR) — skip, weight redistributed
-                    if (merged_script.empty()) return;
-                    delta.weights[merged_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    if (raw_script.empty()) return;
+                    delta.weights[raw_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },
