@@ -5183,22 +5183,38 @@ double MiningInterface::calculate_share_difficulty(
     // Merkle root: internal byte order from reconstruct_merkle_root
     header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
 
-    // ntime: Stratum sends as swap4'd hex (for 4 bytes = reversed).
-    // The miner puts these bytes directly in the header.
-    // We parse the hex and use as-is — the bytes are already in header order.
+    // ntime: Stratum sends as BE hex (swap4'd from LE). Miner parses as
+    // BE uint32 and writes as LE in header. We must reverse to get LE.
     auto ntime_bytes = ParseHex(ntime);
+    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
     header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
 
-    // nbits: same as ntime — Stratum format, already in header byte order
+    // nbits: same — Stratum sends BE hex, header needs LE
     auto bits_bytes = ParseHex(nbits_hex);
+    std::reverse(bits_bytes.begin(), bits_bytes.end());
     header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
 
-    // nonce: same — miner submits in header byte order
+    // nonce: same — miner sends BE hex, header needs LE
     auto nonce_bytes = ParseHex(nonce);
+    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
     header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
 
     if (header.size() != 80)
         return 0.0;
+
+    // Diagnostic: dump header hex for byte-order debugging
+    {
+        static int dump_count = 0;
+        if (dump_count < 5) {
+            std::string hdr_hex;
+            static const char* HX = "0123456789abcdef";
+            for (auto b : header) { hdr_hex += HX[b>>4]; hdr_hex += HX[b&0xf]; }
+            LOG_INFO << "[PoW-diag] header(80)=" << hdr_hex;
+            LOG_INFO << "[PoW-diag] prevhash=" << prevhash_hex.substr(0,16) << "..."
+                     << " ntime=" << ntime << " nbits=" << nbits_hex << " nonce=" << nonce;
+            ++dump_count;
+        }
+    }
 
     char pow_hash_bytes[32];
     scrypt_1024_1_1_256(reinterpret_cast<const char*>(header.data()), pow_hash_bytes);
