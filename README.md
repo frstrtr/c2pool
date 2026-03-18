@@ -266,8 +266,7 @@ a found block's PPLNS distribution matches the committed state root.
 | 1-4 | sharechain_height | Share chain height at block-find |
 | 5-6 | miner_count | Unique miners in PPLNS window |
 | 7 | hashrate_class | log2(pool hashrate in H/s) |
-| 8-11 | chain_fingerprint | 0=public, SHA256(IDENTIFIER)[0:4]=private chain |
-| 12-15 | reserved | Future: pool_aps, THE temporal layer flags |
+| 8-15 | chain_fingerprint | 0=public, SHA256d(PREFIX\|\|IDENTIFIER)[0:8]=private |
 | 16-17 | share_period | Current share period (seconds) |
 | 18-19 | verified_length | Verified chain length |
 
@@ -309,10 +308,13 @@ creates genesis shares — no special flag needed. The first miner
 solution becomes the genesis share, and the chain grows from there.
 Peers that connect later download shares from the genesis node.
 
-**Security:** The IDENTIFIER is **never stored on the blockchain** in any
-form — it is the consensus secret. Private chains are identified on-chain
-by their unique donation addresses, THE state_roots, and the `/c2pool/`
-scriptSig tag.
+**Security:** The IDENTIFIER is never stored raw on the blockchain — it is
+the consensus secret. The `chain_fingerprint` in THE metadata is
+`SHA256d(PREFIX || IDENTIFIER)[0:4]` — a 4-byte cryptographic fingerprint
+using Bitcoin's standard double-SHA256. Even if the PREFIX is sniffed from
+network traffic, the IDENTIFIER half requires 2^64 brute force to recover.
+Blockchain scanners can group blocks by fingerprint without learning the
+secret needed to join the chain.
 
 Default `--network-id 0` = public p2pool network (standard IDENTIFIER).
 

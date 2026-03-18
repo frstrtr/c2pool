@@ -26,10 +26,10 @@
 //   [1-4]   sharechain height at block-find (4 bytes LE)
 //   [5-6]   miner count in PPLNS window (2 bytes LE)
 //   [7]     pool hashrate class (log2 of H/s)
-//   [8-9]   share_period (current value, 2 bytes LE)
-//   [10-11] verified chain length (2 bytes LE)
-//   [12-15] pool_aps compressed (4 bytes)
-//   [16-19] reserved (future THE temporal layer flags)
+//   [8-15]  chain fingerprint: SHA256d(PREFIX||IDENTIFIER)[0:8]
+//           0 = public p2pool network, nonzero = private chain
+//   [16-17] share_period (current value, 2 bytes LE)
+//   [18-19] verified chain length (2 bytes LE)
 //   If fewer than 20 bytes available, metadata is truncated from the end.
 
 #include <cstdint>
@@ -71,23 +71,18 @@ struct TheMetadata {
     uint32_t sharechain_height = 0;    // share chain height at block-find
     uint16_t miner_count = 0;          // unique miners in PPLNS window
     uint8_t  hashrate_class = 0;       // log2(pool_hashrate_in_h_per_s)
-    uint32_t chain_fingerprint = 0;    // SHA256("c2pool-chain-id:" || IDENTIFIER)[0:4]
-        // Discoverable chain identity on the blockchain:
+    uint64_t chain_fingerprint = 0;    // SHA256d(PREFIX || IDENTIFIER)[0:8]
+        // 8-byte discoverable chain identity on the blockchain:
         //   0 = public p2pool network
         //   nonzero = private chain fingerprint
         //
-        // This is a TRUNCATED CRYPTOGRAPHIC HASH of the IDENTIFIER, not the
-        // raw value. The full IDENTIFIER (8 bytes, 2^64 space) cannot be
-        // recovered from 4 bytes of SHA256 output — preimage resistance holds.
-        //
-        // Properties:
-        //   Discoverable: same IDENTIFIER → same fingerprint (chain grouping)
-        //   Secure: SHA256 preimage resistance protects the consensus secret
-        //   Distinguishable: birthday collision at ~65K chains (sufficient)
+        // SHA256d over PREFIX(8) || IDENTIFIER(8) = 16-byte preimage.
+        // 8-byte output → collision-free for all practical chain counts.
+        // IDENTIFIER cannot be recovered (SHA256d preimage resistance).
     uint16_t share_period = 0;         // current share period (seconds)
     uint16_t verified_length = 0;      // verified chain length
     uint32_t pool_aps_compressed = 0;  // compressed pool attempts/s
-    uint32_t reserved = 0;            // future: THE temporal layer flags
+    // No reserved bytes — chain_fingerprint uses [8-15], share_period [16-17], verified_length [18-19]
 
     /// Pack into bytes (up to max_bytes, truncated from end)
     std::vector<uint8_t> pack(size_t max_bytes = 20) const {
@@ -109,8 +104,11 @@ struct TheMetadata {
         push32(sharechain_height);   // [1-4]
         push16(miner_count);         // [5-6]
         push8(hashrate_class);       // [7]
-        push32(chain_fingerprint);   // [8-11]  0 = public, SHA256(IDENTIFIER)[0:4] = private
-        push32(reserved);            // [12-15] future: pool_aps, THE temporal flags
+        // chain_fingerprint: 8 bytes LE
+        for (int i = 0; i < 8; ++i) {
+            if (out.size() < max_bytes)
+                out.push_back((chain_fingerprint >> (8*i)) & 0xff);
+        }                            // [8-15] SHA256d(PREFIX||IDENTIFIER)[0:8]
         push16(share_period);        // [16-17]
         push16(verified_length);     // [18-19]
         return out;
@@ -123,8 +121,11 @@ struct TheMetadata {
         if (len >= 5) m.sharechain_height = data[1] | (data[2]<<8) | (data[3]<<16) | (data[4]<<24);
         if (len >= 7) m.miner_count = data[5] | (data[6]<<8);
         if (len >= 8) m.hashrate_class = data[7];
-        if (len >= 12) m.chain_fingerprint = data[8] | (data[9]<<8) | (data[10]<<16) | (data[11]<<24);
-        if (len >= 16) m.reserved = data[12] | (data[13]<<8) | (data[14]<<16) | (data[15]<<24);
+        if (len >= 16) {
+            m.chain_fingerprint = 0;
+            for (int i = 0; i < 8; ++i)
+                m.chain_fingerprint |= uint64_t(data[8+i]) << (8*i);
+        }
         if (len >= 18) m.share_period = data[16] | (data[17]<<8);
         if (len >= 20) m.verified_length = data[18] | (data[19]<<8);
         return m;

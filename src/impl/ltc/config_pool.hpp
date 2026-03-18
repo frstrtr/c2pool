@@ -4,6 +4,8 @@
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
 #include <btclibs/util/strencodings.h>
+#include <btclibs/crypto/sha256.h>
+#include <core/uint256.hpp>
 
 #include <array>
 #include <cstdint>
@@ -171,24 +173,31 @@ public:
         return is_testnet ? TESTNET_PREFIX_HEX : DEFAULT_PREFIX_HEX;
     }
 
-    /// Returns chain fingerprint for THE metadata (4 bytes on-chain).
-    /// SHA256("c2pool-chain-id:" || IDENTIFIER)[0:4] — cryptographically
-    /// secure, discoverable, cannot reverse to recover the IDENTIFIER.
-    static uint32_t chain_fingerprint_u32() {
+    /// Chain fingerprint: SHA256d(PREFIX || IDENTIFIER)[0:8]
+    ///
+    /// 16-byte preimage → 2^128 preimage space. 8-byte output →
+    /// collision-free for all practical chain counts (birthday at 2^32 chains).
+    /// Standard Bitcoin SHA256d, no custom cryptography.
+    static uint64_t chain_fingerprint_u64() {
         if (override_identifier_hex.empty())
-            return 0;  // public network — no fingerprint
-        // Tagged hash: prevents cross-protocol fingerprint collisions
-        const std::string tag = "c2pool-chain-id:";
+            return 0;  // public network
+
+        auto pfx_bytes = ParseHex(override_prefix_hex);
         auto id_bytes = ParseHex(override_identifier_hex);
-        // Simple SHA256-like mixing (deterministic, one-way)
-        // Using cascaded XOR + rotation for O(1) without SHA256 dependency
-        uint32_t h = 0x5A5A5A5A;  // seed
-        for (char c : tag) h = (h << 5) ^ (h >> 27) ^ static_cast<uint8_t>(c);
-        for (uint8_t b : id_bytes) h = (h << 5) ^ (h >> 27) ^ b;
-        h ^= (h >> 16);  // avalanche
-        h *= 0x45d9f3b;
-        h ^= (h >> 16);
-        return h;
+        std::vector<unsigned char> preimage;
+        preimage.reserve(pfx_bytes.size() + id_bytes.size());
+        preimage.insert(preimage.end(), pfx_bytes.begin(), pfx_bytes.end());
+        preimage.insert(preimage.end(), id_bytes.begin(), id_bytes.end());
+
+        // SHA256d: Hash = SHA256(SHA256(preimage))
+        unsigned char hash1[32], hash2[32];
+        CSHA256().Write(preimage.data(), preimage.size()).Finalize(hash1);
+        CSHA256().Write(hash1, 32).Finalize(hash2);
+
+        uint64_t fp = 0;
+        for (int i = 0; i < 8; ++i)
+            fp |= uint64_t(hash2[i]) << (8 * i);
+        return fp;
     }
 
     static inline const std::set<std::string> SOFTFORKS_REQUIRED = {
