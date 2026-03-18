@@ -13,6 +13,7 @@
 // Core includes
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
+#include <core/coinbase_builder.hpp>
 #include <core/pack.hpp>
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
@@ -213,6 +214,11 @@ void print_help() {
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n\n";
 
+    std::cout << "COINBASE CUSTOMIZATION:\n";
+    std::cout << "  --coinbase-text TEXT       Custom text in coinbase scriptSig (replaces /c2pool/ tag)\n";
+    std::cout << "                            Max 20 chars with merged mining, 64 without\n";
+    std::cout << "                            Default: /c2pool/ (c2pool always identified by donation address)\n\n";
+
     std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
     std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
     std::cout << "                            to embed in locally created V36 shares\n\n";
@@ -367,6 +373,9 @@ int main(int argc, char* argv[]) {
 
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
+
+    // Coinbase scriptSig customization
+    std::string coinbase_text;  // --coinbase-text (replaces /c2pool/ tag)
 
     // Track which options were explicitly set via CLI so that --config file
     // values only fill in gaps (CLI always wins).
@@ -620,6 +629,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--message-blob-hex" && i + 1 < argc) {
             operator_message_blob_hex = argv[++i];
             cli_explicit.insert("message_blob_hex");
+        }
+        else if (arg == "--coinbase-text" && i + 1 < argc) {
+            coinbase_text = argv[++i];
+            cli_explicit.insert("coinbase_text");
         }
         // Legacy support for old --port option
         else if (arg == "--port" && i + 1 < argc) {
@@ -1577,6 +1590,23 @@ int main(int argc, char* argv[]) {
                 }
                 web_server.get_mining_interface()->set_operator_message_blob(blob);
                 LOG_INFO << "Operator message blob configured (" << blob.size() << " bytes)";
+            }
+
+            // Coinbase text customization
+            if (!coinbase_text.empty()) {
+                bool has_mm = !merged_chain_specs.empty();
+                size_t max_len = has_mm ? c2pool::MAX_OPERATOR_TEXT_MM : c2pool::MAX_OPERATOR_TEXT_SOLO;
+                if (coinbase_text.size() > max_len) {
+                    LOG_ERROR << "--coinbase-text too long: " << coinbase_text.size()
+                              << " bytes (max " << max_len << " with"
+                              << (has_mm ? "" : "out") << " merged mining)";
+                    return 1;
+                }
+                web_server.get_mining_interface()->set_coinbase_text(coinbase_text);
+                LOG_INFO << "Coinbase text: \"" << coinbase_text << "\" ("
+                         << coinbase_text.size() << "/" << max_len << " bytes)";
+            } else {
+                LOG_INFO << "Coinbase tag: /c2pool/ (default, use --coinbase-text to customize)";
             }
 
             // Wire the share tracker's best share hash into the mining interface
