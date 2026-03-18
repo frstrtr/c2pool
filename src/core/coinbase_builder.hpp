@@ -62,7 +62,7 @@ static constexpr size_t MAX_OPERATOR_TEXT_MM = 20;
 // Maximum operator text without merged mining
 static constexpr size_t MAX_OPERATOR_TEXT_SOLO = 64;
 
-// Public p2pool network identifier (default — standard p2pool P2P prefix)
+// Public p2pool network identifier (0 = standard p2pool IDENTIFIER)
 static constexpr uint32_t PUBLIC_NETWORK_ID = 0;
 
 /// THE metadata — compact pool state for on-chain commitment
@@ -71,9 +71,20 @@ struct TheMetadata {
     uint32_t sharechain_height = 0;    // share chain height at block-find
     uint16_t miner_count = 0;          // unique miners in PPLNS window
     uint8_t  hashrate_class = 0;       // log2(pool_hashrate_in_h_per_s)
-    uint32_t network_id = PUBLIC_NETWORK_ID;   // P2P prefix as network identifier
-                                                // 0 = public p2pool network
-                                                // nonzero = private chain (use --network-id)
+    uint32_t network_id = PUBLIC_NETWORK_ID;
+        // Network identity stamped on the blockchain:
+        //   0 = public p2pool network (standard IDENTIFIER/PREFIX)
+        //   nonzero = private chain (first 4 bytes of custom IDENTIFIER)
+        //
+        // In p2pool, IDENTIFIER and PREFIX serve different security roles:
+        //   PREFIX (8 bytes)     — TCP framing, visible on wire, transport isolation
+        //   IDENTIFIER (8 bytes) — hashed into ref_hash, consensus-level isolation
+        //
+        // A rogue node can sniff PREFIX from traffic and connect, but cannot
+        // forge valid shares without knowing the IDENTIFIER (it's hashed into
+        // every share's ref_hash). The IDENTIFIER acts as a shared secret.
+        //
+        // --network-id overrides the IDENTIFIER. PREFIX is derived from it.
     uint16_t share_period = 0;         // current share period (seconds)
     uint16_t verified_length = 0;      // verified chain length
     uint32_t pool_aps_compressed = 0;  // compressed pool attempts/s
