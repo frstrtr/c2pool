@@ -1265,7 +1265,11 @@ int main(int argc, char* argv[]) {
                                      << " root=" << cp.the_state_root.GetHex().substr(0, 16) << "...";
                         }
                     );
-                    LOG_INFO << "[THE] Checkpoint store: " << the_store->count() << " existing";
+                    // On startup: prune checkpoints whose blocks are orphaned
+                    size_t pruned = the_store->prune_unverified();
+                    if (pruned > 0)
+                        LOG_INFO << "[THE] Pruned " << pruned << " unverified checkpoints from previous runs";
+                    LOG_INFO << "[THE] Checkpoint store: " << the_store->count() << " verified";
                 } else {
                     LOG_WARNING << "[Pool] Failed to open found blocks LevelDB at " << fblk_db_path;
                 }

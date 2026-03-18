@@ -204,6 +204,65 @@ public:
         return result;
     }
 
+    /// Remove a checkpoint
+    bool remove(const std::string& chain, uint64_t block_height) {
+        auto key = make_key(chain, block_height);
+        return m_store.remove(key);
+    }
+
+    /// Remove all checkpoints with status != 1 (verified)
+    size_t prune_unverified() {
+        auto keys = m_store.list_keys("thecp:", 10000);
+        size_t removed = 0;
+        for (const auto& key : keys) {
+            std::vector<uint8_t> data;
+            if (m_store.get(key, data)) {
+                auto cp = TheCheckpoint::deserialize(data);
+                if (cp.status != 1) { // not verified
+                    m_store.remove(key);
+                    ++removed;
+                }
+            }
+        }
+        return removed;
+    }
+
+    /// Verify all pending checkpoints against a block-exists callback.
+    /// The callback returns true if the block hash is in the best chain.
+    /// Returns number of checkpoints verified or marked orphaned.
+    size_t verify_all(std::function<bool(const std::string& chain,
+                                         const std::string& block_hash)> block_exists_fn) {
+        auto keys = m_store.list_keys("thecp:", 10000);
+        size_t checked = 0;
+        for (const auto& key : keys) {
+            std::vector<uint8_t> data;
+            if (!m_store.get(key, data)) continue;
+            auto cp = TheCheckpoint::deserialize(data);
+            if (cp.status == 1 || cp.status == 2) continue; // already decided
+
+            bool exists = false;
+            try {
+                exists = block_exists_fn(cp.chain, cp.block_hash);
+            } catch (...) {
+                continue; // RPC error — skip
+            }
+
+            if (exists) {
+                cp.status = 1; // verified — block is in best chain
+                LOG_INFO << "[THE] Checkpoint VERIFIED: " << cp.chain
+                         << " height=" << cp.block_height;
+            } else {
+                cp.status = 2; // orphaned — block not in best chain
+                LOG_WARNING << "[THE] Checkpoint ORPHANED: " << cp.chain
+                            << " height=" << cp.block_height
+                            << " hash=" << cp.block_hash;
+            }
+            m_store.put(key, cp.serialize());
+            ++checked;
+        }
+        return checked;
+    }
+
     size_t count() {
         return m_store.list_keys("thecp:", 10000).size();
     }
