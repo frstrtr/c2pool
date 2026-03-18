@@ -766,54 +766,44 @@ void MergedMiningManager::try_submit_merged_blocks(
             parent_header_hex);
 
         if (chain.config.multiaddress && m_payout_provider) {
-            // Multiaddress mode: build a complete block with PPLNS payouts
+            // Strategy: submit via BOTH paths for maximum reliability.
+            //
+            // 1. submitauxblock FIRST (fast path) — uses daemon/adapter template,
+            //    arrives instantly because daemon already has the block ready.
+            //    The mm-adapter builds PPLNS coinbase, so payouts are correct.
+            //
+            // 2. submitblock SECOND (THE commitment path) — uses our custom
+            //    coinbase with /c2pool/ tag + THE state_root. If #1 already
+            //    won, this gets "duplicate" (harmless). If #1 failed, this
+            //    is the backup. If this wins the race, the block carries
+            //    our THE commitment on-chain.
+            //
+            // Both are valid blocks with identical PoW. The daemon picks
+            // whichever arrives first. Different scriptSig text doesn't
+            // invalidate the block — it just changes the merkle_root.
+
+            // Fast path: submitauxblock (daemon template)
+            submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
+
+            // THE commitment path: build custom block with /c2pool/ + state_root
             auto payouts = m_payout_provider(chain.config.chain_id,
                                              chain.current_work.coinbase_value);
-            // Get THE state root for sharechain anchoring in merged coinbase
             uint256 state_root;
             if (m_state_root_provider) state_root = m_state_root_provider();
-            LOG_INFO << "[MM:" << chain.config.symbol << "] Multiaddress: payouts="
-                     << payouts.size() << " coinbase_value=" << chain.current_work.coinbase_value
-                     << " template_null=" << chain.current_work.block_template.is_null();
             if (!payouts.empty() && !chain.current_work.block_template.is_null()) {
                 auto block_hex = build_multiaddress_block(
                     chain.current_work.block_template, payouts, auxpow, state_root);
                 if (!block_hex.empty()) {
                     LOG_INFO << "[MM:" << chain.config.symbol
-                             << "] Multiaddress block built (" << block_hex.size()/2 << " bytes, "
-                             << payouts.size() << " payout outputs)";
-                    bool ok = chain.rpc->submit_block(block_hex);
-                    LOG_INFO << "[MM:" << chain.config.symbol << "] submit_block returned ok=" << ok;
-                    // Force aux work refresh on next poll — the tip may have changed
-                    chain.last_tip.clear();
-                    try {
-                        record_discovered_block(chain, ok, parent_hash.GetHex());
-                        LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block OK";
-                    } catch (const std::exception& e) {
-                        LOG_ERROR << "[MM:" << chain.config.symbol
-                                  << "] record_discovered_block crashed: " << e.what();
+                             << "] THE block submitted (" << block_hex.size()/2 << " bytes, "
+                             << payouts.size() << " outputs, /c2pool/ + state_root)";
+                    chain.rpc->submit_block(block_hex);
+                    // Relay custom block via P2P too
+                    if (m_block_relay_fn) {
+                        try { m_block_relay_fn(chain.config.chain_id, block_hex); }
+                        catch (...) {}
                     }
-                    // Also relay via P2P for fast propagation
-                    try {
-                        if (m_block_relay_fn) {
-                            LOG_INFO << "[MM:" << chain.config.symbol << "] calling block_relay_fn...";
-                            m_block_relay_fn(chain.config.chain_id, block_hex);
-                            LOG_INFO << "[MM:" << chain.config.symbol << "] block_relay_fn OK";
-                        }
-                    } catch (const std::exception& e) {
-                        LOG_ERROR << "[MM:" << chain.config.symbol
-                                  << "] block_relay_fn crashed: " << e.what();
-                    }
-                } else {
-                    LOG_WARNING << "[MM:" << chain.config.symbol
-                                << "] Multiaddress block build FAILED — falling back to submitauxblock";
-                    submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
                 }
-            } else {
-                LOG_INFO << "[MM:" << chain.config.symbol
-                         << "] Multiaddress fallback: payouts=" << payouts.size()
-                         << " template=" << (chain.current_work.block_template.is_null() ? "null" : "present");
-                submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
             }
         } else {
             LOG_INFO << "[MM:" << chain.config.symbol << "] Single-address mode (multiaddress="
