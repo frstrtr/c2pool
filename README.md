@@ -75,7 +75,7 @@ Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 
 | Port | Purpose |
 |------|--------|
-| 9338 | P2Pool sharechain (peer-to-peer) |
+| 9326 | P2Pool sharechain (peer-to-peer) |
 | 9327 | Stratum mining + HTTP API |
 
 **Merged mining chains**
@@ -166,7 +166,7 @@ CLI arguments always take priority over YAML values.
 |----------|----------|---------|-------------|
 | `--net` | — | — | Blockchain: `litecoin`, `bitcoin`, `dogecoin` |
 | `--testnet` | — | off | Enable testnet mode |
-| `--p2pool-port` | `port` | 9338 | P2P sharechain port |
+| `--p2pool-port` | `port` | 9326 | P2P sharechain port |
 | `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
 | `--web-port` | `http_port` | 8080 | HTTP API / dashboard port |
 | `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
@@ -196,8 +196,82 @@ CLI arguments always take priority over YAML values.
 | `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
 | `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
+| `--coinbase-text` | `coinbase_text` | — | Custom coinbase scriptSig text (see below) |
+| `--message-blob-hex` | — | — | V36 authority message blob |
+| `--embedded-ltc` | — | off | Use embedded SPV for LTC (no litecoind needed) |
 
 See [config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) for a complete example.
+
+---
+
+## Coinbase customization
+
+Every block found by c2pool embeds structured data in the coinbase
+scriptSig. The 100-byte scriptSig is partitioned as follows:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ [4]  BIP34 block height (consensus required)                    │
+│ [44] AuxPoW merged mining commitment (when merged mining active)│
+│ [N]  Tag or operator text (see below)                           │
+│ [32] THE state root (sharechain state commitment)               │
+│ [M]  THE metadata (pool analytics, fills remaining space)       │
+└─────────────────────────────────────────────────────────────────┘
+  Total: 100 bytes (Bitcoin consensus limit)
+```
+
+**Operator text (`--coinbase-text`)**
+
+By default, c2pool uses `/c2pool/` (8 bytes) as the tag. Node operators
+can replace this with custom text via `--coinbase-text`:
+
+```bash
+# Default: "/c2pool/" tag
+./src/c2pool/c2pool --integrated ...
+
+# Custom: your node name
+./src/c2pool/c2pool --integrated --coinbase-text "EU-Node1" ...
+
+# Custom: pool branding
+./src/c2pool/c2pool --integrated --coinbase-text "MyPool.io" ...
+```
+
+**Size limits** (enforced at startup):
+
+| Mode | Max text | Reason |
+|------|----------|--------|
+| With merged mining | **20 bytes** | AuxPoW commitment uses 44 bytes |
+| Without merged mining | **64 bytes** | No AuxPoW overhead |
+
+c2pool is always identified by the **combined donation address** in
+coinbase outputs (visible in any block explorer) — the scriptSig tag
+is optional branding, not the primary identifier.
+
+**THE state root** (32 bytes, always present)
+
+Commits the sharechain state at block-find time:
+- PPLNS weight distribution snapshot
+- Sharechain height and chain parameters
+- Epoch metadata (difficulty, pool hashrate)
+
+This enables trustless checkpoints: any c2pool node can verify that
+a found block's PPLNS distribution matches the committed state root.
+
+**THE metadata** (variable, fills remaining space after tag)
+
+| Byte | Field | Description |
+|------|-------|-------------|
+| 0 | version | Protocol version (0x01 = V36) |
+| 1-4 | sharechain_height | Share chain height at block-find |
+| 5-6 | miner_count | Unique miners in PPLNS window |
+| 7 | hashrate_class | log2(pool hashrate in H/s) |
+| 8-9 | share_period | Current share period (seconds) |
+| 10-11 | verified_length | Verified chain length |
+| 12-15 | pool_aps | Compressed pool attempts/second |
+| 16-19 | reserved | Future: THE temporal layer flags |
+
+Metadata is truncated from the end when space is limited (e.g., long
+operator text reduces metadata space).
 
 ---
 
