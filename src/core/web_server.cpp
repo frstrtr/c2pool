@@ -1084,7 +1084,8 @@ MiningInterface::build_coinbase_parts(
     const std::vector<uint8_t>& mm_commitment,
     const std::string& witness_commitment_hex,
     const std::string& ref_hash_hex,
-    const uint256& the_state_root)
+    const uint256& the_state_root,
+    const std::string& coinbase_text)
 {
     // P2Pool-compatible coinbase split: extranonce goes into last_txout_nonce,
     // NOT into the scriptSig.  This way:
@@ -1107,11 +1108,20 @@ MiningInterface::build_coinbase_parts(
     const std::string height_hex = encode_height_pushdata(height);
     const int height_bytes = static_cast<int>(height_hex.size()) / 2;
 
-    // "/c2pool/" in ASCII = 2f 63 32 70 6f 6f 6c 2f
-    const std::string pool_marker = "2f633270 6f6f6c2f";
-    std::string pool_marker_stripped;
-    for (char c : pool_marker) { if (c != ' ') pool_marker_stripped += c; }
-    const int pool_marker_bytes = static_cast<int>(pool_marker_stripped.size()) / 2;
+    // Dynamic tag: "/c2pool/" (default) or operator --coinbase-text
+    // When operator provides text, /c2pool/ tag is replaced — c2pool is
+    // always identified by the combined donation address in coinbase outputs.
+    const std::string default_tag = "/c2pool/";
+    const std::string& tag_text = coinbase_text.empty() ? default_tag : coinbase_text;
+    static const char* HEXC = "0123456789abcdef";
+    std::string tag_hex;
+    tag_hex.reserve(tag_text.size() * 2);
+    for (char c : tag_text) {
+        uint8_t b = static_cast<uint8_t>(c);
+        tag_hex += HEXC[b >> 4];
+        tag_hex += HEXC[b & 0x0f];
+    }
+    const int tag_bytes = static_cast<int>(tag_text.size());
 
     // AuxPoW merged mining commitment
     std::string mm_hex;
@@ -1139,8 +1149,8 @@ MiningInterface::build_coinbase_parts(
         }
     }
 
-    // ScriptSig: height + mm_commitment + pool_marker + state_root (NO extranonce!)
-    const int script_total = height_bytes + mm_bytes + pool_marker_bytes + state_root_bytes;
+    // ScriptSig: height + mm_commitment + tag + state_root (NO extranonce!)
+    const int script_total = height_bytes + mm_bytes + tag_bytes + state_root_bytes;
 
     // Build coinb1: entire coinbase TX up to and including ref_hash in OP_RETURN
     std::ostringstream coinb1;
@@ -1151,10 +1161,10 @@ MiningInterface::build_coinbase_parts(
            << std::hex << std::setfill('0') << std::setw(2) << script_total
            << height_hex;
 
-    // scriptSig: mm + pool_marker + state_root (no en1/en2 — those go into last_txout_nonce)
+    // scriptSig: mm + tag + state_root (no en1/en2 — those go into last_txout_nonce)
     if (!mm_hex.empty())
         coinb1 << mm_hex;
-    coinb1 << pool_marker_stripped;
+    coinb1 << tag_hex;
     if (!state_root_hex.empty())
         coinb1 << state_root_hex;
     coinb1 << "ffffffff";  // sequence = 0xFFFFFFFF
@@ -1222,25 +1232,32 @@ MiningInterface::build_connection_coinbase(
         return {};
 
     // Build the coinbase scriptSig (FIXED — no extranonce1/2):
-    //   BIP34_height + mm_commitment + pool_marker
+    //   BIP34_height + mm_commitment + tag + state_root
     // This is share.m_coinbase and determines ref_hash.
     // extranonce1+extranonce2 go into last_txout_nonce (OP_RETURN), not scriptSig.
     const int height = m_cached_template.value("height", 1);
     std::string height_hex = encode_height_pushdata(height);
 
-    // Pool marker
-    const std::string pool_marker_stripped = "2f633270" "6f6f6c2f";
+    // Dynamic tag: "/c2pool/" (default) or operator --coinbase-text
+    static const char* HEX = "0123456789abcdef";
+    const std::string default_tag2 = "/c2pool/";
+    const std::string& tag_src = m_coinbase_text.empty() ? default_tag2 : m_coinbase_text;
+    std::string tag_hex;
+    for (char c : tag_src) {
+        uint8_t b = static_cast<uint8_t>(c);
+        tag_hex += HEX[b >> 4];
+        tag_hex += HEX[b & 0x0f];
+    }
 
     // MM commitment hex
-    static const char* HEX = "0123456789abcdef";
     std::string mm_hex;
     for (uint8_t b : m_cached_mm_commitment) {
         mm_hex += HEX[b >> 4];
         mm_hex += HEX[b & 0x0f];
     }
 
-    // ScriptSig: height + mm + pool_marker (NO extranonce!)
-    std::string scriptsig_hex = height_hex + mm_hex + pool_marker_stripped;
+    // ScriptSig: height + mm + tag (NO extranonce!)
+    std::string scriptsig_hex = height_hex + mm_hex + tag_hex;
 
     // Decode to bytes for ref_hash computation
     std::vector<unsigned char> scriptsig_bytes;
@@ -1310,7 +1327,8 @@ MiningInterface::build_connection_coinbase(
         m_cached_mm_commitment,
         m_cached_witness_commitment,
         ref_hash_hex,
-        the_root);
+        the_root,
+        m_coinbase_text);
 
     // Return coinbase parts + work snapshot atomically (still under m_work_mutex)
     WorkSnapshot snap;
@@ -1459,7 +1477,8 @@ void MiningInterface::refresh_work()
 
             // Build fallback coinbase (without OP_RETURN, for non-p2pool or initial work)
             cb_parts = build_coinbase_parts(wd.m_data, coinbase_value, pplns_outputs,
-                                            pplns_raw_scripts, mm_commitment, witness_commitment);
+                                            pplns_raw_scripts, mm_commitment, witness_commitment,
+                                            {}, uint256(), m_coinbase_text);
         } catch (const std::exception& e) {
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };

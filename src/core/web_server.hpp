@@ -352,6 +352,10 @@ public:
     void set_operator_message_blob(const std::vector<unsigned char>& blob);
     std::vector<unsigned char> get_operator_message_blob() const;
 
+    // Coinbase scriptSig customization (--coinbase-text)
+    void set_coinbase_text(const std::string& text) { m_coinbase_text = text; }
+    const std::string& get_coinbase_text() const { return m_coinbase_text; }
+
     // Hook: expose decoded protocol messages (e.g. from current best share)
     // through API methods for dashboard/monitoring clients.
     using protocol_messages_fn_t = std::function<nlohmann::json()>;
@@ -508,7 +512,8 @@ private:
         const std::vector<uint8_t>& mm_commitment = {},
         const std::string& witness_commitment_hex = {},
         const std::string& ref_hash_hex = {},
-        const uint256& the_state_root = uint256());
+        const uint256& the_state_root = uint256(),
+        const std::string& coinbase_text = {});
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
@@ -608,6 +613,9 @@ private:
     // Operator blob injected into locally created shares (thread-safe).
     mutable std::mutex m_message_blob_mutex;
     std::vector<unsigned char> m_operator_message_blob;
+
+    // Coinbase scriptSig customization
+    std::string m_coinbase_text;  // empty = "/c2pool/" default tag
 
     // Segwit activation (from template rules)
     bool m_segwit_active{false};
