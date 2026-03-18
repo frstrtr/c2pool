@@ -1165,30 +1165,19 @@ int main(int argc, char* argv[]) {
             // io_context needed for block verification timers in all modes
             web_server.get_mining_interface()->set_io_context(&ioc);
 
-            // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
-            if (!embedded_ltc) {
-                web_server.set_coin_rpc(node_rpc.get(), &coin_node);
-            } else if (embedded_broadcaster && embedded_chain) {
-                // Wire embedded node + header-sync callback (now that web_server is alive)
-                web_server.set_embedded_node(embedded_node.get());
-
-                // Wire block verification for embedded mode
+            // --- Layer +2: Persistent found block + THE checkpoint storage ---
+            // Runs in ALL modes (RPC and embedded). Uses dedicated LevelDB.
+            {
                 auto* mi = web_server.get_mining_interface();
-
-                // --- Layer +2: Persistent found block storage ---
-                // Uses a dedicated LevelDB in the network data dir.
                 std::string net_label = settings->m_testnet ? "testnet" : "mainnet";
                 std::string fblk_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".") +
                     "/.c2pool/" + net_label + "/found_blocks_db";
                 auto fblk_leveldb = std::make_shared<core::LevelDBStore>(
                     fblk_db_path, core::LevelDBOptions{});
-                if (!fblk_leveldb->open()) {
-                    LOG_WARNING << "[Pool] Failed to open found blocks LevelDB at " << fblk_db_path;
-                } else {
+                if (fblk_leveldb->open()) {
                     auto fblk_store = std::make_shared<c2pool::storage::FoundBlockStore>(*fblk_leveldb);
                     using MI = core::MiningInterface;
                     mi->set_found_block_persistence(
-                        // persist callback
                         [fblk_store, fblk_leveldb](const MI::FoundBlock& blk) -> bool {
                             c2pool::storage::FoundBlockRecord rec;
                             rec.chain = blk.chain;
@@ -1201,7 +1190,6 @@ int main(int argc, char* argv[]) {
                             rec.last_checked = static_cast<uint64_t>(std::time(nullptr));
                             return fblk_store->store(rec);
                         },
-                        // load callback
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
                             auto records = fblk_store->load_all();
                             std::vector<MI::FoundBlock> result;
@@ -1223,20 +1211,15 @@ int main(int argc, char* argv[]) {
                     mi->load_persisted_found_blocks();
                     LOG_INFO << "[Pool] Found block persistence enabled at " << fblk_db_path;
 
-                    // --- THE checkpoint store (shares same LevelDB) ---
+                    // THE checkpoint store (shares same LevelDB)
                     auto the_store = std::make_shared<c2pool::storage::TheCheckpointStore>(*fblk_leveldb);
-
-                    // Checkpoint creation: called on every found block
                     mi->set_checkpoint_fns(
-                        // latest verified checkpoint
                         [the_store]() -> nlohmann::json {
-                            // Try all chains
                             for (const auto& chain : {"tLTC", "LTC", "DOGE", "tDOGE"}) {
-                                auto cp = the_store->get_latest_verified(chain);
+                                auto cp = the_store->get_latest(chain);
                                 if (cp.has_value()) {
                                     return nlohmann::json{
-                                        {"chain", cp->chain},
-                                        {"block_height", cp->block_height},
+                                        {"chain", cp->chain}, {"block_height", cp->block_height},
                                         {"block_hash", cp->block_hash},
                                         {"the_state_root", cp->the_state_root.GetHex()},
                                         {"sharechain_height", cp->sharechain_height},
@@ -1247,80 +1230,56 @@ int main(int argc, char* argv[]) {
                                     };
                                 }
                             }
-                            // Fall back to latest any-status
-                            for (const auto& chain : {"tLTC", "LTC", "DOGE", "tDOGE"}) {
-                                auto cp = the_store->get_latest(chain);
-                                if (cp.has_value()) {
-                                    return nlohmann::json{
-                                        {"chain", cp->chain},
-                                        {"block_height", cp->block_height},
-                                        {"block_hash", cp->block_hash},
-                                        {"the_state_root", cp->the_state_root.GetHex()},
-                                        {"sharechain_height", cp->sharechain_height},
-                                        {"miner_count", cp->miner_count},
-                                        {"hashrate_class", cp->hashrate_class},
-                                        {"timestamp", cp->timestamp},
-                                        {"status", "pending"}
-                                    };
-                                }
-                            }
-                            return nlohmann::json{{"error", "no checkpoints found"}};
+                            return nlohmann::json{{"status", "no checkpoints"}};
                         },
-                        // all checkpoints
                         [the_store]() -> nlohmann::json {
                             auto all = the_store->load_all();
                             nlohmann::json arr = nlohmann::json::array();
                             for (const auto& cp : all) {
                                 arr.push_back({
-                                    {"chain", cp.chain},
-                                    {"block_height", cp.block_height},
+                                    {"chain", cp.chain}, {"block_height", cp.block_height},
                                     {"block_hash", cp.block_hash},
                                     {"the_state_root", cp.the_state_root.GetHex()},
                                     {"sharechain_height", cp.sharechain_height},
                                     {"miner_count", cp.miner_count},
-                                    {"hashrate_class", cp.hashrate_class},
                                     {"timestamp", cp.timestamp},
                                     {"status", cp.status == 1 ? "verified" : (cp.status == 2 ? "mismatch" : "pending")}
                                 });
                             }
                             return arr;
                         },
-                        // verify callback (recompute state_root)
-                        [](const uint256& /*state_root*/, uint32_t /*height*/) -> bool {
-                            // TODO: recompute from sharechain and compare
-                            return true; // optimistic until V37
-                        },
-                        // create checkpoint on block found
+                        [](const uint256&, uint32_t) -> bool { return true; },
                         [the_store, mi](const std::string& chain, uint64_t height,
                                         const std::string& hash, uint64_t ts) {
                             c2pool::storage::TheCheckpoint cp;
-                            cp.chain = chain;
-                            cp.block_height = height;
-                            cp.block_hash = hash;
-                            cp.timestamp = ts;
-                            cp.status = 0; // pending
-
-                            // Capture current sharechain state from THE metadata
-                            // The state_root was already computed in refresh_work()
-                            // and embedded in the block. We store the same data here.
+                            cp.chain = chain; cp.block_height = height;
+                            cp.block_hash = hash; cp.timestamp = ts; cp.status = 0;
                             auto work = mi->get_current_work();
-                            if (!work.the_state_root.IsNull())
-                                cp.the_state_root = work.the_state_root;
-
+                            cp.the_state_root = work.the_state_root;
                             cp.sharechain_height = work.sharechain_height;
                             cp.miner_count = work.miner_count;
                             cp.hashrate_class = c2pool::TheMetadata::encode_hashrate(work.pool_hashrate);
-
                             the_store->store(cp);
-                            LOG_INFO << "[THE] Checkpoint created: chain=" << chain
-                                     << " height=" << height
+                            LOG_INFO << "[THE] Checkpoint: " << chain << " height=" << height
                                      << " miners=" << cp.miner_count
-                                     << " hashrate_class=" << (int)cp.hashrate_class
-                                     << " state_root=" << cp.the_state_root.GetHex().substr(0, 16) << "...";
+                                     << " root=" << cp.the_state_root.GetHex().substr(0, 16) << "...";
                         }
                     );
-                    LOG_INFO << "[THE] Checkpoint store enabled (" << the_store->count() << " existing checkpoints)";
+                    LOG_INFO << "[THE] Checkpoint store: " << the_store->count() << " existing";
+                } else {
+                    LOG_WARNING << "[Pool] Failed to open found blocks LevelDB at " << fblk_db_path;
                 }
+            }
+
+            // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
+            if (!embedded_ltc) {
+                web_server.set_coin_rpc(node_rpc.get(), &coin_node);
+            } else if (embedded_broadcaster && embedded_chain) {
+                // Wire embedded node + header-sync callback (now that web_server is alive)
+                web_server.set_embedded_node(embedded_node.get());
+
+                // Wire block verification for embedded mode
+                auto* mi = web_server.get_mining_interface();
                 mi->set_block_verify_fn(
                     [chain = embedded_chain.get()](const std::string& hash_hex) -> int {
                         uint256 h;
