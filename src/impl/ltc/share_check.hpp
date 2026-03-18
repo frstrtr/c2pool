@@ -1859,6 +1859,28 @@ uint256 create_local_share(
             coinbase_bytes_for_hashlink.begin(), coinbase_bytes_for_hashlink.end() - suffix_len);
         share.m_hash_link = prefix_to_hash_link(prefix, gentx_before_refhash);
 
+        // Verify hash_link round-trip: does check_hash_link(hash_link, suffix) == Hash(full)?
+        {
+            static int hl_diag = 0;
+            if (hl_diag < 3) {
+                std::vector<unsigned char> suffix(
+                    coinbase_bytes_for_hashlink.end() - suffix_len,
+                    coinbase_bytes_for_hashlink.end());
+                uint256 hl_result = check_hash_link(share.m_hash_link, suffix, gentx_before_refhash);
+                auto full_span = std::span<const unsigned char>(
+                    coinbase_bytes_for_hashlink.data(), coinbase_bytes_for_hashlink.size());
+                uint256 direct_result = Hash(full_span);
+                LOG_INFO << "[hash_link-roundtrip] direct=" << direct_result.GetHex();
+                LOG_INFO << "[hash_link-roundtrip] hashlink=" << hl_result.GetHex();
+                LOG_INFO << "[hash_link-roundtrip] MATCH=" << (hl_result == direct_result ? "YES" : "NO");
+                LOG_INFO << "[hash_link-roundtrip] prefix_len=" << prefix.size()
+                         << " suffix_len=" << suffix.size()
+                         << " total=" << coinbase_bytes_for_hashlink.size()
+                         << " gentx_before_refhash=" << gentx_before_refhash.size();
+                ++hl_diag;
+            }
+        }
+
         // Extract last_txout_nonce (8 bytes before locktime)
         size_t nonce_offset = coinbase_bytes_for_hashlink.size() - 4 - 8;
         uint64_t extracted_nonce = 0;
