@@ -199,6 +199,7 @@ CLI arguments always take priority over YAML values.
 | `--coinbase-text` | `coinbase_text` | — | Custom coinbase scriptSig text (see below) |
 | `--message-blob-hex` | — | — | V36 authority message blob |
 | `--embedded-ltc` | — | off | Use embedded SPV for LTC (no litecoind needed) |
+| `--network-id` | `network_id` | 0 | Private chain identifier (hex, see below) |
 
 See [config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) for a complete example.
 
@@ -272,6 +273,48 @@ a found block's PPLNS distribution matches the committed state root.
 
 Metadata is truncated from the end when space is limited (e.g., long
 operator text reduces metadata space).
+
+---
+
+## Private sharechains
+
+c2pool supports private sharechains for isolated mining networks.
+
+```bash
+# Start a private chain (operator)
+./src/c2pool/c2pool --integrated --network-id DEADBEEF12345678 \
+  --net litecoin --address YOUR_LTC_ADDRESS ...
+
+# Join the same private chain (miner)
+./src/c2pool/c2pool --integrated --network-id DEADBEEF12345678 \
+  -n OPERATOR_IP:9326 ...
+```
+
+**How it works:**
+
+The `--network-id` overrides the IDENTIFIER used in share consensus
+verification. p2pool uses two-layer network isolation:
+
+| Layer | Value | Security |
+|-------|-------|----------|
+| Transport | PREFIX (derived from network-id) | Filters connections — visible on wire |
+| Consensus | IDENTIFIER (= network-id) | Hashed into every share's `ref_hash` — **secret** |
+
+A node that doesn't know the network-id **cannot forge valid shares**
+because the IDENTIFIER is hashed into every share's verification hash.
+Sharing the network-id with a miner grants them sharechain access.
+
+**Genesis behavior:** When the chain is empty, c2pool automatically
+creates genesis shares — no special flag needed. The first miner
+solution becomes the genesis share, and the chain grows from there.
+Peers that connect later download shares from the genesis node.
+
+**On-chain identity:** Every block found by a private chain carries the
+`network_id` in THE metadata (bytes 8-11 of the scriptSig metadata
+field). Blockchain scanners can identify which private chain found
+which blocks without running a node.
+
+Default `--network-id 0` = public p2pool network (standard IDENTIFIER).
 
 ---
 
