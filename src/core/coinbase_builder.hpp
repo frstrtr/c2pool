@@ -62,15 +62,20 @@ static constexpr size_t MAX_OPERATOR_TEXT_MM = 20;
 // Maximum operator text without merged mining
 static constexpr size_t MAX_OPERATOR_TEXT_SOLO = 64;
 
+// Public p2pool network chain_id (default — no private chain)
+static constexpr uint32_t PUBLIC_CHAIN_ID = 0;
+static constexpr uint32_t PUBLIC_CHAIN_PREFIX = 0;
+
 /// THE metadata — compact pool state for on-chain commitment
 struct TheMetadata {
     uint8_t  version = C2POOL_PROTOCOL_VERSION;
     uint32_t sharechain_height = 0;    // share chain height at block-find
     uint16_t miner_count = 0;          // unique miners in PPLNS window
     uint8_t  hashrate_class = 0;       // log2(pool_hashrate_in_h_per_s)
+    uint32_t chain_id = PUBLIC_CHAIN_ID;       // 0 = public network, nonzero = private chain
+    uint32_t chain_prefix = PUBLIC_CHAIN_PREFIX; // P2P magic prefix (0 = default)
     uint16_t share_period = 0;         // current share period (seconds)
     uint16_t verified_length = 0;      // verified chain length
-    uint32_t pool_aps_compressed = 0;  // compressed pool attempts/s
     uint32_t reserved = 0;            // future: THE temporal layer flags
 
     /// Pack into bytes (up to max_bytes, truncated from end)
@@ -93,10 +98,10 @@ struct TheMetadata {
         push32(sharechain_height);   // [1-4]
         push16(miner_count);         // [5-6]
         push8(hashrate_class);       // [7]
-        push16(share_period);        // [8-9]
-        push16(verified_length);     // [10-11]
-        push32(pool_aps_compressed); // [12-15]
-        push32(reserved);            // [16-19]
+        push32(chain_id);            // [8-11]  0 = public network
+        push32(chain_prefix);        // [12-15] P2P magic prefix
+        push16(share_period);        // [16-17]
+        push16(verified_length);     // [18-19]
         return out;
     }
 
@@ -107,10 +112,10 @@ struct TheMetadata {
         if (len >= 5) m.sharechain_height = data[1] | (data[2]<<8) | (data[3]<<16) | (data[4]<<24);
         if (len >= 7) m.miner_count = data[5] | (data[6]<<8);
         if (len >= 8) m.hashrate_class = data[7];
-        if (len >= 10) m.share_period = data[8] | (data[9]<<8);
-        if (len >= 12) m.verified_length = data[10] | (data[11]<<8);
-        if (len >= 16) m.pool_aps_compressed = data[12] | (data[13]<<8) | (data[14]<<16) | (data[15]<<24);
-        if (len >= 20) m.reserved = data[16] | (data[17]<<8) | (data[18]<<16) | (data[19]<<24);
+        if (len >= 12) m.chain_id = data[8] | (data[9]<<8) | (data[10]<<16) | (data[11]<<24);
+        if (len >= 16) m.chain_prefix = data[12] | (data[13]<<8) | (data[14]<<16) | (data[15]<<24);
+        if (len >= 18) m.share_period = data[16] | (data[17]<<8);
+        if (len >= 20) m.verified_length = data[18] | (data[19]<<8);
         return m;
     }
 
