@@ -245,15 +245,61 @@ Five-layer temporal model for entropy-weighted share evaluation:
 
 Every found block embeds `the_state_root` in the coinbase scriptSig:
 ```
-scriptSig: [BIP34 height][mm_commit]["/c2pool/"][the_state_root(32)]
+scriptSig: [BIP34 height][mm_commit][tag_or_text][the_state_root(32)][metadata]
 ```
 
-Enables: trustless PPLNS verification, fast new-node sync via blockchain
-checkpoint scan, cross-chain temporal consistency for merged mining,
-dispute resolution via on-chain proof.
+**V36 implementation (what works now):**
 
-Currently L-1 and L+1 are zero placeholders. When V37 activates, the
-commitment chain is already established on the blockchain.
+| Feature | Status | How |
+|---------|--------|-----|
+| State root embedded in every found block | Working | `compute_the_state_root()` in `build_coinbase_parts()` |
+| THE metadata (version, height, miners, hashrate) | Working | `TheMetadata::pack()` fills remaining scriptSig space |
+| Checkpoint stored in LevelDB on every block found | Working | `TheCheckpointStore` via `checkpoint_create_fn` |
+| `/checkpoint` REST endpoint | Working | Returns latest verified checkpoint |
+| `/checkpoints` REST endpoint | Working | Returns all checkpoints with status |
+| On-chain analytics (miner_count, hashrate_class) | Working | Readable from any block explorer parsing scriptSig |
+
+**What THE commitment provides honestly:**
+
+1. **Tamper-evident seal** — if a node operator modifies the sharechain
+   after the fact (to change payout distribution), the on-chain state_root
+   won't match the modified state. This is the primary security property.
+
+2. **Historical audit trail** — after shares are pruned (past CHAIN_LENGTH),
+   `ref_hash` and `merged_payout_hash` are gone. The on-chain state_root
+   is the only remaining proof of what the PPLNS distribution was at
+   block-find time.
+
+3. **On-chain pool analytics** — metadata fields (miner_count, hashrate_class,
+   share_period) create a permanent, public record of pool health visible
+   to anyone scanning the blockchain. No c2pool node needed to read it.
+
+4. **V37 migration foundation** — L-1 and L+1 are zero placeholders now.
+   When V37 activates temporal layers, the commitment chain is already
+   established on the blockchain with years of history.
+
+**What THE commitment does NOT provide (V36 limitations):**
+
+- ~~Fast new-node sync~~ — verifying a state_root requires the full sharechain
+  (circular dependency). True checkpoint-based sync needs V37 protocol
+  changes: a new P2P message type for "download shares from checkpoint X".
+
+- ~~Cross-node verification during sync~~ — nodes with different chain tips
+  produce different state_roots. The state_root is a snapshot of ONE node's
+  state, not a global consensus value. (It becomes consensus-equivalent
+  once all nodes are synced to the same tip.)
+
+- ~~Replacing ref_hash~~ — ref_hash is per-share consensus (every 15s),
+  state_root is per-block snapshot (every ~30min+). Different granularity.
+
+**The PPLNS outputs ARE deterministic** across synced nodes. The skip list
+produces identical weights given the same best share tip and chain depth.
+`compute_the_state_root` hashes the same sorted `(script, amount)` table
+that `generate_transaction` uses. So the state_root IS reproducible — but
+only after full share chain sync, which limits its utility for bootstrapping.
+
+**V37 will unlock:** checkpoint-based share download, temporal layer
+anchoring (L-1/L+1 non-zero), cross-layer settlement proofs.
 
 ---
 
