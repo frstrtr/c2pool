@@ -112,9 +112,16 @@ private:
     QPlainTextEdit* seedNodesEdit_;  ///< -n HOST:PORT (one per line)
     QLineEdit* httpHostEdit_;        ///< --http-host (bind address)
 
+    // ── Private Sharechain ───────────────────────────────────────────────────
+    QCheckBox*   privateChainCheck_;   ///< Enable private sharechain
+    QLineEdit*   networkIdEdit_;       ///< --network-id (hex)
+    QPushButton* generateIdBtn_;       ///< Generate random network ID
+    QLabel*      privateStatusLabel_;  ///< "Public network" / "Private chain"
+
     // ── Advanced ────────────────────────────────────────────────────────────
     QLineEdit* configFileEdit_;      ///< --config (YAML file)
     QLineEdit* messageBlobEdit_;     ///< --message-blob-hex
+    QLineEdit* coinbaseTextEdit_;    ///< --coinbase-text
 
     // ── Command Preview ─────────────────────────────────────────────────────
     QTextEdit*   cmdPreview_;

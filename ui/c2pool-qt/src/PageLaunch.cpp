@@ -331,7 +331,73 @@ void PageLaunch::setupUi()
         vbox->addWidget(g);
     }
 
-    // ── 8. Advanced ──────────────────────────────────────────────────────────
+    // ── 8. Private Sharechain ─────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Private Sharechain");
+        auto* form = new QFormLayout(g);
+
+        privateChainCheck_ = new QCheckBox("Enable private sharechain");
+        privateChainCheck_->setToolTip(
+            "Create an isolated mining network. Only nodes with the same\n"
+            "Network ID can exchange shares. The ID is hashed into every\n"
+            "share's verification hash (IDENTIFIER) — it acts as a shared\n"
+            "secret that gates sharechain participation.");
+        form->addRow(privateChainCheck_);
+
+        auto* idRow = new QHBoxLayout;
+        networkIdEdit_ = new QLineEdit;
+        networkIdEdit_->setPlaceholderText("e.g. DEADBEEF12345678");
+        networkIdEdit_->setMaxLength(16);
+        networkIdEdit_->setToolTip(
+            "--network-id  (8-byte hex identifier)\n\n"
+            "This overrides the IDENTIFIER used in share consensus.\n"
+            "A node without this ID cannot forge valid shares.\n"
+            "Share it only with trusted miners.");
+        networkIdEdit_->setEnabled(false);
+        idRow->addWidget(networkIdEdit_);
+
+        generateIdBtn_ = new QPushButton("Generate");
+        generateIdBtn_->setToolTip("Generate a random 8-byte network identifier");
+        generateIdBtn_->setEnabled(false);
+        generateIdBtn_->setFixedWidth(80);
+        connect(generateIdBtn_, &QPushButton::clicked, this, [this]() {
+            // Generate 8 random bytes as hex
+            static const char* HEX = "0123456789ABCDEF";
+            QString id;
+            std::srand(static_cast<unsigned>(std::time(nullptr)));
+            for (int i = 0; i < 16; ++i)
+                id += HEX[std::rand() % 16];
+            networkIdEdit_->setText(id);
+            updateCommandPreview();
+        });
+        idRow->addWidget(generateIdBtn_);
+        form->addRow("Network ID:", idRow);
+
+        privateStatusLabel_ = new QLabel("Public p2pool network");
+        privateStatusLabel_->setStyleSheet("color: green; font-weight: bold;");
+        form->addRow("Status:", privateStatusLabel_);
+
+        connect(privateChainCheck_, &QCheckBox::stateChanged, this, [this](int state) {
+            bool enabled = (state == Qt::Checked);
+            networkIdEdit_->setEnabled(enabled);
+            generateIdBtn_->setEnabled(enabled);
+            if (enabled) {
+                privateStatusLabel_->setText("Private chain (isolated network)");
+                privateStatusLabel_->setStyleSheet("color: orange; font-weight: bold;");
+                if (networkIdEdit_->text().isEmpty())
+                    generateIdBtn_->click();  // auto-generate on first enable
+            } else {
+                networkIdEdit_->clear();
+                privateStatusLabel_->setText("Public p2pool network");
+                privateStatusLabel_->setStyleSheet("color: green; font-weight: bold;");
+            }
+            updateCommandPreview();
+        });
+
+        vbox->addWidget(g);
+    }
+
+    // ── 9. Advanced ──────────────────────────────────────────────────────────
     {
         auto* g = makeGroup("Advanced");
         auto* form = new QFormLayout(g);
@@ -345,6 +411,15 @@ void PageLaunch::setupUi()
         messageBlobEdit_->setPlaceholderText("hex string (optional, v36+)");
         messageBlobEdit_->setToolTip("--message-blob-hex  (embedded share message data)");
         form->addRow("Message blob hex:", messageBlobEdit_);
+
+        coinbaseTextEdit_ = new QLineEdit;
+        coinbaseTextEdit_->setPlaceholderText("/c2pool/ (default, max 20 chars with MM)");
+        coinbaseTextEdit_->setMaxLength(20);
+        coinbaseTextEdit_->setToolTip(
+            "--coinbase-text  (custom text in coinbase scriptSig)\n"
+            "Replaces /c2pool/ tag. Max 20 chars with merged mining, 64 without.\n"
+            "c2pool is always identified by donation address in coinbase outputs.");
+        form->addRow("Coinbase text:", coinbaseTextEdit_);
 
         vbox->addWidget(g);
     }
@@ -502,6 +577,18 @@ QString PageLaunch::buildCommand() const
     const QString msgBlob = messageBlobEdit_->text().trimmed();
     if (!msgBlob.isEmpty())
         parts << "--message-blob-hex" << msgBlob;
+
+    // Coinbase text
+    const QString cbText = coinbaseTextEdit_->text().trimmed();
+    if (!cbText.isEmpty())
+        parts << "--coinbase-text" << cbText;
+
+    // Private sharechain
+    if (privateChainCheck_->isChecked()) {
+        const QString nid = networkIdEdit_->text().trimmed();
+        if (!nid.isEmpty())
+            parts << "--network-id" << nid;
+    }
 
     return parts.join(" ");
 }

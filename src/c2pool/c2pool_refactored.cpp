@@ -296,7 +296,21 @@ int main(int argc, char* argv[]) {
     // Initialize logging
     core::log::Logger::init();
     
-    LOG_INFO << "c2pool - p2pool rebirth in C++ with enhanced features";
+    std::cout << "\n"
+              << "  c2pool v0.1 — P2Pool rebirth in C++\n"
+              << "  https://github.com/frstrtr/c2pool\n"
+              << "\n"
+              << "  Distributed under the MIT/X11 software license, see the accompanying\n"
+              << "  file LICENSE or http://www.opensource.org/licenses/mit-license.php.\n"
+              << "\n"
+              << "  THIS IS EXPERIMENTAL SOFTWARE.\n"
+              << "  USE AT YOUR OWN RISK.\n"
+              << "\n"
+              << "  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n"
+              << "  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n"
+              << "  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\n"
+              << "\n";
+    LOG_INFO << "c2pool v0.1 — p2pool rebirth in C++ with enhanced features";
     
     // Default settings
     auto settings = std::make_unique<core::Settings>();
