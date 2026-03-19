@@ -2289,15 +2289,10 @@ int main(int argc, char* argv[]) {
                     }
 
                     {
-                        auto share_target = chain::bits_to_target(
-                            p.has_frozen_fields && p.frozen_bits ? p.frozen_bits : p.bits);
-                        double share_diff = chain::target_to_difficulty(share_target);
-                        LOG_INFO << "Received good share: "
-                                 << std::scientific << std::setprecision(2)
-                                 << "diff=" << share_diff
-                                 << std::defaultfloat
-                                 << " hash=" << share_hash.GetHex()
-                                 << " miner=" << p.miner_address;
+                        // p2pool format: GOT SHARE! addr.worker hash prev age
+                        LOG_INFO << "GOT SHARE! " << p.miner_address
+                                 << " " << share_hash.GetHex().substr(0, 8)
+                                 << " prev " << prev_share.GetHex().substr(0, 8);
                     }
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
