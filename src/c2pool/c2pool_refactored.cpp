@@ -2292,24 +2292,12 @@ int main(int argc, char* argv[]) {
                         auto share_target = chain::bits_to_target(
                             p.has_frozen_fields && p.frozen_bits ? p.frozen_bits : p.bits);
                         double share_diff = chain::target_to_difficulty(share_target);
-                        // Extract primary address from username
-                        std::string miner_addr;
-                        for (const auto& [script, _] : p.merged_addresses) { (void)_; }
-                        // Use the payout script hash160 as miner identifier
-                        if (p.payout_script.size() == 25 &&
-                            p.payout_script[0] == 0x76 && p.payout_script[1] == 0xa9) {
-                            static const char* HX = "0123456789abcdef";
-                            for (int i = 3; i < 23 && i < (int)p.payout_script.size(); ++i) {
-                                miner_addr += HX[p.payout_script[i] >> 4];
-                                miner_addr += HX[p.payout_script[i] & 0xf];
-                            }
-                        }
-                        LOG_INFO << "GOT SHARE! "
+                        LOG_INFO << "Received good share: "
                                  << std::scientific << std::setprecision(2)
                                  << "diff=" << share_diff
                                  << std::defaultfloat
                                  << " hash=" << share_hash.GetHex()
-                                 << " miner=" << miner_addr;
+                                 << " miner=" << p.miner_address;
                     }
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();

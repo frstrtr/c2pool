@@ -4372,6 +4372,21 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // unmodified — Python p2pool does NOT apply node fee to merged chains.
         if (m_create_share_fn) {
             ShareCreationParams params;
+            // Miner display name: PRIMARY_ADDR.WORKER (strip merged addrs, keep worker)
+            {
+                std::string display = username;
+                // Remove merged addresses (after first comma) but keep worker name (after last dot)
+                auto comma_pos = display.find(',');
+                std::string worker;
+                if (comma_pos != std::string::npos) {
+                    // Check for worker name after the merged addresses
+                    auto dot_pos = display.rfind('.');
+                    if (dot_pos != std::string::npos && dot_pos > comma_pos)
+                        worker = display.substr(dot_pos);
+                    display = display.substr(0, comma_pos) + worker;
+                }
+                params.miner_address = display;
+            }
 
             // Build P2PKH script from share_address (40-char hex hash160)
             if (share_address.size() == 40) {

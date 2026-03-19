@@ -379,6 +379,7 @@ public:
     // Hook: called by mining_submit() pool path to create a share in the tracker.
     // All block template data needed by create_local_share() is passed through.
     struct ShareCreationParams {
+        std::string miner_address;  // Stratum username (human-readable address)
         std::vector<unsigned char> payout_script;
         std::map<uint32_t, std::vector<unsigned char>> merged_addresses;
         uint32_t block_version{0};
