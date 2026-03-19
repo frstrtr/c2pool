@@ -1,5 +1,106 @@
 # Changelog
 
+## [0.9.1] - 2026-03-19
+
+### Added (untested — implemented, needs live validation)
+- **BIP 152 compact blocks** — full send/receive path, SipHash-based short
+  IDs, block reconstruction from mempool, wtxidrelay negotiation (BIP 339).
+  LevelDB pruning of evicted shares. 20 new tests.
+- **AutoRatchet V36→V37** — autonomous share version transition state machine
+  with voting, activation thresholds, and rollback safety. 23 new tests.
+- **Redistribute V2** — graduated boost, hybrid mode, threshold-based
+  activation, opt-in per miner. 19 new tests.
+- **Naughty share punishment** — ancestor propagation + head scoring penalty
+  for misbehaving share chains.
+- **Merged coinbase consensus verification** — 7-step chain verification
+  prevents merged mining reward theft. `merged_payout_hash` verified in
+  `share_check()`.
+- **Canonical merged coinbase** — PPLNS coinbase with THE state root anchoring
+  in merged chain blocks (DOGE, etc.).
+- **Merged PPLNS compatibility** — 3-tier address normalization matching
+  Python p2pool for cross-pool interop.
+- **Found block persistence** — Layer +2 persistent storage with proper
+  blockchain acceptance verification via RPC.
+- **THE checkpoint consumer** — store, verify against blockchain, prune
+  orphaned checkpoints on startup. REST API endpoints for checkpoint queries.
+- **THE coinbase state commitment** — unified share retention policy with
+  THE state root embedded in coinbase scriptSig.
+- **Coinbase builder** — dynamic scriptSig layout with `--coinbase-text`
+  operator customization and THE metadata embedding.
+- **Private sharechain identity** — `--network-id` / `--chain-id` /
+  `--chain-prefix` for isolated pool networks. Secure tagged-hash chain
+  fingerprint (8-byte SHA256d, collision-free).
+- **Startup modes** — `--genesis`, `--wait-for-peers`, `--startup-mode
+  auto|genesis|wait` for flexible bootstrapping.
+- **DOGE P2P header sync** — always active when P2P port configured,
+  independent SPV chain for merged mining verification.
+- **Merged mining coins** — added support for PEP, BELLS, LKY, JKC, SHIC,
+  DINGO (chain IDs and address formats).
+- **Phase 6: DigiByte** — Scrypt parent chain config for DGB as alternative
+  parent chain (embedded SPV for LTC/DOGE).
+- **Stratum extensions** — ASICBoost (version-rolling), NiceHash/MRR
+  compatibility, address separator parsing.
+- **Mining OS integration** — HiveOS, MinerStat, RaveOS deploy templates
+  and flight sheet configs.
+- **Dashboard API extensions** — warnings endpoint, merged chain payouts,
+  daemon health tracking with contact-lost detection.
+- **API reference documentation** — comprehensive REST endpoint docs.
+
+### Fixed
+- **Share PoW invalid (CRITICAL)** — p2pool rejected all c2pool shares as
+  "share PoW invalid". Two root causes found and fixed:
+  1. Coinbase scriptSig mismatch: `compute_ref_hash_for_work` omitted the
+     32-byte THE state_root that `build_coinbase_parts` appends to the
+     coinbase scriptSig, causing ref_hash divergence.
+  2. Segwit merkle branches not frozen: `txid_merkle_link` branches and
+     `wtxid_merkle_root` changed between GBT updates. Shares from older
+     jobs used stale branch data. Now frozen at template time through
+     RefHashResult → JobEntry → JobSnapshot → ShareCreationParams pipeline.
+- **Variable shadowing (CRITICAL)** — `std::string gbt_block_nbits` at line
+  920 of stratum_server.cpp shadowed the outer variable, causing ALL frozen
+  share fields (absheight, bits, max_bits, etc.) to be zero.
+- **verify_share block target** — used `share.m_bits` (share target) instead
+  of `share.m_min_header.m_bits` (block target) for `merged_payout_hash`,
+  causing ~100-200x weight difference in PPLNS distribution.
+- **ref_stream segwit_data** — `PossiblyNoneType` serialization: c2pool
+  skipped `segwit_data` when None (0 bytes) while p2pool always serializes
+  default (33 bytes). Fixed to always serialize.
+- **Share field drift** — ref_hash computed at template time, but share
+  fields recomputed at submit time from different tracker state. Fixed by
+  freezing absheight, abswork, far_share_hash, timestamp, bits, max_bits,
+  merged_payout_hash at template time and passing through job snapshot chain.
+- **LevelDB lock conflict** — EnhancedNode and NodeImpl both opened the same
+  LevelDB database. EnhancedNode now defers to NodeImpl.
+- **Persist path mismatch** — EnhancedNode used "testnet", NodeImpl used
+  "litecoin_testnet". Unified to coin-prefixed path.
+- **Crash during share logging** — `share.ACTION({...})` after
+  `m_tracker.add(share)` accessed moved variant. Log BEFORE add.
+- **Boost.Log rotation** — `keywords::target` moved debug.log to logs/.
+  Removed target keyword to keep debug.log at `~/.c2pool/debug.log`.
+- **"from localhost:0"** log for LevelDB-loaded and downloaded shares.
+  Database shares now show "from database", downloaded shares show peer addr.
+
+### Added
+- **p2pool-style share logging** — "Received share: hash=X height=Y from
+  SOURCE", "Processing N shares from SOURCE...", "GOT SHARE!", and
+  "P2Pool: N shares in chain (M verified/N total) Peers: P" status line.
+- **Share creation counters** — periodic logging of calls/guard_blocked/
+  pow_failed/created every 60 seconds.
+- **Crash handler** — catches SIGSEGV/SIGABRT, writes backtrace to
+  `/tmp/c2pool_crash.log`. Also `std::set_terminate()` handler.
+- **Startup banner** — framed MIT license warning in LOG_WARNING.
+- **hash_link unit tests** — 11 tests including production-path coinbase
+  round-trip verification. Added to CI build targets.
+- **Share cross-check** — runs `share_init_verify` on self-created shares
+  before broadcasting; prevents sending shares peers would reject.
+- **Faster initial sync** — batch size scaled with O(chain_length) walk cost.
+
+### Changed
+- Stratum `nbits` field now sends GBT block difficulty (not share target).
+  Miners put this in the 80-byte header nBits field.
+- Share chain guard: only blocks on null prev_share_hash (removed wrong
+  verified >= 100 guard that prevented share creation).
+
 ## [0.7.0] - 2026-03-12
 
 ### Added
