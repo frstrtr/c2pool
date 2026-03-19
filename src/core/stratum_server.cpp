@@ -752,6 +752,14 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.witness_root            = job.witness_root;
     snapshot.share_bits      = mining_interface_->m_share_bits.load();
     snapshot.share_max_bits  = mining_interface_->m_share_max_bits.load();
+    // Pass frozen share fields through to ShareCreationParams
+    snapshot.frozen_ref.absheight = job.frozen_absheight;
+    snapshot.frozen_ref.abswork = job.frozen_abswork;
+    snapshot.frozen_ref.far_share_hash = job.frozen_far_share_hash;
+    snapshot.frozen_ref.max_bits = job.frozen_max_bits;
+    snapshot.frozen_ref.bits = job.frozen_bits;
+    snapshot.frozen_ref.timestamp = job.frozen_timestamp;
+    snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
 
     // Check EVERY submission for block-level PoW — even rejected shares
     // can meet the blockchain target and must be submitted as blocks.
@@ -1028,6 +1036,14 @@ void StratumSession::send_notify_work(bool force_clean)
         je.subsidy = cbr.snapshot.subsidy;
         je.witness_commitment_hex = std::move(cbr.snapshot.witness_commitment_hex);
         je.witness_root = cbr.snapshot.witness_root;
+        je.frozen_absheight = cbr.snapshot.frozen_ref.absheight;
+        je.frozen_abswork = cbr.snapshot.frozen_ref.abswork;
+        je.frozen_far_share_hash = cbr.snapshot.frozen_ref.far_share_hash;
+        je.frozen_max_bits = cbr.snapshot.frozen_ref.max_bits;
+        je.frozen_bits = cbr.snapshot.frozen_ref.bits;
+        je.frozen_timestamp = cbr.snapshot.frozen_ref.timestamp;
+        je.frozen_merged_payout_hash = cbr.snapshot.frozen_ref.merged_payout_hash;
+        je.has_frozen = true;
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {
             for (const auto& tx : tmpl["transactions"]) {

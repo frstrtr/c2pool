@@ -1292,7 +1292,7 @@ MiningInterface::build_connection_coinbase(
         branches_u256.push_back(h);
     }
 
-    auto [ref_hash, last_txout_nonce] = m_ref_hash_fn(
+    auto rhr = m_ref_hash_fn(
         prev_share_hash,
         scriptsig_bytes, payout_script, subsidy, bits, timestamp,
         m_segwit_active, m_cached_witness_commitment, m_cached_witness_root,
@@ -1301,7 +1301,7 @@ MiningInterface::build_connection_coinbase(
     // Build ref_hash hex (32 bytes LE)
     std::string ref_hash_hex;
     {
-        auto ref_chars = ref_hash.GetChars();
+        auto ref_chars = rhr.ref_hash.GetChars();
         for (unsigned char b : ref_chars) {
             ref_hash_hex += HEX[b >> 4];
             ref_hash_hex += HEX[b & 0x0f];
@@ -1341,6 +1341,7 @@ MiningInterface::build_connection_coinbase(
     snap.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
     snap.witness_commitment_hex = m_cached_witness_commitment;
     snap.witness_root = m_cached_witness_root;
+    snap.frozen_ref = rhr;
     return {std::move(cb1), std::move(cb2), std::move(snap)};
 }
 
@@ -4448,10 +4449,19 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 // Optional operator-provided authority message blob (V36 message_data).
                 params.message_data = get_operator_message_blob();
 
-                // Use the share chain tip from work-generation time (stored in job)
-                // so ref_hash matches the one embedded in the coinbase OP_RETURN.
-                if (job)
+                // Use the share chain tip and frozen fields from work-generation time.
+                // These match what was used to compute the ref_hash in the coinbase.
+                if (job) {
                     params.prev_share_hash = job->prev_share_hash;
+                    params.frozen_absheight = job->frozen_ref.absheight;
+                    params.frozen_abswork = job->frozen_ref.abswork;
+                    params.frozen_far_share_hash = job->frozen_ref.far_share_hash;
+                    params.frozen_max_bits = job->frozen_ref.max_bits;
+                    params.frozen_bits = job->frozen_ref.bits;
+                    params.frozen_timestamp = job->frozen_ref.timestamp;
+                    params.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
+                    params.has_frozen_fields = (job->frozen_ref.absheight > 0);
+                }
             }
 
             // Bootstrap: when chain is empty (bits==0), use max_target

@@ -1587,7 +1587,15 @@ uint256 create_local_share(
     const std::vector<unsigned char>& actual_coinbase_bytes = {},
     const uint256& witness_root = uint256(),
     uint32_t override_max_bits = 0,
-    uint32_t override_bits = 0)
+    uint32_t override_bits = 0,
+    // Frozen share fields from template time — when set, override computed values
+    // to ensure ref_hash matches the one embedded in the coinbase.
+    uint32_t frozen_absheight = 0,
+    uint128  frozen_abswork = uint128(),
+    uint256  frozen_far_share_hash = uint256(),
+    uint32_t frozen_timestamp = 0,
+    uint256  frozen_merged_payout_hash = uint256(),
+    bool     has_frozen = false)
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1677,6 +1685,17 @@ uint256 create_local_share(
     } else {
         share.m_absheight = 0;
         share.m_far_share_hash = uint256();
+    }
+
+    // Override with frozen fields from template time (if available).
+    // These must match what ref_hash_fn computed when building the coinbase.
+    if (has_frozen) {
+        share.m_absheight = frozen_absheight;
+        share.m_abswork = frozen_abswork;
+        share.m_far_share_hash = frozen_far_share_hash;
+        share.m_timestamp = frozen_timestamp;
+        share.m_merged_payout_hash = frozen_merged_payout_hash;
+        // max_bits and bits are already handled by override_max_bits/override_bits
     }
 
     // Random last_txout_nonce for OP_RETURN uniqueness

@@ -238,10 +238,21 @@ public:
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0,
                             const std::string& chain = "LTC");
     
+    // Frozen share fields returned by ref_hash_fn — must be defined before JobSnapshot.
+    struct RefHashResult {
+        uint256  ref_hash;
+        uint64_t last_txout_nonce{0};
+        uint32_t absheight{0};
+        uint128  abswork;
+        uint256  far_share_hash;
+        uint32_t max_bits{0};
+        uint32_t bits{0};
+        uint32_t timestamp{0};
+        uint256  merged_payout_hash;
+    };
+
     // Stratum-style methods (for advanced miners)
     // Job snapshot: holds all template data frozen at the time a mining job was sent.
-    // Passed to mining_submit / build_block_from_stratum so the submitted block
-    // matches the exact template the miner hashed (not the live/refreshed one).
     struct JobSnapshot {
         std::string coinb1, coinb2;
         std::string gbt_prevhash;      // BE display hex
@@ -258,6 +269,7 @@ public:
         uint32_t    share_bits{0};    // share target bits from compute_share_target()
         uint32_t    share_max_bits{0}; // share max_bits from compute_share_target()
         std::string block_nbits;      // original GBT block bits (for block target check)
+        RefHashResult frozen_ref;     // frozen share fields from template time
     };
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
@@ -321,7 +333,7 @@ public:
     // the share tracker state (prev_share, absheight, abswork, etc.) and
     // the miner's payout address (implicit via existing connection state).
     // Called per-connection during work generation.
-    using ref_hash_fn_t = std::function<std::pair<uint256, uint64_t>(
+    using ref_hash_fn_t = std::function<RefHashResult(
         const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
         const std::vector<unsigned char>& payout_script,
@@ -340,6 +352,8 @@ public:
         uint64_t subsidy{0};
         std::string witness_commitment_hex;
         uint256 witness_root;
+        // Frozen share fields from ref_hash_fn
+        RefHashResult frozen_ref;
     };
 
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
@@ -379,6 +393,19 @@ public:
         std::vector<unsigned char> full_coinbase_bytes;  // actual mined coinbase TX for hash_link
         std::vector<unsigned char> message_data;         // optional V36 authority message blob
         uint256 prev_share_hash;  // share chain tip at work-generation time
+
+        // Frozen share fields from ref_hash_fn (template creation time).
+        // These MUST match what was used to compute the ref_hash in the coinbase.
+        // If create_local_share recomputes them from current tracker state,
+        // they may differ → ref_hash mismatch → peer rejection.
+        uint32_t frozen_absheight{0};
+        uint128  frozen_abswork;
+        uint256  frozen_far_share_hash;
+        uint32_t frozen_max_bits{0};
+        uint32_t frozen_bits{0};     // share target at template time
+        uint32_t frozen_timestamp{0};
+        uint256  frozen_merged_payout_hash;
+        bool     has_frozen_fields{false};  // true if the above are valid
     };
     using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }

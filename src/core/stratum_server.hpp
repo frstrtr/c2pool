@@ -68,6 +68,15 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
         uint256     witness_root;            // raw wtxid merkle root frozen at job creation
         std::string gbt_block_nbits; // original GBT block bits (for block target check)
+        // Frozen share fields from template time
+        uint32_t frozen_absheight{0};
+        uint128  frozen_abswork;
+        uint256  frozen_far_share_hash;
+        uint32_t frozen_max_bits{0};
+        uint32_t frozen_bits{0};
+        uint32_t frozen_timestamp{0};
+        uint256  frozen_merged_payout_hash;
+        bool     has_frozen{false};
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection

@@ -2041,7 +2041,7 @@ int main(int argc, char* argv[]) {
                     const uint256& witness_root,
                     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs,
                     const std::vector<uint256>& merkle_branches)
-                    -> std::pair<uint256, uint64_t>
+                    -> core::MiningInterface::RefHashResult
                 {
                     ltc::RefHashParams params;
                     params.prev_share = frozen_prev_share;
@@ -2150,7 +2150,18 @@ int main(int argc, char* argv[]) {
                             params.prev_share, chain::bits_to_target(bits));
                     }
 
-                    return ltc::compute_ref_hash_for_work(params);
+                    auto [rh, nonce] = ltc::compute_ref_hash_for_work(params);
+                    core::MiningInterface::RefHashResult result;
+                    result.ref_hash = rh;
+                    result.last_txout_nonce = nonce;
+                    result.absheight = params.absheight;
+                    result.abswork = params.abswork;
+                    result.far_share_hash = params.far_share_hash;
+                    result.max_bits = params.max_bits;
+                    result.bits = params.bits;
+                    result.timestamp = params.timestamp;
+                    result.merged_payout_hash = params.merged_payout_hash;
+                    return result;
                 });
 
             // Wire the share creation hook so mining_submit() creates a real
@@ -2227,7 +2238,8 @@ int main(int argc, char* argv[]) {
                     if (p.stale_info == 253)      stale = ltc::StaleInfo::orphan;
                     else if (p.stale_info == 254)  stale = ltc::StaleInfo::doa;
 
-                    // Create the share and add it to the tracker
+                    // Create the share and add it to the tracker.
+                    // Pass frozen fields from template time so ref_hash matches coinbase.
                     uint256 share_hash = ltc::create_local_share(
                         p2p_node->tracker(),
                         min_header,
@@ -2243,7 +2255,15 @@ int main(int argc, char* argv[]) {
                         p.witness_commitment_hex,
                         p.message_data,
                         p.full_coinbase_bytes,
-                        p.witness_root);
+                        p.witness_root,
+                        p.has_frozen_fields ? p.frozen_max_bits : 0,
+                        p.has_frozen_fields ? p.frozen_bits : 0,
+                        p.frozen_absheight,
+                        p.frozen_abswork,
+                        p.frozen_far_share_hash,
+                        p.frozen_timestamp,
+                        p.frozen_merged_payout_hash,
+                        p.has_frozen_fields);
 
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {
