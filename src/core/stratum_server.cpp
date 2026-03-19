@@ -916,7 +916,6 @@ void StratumSession::send_notify_work(bool force_clean)
         version = ss.str();
 
         // Save original GBT block bits for block-level target check
-        std::string gbt_block_nbits;
         if (tmpl.contains("bits"))
             gbt_block_nbits = tmpl["bits"].get<std::string>();
         else
