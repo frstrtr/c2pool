@@ -1415,6 +1415,22 @@ void MiningInterface::refresh_work()
 
                     auto expected = m_pplns_fn(best, block_target, coinbase_value, m_donation_script);
 
+                    // Debug: log PPLNS distribution
+                    {
+                        static int pplns_log = 0;
+                        if (pplns_log++ % 60 == 0) { // every ~5 min (60 * 5s interval)
+                            LOG_INFO << "[PPLNS] " << expected.size() << " addrs, subsidy=" << coinbase_value;
+                            for (const auto& [script, amount] : expected) {
+                                uint64_t sat = static_cast<uint64_t>(amount);
+                                LOG_INFO << "[PPLNS]   script(" << script.size() << ")="
+                                         << (script.size() > 4 ? HexStr(std::span<const unsigned char>(
+                                             reinterpret_cast<const unsigned char*>(script.data()),
+                                             std::min(script.size(), size_t(10)))) : "?")
+                                         << "... amount=" << sat;
+                            }
+                        }
+                    }
+
                     if (!expected.empty()) {
                         static const char* HEX = "0123456789abcdef";
 
