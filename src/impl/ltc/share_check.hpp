@@ -1692,17 +1692,17 @@ uint256 create_local_share(
     // Override with frozen fields from template time (if available).
     // These must match what ref_hash_fn computed when building the coinbase.
     if (has_frozen) {
-        LOG_INFO << "[frozen] Applying frozen fields: absheight=" << frozen_absheight
-                 << " bits=" << std::hex << override_bits << std::dec
-                 << " timestamp=" << frozen_timestamp;
+        LOG_INFO << "[frozen] Applying: absheight=" << frozen_absheight
+                 << " bits=" << std::hex << override_bits
+                 << " max_bits=" << override_max_bits << std::dec
+                 << " ts=" << frozen_timestamp;
         share.m_absheight = frozen_absheight;
         share.m_abswork = frozen_abswork;
         share.m_far_share_hash = frozen_far_share_hash;
         share.m_timestamp = frozen_timestamp;
         share.m_merged_payout_hash = frozen_merged_payout_hash;
-    } else {
-        static int nf = 0;
-        if (nf++ < 3) LOG_WARNING << "[frozen] NOT frozen — share fields computed from current state";
+        if (override_max_bits) share.m_max_bits = override_max_bits;
+        if (override_bits) share.m_bits = override_bits;
     }
 
     // Random last_txout_nonce for OP_RETURN uniqueness
