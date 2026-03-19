@@ -330,20 +330,27 @@ public:
         }
 
         // Phase 2: Extend verification from verified heads.
-        // Cap per-cycle verification to keep think() under ~5 seconds.
-        // Python p2pool stays responsive because generate_transaction() uses
-        // a WeightsSkipList (O(log n) cached PPLNS walk).  Our V36 decayed
-        // weights walk is O(chain_length) per share.
+        // During initial sync, verify aggressively (larger batches) so we can
+        // start creating shares sooner. Once caught up, use smaller batches
+        // to keep the ioc thread responsive.
         //
-        // Batch size scales inversely with chain_length:
-        //   testnet  (chain_length=400):   20 shares × 400 walk ≈ 4s
-        //   mainnet  (chain_length=8640):   2 shares × 8640 walk ≈ 4s
-        //   future variable window:        auto-adjusts
-        // Initial 400 shares verified across ~20 cycles (testnet) or
-        // ~200 cycles (mainnet) with zero ioc freeze.
-        const int32_t VERIFY_BATCH_SIZE = std::max(
-            2, static_cast<int32_t>(8000 / std::max(PoolConfig::chain_length(), uint32_t(1))));
-        int32_t verify_budget = VERIFY_BATCH_SIZE;
+        // p2pool verifies all shares in one pass using O(log n) skip lists.
+        // Our PPLNS walk is O(chain_length) per share, so we can't verify
+        // everything at once on mainnet. But we CAN afford large batches
+        // during initial catch-up (the ioc thread isn't doing much else).
+        int32_t verify_budget;
+        {
+            auto verified_sz = verified.size();
+            auto target_sz = PoolConfig::real_chain_length();
+            if (verified_sz < target_sz) {
+                // Initial sync: verify up to 200 per cycle (catches up in ~2 cycles for testnet)
+                verify_budget = 200;
+            } else {
+                // Steady state: small batches
+                verify_budget = std::max(
+                    2, static_cast<int32_t>(8000 / std::max(PoolConfig::chain_length(), uint32_t(1))));
+            }
+        }
 
         for (auto& [head_hash, tail_hash] : verified.get_heads())
         {
