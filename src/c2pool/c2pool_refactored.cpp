@@ -373,7 +373,7 @@ int main(int argc, char* argv[]) {
 
     LOG_WARNING << "############################################################";
     LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK   #";
-    LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY    #";
+    LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY      #";
     LOG_WARNING << "#  OF ANY KIND, EXPRESS OR IMPLIED.                        #";
     LOG_WARNING << "#  Distributed under the MIT/X11 software license          #";
     LOG_WARNING << "#  See http://www.opensource.org/licenses/mit-license.php  #";
