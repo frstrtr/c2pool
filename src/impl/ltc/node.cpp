@@ -300,9 +300,11 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
         // Log received share BEFORE add (add may move/invalidate the variant)
         share.ACTION({
+            auto as = addr.to_string();
+            std::string source = (addr.port() == 0) ? as.substr(0, as.rfind(':')) : as;
             LOG_INFO << "Received share: hash=" << obj->m_hash.GetHex().substr(0, 16)
                      << " height=" << obj->m_absheight
-                     << " from " << addr.to_string();
+                     << " from " << source;
         });
 
         m_tracker.add(share);
@@ -350,9 +352,11 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 
     if (new_count > 0) {
-        LOG_INFO << "[Pool] Processed " << new_count << " new shares from "
-                 << addr.to_string() << " (dup=" << dup_count << " total_chain="
-                 << m_tracker.chain.size() << ")";
+        auto as2 = addr.to_string();
+        std::string source = (addr.port() == 0) ? as2.substr(0, as2.rfind(':')) : as2;
+        LOG_INFO << "Processing " << new_count << " shares from "
+                 << source << "... (dup=" << dup_count
+                 << " chain=" << m_tracker.chain.size() << ")";
     }
 
     // NOTE: Do NOT call run_think() here. During download sync, the chain is
@@ -632,7 +636,7 @@ void NodeImpl::load_persisted_shares()
             std::vector<unsigned char> share_bytes(data.begin() + 8, data.end());
             PackStream ps(share_bytes);
 
-            auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"0.0.0.0", 0});
+            auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
             if (!m_chain->contains(share.hash()))
             {
                 m_tracker.add(share);
