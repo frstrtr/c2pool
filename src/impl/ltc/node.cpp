@@ -867,7 +867,7 @@ void NodeImpl::run_think()
         auto verified  = m_tracker.verified.size();
         auto peers     = m_peers.size();
 
-        LOG_INFO << "P2Pool: " << chain_sz << " shares in chain ("
+        LOG_INFO << "c2pool: " << chain_sz << " shares in chain ("
                  << verified << " verified/" << chain_sz << " total) Peers: "
                  << peers;
 
