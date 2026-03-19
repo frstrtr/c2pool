@@ -366,15 +366,15 @@ int main(int argc, char* argv[]) {
               << "  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n"
               << "  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\n"
               << "\n";
-    LOG_INFO << "########################################################################";
-    LOG_INFO << "# c2pool v0.1 — P2Pool rebirth in C++                                #";
-    LOG_INFO << "# https://github.com/frstrtr/c2pool                                  #";
-    LOG_INFO << "########################################################################";
-    LOG_WARNING << "# THIS IS EXPERIMENTAL SOFTWARE — USE AT YOUR OWN RISK               #";
-    LOG_WARNING << "# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND    #";
-    LOG_WARNING << "# Distributed under the MIT/X11 software license                     #";
-    LOG_WARNING << "# See http://www.opensource.org/licenses/mit-license.php              #";
-    LOG_WARNING << "########################################################################";
+    LOG_INFO    << "######################################################################";
+    LOG_INFO    << "#  c2pool v0.1 -- P2Pool rebirth in C++                            #";
+    LOG_INFO    << "#  https://github.com/frstrtr/c2pool                               #";
+    LOG_INFO    << "######################################################################";
+    LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK            #";
+    LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY             #";
+    LOG_WARNING << "#  Distributed under the MIT/X11 software license                  #";
+    LOG_WARNING << "#  See http://www.opensource.org/licenses/mit-license.php           #";
+    LOG_WARNING << "######################################################################";
     
     // Default settings
     auto settings = std::make_unique<core::Settings>();
