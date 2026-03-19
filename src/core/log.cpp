@@ -104,10 +104,11 @@ void Logger::init(const std::string& log_file_name, int rotation_size_mb, int ma
         boost::log::keywords::file_name = debug_log.string(),
         boost::log::keywords::rotation_size = rotation_size_mb * 1024 * 1024,
         boost::log::keywords::open_mode = std::ios_base::app,
-        keywords::target = log_dir / "logs",
-        keywords::max_size = max_total_mb * 1024 * 1024,
         boost::log::keywords::min_free_space = 30 * 1024 * 1024
     );
+    // Note: removed keywords::target (log rotation directory) — it caused
+    // the active debug.log to be moved to logs/, making tail -f unreliable.
+    // Rotated files now stay alongside debug.log in ~/.c2pool/.
     fsSink->set_formatter(logFmt);
     fsSink->locked_backend()->auto_flush(true);
 }
