@@ -297,23 +297,15 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         }
 
         ++new_count;
-        m_tracker.add(share);
 
-        // Log received share (matching p2pool's "Received good share" format)
+        // Log received share BEFORE add (add may move/invalidate the variant)
         share.ACTION({
-            auto target = chain::bits_to_target(obj->m_bits);
-            double diff = chain::target_to_difficulty(target);
-            auto script = ltc::get_share_script(obj);
-            static const char* HX = "0123456789abcdef";
-            std::string miner_hex;
-            for (size_t i = 0; i < std::min<size_t>(8, script.size()); ++i) {
-                miner_hex += HX[script[i]>>4]; miner_hex += HX[script[i]&0xf];
-            }
-            LOG_INFO << "Received share: diff=" << std::scientific << diff
-                     << " hash=" << obj->m_hash.GetHex().substr(0, 16) << "..."
+            LOG_INFO << "Received share: hash=" << obj->m_hash.GetHex().substr(0, 16)
                      << " height=" << obj->m_absheight
                      << " from " << addr.to_string();
         });
+
+        m_tracker.add(share);
 
         // NOTE: Do NOT trim inside the processing loop. The trim in run_think()
         // handles pruning between batches. Trimming here is unsafe because
