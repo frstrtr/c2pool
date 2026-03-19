@@ -2177,25 +2177,18 @@ int main(int argc, char* argv[]) {
                 }
 
                 try {
-                    // Share creation guards:
-                    // 1. prev_share_hash must be non-null (chain must be synced)
-                    // 2. Verified chain must be >= REAL_CHAIN_LENGTH for correct PPLNS.
-                    //    p2pool rejects shares whose merged_payout_hash doesn't match
-                    //    because PPLNS weights depend on the full verified chain window.
-                    auto chain_sz = p2p_node->tracker().chain.size();
-                    auto verified_sz = p2p_node->tracker().verified.size();
-                    auto min_verified = ltc::PoolConfig::real_chain_length();
-
-                    if (p.prev_share_hash.IsNull() || verified_sz < min_verified) {
+                    // prev_share_hash must be non-null — the job needs a valid chain tip.
+                    // p2pool creates shares as soon as it has a chain (no verification guard).
+                    // PPLNS walks chain data directly, not verified data.
+                    if (p.prev_share_hash.IsNull()) {
                         ++s_guard_blocked;
                         static std::atomic<int64_t> s_last_warn{0};
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
                         if (now - s_last_warn.load() > 30'000'000'000LL) {
                             s_last_warn.store(now);
-                            LOG_WARNING << "[Pool] Skipping share: "
-                                        << (p.prev_share_hash.IsNull() ? "null prev_share" : "chain not verified")
-                                        << " (chain=" << chain_sz
-                                        << " verified=" << verified_sz << ")";
+                            LOG_WARNING << "[Pool] Skipping share: null prev_share_hash"
+                                        << " (chain=" << p2p_node->tracker().chain.size()
+                                        << " verified=" << p2p_node->tracker().verified.size() << ")";
                         }
                         return;
                     }

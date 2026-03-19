@@ -2017,19 +2017,9 @@ uint256 create_local_share(
     // Set the share's identity hash
     share.m_hash = share_hash;
 
-    // Self-validation: PoW check using the DIRECT gentx_hash (from actual coinbase bytes).
-    //
-    // We CANNOT use share_init_verify here because it reconstructs gentx_hash via
-    // check_hash_link() which produces a DIFFERENT hash (hash_link bug — prefix_to_hash_link
-    // doesn't correctly capture the SHA256 midstate). The direct Hash(coinbase_bytes)
-    // gives the correct gentx_hash, which we already used for merkle_root above.
-    //
-    // The PoW check here uses the same header construction as calculate_share_difficulty
-    // (which reports correct difficulty values), so the scrypt hash will be correct.
-    //
-    // Peer verification still uses share_init_verify (check_hash_link path) because
-    // peers don't have the full coinbase — only the hash_link. The hash_link bug
-    // needs to be fixed separately for peer share acceptance.
+    // Self-validation: PoW check against share target.
+    // Also run share_init_verify to confirm peers will accept this share
+    // (same check they'll run when they receive it).
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (!target.IsNull()) {
@@ -2045,13 +2035,25 @@ uint256 create_local_share(
             LOG_INFO << "[Pool] REAL SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
                      << " target=" << target.GetHex().substr(0, 16)
                      << " diff=" << chain::target_to_difficulty(target);
+
+            // Cross-check: run the SAME verification that peers will run.
+            // If this fails, peers will reject the share as "PoW invalid".
+            try {
+                uint256 verify_hash = share_init_verify(share, false);
+                if (verify_hash != share_hash) {
+                    LOG_ERROR << "[Pool] CROSS-CHECK FAILED! share_init_verify hash="
+                              << verify_hash.GetHex().substr(0, 16)
+                              << " direct=" << share_hash.GetHex().substr(0, 16);
+                    // Don't broadcast — peers would reject and ban us
+                    return uint256();
+                }
+                LOG_INFO << "[Pool] Cross-check PASSED — peers will accept this share";
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[Pool] CROSS-CHECK EXCEPTION: " << e.what();
+                return uint256();
+            }
         }
     }
-
-    // No cross-check needed: the hash_link is derived from actual_coinbase_bytes
-    // (the exact bytes the miner solved), not from a re-computed PPLNS gentx.
-    // Python p2pool follows the same pattern — the gentx is captured once at
-    // template creation time and never re-derived.
 
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);
