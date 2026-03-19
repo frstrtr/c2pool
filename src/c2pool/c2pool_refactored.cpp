@@ -2282,10 +2282,10 @@ int main(int argc, char* argv[]) {
                         LOG_ERROR << "broadcast_share failed: " << e.what();
                     }
 
-                    LOG_INFO << "[Pool] Share created and broadcast: "
-                             << share_hash.GetHex()
+                    LOG_INFO << "GOT SHARE! " << share_hash.GetHex().substr(0, 8)
+                             << " prev " << prev_share.GetHex().substr(0, 8)
                              << " subsidy=" << p.subsidy
-                             << " merged_chains=" << merged_addrs.size();
+                             << " merged=" << merged_addrs.size();
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
                 }

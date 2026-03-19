@@ -299,6 +299,22 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         ++new_count;
         m_tracker.add(share);
 
+        // Log received share (matching p2pool's "Received good share" format)
+        share.ACTION({
+            auto target = chain::bits_to_target(obj->m_bits);
+            double diff = chain::target_to_difficulty(target);
+            auto script = ltc::get_share_script(obj);
+            static const char* HX = "0123456789abcdef";
+            std::string miner_hex;
+            for (size_t i = 0; i < std::min<size_t>(8, script.size()); ++i) {
+                miner_hex += HX[script[i]>>4]; miner_hex += HX[script[i]&0xf];
+            }
+            LOG_INFO << "Received share: diff=" << std::scientific << diff
+                     << " hash=" << obj->m_hash.GetHex().substr(0, 16) << "..."
+                     << " height=" << obj->m_absheight
+                     << " from " << addr.to_string();
+        });
+
         // NOTE: Do NOT trim inside the processing loop. The trim in run_think()
         // handles pruning between batches. Trimming here is unsafe because
         // shares added at the tail can be freed while the loop still holds
@@ -339,6 +355,12 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                                        abswork_256, target);
             });
         }
+    }
+
+    if (new_count > 0) {
+        LOG_INFO << "[Pool] Processed " << new_count << " new shares from "
+                 << addr.to_string() << " (dup=" << dup_count << " total_chain="
+                 << m_tracker.chain.size() << ")";
     }
 
     // NOTE: Do NOT call run_think() here. During download sync, the chain is
@@ -841,9 +863,10 @@ void NodeImpl::run_think()
     if (m_think_running.exchange(true))
         return;
 
-    LOG_INFO << "[Pool] run_think(): chain=" << m_tracker.chain.size()
-             << " verified=" << m_tracker.verified.size()
-             << " heads=" << m_tracker.chain.get_heads().size()
+    LOG_INFO << "P2Pool: " << m_tracker.chain.size() << " shares in chain ("
+             << m_tracker.verified.size() << " verified/"
+             << m_tracker.chain.size() << " total) Peers: "
+             << m_peers.size() << " heads=" << m_tracker.chain.get_heads().size()
              << " rss=" << get_rss_mb() << "MB";
 
     // Capture block_rel_height fn by value for thread safety
