@@ -460,8 +460,15 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         {
             if constexpr (ver >= ltc::SEGWIT_ACTIVATION_VERSION)
             {
-                if (share.m_segwit_data.has_value())
+                // PossiblyNoneType: ALWAYS serialize (p2pool writes default when None)
+                if (share.m_segwit_data.has_value()) {
                     ref_stream << share.m_segwit_data.value();
+                } else {
+                    std::vector<uint256> empty_branch;
+                    ref_stream << empty_branch;
+                    uint256 zero_root;
+                    ref_stream << zero_root;
+                }
             }
         }
 
@@ -1451,8 +1458,15 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
         {
             if constexpr (ver >= ltc::SEGWIT_ACTIVATION_VERSION)
             {
-                if (share.m_segwit_data.has_value())
+                // PossiblyNoneType: ALWAYS serialize (p2pool writes default when None)
+                if (share.m_segwit_data.has_value()) {
                     ref_stream << share.m_segwit_data.value();
+                } else {
+                    std::vector<uint256> empty_branch;
+                    ref_stream << empty_branch;
+                    uint256 zero_root;
+                    ref_stream << zero_root;
+                }
             }
         }
 
@@ -1729,9 +1743,18 @@ uint256 create_local_share(
     ref_stream << share.m_donation;
     { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
     ::Serialize(ref_stream, VarInt(share.m_desired_version));
-    // segwit_data (V36+, optional)
-    if (share.m_segwit_data.has_value())
+    // segwit_data: PossiblyNoneType in p2pool — ALWAYS serialize.
+    // When None, write default: {txid_merkle_link: {branch: [], index: 0}, wtxid_merkle_root: 0}
+    // = varint(0) [empty branch list] + uint256(0) [wtxid_merkle_root] = 33 bytes.
+    if (share.m_segwit_data.has_value()) {
         ref_stream << share.m_segwit_data.value();
+    } else {
+        // Write PossiblyNoneType default: empty branch list + zero wtxid_merkle_root
+        std::vector<uint256> empty_branch;
+        ref_stream << empty_branch;   // varint(0)
+        uint256 zero_root;
+        ref_stream << zero_root;      // 32 zero bytes
+    }
     ref_stream << share.m_merged_addresses;
     ref_stream << share.m_far_share_hash;
     ref_stream << share.m_max_bits;
@@ -1748,6 +1771,25 @@ uint256 create_local_share(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 hash_ref = Hash(ref_span_v);
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
+
+    // Diagnostic: dump ref_stream raw bytes + ref_hash_data for comparison with p2pool
+    {
+        static int ref_diag = 0;
+        if (ref_diag < 3) {
+            static const char* HX = "0123456789abcdef";
+            // Dump FULL ref_stream for byte-by-byte comparison with p2pool
+            std::string rs_hex;
+            auto* rp = reinterpret_cast<const unsigned char*>(ref_stream.data());
+            for (size_t i = 0; i < ref_stream.size(); ++i) {
+                rs_hex += HX[rp[i]>>4]; rs_hex += HX[rp[i]&0xf];
+            }
+            LOG_INFO << "[ref_stream] full=" << rs_hex;
+            LOG_INFO << "[ref_stream] total=" << ref_stream.size();
+            LOG_INFO << "[ref_stream] ref_hash=" << hash_ref.GetHex()
+                     << " ref_hash_via_merkle=" << ref_hash.GetHex();
+            ++ref_diag;
+        }
+    }
 
     // --- Derive hash_link from the actual mined coinbase ---
     // Python p2pool captures the gentx at template creation time in a closure
@@ -1862,7 +1904,7 @@ uint256 create_local_share(
         // Verify hash_link round-trip: does check_hash_link(hash_link, suffix) == Hash(full)?
         {
             static int hl_diag = 0;
-            if (hl_diag < 3) {
+            if (hl_diag < 5) {
                 std::vector<unsigned char> suffix(
                     coinbase_bytes_for_hashlink.end() - suffix_len,
                     coinbase_bytes_for_hashlink.end());
@@ -1870,13 +1912,39 @@ uint256 create_local_share(
                 auto full_span = std::span<const unsigned char>(
                     coinbase_bytes_for_hashlink.data(), coinbase_bytes_for_hashlink.size());
                 uint256 direct_result = Hash(full_span);
-                LOG_INFO << "[hash_link-roundtrip] direct=" << direct_result.GetHex();
-                LOG_INFO << "[hash_link-roundtrip] hashlink=" << hl_result.GetHex();
-                LOG_INFO << "[hash_link-roundtrip] MATCH=" << (hl_result == direct_result ? "YES" : "NO");
-                LOG_INFO << "[hash_link-roundtrip] prefix_len=" << prefix.size()
-                         << " suffix_len=" << suffix.size()
-                         << " total=" << coinbase_bytes_for_hashlink.size()
-                         << " gentx_before_refhash=" << gentx_before_refhash.size();
+                bool match = (hl_result == direct_result);
+
+                // Check if prefix ends with const_ending
+                size_t ce_len = gentx_before_refhash.size();
+                bool ce_match = (prefix.size() >= ce_len) &&
+                    std::equal(gentx_before_refhash.begin(), gentx_before_refhash.end(),
+                               prefix.end() - ce_len);
+
+                LOG_INFO << "[hash_link-roundtrip] MATCH=" << (match ? "YES" : "NO")
+                         << " CE_match=" << (ce_match ? "YES" : "NO")
+                         << " prefix=" << prefix.size()
+                         << " cb_total=" << coinbase_bytes_for_hashlink.size()
+                         << " CE=" << ce_len;
+
+                if (!match || !ce_match) {
+                    LOG_WARNING << "[hash_link-roundtrip] MISMATCH! direct=" << direct_result.GetHex()
+                                << " hashlink=" << hl_result.GetHex();
+                    // Dump boundary bytes for debugging
+                    static const char* HX = "0123456789abcdef";
+                    if (prefix.size() >= ce_len) {
+                        std::string pfx_tail, ce_hex;
+                        for (size_t i = prefix.size() - ce_len; i < prefix.size(); ++i) {
+                            pfx_tail += HX[prefix[i] >> 4];
+                            pfx_tail += HX[prefix[i] & 0xf];
+                        }
+                        for (size_t i = 0; i < ce_len; ++i) {
+                            ce_hex += HX[gentx_before_refhash[i] >> 4];
+                            ce_hex += HX[gentx_before_refhash[i] & 0xf];
+                        }
+                        LOG_WARNING << "[hash_link-roundtrip] prefix_tail=" << pfx_tail;
+                        LOG_WARNING << "[hash_link-roundtrip] expected_CE=" << ce_hex;
+                    }
+                }
                 ++hl_diag;
             }
         }

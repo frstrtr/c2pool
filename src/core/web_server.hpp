@@ -366,7 +366,8 @@ public:
         uint32_t block_version{0};
         uint256  prev_block_hash;
         uint32_t timestamp{0};
-        uint32_t bits{0};
+        uint32_t bits{0};          // share chain target bits (share.m_bits)
+        uint32_t block_bits{0};   // GBT block difficulty (min_header.m_bits in the 80-byte header)
         uint32_t nonce{0};
         std::vector<unsigned char> coinbase_scriptSig;  // BIP34 height + pool tag
         uint64_t subsidy{0};

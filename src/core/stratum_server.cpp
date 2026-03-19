@@ -647,9 +647,10 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     bool is_stale = (job_it == active_jobs_.end());
     if (is_stale) {
         ++stale_shares_;
-        LOG_INFO << "[Stratum] Stale share from " << username_ << " for expired job " << job_id;
-        // Return stale response to the miner, but DON'T skip block checking.
-        // With MAX_ACTIVE_JOBS=32, most "stale" shares still have job data.
+        LOG_INFO << "[Stratum] Stale share from " << username_ << " for expired job " << job_id
+                 << " (active_jobs=" << active_jobs_.size() << ")";
+        // Job data evicted — can't reconstruct block or share.
+        // Return stale response to the miner.
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = false;
@@ -913,18 +914,12 @@ void StratumSession::send_notify_work(bool force_clean)
         else
             gbt_block_nbits = "1d00ffff";
 
-        // Use share target bits for nbits in mining.notify.
-        // Miners hash the header with share bits (easier than block bits),
-        // so more solutions meet the share target → more real p2pool shares.
-        // This matches p2pool's approach: nbits in stratum = share chain difficulty.
-        uint32_t share_bits_val = mining_interface_->m_share_bits.load();
-        if (share_bits_val != 0) {
-            std::ostringstream sb;
-            sb << std::hex << std::setw(8) << std::setfill('0') << share_bits_val;
-            nbits = sb.str();
-        } else {
-            nbits = gbt_block_nbits;
-        }
+        // nbits in mining.notify = GBT BLOCK difficulty (not share target).
+        // p2pool sends block_bits here. The miner puts this in the 80-byte header's
+        // nBits field. The share difficulty is communicated separately via
+        // mining.set_difficulty (VARDIFF). This is critical for interoperability:
+        // p2pool stores min_header.bits = header.bits = GBT block bits.
+        nbits = gbt_block_nbits;
 
         if (tmpl.contains("curtime"))
             curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());

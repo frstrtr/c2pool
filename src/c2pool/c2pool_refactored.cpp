@@ -48,9 +48,23 @@
 static void segfault_handler(int sig) {
     void* frames[64];
     int n = backtrace(frames, 64);
-    fprintf(stderr, "\n=== SEGFAULT (signal %d) ===\n", sig);
+    fprintf(stderr, "\n=== CRASH (signal %d) ===\n", sig);
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
-    fprintf(stderr, "=== END SEGFAULT ===\n");
+    fprintf(stderr, "=== END CRASH ===\n");
+    // Also write to a crash log file for persistence
+    FILE* f = fopen("/tmp/c2pool_crash.log", "a");
+    if (f) {
+        time_t now = time(nullptr);
+        fprintf(f, "\n=== CRASH (signal %d) at %s", sig, ctime(&now));
+        char** syms = backtrace_symbols(frames, n);
+        if (syms) {
+            for (int i = 0; i < n; ++i)
+                fprintf(f, "  %s\n", syms[i]);
+            free(syms);
+        }
+        fprintf(f, "=== END CRASH ===\n");
+        fclose(f);
+    }
     _exit(128 + sig);
 }
 
@@ -297,6 +311,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGSEGV, segfault_handler);
+    std::signal(SIGABRT, segfault_handler);
     
     // Initialize logging
     core::log::Logger::init();
@@ -2098,26 +2113,58 @@ int main(int argc, char* argv[]) {
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
                 [&p2p_node](const core::MiningInterface::ShareCreationParams& p) {
+                // Counters for periodic status reporting
+                static std::atomic<uint64_t> s_call_count{0};
+                static std::atomic<uint64_t> s_guard_blocked{0};
+                static std::atomic<uint64_t> s_pow_failed{0};
+                static std::atomic<uint64_t> s_created{0};
+                static std::atomic<int64_t>  s_last_report{0};
+
+                uint64_t calls = ++s_call_count;
+                {
+                    auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                    if (now_ns - s_last_report.load() > 60'000'000'000LL) { // every 60s
+                        s_last_report.store(now_ns);
+                        LOG_INFO << "[ShareCreate] calls=" << calls
+                                 << " guard_blocked=" << s_guard_blocked.load()
+                                 << " pow_failed=" << s_pow_failed.load()
+                                 << " created=" << s_created.load();
+                    }
+                }
+
                 try {
-                    // Don't create shares before PPLNS is available.
-                    // Without chain data, the coinbase won't have correct PPLNS outputs
-                    // and Python peers will reject and ban us.
+                    // Share chain tip validation.
+                    // prev_share_hash comes from the job snapshot (frozen at work
+                    // generation time). If null, it means no shares were in the chain
+                    // when the job was created. We MUST NOT create shares with null
+                    // prev_share when peers have already sent us a chain — that
+                    // produces a "genesis" share that p2pool rejects and bans us for.
+                    //
+                    // Instead, wait until the job snapshot has a valid prev_share_hash,
+                    // which happens after think() identifies the best share and
+                    // ref_hash_fn gets called with the chain tip.
                     if (p.prev_share_hash.IsNull()) {
+                        ++s_guard_blocked;
                         static std::atomic<int64_t> s_last_warn{0};
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
                         if (now - s_last_warn.load() > 30'000'000'000LL) {
                             s_last_warn.store(now);
-                            LOG_WARNING << "[Pool] Skipping share creation: chain not ready (waiting for shares from peers)";
+                            LOG_WARNING << "[Pool] Skipping share: null prev_share_hash"
+                                        << " (chain=" << p2p_node->tracker().chain.size()
+                                        << " verified=" << p2p_node->tracker().verified.size() << ")";
                         }
                         return;
                     }
 
-                    // Build SmallBlockHeaderType from Stratum params
+                    // Build SmallBlockHeaderType from Stratum params.
+                    // min_header.m_bits = GBT BLOCK difficulty (the nBits the miner put
+                    // in the 80-byte header). This is different from share.m_bits (share
+                    // chain target). p2pool stores block_bits in min_header.
                     ltc::coin::SmallBlockHeaderType min_header;
                     min_header.m_version        = p.block_version;
                     min_header.m_previous_block  = p.prev_block_hash;
                     min_header.m_timestamp       = p.timestamp;
-                    min_header.m_bits            = p.bits;
+                    min_header.m_bits            = p.block_bits ? p.block_bits : p.bits;
                     min_header.m_nonce           = p.nonce;
 
                     // Coinbase scriptSig (BIP34 height + pool identifier)
@@ -2163,8 +2210,10 @@ int main(int argc, char* argv[]) {
 
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {
+                        ++s_pow_failed;
                         return;  // share failed PoW or validation; don't broadcast
                     }
+                    ++s_created;
 
                     // Broadcast to all connected peers
                     try {

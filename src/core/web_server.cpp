@@ -4353,17 +4353,22 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             params.timestamp = static_cast<uint32_t>(std::stoul(ntime, nullptr, 16));
 
             // Extract block template fields — prefer job snapshot over live template.
-            // Use SHARE target bits (from compute_share_target) for the share's m_bits,
-            // not the GBT block bits. This matches p2pool's behavior where each
-            // share's bits = share chain difficulty (consensus-determined).
+            // CRITICAL: share.m_bits (share chain target) and min_header.m_bits
+            // (block difficulty in the 80-byte header) are DIFFERENT values.
+            // - params.bits = share chain target from compute_share_target()
+            // - params.block_bits = GBT block difficulty (what the miner puts in the header)
+            // Confusing these causes p2pool to reject shares as "PoW invalid".
             {
                 std::lock_guard<std::mutex> lock(m_work_mutex);
                 if (job) {
                     params.block_version = job->version;
                     params.prev_block_hash.SetHex(job->gbt_prevhash);
-                    // Use share target bits — the miner's header has these as nbits
+                    // Share chain difficulty
                     params.bits = job->share_bits ? job->share_bits
                         : static_cast<uint32_t>(std::stoul(job->nbits, nullptr, 16));
+                    // Block difficulty (GBT bits) — goes into the 80-byte header
+                    params.block_bits = static_cast<uint32_t>(
+                        std::stoul(job->block_nbits.empty() ? job->nbits : job->block_nbits, nullptr, 16));
                     params.subsidy = job->subsidy;
                 } else if (m_work_valid) {
                     params.block_version = m_cached_template.value("version", 536870912U);
@@ -4371,12 +4376,17 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         params.prev_block_hash.SetHex(
                             m_cached_template["previousblockhash"].get<std::string>());
                     }
-                    // Use share target if available, fallback to GBT bits
+                    // Share chain difficulty
                     uint32_t sb = m_share_bits.load();
                     if (sb != 0) {
                         params.bits = sb;
                     } else if (m_cached_template.contains("bits")) {
                         params.bits = static_cast<uint32_t>(std::stoul(
+                            m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                    }
+                    // Block difficulty from GBT
+                    if (m_cached_template.contains("bits")) {
+                        params.block_bits = static_cast<uint32_t>(std::stoul(
                             m_cached_template["bits"].get<std::string>(), nullptr, 16));
                     }
                     params.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
