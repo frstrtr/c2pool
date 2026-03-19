@@ -508,15 +508,17 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
 uint256 NodeImpl::best_share_hash()
 {
-    // Return the cached result from the most recent think() cycle.
-    // Falls back to O(heads) scan only when think() hasn't run yet.
-    if (!m_best_share_hash.IsNull())
-        return m_best_share_hash;
-
+    // p2pool uses the RAW chain (tracker.items) for PPLNS, not the verified
+    // chain. This ensures all miners get paid from the first block, even if
+    // verification hasn't caught up yet. Verification is for detecting bad
+    // shares/peers, not for restricting PPLNS distribution.
+    //
+    // Always return the tallest raw chain head. The verified best (from
+    // think()) is used for peer scoring and ban decisions, not for payouts.
     if (!m_chain || m_chain->size() == 0)
         return uint256::ZERO;
 
-    // Pick the head with the greatest height
+    // Pick the head with the greatest height in the RAW chain
     uint256 best;
     int32_t best_height = -1;
     for (const auto& [head_hash, tail_hash] : m_chain->get_heads())
