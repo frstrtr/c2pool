@@ -760,6 +760,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.bits = job.frozen_bits;
     snapshot.frozen_ref.timestamp = job.frozen_timestamp;
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
+    snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
+    snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
 
     // Check EVERY submission for block-level PoW — even rejected shares
     // can meet the blockchain target and must be submitted as blocks.
@@ -1042,6 +1044,8 @@ void StratumSession::send_notify_work(bool force_clean)
         je.frozen_bits = cbr.snapshot.frozen_ref.bits;
         je.frozen_timestamp = cbr.snapshot.frozen_ref.timestamp;
         je.frozen_merged_payout_hash = cbr.snapshot.frozen_ref.merged_payout_hash;
+        je.frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
+        je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
         je.has_frozen = true;
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {

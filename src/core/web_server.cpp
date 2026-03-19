@@ -1260,8 +1260,31 @@ MiningInterface::build_connection_coinbase(
         mm_hex += HEX[b & 0x0f];
     }
 
-    // ScriptSig: height + mm + tag (NO extranonce!)
-    std::string scriptsig_hex = height_hex + mm_hex + tag_hex;
+    // THE state root (V37 prep — 32 bytes appended to scriptSig like build_coinbase_parts)
+    std::string state_root_hex;
+    {
+        uint32_t tmpl_height = m_cached_template.value("height", uint32_t(0));
+        uint32_t tmpl_bits = 0;
+        if (m_cached_template.contains("bits"))
+            tmpl_bits = static_cast<uint32_t>(std::stoul(
+                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+        uint256 the_root = compute_the_state_root(
+            m_cached_pplns_outputs,
+            static_cast<uint32_t>(m_cached_pplns_outputs.size()),
+            tmpl_height, tmpl_bits);
+        if (!the_root.IsNull()) {
+            state_root_hex.reserve(64);
+            for (int i = 0; i < 32; ++i) {
+                unsigned char c = the_root.data()[i];
+                state_root_hex += HEX[c >> 4];
+                state_root_hex += HEX[c & 0x0f];
+            }
+        }
+    }
+
+    // ScriptSig: height + mm + tag + state_root (NO extranonce!)
+    // Must match what build_coinbase_parts produces in the actual coinbase.
+    std::string scriptsig_hex = height_hex + mm_hex + tag_hex + state_root_hex;
 
     // Decode to bytes for ref_hash computation
     std::vector<unsigned char> scriptsig_bytes;
@@ -4460,6 +4483,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_bits = job->frozen_ref.bits;
                     params.frozen_timestamp = job->frozen_ref.timestamp;
                     params.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
+                    params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
+                    params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
                     params.has_frozen_fields = (job->frozen_ref.absheight > 0);
                 }
             }

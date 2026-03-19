@@ -2164,6 +2164,10 @@ int main(int argc, char* argv[]) {
                     result.bits = params.bits;
                     result.timestamp = params.timestamp;
                     result.merged_payout_hash = params.merged_payout_hash;
+                    // Freeze segwit merkle branches + witness root — these change
+                    // between GBT updates but the ref_hash was computed with these values.
+                    result.frozen_merkle_branches = merkle_branches;
+                    result.frozen_witness_root = witness_root;
                     return result;
                 });
 
@@ -2266,7 +2270,9 @@ int main(int argc, char* argv[]) {
                         p.frozen_far_share_hash,
                         p.frozen_timestamp,
                         p.frozen_merged_payout_hash,
-                        p.has_frozen_fields);
+                        p.has_frozen_fields,
+                        p.frozen_merkle_branches,
+                        p.frozen_witness_root);
 
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {

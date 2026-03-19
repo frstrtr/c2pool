@@ -550,9 +550,10 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
 
     // weak_ptr prevents use-after-free if peer disconnects before reply
     std::weak_ptr<pool::Peer<ltc::Peer>> weak_peer = peer;
+    auto peer_addr_for_log = peer->addr();
 
     request_shares(req_id, peer, hashes, PARENTS_PER_REQUEST, stops,
-        [this, weak_peer, target_hash](ltc::ShareReplyData reply)
+        [this, weak_peer, target_hash, peer_addr_for_log](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
 
@@ -573,7 +574,7 @@ void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
                 else
                     data.add(reply.m_items[idx], {});
             }
-            processing_shares(data, NetService{});
+            processing_shares(data, peer_addr_for_log);
 
             // Find the oldest share's parent — if unknown, keep fetching
             uint256 oldest_parent;

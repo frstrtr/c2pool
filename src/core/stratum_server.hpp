@@ -76,6 +76,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         uint32_t frozen_bits{0};
         uint32_t frozen_timestamp{0};
         uint256  frozen_merged_payout_hash;
+        std::vector<uint256> frozen_merkle_branches;  // segwit txid_merkle_link at template time
+        uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
         bool     has_frozen{false};
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;

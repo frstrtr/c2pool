@@ -1597,7 +1597,9 @@ uint256 create_local_share(
     uint256  frozen_far_share_hash = uint256(),
     uint32_t frozen_timestamp = 0,
     uint256  frozen_merged_payout_hash = uint256(),
-    bool     has_frozen = false)
+    bool     has_frozen = false,
+    const std::vector<uint256>& frozen_merkle_branches = {},
+    const uint256& frozen_witness_root = uint256())
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1732,12 +1734,24 @@ uint256 create_local_share(
     if (segwit_active && !witness_commitment_hex.empty())
     {
         SegwitData sd;
-        // txid_merkle_link == merkle_link (coinbase txid == stripped hash for non-witness)
-        sd.m_txid_merkle_link.m_branch = merkle_branches;
+        // txid_merkle_link: use FROZEN merkle branches from template time if available.
+        // The ref_hash was computed with these branches at template time. If new transactions
+        // arrived between template creation and share submission, the branches change →
+        // ref_hash mismatch → p2pool rejects the share as "PoW invalid".
+        sd.m_txid_merkle_link.m_branch = (has_frozen && !frozen_merkle_branches.empty())
+            ? frozen_merkle_branches : merkle_branches;
         sd.m_txid_merkle_link.m_index  = 0;
-        // wtxid_merkle_root: the RAW witness merkle root (not the commitment hash)
-        // Python stores this raw root and computes SHA256d(root || '[P2Pool]'*4) at verify time
-        if (!witness_root.IsNull()) {
+        // Debug: log only when frozen/current diverge (indicates the fix is active)
+        if (has_frozen && !frozen_merkle_branches.empty() &&
+            frozen_merkle_branches.size() != merkle_branches.size()) {
+            LOG_INFO << "[segwit-freeze] branches changed: frozen="
+                     << frozen_merkle_branches.size()
+                     << " current=" << merkle_branches.size();
+        }
+        // wtxid_merkle_root: use frozen witness root if available
+        if (has_frozen && !frozen_witness_root.IsNull()) {
+            sd.m_wtxid_merkle_root = frozen_witness_root;
+        } else if (!witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = witness_root;
         } else if (witness_commitment_hex.size() >= 76) {
             // Legacy fallback: extract commitment hash from witness_commitment_hex
@@ -1815,21 +1829,13 @@ uint256 create_local_share(
         ref_hash = coinbase_ref_hash;
     }
 
-    // Diagnostic: dump ref_stream raw bytes + ref_hash_data for comparison with p2pool
+    // Diagnostic: log ref_hash match/mismatch (first few only to avoid log spam)
     {
         static int ref_diag = 0;
-        if (ref_diag < 3) {
-            static const char* HX = "0123456789abcdef";
-            // Dump FULL ref_stream for byte-by-byte comparison with p2pool
-            std::string rs_hex;
-            auto* rp = reinterpret_cast<const unsigned char*>(ref_stream.data());
-            for (size_t i = 0; i < ref_stream.size(); ++i) {
-                rs_hex += HX[rp[i]>>4]; rs_hex += HX[rp[i]&0xf];
-            }
-            LOG_INFO << "[ref_stream] full=" << rs_hex;
-            LOG_INFO << "[ref_stream] total=" << ref_stream.size();
-            LOG_INFO << "[ref_stream] ref_hash=" << hash_ref.GetHex()
-                     << " ref_hash_via_merkle=" << ref_hash.GetHex();
+        bool match = (hash_ref == ref_hash);
+        if (!match || ref_diag < 3) {
+            LOG_INFO << "[ref_stream] total=" << ref_stream.size()
+                     << " ref_hash_match=" << (match ? "YES" : "NO");
             ++ref_diag;
         }
     }

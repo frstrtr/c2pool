@@ -249,6 +249,10 @@ public:
         uint32_t bits{0};
         uint32_t timestamp{0};
         uint256  merged_payout_hash;
+        // Frozen segwit data — merkle branches and witness root change between
+        // GBT updates, but the ref_hash was computed with the values at template time.
+        std::vector<uint256> frozen_merkle_branches;
+        uint256  frozen_witness_root;
     };
 
     // Stratum-style methods (for advanced miners)
@@ -405,6 +409,8 @@ public:
         uint32_t frozen_bits{0};     // share target at template time
         uint32_t frozen_timestamp{0};
         uint256  frozen_merged_payout_hash;
+        std::vector<uint256> frozen_merkle_branches;  // segwit txid_merkle_link branches at template time
+        uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
         bool     has_frozen_fields{false};  // true if the above are valid
     };
     using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
