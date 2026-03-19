@@ -479,6 +479,29 @@ IDs. Foundation committed: data structures, SipHash, peer negotiation.
 Remaining: wire send path (BuildCompactBlock → cmpctblock), receive path
 (reconstruct from mempool), multi-peer broadcast.
 
+### Received Block Resubmission — Not Started
+When a peer's share meets the block target, c2pool detects it (block found
+banner in log, commit `fed933d3`) but does NOT resubmit the block to the
+local coin daemon for propagation redundancy. p2pool does this in `work.py`
+via `helper.submit_block()`, reconstructing the full block from share data
++ `known_txs` (the transaction cache). Implementing this in c2pool requires:
+
+1. **Transaction relay pipeline** — peers must relay `known_txs` alongside
+   shares (p2pool's `have_tx`/`losing_tx` messages). Currently c2pool stores
+   transaction data in `HandleSharesData::m_txs` but only for locally-held
+   templates, not for reconstructing blocks from peer shares.
+2. **Block reconstruction** — given a block-level share + transaction data,
+   rebuild the full block (header + coinbase + all transactions) and call
+   `submitblock` RPC to the local coin daemon.
+3. **P2P block broadcast** — additionally relay the reconstructed block via
+   the P2P connection to the coin daemon for fastest propagation (bypasses
+   RPC latency). p2pool uses `Broadcaster` for parallel relay to multiple
+   coin daemon P2P connections.
+
+**Impact:** Reduces orphan rate — every pool node that receives the block-level
+share resubmits it independently, creating N parallel submission paths instead
+of relying on the single node that found the block.
+
 ---
 
 ## Share Redistribution Enhancements (from p2pool-merged-v36)
