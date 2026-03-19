@@ -2133,25 +2133,23 @@ int main(int argc, char* argv[]) {
                 }
 
                 try {
-                    // Share chain tip validation.
-                    // prev_share_hash comes from the job snapshot (frozen at work
-                    // generation time). If null, it means no shares were in the chain
-                    // when the job was created. We MUST NOT create shares with null
-                    // prev_share when peers have already sent us a chain — that
-                    // produces a "genesis" share that p2pool rejects and bans us for.
-                    //
-                    // Instead, wait until the job snapshot has a valid prev_share_hash,
-                    // which happens after think() identifies the best share and
-                    // ref_hash_fn gets called with the chain tip.
-                    if (p.prev_share_hash.IsNull()) {
+                    // Share creation guards:
+                    // 1. prev_share_hash must be non-null (chain must be synced)
+                    // 2. Verified chain must be long enough for correct PPLNS
+                    //    (p2pool rejects shares with wrong merged_payout_hash)
+                    auto chain_sz = p2p_node->tracker().chain.size();
+                    auto verified_sz = p2p_node->tracker().verified.size();
+
+                    if (p.prev_share_hash.IsNull() || verified_sz < 100) {
                         ++s_guard_blocked;
                         static std::atomic<int64_t> s_last_warn{0};
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
                         if (now - s_last_warn.load() > 30'000'000'000LL) {
                             s_last_warn.store(now);
-                            LOG_WARNING << "[Pool] Skipping share: null prev_share_hash"
-                                        << " (chain=" << p2p_node->tracker().chain.size()
-                                        << " verified=" << p2p_node->tracker().verified.size() << ")";
+                            LOG_WARNING << "[Pool] Skipping share: "
+                                        << (p.prev_share_hash.IsNull() ? "null prev_share" : "chain not verified")
+                                        << " (chain=" << chain_sz
+                                        << " verified=" << verified_sz << ")";
                         }
                         return;
                     }
