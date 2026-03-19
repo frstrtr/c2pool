@@ -1461,6 +1461,8 @@ void MiningInterface::refresh_work()
                 segwit_active = std::any_of(rules.begin(), rules.end(),
                     [](const auto& r) { return r == "segwit" || r == "!segwit"; });
             }
+            LOG_INFO << "[Pool] segwit_active=" << segwit_active
+                     << " rules=" << (wd.m_data.contains("rules") ? wd.m_data["rules"].dump() : "none");
             if (segwit_active && wd.m_data.contains("transactions")) {
                 // Compute raw wtxid merkle root from block template transactions
                 std::vector<uint256> wtxids;
