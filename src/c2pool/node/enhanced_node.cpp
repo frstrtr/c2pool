@@ -7,9 +7,10 @@ namespace node {
 EnhancedC2PoolNode::EnhancedC2PoolNode(bool testnet) {
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
     m_hashrate_tracker->set_difficulty_bounds(0.001, 65536.0);
-    std::string network = testnet ? "testnet" : "mainnet";
+    // Use coin-prefixed path matching NodeImpl: "litecoin_testnet" / "litecoin"
+    std::string network = testnet ? "litecoin_testnet" : "litecoin";
     m_storage = std::make_unique<storage::SharechainStorage>(network);
-    
+
     LOG_INFO << "Enhanced C2Pool node initialized with default configuration";
     LOG_INFO << "  - Automatic difficulty adjustment";
     LOG_INFO << "  - Real-time hashrate tracking";
@@ -23,8 +24,8 @@ EnhancedC2PoolNode::EnhancedC2PoolNode(boost::asio::io_context* ctx, ltc::Config
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
     m_hashrate_tracker->set_difficulty_bounds(0.001, 65536.0);
     
-    // Initialize storage
-    std::string network = config ? (config->m_testnet ? "testnet" : "mainnet") : "testnet";
+    // Initialize storage — use coin-prefixed path matching NodeImpl
+    std::string network = config ? (config->m_testnet ? "litecoin_testnet" : "litecoin") : "litecoin_testnet";
     m_storage = std::make_unique<storage::SharechainStorage>(network);
     
     // Only load sharechain if we have a valid chain pointer
