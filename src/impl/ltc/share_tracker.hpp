@@ -1137,11 +1137,14 @@ public:
         payload += "|D:";
         payload += to_decimal(donation_weight);
 
-        // Log payload for debugging (one-shot)
+        // Log payload for debugging
         {
             static int plog = 0;
-            if (plog < 2) {
-                LOG_INFO << "[merged_payout_hash] payload(" << payload.size() << ")=" << payload.substr(0, 200);
+            if (plog < 3) {
+                LOG_INFO << "[merged_payout_hash] chain_len=" << chain_len
+                         << " height=" << height
+                         << " weights=" << weights.size()
+                         << " payload(" << payload.size() << ")=" << payload.substr(0, 200);
                 ++plog;
             }
         }

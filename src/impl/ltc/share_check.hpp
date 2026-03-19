@@ -1364,7 +1364,9 @@ bool share_check(const ShareT& share,
                 !share.m_prev_hash.IsNull() &&
                 tracker.chain.contains(share.m_prev_hash))
             {
-                auto block_target = chain::bits_to_target(share.m_bits);
+                // Use BLOCK target (from header bits), not share target.
+                // p2pool: block_target = self.header['bits'].target
+                auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
                 auto expected_hash = tracker.compute_merged_payout_hash(
                     share.m_prev_hash, block_target);
 
