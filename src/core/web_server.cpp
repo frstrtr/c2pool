@@ -1346,6 +1346,8 @@ MiningInterface::build_connection_coinbase(
         static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
         tmpl_height, tmpl_bits);
 
+    LOG_INFO << "[build_connection_cb] pplns_outputs=" << m_cached_pplns_outputs.size()
+             << " raw_scripts=" << m_cached_raw_scripts;
     auto [cb1, cb2] = build_coinbase_parts(
         m_cached_template,
         subsidy,
