@@ -630,6 +630,22 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
                       << " pow_hash=" << pow_hash.GetHex().substr(0,32);
             throw std::invalid_argument("share PoW hash does not meet target");
         }
+
+        // Block detection: check if share's scrypt hash also meets the BLOCK target.
+        // min_header.m_bits = block difficulty from GBT (much harder than share target).
+        // When pow_hash <= block_target, this share IS a solved block!
+        uint256 block_target = chain::bits_to_target(share.m_min_header.m_bits);
+        if (!block_target.IsNull() && pow_hash <= block_target) {
+            LOG_WARNING << "\n"
+                << "######################################################################\n"
+                << "###  BLOCK FOUND by pool!                                          ###\n"
+                << "######################################################################\n"
+                << "  Share hash:  " << share_hash.GetHex() << "\n"
+                << "  PoW hash:    " << pow_hash.GetHex() << "\n"
+                << "  Block target:" << block_target.GetHex() << "\n"
+                << "  Block bits:  " << std::hex << share.m_min_header.m_bits << std::dec << "\n"
+                << "######################################################################";
+        }
     }
 
     return share_hash;
