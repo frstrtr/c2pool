@@ -744,13 +744,17 @@ void MergedMiningManager::try_submit_merged_blocks(
             continue;  // doesn't meet this chain's target
         }
 
-        LOG_INFO << "\n"
-                 << "  ###  MERGED BLOCK FOUND! " << chain.config.symbol << "  ###\n"
-                 << "  Chain:      " << chain.config.symbol << " (chain_id=" << chain.config.chain_id << ")\n"
-                 << "  Height:     " << chain.current_work.height << "\n"
-                 << "  Aux hash:   " << chain.current_work.block_hash.GetHex() << "\n"
-                 << "  Aux target: " << chain.current_work.target.GetHex() << "\n"
-                 << "  Parent PoW: " << parent_hash.GetHex();
+        LOG_WARNING << "\n"
+                 << "######################################################################\n"
+                 << "###  MERGED BLOCK FOUND! " << chain.config.symbol
+                 << std::string(std::max(0, 39 - (int)chain.config.symbol.size()), ' ') << "###\n"
+                 << "######################################################################\n"
+                 << "  Chain:       " << chain.config.symbol << " (chain_id=" << chain.config.chain_id << ")\n"
+                 << "  Height:      " << chain.current_work.height << "\n"
+                 << "  Block hash:  " << chain.current_work.block_hash.GetHex() << "\n"
+                 << "  Aux target:  " << chain.current_work.target.GetHex() << "\n"
+                 << "  Parent PoW:  " << parent_hash.GetHex() << "\n"
+                 << "######################################################################";
 
         // Build aux merkle proof for this chain's slot
         auto proof = m_tree.compute_root(slot_hashes, slot);

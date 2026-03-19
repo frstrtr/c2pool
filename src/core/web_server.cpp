@@ -4258,7 +4258,16 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             static uint256 s_last_submitted_prev;
                             if (prev_block != s_last_submitted_prev) {
                                 s_last_submitted_prev = prev_block;
-                                LOG_INFO << "[LTC] Block meets blockchain target! Submitting to coin daemon";
+                                uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                                LOG_WARNING << "\n"
+                                    << "######################################################################\n"
+                                    << "###  PARENT NETWORK BLOCK FOUND!                                   ###\n"
+                                    << "######################################################################\n"
+                                    << "  Miner:       " << username << "\n"
+                                    << "  Block hash:  " << block_hash.GetHex() << "\n"
+                                    << "  PoW hash:    " << pow_hash.GetHex() << "\n"
+                                    << "  Target:      " << block_target.GetHex() << "\n"
+                                    << "######################################################################";
                                 submitblock(block_hex);
                             }
                         }
@@ -4527,14 +4536,6 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     }
 
                     if (!block_target.IsNull() && pow_hash <= block_target) {
-                        // Twin block: same PoW hash meets BOTH parent and merged targets!
-                        if (merged_found) {
-                            LOG_INFO << "\n"
-                                     << "  ***  TWIN BLOCK!  ***\n"
-                                     << "  Parent + merged chain targets met by same PoW hash\n"
-                                     << "  PoW hash: " << pow_hash.GetHex();
-                        }
-
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
 
@@ -4559,7 +4560,28 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             static uint256 s_last_pool_submitted_prev;
                             if (prev_block != s_last_pool_submitted_prev) {
                                 s_last_pool_submitted_prev = prev_block;
-                                LOG_INFO << "[LTC] Pool block merkle_root validated, submitting to coin daemon";
+                                uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
+                                if (merged_found) {
+                                    LOG_WARNING << "\n"
+                                        << "######################################################################\n"
+                                        << "###  TWIN BLOCK FOUND! Parent + Merged in same PoW!               ###\n"
+                                        << "######################################################################\n"
+                                        << "  Miner:       " << username << "\n"
+                                        << "  Block hash:  " << block_hash.GetHex() << "\n"
+                                        << "  PoW hash:    " << pow_hash.GetHex() << "\n"
+                                        << "  Target:      " << block_target.GetHex() << "\n"
+                                        << "######################################################################";
+                                } else {
+                                    LOG_WARNING << "\n"
+                                        << "######################################################################\n"
+                                        << "###  PARENT NETWORK BLOCK FOUND!                                   ###\n"
+                                        << "######################################################################\n"
+                                        << "  Miner:       " << username << "\n"
+                                        << "  Block hash:  " << block_hash.GetHex() << "\n"
+                                        << "  PoW hash:    " << pow_hash.GetHex() << "\n"
+                                        << "  Target:      " << block_target.GetHex() << "\n"
+                                        << "######################################################################";
+                                }
                                 submitblock(block_hex);
                             }
                         }

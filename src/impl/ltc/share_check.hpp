@@ -638,12 +638,12 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         if (!block_target.IsNull() && pow_hash <= block_target) {
             LOG_WARNING << "\n"
                 << "######################################################################\n"
-                << "###  BLOCK FOUND by pool!                                          ###\n"
+                << "###  BLOCK FOUND! (detected from share)                            ###\n"
                 << "######################################################################\n"
                 << "  Share hash:  " << share_hash.GetHex() << "\n"
                 << "  PoW hash:    " << pow_hash.GetHex() << "\n"
                 << "  Block target:" << block_target.GetHex() << "\n"
-                << "  Block bits:  " << std::hex << share.m_min_header.m_bits << std::dec << "\n"
+                << "  Absheight:   " << share.m_absheight << "\n"
                 << "######################################################################";
         }
     }
