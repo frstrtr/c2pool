@@ -2048,11 +2048,11 @@ uint256 create_local_share(
             coinbase_bytes_for_hashlink.data(), coinbase_bytes_for_hashlink.size());
         gentx_hash_for_header = Hash(cb_span);
     }
-    uint256 merkle_root;
-    if (share.m_segwit_data.has_value())
-        merkle_root = check_merkle_link(gentx_hash_for_header, share.m_segwit_data->m_txid_merkle_link);
-    else
-        merkle_root = check_merkle_link(gentx_hash_for_header, share.m_merkle_link);
+    // For the BLOCK HEADER merkle root, always use the actual job merkle branches
+    // (share.m_merkle_link), NOT the frozen segwit_data.txid_merkle_link.
+    // The frozen branches are for the ref_hash/share_info serialization only.
+    // The block header must match the actual transactions in the template.
+    uint256 merkle_root = check_merkle_link(gentx_hash_for_header, share.m_merkle_link);
 
     header_stream << merkle_root;
     header_stream << min_header.m_timestamp;
