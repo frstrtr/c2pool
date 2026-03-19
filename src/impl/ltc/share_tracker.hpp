@@ -775,8 +775,10 @@ public:
         if (start.IsNull())
             return {};
 
-        // Cache check — valid while chain head hasn't changed and all
-        // three query parameters match (start, max_shares, desired_weight).
+        // Cache: keyed by (start_hash, max_shares, desired_weight).
+        // Same inputs always produce same outputs (deterministic walk).
+        // Invalidated when chain head changes (new shares added/removed).
+        // No consensus risk — cached result is byte-identical to fresh computation.
         if (m_decayed_cache_valid && m_decayed_cache_start == start
             && m_decayed_cache_shares == max_shares
             && m_decayed_cache_desired == desired_weight)
@@ -842,7 +844,7 @@ public:
                 (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
         }
 
-        // Cache result
+        // Cache result (single-entry, invalidated on chain change)
         m_decayed_cache_start = start;
         m_decayed_cache_shares = max_shares;
         m_decayed_cache_desired = desired_weight;
