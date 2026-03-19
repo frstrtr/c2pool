@@ -1137,6 +1137,15 @@ public:
         payload += "|D:";
         payload += to_decimal(donation_weight);
 
+        // Log payload for debugging (one-shot)
+        {
+            static int plog = 0;
+            if (plog < 2) {
+                LOG_INFO << "[merged_payout_hash] payload(" << payload.size() << ")=" << payload.substr(0, 200);
+                ++plog;
+            }
+        }
+
         // SHA256d (hash256 in p2pool)
         auto span = std::span<const unsigned char>(
             reinterpret_cast<const unsigned char*>(payload.data()), payload.size());
