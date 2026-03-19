@@ -2038,19 +2038,87 @@ uint256 create_local_share(
 
             // Cross-check: run the SAME verification that peers will run.
             // If this fails, peers will reject the share as "PoW invalid".
-            try {
-                uint256 verify_hash = share_init_verify(share, false);
-                if (verify_hash != share_hash) {
-                    LOG_ERROR << "[Pool] CROSS-CHECK FAILED! share_init_verify hash="
-                              << verify_hash.GetHex().substr(0, 16)
-                              << " direct=" << share_hash.GetHex().substr(0, 16);
-                    // Don't broadcast — peers would reject and ban us
-                    return uint256();
+            // Cross-check: compare hash_link path vs direct path.
+            // hash_link path = what peers compute from share fields.
+            // direct path = what we computed from actual coinbase bytes.
+            {
+                // Recompute ref_hash from share fields (same as share_init_verify)
+                auto gentx_before_refhash_xc = compute_gentx_before_refhash(int64_t(36));
+                PackStream ref_stream_xc;
+                {
+                    auto hex = PoolConfig::identifier_hex();
+                    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                        unsigned char byte = static_cast<unsigned char>(
+                            std::stoul(hex.substr(i, 2), nullptr, 16));
+                        ref_stream_xc.write(std::span<const std::byte>(
+                            reinterpret_cast<const std::byte*>(&byte), 1));
+                    }
                 }
-                LOG_INFO << "[Pool] Cross-check PASSED — peers will accept this share";
-            } catch (const std::exception& e) {
-                LOG_ERROR << "[Pool] CROSS-CHECK EXCEPTION: " << e.what();
-                return uint256();
+                ref_stream_xc << share.m_prev_hash;
+                ref_stream_xc << share.m_coinbase;
+                ref_stream_xc << share.m_nonce;
+                ref_stream_xc << share.m_pubkey_hash;
+                ref_stream_xc << share.m_pubkey_type;
+                ::Serialize(ref_stream_xc, VarInt(share.m_subsidy));
+                ref_stream_xc << share.m_donation;
+                { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream_xc << si; }
+                ::Serialize(ref_stream_xc, VarInt(share.m_desired_version));
+                if (share.m_segwit_data.has_value()) {
+                    ref_stream_xc << share.m_segwit_data.value();
+                } else {
+                    std::vector<uint256> eb; ref_stream_xc << eb;
+                    uint256 zr; ref_stream_xc << zr;
+                }
+                ref_stream_xc << share.m_merged_addresses;
+                ref_stream_xc << share.m_far_share_hash;
+                ref_stream_xc << share.m_max_bits;
+                ref_stream_xc << share.m_bits;
+                ref_stream_xc << share.m_timestamp;
+                ref_stream_xc << share.m_absheight;
+                ::Serialize(ref_stream_xc, Using<AbsworkV36Format>(share.m_abswork));
+                ref_stream_xc << share.m_merged_coinbase_info;
+                ref_stream_xc << share.m_merged_payout_hash;
+                ref_stream_xc << share.m_message_data;
+
+                auto xc_span = std::span<const unsigned char>(
+                    reinterpret_cast<const unsigned char*>(ref_stream_xc.data()), ref_stream_xc.size());
+                uint256 xc_hash_ref = Hash(xc_span);
+                uint256 xc_ref_hash = check_merkle_link(xc_hash_ref, share.m_ref_merkle_link);
+
+                // Compare xc_ref_hash with what's in the coinbase suffix
+                std::vector<unsigned char> xc_hash_link_data;
+                xc_hash_link_data.insert(xc_hash_link_data.end(), xc_ref_hash.data(), xc_ref_hash.data() + 32);
+                { uint64_t n = share.m_last_txout_nonce;
+                  auto* p = reinterpret_cast<const unsigned char*>(&n);
+                  xc_hash_link_data.insert(xc_hash_link_data.end(), p, p + 8); }
+                { uint32_t z = 0;
+                  auto* p = reinterpret_cast<const unsigned char*>(&z);
+                  xc_hash_link_data.insert(xc_hash_link_data.end(), p, p + 4); }
+
+                uint256 xc_gentx = check_hash_link(share.m_hash_link, xc_hash_link_data, gentx_before_refhash_xc);
+
+                // Compare with direct gentx_hash
+                if (xc_gentx != gentx_hash_for_header) {
+                    LOG_ERROR << "[Pool] CROSS-CHECK FAILED!"
+                              << " hl_gentx=" << xc_gentx.GetHex().substr(0, 16)
+                              << " direct_gentx=" << gentx_hash_for_header.GetHex().substr(0, 16)
+                              << " xc_ref_hash=" << xc_ref_hash.GetHex().substr(0, 16)
+                              << " ref_stream_sz=" << ref_stream_xc.size();
+                    // Compare with actual coinbase suffix
+                    if (!actual_coinbase_bytes.empty()) {
+                        constexpr size_t sfx = 32+8+4;
+                        static const char* HX = "0123456789abcdef";
+                        std::string cb_tail;
+                        for (size_t i = actual_coinbase_bytes.size()-sfx; i < actual_coinbase_bytes.size()-sfx+32; ++i) {
+                            cb_tail += HX[actual_coinbase_bytes[i]>>4];
+                            cb_tail += HX[actual_coinbase_bytes[i]&0xf];
+                        }
+                        LOG_ERROR << "[Pool] coinbase_ref_hash=" << cb_tail.substr(0,32)
+                                  << " xc_ref_hash=" << xc_ref_hash.GetHex().substr(0,32);
+                    }
+                    return uint256(); // don't broadcast
+                }
+                LOG_INFO << "[Pool] Cross-check PASSED — share will be accepted by peers";
             }
         }
     }
