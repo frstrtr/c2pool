@@ -2805,7 +2805,7 @@ nlohmann::json MiningInterface::rest_local_stats()
             auto hs = m_node->get_hashrate_stats();
             int peers = hs.value("peer_count", 0);
             if (peers == 0)
-                warnings.push_back("No P2Pool peers connected — share propagation disabled");
+                warnings.push_back("No pool peers connected — share propagation disabled");
         }
 
         // 5. No miners connected

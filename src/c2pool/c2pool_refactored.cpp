@@ -44,18 +44,15 @@
 #include <c2pool/storage/found_block_store.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <execinfo.h>  // for backtrace()
+#include <cxxabi.h>    // for __cxa_current_exception_type
 
-static void segfault_handler(int sig) {
-    void* frames[64];
-    int n = backtrace(frames, 64);
-    fprintf(stderr, "\n=== CRASH (signal %d) ===\n", sig);
-    backtrace_symbols_fd(frames, n, STDERR_FILENO);
-    fprintf(stderr, "=== END CRASH ===\n");
-    // Also write to a crash log file for persistence
+static void write_crash_log(const char* reason) {
     FILE* f = fopen("/tmp/c2pool_crash.log", "a");
     if (f) {
         time_t now = time(nullptr);
-        fprintf(f, "\n=== CRASH (signal %d) at %s", sig, ctime(&now));
+        fprintf(f, "\n=== CRASH: %s at %s", reason, ctime(&now));
+        void* frames[64];
+        int n = backtrace(frames, 64);
         char** syms = backtrace_symbols(frames, n);
         if (syms) {
             for (int i = 0; i < n; ++i)
@@ -65,6 +62,44 @@ static void segfault_handler(int sig) {
         fprintf(f, "=== END CRASH ===\n");
         fclose(f);
     }
+}
+
+static void terminate_handler() {
+    // Catch unhandled exceptions that call std::terminate
+    fprintf(stderr, "\n=== std::terminate() called ===\n");
+    auto eptr = std::current_exception();
+    if (eptr) {
+        try { std::rethrow_exception(eptr); }
+        catch (const std::exception& e) {
+            fprintf(stderr, "Unhandled exception: %s\n", e.what());
+            char msg[512];
+            snprintf(msg, sizeof(msg), "std::terminate — %s", e.what());
+            write_crash_log(msg);
+        }
+        catch (...) {
+            fprintf(stderr, "Unhandled non-std exception\n");
+            write_crash_log("std::terminate — unknown exception");
+        }
+    } else {
+        fprintf(stderr, "No active exception\n");
+        write_crash_log("std::terminate — no exception");
+    }
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    fprintf(stderr, "=== END ===\n");
+    _exit(134);
+}
+
+static void segfault_handler(int sig) {
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    fprintf(stderr, "\n=== CRASH (signal %d) ===\n", sig);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    fprintf(stderr, "=== END CRASH ===\n");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "signal %d", sig);
+    write_crash_log(msg);
     _exit(128 + sig);
 }
 
@@ -307,7 +342,8 @@ void print_help() {
 }
 
 int main(int argc, char* argv[]) {
-    // Install signal handlers
+    // Install crash handlers
+    std::set_terminate(terminate_handler);
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGSEGV, segfault_handler);
@@ -331,6 +367,10 @@ int main(int argc, char* argv[]) {
               << "  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\n"
               << "\n";
     LOG_INFO << "c2pool v0.1 — p2pool rebirth in C++ with enhanced features";
+    LOG_WARNING << "THIS IS EXPERIMENTAL SOFTWARE — USE AT YOUR OWN RISK";
+    LOG_WARNING << "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND";
+    LOG_WARNING << "Distributed under the MIT/X11 software license";
+    LOG_WARNING << "See LICENSE or http://www.opensource.org/licenses/mit-license.php";
     
     // Default settings
     auto settings = std::make_unique<core::Settings>();
@@ -2135,12 +2175,14 @@ int main(int argc, char* argv[]) {
                 try {
                     // Share creation guards:
                     // 1. prev_share_hash must be non-null (chain must be synced)
-                    // 2. Verified chain must be long enough for correct PPLNS
-                    //    (p2pool rejects shares with wrong merged_payout_hash)
+                    // 2. Verified chain must be >= REAL_CHAIN_LENGTH for correct PPLNS.
+                    //    p2pool rejects shares whose merged_payout_hash doesn't match
+                    //    because PPLNS weights depend on the full verified chain window.
                     auto chain_sz = p2p_node->tracker().chain.size();
                     auto verified_sz = p2p_node->tracker().verified.size();
+                    auto min_verified = ltc::PoolConfig::real_chain_length();
 
-                    if (p.prev_share_hash.IsNull() || verified_sz < 100) {
+                    if (p.prev_share_hash.IsNull() || verified_sz < min_verified) {
                         ++s_guard_blocked;
                         static std::atomic<int64_t> s_last_warn{0};
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();

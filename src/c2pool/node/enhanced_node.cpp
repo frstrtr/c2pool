@@ -23,26 +23,16 @@ EnhancedC2PoolNode::EnhancedC2PoolNode(boost::asio::io_context* ctx, ltc::Config
     // Initialize components
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
     m_hashrate_tracker->set_difficulty_bounds(0.001, 65536.0);
-    
-    // Initialize storage — use coin-prefixed path matching NodeImpl
-    std::string network = config ? (config->m_testnet ? "litecoin_testnet" : "litecoin") : "litecoin_testnet";
-    m_storage = std::make_unique<storage::SharechainStorage>(network);
-    
-    // Only load sharechain if we have a valid chain pointer
-    if (m_chain) {
-        if (m_storage->load_sharechain(*m_chain)) {
-            LOG_INFO << "Restored sharechain from disk";
-            log_sharechain_stats();
-        }
-        
-        // Schedule periodic saves
-        m_storage->schedule_periodic_save(*m_chain, *ctx);
-    }
+
+    // NOTE: In integrated mode, NodeImpl opens LevelDB for sharechain persist
+    // (path: litecoin_testnet/sharechain_leveldb). We do NOT open a second
+    // LevelDB here — it would fail with "LOCK already held by process".
+    // EnhancedNode's m_storage is left null; NodeImpl handles all persist.
     
     LOG_INFO << "Enhanced C2Pool node initialized with:";
     LOG_INFO << "  - Automatic difficulty adjustment";
     LOG_INFO << "  - Real-time hashrate tracking";
-    LOG_INFO << "  - Persistent storage (" << network << ")";
+    LOG_INFO << "  - Persistent storage (managed by NodeImpl)";
 }
 
 void EnhancedC2PoolNode::handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) {
