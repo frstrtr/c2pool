@@ -343,8 +343,11 @@ public:
             auto verified_sz = verified.size();
             auto target_sz = PoolConfig::real_chain_length();
             if (verified_sz < target_sz) {
-                // Initial sync: verify up to 200 per cycle (catches up in ~2 cycles for testnet)
-                verify_budget = 200;
+                // Initial sync: verify aggressively but respect O(chain_length) walk cost.
+                // Each share verification costs ~chain_length iterations.
+                // Budget: ~10s max per cycle → 10000 / chain_length shares.
+                verify_budget = std::max(
+                    5, static_cast<int32_t>(10000 / std::max(PoolConfig::chain_length(), uint32_t(1))));
             } else {
                 // Steady state: small batches
                 verify_budget = std::max(
