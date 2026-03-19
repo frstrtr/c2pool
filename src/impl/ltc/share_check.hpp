@@ -2078,6 +2078,20 @@ uint256 create_local_share(
             LOG_INFO << "[Pool] REAL SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
                      << " target=" << target.GetHex().substr(0, 16)
                      << " diff=" << chain::target_to_difficulty(target);
+            // Log fields for comparison with p2pool's SHARE-REJECT
+            {
+                static int sl = 0;
+                if (sl++ < 5) {
+                    LOG_INFO << "[SHARE-FIELDS] header_bits=" << std::hex << share.m_min_header.m_bits
+                             << " share_bits=" << share.m_bits
+                             << " max_bits=" << share.m_max_bits << std::dec
+                             << " absheight=" << share.m_absheight
+                             << " ts=" << share.m_timestamp
+                             << " donation=" << share.m_donation
+                             << " segwit=" << (share.m_segwit_data.has_value() ? "YES" : "NO")
+                             << " prev=" << share.m_prev_hash.GetHex().substr(0, 16);
+                }
+            }
 
             // Cross-check: run the SAME verification that peers will run.
             // If this fails, peers will reject the share as "PoW invalid".
