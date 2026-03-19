@@ -634,17 +634,23 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         // Block detection: check if share's scrypt hash also meets the BLOCK target.
         // min_header.m_bits = block difficulty from GBT (much harder than share target).
         // When pow_hash <= block_target, this share IS a solved block!
+        // Use static dedup to avoid logging same block twice (phase1 + phase2 both call this).
         uint256 block_target = chain::bits_to_target(share.m_min_header.m_bits);
         if (!block_target.IsNull() && pow_hash <= block_target) {
-            LOG_WARNING << "\n"
-                << "######################################################################\n"
-                << "###  BLOCK FOUND! (detected from share)                            ###\n"
-                << "######################################################################\n"
-                << "  Share hash:  " << share_hash.GetHex() << "\n"
-                << "  PoW hash:    " << pow_hash.GetHex() << "\n"
-                << "  Block target:" << block_target.GetHex() << "\n"
-                << "  Absheight:   " << share.m_absheight << "\n"
-                << "######################################################################";
+            static uint256 s_last_block_share;
+            if (share_hash != s_last_block_share) {
+                s_last_block_share = share_hash;
+                LOG_WARNING << "\n"
+                    << "######################################################################\n"
+                    << "###  PARENT BLOCK FOUND! (detected from peer share)                ###\n"
+                    << "###  Network: Litecoin                                             ###\n"
+                    << "######################################################################\n"
+                    << "  Share hash:  " << share_hash.GetHex() << "\n"
+                    << "  PoW hash:    " << pow_hash.GetHex() << "\n"
+                    << "  Block target:" << block_target.GetHex() << "\n"
+                    << "  Block bits:  " << std::hex << share.m_min_header.m_bits << std::dec << "\n"
+                    << "######################################################################";
+            }
         }
     }
 
