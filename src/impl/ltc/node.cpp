@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <random>
 
 // Helper: read current RSS from /proc/self/status (Linux only)
@@ -860,11 +861,37 @@ void NodeImpl::run_think()
     if (m_think_running.exchange(true))
         return;
 
-    LOG_INFO << "P2Pool: " << m_tracker.chain.size() << " shares in chain ("
-             << m_tracker.verified.size() << " verified/"
-             << m_tracker.chain.size() << " total) Peers: "
-             << m_peers.size() << " heads=" << m_tracker.chain.get_heads().size()
-             << " rss=" << get_rss_mb() << "MB";
+    // p2pool-style periodic heartbeat
+    {
+        auto chain_sz  = m_tracker.chain.size();
+        auto verified  = m_tracker.verified.size();
+        auto peers     = m_peers.size();
+
+        LOG_INFO << "P2Pool: " << chain_sz << " shares in chain ("
+                 << verified << " verified/" << chain_sz << " total) Peers: "
+                 << peers;
+
+        // Stale rate: count orphan/DOA shares in recent chain
+        int orphan_count = 0, doa_count = 0, total_recent = 0;
+        if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+            uint256 cur = m_best_share_hash;
+            int window = std::min(static_cast<int>(chain_sz), 100);
+            for (int i = 0; i < window && !cur.IsNull() && m_tracker.chain.contains(cur); ++i) {
+                m_tracker.chain.get(cur).share.invoke([&](auto* s) {
+                    if (s->m_stale_info == ltc::StaleInfo::orphan) ++orphan_count;
+                    else if (s->m_stale_info == ltc::StaleInfo::doa) ++doa_count;
+                    cur = s->m_prev_hash;
+                });
+                ++total_recent;
+            }
+        }
+        double stale_pct = total_recent > 0 ? 100.0 * (orphan_count + doa_count) / total_recent : 0.0;
+        LOG_INFO << " Shares: " << total_recent << " (" << orphan_count << " orphan, "
+                 << doa_count << " dead) Stale rate: ~"
+                 << std::fixed << std::setprecision(1) << stale_pct << "%"
+                 << " heads=" << m_tracker.chain.get_heads().size()
+                 << " rss=" << get_rss_mb() << "MB";
+    }
 
     // Capture block_rel_height fn by value for thread safety
     auto block_rel_height = m_block_rel_height_fn
