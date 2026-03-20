@@ -875,6 +875,26 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 
     std::map<std::vector<unsigned char>, uint64_t> amounts;
 
+    // Periodic dump of PPLNS weights for cross-impl comparison
+    {
+        static auto last_amt_dump = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+        auto now_d = std::chrono::steady_clock::now();
+        if (now_d - last_amt_dump > std::chrono::seconds(30) && weights.size() >= 2) {
+            last_amt_dump = now_d;
+            LOG_INFO << "[PPLNS-AMT] subsidy=" << subsidy
+                     << " total_weight=" << total_weight.GetLow64()
+                     << " don_weight=" << total_donation_weight.GetLow64()
+                     << " addrs=" << weights.size()
+                     << " prev=" << prev_hash.GetHex().substr(0, 16);
+            for (auto& [s, w] : weights) {
+                uint64_t a = (total_weight.IsNull()) ? 0 :
+                    (uint288(subsidy) * w / total_weight).GetLow64();
+                LOG_INFO << "[PPLNS-AMT]   weight=" << w.GetLow64()
+                         << " amount=" << a;
+            }
+        }
+    }
+
     if (!total_weight.IsNull())
     {
         for (auto& [script, weight] : weights)
