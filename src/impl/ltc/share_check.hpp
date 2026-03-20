@@ -1168,6 +1168,24 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     auto txid = Hash(tx_span);
 
+    // One-time full coinbase hex dump for cross-implementation debugging
+    {
+        static int coinbase_dump_count = 0;
+        if (coinbase_dump_count++ < 3) {
+            const char* HX = "0123456789abcdef";
+            auto to_hex_fn = [&](const unsigned char* p, size_t len) {
+                std::string h; h.reserve(len * 2);
+                for (size_t i = 0; i < len; ++i) { h += HX[p[i] >> 4]; h += HX[p[i] & 0xf]; }
+                return h;
+            };
+            auto* cp = reinterpret_cast<const unsigned char*>(tx.data());
+            LOG_INFO << "[COINBASE-HEX] len=" << tx.size()
+                     << " txid=" << txid.GetHex()
+                     << " share=" << share.m_hash.GetHex().substr(0, 16)
+                     << " hex=" << to_hex_fn(cp, tx.size());
+        }
+    }
+
     if (dump_diag)
     {
         const char* HX = "0123456789abcdef";

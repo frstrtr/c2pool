@@ -2057,10 +2057,12 @@ int main(int argc, char* argv[]) {
                     params.desired_version = 36;
 
                     // Compute pool-level share target from tracker state.
-                    // Pass MAX_TARGET as desired_target so compute_share_target
-                    // clips to pool share difficulty (pre_target3). Block difficulty
-                    // is NOT the share target — it would make shares 1000x+ too hard.
-                    // Per-miner difficulty adjustment happens via VARDIFF in stratum.
+                    // Pass block_target as desired_target — this gets clipped to
+                    // [pre_target3//30, pre_target3] by compute_share_target.
+                    // Block target is much harder than share target, so it clips to
+                    // pre_target3//30 (hardest allowed). This matches p2pool behavior
+                    // where desired_share_target defaults to 2^256-1 (easiest) but
+                    // gets clipped to pool difficulty range.
                     auto desired_target = ltc::PoolConfig::max_target();
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
