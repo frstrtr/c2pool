@@ -1451,17 +1451,13 @@ bool share_check(const ShareT& share,
                 auto expected_hash = tracker.compute_merged_payout_hash(
                     share.m_prev_hash, block_target);
 
-                // TODO: Re-enable as hard reject once computation is validated
-                // against reference p2pool on a fresh sharechain.
-                // For now, log as warning to allow chain sync with existing peers.
                 if (!expected_hash.IsNull() && share.m_merged_payout_hash != expected_hash)
                 {
-                    static int _warn_count = 0;
-                    if (_warn_count++ < 5) {
-                        LOG_WARNING << "merged_payout_hash mismatch (non-fatal): claimed "
-                            << share.m_merged_payout_hash.GetHex()
-                            << " != expected " << expected_hash.GetHex();
-                    }
+                    LOG_WARNING << "merged_payout_hash REJECT: claimed "
+                        << share.m_merged_payout_hash.GetHex()
+                        << " != expected " << expected_hash.GetHex();
+                    throw std::invalid_argument(
+                        "merged_payout_hash mismatch — merged chain reward theft attempt");
                 }
             }
         }
