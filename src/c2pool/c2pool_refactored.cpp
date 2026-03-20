@@ -219,7 +219,7 @@ void print_help() {
     std::cout << "  --address ADDRESS         Payout address (alias: --solo-address)\n\n";
     
     std::cout << "PAYOUT & FEE CONFIGURATION:\n";
-    std::cout << "  --give-author PERCENT     Developer donation (alias: --dev-donation; default: 0%)\n";
+    std::cout << "  --give-author PERCENT     Developer donation (alias: --dev-donation; default: 0.1%)\n";
     std::cout << "  -f / --fee PERCENT        Node owner fee (alias: --node-owner-fee; default: 0%)\n";
     std::cout << "  --node-owner-address ADDR Node owner payout address\n";
     std::cout << "  --redistribute MODE       Redistribution mode: pplns, fee, boost, donate\n\n";
@@ -402,7 +402,7 @@ int main(int argc, char* argv[]) {
     std::string solo_address;
     std::string node_owner_address;
     std::string node_owner_script;         // Node owner script hex
-    double dev_donation = 0.0;          // Developer donation percentage
+    double dev_donation = 0.1;          // Developer donation percentage (default 0.1%)
     double node_owner_fee = 0.0;        // Node owner fee percentage
     bool auto_detect_wallet = true;     // Auto-detect wallet address
     bool integrated_mode = false;
@@ -1602,7 +1602,7 @@ int main(int argc, char* argv[]) {
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
             bool is_testnet = settings->m_testnet;
             auto* embedded_chain_ptr = embedded_chain.get();
-            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc, is_testnet, embedded_chain_ptr](const std::string& header_hex, int stale_info) {
+            web_server.set_on_block_submitted([&p2p_node, &web_server, &ioc, &node_rpc, embedded_ltc, is_testnet, embedded_chain_ptr, dev_donation](const std::string& header_hex, int stale_info) {
                 if (header_hex.size() < 160) return;
                 // Parse the 80-byte Bitcoin wire-format block header
                 auto hb = [&](int i) -> uint8_t {
@@ -2035,7 +2035,7 @@ int main(int argc, char* argv[]) {
             // creation use the share difficulty (not block difficulty).
             auto* mi_for_share_bits = web_server.get_mining_interface();
             web_server.get_mining_interface()->set_ref_hash_fn(
-                [&p2p_node, &whale_detector, mi_for_share_bits](
+                [&p2p_node, &whale_detector, mi_for_share_bits, dev_donation](
                     const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
@@ -2051,7 +2051,9 @@ int main(int argc, char* argv[]) {
                     params.coinbase_scriptSig = coinbase_scriptSig;
                     params.share_nonce = 0;
                     params.subsidy = subsidy;
-                    params.donation = 50; // 0.5%
+                    // donation = round(65535 * percentage / 100)
+                    // Matches p2pool: math.perfect_round(65535*self.donation_percentage/100)
+                    params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = 36;
 
                     // Compute pool-level share target from tracker state
@@ -2174,7 +2176,7 @@ int main(int argc, char* argv[]) {
             // Wire the share creation hook so mining_submit() creates a real
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
-                [&p2p_node](const core::MiningInterface::ShareCreationParams& p) {
+                [&p2p_node, dev_donation](const core::MiningInterface::ShareCreationParams& p) {
                 // Counters for periodic status reporting
                 static std::atomic<uint64_t> s_call_count{0};
                 static std::atomic<uint64_t> s_guard_blocked{0};
@@ -2255,7 +2257,7 @@ int main(int argc, char* argv[]) {
                         prev_share,
                         p.merkle_branches,
                         p.payout_script,
-                        50,  // donation = 0.5%
+                        static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0)),  // donation from --give-author
                         merged_addrs,
                         stale,
                         p.segwit_active,
