@@ -2568,10 +2568,11 @@ int main(int argc, char* argv[]) {
                     if (best.IsNull())
                         return {};
 
-                    // Compute block_target from the share tracker's current tip
+                    // Use block target (from min_header.bits), not share target.
+                    // Matches p2pool: block_target = self.header['bits'].target
                     uint256 block_target;
                     p2p_node->tracker().chain.get(best).share.invoke([&](auto* s) {
-                        block_target = chain::bits_to_target(s->m_bits);
+                        block_target = chain::bits_to_target(s->m_min_header.m_bits);
                     });
 
                     auto& donation_script = mi->get_donation_script();

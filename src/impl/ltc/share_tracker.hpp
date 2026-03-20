@@ -1167,11 +1167,13 @@ public:
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
-        auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
+        // Unlimited desired_weight — exponential decay handles windowing.
+        // Same fix as get_expected_payouts / generate_share_transaction.
+        uint288 unlimited_weight;
+        unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         auto [weights, total_weight, donation_weight] =
-            get_merged_cumulative_weights(best_share_hash, chain_len, max_weight, chain_id);
+            get_merged_cumulative_weights(best_share_hash, chain_len, unlimited_weight, chain_id);
 
         std::map<std::vector<unsigned char>, double> result;
         double sum = 0;
