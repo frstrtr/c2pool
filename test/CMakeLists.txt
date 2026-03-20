@@ -217,4 +217,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_hash_link "" AUTO)
+
+    add_executable(test_decay_pplns test_decay_pplns.cpp)
+    target_link_libraries(test_decay_pplns PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_decay_pplns "" AUTO)
 endif()

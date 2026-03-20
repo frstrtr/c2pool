@@ -867,11 +867,11 @@ public:
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
-        auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
-
-        // V36: use exponential depth-decay (matching Python's get_decayed_cumulative_weights)
-        auto [weights, total_weight, donation_weight] = get_v36_decayed_cumulative_weights(best_share_hash, chain_len, max_weight);
+        // V36: remove desired_weight cap — exponential decay handles windowing.
+        // See generate_share_transaction() for detailed rationale.
+        uint288 unlimited_weight;
+        unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        auto [weights, total_weight, donation_weight] = get_v36_decayed_cumulative_weights(best_share_hash, chain_len, unlimited_weight);
 
         std::map<std::vector<unsigned char>, double> result;
         uint64_t sum = 0;

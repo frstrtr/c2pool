@@ -87,7 +87,7 @@ jobs:
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks \
                     test_multiaddress_pplns test_pplns_stress \
-                    test_hash_link \
+                    test_hash_link test_decay_pplns \
                     test_phase0_live test_phase1_live test_phase2_live \
                     test_phase3_live test_phase4_embedded test_phase4_live \
             -j$(nproc)

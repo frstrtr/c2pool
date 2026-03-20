@@ -768,7 +768,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false)
 {
     constexpr int64_t ver = ShareT::version;
     const uint64_t subsidy = share.m_subsidy;
@@ -795,8 +795,13 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker)
                           * PoolConfig::SPREAD * 65535;
 
         // V36: use exponential depth-decay (matching Python's get_decayed_cumulative_weights)
+        // Remove desired_weight cap — exponential decay naturally limits old shares'
+        // contribution. The cap is harmful on low-difficulty networks (testnet) where
+        // block_att < share_att, truncating the PPLNS window to ~2 shares.
         if constexpr (ver >= 36) {
-            auto result = tracker.get_v36_decayed_cumulative_weights(prev_hash, chain_len, max_weight);
+            uint288 unlimited_weight;
+            unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            auto result = tracker.get_v36_decayed_cumulative_weights(prev_hash, chain_len, unlimited_weight);
             weights = std::move(result.weights);
             total_weight = result.total_weight;
             total_donation_weight = result.total_donation_weight;
@@ -1156,7 +1161,53 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker)
     // --- 5. Compute txid (double-SHA256 of non-witness serialization) ---
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
-    return Hash(tx_span);
+    auto txid = Hash(tx_span);
+
+    if (dump_diag)
+    {
+        const char* HX = "0123456789abcdef";
+        auto to_hex = [&](const unsigned char* p, size_t len) {
+            std::string h; h.reserve(len * 2);
+            for (size_t i = 0; i < len; ++i) { h += HX[p[i] >> 4]; h += HX[p[i] & 0xf]; }
+            return h;
+        };
+
+        auto* cp = reinterpret_cast<const unsigned char*>(tx.data());
+        LOG_WARNING << "[GENTX-DIAG] coinbase_len=" << tx.size() << " txid=" << txid.GetHex();
+        LOG_WARNING << "[GENTX-DIAG] coinbase_hex=" << to_hex(cp, tx.size());
+        LOG_WARNING << "[GENTX-DIAG] pplns_outputs=" << payout_outputs.size()
+                    << " donation_amount=" << donation_amount
+                    << " n_outs=" << n_outs
+                    << " has_segwit=" << has_segwit;
+        LOG_WARNING << "[GENTX-DIAG] total_weight=" << total_weight.GetHex()
+                    << " total_don_weight=" << total_donation_weight.GetHex();
+        for (size_t i = 0; i < payout_outputs.size(); ++i) {
+            auto& [s, a] = payout_outputs[i];
+            LOG_WARNING << "[GENTX-DIAG]  payout[" << i << "] amount=" << a
+                        << " script=" << to_hex(s.data(), s.size());
+        }
+        // First 5 shares in walk
+        if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash)) {
+            auto cl = std::min(tracker.chain.get_height(share.m_prev_hash),
+                               static_cast<int32_t>(PoolConfig::real_chain_length()));
+            auto wv = tracker.chain.get_chain(share.m_prev_hash, std::min(cl, int32_t(5)));
+            int si = 0;
+            for (auto& [h, d] : wv) {
+                d.share.invoke([&](auto* obj) {
+                    auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
+                    auto sc = get_share_script(obj);
+                    LOG_WARNING << "[GENTX-DIAG]  walk[" << si << "] hash=" << h.ToString().substr(0,16)
+                                << " bits=0x" << std::hex << obj->m_bits << std::dec
+                                << " att=" << att.GetHex()
+                                << " don=" << obj->m_donation
+                                << " script=" << to_hex(sc.data(), sc.size());
+                });
+                ++si;
+            }
+        }
+    }
+
+    return txid;
 }
 
 // ============================================================================
@@ -1361,13 +1412,21 @@ bool share_check(const ShareT& share,
                         << " prev=" << share.m_prev_hash.ToString().substr(0,16);
             LOG_WARNING << "  expected_gentx=" << expected_gentx.ToString().substr(0,32)
                         << " actual_gentx=" << gentx_hash.ToString().substr(0,32);
-            
+
             auto chain_len = std::min(
                 tracker.chain.get_height(share.m_prev_hash),
                 static_cast<int32_t>(PoolConfig::real_chain_length()));
             LOG_WARNING << "  PPLNS chain_len=" << chain_len
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
+
+            // --- Detailed diagnostics: re-run with full dump ---
+            static int s_diag_count = 0;
+            if (s_diag_count++ < 2)
+            {
+                LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump:";
+                generate_share_transaction(share, tracker, true);
+            }
 
             throw std::invalid_argument("GenerateShareTransaction mismatch — coinbase does not match PPLNS payouts");
         }
