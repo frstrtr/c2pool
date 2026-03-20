@@ -1156,7 +1156,12 @@ MiningInterface::build_coinbase_parts(
     }
 
     // ScriptSig: height + mm_commitment + tag + state_root (NO extranonce!)
-    const int script_total = height_bytes + mm_bytes + tag_bytes + state_root_bytes;
+    // Each element (mm, tag) gets a 1-byte push opcode prefix (matching create_push_script)
+    // state_root is raw (no push opcode, like coinbaseflags in p2pool)
+    const int mm_push_overhead = (mm_bytes > 0) ? 1 : 0;
+    const int tag_push_overhead = (tag_bytes > 0) ? 1 : 0;
+    const int script_total = height_bytes + mm_push_overhead + mm_bytes
+                           + tag_push_overhead + tag_bytes + state_root_bytes;
 
     // Build coinb1: entire coinbase TX up to and including ref_hash in OP_RETURN
     std::ostringstream coinb1;
@@ -1167,10 +1172,17 @@ MiningInterface::build_coinbase_parts(
            << std::hex << std::setfill('0') << std::setw(2) << script_total
            << height_hex;
 
-    // scriptSig: mm + tag + state_root (no en1/en2 — those go into last_txout_nonce)
-    if (!mm_hex.empty())
-        coinb1 << mm_hex;
-    coinb1 << tag_hex;
+    // scriptSig elements with push opcodes (matching p2pool's create_push_script):
+    // Each datum gets its own length-prefix push opcode.
+    auto emit_push = [&](std::ostringstream& os, const std::string& data_hex) {
+        size_t len = data_hex.size() / 2;
+        if (len > 0 && len < 76)
+            os << std::hex << std::setfill('0') << std::setw(2) << len;
+        os << data_hex;
+    };
+    if (!mm_hex.empty()) emit_push(coinb1, mm_hex);
+    if (!tag_hex.empty()) emit_push(coinb1, tag_hex);
+    // state_root appended raw (like p2pool's coinbaseflags)
     if (!state_root_hex.empty())
         coinb1 << state_root_hex;
     coinb1 << "ffffffff";  // sequence = 0xFFFFFFFF
@@ -1331,9 +1343,22 @@ MiningInterface::build_connection_coinbase(
         }
     }
 
-    // ScriptSig: height + mm + tag + state_root (NO extranonce!)
-    // Must match what build_coinbase_parts produces in the actual coinbase.
-    std::string scriptsig_hex = height_hex + mm_hex + tag_hex + state_root_hex;
+    // ScriptSig: height_push + mm_push + tag_push + state_root (NO extranonce!)
+    // Must match p2pool's create_push_script([height, mm_data, coinb_texts]):
+    // Each element gets its own push opcode prefix (PUSH_N for N < 76 bytes).
+    // state_root is appended as raw bytes (like coinbaseflags in p2pool).
+    auto push_prefix = [&](const std::string& data_hex) -> std::string {
+        size_t len = data_hex.size() / 2;
+        if (len == 0) return "";
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned>(len));
+        return std::string(buf) + data_hex;
+    };
+    std::string scriptsig_hex = height_hex;
+    if (!mm_hex.empty()) scriptsig_hex += push_prefix(mm_hex);
+    if (!tag_hex.empty()) scriptsig_hex += push_prefix(tag_hex);
+    // state_root appended raw (like p2pool's coinbaseflags + COINBASEEXT)
+    scriptsig_hex += state_root_hex;
 
     // Decode to bytes for ref_hash computation
     std::vector<unsigned char> scriptsig_bytes;
