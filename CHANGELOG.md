@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.9.2] - 2026-03-20
+
+### Security
+- **fix: Share target validation** — Reject shares where `target > max_target` (matching p2pool-merged-v36 v0.14-alpha fix). Closes latent vulnerability present since p2pool inception.
+- **fix: Bootstrap share target** — Use hardest chain bits during bootstrap instead of MAX_TARGET. Prevents easy-share flooding when joining existing networks.
+
+### Bug Fixes
+- **fix: PPLNS desired_weight cap** — V36 exponential decay now uses unlimited desired_weight (`2^288 - 1`). The cap truncated the PPLNS window to ~2 shares on testnet, causing single-miner payouts.
+- **fix: merged_payout_hash consensus** — Walk VERIFIED chain only (not raw chain) to exclude c2pool's own unverified shares. Defer check until verified depth >= CHAIN_LENGTH. Fixes consensus divergence with p2pool peers.
+- **fix: Share difficulty (desired_target)** — Pass MAX_TARGET (clipped to pool share difficulty) instead of block difficulty. Block difficulty made shares 2634x too hard, causing c2pool's miner to contribute negligible PPLNS weight.
+- **fix: PPLNS race condition** — Recompute PPLNS from frozen prev_share in `build_connection_coinbase`. Prevents stale coinbase when chain advances between template creation and share submission.
+- **fix: Log rotation** — Add target directory for log rotation, increase default to 100MB.
+
+### Added
+- **`/miner_thresholds` API endpoint** — Returns minimum viable hashrate (normal and with 30x DUST range), minimum payout per share, pool hashrate, PPLNS window duration. Enables dashboard display of miner feasibility.
+- **`MinerThresholds` struct** — Pool-level computation of minimum viable hashrate from chain state.
+- **SHAREREQ diagnostic** — Log first 5 SHAREREQ misses with chain size for debugging share sync issues.
+
+### Documentation
+- Analysis documents in frstrtr/the: DESIRED_WEIGHT_CAP_BUG.md, SHARE_TARGET_VALIDATION.md, SHARE_PERIOD_AND_TINY_MINERS.md, TINY_MINER_ECONOMICS.md
+
 ## [0.9.1] - 2026-03-19
 
 ### Added (untested — implemented, needs live validation)
