@@ -4642,13 +4642,14 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 }
             }
 
-            // Bootstrap: when chain is empty (bits==0), use max_target
-            // so miners can create genesis shares immediately.
-            // P2Pool sets desired_share_target = 2**256-1 when chain is empty.
+            // Bootstrap: when chain depth < TARGET_LOOKBEHIND, share_bits is 0
+            // to signal "not ready for share creation yet". Skip share creation
+            // and only mine pseudoshares until difficulty stabilizes.
+            // Exception: genesis mode (no peers) uses max_target fallback.
             if (params.bits == 0) {
                 params.bits = m_share_max_bits.load();
-                if (params.bits == 0)
-                    params.bits = 0x1e0fffff; // fallback: easiest LTC testnet target
+                // Only use genesis fallback if no peers have connected yet
+                // (m_share_max_bits is 0 when compute_share_target returns {0,0})
             }
             if (!params.payout_script.empty() && params.bits != 0) {
                 m_create_share_fn(params);

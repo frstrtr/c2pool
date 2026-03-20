@@ -556,38 +556,18 @@ public:
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
         // Not enough chain depth for proper difficulty calculation.
-        // Walk backward to find the HARDEST (lowest target) bits in the chain
-        // — this approximates the network's stabilized share difficulty.
-        // On a fresh chain, early shares are easy but later shares ramp up.
-        // Using the hardest share's bits prevents c2pool from flooding the
-        // network with easy shares during bootstrap.
+        // Use the chain HEAD's bits (most recent peer share) as the target.
+        // The HEAD reflects the network's CURRENT stabilized difficulty,
+        // unlike "hardest bits" which might pick from the ramp-up period.
+        // Genesis nodes (no peers) fall back to MAX_TARGET.
         if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
-            uint32_t best_bits = 0;
-            uint32_t best_max_bits = 0;
-            uint256 best_target;
-            best_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-
-            auto pos = prev_share_hash;
-            for (int i = 0; i < height && !pos.IsNull() && chain.contains(pos); ++i) {
-                chain.get_share(pos).invoke([&](auto* obj) {
-                    auto target = chain::bits_to_target(obj->m_bits);
-                    if (target < best_target) {
-                        best_target = target;
-                        best_bits = obj->m_bits;
-                        best_max_bits = obj->m_max_bits;
-                    }
-                });
-                uint256 next;
-                chain.get_share(pos).invoke([&](auto* obj) { next = obj->m_prev_hash; });
-                pos = next;
-            }
-            if (best_bits != 0 && best_max_bits != 0) {
-                return {best_max_bits, best_bits};
-            }
-            // No peers yet — fall back to MAX_TARGET
-            auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
-            return {max_bits, max_bits};
+            // Not enough history for proper difficulty calculation.
+            // Return {0, 0} to signal "don't create shares yet" — the caller
+            // should only mine pseudoshares until the chain has enough depth
+            // for compute_share_target to compute proper difficulty.
+            // Genesis nodes (persist=false, no peers) can override this.
+            return {0, 0};
         }
 
         // Step 1: Derive target from pool hashrate
