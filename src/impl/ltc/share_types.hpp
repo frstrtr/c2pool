@@ -82,7 +82,11 @@ struct SegwitDataDefault
 {
     static SegwitData get()
     {
-        return SegwitData{{}, uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")};
+        // Sentinel must match p2pool's PossiblyNoneType sentinel:
+        // dict(txid_merkle_link=dict(branch=[], index=0), wtxid_merkle_root=0)
+        // Using all-0xff caused p2pool to interpret "None" as a valid wtxid root,
+        // producing different witness commitment → different coinbase txid.
+        return SegwitData{{}, uint256()}; // zero = None sentinel
     }
 };
 

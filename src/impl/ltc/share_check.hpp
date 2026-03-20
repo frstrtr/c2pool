@@ -2235,6 +2235,29 @@ uint256 create_local_share(
         static int wire_dump = 0;
         if (wire_dump++ < 1) {
             // Pack just the share_info fields to see exact wire bytes
+            // Dump share_data fields manually for wire format comparison
+            {
+                PackStream sd_pack;
+                // Serialize share_data portion (same as share.hpp lines 155-190)
+                // prev_hash (uint256 = 32 bytes)
+                sd_pack << share.m_prev_hash;
+                // coinbase (VarStr)
+                sd_pack << share.m_coinbase;
+                // nonce (uint32)
+                sd_pack.write(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(&share.m_nonce), 4));
+                auto sd_span = sd_pack.get_span();
+                auto* sp = reinterpret_cast<const unsigned char*>(sd_span.data());
+                std::string sd_hex;
+                for (size_t i = 0; i < sd_span.size(); ++i) {
+                    static const char* H = "0123456789abcdef";
+                    sd_hex += H[sp[i] >> 4]; sd_hex += H[sp[i] & 0xf];
+                }
+                LOG_INFO << "[WIRE-DUMP] share_data_head(" << sd_span.size()
+                         << "): " << sd_hex.substr(0, 160);
+                LOG_INFO << "[WIRE-DUMP] m_coinbase(" << share.m_coinbase.size()
+                         << "): " << sd_hex.substr(64, std::min(size_t(100), sd_hex.size()-64));
+            }
             LOG_INFO << "[WIRE-DUMP] m_bits=0x" << std::hex << share.m_bits
                      << " m_max_bits=0x" << share.m_max_bits << std::dec
                      << " m_timestamp=" << share.m_timestamp
