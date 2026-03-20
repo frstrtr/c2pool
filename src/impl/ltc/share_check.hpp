@@ -2230,6 +2230,42 @@ uint256 create_local_share(
         }
     }
 
+    // One-time hex dump of the share_info portion for wire format debugging
+    {
+        static int wire_dump = 0;
+        if (wire_dump++ < 1) {
+            // Pack just the share_info fields to see exact wire bytes
+            LOG_INFO << "[WIRE-DUMP] m_bits=0x" << std::hex << share.m_bits
+                     << " m_max_bits=0x" << share.m_max_bits << std::dec
+                     << " m_timestamp=" << share.m_timestamp
+                     << " m_absheight=" << share.m_absheight
+                     << " m_donation=" << share.m_donation
+                     << " m_subsidy=" << share.m_subsidy;
+            // Dump the share_info fields as they would be serialized
+            PackStream info_pack;
+            // far_share_hash (PossiblyNoneType(0, IntType(256)))
+            if (share.m_far_share_hash.IsNull()) {
+                uint8_t z = 0; info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&z), 1));
+            } else {
+                uint8_t one = 1; info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&one), 1));
+                info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(share.m_far_share_hash.data()), 32));
+            }
+            // max_bits, bits, timestamp, absheight (4 bytes each, LE)
+            info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&share.m_max_bits), 4));
+            info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&share.m_bits), 4));
+            info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&share.m_timestamp), 4));
+            info_pack.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&share.m_absheight), 4));
+            auto info_span = info_pack.get_span();
+            std::string info_hex;
+            auto* ip = reinterpret_cast<const unsigned char*>(info_span.data());
+            for (size_t i = 0; i < info_span.size(); ++i) {
+                static const char* H = "0123456789abcdef";
+                info_hex += H[ip[i] >> 4]; info_hex += H[ip[i] & 0xf];
+            }
+            LOG_INFO << "[WIRE-DUMP] share_info_tail=" << info_hex;
+        }
+    }
+
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);
     tracker.add(heap_share);
