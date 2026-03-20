@@ -935,8 +935,12 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     if constexpr (ver >= 36) {
         if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
             // Deduct 1 sat from the largest miner payout
+            // Deterministic tiebreak: (amount, script) — largest script wins when equal
             auto largest = std::max_element(amounts.begin(), amounts.end(),
-                [](const auto& a, const auto& b) { return a.second < b.second; });
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
             if (largest != amounts.end() && largest->second > 0) {
                 largest->second -= 1;
                 sum_amounts -= 1;
@@ -1359,8 +1363,12 @@ std::string verify_merged_coinbase_commitment(
         uint64_t donation_amount = coinbase_value - total_distributed;
         // Donation >= 1 satoshi
         if (donation_amount < 1 && !output_amounts.empty()) {
+            // Deterministic tiebreak: (amount, script) — largest script wins when equal
             auto it = std::max_element(output_amounts.begin(), output_amounts.end(),
-                [](auto& a, auto& b) { return a.second < b.second; });
+                [](auto& a, auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
             it->second -= 1;
             donation_amount += 1;
         }
@@ -2006,8 +2014,12 @@ uint256 create_local_share(
         for (auto& [s, a] : amounts) sum_amounts += a;
         uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
         if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
+            // Deterministic tiebreak: (amount, script) — largest script wins when equal
             auto largest = std::max_element(amounts.begin(), amounts.end(),
-                [](const auto& a, const auto& b) { return a.second < b.second; });
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
             if (largest != amounts.end() && largest->second > 0) {
                 largest->second -= 1; sum_amounts -= 1;
                 donation_amount = subsidy - sum_amounts;

@@ -235,4 +235,17 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_pplns_consensus "" AUTO)
+
+    add_executable(test_v36_script_sorting test_v36_script_sorting.cpp)
+    target_link_libraries(test_v36_script_sorting PRIVATE
+        GTest::gtest_main GTest::gtest
+    )
+    gtest_add_tests(test_v36_script_sorting "" AUTO)
+
+    add_executable(test_v36_cross_impl_refhash test_v36_cross_impl_refhash.cpp)
+    target_link_libraries(test_v36_cross_impl_refhash PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+    )
+    gtest_add_tests(test_v36_cross_impl_refhash "" AUTO)
 endif()

@@ -1018,8 +1018,12 @@ public:
 
         // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
         if (donation_amount < 1 && subsidy > 0 && !result.empty()) {
+            // Deterministic tiebreak: (amount, script) — largest script wins when equal
             auto largest = std::max_element(result.begin(), result.end(),
-                [](const auto& a, const auto& b) { return a.second < b.second; });
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
             if (largest != result.end() && largest->second >= 1.0) {
                 largest->second -= 1.0;
                 sum -= 1;
@@ -1237,65 +1241,32 @@ public:
             return result;
         };
 
-        // Convert script bytes to address string (matching Python's share.address).
-        // Must handle P2PKH, P2SH, and P2WPKH (bech32) to produce identical
-        // keys as the reference p2pool for merged_payout_hash consensus.
-        auto script_to_address = [](const std::vector<unsigned char>& script) -> std::string {
-            // P2WPKH: OP_0 PUSH_20 <20-byte-hash>
-            if (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14)
-            {
-                std::string hrp = PoolConfig::is_testnet ? "tltc" : "ltc";
-                std::vector<uint8_t> prog(script.begin() + 2, script.end());
-                return bech32::encode_segwit(hrp, 0, prog);
-            }
-            // P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
-            if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9
-                && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
-            {
-                unsigned char addr_ver = PoolConfig::is_testnet ? 111 : 48;
-                std::vector<unsigned char> data = {addr_ver};
-                data.insert(data.end(), script.begin() + 3, script.begin() + 23);
-                return EncodeBase58Check(data);
-            }
-            // P2SH: OP_HASH160 <20> <hash160> OP_EQUAL
-            if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14
-                && script[22] == 0x87)
-            {
-                unsigned char addr_ver = PoolConfig::is_testnet ? 58 : 50;
-                std::vector<unsigned char> data = {addr_ver};
-                data.insert(data.end(), script.begin() + 2, script.begin() + 22);
-                return EncodeBase58Check(data);
-            }
-            // P2WSH: OP_0 PUSH_32 <32-byte-hash>
-            if (script.size() == 34 && script[0] == 0x00 && script[1] == 0x20)
-            {
-                std::string hrp = PoolConfig::is_testnet ? "tltc" : "ltc";
-                std::vector<uint8_t> prog(script.begin() + 2, script.end());
-                return bech32::encode_segwit(hrp, 0, prog);
-            }
-            // Unknown script: fall back to hex encoding
+        // Convert script bytes to hex string for deterministic serialization.
+        // V36 consensus: sort and serialize by script hex (not address string).
+        // Matches p2pool's compute_merged_payout_hash() which uses script.encode('hex').
+        auto script_to_hex = [](const std::vector<unsigned char>& script) -> std::string {
+            static const char digits[] = "0123456789abcdef";
             std::string hex;
+            hex.reserve(script.size() * 2);
             for (unsigned char c : script) {
-                static const char digits[] = "0123456789abcdef";
                 hex.push_back(digits[c >> 4]);
                 hex.push_back(digits[c & 0xf]);
             }
             return hex;
         };
 
-        // Deterministic serialization: sorted by address key (matches Python)
-        // Format: "addr1:weight1|addr2:weight2|...|T:total|D:donation"
-        // where addr is base58check address string and weight is decimal integer
-        std::map<std::string, uint288> sorted_by_addr;
+        // Deterministic serialization: sorted by script hex (V36 consensus)
+        // Format: "script_hex1:weight1|script_hex2:weight2|...|T:total|D:donation"
+        std::map<std::string, uint288> sorted_by_script;
         for (const auto& [script, w] : weights)
-            sorted_by_addr[script_to_address(script)] += w;
+            sorted_by_script[script_to_hex(script)] += w;
 
         std::string payload;
-        for (const auto& [addr_key, w] : sorted_by_addr)
+        for (const auto& [script_hex, w] : sorted_by_script)
         {
             if (!payload.empty())
                 payload.push_back('|');
-            payload += addr_key;
+            payload += script_hex;
             payload.push_back(':');
             payload += to_decimal(w);
         }
@@ -1313,7 +1284,7 @@ public:
                 last_log = now;
                 LOG_INFO << "[merged_payout_hash] chain_len=" << chain_len
                          << " verified_height=" << height
-                         << " weights=" << sorted_by_addr.size()
+                         << " weights=" << sorted_by_script.size()
                          << " total_weight=" << to_decimal(total_weight)
                          << " payload(" << payload.size() << ")=" << payload.substr(0, 200);
             }
@@ -1367,8 +1338,12 @@ public:
         if (donation_remainder < 1.0 && subsidy > 0 && !result.empty())
         {
             // Deduct 1 satoshi from the largest miner payout
+            // Deterministic tiebreak: (amount, script) — largest script wins when equal
             auto largest = std::max_element(result.begin(), result.end(),
-                [](const auto& a, const auto& b) { return a.second < b.second; });
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
             if (largest != result.end() && largest->second >= 2.0) {
                 largest->second -= 1.0;
                 donation_remainder += 1.0;
