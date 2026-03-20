@@ -1040,13 +1040,15 @@ public:
         if (height == 0)
             return uint256{};
 
-        auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
+        // Unlimited desired_weight — V36 exponential decay handles windowing.
+        // Must match get_merged_expected_payouts and p2pool's computation.
+        uint288 unlimited_weight;
+        unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         auto chain_len = std::min(height,
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
 
         auto [weights, total_weight, donation_weight] =
-            get_v36_merged_weights(prev_share_hash, chain_len, max_weight);
+            get_v36_merged_weights(prev_share_hash, chain_len, unlimited_weight);
 
         if (weights.empty() || total_weight.IsNull())
             return uint256{};
