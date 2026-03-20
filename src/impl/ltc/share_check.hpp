@@ -612,6 +612,11 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         uint256 target = chain::bits_to_target(share.m_bits);
         if (target.IsNull())
             throw std::invalid_argument("share target is zero");
+        if (target > PoolConfig::max_target())
+            throw std::invalid_argument("share target exceeds MAX_TARGET");
+        auto max_target = chain::bits_to_target(share.m_max_bits);
+        if (!max_target.IsNull() && target > max_target)
+            throw std::invalid_argument("share target exceeds max_target — too easy");
 
         // Compute the scrypt hash of the 80-byte block header
         char pow_hash_bytes[32];
