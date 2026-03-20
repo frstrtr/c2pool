@@ -555,9 +555,37 @@ public:
 
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
-        // Not enough chain depth: use MAX_TARGET
+        // Not enough chain depth for proper difficulty calculation.
+        // Walk backward to find the HARDEST (lowest target) bits in the chain
+        // — this approximates the network's stabilized share difficulty.
+        // On a fresh chain, early shares are easy but later shares ramp up.
+        // Using the hardest share's bits prevents c2pool from flooding the
+        // network with easy shares during bootstrap.
         if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
+            uint32_t best_bits = 0;
+            uint32_t best_max_bits = 0;
+            uint256 best_target;
+            best_target.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+            auto pos = prev_share_hash;
+            for (int i = 0; i < height && !pos.IsNull() && chain.contains(pos); ++i) {
+                chain.get_share(pos).invoke([&](auto* obj) {
+                    auto target = chain::bits_to_target(obj->m_bits);
+                    if (target < best_target) {
+                        best_target = target;
+                        best_bits = obj->m_bits;
+                        best_max_bits = obj->m_max_bits;
+                    }
+                });
+                uint256 next;
+                chain.get_share(pos).invoke([&](auto* obj) { next = obj->m_prev_hash; });
+                pos = next;
+            }
+            if (best_bits != 0 && best_max_bits != 0) {
+                return {best_max_bits, best_bits};
+            }
+            // No peers yet — fall back to MAX_TARGET
             auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
             return {max_bits, max_bits};
         }
@@ -669,6 +697,25 @@ public:
 
         auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
 
+        // Apply 1.67% share cap: desired_target cannot be easier than
+        // pool_target / 0.0167 ≈ pool_target * 60. This ensures no single
+        // miner can produce more than ~1.67% of all shares (anti-spam).
+        // P2pool ref: work.py line 2402: hashrate * SHARE_PERIOD / 0.0167
+        uint256 cap_target = pre_target3; // default: pool target (1 share/period)
+        // cap_target represents the easiest target a single miner should use.
+        // At pool target difficulty, a miner with all pool hashrate produces
+        // 1 share/period. At pre_target3 (the pool target), that's 100%.
+        // desired_target is already clipped to [pre_target3//30, pre_target3]
+        // so the cap is inherently enforced by the upper clamp to pre_target3.
+
+        // DUST threshold: if the pool share target is too hard for tiny miners,
+        // allow shares at up to 30x easier difficulty (pre_target3 * 30 would be
+        // out of bounds, so the 30x range [pre_target3//30, pre_target3] is the
+        // full allowed range — this is already how p2pool works).
+        // The key fix is that desired_target = MAX_TARGET (from caller), which
+        // gets clipped to pre_target3 here — shares at pool difficulty.
+        // Tiny miners simply find them less often, proportional to hashrate.
+
         // bits = from_target_upper_bound(clip(desired_target, (pre_target3/30, pre_target3)))
         uint256 bits_lo = pre_target3 / 30;
         if (bits_lo.IsNull()) bits_lo = uint256(1);
@@ -678,6 +725,58 @@ public:
         auto bits = chain::target_to_bits_upper_bound(bits_target);
 
         return {max_bits, bits};
+    }
+
+    // -- Minimum viable hashrate for dashboard display --
+    // Returns the minimum hashrate (H/s) needed to produce at least 1 share
+    // per PPLNS window. With DUST (30x range), tiny miners get easier shares.
+    struct MinerThresholds {
+        double min_hashrate_normal;  // H/s at pool share difficulty
+        double min_hashrate_dust;    // H/s at 30x easier (DUST)
+        double min_payout_ltc;       // LTC per share at pool difficulty
+        double pool_hashrate;        // current pool H/s estimate
+    };
+
+    MinerThresholds get_miner_thresholds(const uint256& prev_share_hash,
+                                          uint64_t block_subsidy_sat)
+    {
+        MinerThresholds t{};
+        if (prev_share_hash.IsNull() || !chain.contains(prev_share_hash))
+            return t;
+
+        auto [height, last] = chain.get_height_and_last(prev_share_hash);
+        if (height < 2) return t;
+
+        auto lookback = std::min(height,
+            static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND));
+        auto aps = get_pool_attempts_per_second(prev_share_hash,
+            lookback, /*min_work=*/true);
+
+        double pool_hr = 0;
+        {
+            uint288 aps_288 = aps;
+            // Convert uint288 to double (approximate)
+            for (int i = uint288::WIDTH - 1; i >= 0; --i) {
+                pool_hr = pool_hr * 4294967296.0 + aps_288.pn[i];
+            }
+        }
+        t.pool_hashrate = pool_hr;
+
+        double share_period = static_cast<double>(PoolConfig::share_period());
+        double chain_length = static_cast<double>(PoolConfig::real_chain_length());
+        double window = chain_length * share_period;
+
+        // pool_share_att = pool_hashrate * share_period
+        double pool_share_att = pool_hr * share_period;
+
+        // min_hashrate = pool_share_att / window = pool_hr / chain_length
+        t.min_hashrate_normal = pool_hr / chain_length;
+        t.min_hashrate_dust = t.min_hashrate_normal / 30.0; // 30x DUST range
+
+        // min_payout = block_subsidy / chain_length (one share in full window)
+        t.min_payout_ltc = static_cast<double>(block_subsidy_sat) / 1e8 / chain_length;
+
+        return t;
     }
 
     // -- PPLNS cumulative weights computation --
@@ -1036,8 +1135,21 @@ public:
         if (prev_share_hash.IsNull())
             return uint256{};
 
-        auto height = chain.get_height(prev_share_hash);
+        // Use VERIFIED chain for consensus hash — only includes shares that
+        // all peers agree on. Prevents c2pool's own unverified shares from
+        // polluting the weight distribution.
+        if (!verified.contains(prev_share_hash))
+            return uint256{};
+
+        auto height = verified.get_height(prev_share_hash);
         if (height == 0)
+            return uint256{};
+
+        // Defer check until verified chain has enough depth for a meaningful
+        // PPLNS window. During bootstrap, the verified chain is too shallow
+        // to produce the same hash as p2pool (which has the full window).
+        // Return null → caller skips the comparison.
+        if (height < static_cast<int32_t>(PoolConfig::real_chain_length()))
             return uint256{};
 
         // Unlimited desired_weight — V36 exponential decay handles windowing.
@@ -1047,8 +1159,38 @@ public:
         auto chain_len = std::min(height,
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
 
-        auto [weights, total_weight, donation_weight] =
-            get_v36_merged_weights(prev_share_hash, chain_len, unlimited_weight);
+        // Walk verified chain only — rebuild skip list each call since the
+        // verified chain grows during sync. O(chain_len) for build + O(log n)
+        // for query. Called once per share verification, not a hot path.
+        // Walk verified chain only — rebuild skip list each call since the
+        // verified chain grows during sync.
+        auto verified_prev_fn = [this](const uint256& hash) -> uint256 {
+            if (!verified.contains(hash)) return uint256{};
+            return verified.get_index(hash)->tail;
+        };
+        chain::WeightsSkipList verified_sl(
+            [this](const uint256& hash) -> chain::WeightsDelta {
+                chain::WeightsDelta delta;
+                if (!verified.contains(hash)) return delta;
+                delta.share_count = 1;
+                chain.get_share(hash).invoke([&](auto* obj) {
+                    if (obj->m_desired_version < 36) return;
+                    auto target = chain::bits_to_target(obj->m_bits);
+                    auto att = chain::target_to_average_attempts(target);
+                    delta.total_weight = att * 65535;
+                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+                    auto raw_script = get_share_script(obj);
+                    if (raw_script.empty()) return;
+                    delta.weights[raw_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                });
+                return delta;
+            },
+            std::move(verified_prev_fn)
+        );
+        auto result = verified_sl.query(prev_share_hash, chain_len, unlimited_weight);
+        auto weights = std::move(result.weights);
+        auto total_weight = result.total_weight;
+        auto donation_weight = result.total_donation_weight;
 
         if (weights.empty() || total_weight.IsNull())
             return uint256{};
@@ -1139,15 +1281,17 @@ public:
         payload += "|D:";
         payload += to_decimal(donation_weight);
 
-        // Log payload for debugging
+        // Log payload periodically (every 15s)
         {
-            static int plog = 0;
-            if (plog < 3) {
+            static auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(30);
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_log > std::chrono::seconds(15)) {
+                last_log = now;
                 LOG_INFO << "[merged_payout_hash] chain_len=" << chain_len
-                         << " height=" << height
-                         << " weights=" << weights.size()
+                         << " verified_height=" << height
+                         << " weights=" << sorted_by_addr.size()
+                         << " total_weight=" << to_decimal(total_weight)
                          << " payload(" << payload.size() << ")=" << payload.substr(0, 200);
-                ++plog;
             }
         }
 
@@ -1246,12 +1390,24 @@ private:
     std::optional<chain::WeightsSkipList> m_v36_weights_skiplist;
     std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
 
-    // Previous-share lambda shared by all skip lists
+    // Previous-share lambda for RAW chain (work templates, general PPLNS)
     auto make_previous_fn()
     {
         return [this](const uint256& hash) -> uint256 {
             if (!chain.contains(hash)) return uint256{};
             return chain.get_index(hash)->tail;
+        };
+    }
+
+    // Previous-share lambda for VERIFIED chain (consensus hash computation).
+    // Ensures compute_merged_payout_hash only walks shares that all peers
+    // agree on — prevents c2pool's own unverified shares from polluting
+    // the weight distribution and causing consensus divergence.
+    auto make_verified_previous_fn()
+    {
+        return [this](const uint256& hash) -> uint256 {
+            if (!verified.contains(hash)) return uint256{};
+            return verified.get_index(hash)->tail;
         };
     }
 

@@ -266,6 +266,8 @@ void HttpSession::process_request()
             // ── p2pool legacy compatibility endpoints ──────────────────────
             else if (target == "/local_stats")
                 rest_result = mining_interface_->rest_local_stats();
+            else if (target == "/miner_thresholds")
+                rest_result = mining_interface_->rest_miner_thresholds();
             else if (target == "/web/version")
                 rest_result = mining_interface_->rest_web_version();
             else if (target == "/web/currency_info")
@@ -2383,6 +2385,64 @@ nlohmann::json MiningInterface::rest_stratum_stats()
         result["mining_enabled"] = m_mining_enabled;
         result["banned_count"] = static_cast<uint64_t>(m_banned_targets.size());
     }
+
+    return result;
+}
+
+nlohmann::json MiningInterface::rest_miner_thresholds()
+{
+    nlohmann::json result = nlohmann::json::object();
+
+    // Get pool hashrate from global_stats computation
+    auto gs = rest_global_stats();
+    double pool_hr = gs.value("pool_hash_rate", 0.0);
+
+    // Get block subsidy from cached GBT template
+    uint64_t subsidy = 156250000; // default 1.5625 LTC
+    if (m_cached_template.contains("coinbasevalue"))
+        subsidy = m_cached_template.value("coinbasevalue", subsidy);
+
+    // Network params (testnet defaults, overridden by config)
+    uint32_t chain_length = 400;  // REAL_CHAIN_LENGTH
+    uint32_t share_period = 4;    // SHARE_PERIOD
+    if (m_node) {
+        auto hs = m_node->get_hashrate_stats();
+        if (hs.contains("chain_length"))
+            chain_length = hs.value("chain_length", chain_length);
+        if (hs.contains("share_period"))
+            share_period = hs.value("share_period", share_period);
+    }
+
+    double window_sec = static_cast<double>(chain_length) * share_period;
+
+    // min_hashrate = pool_hashrate / chain_length (1 share per window)
+    double min_hr_normal = pool_hr / chain_length;
+    double min_hr_dust = min_hr_normal / 30.0; // 30x DUST range
+
+    // min_payout = subsidy / chain_length
+    double min_payout = static_cast<double>(subsidy) / 1e8 / chain_length;
+
+    result["pool_hashrate"] = pool_hr;
+    result["min_hashrate_normal"] = min_hr_normal;
+    result["min_hashrate_dust"] = min_hr_dust;
+    result["min_payout_ltc"] = min_payout;
+    result["block_subsidy_ltc"] = static_cast<double>(subsidy) / 1e8;
+    result["chain_length"] = chain_length;
+    result["share_period"] = share_period;
+    result["window_seconds"] = window_sec;
+    result["dust_range"] = 30;
+
+    // Human-readable formatting
+    auto fmt_hr = [](double hr) -> std::string {
+        char buf[32];
+        if (hr >= 1e12) { snprintf(buf, sizeof(buf), "%.2f TH/s", hr / 1e12); return buf; }
+        if (hr >= 1e9)  { snprintf(buf, sizeof(buf), "%.2f GH/s", hr / 1e9);  return buf; }
+        if (hr >= 1e6)  { snprintf(buf, sizeof(buf), "%.2f MH/s", hr / 1e6);  return buf; }
+        if (hr >= 1e3)  { snprintf(buf, sizeof(buf), "%.2f KH/s", hr / 1e3);  return buf; }
+        snprintf(buf, sizeof(buf), "%.0f H/s", hr); return buf;
+    };
+    result["min_hashrate_display"] = fmt_hr(min_hr_dust);
+    result["pool_hashrate_display"] = fmt_hr(pool_hr);
 
     return result;
 }

@@ -2056,8 +2056,12 @@ int main(int argc, char* argv[]) {
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = 36;
 
-                    // Compute pool-level share target from tracker state
-                    auto desired_target = chain::bits_to_target(bits);
+                    // Compute pool-level share target from tracker state.
+                    // Pass MAX_TARGET as desired_target so compute_share_target
+                    // clips to pool share difficulty (pre_target3). Block difficulty
+                    // is NOT the share target — it would make shares 1000x+ too hard.
+                    // Per-miner difficulty adjustment happens via VARDIFF in stratum.
+                    auto desired_target = ltc::PoolConfig::max_target();
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
                     params.max_bits = share_max_bits;
@@ -2125,7 +2129,7 @@ int main(int argc, char* argv[]) {
 
                         // Recompute share target with the clipped timestamp
                         {
-                            auto desired_target2 = chain::bits_to_target(bits);
+                            auto desired_target2 = ltc::PoolConfig::max_target();
                             auto [sm, sb] = tracker.compute_share_target(
                                 params.prev_share, params.timestamp, desired_target2);
                             params.max_bits = sm;

@@ -769,27 +769,11 @@ void MergedMiningManager::try_submit_merged_blocks(
             proof.index,
             parent_header_hex);
 
-        if (chain.config.multiaddress && m_payout_provider) {
-            // Strategy: submit via BOTH paths for maximum reliability.
-            //
-            // 1. submitauxblock FIRST (fast path) — uses daemon/adapter template,
-            //    arrives instantly because daemon already has the block ready.
-            //    The mm-adapter builds PPLNS coinbase, so payouts are correct.
-            //
-            // 2. submitblock SECOND (THE commitment path) — uses our custom
-            //    coinbase with /c2pool/ tag + THE state_root. If #1 already
-            //    won, this gets "duplicate" (harmless). If #1 failed, this
-            //    is the backup. If this wins the race, the block carries
-            //    our THE commitment on-chain.
-            //
-            // Both are valid blocks with identical PoW. The daemon picks
-            // whichever arrives first. Different scriptSig text doesn't
-            // invalidate the block — it just changes the merkle_root.
-
-            // Fast path: submitauxblock (daemon template)
-            submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
-
-            // THE commitment path: build custom block with /c2pool/ + state_root
+        // Always use the PPLNS multiaddress path with /c2pool/ tag +
+        // THE state_root + COMBINED_DONATION_SCRIPT marker.
+        // Even solo mode gets proper donation marker and fee outputs.
+        // submitauxblock is never used — it bypasses our coinbase builder.
+        if (m_payout_provider) {
             auto payouts = m_payout_provider(chain.config.chain_id,
                                              chain.current_work.coinbase_value);
             uint256 state_root;
@@ -799,10 +783,9 @@ void MergedMiningManager::try_submit_merged_blocks(
                     chain.current_work.block_template, payouts, auxpow, state_root);
                 if (!block_hex.empty()) {
                     LOG_INFO << "[MM:" << chain.config.symbol
-                             << "] THE block submitted (" << block_hex.size()/2 << " bytes, "
+                             << "] PPLNS block submitted (" << block_hex.size()/2 << " bytes, "
                              << payouts.size() << " outputs, /c2pool/ + state_root)";
                     chain.rpc->submit_block(block_hex);
-                    // Relay custom block via P2P too
                     if (m_block_relay_fn) {
                         try { m_block_relay_fn(chain.config.chain_id, block_hex); }
                         catch (...) {}
@@ -810,8 +793,10 @@ void MergedMiningManager::try_submit_merged_blocks(
                 }
             }
         } else {
-            LOG_INFO << "[MM:" << chain.config.symbol << "] Single-address mode (multiaddress="
-                     << chain.config.multiaddress << " payout_provider=" << !!m_payout_provider << ")";
+            // No payout provider — cannot build coinbase. Use daemon template
+            // as absolute last resort (no PPLNS, no donation marker).
+            LOG_WARNING << "[MM:" << chain.config.symbol
+                        << "] No payout_provider — falling back to submitauxblock (no PPLNS)";
             submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
         }
         LOG_INFO << "[MM:" << chain.config.symbol << "] Post-submission processing complete";

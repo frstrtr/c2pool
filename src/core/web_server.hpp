@@ -168,6 +168,7 @@ public:
     nlohmann::json rest_uptime();
     nlohmann::json rest_connected_miners();
     nlohmann::json rest_stratum_stats();
+    nlohmann::json rest_miner_thresholds();
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
     nlohmann::json rest_sharechain_window();
