@@ -666,7 +666,10 @@ private:
 
     // Cached PPLNS outputs for per-connection coinbase generation
     // (populated in refresh_work, consumed in build_connection_coinbase)
+    // m_cached_pplns_best_share records which share the PPLNS was computed from.
+    // If build_connection_coinbase's frozen_prev_share differs, PPLNS is recomputed.
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
+    uint256 m_cached_pplns_best_share;
     bool m_cached_raw_scripts{false};
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root

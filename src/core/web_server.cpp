@@ -1235,6 +1235,53 @@ MiningInterface::build_connection_coinbase(
     if (!m_work_valid || m_cached_template.is_null())
         return {};
 
+    // CRITICAL: If frozen prev_share_hash differs from the share used for cached PPLNS,
+    // recompute PPLNS from the frozen share. This ensures the coinbase amounts match
+    // what generate_share_transaction will compute during verification.
+    // (Matches p2pool's closure pattern: coinbase is frozen at template time.)
+    if (m_pplns_fn && prev_share_hash != m_cached_pplns_best_share && !prev_share_hash.IsNull())
+    {
+        uint32_t nbits = 0;
+        if (m_cached_template.contains("bits"))
+            nbits = static_cast<uint32_t>(std::stoul(
+                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+        uint256 block_target = chain::bits_to_target(nbits);
+        uint64_t subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+
+        auto expected = m_pplns_fn(prev_share_hash, block_target, subsidy, m_donation_script);
+
+        if (!expected.empty()) {
+            // Rebuild cached outputs from fresh PPLNS (same logic as refresh_work)
+            auto& self = const_cast<MiningInterface&>(*this);
+            self.m_cached_pplns_outputs.clear();
+            static const char* HX = "0123456789abcdef";
+
+            std::string donation_hex;
+            for (unsigned char b : m_donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
+
+            std::pair<std::string, uint64_t> donation_entry;
+            bool found_donation = false;
+
+            for (const auto& [script_bytes, amount] : expected) {
+                uint64_t sat = static_cast<uint64_t>(amount);
+                std::string hex;
+                for (unsigned char b : script_bytes) { hex += HX[b >> 4]; hex += HX[b & 0x0f]; }
+                if (hex == donation_hex) { donation_entry = {hex, sat}; found_donation = true; }
+                else if (sat > 0) { self.m_cached_pplns_outputs.push_back({std::move(hex), sat}); }
+            }
+            std::sort(self.m_cached_pplns_outputs.begin(), self.m_cached_pplns_outputs.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.second != b.second) return a.second < b.second;
+                    return a.first < b.first;
+                });
+            if (found_donation) self.m_cached_pplns_outputs.push_back(donation_entry);
+            self.m_cached_pplns_best_share = prev_share_hash;
+            LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
+                     << prev_share_hash.ToString().substr(0, 16)
+                     << " outputs=" << self.m_cached_pplns_outputs.size();
+        }
+    }
+
     // Build the coinbase scriptSig (FIXED — no extranonce1/2):
     //   BIP34_height + mm_commitment + tag + state_root
     // This is share.m_coinbase and determines ref_hash.
@@ -1406,8 +1453,12 @@ void MiningInterface::refresh_work()
 
         try {
             // V36 PPLNS path: use share-tracker proportional payouts directly
+            // IMPORTANT: Use m_best_share_hash_fn() here for the PPLNS computation AND
+            // cache it so build_connection_coinbase can verify consistency with frozen_prev_share.
+            // If they diverge, build_connection_coinbase will recompute PPLNS from frozen_prev_share.
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
+                m_cached_pplns_best_share = best;  // remember which share PPLNS was computed from
                 if (!best.IsNull()) {
                     LOG_INFO << "[Pool] refresh_work: PPLNS active, best_share=" << best.GetHex()
                              << " donation_script_len=" << m_donation_script.size();
