@@ -524,7 +524,17 @@ public:
         if (time <= 0)
             time = 1;
 
-        return (use_min_work ? interval.min_work : interval.work) / static_cast<uint32_t>(time);
+        auto result = (use_min_work ? interval.min_work : interval.work) / static_cast<uint32_t>(time);
+        {
+            static int aps_log = 0;
+            if (aps_log++ < 3)
+                LOG_INFO << "[APS] dist=" << dist << " time=" << time
+                         << " work=" << interval.work.GetHex().substr(0, 20)
+                         << " min_work=" << interval.min_work.GetHex().substr(0, 20)
+                         << " use_min=" << use_min_work
+                         << " result=" << result.GetHex().substr(0, 20);
+        }
+        return result;
     }
 
     // -- Share target computation --

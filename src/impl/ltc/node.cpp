@@ -306,6 +306,17 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
             LOG_INFO << "Received share: hash=" << obj->m_hash.GetHex().substr(0, 16)
                      << " height=" << obj->m_absheight
                      << " from " << source;
+            // One-time diagnostic: log first share's bits and chain work
+            static int bits_log = 0;
+            if (bits_log++ < 3) {
+                LOG_INFO << "[SHARE-BITS] bits=0x" << std::hex << obj->m_bits
+                         << " max_bits=0x" << obj->m_max_bits << std::dec
+                         << " absheight=" << obj->m_absheight;
+                auto target = chain::bits_to_target(obj->m_bits);
+                auto att = chain::target_to_average_attempts(target);
+                LOG_INFO << "[SHARE-BITS] target=" << target.GetHex().substr(0, 20)
+                         << " att=" << att.GetHex().substr(0, 20);
+            }
         });
 
         m_tracker.add(share);
