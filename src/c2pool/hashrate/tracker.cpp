@@ -123,7 +123,7 @@ void HashrateTracker::enable_vardiff(bool enabled) {
 void HashrateTracker::set_difficulty_hint(double hint) {
     std::lock_guard<std::mutex> lock(shares_mutex_);
     double clamped = std::max(min_difficulty_, std::min(max_difficulty_, hint));
-    if (clamped != current_difficulty_) {
+    if (std::abs(clamped - current_difficulty_) > 1e-9) {
         LOG_INFO << "[Stratum] Applying difficulty hint: " << current_difficulty_ << " -> " << clamped;
         current_difficulty_ = clamped;
     }

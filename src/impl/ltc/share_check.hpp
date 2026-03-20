@@ -1321,7 +1321,6 @@ std::string verify_merged_coinbase_commitment(
         // Build payout list (same logic as payout_provider)
         auto donation_script = PoolConfig::get_donation_script(36);
         uint64_t coinbase_value = info.m_coinbase_value;
-        uint32_t block_height = info.m_block_height;
 
         // Convert weights to integer payouts
         std::map<std::vector<unsigned char>, uint64_t> output_amounts;

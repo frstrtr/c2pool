@@ -8,6 +8,9 @@
 #include <csignal>
 #include <ctime>
 #include <memory>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <sstream>
 
 // Core includes
@@ -47,10 +50,17 @@
 #include <cxxabi.h>    // for __cxa_current_exception_type
 
 static void write_crash_log(const char* reason) {
-    FILE* f = fopen("/tmp/c2pool_crash.log", "a");
-    if (f) {
+    int fd = open("/tmp/c2pool_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0640);
+    if (fd < 0) return;
+    FILE* f = fdopen(fd, "a");
+    if (!f) { close(fd); return; }
+    {
         time_t now = time(nullptr);
-        fprintf(f, "\n=== CRASH: %s at %s", reason, ctime(&now));
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S %Z", &tm_buf);
+        fprintf(f, "\n=== CRASH: %s at %s\n", reason, time_str);
         void* frames[64];
         int n = backtrace(frames, 64);
         char** syms = backtrace_symbols(frames, n);

@@ -232,17 +232,17 @@ struct ParsedScriptSig {
 
         size_t pos = 0;
 
-        // BIP34 height
+        // BIP34 height: first byte is push length (1-8 bytes of LE height),
+        // or OP_1..OP_16 (0x51-0x60) for heights 1-16 in very old blocks.
         uint8_t height_len = data[pos++];
-        if (height_len <= 16) {
-            // OP_1..OP_16
-            out.block_height = height_len - 0x50;
-            pos--; pos++; // height was the opcode itself
-        } else if (height_len > 0 && height_len <= 8 && pos + height_len <= len) {
+        if (height_len >= 1 && height_len <= 8 && pos + height_len <= len) {
             out.block_height = 0;
             for (size_t i = 0; i < height_len; ++i)
                 out.block_height |= static_cast<int>(data[pos + i]) << (8 * i);
             pos += height_len;
+        } else if (height_len >= 0x51 && height_len <= 0x60) {
+            // OP_1..OP_16
+            out.block_height = height_len - 0x50;
         }
 
         // Check for AuxPoW marker: fabe6d6d

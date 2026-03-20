@@ -713,7 +713,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         }
     }
 
-    if (new_difficulty != old_difficulty) {
+    if (std::abs(new_difficulty - old_difficulty) > 1e-9) {
         send_set_difficulty(new_difficulty);
         LOG_INFO << "[Stratum] VARDIFF adjustment for " << username_ << ": "
                  << old_difficulty << " -> " << new_difficulty;

@@ -566,18 +566,25 @@ public:
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
         // Not enough chain depth for proper difficulty calculation.
-        // Use the chain HEAD's bits (most recent peer share) as the target.
-        // The HEAD reflects the network's CURRENT stabilized difficulty,
-        // unlike "hardest bits" which might pick from the ramp-up period.
-        // Genesis nodes (no peers) fall back to MAX_TARGET.
+        // Use the prev_share's bits and max_bits as-is — they reflect the
+        // network's current difficulty at the chain tip. This matches
+        // p2pool's behavior: on genesis, first shares use MAX_TARGET and
+        // difficulty ramps up as the chain grows.
         if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
-            // Not enough history for proper difficulty calculation.
-            // Return {0, 0} to signal "don't create shares yet" — the caller
-            // should only mine pseudoshares until the chain has enough depth
-            // for compute_share_target to compute proper difficulty.
-            // Genesis nodes (persist=false, no peers) can override this.
-            return {0, 0};
+            uint32_t peer_bits = 0, peer_max_bits = 0;
+            if (!prev_share_hash.IsNull() && chain.contains(prev_share_hash)) {
+                chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+                    peer_bits = obj->m_bits;
+                    peer_max_bits = obj->m_max_bits;
+                });
+            }
+            if (peer_bits != 0 && peer_max_bits != 0) {
+                return {peer_max_bits, peer_bits};
+            }
+            // Genesis (no peers) — use MAX_TARGET
+            auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
+            return {max_bits, max_bits};
         }
 
         // Step 1: Derive target from pool hashrate
@@ -754,10 +761,6 @@ public:
 
         double share_period = static_cast<double>(PoolConfig::share_period());
         double chain_length = static_cast<double>(PoolConfig::real_chain_length());
-        double window = chain_length * share_period;
-
-        // pool_share_att = pool_hashrate * share_period
-        double pool_share_att = pool_hr * share_period;
 
         // min_hashrate = pool_share_att / window = pool_hr / chain_length
         t.min_hashrate_normal = pool_hr / chain_length;
@@ -892,6 +895,9 @@ public:
         auto walk_count = std::min(max_shares, chain.get_height(start));
         auto walk_view = chain.get_chain(start, walk_count);
 
+        static int decay_dump = 0;
+        bool do_dump = (decay_dump++ < 2);
+
         for (auto& [hash, data] : walk_view)
         {
             data.share.invoke([&](auto* obj) {
@@ -901,6 +907,16 @@ public:
 
                 // Apply exponential decay: decayed_att = att * decay_fp >> PRECISION
                 uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
+
+                if (do_dump && share_count < 5) {
+                    LOG_INFO << "[DECAY-WALK] #" << share_count
+                             << " bits=0x" << std::hex << obj->m_bits << std::dec
+                             << " att=" << att.GetLow64()
+                             << " decay_fp=" << decay_fp
+                             << " decayed_att=" << decayed_att.GetLow64()
+                             << " don=" << don
+                             << " hash=" << hash.GetHex().substr(0, 16);
+                }
 
                 auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
                 auto don_w  = decayed_att * don;
@@ -934,6 +950,24 @@ public:
             // 128-bit multiply avoids overflow: decay_fp × decay_per ≈ 2^80.
             decay_fp = static_cast<uint64_t>(
                 (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
+        }
+
+        if (do_dump) {
+            LOG_INFO << "[DECAY-WALK] TOTAL: shares=" << share_count
+                     << " addrs=" << result.weights.size()
+                     << " total_w=" << result.total_weight.GetLow64()
+                     << " don_w=" << result.total_donation_weight.GetLow64()
+                     << " start=" << start.GetHex().substr(0, 16)
+                     << " max_shares=" << max_shares;
+            for (auto& [script, w] : result.weights) {
+                auto script_hex = std::string();
+                for (auto b : script) {
+                    static const char* H = "0123456789abcdef";
+                    script_hex += H[b >> 4]; script_hex += H[b & 0xf];
+                }
+                LOG_INFO << "[DECAY-WALK]   " << script_hex.substr(0, 40)
+                         << " weight=" << w.GetLow64();
+            }
         }
 
         // Cache result (single-entry, invalidated on chain change)
