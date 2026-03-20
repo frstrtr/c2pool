@@ -373,7 +373,15 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 	for (const auto& handle_hash : hashes)
 	{
 		if (!m_chain->contains(handle_hash))
+		{
+			static int miss_log = 0;
+			if (miss_log++ < 5)
+				LOG_WARNING << "[handle_get_share] hash NOT in chain: "
+				            << handle_hash.ToString().substr(0, 16)
+				            << " chain_size=" << m_chain->size()
+				            << " tracker_chain_size=" << m_tracker.chain.size();
 			continue;
+		}
 		uint64_t n = std::min(parents+1, (uint64_t) m_chain->get_height(handle_hash));
 		for (auto& [hash, data] : m_chain->get_chain(handle_hash, n))
         {
