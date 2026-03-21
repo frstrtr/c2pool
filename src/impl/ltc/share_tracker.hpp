@@ -1186,19 +1186,17 @@ public:
         auto chain_len = std::min(height,
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
 
-        // Walk verified chain only — rebuild skip list each call since the
-        // verified chain grows during sync. O(chain_len) for build + O(log n)
-        // for query. Called once per share verification, not a hot path.
-        // Walk verified chain only — rebuild skip list each call since the
-        // verified chain grows during sync.
-        auto verified_prev_fn = [this](const uint256& hash) -> uint256 {
-            if (!verified.contains(hash)) return uint256{};
-            return verified.get_index(hash)->tail;
+        // Walk RAW chain (not verified) — matches p2pool's compute_merged_payout_hash
+        // which uses tracker (raw). Using verified chain causes hash mismatch when
+        // the verified chain is shorter (during sync or with missing ancestors).
+        auto raw_prev_fn = [this](const uint256& hash) -> uint256 {
+            if (!chain.contains(hash)) return uint256{};
+            return chain.get_index(hash)->tail;
         };
-        chain::WeightsSkipList verified_sl(
+        chain::WeightsSkipList raw_sl(
             [this](const uint256& hash) -> chain::WeightsDelta {
                 chain::WeightsDelta delta;
-                if (!verified.contains(hash)) return delta;
+                if (!chain.contains(hash)) return delta;
                 delta.share_count = 1;
                 chain.get_share(hash).invoke([&](auto* obj) {
                     if (obj->m_desired_version < 36) return;
@@ -1212,9 +1210,9 @@ public:
                 });
                 return delta;
             },
-            std::move(verified_prev_fn)
+            std::move(raw_prev_fn)
         );
-        auto result = verified_sl.query(prev_share_hash, chain_len, unlimited_weight);
+        auto result = raw_sl.query(prev_share_hash, chain_len, unlimited_weight);
         auto weights = std::move(result.weights);
         auto total_weight = result.total_weight;
         auto donation_weight = result.total_donation_weight;
@@ -1282,7 +1280,7 @@ public:
             if (now - last_log > std::chrono::seconds(15)) {
                 last_log = now;
                 LOG_INFO << "[merged_payout_hash] chain_len=" << chain_len
-                         << " verified_height=" << height
+                         << " raw_height=" << height
                          << " weights=" << sorted_by_script.size()
                          << " total_weight=" << to_decimal(total_weight)
                          << " payload(" << payload.size() << ")=" << payload.substr(0, 200);

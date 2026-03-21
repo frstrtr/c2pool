@@ -700,7 +700,7 @@ std::vector<uint8_t> MergedMiningManager::get_auxpow_commitment()
     return m_cached_commitment;
 }
 
-void MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash)
+std::vector<uint8_t> MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& chain : m_chains) {
@@ -709,7 +709,9 @@ void MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uin
             break;
         }
     }
-    // Rebuild the commitment with updated block hash
+    // Rebuild the commitment with updated block hash and return it atomically.
+    // This avoids the race where poll_loop overwrites block_hash between
+    // override and get_auxpow_commitment().
     std::map<uint32_t, uint256> slot_hashes;
     for (const auto& chain : m_chains) {
         if (!chain.current_work.block_hash.IsNull()) {
@@ -722,6 +724,7 @@ void MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uin
         auto proof = m_tree.compute_root(slot_hashes, 0);
         m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
     }
+    return m_cached_commitment;
 }
 
 void MergedMiningManager::try_submit_merged_blocks(

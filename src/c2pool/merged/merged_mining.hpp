@@ -183,12 +183,12 @@ public:
     // Also caches current aux work so submit_merged_blocks() can use it.
     std::vector<uint8_t> get_auxpow_commitment();
 
-    // Override the cached block hash for a chain. Used after build_merged_header_info()
-    // computes the PPLNS-derived DOGE header — the block hash from that header must
-    // replace the daemon's createauxblock hash so mm_data is consistent with
-    // merged_coinbase_info. Without this, verification fails:
-    //   block_hash(from header) != aux_merkle_root(from mm_data)
-    void override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash);
+    // Override the cached block hash for a chain and return the fresh auxpow commitment.
+    // Used after build_merged_header_info() computes the PPLNS-derived DOGE header —
+    // the block hash from that header must replace the daemon's createauxblock hash
+    // so mm_data is consistent with merged_coinbase_info. Returns the rebuilt commitment
+    // atomically to avoid race with poll_loop overwriting the hash.
+    std::vector<uint8_t> override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash);
 
     // Called after a parent block is found / share meets aux target.
     // Builds and submits merged blocks for all aux chains whose target is met.
