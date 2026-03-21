@@ -534,12 +534,23 @@ uint256 NodeImpl::best_share_hash()
     //
     // Fallback: if verified chain is empty (initial sync), use raw chain
     // so the node can still generate work for miners (pseudoshares).
+    // Use the result from think() — this is what p2pool uses for share creation.
+    // think() scores heads by accumulated work and applies punishment, matching
+    // the network consensus on which chain is best.
+    if (!m_best_share_hash.IsNull()) {
+        static int log_count = 0;
+        if (log_count++ % 60 == 0) {
+            auto h = m_tracker.verified.contains(m_best_share_hash)
+                ? m_tracker.verified.get_height(m_best_share_hash) : 0;
+            LOG_INFO << "[best_share] using think() result height=" << h
+                     << " verified=" << m_tracker.verified.size()
+                     << " raw=" << (m_chain ? m_chain->size() : 0);
+        }
+        return m_best_share_hash;
+    }
+    // Fallback: if think() hasn't run yet, pick best verified head by work
     auto& verified = m_tracker.verified;
     if (verified.size() > 0) {
-        // Pick the verified head with greatest accumulated WORK (matches p2pool's think()).
-        // Using height instead of work caused c2pool to prefer its own chain
-        // (more shares at lower difficulty) over p2pool's chain (fewer shares
-        // at higher difficulty), creating a fork with different PPLNS weights.
         uint256 best;
         uint288 best_work;
         bool first = true;
@@ -552,10 +563,10 @@ uint256 NodeImpl::best_share_hash()
             }
         }
         if (!best.IsNull()) {
-            static int log_count = 0;
+            static int log_count2 = 0;
             auto best_height = verified.get_height(best);
-            if (log_count++ % 60 == 0)
-                LOG_INFO << "[best_share] using VERIFIED head height=" << best_height
+            if (log_count2++ % 60 == 0)
+                LOG_INFO << "[best_share] fallback VERIFIED head height=" << best_height
                          << " work=" << best_work.GetHex().substr(0, 16)
                          << " verified=" << verified.size()
                          << " raw=" << (m_chain ? m_chain->size() : 0);
