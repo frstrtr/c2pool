@@ -1425,6 +1425,13 @@ MiningInterface::build_connection_coinbase(
         static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
         tmpl_height, tmpl_bits);
 
+    // Re-fetch mm_commitment AFTER ref_hash_fn, because ref_hash_fn calls
+    // override_chain_block_hash() which updates the DOGE block hash to the
+    // PPLNS-derived hash. Without this, mm_data commits to the daemon's hash
+    // while merged_coinbase_info commits to the PPLNS hash → verification fails.
+    auto mm_commitment_fresh = m_mm_manager ?
+        m_mm_manager->get_auxpow_commitment() : m_cached_mm_commitment;
+
     LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
              << prev_share_hash.GetHex().substr(0, 16) << " outputs=" << m_cached_pplns_outputs.size();
     {
@@ -1439,7 +1446,7 @@ MiningInterface::build_connection_coinbase(
         subsidy,
         m_cached_pplns_outputs,
         m_cached_raw_scripts,
-        m_cached_mm_commitment,
+        mm_commitment_fresh,
         m_cached_witness_commitment,
         ref_hash_hex,
         the_root,

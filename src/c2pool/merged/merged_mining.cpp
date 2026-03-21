@@ -700,6 +700,30 @@ std::vector<uint8_t> MergedMiningManager::get_auxpow_commitment()
     return m_cached_commitment;
 }
 
+void MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& chain : m_chains) {
+        if (chain.config.chain_id == chain_id) {
+            chain.current_work.block_hash = pplns_block_hash;
+            break;
+        }
+    }
+    // Rebuild the commitment with updated block hash
+    std::map<uint32_t, uint256> slot_hashes;
+    for (const auto& chain : m_chains) {
+        if (!chain.current_work.block_hash.IsNull()) {
+            auto it = m_tree.slot_map.find(chain.config.chain_id);
+            if (it != m_tree.slot_map.end())
+                slot_hashes[it->second] = chain.current_work.block_hash;
+        }
+    }
+    if (!slot_hashes.empty()) {
+        auto proof = m_tree.compute_root(slot_hashes, 0);
+        m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
+    }
+}
+
 void MergedMiningManager::try_submit_merged_blocks(
     const std::string& parent_header_hex,
     const std::string& parent_coinbase_hex,

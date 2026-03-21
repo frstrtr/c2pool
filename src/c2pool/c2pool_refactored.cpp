@@ -2186,10 +2186,16 @@ int main(int argc, char* argv[]) {
                             entry.m_chain_id = hi.chain_id;
                             entry.m_coinbase_value = hi.coinbase_value;
                             entry.m_block_height = hi.block_height;
-                            if (hi.block_header.size() == 80)
-                                entry.m_block_header.m_data = std::move(hi.block_header);
-                            else
+                            if (hi.block_header.size() == 80) {
+                                entry.m_block_header.m_data = hi.block_header; // copy, need original for hash
+                                // Compute PPLNS-derived block hash and override the daemon's hash
+                                // so get_auxpow_commitment() returns mm_data consistent with this header
+                                uint256 pplns_block_hash = Hash(hi.block_header);
+                                mi_for_share_bits->get_mm_manager()->override_chain_block_hash(
+                                    hi.chain_id, pplns_block_hash);
+                            } else {
                                 entry.m_block_header.m_data.assign(80, 0);
+                            }
                             entry.m_coinbase_merkle_link.m_branch = std::move(hi.coinbase_merkle_branches);
                             entry.m_coinbase_merkle_link.m_index = 0;
                             entry.m_coinbase_script.m_data = std::move(hi.coinbase_script);
