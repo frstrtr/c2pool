@@ -796,34 +796,27 @@ void MergedMiningManager::try_submit_merged_blocks(
             proof.index,
             parent_header_hex);
 
-        // Always use the PPLNS multiaddress path with /c2pool/ tag +
-        // THE state_root + COMBINED_DONATION_SCRIPT marker.
-        // Even solo mode gets proper donation marker and fee outputs.
-        // submitauxblock is never used — it bypasses our coinbase builder.
-        if (m_payout_provider) {
-            auto payouts = m_payout_provider(chain.config.chain_id,
-                                             chain.current_work.coinbase_value);
-            uint256 state_root;
-            if (m_state_root_provider) state_root = m_state_root_provider();
-            if (!payouts.empty() && !chain.current_work.block_template.is_null()) {
-                auto block_hex = build_multiaddress_block(
-                    chain.current_work.block_template, payouts, auxpow, state_root);
-                if (!block_hex.empty()) {
-                    LOG_INFO << "[MM:" << chain.config.symbol
-                             << "] PPLNS block submitted (" << block_hex.size()/2 << " bytes, "
-                             << payouts.size() << " outputs, /c2pool/ + state_root)";
-                    chain.rpc->submit_block(block_hex);
-                    if (m_block_relay_fn) {
-                        try { m_block_relay_fn(chain.config.chain_id, block_hex); }
-                        catch (...) {}
-                    }
+        // Use FROZEN payouts + template from ref_hash_fn time.
+        // These match the DOGE block hash committed in the LTC coinbase's mm_data.
+        // Using current payouts would produce a different coinbase → different
+        // merkle root → different block hash → invalid AuxPoW proof.
+        if (!chain.frozen_payouts.empty() && !chain.frozen_template.is_null()) {
+            auto block_hex = build_multiaddress_block(
+                chain.frozen_template, chain.frozen_payouts, auxpow, chain.frozen_state_root);
+            if (!block_hex.empty()) {
+                LOG_INFO << "[MM:" << chain.config.symbol
+                         << "] PPLNS block submitted (" << block_hex.size()/2 << " bytes, "
+                         << chain.frozen_payouts.size() << " outputs, frozen from ref_hash_fn)";
+                chain.rpc->submit_block(block_hex);
+                if (m_block_relay_fn) {
+                    try { m_block_relay_fn(chain.config.chain_id, block_hex); }
+                    catch (...) {}
                 }
             }
         } else {
-            // No payout provider — cannot build coinbase. Use daemon template
-            // as absolute last resort (no PPLNS, no donation marker).
+            // No frozen data — either payout_provider not set or template not ready
             LOG_WARNING << "[MM:" << chain.config.symbol
-                        << "] No payout_provider — falling back to submitauxblock (no PPLNS)";
+                        << "] No frozen payouts/template — falling back to submitauxblock";
             submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
         }
         LOG_INFO << "[MM:" << chain.config.symbol << "] Post-submission processing complete";
@@ -973,22 +966,59 @@ MergedMiningManager::build_merged_header_info() const
 std::pair<std::vector<MergedMiningManager::MergedHeaderInfo>, std::vector<uint8_t>>
 MergedMiningManager::build_merged_header_info_with_commitment()
 {
-    // Step 1: Build header infos (releases lock internally for payout_fn callback)
+    // Step 1: Snapshot chain data + payouts (releases lock for payout_fn callback)
+    struct FrozenChain {
+        uint32_t chain_id;
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
+        nlohmann::json block_template;
+    };
+    std::vector<FrozenChain> frozen;
+    PayoutProvider payout_fn;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        payout_fn = m_payout_provider;
+        for (const auto& chain : m_chains) {
+            if (chain.current_work.coinbase_value == 0) continue;
+            if (chain.current_work.block_template.is_null()) continue;
+            frozen.push_back({chain.config.chain_id, {}, chain.current_work.block_template});
+        }
+    }
+    // Compute payouts outside lock (payout_fn calls tracker → would deadlock)
+    if (payout_fn) {
+        for (auto& fc : frozen) {
+            uint64_t cv = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (const auto& c : m_chains)
+                    if (c.config.chain_id == fc.chain_id) { cv = c.current_work.coinbase_value; break; }
+            }
+            fc.payouts = payout_fn(fc.chain_id, cv);
+        }
+    }
+
+    // Step 2: Build header infos from frozen data
     auto header_infos = build_merged_header_info();
 
-    // Step 2: Compute block hashes from PPLNS headers and update commitment atomically
+    // Step 3: Freeze payouts + template per chain AND update commitment atomically
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto& hi : header_infos) {
-        if (hi.block_header.size() == 80) {
-            uint256 pplns_hash = Hash(hi.block_header);
-            for (auto& chain : m_chains) {
-                if (chain.config.chain_id == hi.chain_id) {
-                    chain.current_work.block_hash = pplns_hash;
+        for (auto& chain : m_chains) {
+            if (chain.config.chain_id != hi.chain_id) continue;
+            if (hi.block_header.size() == 80)
+                chain.current_work.block_hash = Hash(hi.block_header);
+            // Freeze the payouts + template that match the committed block hash
+            for (const auto& fc : frozen) {
+                if (fc.chain_id == hi.chain_id) {
+                    chain.frozen_payouts = fc.payouts;
+                    chain.frozen_template = fc.block_template;
+                    chain.frozen_state_root = uint256{}; // zero — avoid deadlock
                     break;
                 }
             }
+            break;
         }
     }
+
     // Rebuild commitment with PPLNS-derived hashes (all under lock — no poll race)
     std::map<uint32_t, uint256> slot_hashes;
     for (const auto& chain : m_chains) {
@@ -998,7 +1028,6 @@ MergedMiningManager::build_merged_header_info_with_commitment()
                 slot_hashes[it->second] = chain.current_work.block_hash;
         }
     }
-    std::vector<uint8_t> commitment;
     if (!slot_hashes.empty()) {
         auto proof = m_tree.compute_root(slot_hashes, 0);
         m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);

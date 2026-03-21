@@ -337,6 +337,14 @@ private:
         std::string                          last_tip;
         bool                                 using_fallback{false};
         int64_t                              last_update_time{0}; // monotonic seconds
+        // Frozen DOGE block data from build_merged_header_info_with_commitment.
+        // Used by try_submit_merged_blocks to ensure the submitted block matches
+        // the AuxPoW commitment in the LTC parent coinbase. Without freezing,
+        // PPLNS state changes between template and submission time cause the
+        // DOGE block hash to differ from what's committed → invalid AuxPoW.
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> frozen_payouts;
+        nlohmann::json frozen_template;
+        uint256 frozen_state_root;
     };
     std::vector<ChainState> m_chains;
 
