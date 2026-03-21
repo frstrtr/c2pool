@@ -125,7 +125,7 @@ void StratumServer::notify_all()
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     for (auto& s : sessions_) {
         try {
-            s->send_notify_work(true); // clean_jobs=true so miner drops old work
+            s->send_notify_work(false); // clean_jobs=false: miner keeps working, submits for any valid job
         } catch (...) {}
     }
     // Prune dead sessions
