@@ -537,16 +537,38 @@ uint256 NodeImpl::best_share_hash()
     // Use the result from think() — this is what p2pool uses for share creation.
     // think() scores heads by accumulated work and applies punishment, matching
     // the network consensus on which chain is best.
-    if (!m_best_share_hash.IsNull()) {
+    //
+    // CRITICAL: Walk back past our OWN shares to find a peer-created share.
+    // c2pool shares have lower difficulty than pool target, so building on our
+    // own shares creates a feedback loop: low-diff shares → lower APS estimate
+    // → even lower target → more low-diff shares. By always extending from a
+    // peer's share, we inherit the pool's difficulty and our shares match.
+    if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+        uint256 candidate = m_best_share_hash;
+        // Walk back at most 10 shares to find one NOT from our own node
+        for (int i = 0; i < 10 && !candidate.IsNull() && m_tracker.chain.contains(candidate); ++i) {
+            bool is_local = false;
+            m_tracker.chain.get_share(candidate).invoke([&](auto* obj) {
+                is_local = (obj->peer_addr == NetService{"0.0.0.0", 0} ||
+                            obj->peer_addr == NetService{});
+            });
+            if (!is_local) break; // found a peer share — use it
+            // Walk to parent
+            m_tracker.chain.get_share(candidate).invoke([&](auto* obj) {
+                candidate = obj->m_prev_hash;
+            });
+        }
         static int log_count = 0;
         if (log_count++ % 60 == 0) {
-            auto h = m_tracker.verified.contains(m_best_share_hash)
-                ? m_tracker.verified.get_height(m_best_share_hash) : 0;
+            auto h = m_tracker.verified.contains(candidate)
+                ? m_tracker.verified.get_height(candidate) : 0;
             LOG_INFO << "[best_share] using think() result height=" << h
+                     << " skipped_local=" << (candidate != m_best_share_hash)
                      << " verified=" << m_tracker.verified.size()
                      << " raw=" << (m_chain ? m_chain->size() : 0);
         }
-        return m_best_share_hash;
+        if (!candidate.IsNull())
+            return candidate;
     }
     // Fallback: if think() hasn't run yet, pick best verified head by work
     auto& verified = m_tracker.verified;
