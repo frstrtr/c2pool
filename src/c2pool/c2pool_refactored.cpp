@@ -2075,6 +2075,33 @@ int main(int argc, char* argv[]) {
                     auto desired_target = ltc::PoolConfig::max_target();
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
+                    // Sanity check: if our computed target drifted from the peer's
+                    // (due to our own low-diff shares contaminating the chain's APS),
+                    // inherit the peer share's bits. This matches what p2pool would
+                    // compute on a clean chain — the ±10% clamp keeps bits close to
+                    // the prev share, so a peer share's bits ARE the correct pool target.
+                    if (!params.prev_share.IsNull() &&
+                        p2p_node->tracker().chain.contains(params.prev_share)) {
+                        uint32_t peer_bits = 0, peer_max_bits = 0;
+                        p2p_node->tracker().chain.get_share(params.prev_share).invoke([&](auto* obj) {
+                            peer_bits = obj->m_bits;
+                            peer_max_bits = obj->m_max_bits;
+                        });
+                        if (peer_bits != 0 && peer_max_bits != 0) {
+                            auto peer_target = chain::bits_to_target(peer_bits);
+                            auto our_target = chain::bits_to_target(share_bits);
+                            // If our target drifted >2x from peer's, use peer's bits
+                            if (our_target > peer_target && (our_target >> 1) > peer_target) {
+                                share_bits = peer_bits;
+                                share_max_bits = peer_max_bits;
+                                static int guard_log = 0;
+                                if (guard_log++ < 10)
+                                    LOG_WARNING << "[ShareTarget] GUARD: using peer bits=0x"
+                                                << std::hex << peer_bits << std::dec
+                                                << " (computed was >2x easier)";
+                            }
+                        }
+                    }
                     params.max_bits = share_max_bits;
                     params.bits = share_bits;
                     params.timestamp = timestamp;
