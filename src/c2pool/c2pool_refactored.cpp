@@ -2193,24 +2193,24 @@ int main(int argc, char* argv[]) {
                     // this by building everything in get_work() closure.
                     // TODO: Implement full DOGE header construction at ref_hash_fn time.
                     // For now, populate with available data from MM manager.
-                    if (mi_for_share_bits->get_mm_manager()) {
-                        // Atomic: build DOGE headers AND matching commitment in one shot.
-                        // Prevents race where poll_loop updates DOGE template between
-                        // header build and commitment generation.
-                        auto [header_infos, fresh_commitment] =
-                            mi_for_share_bits->get_mm_manager()->build_merged_header_info_with_commitment();
-                        for (auto& hi : header_infos) {
+                    // Use pre-computed merged header infos from build_connection_coinbase.
+                    // They were built atomically with the mm_commitment that's in the
+                    // scriptSig — this ensures the DOGE block hash in merged_coinbase_info
+                    // matches the aux_merkle_root in the mm_data commitment.
+                    // (p2pool: _build_user_specific_merged_work + mm_data computed together)
+                    {
+                        for (const auto& hi : mi_for_share_bits->get_last_merged_header_infos()) {
                             ltc::MergedCoinbaseEntry entry;
                             entry.m_chain_id = hi.chain_id;
                             entry.m_coinbase_value = hi.coinbase_value;
                             entry.m_block_height = hi.block_height;
                             if (hi.block_header.size() == 80)
-                                entry.m_block_header.m_data = std::move(hi.block_header);
+                                entry.m_block_header.m_data = hi.block_header;
                             else
                                 entry.m_block_header.m_data.assign(80, 0);
-                            entry.m_coinbase_merkle_link.m_branch = std::move(hi.coinbase_merkle_branches);
+                            entry.m_coinbase_merkle_link.m_branch = hi.coinbase_merkle_branches;
                             entry.m_coinbase_merkle_link.m_index = 0;
-                            entry.m_coinbase_script.m_data = std::move(hi.coinbase_script);
+                            entry.m_coinbase_script.m_data = hi.coinbase_script;
                             params.merged_coinbase_info.push_back(std::move(entry));
                         }
                     }
@@ -2242,10 +2242,8 @@ int main(int argc, char* argv[]) {
                             mci_stream.size());
                         result.frozen_merged_coinbase_info.assign(mci_span.begin(), mci_span.end());
                     }
-                    // Freeze the atomically-built mm_commitment so build_connection_cb
-                    // uses it instead of calling get_auxpow_commitment() (which could race)
-                    if (mi_for_share_bits->get_mm_manager())
-                        result.frozen_mm_commitment = mi_for_share_bits->get_mm_manager()->get_auxpow_commitment();
+                    // mm_commitment is now computed atomically in build_connection_coinbase
+                    // (before ref_hash_fn is called), so no need to freeze it here.
                     return result;
                 });
 

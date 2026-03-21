@@ -444,6 +444,18 @@ public:
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
     c2pool::merged::MergedMiningManager* get_mm_manager() const { return m_mm_manager; }
 
+    // Cached merged header info — built atomically with mm_commitment
+    struct CachedMergedHeaderInfo {
+        uint32_t chain_id{0};
+        uint64_t coinbase_value{0};
+        uint32_t block_height{0};
+        std::vector<unsigned char> block_header;
+        std::vector<uint256> coinbase_merkle_branches;
+        std::vector<unsigned char> coinbase_script;
+        std::string coinbase_hex;
+    };
+    const std::vector<CachedMergedHeaderInfo>& get_last_merged_header_infos() const { return m_last_merged_header_infos; }
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = std::move(fn); }
@@ -687,6 +699,7 @@ private:
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
+    mutable std::vector<CachedMergedHeaderInfo> m_last_merged_header_infos;
     uint256 m_cached_the_state_root;  // THE state root for sharechain anchoring
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
 

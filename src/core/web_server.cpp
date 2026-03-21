@@ -1319,9 +1319,38 @@ MiningInterface::build_connection_coinbase(
         tag_hex += HEX[b & 0x0f];
     }
 
+    // Compute mm_commitment ATOMICALLY with merged_coinbase_info (p2pool pattern).
+    // build_merged_header_info_with_commitment() builds DOGE PPLNS coinbase +
+    // DOGE block hash + aux_pow commitment in one shot. The commitment goes
+    // into the LTC scriptSig AND the merged_coinbase_info uses the same hash.
+    // Using m_cached_mm_commitment here would cause a mismatch when DOGE PPLNS
+    // changed since last refresh_work().
+    std::vector<uint8_t> atomic_mm_commitment;
+    if (m_mm_manager) {
+        auto [header_infos, fresh_commit] =
+            m_mm_manager->build_merged_header_info_with_commitment();
+        atomic_mm_commitment = std::move(fresh_commit);
+        // Store header_infos so ref_hash_fn can use them (avoid double computation)
+        m_last_merged_header_infos.clear();
+        m_last_merged_header_infos.reserve(header_infos.size());
+        for (auto& hi : header_infos) {
+            CachedMergedHeaderInfo c;
+            c.chain_id = hi.chain_id;
+            c.coinbase_value = hi.coinbase_value;
+            c.block_height = hi.block_height;
+            c.block_header = std::move(hi.block_header);
+            c.coinbase_merkle_branches = std::move(hi.coinbase_merkle_branches);
+            c.coinbase_script = std::move(hi.coinbase_script);
+            c.coinbase_hex = std::move(hi.coinbase_hex);
+            m_last_merged_header_infos.push_back(std::move(c));
+        }
+    }
+    const auto& mm_for_scriptsig = atomic_mm_commitment.empty()
+        ? m_cached_mm_commitment : atomic_mm_commitment;
+
     // MM commitment hex
     std::string mm_hex;
-    for (uint8_t b : m_cached_mm_commitment) {
+    for (uint8_t b : mm_for_scriptsig) {
         mm_hex += HEX[b >> 4];
         mm_hex += HEX[b & 0x0f];
     }
@@ -1425,11 +1454,11 @@ MiningInterface::build_connection_coinbase(
         static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
         tmpl_height, tmpl_bits);
 
-    // Use the frozen mm_commitment from ref_hash_fn — it was built atomically
-    // with merged_coinbase_info headers, so block_hash and aux_merkle_root match.
-    // Falls back to cached commitment if ref_hash_fn didn't produce one.
-    const auto& mm_commitment_fresh = rhr.frozen_mm_commitment.empty()
-        ? m_cached_mm_commitment : rhr.frozen_mm_commitment;
+    // Use the SAME mm_commitment that was used to build the scriptSig above.
+    // atomic_mm_commitment was computed together with merged_coinbase_info
+    // by build_merged_header_info_with_commitment() before the scriptSig
+    // was built. This ensures the coinbase parts match the ref_hash.
+    const auto& mm_commitment_fresh = mm_for_scriptsig;
 
     LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
              << prev_share_hash.GetHex().substr(0, 16) << " outputs=" << m_cached_pplns_outputs.size();
