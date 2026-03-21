@@ -514,21 +514,21 @@ TEST_F(MultiaddressCoinbaseTest, OpReturnPresent)
     auto block_hex = MergedMiningManager::build_multiaddress_block(
         tmpl, payouts, "", uint256{});
 
-    // OP_RETURN (0x6a) followed by push of "c2pool merged mining"
+    // OP_RETURN (0x6a) followed by push of "P2Pool merged mining" (canonical V36 text)
     std::string op_return_marker = "6a14";  // OP_RETURN PUSH_20
     EXPECT_NE(block_hex.find(op_return_marker), std::string::npos)
         << "Block should contain OP_RETURN output";
 
-    // Check the text "c2pool merged mining" in hex
+    // Check the canonical text "P2Pool merged mining" in hex
     std::string text_hex;
-    for (char c : std::string("c2pool merged mining")) {
+    for (char c : std::string("P2Pool merged mining")) {
         uint8_t b = static_cast<uint8_t>(c);
         static const char H[] = "0123456789abcdef";
         text_hex += H[b >> 4];
         text_hex += H[b & 0x0f];
     }
     EXPECT_NE(block_hex.find(text_hex), std::string::npos)
-        << "OP_RETURN should contain 'c2pool merged mining'";
+        << "OP_RETURN should contain 'P2Pool merged mining'";
 }
 
 TEST_F(MultiaddressCoinbaseTest, DonationMinimumOneSatoshi)
