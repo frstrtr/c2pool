@@ -527,28 +527,51 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
 uint256 NodeImpl::best_share_hash()
 {
-    // p2pool uses the RAW chain (tracker.items) for PPLNS, not the verified
-    // chain. This ensures all miners get paid from the first block, even if
-    // verification hasn't caught up yet. Verification is for detecting bad
-    // shares/peers, not for restricting PPLNS distribution.
+    // p2pool's think() returns the best VERIFIED head — not the raw chain tip.
+    // This ensures shares are built on a chain that all peers agree on.
+    // Using raw chain tips caused GENTX-FAIL because the PPLNS walk from an
+    // unverified tip covers shares that peers don't have in verified state.
     //
-    // Always return the tallest raw chain head. The verified best (from
-    // think()) is used for peer scoring and ban decisions, not for payouts.
+    // Fallback: if verified chain is empty (initial sync), use raw chain
+    // so the node can still generate work for miners (pseudoshares).
+    auto& verified = m_tracker.verified;
+    if (verified.size() > 0) {
+        // Pick the verified head with greatest height (matches p2pool's think())
+        uint256 best;
+        int32_t best_height = -1;
+        for (const auto& [head_hash, tail_hash] : verified.get_heads()) {
+            auto h = verified.get_height(head_hash);
+            if (h > best_height) {
+                best = head_hash;
+                best_height = h;
+            }
+        }
+        if (!best.IsNull()) {
+            static int log_count = 0;
+            if (log_count++ % 60 == 0)
+                LOG_INFO << "[best_share] using VERIFIED head height=" << best_height
+                         << " verified=" << verified.size()
+                         << " raw=" << (m_chain ? m_chain->size() : 0);
+            return best;
+        }
+    }
+
+    // Fallback to raw chain during initial sync
     if (!m_chain || m_chain->size() == 0)
         return uint256::ZERO;
 
-    // Pick the head with the greatest height in the RAW chain
     uint256 best;
     int32_t best_height = -1;
-    for (const auto& [head_hash, tail_hash] : m_chain->get_heads())
-    {
+    for (const auto& [head_hash, tail_hash] : m_chain->get_heads()) {
         auto h = m_chain->get_height(head_hash);
-        if (h > best_height)
-        {
+        if (h > best_height) {
             best = head_hash;
             best_height = h;
         }
     }
+    static int raw_log = 0;
+    if (raw_log++ % 60 == 0)
+        LOG_INFO << "[best_share] using RAW head (no verified yet) height=" << best_height;
     return best;
 }
 
