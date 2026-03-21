@@ -250,6 +250,9 @@ public:
         uint32_t bits{0};
         uint32_t timestamp{0};
         uint256  merged_payout_hash;
+        // Frozen mm_commitment — built atomically with merged_coinbase_info headers
+        // by build_merged_header_info_with_commitment(). Empty if no merged mining.
+        std::vector<uint8_t> frozen_mm_commitment;
         // Frozen segwit data — merkle branches and witness root change between
         // GBT updates, but the ref_hash was computed with the values at template time.
         std::vector<uint256> frozen_merkle_branches;

@@ -219,6 +219,12 @@ public:
     };
     std::vector<MergedHeaderInfo> build_merged_header_info() const;
 
+    // Atomic: build header info + compute matching auxpow commitment in one operation.
+    // Eliminates race where poll_loop updates current_work between header build and
+    // commitment generation. Returns (header_infos, fresh_mm_commitment).
+    std::pair<std::vector<MergedHeaderInfo>, std::vector<uint8_t>>
+    build_merged_header_info_with_commitment();
+
     // Check if any aux chains are configured
     bool has_chains() const { return !m_chains.empty(); }
 

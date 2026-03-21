@@ -970,6 +970,42 @@ MergedMiningManager::build_merged_header_info() const
     return result;
 }
 
+std::pair<std::vector<MergedMiningManager::MergedHeaderInfo>, std::vector<uint8_t>>
+MergedMiningManager::build_merged_header_info_with_commitment()
+{
+    // Step 1: Build header infos (releases lock internally for payout_fn callback)
+    auto header_infos = build_merged_header_info();
+
+    // Step 2: Compute block hashes from PPLNS headers and update commitment atomically
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& hi : header_infos) {
+        if (hi.block_header.size() == 80) {
+            uint256 pplns_hash = Hash(hi.block_header);
+            for (auto& chain : m_chains) {
+                if (chain.config.chain_id == hi.chain_id) {
+                    chain.current_work.block_hash = pplns_hash;
+                    break;
+                }
+            }
+        }
+    }
+    // Rebuild commitment with PPLNS-derived hashes (all under lock — no poll race)
+    std::map<uint32_t, uint256> slot_hashes;
+    for (const auto& chain : m_chains) {
+        if (!chain.current_work.block_hash.IsNull()) {
+            auto it = m_tree.slot_map.find(chain.config.chain_id);
+            if (it != m_tree.slot_map.end())
+                slot_hashes[it->second] = chain.current_work.block_hash;
+        }
+    }
+    std::vector<uint8_t> commitment;
+    if (!slot_hashes.empty()) {
+        auto proof = m_tree.compute_root(slot_hashes, 0);
+        m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
+    }
+    return {std::move(header_infos), m_cached_commitment};
+}
+
 void MergedMiningManager::set_payout_provider(PayoutProvider provider)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
