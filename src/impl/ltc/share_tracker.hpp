@@ -527,12 +527,12 @@ public:
         auto result = (use_min_work ? interval.min_work : interval.work) / static_cast<uint32_t>(time);
         {
             static int aps_log = 0;
-            if (aps_log++ < 3)
+            if (aps_log++ < 5)
                 LOG_INFO << "[APS] dist=" << dist << " time=" << time
-                         << " work=" << interval.work.GetHex().substr(0, 20)
-                         << " min_work=" << interval.min_work.GetHex().substr(0, 20)
+                         << " min_work=" << interval.min_work.GetLow64()
+                         << " work=" << interval.work.GetLow64()
                          << " use_min=" << use_min_work
-                         << " result=" << result.GetHex().substr(0, 20);
+                         << " aps=" << result.GetLow64();
         }
         return result;
     }
@@ -617,6 +617,17 @@ public:
             else
             {
                 pre_target.SetHex(result.GetHex());
+            }
+        }
+
+        {
+            static int cst_log = 0;
+            if (cst_log++ < 5) {
+                auto pre_diff = chain::target_to_difficulty(pre_target);
+                LOG_INFO << "[CST] aps=" << aps.GetLow64()
+                         << " share_period=" << PoolConfig::share_period()
+                         << " pre_target_diff=" << pre_diff
+                         << " height=" << height;
             }
         }
 
