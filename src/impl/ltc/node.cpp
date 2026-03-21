@@ -1022,12 +1022,25 @@ void NodeImpl::run_think()
                     }
 
                     // Request desired shares from peers
+                    // Try the original peer first, then any peer if not found.
+                    // The share's peer_addr may be stale (reconnected with different port).
                     for (const auto& [peer_addr, hash] : result.desired) {
+                        bool sent = false;
+                        // Try exact match first
                         for (auto& [nonce, peer] : m_peers) {
                             if (peer->addr() == peer_addr) {
                                 download_shares(peer, hash);
+                                sent = true;
                                 break;
                             }
+                        }
+                        // Fallback: send to any peer (same IP or first available)
+                        if (!sent && !m_peers.empty()) {
+                            auto& [nonce, peer] = *m_peers.begin();
+                            download_shares(peer, hash);
+                            LOG_INFO << "[Pool] Requesting shares from fallback peer "
+                                     << peer->addr().to_string()
+                                     << " (original " << peer_addr.to_string() << " not found)";
                         }
                     }
 

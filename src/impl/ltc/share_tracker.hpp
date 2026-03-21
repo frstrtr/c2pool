@@ -330,36 +330,11 @@ public:
         }
 
         // Phase 2: Extend verification from verified heads.
-        // During initial sync, verify aggressively (larger batches) so we can
-        // start creating shares sooner. Once caught up, use smaller batches
-        // to keep the ioc thread responsive.
-        //
-        // p2pool verifies all shares in one pass using O(log n) skip lists.
-        // Our PPLNS walk is O(chain_length) per share, so we can't verify
-        // everything at once on mainnet. But we CAN afford large batches
-        // during initial catch-up (the ioc thread isn't doing much else).
-        int32_t verify_budget;
-        {
-            auto verified_sz = verified.size();
-            auto target_sz = PoolConfig::real_chain_length();
-            if (verified_sz < target_sz) {
-                // Initial sync: verify aggressively but respect O(chain_length) walk cost.
-                // Each share verification costs ~chain_length iterations.
-                // Budget: ~10s max per cycle → 10000 / chain_length shares.
-                verify_budget = std::max(
-                    5, static_cast<int32_t>(10000 / std::max(PoolConfig::chain_length(), uint32_t(1))));
-            } else {
-                // Steady state: small batches
-                verify_budget = std::max(
-                    2, static_cast<int32_t>(8000 / std::max(PoolConfig::chain_length(), uint32_t(1))));
-            }
-        }
-
+        // Matches p2pool: verify ALL shares in one pass (no budget limit).
+        // p2pool does this in a single think() call — any artificial budget
+        // causes c2pool to fall behind the growing chain, creating forks.
         for (auto& [head_hash, tail_hash] : verified.get_heads())
         {
-            if (verify_budget <= 0)
-                break;
-
             if (!chain.contains(head_hash))
                 continue;
 
@@ -373,7 +348,12 @@ public:
             auto can = last_last_hash.IsNull()
                 ? last_height
                 : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
-            auto to_get = std::min({want, can, verify_budget});
+            auto to_get = std::min(want, can);
+
+            LOG_INFO << "[think-P2] head_height=" << head_height
+                     << " last_height=" << last_height
+                     << " last_rooted=" << last_last_hash.IsNull()
+                     << " want=" << want << " can=" << can << " to_get=" << to_get;
 
             if (to_get > 0)
             {
@@ -382,7 +362,6 @@ public:
                 {
                     if (!attempt_verify(hash))
                         break;
-                    --verify_budget;
                 }
             }
 
