@@ -92,3 +92,23 @@ CLAUDE.md
 /doge_testnet/
 /doge/
 .claude/
+
+# Conan-generated cmake files (from conan install)
+*-Target-debug.cmake
+*-debug-x86_64-data.cmake
+*Config.cmake
+*ConfigVersion.cmake
+*Targets.cmake
+*-config.cmake
+*-config-version.cmake
+Find*.cmake
+cmakedeps_macros.cmake
+conan_toolchain.cmake
+conanbuild.sh
+conanbuildenv-*.sh
+conandeps_legacy.cmake
+conanrun.sh
+conanrunenv-*.sh
+deactivate_conanbuild.sh
+deactivate_conanrun.sh
+CMakePresets.json
