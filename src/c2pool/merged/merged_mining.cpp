@@ -874,8 +874,10 @@ MergedMiningManager::build_merged_header_info() const
         info.block_height = static_cast<uint32_t>(snap.height);
 
         // Build PPLNS coinbase for this chain (NO lock held — safe)
+        LOG_TRACE << "[MM-header] building header for chain " << snap.chain_id;
         auto payouts = payout_fn(snap.chain_id, snap.coinbase_value);
-        if (payouts.empty()) continue;
+        if (payouts.empty()) { LOG_TRACE << "[MM-header] empty payouts, skip"; continue; }
+        LOG_TRACE << "[MM-header] got " << payouts.size() << " payouts";
 
         // Build coinbase hex using the same logic as build_multiaddress_block
         // (simplified — just need the coinbase hash + tx hashes for merkle)
@@ -887,8 +889,12 @@ MergedMiningManager::build_merged_header_info() const
         std::string bits_hex = tmpl.value("bits", std::string("1d00ffff"));
 
         try {
-            uint256 state_root;
-            if (state_fn) state_root = state_fn();
+            LOG_TRACE << "[MM-header] building coinbase hex...";
+            // NOTE: state_root is NOT fetched here — it would deadlock
+            // (state_fn → MiningInterface::get_the_state_root → m_work_mutex).
+            // The state_root in merged coinbase is informational, not consensus.
+            // Use a zero root; the actual THE commitment is in the LTC coinbase.
+            uint256 state_root; // zero — avoid deadlock
 
             // Build coinbase, compute merkle root + link using shared helpers
             std::string coinbase_hex = build_pplns_coinbase_hex(
