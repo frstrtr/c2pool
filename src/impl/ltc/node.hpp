@@ -194,11 +194,16 @@ public:
     using block_rel_height_fn_t = std::function<int32_t(uint256)>;
     void set_block_rel_height_fn(block_rel_height_fn_t fn) { m_block_rel_height_fn = std::move(fn); }
 
+    /// Called when best_share changes (p2pool: new_work_event)
+    /// Triggers immediate work update for all stratum miners.
+    void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
+
     /// Check whether a peer address is currently banned.
     bool is_banned(const NetService& addr) const;
 
 protected:
     std::function<void()> m_on_bestblock;
+    std::function<void()> m_on_best_share_changed;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
@@ -216,7 +221,8 @@ protected:
 
     // Rate-limit run_think(): minimum interval between calls
     std::chrono::steady_clock::time_point m_last_think_time{};
-    static constexpr std::chrono::seconds THINK_MIN_INTERVAL{5};
+    // p2pool: 0ms (synchronous, no rate limit). Match exactly.
+    static constexpr std::chrono::milliseconds THINK_MIN_INTERVAL{0};
 
     // Cache limits (configurable)
     size_t m_max_shared_hashes = 50000;

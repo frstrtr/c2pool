@@ -2002,21 +2002,20 @@ uint256 create_local_share(
     uint256 hash_ref = Hash(ref_span_v);
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
-    // Dump FULL ref_stream for cross-impl comparison
+    // Dump ref_stream for cross-impl comparison (always, for diagnostics)
     {
-        static int ref_dump_count = 0;
-        if (ref_dump_count < 3 && !actual_coinbase_bytes.empty()) {
+        if (!actual_coinbase_bytes.empty()) {
             static const char* HX = "0123456789abcdef";
             std::string full_hex;
             auto* rd = reinterpret_cast<const unsigned char*>(ref_stream.data());
             for (size_t i = 0; i < ref_stream.size(); ++i) { full_hex += HX[rd[i]>>4]; full_hex += HX[rd[i]&0xf]; }
             LOG_INFO << "[REF-HASH] ref_packed_len=" << ref_stream.size()
-                     << " ref_hash=" << hash_ref.GetHex();
+                     << " ref_hash=" << hash_ref.GetHex()
+                     << " prev=" << share.m_prev_hash.GetHex().substr(0, 16)
+                     << " abs=" << share.m_absheight
+                     << " bits=" << std::hex << share.m_bits
+                     << " maxbits=" << share.m_max_bits << std::dec;
             LOG_INFO << "[REF-HASH-FULL] " << full_hex;
-            LOG_INFO << "[REF-HASH] coinbase_len=" << share.m_coinbase.size()
-                     << " subsidy=" << share.m_subsidy
-                     << " donation=" << share.m_donation;
-            ++ref_dump_count;
         }
     }
 
@@ -2319,6 +2318,20 @@ uint256 create_local_share(
             LOG_INFO << "[Pool] REAL SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
                      << " target=" << target.GetHex().substr(0, 16)
                      << " diff=" << chain::target_to_difficulty(target);
+            // Dump raw 80-byte header for byte-level comparison with p2pool
+            {
+                static int hdr_dump = 0;
+                if (hdr_dump++ < 5) {
+                    static const char* HX = "0123456789abcdef";
+                    std::string hex;
+                    auto* rd = reinterpret_cast<const unsigned char*>(hdr_span.data());
+                    for (size_t i = 0; i < hdr_span.size() && i < 80; ++i) {
+                        hex += HX[rd[i]>>4]; hex += HX[rd[i]&0xf];
+                    }
+                    LOG_INFO << "[HDR-DUMP] " << hex
+                             << " hash=" << share.m_hash.GetHex().substr(0, 16);
+                }
+            }
             // Log fields for comparison with p2pool's SHARE-REJECT
             {
                 static int sl = 0;

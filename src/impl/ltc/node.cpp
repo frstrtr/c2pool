@@ -371,10 +371,13 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                  << " chain=" << m_tracker.chain.size() << ")";
     }
 
-    // NOTE: Do NOT call run_think() here. During download sync, the chain is
-    // incomplete and run_think would mark verifiable shares as "bad" and ban
-    // the peer we're downloading from — killing the sync.
-    // run_think() is called periodically from the main event loop instead.
+    // Trigger think() for small batches (real-time share arrival, not bulk sync).
+    // During bulk download (>10 shares), skip — chain is incomplete and think
+    // would ban the peer. For 1-3 shares (normal peer-to-peer relay), think
+    // immediately so best_share updates → new work for miners → no orphans.
+    if (data.m_items.size() <= 3 && m_tracker.chain.size() > 10) {
+        run_think();
+    }
 }
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
@@ -1044,10 +1047,14 @@ void NodeImpl::run_think()
                         }
                     }
 
-                    // Update best share
+                    // Update best share — trigger work update if changed (p2pool: new_work_event)
                     if (!result.best.IsNull()) {
+                        bool changed = (m_best_share_hash != result.best);
                         m_best_share_hash = result.best;
-                        LOG_INFO << "[Pool] think(): best=" << result.best.GetHex();
+                        if (changed) {
+                            LOG_INFO << "[Pool] think(): best=" << result.best.GetHex();
+                            if (m_on_best_share_changed) m_on_best_share_changed();
+                        }
                     } else {
                         LOG_WARNING << "[Pool] think(): result.best is NULL — verified_tails="
                                     << m_tracker.verified.get_tails().size()

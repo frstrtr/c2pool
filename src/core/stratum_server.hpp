@@ -114,6 +114,7 @@ public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
     void start();
 
+    bool is_connected() const { return socket_.is_open(); }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
 
 private:
@@ -133,7 +134,9 @@ private:
     void send_error(int code, const std::string& message, const nlohmann::json& request_id);
     void send_set_difficulty(double difficulty);
     void send_set_extranonce(const std::string& extranonce1, int extranonce2_size);
+public:
     void send_notify_work(bool force_clean = false);
+private:
     void start_periodic_work_push();
 
     std::string generate_extranonce1();
@@ -150,12 +153,24 @@ class StratumServer
     uint16_t port_;
     bool running_;
 
+    // Track active sessions for broadcast (p2pool: new_work_event → _send_work)
+    mutable std::mutex sessions_mutex_;
+    std::set<std::shared_ptr<StratumSession>> sessions_;
+
 public:
     StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface);
     ~StratumServer();
 
     bool start();
     void stop();
+
+    /// Push new work to ALL connected miners immediately (p2pool: new_work_event).
+    /// Called when best_share changes or new block template arrives.
+    void notify_all();
+
+    /// Register/unregister sessions for broadcast
+    void register_session(std::shared_ptr<StratumSession> s);
+    void unregister_session(std::shared_ptr<StratumSession> s);
 
     std::string get_bind_address() const { return bind_address_; }
     uint16_t get_port() const { return port_; }

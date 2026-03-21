@@ -23,10 +23,9 @@ void HashrateTracker::record_mining_share_submission(double difficulty, bool acc
         total_mining_shares_accepted_++;
         total_work_done_ += difficulty;
 
-        // Only accepted shares inform vardiff timing.
-        // Rejected shares are stale pipeline artefacts from the miner
-        // still mining at a previous (lower) difficulty and would make
-        // vardiff think the miner is faster than it really is.
+        // Only accepted shares inform vardiff timing (matching p2pool).
+        // Stale-job submissions arrive in bursts and would make vardiff
+        // think the miner is 10-100x faster → difficulty spikes.
         auto tp = clock::now();
         recent_share_times_.push_back(tp);
     }
@@ -129,14 +128,18 @@ void HashrateTracker::set_difficulty_hint(double hint) {
     }
 }
 
-// Python-style aggressive vardiff.  Called after every share submission.
-// Three triggers:
-//   1) Normal: after VARDIFF_TRIGGER shares, scale by actual_rate / target_rate.
-//   2) Quick-up: 2 shares in < target/3 time → ramp up immediately.
-//   3) Timeout: if time since last share > 5 * target → ramp down.
+// Matches p2pool's stratum vardiff algorithm (stratum.py:546-573).
+// Matches p2pool's stratum vardiff algorithm (stratum.py:546-573).
+// Adjusts difficulty to target ~target_time_per_mining_share_ seconds per pseudoshare.
 //
-// After each adjustment, enforce a cooldown of target_time seconds so the miner
-// has time to apply the new set_difficulty before we measure again.
+// Two triggers (matching p2pool exactly):
+//   1) Normal: after VARDIFF_TRIGGER shares accumulated.
+//   2) Timeout: elapsed time exceeds TIMEOUT_MULT * N * target_time.
+//
+// No quick-ramp — it causes oscillation when natural variance produces
+// 2 back-to-back shares at the correct difficulty level.
+// No cooldown — p2pool doesn't use one; the window reset after each
+// adjustment means VARDIFF_TRIGGER shares must accumulate again.
 void HashrateTracker::adjust_difficulty() {
     if (!vardiff_enabled_)
         return;
@@ -147,55 +150,41 @@ void HashrateTracker::adjust_difficulty() {
 
     auto now = clock::now();
 
-    // Cooldown: skip adjustment if we adjusted recently.
-    // This prevents spiraling when a burst of queued shares arrives
-    // before the miner applies the new set_difficulty.
-    double since_last_adjust = std::chrono::duration<double>(now - last_adjust_time_).count();
-    if (last_adjust_time_ != time_point{} && since_last_adjust < target_time_per_mining_share_)
-        return;
-
     double elapsed = std::chrono::duration<double>(now - recent_share_times_.front()).count();
-    double target_time = static_cast<double>(num_shares) * target_time_per_mining_share_;
 
     bool should_adjust = false;
 
-    // Trigger 1: enough shares accumulated
-    if (num_shares >= VARDIFF_TRIGGER)
+    // Trigger 1 (p2pool): enough shares accumulated
+    if (num_shares > VARDIFF_TRIGGER)
         should_adjust = true;
 
-    // Trigger 2: quick ramp-up — shares arriving much faster than target
-    if (num_shares >= QUICKUP_SHARES && elapsed < target_time / QUICKUP_DIVISOR)
-        should_adjust = true;
-
-    // Trigger 3: timeout — no shares for a long time (elapsed >> target_time)
-    if (num_shares >= 1 && elapsed > TIMEOUT_MULT * target_time)
+    // Trigger 2 (p2pool): time since first share > TIMEOUT_MULT * N * target_time
+    if (elapsed > TIMEOUT_MULT * static_cast<double>(num_shares) * target_time_per_mining_share_)
         should_adjust = true;
 
     if (!should_adjust)
         return;
 
-    double actual_rate = (num_shares > 0) ? elapsed / num_shares : target_time_per_mining_share_;
+    // p2pool algorithm: ratio = actual_time_per_share / target_time_per_share
+    // then target *= clip(ratio, 0.1, 10.0)  [target is inverse of difficulty]
+    // equivalent: difficulty /= clip(ratio, 0.1, 10.0)
+    double ratio = (num_shares > 0) ? elapsed / (static_cast<double>(num_shares) * target_time_per_mining_share_) : 1.0;
 
-    // Avoid division by zero if shares arrive in <1ms
-    if (actual_rate < 0.001)
-        actual_rate = 0.001;
+    // Avoid extreme ratios from sub-millisecond bursts
+    ratio = std::max(MIN_ADJUST, std::min(MAX_ADJUST, ratio));
 
-    double adjustment = actual_rate / target_time_per_mining_share_;
-    adjustment = std::max(MIN_ADJUST, std::min(MAX_ADJUST, adjustment));
-
-    double new_difficulty = current_difficulty_ / adjustment;
+    double new_difficulty = current_difficulty_ / ratio;
     new_difficulty = std::max(min_difficulty_, std::min(max_difficulty_, new_difficulty));
 
-    if (std::abs(new_difficulty - current_difficulty_) / std::max(current_difficulty_, 0.001) > 0.05) {
+    if (std::abs(new_difficulty - current_difficulty_) / std::max(current_difficulty_, 0.001) > 0.01) {
         LOG_INFO << "[Stratum] VARDIFF: " << current_difficulty_ << " -> " << new_difficulty
                  << " (" << num_shares << " shares in " << elapsed << "s"
-                 << ", actual_rate=" << actual_rate << "s"
+                 << ", ratio=" << ratio
                  << ", target=" << target_time_per_mining_share_ << "s)";
         current_difficulty_ = new_difficulty;
-        last_adjust_time_ = now;
     }
 
-    // Reset window — keep only the most recent timestamp
+    // Reset window — keep only the most recent timestamp (matches p2pool)
     recent_share_times_.clear();
     recent_share_times_.push_back(now);
 }

@@ -35,7 +35,7 @@ private:
     std::deque<MiningShareSubmission> recent_mining_shares_;
     mutable std::mutex shares_mutex_;
     double current_difficulty_ = 1.0;
-    double target_time_per_mining_share_ = 10.0; // target seconds per pseudoshare
+    double target_time_per_mining_share_ = 3.0;  // target seconds per pseudoshare (p2pool: 3)
 
     // Difficulty bounds
     double min_difficulty_ = 0.001;
@@ -43,13 +43,10 @@ private:
 
     // Vardiff state (high-resolution)
     std::deque<time_point> recent_share_times_;   // timestamps of recent submissions
-    time_point last_adjust_time_{};               // cooldown: last time we adjusted difficulty
-    static constexpr size_t VARDIFF_TRIGGER = 8;  // normal adjust after N shares
-    static constexpr size_t QUICKUP_SHARES  = 2;  // quick-ramp trigger
-    static constexpr double QUICKUP_DIVISOR = 3.0;
-    static constexpr double TIMEOUT_MULT   = 5.0;
-    static constexpr double MIN_ADJUST     = 0.5;
-    static constexpr double MAX_ADJUST     = 4.0; // allow aggressive ramp-up
+    static constexpr size_t VARDIFF_TRIGGER = 12; // normal adjust after N shares (p2pool: >12)
+    static constexpr double TIMEOUT_MULT   = 10.0; // p2pool: time > 10*N*share_rate
+    static constexpr double MIN_ADJUST     = 0.1;  // p2pool: clip(ratio, 0.1, 10.0)
+    static constexpr double MAX_ADJUST     = 10.0;  // p2pool: clip(ratio, 0.1, 10.0)
 
     // Whether vardiff auto-adjustment is active (only for stratum per-connection trackers)
     bool vardiff_enabled_ = false;

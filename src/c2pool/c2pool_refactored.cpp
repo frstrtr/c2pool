@@ -270,7 +270,7 @@ void print_help() {
     std::cout << "STRATUM TUNING:\n";
     std::cout << "  --stratum-min-diff N      Minimum per-connection difficulty (default: 0.001)\n";
     std::cout << "  --stratum-max-diff N      Maximum per-connection difficulty (default: 65536)\n";
-    std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 10)\n";
+    std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 3)\n";
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n\n";
 
@@ -505,7 +505,7 @@ int main(int argc, char* argv[]) {
     // Well-known P2P ports for coin daemons (same machine as RPC by default)
     auto get_coin_p2p_port = [](const std::string& symbol, bool testnet) -> int {
         if (symbol == "LTC"   || symbol == "ltc")   return testnet ? 19335 : 9333;
-        if (symbol == "DOGE"  || symbol == "doge")  return testnet ? 44557 : 22556;
+        if (symbol == "DOGE"  || symbol == "doge")  return testnet ? 44556 : 22556;
         if (symbol == "BTC"   || symbol == "btc")   return testnet ? 18333 : 8333;
         if (symbol == "DGB"   || symbol == "dgb")   return testnet ? 12026 : 12024;
         if (symbol == "PEP"   || symbol == "pep")   return testnet ? 44874 : 33874;
@@ -1606,6 +1606,13 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[LTC] bestblock received from P2P peer — work template refreshed";
             });
 
+            // When best_share changes (new share on chain), immediately refresh
+            // work for all miners — matches p2pool's new_work_event pattern.
+            // Without this, miners work on stale prev_share → shares get orphaned.
+            p2p_node->set_on_best_share_changed([&web_server]() {
+                web_server.trigger_work_refresh();
+            });
+
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
@@ -2066,42 +2073,20 @@ int main(int argc, char* argv[]) {
                     params.desired_version = 36;
 
                     // Compute pool-level share target from tracker state.
-                    // Pass block_target as desired_target — this gets clipped to
-                    // [pre_target3//30, pre_target3] by compute_share_target.
-                    // Block target is much harder than share target, so it clips to
-                    // pre_target3//30 (hardest allowed). This matches p2pool behavior
-                    // where desired_share_target defaults to 2^256-1 (easiest) but
-                    // gets clipped to pool difficulty range.
-                    auto desired_target = ltc::PoolConfig::max_target();
+                    // p2pool computes desired_target from miner hashrate:
+                    //   desired = average_attempts_to_target(hashrate * SHARE_PERIOD / 0.0167)
+                    // With any real miner (>40 H/s), this clips to pre_target3/30
+                    // (hardest in the [pre_target3/30, pre_target3] range).
+                    // Using uint256(1) here matches this: clips to pre_target3/30.
+                    // This gives c2pool shares the same bits as p2pool shares.
+                    auto desired_target = uint256(1);
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
-                    // Sanity check: if our computed target drifted from the peer's
-                    // (due to our own low-diff shares contaminating the chain's APS),
-                    // inherit the peer share's bits. This matches what p2pool would
-                    // compute on a clean chain — the ±10% clamp keeps bits close to
-                    // the prev share, so a peer share's bits ARE the correct pool target.
-                    if (!params.prev_share.IsNull() &&
-                        p2p_node->tracker().chain.contains(params.prev_share)) {
-                        uint32_t peer_bits = 0, peer_max_bits = 0;
-                        p2p_node->tracker().chain.get_share(params.prev_share).invoke([&](auto* obj) {
-                            peer_bits = obj->m_bits;
-                            peer_max_bits = obj->m_max_bits;
-                        });
-                        if (peer_bits != 0 && peer_max_bits != 0) {
-                            auto peer_target = chain::bits_to_target(peer_bits);
-                            auto our_target = chain::bits_to_target(share_bits);
-                            // If our target drifted >2x from peer's, use peer's bits
-                            if (our_target > peer_target && (our_target >> 1) > peer_target) {
-                                share_bits = peer_bits;
-                                share_max_bits = peer_max_bits;
-                                static int guard_log = 0;
-                                if (guard_log++ < 10)
-                                    LOG_WARNING << "[ShareTarget] GUARD: using peer bits=0x"
-                                                << std::hex << peer_bits << std::dec
-                                                << " (computed was >2x easier)";
-                            }
-                        }
-                    }
+                    // No bits guard needed: compute_share_target's ±10% clamp
+                    // (matching p2pool) prevents drift. The old guard was a workaround
+                    // for VARDIFF setting 3x harder difficulty → APS contamination.
+                    // With VARDIFF fixed (target_time=3s matching p2pool), APS is
+                    // accurate and the guard would risk GENTX-FAIL if it ever fired.
                     params.max_bits = share_max_bits;
                     params.bits = share_bits;
                     params.timestamp = timestamp;
@@ -2168,22 +2153,10 @@ int main(int argc, char* argv[]) {
                         });
 
                         // Recompute share target with the clipped timestamp
+                        // Must use same desired_target as the initial computation
                         {
-                            auto desired_target2 = ltc::PoolConfig::max_target();
                             auto [sm, sb] = tracker.compute_share_target(
-                                params.prev_share, params.timestamp, desired_target2);
-                            // Apply same guard: inherit peer bits if drifted >2x
-                            uint32_t pb = 0, pmb = 0;
-                            tracker.chain.get_share(params.prev_share).invoke([&](auto* obj) {
-                                pb = obj->m_bits; pmb = obj->m_max_bits;
-                            });
-                            if (pb != 0) {
-                                auto pt = chain::bits_to_target(pb);
-                                auto ot = chain::bits_to_target(sb);
-                                if (ot > pt && (ot >> 1) > pt) {
-                                    sb = pb; sm = pmb;
-                                }
-                            }
+                                params.prev_share, params.timestamp, desired_target);
                             params.max_bits = sm;
                             params.bits = sb;
                         }
@@ -2252,6 +2225,9 @@ int main(int argc, char* argv[]) {
                     result.max_bits = params.max_bits;
                     result.bits = params.bits;
                     result.timestamp = params.timestamp;
+                    LOG_INFO << "[ref_hash_fn-result] bits=" << std::hex << result.bits
+                             << " max_bits=" << result.max_bits << std::dec
+                             << " absheight=" << result.absheight;
                     result.merged_payout_hash = params.merged_payout_hash;
                     // Freeze segwit merkle branches + witness root — these change
                     // between GBT updates but the ref_hash was computed with these values.
@@ -2477,7 +2453,10 @@ int main(int argc, char* argv[]) {
                             LOG_INFO << "Auto-detected P2P port for " << cfg.symbol << ": " << auto_port;
                         }
                     }
-                    cfg.p2p_address = cfg.rpc_host;  // same host as RPC daemon
+                    // P2P address: prefer --merged-coind-p2p-address if set
+                    // (RPC may go through mm-adapter on a different host than the P2P daemon)
+                    cfg.p2p_address = !merged_coind_p2p_address.empty()
+                        ? merged_coind_p2p_address : cfg.rpc_host;
 
                     // Phase 5/Step 4: create DOGE HeaderChain when embedded OR P2P is available.
                     // Even in RPC-primary mode, the HeaderChain enables live header sync
@@ -2848,7 +2827,10 @@ int main(int argc, char* argv[]) {
             // Keep redistributor alive for the lifetime of the pool
             auto redistributor_holder = std::move(redistributor);
 
-            // Periodic run_think timer (every 15 seconds) — verify shares & manage peers
+            // Periodic run_think timer (every 5 seconds, safety net)
+            // Primary think trigger: processing_shares_phase2 calls run_think()
+            // for small batches (real-time share relay). This timer catches
+            // anything that falls through.
             auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
             std::function<void(boost::system::error_code)> think_tick;
             think_tick = [&, think_timer](boost::system::error_code ec) {
@@ -2858,10 +2840,10 @@ int main(int argc, char* argv[]) {
                 } catch (const std::exception& e) {
                     LOG_ERROR << "[THINK] error: " << e.what();
                 }
-                think_timer->expires_after(std::chrono::seconds(15));
+                think_timer->expires_after(std::chrono::seconds(5));
                 think_timer->async_wait(think_tick);
             };
-            think_timer->expires_after(std::chrono::seconds(15));
+            think_timer->expires_after(std::chrono::seconds(5));
             think_timer->async_wait(think_tick);
 
             // Periodic monitoring timer (every 30 seconds)

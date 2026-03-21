@@ -83,15 +83,46 @@ void StratumServer::accept_connections()
 void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket socket)
 {
     if (!ec) {
-        // Create and start Stratum session
-        std::make_shared<StratumSession>(std::move(socket), mining_interface_)->start();
+        // Create, register, and start Stratum session
+        auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_);
+        register_session(session);
+        session->start();
     } else {
         LOG_ERROR << "Stratum accept error: " << ec.message();
     }
-    
+
     // Continue accepting new connections
     if (running_) {
         accept_connections();
+    }
+}
+
+void StratumServer::register_session(std::shared_ptr<StratumSession> s)
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions_.insert(std::move(s));
+}
+
+void StratumServer::unregister_session(std::shared_ptr<StratumSession> s)
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions_.erase(s);
+}
+
+void StratumServer::notify_all()
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    for (auto& s : sessions_) {
+        try {
+            s->send_notify_work(true); // clean_jobs=true so miner drops old work
+        } catch (...) {}
+    }
+    // Prune dead sessions
+    for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+        if (!(*it)->is_connected())
+            it = sessions_.erase(it);
+        else
+            ++it;
     }
 }
 
@@ -1098,10 +1129,12 @@ void StratumSession::start_periodic_work_push()
     *fn = [this, self, fn](boost::system::error_code ec) {
         if (ec) return;
         send_notify_work();
-        work_push_timer_->expires_after(std::chrono::seconds(4));
+        // Push new work every 1 second (p2pool pushes immediately on new_work_event).
+        // Short interval ensures miner always works on the latest chain tip.
+        work_push_timer_->expires_after(std::chrono::seconds(1));
         work_push_timer_->async_wait(*fn);
     };
-    work_push_timer_->expires_after(std::chrono::seconds(4));
+    work_push_timer_->expires_after(std::chrono::seconds(1));
     work_push_timer_->async_wait(*fn);
 }
 

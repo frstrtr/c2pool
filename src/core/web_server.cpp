@@ -5077,6 +5077,9 @@ void WebServer::set_on_block_relay(std::function<void(const std::string&)> fn)
 void WebServer::trigger_work_refresh()
 {
     mining_interface_->refresh_work();
+    // Push new work to all stratum miners immediately (p2pool: new_work_event)
+    if (stratum_server_)
+        stratum_server_->notify_all();
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)

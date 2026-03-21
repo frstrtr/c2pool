@@ -99,7 +99,7 @@ private:
 struct StratumConfig {
     double min_difficulty       = 0.001;    // floor for per-connection vardiff
     double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
-    double target_time          = 10.0;     // seconds between pseudoshares
+    double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
     bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
     size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
 };

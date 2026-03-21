@@ -428,28 +428,32 @@ public:
                 if (!chain.contains(hh))
                     continue;
 
-                auto v_height = verified.get_height(hh);
-                auto recent_ancestor = verified.get_nth_parent_key(hh, std::min(5, v_height));
-                uint288 work_score = verified.get_index(recent_ancestor)->work;
+                try {
+                    auto v_height = verified.get_height(hh);
+                    auto recent_ancestor = verified.get_nth_parent_key(hh, std::min(5, v_height));
+                    uint288 work_score = verified.get_index(recent_ancestor)->work;
 
-                auto* head_idx = chain.get_index(hh);
-                int64_t ts = head_idx->time_seen;
+                    auto* head_idx = chain.get_index(hh);
+                    if (!head_idx) continue;
+                    int64_t ts = head_idx->time_seen;
 
-                // Punish heads: version obsolescence OR naughty (invalid block)
-                int32_t reason = 0;
-                {
-                    auto share_version = chain.get_share(hh).version();
-                    auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-                    if (should_punish_version(hh, share_version, lookbehind))
-                        reason = 1;
-                    // Naughty: share or ancestor would make invalid block
-                    auto* idx = chain.get_index(hh);
-                    if (idx && idx->naughty > 0)
-                        reason = std::max(reason, idx->naughty);
+                    // Punish heads: version obsolescence OR naughty (invalid block)
+                    int32_t reason = 0;
+                    {
+                        auto share_version = chain.get_share(hh).version();
+                        auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
+                        if (should_punish_version(hh, share_version, lookbehind))
+                            reason = 1;
+                        auto* idx = chain.get_index(hh);
+                        if (idx && idx->naughty > 0)
+                            reason = std::max(reason, idx->naughty);
+                    }
+
+                    decorated_heads.push_back({{work_score, reason, ts}, hh});
+                    traditional_sort.push_back({{work_score, ts, reason}, hh});
+                } catch (const std::exception&) {
+                    // Chain concurrently modified — skip this head, retry next cycle
                 }
-
-                decorated_heads.push_back({{work_score, reason, ts}, hh});
-                traditional_sort.push_back({{work_score, ts, reason}, hh});
             }
             std::sort(decorated_heads.begin(), decorated_heads.end());
             std::sort(traditional_sort.begin(), traditional_sort.end());
@@ -489,6 +493,11 @@ public:
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
         if (dist < 2 || !chain.contains(share_hash))
+            return uint288(0);
+
+        // Guard: ensure chain is deep enough (p2pool checks height before walking)
+        auto actual_height = chain.get_height(share_hash);
+        if (actual_height < dist)
             return uint288(0);
 
         auto far_hash = chain.get_nth_parent_key(share_hash, dist - 1);
@@ -545,25 +554,22 @@ public:
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
         // Not enough chain depth for proper difficulty calculation.
-        // Use the prev_share's bits and max_bits as-is — they reflect the
-        // network's current difficulty at the chain tip. This matches
-        // p2pool's behavior: on genesis, first shares use MAX_TARGET and
-        // difficulty ramps up as the chain grows.
+        // p2pool (data.py:746-747): pre_target3 = MAX_TARGET, then computes
+        // max_bits and bits from that. Do NOT inherit from prev share —
+        // that would produce different bits than what p2pool computes during
+        // check(), causing GENTX-FAIL (ref_hash mismatch).
         if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
-            uint32_t peer_bits = 0, peer_max_bits = 0;
-            if (!prev_share_hash.IsNull() && chain.contains(prev_share_hash)) {
-                chain.get_share(prev_share_hash).invoke([&](auto* obj) {
-                    peer_bits = obj->m_bits;
-                    peer_max_bits = obj->m_max_bits;
-                });
-            }
-            if (peer_bits != 0 && peer_max_bits != 0) {
-                return {peer_max_bits, peer_bits};
-            }
-            // Genesis (no peers) — use MAX_TARGET
-            auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
-            return {max_bits, max_bits};
+            auto pre_target3 = MAX_TARGET;
+            auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+            // bits = clip(desired_target, [pre_target3/30, pre_target3])
+            uint256 bits_lo = pre_target3 / 30;
+            if (bits_lo.IsNull()) bits_lo = uint256(1);
+            uint256 bits_target = desired_target;
+            if (bits_target < bits_lo) bits_target = bits_lo;
+            if (bits_target > pre_target3) bits_target = pre_target3;
+            auto bits = chain::target_to_bits_upper_bound(bits_target);
+            return {max_bits, bits};
         }
 
         // Step 1: Derive target from pool hashrate
