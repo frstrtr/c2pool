@@ -2102,7 +2102,12 @@ int main(int argc, char* argv[]) {
                             }
                         }
                     }
-                    params.max_bits = share_max_bits;
+                    // V36 with desired_target=MAX_TARGET: bits == max_bits (matching p2pool).
+                    // compute_share_target clips desired_target to [pre_target3//30, pre_target3]
+                    // and MAX_TARGET always clips to pre_target3, so bits == max_bits.
+                    // Force this invariant to prevent max_bits from being easier than bits
+                    // (which would contaminate the min_work-based APS calculation).
+                    params.max_bits = share_bits;  // NOT share_max_bits — must equal bits
                     params.bits = share_bits;
                     params.timestamp = timestamp;
 
@@ -2111,10 +2116,12 @@ int main(int argc, char* argv[]) {
                     mi_for_share_bits->m_share_max_bits.store(share_max_bits);
                     {
                         auto st = chain::bits_to_target(share_bits);
+                        auto mt = chain::bits_to_target(share_max_bits);
                         double sd = chain::target_to_difficulty(st);
+                        double md = chain::target_to_difficulty(mt);
                         LOG_INFO << "[ShareTarget] share_bits=" << std::hex << share_bits
                                  << " max_bits=" << share_max_bits << std::dec
-                                 << " share_diff=" << sd;
+                                 << " share_diff=" << sd << " max_diff=" << md;
                     }
 
                     // Extract pubkey_hash and type from payout_script
@@ -2170,7 +2177,20 @@ int main(int argc, char* argv[]) {
                             auto desired_target2 = ltc::PoolConfig::max_target();
                             auto [sm, sb] = tracker.compute_share_target(
                                 params.prev_share, params.timestamp, desired_target2);
-                            params.max_bits = sm;
+                            // Apply same guard as above: inherit peer bits if drifted
+                            uint32_t pb = 0, pmb = 0;
+                            tracker.chain.get_share(params.prev_share).invoke([&](auto* obj) {
+                                pb = obj->m_bits; pmb = obj->m_max_bits;
+                            });
+                            if (pb != 0) {
+                                auto pt = chain::bits_to_target(pb);
+                                auto ot = chain::bits_to_target(sb);
+                                if (ot > pt && (ot >> 1) > pt) {
+                                    sb = pb; sm = pmb;
+                                }
+                            }
+                            // V36: max_bits must equal bits (desired_target=MAX clips to pre_target3)
+                            params.max_bits = sb;
                             params.bits = sb;
                         }
 
