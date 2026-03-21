@@ -280,6 +280,26 @@ private:
     void refresh_aux_work();
 
 public:
+    // ─── Shared helpers (used by both build_multiaddress_block and build_merged_header_info) ───
+
+    // Build canonical merged coinbase TX hex from PPLNS payouts.
+    // Matches p2pool's build_canonical_merged_coinbase output ordering.
+    static std::string build_pplns_coinbase_hex(
+        int height,
+        const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,
+        const uint256& the_state_root);
+
+    // Compute merkle root from a list of tx hashes (first = coinbase).
+    static uint256 compute_tx_merkle_root(const std::vector<uint256>& tx_hashes);
+
+    // Compute merkle link (proof branches) from leaf at index to root.
+    static std::vector<uint256> compute_merkle_link(
+        const std::vector<uint256>& tx_hashes, size_t leaf_index);
+
+    // Collect tx hashes from block template JSON + coinbase hash.
+    static std::vector<uint256> collect_tx_hashes(
+        const uint256& coinbase_hash, const nlohmann::json& tmpl);
+
     // Build a complete aux block in multiaddress mode from getblocktemplate
     // result, PPLNS payout outputs, AuxPoW proof hex, and THE state root
     // for sharechain anchoring (embedded in coinbase scriptSig).
