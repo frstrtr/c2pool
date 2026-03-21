@@ -536,20 +536,27 @@ uint256 NodeImpl::best_share_hash()
     // so the node can still generate work for miners (pseudoshares).
     auto& verified = m_tracker.verified;
     if (verified.size() > 0) {
-        // Pick the verified head with greatest height (matches p2pool's think())
+        // Pick the verified head with greatest accumulated WORK (matches p2pool's think()).
+        // Using height instead of work caused c2pool to prefer its own chain
+        // (more shares at lower difficulty) over p2pool's chain (fewer shares
+        // at higher difficulty), creating a fork with different PPLNS weights.
         uint256 best;
-        int32_t best_height = -1;
+        uint288 best_work;
+        bool first = true;
         for (const auto& [head_hash, tail_hash] : verified.get_heads()) {
-            auto h = verified.get_height(head_hash);
-            if (h > best_height) {
+            auto* idx = verified.get_index(head_hash);
+            if (idx && (first || idx->work > best_work)) {
                 best = head_hash;
-                best_height = h;
+                best_work = idx->work;
+                first = false;
             }
         }
         if (!best.IsNull()) {
             static int log_count = 0;
+            auto best_height = verified.get_height(best);
             if (log_count++ % 60 == 0)
                 LOG_INFO << "[best_share] using VERIFIED head height=" << best_height
+                         << " work=" << best_work.GetHex().substr(0, 16)
                          << " verified=" << verified.size()
                          << " raw=" << (m_chain ? m_chain->size() : 0);
             return best;
