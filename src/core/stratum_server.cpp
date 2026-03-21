@@ -657,6 +657,26 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         response["error"] = nlohmann::json::array({21, "Stale share", nullptr});
         return response;
     }
+
+    // DOA detection: if GBT previousblockhash changed since job creation,
+    // this share is for an old block. Track for statistics but do NOT modify
+    // job.stale_info — that field is part of ref_hash (frozen at template time).
+    // Changing it at submit time would break ref_hash consistency → GENTX-FAIL.
+    // p2pool computes stale_info at get_work() time (job creation), not at submit.
+    {
+        auto current_prevhash = mining_interface_->get_current_gbt_prevhash();
+        if (!current_prevhash.empty() && !job_it->second.gbt_prevhash.empty()
+            && current_prevhash != job_it->second.gbt_prevhash)
+        {
+            LOG_INFO << "[Stratum] DOA share from " << username_
+                     << ": block template changed (job=" << job_id
+                     << " job_prev=" << job_it->second.gbt_prevhash.substr(0, 16)
+                     << " current_prev=" << current_prevhash.substr(0, 16) << ")";
+            // DON'T set job.stale_info here — it would break ref_hash.
+            // The share is still created and broadcast (matches p2pool behavior).
+            // DOA tracking is for statistics/dashboard only.
+        }
+    }
     
     // Calculate share difficulty using per-connection coinbase and job-specific template data
     const auto& job = job_it->second;
@@ -762,6 +782,10 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
     snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
+    // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
+    // used at job creation time (always 0 for now). Changing it at submit
+    // time would break ref_hash consistency. Future: compute stale_info
+    // at ref_hash_fn time and freeze it, matching p2pool's get_work() pattern.
 
     // Check EVERY submission for block-level PoW — even rejected shares
     // can meet the blockchain target and must be submitted as blocks.

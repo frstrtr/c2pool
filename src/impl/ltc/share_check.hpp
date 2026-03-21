@@ -341,6 +341,20 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 ref_hash = Hash(ref_span);
 
+    {
+        static int rfn_log = 0;
+        if (rfn_log++ < 3) {
+            static const char* HX = "0123456789abcdef";
+            std::string hex;
+            auto* rd = reinterpret_cast<const unsigned char*>(ref_stream.data());
+            for (size_t i = 0; i < ref_stream.size(); ++i) { hex += HX[rd[i]>>4]; hex += HX[rd[i]&0xf]; }
+            LOG_INFO << "[REF-FN] ref_packed_len=" << ref_stream.size()
+                     << " ref_hash=" << ref_hash.GetHex()
+                     << " absheight=" << p.absheight << " prev=" << p.prev_share.GetHex().substr(0,16);
+            LOG_INFO << "[REF-FN-FULL] " << hex;
+        }
+    }
+
     // Generate a random-ish last_txout_nonce
     uint64_t nonce = static_cast<uint64_t>(std::time(nullptr)) ^
                      (static_cast<uint64_t>(p.timestamp) << 32) ^
@@ -931,6 +945,18 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         sum_amounts += a;
     uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
 
+    // Dump amounts for cross-impl debugging
+    if (dump_diag) {
+        LOG_INFO << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << amounts.size()
+                 << " sum=" << sum_amounts << " donation=" << donation_amount
+                 << " prev=" << prev_hash.GetHex().substr(0,16);
+        for (auto& [s, a] : amounts) {
+            static const char* HX = "0123456789abcdef";
+            std::string sh; for (size_t i = 0; i < std::min(s.size(), size_t(10)); ++i) { sh += HX[s[i]>>4]; sh += HX[s[i]&0xf]; }
+            LOG_INFO << "[GST-AMOUNTS]   " << sh << "... = " << a;
+        }
+    }
+
     // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
     if constexpr (ver >= 36) {
         if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
@@ -1053,6 +1079,10 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 auto commitment_bytes = commitment.GetChars();
                 wscript.insert(wscript.end(), commitment_bytes.begin(), commitment_bytes.end());
                 write_txout(0, wscript);
+                if (dump_diag) {
+                    LOG_INFO << "[WC-GST] wtxid_root=" << sd.m_wtxid_merkle_root.GetHex()
+                             << " commitment=" << commitment.GetHex();
+                }
             }
         }
     }
@@ -1876,16 +1906,35 @@ uint256 create_local_share(
                      << " current=" << merkle_branches.size();
         }
         // wtxid_merkle_root: use frozen witness root if available
+        const char* wc_source = "unknown";
         if (has_frozen && !frozen_witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = frozen_witness_root;
+            wc_source = "frozen";
         } else if (!witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = witness_root;
+            wc_source = "witness_root";
         } else if (witness_commitment_hex.size() >= 76) {
             // Legacy fallback: extract commitment hash from witness_commitment_hex
-            // (only used if witness_root is not provided)
+            // WARNING: if witness_commitment_hex uses GBT nonce (zeros) but
+            // p2pool uses [P2Pool]*4 nonce, this will be WRONG
             sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
+            wc_source = "LEGACY_EXTRACT";
         } else {
             sd.m_wtxid_merkle_root = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            wc_source = "DEFAULT_FF";
+        }
+        {
+            static int wc_src_log = 0;
+            if (wc_src_log++ < 5) {
+                uint256 p2pool_commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
+                LOG_INFO << "[WC-SOURCE] source=" << wc_source
+                         << " wtxid_root=" << sd.m_wtxid_merkle_root.GetHex()
+                         << " p2pool_wc=" << p2pool_commitment.GetHex();
+                // Also show what the GBT commitment would be (for comparison)
+                if (witness_commitment_hex.size() >= 76) {
+                    LOG_INFO << "[WC-SOURCE] gbt_wc_hex=" << witness_commitment_hex.substr(12, 64);
+                }
+            }
         }
         share.m_segwit_data = sd;
     }
@@ -1938,6 +1987,24 @@ uint256 create_local_share(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
     uint256 hash_ref = Hash(ref_span_v);
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
+
+    // Dump FULL ref_stream for cross-impl comparison
+    {
+        static int ref_dump_count = 0;
+        if (ref_dump_count < 3 && !actual_coinbase_bytes.empty()) {
+            static const char* HX = "0123456789abcdef";
+            std::string full_hex;
+            auto* rd = reinterpret_cast<const unsigned char*>(ref_stream.data());
+            for (size_t i = 0; i < ref_stream.size(); ++i) { full_hex += HX[rd[i]>>4]; full_hex += HX[rd[i]&0xf]; }
+            LOG_INFO << "[REF-HASH] ref_packed_len=" << ref_stream.size()
+                     << " ref_hash=" << hash_ref.GetHex();
+            LOG_INFO << "[REF-HASH-FULL] " << full_hex;
+            LOG_INFO << "[REF-HASH] coinbase_len=" << share.m_coinbase.size()
+                     << " subsidy=" << share.m_subsidy
+                     << " donation=" << share.m_donation;
+            ++ref_dump_count;
+        }
+    }
 
     // If we have actual coinbase bytes, extract the ref_hash from the coinbase.
     // The coinbase has ref_hash embedded at position [len-44 : len-44+32].
@@ -2134,6 +2201,29 @@ uint256 create_local_share(
         uint64_t extracted_nonce = 0;
         std::memcpy(&extracted_nonce, coinbase_bytes_for_hashlink.data() + nonce_offset, 8);
         share.m_last_txout_nonce = extracted_nonce;
+        {
+            static int nonce_log = 0;
+            if (nonce_log++ < 5) {
+                static const char* HX = "0123456789abcdef";
+                std::string nonce_hex;
+                for (int i = 0; i < 8; ++i) {
+                    uint8_t b = coinbase_bytes_for_hashlink[nonce_offset + i];
+                    nonce_hex += HX[b>>4]; nonce_hex += HX[b&0xf];
+                }
+                LOG_INFO << "[NONCE-EXTRACT] offset=" << nonce_offset
+                         << " nonce_hex=" << nonce_hex
+                         << " nonce_u64=0x" << std::hex << extracted_nonce << std::dec
+                         << " cb_total=" << coinbase_bytes_for_hashlink.size()
+                         << " src=" << (actual_coinbase_bytes.empty() ? "reconstructed" : "actual_mined");
+                // Dump FULL actual coinbase hex for byte-by-byte comparison with p2pool
+                std::string full_cb_hex;
+                for (size_t i = 0; i < coinbase_bytes_for_hashlink.size(); ++i) {
+                    full_cb_hex += HX[coinbase_bytes_for_hashlink[i]>>4];
+                    full_cb_hex += HX[coinbase_bytes_for_hashlink[i]&0xf];
+                }
+                LOG_INFO << "[ACTUAL-CB] hex=" << full_cb_hex;
+            }
+        }
     }
 
     // --- Compute share hash ---
@@ -2327,6 +2417,23 @@ uint256 create_local_share(
     LOG_INFO << "create_local_share: added share " << share_hash.GetHex()
              << " height=" << share.m_absheight
              << " prev=" << prev_share.GetHex().substr(0, 16) << "...";
+
+    // Cross-check: call generate_share_transaction on the share we just created
+    // to verify p2pool would produce the same gentx_hash.
+    {
+        static int xcheck_count = 0;
+        if (xcheck_count < 5) {
+            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true);
+            bool xcheck_ok = (verify_hash == gentx_hash_for_header);
+            if (xcheck_ok) {
+                LOG_INFO << "[Pool] Cross-check PASSED";
+            } else {
+                LOG_WARNING << "[Pool] Cross-check FAILED! mined_gentx=" << gentx_hash_for_header.GetHex()
+                            << " verify_gentx=" << verify_hash.GetHex();
+            }
+            ++xcheck_count;
+        }
+    }
 
     return share_hash;
 }

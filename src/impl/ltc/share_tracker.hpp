@@ -1163,20 +1163,18 @@ public:
         if (prev_share_hash.IsNull())
             return uint256{};
 
-        // Use VERIFIED chain for consensus hash — only includes shares that
-        // all peers agree on. Prevents c2pool's own unverified shares from
-        // polluting the weight distribution.
-        if (!verified.contains(prev_share_hash))
+        // Use RAW chain — matches p2pool's compute_merged_payout_hash()
+        // which uses tracker (raw), not tracker.verified.
+        // Using verified chain caused zero returns when prev_share wasn't
+        // yet verified → ref_hash mismatch → GENTX-FAIL.
+        if (!chain.contains(prev_share_hash))
             return uint256{};
 
-        auto height = verified.get_height(prev_share_hash);
+        auto height = chain.get_height(prev_share_hash);
         if (height == 0)
             return uint256{};
 
-        // Defer check until verified chain has enough depth for a meaningful
-        // PPLNS window. During bootstrap, the verified chain is too shallow
-        // to produce the same hash as p2pool (which has the full window).
-        // Return null → caller skips the comparison.
+        // Defer when chain is too shallow for a meaningful PPLNS window
         if (height < static_cast<int32_t>(PoolConfig::real_chain_length()))
             return uint256{};
 

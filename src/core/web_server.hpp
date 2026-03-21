@@ -275,6 +275,7 @@ public:
         uint32_t    share_max_bits{0}; // share max_bits from compute_share_target()
         std::string block_nbits;      // original GBT block bits (for block target check)
         RefHashResult frozen_ref;     // frozen share fields from template time
+        int stale_info{0};            // 0=none, 253=orphan (stale block template)
     };
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
@@ -509,6 +510,9 @@ public:
     uint256 get_cached_witness_root() const;
 
     WorkSnapshot get_work_snapshot() const;
+
+    // Returns current GBT previousblockhash (for stale block template detection)
+    std::string get_current_gbt_prevhash() const;
 
     // Found block status and record (Layer +2 — blockchain-accepted blocks)
     enum class BlockStatus : uint8_t {

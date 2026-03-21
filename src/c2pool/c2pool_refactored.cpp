@@ -358,7 +358,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGSEGV, segfault_handler);
     std::signal(SIGABRT, segfault_handler);
-    
+
     // Initialize logging
     core::log::Logger::init();
     
@@ -380,7 +380,6 @@ int main(int argc, char* argv[]) {
     LOG_INFO    << "#  c2pool v0.1 -- Decentralized Mining Pool  #";
     LOG_INFO    << "#  https://github.com/frstrtr/c2pool         #";
     LOG_INFO    << "##############################################";
-
     LOG_WARNING << "############################################################";
     LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK   #";
     LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY      #";
@@ -388,7 +387,7 @@ int main(int argc, char* argv[]) {
     LOG_WARNING << "#  Distributed under the MIT/X11 software license          #";
     LOG_WARNING << "#  See http://www.opensource.org/licenses/mit-license.php  #";
     LOG_WARNING << "############################################################";
-    
+
     // Default settings
     auto settings = std::make_unique<core::Settings>();
     settings->m_testnet = false;
@@ -2227,6 +2226,19 @@ int main(int argc, char* argv[]) {
                                         << " verified=" << p2p_node->tracker().verified.size() << ")";
                         }
                         return;
+                    }
+
+                    // Log chain depth for diagnostics (no guard — p2pool creates
+                    // shares immediately with whatever depth it has)
+                    {
+                        auto& tracker = p2p_node->tracker();
+                        if (tracker.chain.contains(p.prev_share_hash)) {
+                            auto depth = tracker.chain.get_height(p.prev_share_hash);
+                            static int depth_log = 0;
+                            if (depth_log++ < 5)
+                                LOG_INFO << "[Pool] Creating share at chain depth " << depth
+                                         << " prev=" << p.prev_share_hash.GetHex().substr(0, 16);
+                        }
                     }
 
                     // Build SmallBlockHeaderType from Stratum params.

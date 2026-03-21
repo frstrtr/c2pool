@@ -1206,6 +1206,11 @@ MiningInterface::build_coinbase_parts(
         size_t wc_len = witness_commitment_hex.size() / 2;
         coinb1 << std::hex << std::setfill('0') << std::setw(2) << wc_len;
         coinb1 << witness_commitment_hex;
+        {
+            static int wc_log = 0;
+            if (wc_log++ < 5)
+                LOG_INFO << "[WC-COINBASE] witness_commitment(" << wc_len << ")=" << witness_commitment_hex.substr(0, 80);
+        }
     }
 
     // Outputs 2..N: PPLNS payouts + donation (already sorted by caller)
@@ -1420,8 +1425,15 @@ MiningInterface::build_connection_coinbase(
         static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
         tmpl_height, tmpl_bits);
 
-    LOG_INFO << "[build_connection_cb] pplns_outputs=" << m_cached_pplns_outputs.size()
-             << " raw_scripts=" << m_cached_raw_scripts;
+    LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
+             << prev_share_hash.GetHex().substr(0, 16) << " outputs=" << m_cached_pplns_outputs.size();
+    {
+        uint64_t pplns_total = 0;
+        for (auto& [_, amt] : m_cached_pplns_outputs) pplns_total += amt;
+        LOG_INFO << "[build_connection_cb] subsidy=" << subsidy
+                 << " pplns_total=" << pplns_total
+                 << " diff=" << (int64_t(subsidy) - int64_t(pplns_total));
+    }
     auto [cb1, cb2] = build_coinbase_parts(
         m_cached_template,
         subsidy,
@@ -1715,6 +1727,14 @@ uint256 MiningInterface::get_cached_witness_root() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
     return m_cached_witness_root;
+}
+
+std::string MiningInterface::get_current_gbt_prevhash() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    if (!m_cached_template.is_null() && m_cached_template.contains("previousblockhash"))
+        return m_cached_template["previousblockhash"].get<std::string>();
+    return {};
 }
 
 MiningInterface::WorkSnapshot MiningInterface::get_work_snapshot() const
@@ -4617,6 +4637,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             cb_bytes.begin() + pos,
                             cb_bytes.begin() + pos + scriptsig_len);
                     }
+                    LOG_INFO << "[scriptSig-extract] cb_total=" << cb_bytes.size()
+                             << " scriptsig_varint=0x" << std::hex << scriptsig_len << std::dec
+                             << " scriptsig_len=" << scriptsig_len
+                             << " extracted=" << params.coinbase_scriptSig.size()
+                             << " cb1_src=" << (job ? "job" : "cached");
                 }
 
                 // Convert string merkle branches to uint256 (internal byte order)
@@ -4664,6 +4689,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
                     params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
                     params.has_frozen_fields = (job->frozen_ref.absheight > 0);
+                    params.stale_info = job->stale_info;
                 }
             }
 
