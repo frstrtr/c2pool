@@ -1140,9 +1140,9 @@ void StratumSession::start_periodic_work_push()
     *fn = [this, self, fn](boost::system::error_code ec) {
         if (ec) return;
         send_notify_work();
-        // Push new work every 1 second (p2pool pushes immediately on new_work_event).
-        // Short interval ensures miner always works on the latest chain tip.
-        work_push_timer_->expires_after(std::chrono::seconds(1));
+        // Push new work every 4 seconds — matches p2pool's natural share rate.
+        // Too frequent pushes cause high stale rate on slow ASIC miners.
+        work_push_timer_->expires_after(std::chrono::seconds(4));
         work_push_timer_->async_wait(*fn);
     };
     work_push_timer_->expires_after(std::chrono::seconds(1));

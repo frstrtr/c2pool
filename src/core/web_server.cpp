@@ -5109,9 +5109,9 @@ void WebServer::trigger_work_refresh()
     if (stratum_server_)
         mining_interface_->set_local_hashrate(stratum_server_->get_total_hashrate());
     mining_interface_->refresh_work();
-    // Push new work to all stratum miners immediately (p2pool: new_work_event)
-    if (stratum_server_)
-        stratum_server_->notify_all();
+    // Don't call notify_all here — the per-session work push timer (4s)
+    // picks up the refreshed template. Immediate push causes high stale
+    // rate on slow ASIC miners (69% stale with 1s push + notify_all).
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
