@@ -837,24 +837,44 @@ std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
 std::vector<MergedMiningManager::MergedHeaderInfo>
 MergedMiningManager::build_merged_header_info() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    std::vector<MergedHeaderInfo> result;
-
-    for (const auto& chain : m_chains)
+    // Snapshot chain data under lock, then release before calling
+    // m_payout_provider (which calls back into tracker → would deadlock).
+    struct ChainSnapshot {
+        uint32_t chain_id; uint64_t coinbase_value; int height;
+        nlohmann::json block_template;
+    };
+    std::vector<ChainSnapshot> snapshots;
+    PayoutProvider payout_fn;
+    StateRootProvider state_fn;
     {
-        if (chain.current_work.coinbase_value == 0) continue;
-        if (chain.current_work.block_template.is_null()) continue;
-        if (!m_payout_provider) continue;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        payout_fn = m_payout_provider;
+        state_fn = m_state_root_provider;
+        for (const auto& chain : m_chains) {
+            if (chain.current_work.coinbase_value == 0) continue;
+            if (chain.current_work.block_template.is_null()) continue;
+            snapshots.push_back({chain.config.chain_id,
+                chain.current_work.coinbase_value,
+                chain.current_work.height,
+                chain.current_work.block_template});
+        }
+    }
+    // Lock released — safe to call payout_fn
 
-        const auto& tmpl = chain.current_work.block_template;
+    std::vector<MergedHeaderInfo> result;
+    if (!payout_fn) return result;
+
+    for (auto& snap : snapshots)
+    {
+
+        const auto& tmpl = snap.block_template;
         MergedHeaderInfo info;
-        info.chain_id = chain.config.chain_id;
-        info.coinbase_value = chain.current_work.coinbase_value;
-        info.block_height = static_cast<uint32_t>(chain.current_work.height);
+        info.chain_id = snap.chain_id;
+        info.coinbase_value = snap.coinbase_value;
+        info.block_height = static_cast<uint32_t>(snap.height);
 
-        // Build PPLNS coinbase for this chain
-        auto payouts = m_payout_provider(chain.config.chain_id,
-                                          chain.current_work.coinbase_value);
+        // Build PPLNS coinbase for this chain (NO lock held — safe)
+        auto payouts = payout_fn(snap.chain_id, snap.coinbase_value);
         if (payouts.empty()) continue;
 
         // Build coinbase hex using the same logic as build_multiaddress_block
@@ -868,7 +888,7 @@ MergedMiningManager::build_merged_header_info() const
 
         try {
             uint256 state_root;
-            if (m_state_root_provider) state_root = m_state_root_provider();
+            if (state_fn) state_root = state_fn();
 
             // Build coinbase, compute merkle root + link using shared helpers
             std::string coinbase_hex = build_pplns_coinbase_hex(
@@ -910,7 +930,7 @@ MergedMiningManager::build_merged_header_info() const
 
             result.push_back(std::move(info));
         } catch (const std::exception& e) {
-            LOG_WARNING << "[MM:" << chain.config.symbol
+            LOG_WARNING << "[MM:chain_" << snap.chain_id
                         << "] build_merged_header_info failed: " << e.what();
         }
     }
