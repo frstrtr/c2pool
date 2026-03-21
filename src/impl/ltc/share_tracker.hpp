@@ -1174,12 +1174,13 @@ public:
         if (height == 0)
             return uint256{};
 
-        // Defer when chain is too shallow for a meaningful PPLNS window
-        if (height < static_cast<int32_t>(PoolConfig::real_chain_length()))
-            return uint256{};
+        // No chain depth guard — p2pool computes merged_payout_hash for ANY
+        // height > 0 using chain_length = min(height, REAL_CHAIN_LENGTH).
+        // The previous guard (height < CHAIN_LENGTH → return zero) caused
+        // ref_hash mismatch because p2pool computed a real hash while c2pool
+        // returned zero.
 
         // Unlimited desired_weight — V36 exponential decay handles windowing.
-        // Must match get_merged_expected_payouts and p2pool's computation.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         auto chain_len = std::min(height,
