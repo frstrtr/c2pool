@@ -2651,14 +2651,12 @@ int main(int argc, char* argv[]) {
                              << " block_target=" << block_target.GetHex().substr(0,16);
 
                     // Convert map → sorted vector for coinbase construction
+                    // Amounts are already integer (uint64_t) from integer-only arithmetic
                     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
                     result.reserve(payouts_map.size());
                     for (auto& [script, amount] : payouts_map) {
-                        if (amount >= 1.0)
-                            result.emplace_back(script, static_cast<uint64_t>(amount));
-                        else
-                            LOG_WARNING << "[MM-payout] Skipping script (len=" << script.size()
-                                        << ") with amount=" << amount;
+                        if (amount >= 1)
+                            result.emplace_back(script, amount);
                     }
                     // Sort by script for deterministic coinbase ordering
                     std::sort(result.begin(), result.end());

@@ -1029,7 +1029,7 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
         donation_amount += 1;
     }
 
-    const std::string op_return_text = "c2pool merged mining";
+    const std::string op_return_text = "P2Pool merged mining";
     std::vector<unsigned char> op_return_script;
     op_return_script.push_back(0x6a);
     op_return_script.push_back(static_cast<unsigned char>(op_return_text.size()));
@@ -1202,7 +1202,7 @@ std::string MergedMiningManager::build_multiaddress_block(
     }
 
     // OP_RETURN: c2pool identity in merged block coinbase
-    const std::string op_return_text = "c2pool merged mining";
+    const std::string op_return_text = "P2Pool merged mining";
     std::vector<unsigned char> op_return_script;
     op_return_script.push_back(0x6a); // OP_RETURN
     op_return_script.push_back(static_cast<unsigned char>(op_return_text.size()));

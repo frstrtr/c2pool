@@ -1298,7 +1298,18 @@ public:
     // -- Merged mining: per-chain expected payouts --
     // Given an aux chain's subsidy and chain_id, computes the expected payout
     // distribution using merged PPLNS weights.
-    std::map<std::vector<unsigned char>, double>
+    // Uses INTEGER arithmetic matching p2pool's build_canonical_merged_coinbase
+    // exactly — no floating point anywhere.
+    //
+    // p2pool algorithm:
+    //   grand_total = total_weight (already includes donation_weight)
+    //   donation_amount = coinbase_value * donation_weight // grand_total
+    //   miners_reward = coinbase_value - donation_amount
+    //   accepted_total = sum of convertible miner weights (== total_weight - donation_weight here)
+    //   per_miner = miners_reward * w // accepted_total
+    //   rounding_remainder = miners_reward - sum(per_miner)
+    //   final_donation = donation_amount + rounding_remainder
+    std::map<std::vector<unsigned char>, uint64_t>
     get_merged_expected_payouts(const uint256& best_share_hash,
                                 const uint256& block_target,
                                 uint64_t subsidy,
@@ -1308,49 +1319,72 @@ public:
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
         // Unlimited desired_weight — exponential decay handles windowing.
-        // Same fix as get_expected_payouts / generate_share_transaction.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         auto [weights, total_weight, donation_weight] =
             get_merged_cumulative_weights(best_share_hash, chain_len, unlimited_weight, chain_id);
 
-        std::map<std::vector<unsigned char>, double> result;
-        double sum = 0;
+        std::map<std::vector<unsigned char>, uint64_t> result;
 
-        if (!total_weight.IsNull())
-        {
-            for (const auto& [script, weight] : weights)
-            {
-                double payout = subsidy * (weight.getdouble() / total_weight.getdouble());
-                result[script] = payout;
-                sum += payout;
+        if (total_weight.IsNull() || subsidy == 0)
+            return result;
+
+        // Integer division matching p2pool exactly:
+        // grand_total = total_weight (includes donation_weight)
+        // donation_amount = subsidy * donation_weight // grand_total
+        uint64_t grand_total_lo = total_weight.GetLow64();
+        uint64_t donation_w_lo = donation_weight.GetLow64();
+
+        // For large weights, use double only for the ratio, then truncate
+        // This matches Python's integer // on arbitrary-precision ints
+        uint64_t donation_amount = 0;
+        if (!donation_weight.IsNull()) {
+            // donation_amount = subsidy * donation_weight // grand_total
+            // Use 128-bit arithmetic to avoid overflow
+            __uint128_t num = static_cast<__uint128_t>(subsidy) * donation_w_lo;
+            donation_amount = static_cast<uint64_t>(num / grand_total_lo);
+        }
+
+        // finder_fee = 0 (CANONICAL_MERGED_FINDER_FEE_PER_MILLE = 0 in p2pool)
+        uint64_t miners_reward = subsidy - donation_amount;
+
+        // accepted_total = total_weight - donation_weight (all miner weights)
+        uint64_t accepted_total = grand_total_lo - donation_w_lo;
+
+        uint64_t total_distributed = 0;
+        for (const auto& [script, weight] : weights) {
+            uint64_t w = weight.GetLow64();
+            // amount = miners_reward * w // accepted_total
+            __uint128_t num = static_cast<__uint128_t>(miners_reward) * w;
+            uint64_t amount = (accepted_total > 0) ?
+                static_cast<uint64_t>(num / accepted_total) : 0;
+            if (amount > 0) {
+                result[script] = amount;
+                total_distributed += amount;
             }
         }
 
-        double donation_remainder = static_cast<double>(subsidy) - sum;
+        // Rounding remainder → donation (integer division truncates)
+        uint64_t rounding_remainder = miners_reward - total_distributed;
+        uint64_t final_donation = donation_amount + rounding_remainder;
 
-        // V36 CONSENSUS RULE: Donation/marker output must be >= 1 satoshi.
-        // Even when --give-author is 0, the COMBINED_DONATION_SCRIPT output
-        // must be nonzero on-chain as an identifiable P2Pool marker.
-        // Reference: p2pool/data.py generate_transaction() V36 rule.
-        if (donation_remainder < 1.0 && subsidy > 0 && !result.empty())
-        {
-            // Deduct 1 satoshi from the largest miner payout
-            // Deterministic tiebreak: (amount, script) — largest script wins when equal
+        // V36 CONSENSUS RULE: Donation must be >= 1 satoshi
+        if (final_donation < 1 && subsidy > 0 && !result.empty()) {
+            // Deduct from largest miner (deterministic tiebreak by script)
             auto largest = std::max_element(result.begin(), result.end(),
                 [](const auto& a, const auto& b) {
                     if (a.second != b.second) return a.second < b.second;
                     return a.first < b.first;
                 });
-            if (largest != result.end() && largest->second >= 2.0) {
-                largest->second -= 1.0;
-                donation_remainder += 1.0;
+            if (largest != result.end()) {
+                largest->second -= 1;
+                final_donation += 1;
             }
         }
 
-        result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
-                                  + donation_remainder;
+        result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0ULL)
+                                  + final_donation;
 
         return result;
     }
