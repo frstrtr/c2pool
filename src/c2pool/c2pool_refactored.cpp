@@ -2073,13 +2073,12 @@ int main(int argc, char* argv[]) {
                     params.desired_version = 36;
 
                     // Compute pool-level share target from tracker state.
-                    // p2pool computes desired_target from miner hashrate:
-                    //   desired = average_attempts_to_target(hashrate * SHARE_PERIOD / 0.0167)
-                    // With any real miner (>40 H/s), this clips to pre_target3/30
-                    // (hardest in the [pre_target3/30, pre_target3] range).
-                    // Using uint256(1) here matches this: clips to pre_target3/30.
-                    // This gives c2pool shares the same bits as p2pool shares.
-                    auto desired_target = uint256(1);
+                    // p2pool defaults to desired_share_target = 2^256-1 (easiest) when
+                    // local_hash_rate is not yet measured. This clips to pre_target3
+                    // (max_bits). With measured hashrate it gets harder, but on testnet
+                    // with low hashrate the default dominates. Match p2pool's default
+                    // to produce shares with the same bits as p2pool miners.
+                    auto desired_target = ltc::PoolConfig::max_target();
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
                     // No bits guard needed: compute_share_target's ±10% clamp
