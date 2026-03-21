@@ -109,6 +109,17 @@ void StratumServer::unregister_session(std::shared_ptr<StratumSession> s)
     sessions_.erase(s);
 }
 
+double StratumServer::get_total_hashrate() const
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    double total = 0;
+    for (const auto& s : sessions_) {
+        if (s->is_connected())
+            total += s->get_hashrate();
+    }
+    return total;
+}
+
 void StratumServer::notify_all()
 {
     std::lock_guard<std::mutex> lock(sessions_mutex_);

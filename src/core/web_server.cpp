@@ -5105,6 +5105,9 @@ void WebServer::set_on_block_relay(std::function<void(const std::string&)> fn)
 
 void WebServer::trigger_work_refresh()
 {
+    // Update local hashrate from stratum sessions (p2pool: get_local_addr_rates)
+    if (stratum_server_)
+        mining_interface_->set_local_hashrate(stratum_server_->get_total_hashrate());
     mining_interface_->refresh_work();
     // Push new work to all stratum miners immediately (p2pool: new_work_event)
     if (stratum_server_)

@@ -456,6 +456,7 @@ public:
     };
     const std::vector<CachedMergedHeaderInfo>& get_last_merged_header_infos() const { return m_last_merged_header_infos; }
     double get_local_hashrate() const { return m_cached_pool_hashrate; }
+    void set_local_hashrate(double hr) { m_cached_pool_hashrate = hr; }
 
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;

@@ -115,6 +115,7 @@ public:
     void start();
 
     bool is_connected() const { return socket_.is_open(); }
+    double get_hashrate() const { return hashrate_tracker_.get_current_hashrate(); }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
 
 private:
@@ -167,6 +168,10 @@ public:
     /// Push new work to ALL connected miners immediately (p2pool: new_work_event).
     /// Called when best_share changes or new block template arrives.
     void notify_all();
+
+    /// Sum of all connected miners' hashrate (H/s).
+    /// Matches p2pool's get_local_addr_rates() aggregation.
+    double get_total_hashrate() const;
 
     /// Register/unregister sessions for broadcast
     void register_session(std::shared_ptr<StratumSession> s);
