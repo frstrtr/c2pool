@@ -254,6 +254,9 @@ public:
         // GBT updates, but the ref_hash was computed with the values at template time.
         std::vector<uint256> frozen_merkle_branches;
         uint256  frozen_witness_root;
+        // V36: frozen merged coinbase info (pre-serialized vector<MergedCoinbaseEntry>)
+        // Contains DOGE block header + merkle proof for consensus verification.
+        std::vector<unsigned char> frozen_merged_coinbase_info;
     };
 
     // Stratum-style methods (for advanced miners)
@@ -414,6 +417,7 @@ public:
         uint256  frozen_merged_payout_hash;
         std::vector<uint256> frozen_merkle_branches;  // segwit txid_merkle_link branches at template time
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
+        std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized MergedCoinbaseEntry vector
         bool     has_frozen_fields{false};  // true if the above are valid
     };
     using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
@@ -435,6 +439,7 @@ public:
 
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
+    c2pool::merged::MergedMiningManager* get_mm_manager() const { return m_mm_manager; }
 
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;

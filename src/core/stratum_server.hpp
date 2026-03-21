@@ -78,6 +78,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         uint256  frozen_merged_payout_hash;
         std::vector<uint256> frozen_merkle_branches;  // segwit txid_merkle_link at template time
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
+        std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized
         bool     has_frozen{false};
         int      stale_info{0};  // 0=none, 253=orphan (block template changed), 254=doa
     };

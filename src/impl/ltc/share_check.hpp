@@ -283,7 +283,7 @@ struct RefHashParams {
     uint32_t timestamp{0};
     uint32_t absheight{0};
     uint128  abswork;
-    BaseScript merged_coinbase_info;
+    std::vector<MergedCoinbaseEntry> merged_coinbase_info;  // V36: per-chain DOGE header + merkle proof
     uint256  merged_payout_hash;
     BaseScript message_data;              // V36 PossiblyNoneType(b'', VarStrType())
 };
@@ -1756,7 +1756,8 @@ uint256 create_local_share(
     uint256  frozen_merged_payout_hash = uint256(),
     bool     has_frozen = false,
     const std::vector<uint256>& frozen_merkle_branches = {},
-    const uint256& frozen_witness_root = uint256())
+    const uint256& frozen_witness_root = uint256(),
+    const std::vector<unsigned char>& frozen_merged_coinbase_info = {})
 {
     MergedMiningShare share;
     share.m_min_header = min_header;
@@ -1862,6 +1863,19 @@ uint256 create_local_share(
         share.m_merged_payout_hash = frozen_merged_payout_hash;
         if (override_max_bits) share.m_max_bits = override_max_bits;
         if (override_bits) share.m_bits = override_bits;
+        // Deserialize frozen merged_coinbase_info blob → vector<MergedCoinbaseEntry>
+        if (!frozen_merged_coinbase_info.empty()) {
+            try {
+                PackStream ps;
+                ps.write(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(frozen_merged_coinbase_info.data()),
+                    frozen_merged_coinbase_info.size()));
+                ps >> share.m_merged_coinbase_info;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[frozen] Failed to deserialize merged_coinbase_info ("
+                            << frozen_merged_coinbase_info.size() << " bytes): " << e.what();
+            }
+        }
     }
 
     // Random last_txout_nonce for OP_RETURN uniqueness

@@ -782,6 +782,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
     snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
+    snapshot.frozen_ref.frozen_merged_coinbase_info = job.frozen_merged_coinbase_info;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
     // used at job creation time (always 0 for now). Changing it at submit
     // time would break ref_hash consistency. Future: compute stale_info
@@ -1070,6 +1071,7 @@ void StratumSession::send_notify_work(bool force_clean)
         je.frozen_merged_payout_hash = cbr.snapshot.frozen_ref.merged_payout_hash;
         je.frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
+        je.frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
         je.has_frozen = true;
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {

@@ -4688,6 +4688,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
                     params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
                     params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
+                    params.frozen_merged_coinbase_info = job->frozen_ref.frozen_merged_coinbase_info;
                     params.has_frozen_fields = (job->frozen_ref.absheight > 0);
                     params.stale_info = job->stale_info;
                 }

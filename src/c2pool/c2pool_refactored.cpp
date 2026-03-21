@@ -2170,6 +2170,32 @@ int main(int argc, char* argv[]) {
                             params.prev_share, chain::bits_to_target(bits));
                     }
 
+                    // V36: Collect merged coinbase info from MM manager.
+                    // This contains DOGE block header + merkle proof for each merged chain.
+                    // Must be frozen at template time and match what p2pool stores in share_info.
+                    //
+                    // NOTE: Building the correct DOGE header requires the PPLNS coinbase
+                    // (which depends on share chain state → chicken-and-egg). p2pool solves
+                    // this by building everything in get_work() closure.
+                    // TODO: Implement full DOGE header construction at ref_hash_fn time.
+                    // For now, populate with available data from MM manager.
+                    if (mi_for_share_bits->get_mm_manager()) {
+                        auto aux_works = mi_for_share_bits->get_mm_manager()->get_current_work();
+                        for (const auto& [chain_id, aux_work] : aux_works) {
+                            if (aux_work.coinbase_value == 0) continue;
+                            ltc::MergedCoinbaseEntry entry;
+                            entry.m_chain_id = chain_id;
+                            entry.m_coinbase_value = aux_work.coinbase_value;
+                            entry.m_block_height = static_cast<uint32_t>(aux_work.height);
+                            // 80-byte block header: zeros for now (TODO: build from MM template)
+                            entry.m_block_header.m_data.assign(80, 0);
+                            // coinbase_merkle_link: empty (single-tx aux blocks)
+                            entry.m_coinbase_merkle_link.m_branch.clear();
+                            entry.m_coinbase_merkle_link.m_index = 0;
+                            params.merged_coinbase_info.push_back(std::move(entry));
+                        }
+                    }
+
                     auto [rh, nonce] = ltc::compute_ref_hash_for_work(params);
                     core::MiningInterface::RefHashResult result;
                     result.ref_hash = rh;
@@ -2185,6 +2211,15 @@ int main(int argc, char* argv[]) {
                     // between GBT updates but the ref_hash was computed with these values.
                     result.frozen_merkle_branches = merkle_branches;
                     result.frozen_witness_root = witness_root;
+                    // Freeze merged coinbase info — serialize to blob for transport
+                    if (!params.merged_coinbase_info.empty()) {
+                        PackStream mci_stream;
+                        mci_stream << params.merged_coinbase_info;
+                        auto mci_span = std::span<const unsigned char>(
+                            reinterpret_cast<const unsigned char*>(mci_stream.data()),
+                            mci_stream.size());
+                        result.frozen_merged_coinbase_info.assign(mci_span.begin(), mci_span.end());
+                    }
                     return result;
                 });
 
@@ -2302,7 +2337,8 @@ int main(int argc, char* argv[]) {
                         p.frozen_merged_payout_hash,
                         p.has_frozen_fields,
                         p.frozen_merkle_branches,
-                        p.frozen_witness_root);
+                        p.frozen_witness_root,
+                        p.frozen_merged_coinbase_info);
 
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {
