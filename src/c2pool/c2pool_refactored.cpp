@@ -2180,17 +2180,17 @@ int main(int argc, char* argv[]) {
                     // TODO: Implement full DOGE header construction at ref_hash_fn time.
                     // For now, populate with available data from MM manager.
                     if (mi_for_share_bits->get_mm_manager()) {
-                        auto aux_works = mi_for_share_bits->get_mm_manager()->get_current_work();
-                        for (const auto& [chain_id, aux_work] : aux_works) {
-                            if (aux_work.coinbase_value == 0) continue;
+                        auto header_infos = mi_for_share_bits->get_mm_manager()->build_merged_header_info();
+                        for (auto& hi : header_infos) {
                             ltc::MergedCoinbaseEntry entry;
-                            entry.m_chain_id = chain_id;
-                            entry.m_coinbase_value = aux_work.coinbase_value;
-                            entry.m_block_height = static_cast<uint32_t>(aux_work.height);
-                            // 80-byte block header: zeros for now (TODO: build from MM template)
-                            entry.m_block_header.m_data.assign(80, 0);
-                            // coinbase_merkle_link: empty (single-tx aux blocks)
-                            entry.m_coinbase_merkle_link.m_branch.clear();
+                            entry.m_chain_id = hi.chain_id;
+                            entry.m_coinbase_value = hi.coinbase_value;
+                            entry.m_block_height = hi.block_height;
+                            if (hi.block_header.size() == 80)
+                                entry.m_block_header.m_data = std::move(hi.block_header);
+                            else
+                                entry.m_block_header.m_data.assign(80, 0);
+                            entry.m_coinbase_merkle_link.m_branch = std::move(hi.coinbase_merkle_branches);
                             entry.m_coinbase_merkle_link.m_index = 0;
                             params.merged_coinbase_info.push_back(std::move(entry));
                         }

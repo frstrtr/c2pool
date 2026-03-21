@@ -199,6 +199,18 @@ public:
     // Current aux work per chain_id
     std::map<uint32_t, AuxWork> get_current_work() const;
 
+    // V36: Build merged block header info for share_info.merged_coinbase_info.
+    // Returns (80-byte header, coinbase_merkle_link_branches) per chain.
+    // Builds the PPLNS coinbase, computes merkle root, assembles header.
+    struct MergedHeaderInfo {
+        uint32_t chain_id{0};
+        uint64_t coinbase_value{0};
+        uint32_t block_height{0};
+        std::vector<unsigned char> block_header;  // 80 bytes
+        std::vector<uint256> coinbase_merkle_branches;
+    };
+    std::vector<MergedHeaderInfo> build_merged_header_info() const;
+
     // Check if any aux chains are configured
     bool has_chains() const { return !m_chains.empty(); }
 

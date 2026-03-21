@@ -834,6 +834,156 @@ std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
     return result;
 }
 
+std::vector<MergedMiningManager::MergedHeaderInfo>
+MergedMiningManager::build_merged_header_info() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<MergedHeaderInfo> result;
+
+    for (const auto& chain : m_chains)
+    {
+        if (chain.current_work.coinbase_value == 0) continue;
+        if (chain.current_work.block_template.is_null()) continue;
+        if (!m_payout_provider) continue;
+
+        const auto& tmpl = chain.current_work.block_template;
+        MergedHeaderInfo info;
+        info.chain_id = chain.config.chain_id;
+        info.coinbase_value = chain.current_work.coinbase_value;
+        info.block_height = static_cast<uint32_t>(chain.current_work.height);
+
+        // Build PPLNS coinbase for this chain
+        auto payouts = m_payout_provider(chain.config.chain_id,
+                                          chain.current_work.coinbase_value);
+        if (payouts.empty()) continue;
+
+        // Build coinbase hex using the same logic as build_multiaddress_block
+        // (simplified — just need the coinbase hash + tx hashes for merkle)
+        uint32_t version = tmpl.value("version", 1u);
+        if (tmpl.contains("auxpow") && tmpl["auxpow"].value("is_auxpow", false))
+            version |= (1 << 8);
+        std::string prev_hash_hex = tmpl.value("previousblockhash", std::string("0000000000000000000000000000000000000000000000000000000000000000"));
+        uint32_t curtime = tmpl.value("curtime", 0u);
+        std::string bits_hex = tmpl.value("bits", std::string("1d00ffff"));
+
+        try {
+            // Build full block hex (reuses existing tested code)
+            uint256 state_root;
+            if (m_state_root_provider) state_root = m_state_root_provider();
+            // Need a dummy auxpow — but we don't have the parent data yet.
+            // The header doesn't include auxpow — it's just the first 80 bytes.
+            // We can build coinbase + compute merkle root + assemble header separately.
+
+            // Build coinbase TX hex (same logic as build_multiaddress_block)
+            std::string coinbase_hex;
+            {
+                std::ostringstream coinb;
+                coinb << "01000000" << "01"
+                      << "0000000000000000000000000000000000000000000000000000000000000000"
+                      << "ffffffff";
+                // scriptSig: BIP34 height + tag
+                std::ostringstream sig2;
+                { uint32_t h2 = info.block_height;
+                  // BIP34 height push: 03 + LE bytes (matches encode_height_pushdata)
+                  uint8_t hb[4]; for (int i=0;i<4;++i) hb[i]=(h2>>(8*i))&0xff;
+                  if (h2 < 0x100) { sig2 << "02" << to_hex(hb, 1) << "00"; }
+                  else if (h2 < 0x10000) { sig2 << "03" << to_hex(hb, 2) << "00"; }
+                  else { sig2 << "04" << to_hex(hb, 4); }
+                }
+                const std::string ctag = "/c2pool/";
+                for (char ch : ctag) { uint8_t b2 = uint8_t(ch); sig2 << to_hex(&b2, 1); }
+                if (!state_root.IsNull()) sig2 << to_hex(state_root.data(), 32);
+                std::string sig_hex2 = sig2.str();
+                coinb << varint_hex(sig_hex2.size()/2) << sig_hex2 << "ffffffff";
+                // Outputs
+                static const std::vector<unsigned char> CDON = {
+                    0xa9,0x14,0x8c,0x62,0x72,0x62,0x1d,0x89,0xe8,0xfa,
+                    0x52,0x6d,0xd8,0x6a,0xcf,0xf6,0x0c,0x71,0x36,0xbe,0x8e,0x85,0x87};
+                std::vector<std::pair<std::vector<unsigned char>,uint64_t>> mouts;
+                uint64_t don = 0;
+                for (auto& [s,a] : payouts) { if (s == CDON) don += a; else if (a > 0) mouts.emplace_back(s,a); }
+                if (don < 1 && !mouts.empty()) { mouts.back().second -= 1; don += 1; }
+                std::string optext = "c2pool merged mining";
+                coinb << varint_hex(mouts.size() + 2);
+                for (auto& [s,a] : mouts) {
+                    uint8_t v[8]; for (int i=0;i<8;++i) v[i]=(a>>(8*i))&0xFF;
+                    coinb << to_hex(v,8) << varint_hex(s.size()) << to_hex(s.data(), s.size());
+                }
+                { uint8_t z[8]={}; coinb << to_hex(z,8); // OP_RETURN value=0
+                  std::vector<uint8_t> ops; ops.push_back(0x6a); ops.push_back(uint8_t(optext.size()));
+                  ops.insert(ops.end(), optext.begin(), optext.end());
+                  coinb << varint_hex(ops.size()) << to_hex(ops.data(), ops.size()); }
+                { uint8_t v[8]; for (int i=0;i<8;++i) v[i]=(don>>(8*i))&0xFF;
+                  coinb << to_hex(v,8) << varint_hex(CDON.size()) << to_hex(CDON.data(), CDON.size()); }
+                coinb << "00000000"; // locktime
+                coinbase_hex = coinb.str();
+            }
+            if (coinbase_hex.empty()) continue;
+
+            auto coinbase_bytes = from_hex(coinbase_hex);
+            uint256 cb_hash = Hash(coinbase_bytes);
+
+            // Tx hashes
+            std::vector<uint256> tx_hashes;
+            tx_hashes.push_back(cb_hash);
+            if (tmpl.contains("transactions") && tmpl["transactions"].is_array()) {
+                for (const auto& tx : tmpl["transactions"]) {
+                    std::string txid_str = tx.value("txid", "");
+                    if (!txid_str.empty()) { uint256 h; h.SetHex(txid_str); tx_hashes.push_back(h); }
+                    else { auto raw = from_hex(tx.value("data", "")); tx_hashes.push_back(Hash(raw)); }
+                }
+            }
+
+            // Merkle root
+            auto layer = tx_hashes;
+            while (layer.size() > 1) {
+                if (layer.size() % 2) layer.push_back(layer.back());
+                std::vector<uint256> next;
+                for (size_t i = 0; i < layer.size(); i += 2)
+                    next.push_back(Hash(layer[i], layer[i+1]));
+                layer = std::move(next);
+            }
+            uint256 merkle_root = layer.empty() ? cb_hash : layer[0];
+
+            // Coinbase merkle link (branches for proof: coinbase → root)
+            {
+                auto all = tx_hashes;
+                size_t idx = 0; // coinbase is at index 0
+                while (all.size() > 1) {
+                    if (all.size() % 2) all.push_back(all.back());
+                    info.coinbase_merkle_branches.push_back(all[idx ^ 1]);
+                    std::vector<uint256> next;
+                    for (size_t i = 0; i < all.size(); i += 2)
+                        next.push_back(Hash(all[i], all[i+1]));
+                    all = std::move(next);
+                    idx >>= 1;
+                }
+            }
+
+            // 80-byte header
+            uint256 prev_hash;
+            prev_hash.SetHex(prev_hash_hex);
+            uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
+
+            info.block_header.resize(80);
+            auto* p = info.block_header.data();
+            std::memcpy(p, &version, 4); p += 4;
+            std::memcpy(p, prev_hash.data(), 32); p += 32;
+            std::memcpy(p, merkle_root.data(), 32); p += 32;
+            std::memcpy(p, &curtime, 4); p += 4;
+            std::memcpy(p, &nbits, 4); p += 4;
+            uint32_t nonce = 0;
+            std::memcpy(p, &nonce, 4);
+
+            result.push_back(std::move(info));
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[MM:" << chain.config.symbol
+                        << "] build_merged_header_info failed: " << e.what();
+        }
+    }
+    return result;
+}
+
 void MergedMiningManager::set_payout_provider(PayoutProvider provider)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
