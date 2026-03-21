@@ -84,7 +84,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection
-    static constexpr size_t MAX_ACTIVE_JOBS = 32;
+    static constexpr size_t MAX_ACTIVE_JOBS = 256; // p2pool keeps all jobs from current block
 
     // Per-worker statistics
     uint64_t accepted_shares_ = 0;
