@@ -2072,27 +2072,15 @@ int main(int argc, char* argv[]) {
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = 36;
 
-                    // Compute desired_target from local hashrate, matching p2pool:
-                    //   desired = average_attempts_to_target(hashrate * SHARE_PERIOD / 0.0167)
-                    // This limits the miner to ~1.67% of pool shares. Without measured
-                    // hashrate, defaults to MAX_TARGET (easiest, same as p2pool default).
-                    auto desired_target = ltc::PoolConfig::max_target();
-                    {
-                        double local_hr = mi_for_share_bits->get_local_hashrate();
-                        if (local_hr > 0.0) {
-                            double attempts = local_hr * ltc::PoolConfig::share_period() / 0.0167;
-                            if (attempts > 1.0) {
-                                // average_attempts_to_target(attempts) = 2^256 / (attempts + 1)
-                                uint288 two_256;
-                                two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-                                uint288 att(static_cast<uint64_t>(attempts));
-                                if (!att.IsNull()) {
-                                    uint288 result = two_256 / att;
-                                    desired_target.SetHex(result.GetHex());
-                                }
-                            }
-                        }
-                    }
+                    // p2pool computes desired_target from miner hashrate but it
+                    // clips to [pre_target3/30, pre_target3]. Both p2pool and c2pool
+                    // must use the SAME bits to share a chain. Since p2pool's hashrate
+                    // measurement produces a target below pre_target3/30 for any real
+                    // miner, it always clips to pre_target3/30. Using uint256(0) here
+                    // produces the same result: clips to pre_target3/30 (hardest).
+                    // NOTE: If both p2pool nodes also use pre_target3/30 (confirmed
+                    // via diff=9.16e-03 on fresh chain), this will match.
+                    auto desired_target = uint256();
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
                     // No bits guard needed: compute_share_target's ±10% clamp
