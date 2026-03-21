@@ -2072,13 +2072,27 @@ int main(int argc, char* argv[]) {
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = 36;
 
-                    // Compute pool-level share target from tracker state.
-                    // p2pool defaults to desired_share_target = 2^256-1 (easiest) when
-                    // local_hash_rate is not yet measured. This clips to pre_target3
-                    // (max_bits). With measured hashrate it gets harder, but on testnet
-                    // with low hashrate the default dominates. Match p2pool's default
-                    // to produce shares with the same bits as p2pool miners.
+                    // Compute desired_target from local hashrate, matching p2pool:
+                    //   desired = average_attempts_to_target(hashrate * SHARE_PERIOD / 0.0167)
+                    // This limits the miner to ~1.67% of pool shares. Without measured
+                    // hashrate, defaults to MAX_TARGET (easiest, same as p2pool default).
                     auto desired_target = ltc::PoolConfig::max_target();
+                    {
+                        double local_hr = mi_for_share_bits->get_local_hashrate();
+                        if (local_hr > 0.0) {
+                            double attempts = local_hr * ltc::PoolConfig::share_period() / 0.0167;
+                            if (attempts > 1.0) {
+                                // average_attempts_to_target(attempts) = 2^256 / (attempts + 1)
+                                uint288 two_256;
+                                two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+                                uint288 att(static_cast<uint64_t>(attempts));
+                                if (!att.IsNull()) {
+                                    uint288 result = two_256 / att;
+                                    desired_target.SetHex(result.GetHex());
+                                }
+                            }
+                        }
+                    }
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         params.prev_share, timestamp, desired_target);
                     // No bits guard needed: compute_share_target's ±10% clamp
