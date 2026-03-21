@@ -2192,6 +2192,7 @@ int main(int argc, char* argv[]) {
                                 entry.m_block_header.m_data.assign(80, 0);
                             entry.m_coinbase_merkle_link.m_branch = std::move(hi.coinbase_merkle_branches);
                             entry.m_coinbase_merkle_link.m_index = 0;
+                            entry.m_coinbase_script.m_data = std::move(hi.coinbase_script);
                             params.merged_coinbase_info.push_back(std::move(entry));
                         }
                     }

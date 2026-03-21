@@ -150,6 +150,7 @@ struct MergedCoinbaseEntry
     uint32_t m_block_height;
     FixedStrType<80> m_block_header;
     MerkleLink m_coinbase_merkle_link;
+    BaseScript m_coinbase_script;  // V36: actual scriptSig (allows custom tags + THE state_root)
 
     template <typename StreamType>
     void Serialize(StreamType& os) const
@@ -160,6 +161,7 @@ struct MergedCoinbaseEntry
         ::Serialize(os, m_block_header);
         ParamPackStream pstream{MERKLE_LINK_SMALL, os};
         ::Serialize(pstream, m_coinbase_merkle_link);
+        ::Serialize(os, m_coinbase_script);
     }
 
     template <typename StreamType>
@@ -171,6 +173,7 @@ struct MergedCoinbaseEntry
         ::Unserialize(is, m_block_header);
         ParamPackStream pstream{MERKLE_LINK_SMALL, is};
         ::Unserialize(pstream, m_coinbase_merkle_link);
+        ::Unserialize(is, m_coinbase_script);
     }
 };
 

@@ -881,6 +881,18 @@ MergedMiningManager::build_merged_header_info() const
             uint256 merkle_root = compute_tx_merkle_root(tx_hashes);
             info.coinbase_merkle_branches = compute_merkle_link(tx_hashes, 0);
 
+            // Extract scriptSig from the coinbase for the coinbase_script field
+            // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) = 41 bytes
+            if (coinbase_bytes.size() > 42) {
+                size_t pos = 41;
+                uint64_t sslen = coinbase_bytes[pos++];
+                if (sslen < 0xfd && pos + sslen <= coinbase_bytes.size()) {
+                    info.coinbase_script.assign(
+                        coinbase_bytes.begin() + pos,
+                        coinbase_bytes.begin() + pos + sslen);
+                }
+            }
+
             // 80-byte header
             uint256 prev_hash;
             prev_hash.SetHex(prev_hash_hex);
@@ -981,7 +993,13 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
         else if (amount > 0) miner_outs.emplace_back(script, amount);
     }
     if (donation_amount < 1 && !miner_outs.empty()) {
-        miner_outs.back().second -= 1;
+        // Deterministic tiebreak: deduct from largest amount (then largest script)
+        auto largest = std::max_element(miner_outs.begin(), miner_outs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        largest->second -= 1;
         donation_amount += 1;
     }
 
@@ -1147,7 +1165,13 @@ std::string MergedMiningManager::build_multiaddress_block(
     }
     // Ensure donation >= 1 satoshi (V36 consensus rule)
     if (donation_amount < 1 && !miner_outs.empty()) {
-        miner_outs.back().second -= 1;
+        // Deterministic tiebreak: deduct from largest amount (then largest script)
+        auto largest = std::max_element(miner_outs.begin(), miner_outs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        largest->second -= 1;
         donation_amount += 1;
     }
 

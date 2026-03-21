@@ -208,6 +208,7 @@ public:
         uint32_t block_height{0};
         std::vector<unsigned char> block_header;  // 80 bytes
         std::vector<uint256> coinbase_merkle_branches;
+        std::vector<unsigned char> coinbase_script;  // scriptSig from the merged coinbase
     };
     std::vector<MergedHeaderInfo> build_merged_header_info() const;
 
