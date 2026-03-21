@@ -2102,12 +2102,7 @@ int main(int argc, char* argv[]) {
                             }
                         }
                     }
-                    // V36 with desired_target=MAX_TARGET: bits == max_bits (matching p2pool).
-                    // compute_share_target clips desired_target to [pre_target3//30, pre_target3]
-                    // and MAX_TARGET always clips to pre_target3, so bits == max_bits.
-                    // Force this invariant to prevent max_bits from being easier than bits
-                    // (which would contaminate the min_work-based APS calculation).
-                    params.max_bits = share_bits;  // NOT share_max_bits — must equal bits
+                    params.max_bits = share_max_bits;
                     params.bits = share_bits;
                     params.timestamp = timestamp;
 
@@ -2177,7 +2172,7 @@ int main(int argc, char* argv[]) {
                             auto desired_target2 = ltc::PoolConfig::max_target();
                             auto [sm, sb] = tracker.compute_share_target(
                                 params.prev_share, params.timestamp, desired_target2);
-                            // Apply same guard as above: inherit peer bits if drifted
+                            // Apply same guard: inherit peer bits if drifted >2x
                             uint32_t pb = 0, pmb = 0;
                             tracker.chain.get_share(params.prev_share).invoke([&](auto* obj) {
                                 pb = obj->m_bits; pmb = obj->m_max_bits;
@@ -2189,8 +2184,7 @@ int main(int argc, char* argv[]) {
                                     sb = pb; sm = pmb;
                                 }
                             }
-                            // V36: max_bits must equal bits (desired_target=MAX clips to pre_target3)
-                            params.max_bits = sb;
+                            params.max_bits = sm;
                             params.bits = sb;
                         }
 
