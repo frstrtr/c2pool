@@ -216,6 +216,7 @@ public:
         std::vector<unsigned char> block_header;  // 80 bytes
         std::vector<uint256> coinbase_merkle_branches;
         std::vector<unsigned char> coinbase_script;  // scriptSig from the merged coinbase
+        std::string coinbase_hex;  // full coinbase TX hex (for freezing at submission time)
     };
     std::vector<MergedHeaderInfo> build_merged_header_info() const;
 
@@ -338,13 +339,11 @@ private:
         bool                                 using_fallback{false};
         int64_t                              last_update_time{0}; // monotonic seconds
         // Frozen DOGE block data from build_merged_header_info_with_commitment.
-        // Used by try_submit_merged_blocks to ensure the submitted block matches
-        // the AuxPoW commitment in the LTC parent coinbase. Without freezing,
-        // PPLNS state changes between template and submission time cause the
-        // DOGE block hash to differ from what's committed → invalid AuxPoW.
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> frozen_payouts;
-        nlohmann::json frozen_template;
-        uint256 frozen_state_root;
+        // Contains the pre-built DOGE coinbase hex and template snapshot that
+        // match the block hash committed in the LTC parent's mm_data.
+        // try_submit_merged_blocks uses these instead of rebuilding.
+        std::string frozen_coinbase_hex;   // pre-built PPLNS coinbase from ref_hash_fn time
+        nlohmann::json frozen_template;    // template snapshot from ref_hash_fn time
     };
     std::vector<ChainState> m_chains;
 

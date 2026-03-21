@@ -796,17 +796,54 @@ void MergedMiningManager::try_submit_merged_blocks(
             proof.index,
             parent_header_hex);
 
-        // Use FROZEN payouts + template from ref_hash_fn time.
-        // These match the DOGE block hash committed in the LTC coinbase's mm_data.
-        // Using current payouts would produce a different coinbase → different
-        // merkle root → different block hash → invalid AuxPoW proof.
-        if (!chain.frozen_payouts.empty() && !chain.frozen_template.is_null()) {
-            auto block_hex = build_multiaddress_block(
-                chain.frozen_template, chain.frozen_payouts, auxpow, chain.frozen_state_root);
+        // Use FROZEN coinbase + template from ref_hash_fn time.
+        // Matches p2pool Phase A/C pattern: the coinbase and header were built at
+        // get_work time, and submission uses the pre-built data + fresh AuxPoW proof.
+        if (!chain.frozen_coinbase_hex.empty() && !chain.frozen_template.is_null()) {
+            // Build block from frozen coinbase (not from payouts — avoids PPLNS drift)
+            auto& tmpl = chain.frozen_template;
+            uint32_t version = tmpl.value("version", 0x20000002u) | 0x100;
+            std::string prev_hash_hex = tmpl.value("previousblockhash", "");
+            uint32_t curtime = tmpl.value("curtime", 0u);
+            std::string bits_hex = tmpl.value("bits", "1d00ffff");
+
+            auto coinbase_bytes = from_hex(chain.frozen_coinbase_hex);
+            uint256 cb_hash = Hash(coinbase_bytes);
+            auto tx_hashes = collect_tx_hashes(cb_hash, tmpl);
+            uint256 merkle_root = compute_tx_merkle_root(tx_hashes);
+
+            // Build 80-byte header
+            uint256 prev_hash; prev_hash.SetHex(prev_hash_hex);
+            uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
+            std::vector<unsigned char> header_bytes(80);
+            auto* p = header_bytes.data();
+            std::memcpy(p, &version, 4); p += 4;
+            std::memcpy(p, prev_hash.data(), 32); p += 32;
+            std::memcpy(p, merkle_root.data(), 32); p += 32;
+            std::memcpy(p, &curtime, 4); p += 4;
+            std::memcpy(p, &nbits, 4); p += 4;
+            uint32_t nonce = 0;
+            std::memcpy(p, &nonce, 4);
+
+            // Assemble: header + auxpow + coinbase + template txs
+            std::ostringstream blk;
+            blk << to_hex(header_bytes.data(), 80);
+            blk << auxpow;
+            // tx count
+            size_t n_tx = 1;
+            if (tmpl.contains("transactions")) n_tx += tmpl["transactions"].size();
+            blk << varint_hex(n_tx);
+            blk << chain.frozen_coinbase_hex;
+            if (tmpl.contains("transactions")) {
+                for (auto& tx : tmpl["transactions"])
+                    blk << tx.value("data", std::string(""));
+            }
+
+            auto block_hex = blk.str();
             if (!block_hex.empty()) {
                 LOG_INFO << "[MM:" << chain.config.symbol
-                         << "] PPLNS block submitted (" << block_hex.size()/2 << " bytes, "
-                         << chain.frozen_payouts.size() << " outputs, frozen from ref_hash_fn)";
+                         << "] Frozen block submitted (" << block_hex.size()/2 << " bytes"
+                         << ", frozen coinbase from ref_hash_fn)";
                 chain.rpc->submit_block(block_hex);
                 if (m_block_relay_fn) {
                     try { m_block_relay_fn(chain.config.chain_id, block_hex); }
@@ -814,9 +851,9 @@ void MergedMiningManager::try_submit_merged_blocks(
                 }
             }
         } else {
-            // No frozen data — either payout_provider not set or template not ready
+            // No frozen data — template not ready yet
             LOG_WARNING << "[MM:" << chain.config.symbol
-                        << "] No frozen payouts/template — falling back to submitauxblock";
+                        << "] No frozen coinbase — falling back to submitauxblock";
             submit_aux_and_relay(chain, auxpow, parent_hash.GetHex());
         }
         LOG_INFO << "[MM:" << chain.config.symbol << "] Post-submission processing complete";
@@ -926,6 +963,7 @@ MergedMiningManager::build_merged_header_info() const
             auto tx_hashes = collect_tx_hashes(cb_hash, tmpl);
             uint256 merkle_root = compute_tx_merkle_root(tx_hashes);
             info.coinbase_merkle_branches = compute_merkle_link(tx_hashes, 0);
+            info.coinbase_hex = coinbase_hex;  // freeze for block submission
 
             // Extract scriptSig from the coinbase for the coinbase_script field
             // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) = 41 bytes
@@ -966,55 +1004,22 @@ MergedMiningManager::build_merged_header_info() const
 std::pair<std::vector<MergedMiningManager::MergedHeaderInfo>, std::vector<uint8_t>>
 MergedMiningManager::build_merged_header_info_with_commitment()
 {
-    // Step 1: Snapshot chain data + payouts (releases lock for payout_fn callback)
-    struct FrozenChain {
-        uint32_t chain_id;
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payouts;
-        nlohmann::json block_template;
-    };
-    std::vector<FrozenChain> frozen;
-    PayoutProvider payout_fn;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        payout_fn = m_payout_provider;
-        for (const auto& chain : m_chains) {
-            if (chain.current_work.coinbase_value == 0) continue;
-            if (chain.current_work.block_template.is_null()) continue;
-            frozen.push_back({chain.config.chain_id, {}, chain.current_work.block_template});
-        }
-    }
-    // Compute payouts outside lock (payout_fn calls tracker → would deadlock)
-    if (payout_fn) {
-        for (auto& fc : frozen) {
-            uint64_t cv = 0;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                for (const auto& c : m_chains)
-                    if (c.config.chain_id == fc.chain_id) { cv = c.current_work.coinbase_value; break; }
-            }
-            fc.payouts = payout_fn(fc.chain_id, cv);
-        }
-    }
-
-    // Step 2: Build header infos from frozen data
+    // Step 1: Build header infos (releases lock internally for payout_fn callback).
+    // Each MergedHeaderInfo now contains coinbase_hex — the pre-built PPLNS coinbase.
     auto header_infos = build_merged_header_info();
 
-    // Step 3: Freeze payouts + template per chain AND update commitment atomically
+    // Step 2: Freeze coinbase_hex + template per chain AND update commitment atomically.
+    // Matches p2pool's Phase A pattern: freeze doge_coinbase + doge_header at get_work time,
+    // then use the frozen data at submission time (Phase C).
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto& hi : header_infos) {
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
             if (hi.block_header.size() == 80)
                 chain.current_work.block_hash = Hash(hi.block_header);
-            // Freeze the payouts + template that match the committed block hash
-            for (const auto& fc : frozen) {
-                if (fc.chain_id == hi.chain_id) {
-                    chain.frozen_payouts = fc.payouts;
-                    chain.frozen_template = fc.block_template;
-                    chain.frozen_state_root = uint256{}; // zero — avoid deadlock
-                    break;
-                }
-            }
+            // Freeze the pre-built coinbase + template (matches what produced the block hash)
+            chain.frozen_coinbase_hex = hi.coinbase_hex;
+            chain.frozen_template = chain.current_work.block_template;
             break;
         }
     }
