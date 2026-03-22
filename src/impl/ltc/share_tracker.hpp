@@ -497,9 +497,15 @@ public:
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
             auto want = std::max(static_cast<int32_t>(PoolConfig::chain_length()) - head_height, 0);
+            // p2pool: can = last_height if rooted, else max(last_height-1-CHAIN_LENGTH, 0).
+            // Extension: for unrooted chains with enough total depth (head_height + last_height
+            // >= CHAIN_LENGTH), treat as rooted. This handles pruned peer genesis on testnet
+            // where the chain has enough depth for PPLNS but the genesis is gone.
             auto can = last_last_hash.IsNull()
                 ? last_height
-                : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
+                : (head_height + last_height >= static_cast<int32_t>(PoolConfig::chain_length()))
+                    ? last_height  // Deep enough — treat as rooted
+                    : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
             auto to_get = std::min(want, can);
 
             LOG_INFO << "[think-P2] head_height=" << head_height
