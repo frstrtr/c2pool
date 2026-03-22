@@ -2205,6 +2205,11 @@ int main(int argc, char* argv[]) {
                         // Must match what create_local_share computes at submit time.
                         params.merged_payout_hash = tracker.compute_merged_payout_hash(
                             params.prev_share, chain::bits_to_target(bits));
+                    } else {
+                        // Genesis: p2pool always does (0 + 1) for absheight, (0 + aps) for abswork
+                        params.absheight = 1;
+                        params.abswork = uint128(chain::target_to_average_attempts(
+                            chain::bits_to_target(params.bits)).GetLow64());
                     }
 
                     // V36: Collect merged coinbase info from MM manager.

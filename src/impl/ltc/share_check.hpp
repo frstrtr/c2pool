@@ -1867,7 +1867,11 @@ uint256 create_local_share(
             share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
         }
     } else {
-        share.m_absheight = 0;
+        // Genesis: p2pool always does (prev_absheight + 1), (prev_abswork + aps)
+        // With prev=None: absheight = 0 + 1 = 1, abswork = 0 + aps(bits)
+        share.m_absheight = 1;
+        share.m_abswork = uint128(chain::target_to_average_attempts(
+            chain::bits_to_target(share.m_bits)).GetLow64());
         share.m_far_share_hash = uint256();
     }
 
