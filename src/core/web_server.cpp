@@ -4468,15 +4468,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             if (prev_block != s_last_submitted_prev) {
                                 s_last_submitted_prev = prev_block;
                                 uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
-                                LOG_WARNING << "\n"
-                                    << "######################################################################\n"
-                                    << "###  PARENT NETWORK BLOCK FOUND!                                   ###\n"
-                                    << "######################################################################\n"
-                                    << "  Miner:       " << username << "\n"
-                                    << "  Block hash:  " << block_hash.GetHex() << "\n"
-                                    << "  PoW hash:    " << pow_hash.GetHex() << "\n"
-                                    << "  Target:      " << block_target.GetHex() << "\n"
-                                    << "######################################################################";
+                                LOG_INFO << "[BLOCK] Parent block found by " << username
+                                         << " hash=" << block_hash.GetHex().substr(0,16);
                                 submitblock(block_hex);
                             }
                         }
@@ -4793,27 +4786,9 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             if (prev_block != s_last_pool_submitted_prev) {
                                 s_last_pool_submitted_prev = prev_block;
                                 uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), block_bytes.size()));
-                                if (merged_found) {
-                                    LOG_WARNING << "\n"
-                                        << "######################################################################\n"
-                                        << "###  TWIN BLOCK FOUND! Parent + Merged in same PoW!               ###\n"
-                                        << "######################################################################\n"
-                                        << "  Miner:       " << username << "\n"
-                                        << "  Block hash:  " << block_hash.GetHex() << "\n"
-                                        << "  PoW hash:    " << pow_hash.GetHex() << "\n"
-                                        << "  Target:      " << block_target.GetHex() << "\n"
-                                        << "######################################################################";
-                                } else {
-                                    LOG_WARNING << "\n"
-                                        << "######################################################################\n"
-                                        << "###  PARENT NETWORK BLOCK FOUND!                                   ###\n"
-                                        << "######################################################################\n"
-                                        << "  Miner:       " << username << "\n"
-                                        << "  Block hash:  " << block_hash.GetHex() << "\n"
-                                        << "  PoW hash:    " << pow_hash.GetHex() << "\n"
-                                        << "  Target:      " << block_target.GetHex() << "\n"
-                                        << "######################################################################";
-                                }
+                                LOG_INFO << "[BLOCK] " << (merged_found ? "Twin" : "Parent")
+                                         << " block found by " << username
+                                         << " hash=" << block_hash.GetHex().substr(0,16);
                                 submitblock(block_hex);
                             }
                         }

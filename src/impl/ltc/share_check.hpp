@@ -659,16 +659,8 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
             static uint256 s_last_block_share;
             if (share_hash != s_last_block_share) {
                 s_last_block_share = share_hash;
-                LOG_WARNING << "\n"
-                    << "######################################################################\n"
-                    << "###  PARENT BLOCK FOUND! (detected from peer share)                ###\n"
-                    << "###  Network: Litecoin                                             ###\n"
-                    << "######################################################################\n"
-                    << "  Share hash:  " << share_hash.GetHex() << "\n"
-                    << "  PoW hash:    " << pow_hash.GetHex() << "\n"
-                    << "  Block target:" << block_target.GetHex() << "\n"
-                    << "  Block bits:  " << std::hex << share.m_min_header.m_bits << std::dec << "\n"
-                    << "######################################################################";
+                LOG_INFO << "[BLOCK] Peer share meets block target"
+                         << " hash=" << share_hash.GetHex().substr(0,16);
             }
         }
     }
