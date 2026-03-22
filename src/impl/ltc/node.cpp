@@ -1076,86 +1076,51 @@ void NodeImpl::clean_tracker()
     auto now_sec = static_cast<int64_t>(std::time(nullptr));
 
     // Step 2: Eat stale heads (p2pool node.py:358-378)
-    // Remove heads that are: old (>300s), not top-5 scored, and either
-    // verified or have children older than 120s.
-    for (int iter = 0; iter < 1000; ++iter) {
-        std::vector<uint256> to_remove;
-        // Snapshot heads — remove() modifies heads map
+    // Remove ONE stale head per clean_tracker call (safe — no cascading removes).
+    // The 5s timer will clean more on the next cycle.
+    {
         auto heads_copy = m_tracker.chain.get_heads();
         for (auto& [head_hash, tail_hash] : heads_copy) {
-            if (!m_tracker.chain.contains(head_hash))
-                continue; // already removed in previous iteration
-
-            // Keep top-5 scored heads (approximate: keep verified heads)
-            if (m_tracker.verified.get_heads().contains(head_hash))
-                continue;
-
-            // Keep recent heads (< 300s old)
+            if (!m_tracker.chain.contains(head_hash)) continue;
+            if (m_tracker.verified.get_heads().contains(head_hash)) continue;
             auto* idx = m_tracker.chain.get_index(head_hash);
-            if (!idx || idx->time_seen > now_sec - 300)
-                continue;
-
-            // For unverified heads: keep if children of the TAIL are recent (< 120s)
-            if (!m_tracker.verified.contains(head_hash)) {
-                auto& rev = m_tracker.chain.get_reverse();
-                auto rev_it = rev.find(tail_hash);
-                if (rev_it != rev.end()) {
-                    int64_t max_child_time = 0;
-                    for (auto& child : rev_it->second) {
-                        if (!m_tracker.chain.contains(child)) continue;
-                        auto* ci = m_tracker.chain.get_index(child);
-                        if (ci && ci->time_seen > max_child_time)
-                            max_child_time = ci->time_seen;
-                    }
-                    if (max_child_time > now_sec - 120)
-                        continue;
-                }
-            }
-
-            to_remove.push_back(head_hash);
-        }
-        if (to_remove.empty()) break;
-        for (auto& h : to_remove) {
-            if (!m_tracker.chain.contains(h)) continue;
-            if (m_tracker.verified.contains(h))
-                m_tracker.verified.remove(h);
-            try { m_tracker.chain.remove(h); } catch (...) {}
+            if (!idx || idx->time_seen > now_sec - 300) continue;
+            // Safe to remove this stale head
+            try {
+                if (m_tracker.verified.contains(head_hash))
+                    m_tracker.verified.remove(head_hash);
+                m_tracker.chain.remove(head_hash);
+                LOG_INFO << "[clean_tracker] ate stale head " << head_hash.GetHex().substr(0,16);
+            } catch (...) {}
+            break; // one per cycle
         }
     }
 
-    // Step 3: Drop tails (p2pool node.py:381-398)
-    // When all heads reaching a tail have height > 2*CHAIN_LENGTH+10,
-    // remove the tail's immediate children.
-    auto chain_length = static_cast<int32_t>(ltc::PoolConfig::chain_length());
-    for (int iter = 0; iter < 1000; ++iter) {
-        std::vector<uint256> to_remove;
-        // Snapshot tails — remove() modifies tails map
+    // Step 3: Drop tails — remove ONE tail child per cycle (safe).
+    {
+        auto chain_length = static_cast<int32_t>(ltc::PoolConfig::chain_length());
         auto tails_copy = m_tracker.chain.get_tails();
         for (auto& [tail_hash, head_hashes] : tails_copy) {
             int32_t min_height = std::numeric_limits<int32_t>::max();
             for (auto& hh : head_hashes) {
                 if (!m_tracker.chain.contains(hh)) continue;
-                auto h = m_tracker.chain.get_height(hh);
-                if (h < min_height) min_height = h;
+                min_height = std::min(min_height, m_tracker.chain.get_height(hh));
             }
-            if (min_height < 2 * chain_length + 10)
-                continue;
-            // Remove direct children of this tail
+            if (min_height < 2 * chain_length + 10) continue;
+            // Find one child of this tail to remove
             auto& rev = m_tracker.chain.get_reverse();
             auto rev_it = rev.find(tail_hash);
-            if (rev_it != rev.end()) {
-                // Copy children — iterator invalidated by remove
-                auto children = rev_it->second;
-                for (auto& child : children)
-                    to_remove.push_back(child);
+            if (rev_it != rev.end() && !rev_it->second.empty()) {
+                auto child = *rev_it->second.begin();
+                if (m_tracker.chain.contains(child)) {
+                    try {
+                        if (m_tracker.verified.contains(child))
+                            m_tracker.verified.remove(child);
+                        m_tracker.chain.remove(child);
+                    } catch (...) {}
+                    break; // one per cycle
+                }
             }
-        }
-        if (to_remove.empty()) break;
-        for (auto& h : to_remove) {
-            if (!m_tracker.chain.contains(h)) continue;
-            if (m_tracker.verified.contains(h))
-                m_tracker.verified.remove(h);
-            try { m_tracker.chain.remove(h); } catch (...) {}
         }
     }
 
