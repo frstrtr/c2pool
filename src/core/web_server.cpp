@@ -5189,6 +5189,11 @@ bool WebServer::start_stratum_server()
         bool started = stratum_server_->start();
         if (started) {
             LOG_INFO << "Stratum server started on port " << stratum_port_;
+            // Wire stratum hashrate callback to MiningInterface
+            auto* ss = stratum_server_.get();
+            mining_interface_->set_stratum_hashrate_fn([ss]() -> double {
+                return ss->get_total_hashrate();
+            });
         }
         return started;
         

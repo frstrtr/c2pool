@@ -913,15 +913,36 @@ void NodeImpl::run_think()
         auto verified  = m_tracker.verified.size();
         auto peers     = m_peers.size();
 
-        LOG_INFO << "c2pool: " << chain_sz << " shares in chain ("
-                 << verified << " verified/" << chain_sz << " total) Peers: "
-                 << peers;
+        // Count incoming peers (not in m_outbound_addrs)
+        int incoming_peers = 0;
+        for (auto& [nonce, peer] : m_peers) {
+            if (peer && !m_outbound_addrs.contains(peer->addr()))
+                ++incoming_peers;
+        }
 
-        // Stale rate: count orphan/DOA shares in recent chain
+        // Chain height from best_share
+        int height = 0;
+        if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash))
+            height = m_tracker.chain.get_height(m_best_share_hash);
+
+        // Line 1: chain status (matches p2pool format exactly)
+        LOG_INFO << "c2pool: " << height << " shares in chain ("
+                 << verified << " verified/" << chain_sz << " total) Peers: "
+                 << peers << " (" << incoming_peers << " incoming)";
+
+        // Line 2: Local hashrate + DOA
+        if (m_local_hashrate_fn) {
+            double local_hs = m_local_hashrate_fn();
+            LOG_INFO << " Local: " << std::fixed << std::setprecision(0)
+                     << local_hs << "H/s";
+        }
+
+        // Count orphan/DOA shares in recent chain (matching p2pool get_stale_counts)
         int orphan_count = 0, doa_count = 0, total_recent = 0;
         if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
             uint256 cur = m_best_share_hash;
-            int window = std::min(static_cast<int>(chain_sz), 100);
+            int window = std::min(height, static_cast<int>(
+                std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
             for (int i = 0; i < window && !cur.IsNull() && m_tracker.chain.contains(cur); ++i) {
                 m_tracker.chain.get(cur).share.invoke([&](auto* s) {
                     if (s->m_stale_info == ltc::StaleInfo::orphan) ++orphan_count;
@@ -932,11 +953,48 @@ void NodeImpl::run_think()
             }
         }
         double stale_pct = total_recent > 0 ? 100.0 * (orphan_count + doa_count) / total_recent : 0.0;
+
+        // Line 3: Shares + stale rate (matching p2pool format)
         LOG_INFO << " Shares: " << total_recent << " (" << orphan_count << " orphan, "
                  << doa_count << " dead) Stale rate: ~"
                  << std::fixed << std::setprecision(1) << stale_pct << "%"
                  << " heads=" << m_tracker.chain.get_heads().size()
                  << " rss=" << get_rss_mb() << "MB";
+
+        // Line 4: Pool hashrate + expected time to block
+        if (height > 2) {
+            try {
+                auto aps = m_tracker.get_pool_attempts_per_second(
+                    m_best_share_hash,
+                    std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
+                    /*min_work=*/false);
+                double pool_hs = static_cast<double>(aps.GetLow64());
+                // Expected time to block: 2^256 / block_target / pool_hashrate
+                double etb_secs = 0;
+                if (pool_hs > 0 && stale_pct < 100.0) {
+                    double real_pool_hs = pool_hs / (1.0 - stale_pct / 100.0);
+                    // Block target from cached template
+                    auto max_target = PoolConfig::max_target();
+                    double target_d = static_cast<double>(max_target.GetLow64());
+                    if (target_d > 0)
+                        etb_secs = std::pow(2.0, 256) / target_d / real_pool_hs;
+                }
+                std::string etb_str;
+                if (etb_secs > 86400 * 365)
+                    etb_str = std::to_string(static_cast<int>(etb_secs / 86400 / 365)) + " years";
+                else if (etb_secs > 86400)
+                    etb_str = std::to_string(static_cast<int>(etb_secs / 86400)) + " days";
+                else if (etb_secs > 3600)
+                    etb_str = std::to_string(static_cast<int>(etb_secs / 3600)) + " hours";
+                else
+                    etb_str = std::to_string(static_cast<int>(etb_secs)) + " seconds";
+
+                LOG_INFO << " Pool: " << std::fixed << std::setprecision(0)
+                         << pool_hs << "H/s Stale rate: "
+                         << std::setprecision(1) << stale_pct << "%"
+                         << " Expected time to block: " << etb_str;
+            } catch (...) {}
+        }
     }
 
     // Capture block_rel_height fn by value for thread safety

@@ -1615,6 +1615,13 @@ int main(int argc, char* argv[]) {
                 web_server.trigger_work_refresh();
             });
 
+            // Wire local hashrate callback (from stratum server)
+            p2p_node->set_local_hashrate_fn([&web_server]() -> double {
+                auto* mi = web_server.get_mining_interface();
+                if (mi) return mi->get_stratum_total_hashrate();
+                return 0.0;
+            });
+
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)

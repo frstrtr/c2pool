@@ -202,12 +202,16 @@ public:
     /// Triggers immediate work update for all stratum miners.
     void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
 
+    /// Callback to get local hashrate from stratum server (H/s)
+    void set_local_hashrate_fn(std::function<double()> fn) { m_local_hashrate_fn = std::move(fn); }
+
     /// Check whether a peer address is currently banned.
     bool is_banned(const NetService& addr) const;
 
 protected:
     std::function<void()> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
+    std::function<double()> m_local_hashrate_fn;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
