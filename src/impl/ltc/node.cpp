@@ -392,11 +392,10 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                  << " chain=" << m_tracker.chain.size() << ")";
     }
 
-    // Trigger think() for small batches (real-time share arrival, not bulk sync).
-    // During bulk download (>10 shares), skip — chain is incomplete and think
-    // would ban the peer. For 1-3 shares (normal peer-to-peer relay), think
-    // immediately so best_share updates → new work for miners → no orphans.
-    if (data.m_items.size() <= 3 && m_tracker.chain.size() > 10) {
+    // Trigger think() after every share batch (p2pool: set_best_share after handle_shares).
+    // With inline verification, all shares are already verified by this point.
+    // think() just scores heads and updates best_share — safe for any batch size.
+    if (new_count > 0 && m_tracker.chain.size() > 10) {
         run_think();
     }
 }
