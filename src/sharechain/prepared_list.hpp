@@ -193,6 +193,10 @@ struct PreparedList
             st.pop();
         }
 
+        // Reverse: parents before children. Ensures parent exists in chain
+        // when child is added, preventing unrooted branches.
+        std::reverse(result.begin(), result.end());
+
         return result;
     };
 };
