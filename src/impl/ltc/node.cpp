@@ -328,8 +328,18 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         {
             uint256 share_hash;
             share.invoke([&](auto* obj) { share_hash = obj->m_hash; });
-            if (!share_hash.IsNull())
-                m_tracker.attempt_verify(share_hash);
+            if (!share_hash.IsNull()) {
+                bool ok = m_tracker.attempt_verify(share_hash);
+                static int verify_log = 0;
+                if (!ok && verify_log++ < 200) {
+                    auto [h, l] = m_tracker.chain.get_height_and_last(share_hash);
+                    LOG_WARNING << "[inline-verify] FAILED hash=" << share_hash.GetHex().substr(0,16)
+                                << " height=" << h << " last=" << (l.IsNull() ? "null" : l.GetHex().substr(0,16))
+                                << " verified_contains_parent="
+                                << m_tracker.verified.contains(
+                                    [&]{ uint256 p; share.invoke([&](auto* obj){ p = obj->m_prev_hash; }); return p; }());
+                }
+            }
         }
 
         // NOTE: Do NOT trim inside the processing loop. The trim in run_think()
