@@ -579,9 +579,21 @@ public:
         // Mainnet: 2^236 - 1, Testnet: 2^256/20 - 1  (from PoolConfig)
         const uint256 MAX_TARGET = PoolConfig::max_target();
 
-        if (prev_share_hash.IsNull())
-            return {chain::target_to_bits_upper_bound(MAX_TARGET),
-                    chain::target_to_bits_upper_bound(MAX_TARGET)};
+        if (prev_share_hash.IsNull() || !chain.contains(prev_share_hash))
+        {
+            // Genesis or unknown prev: use MAX_TARGET for max_bits,
+            // clip desired_target to [MAX_TARGET/30, MAX_TARGET] for bits.
+            // Matches p2pool generate_transaction (data.py:746-774).
+            auto pre_target3 = MAX_TARGET;
+            auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+            uint256 bits_lo = pre_target3 / 30;
+            if (bits_lo.IsNull()) bits_lo = uint256(1);
+            uint256 bits_target = desired_target;
+            if (bits_target < bits_lo) bits_target = bits_lo;
+            if (bits_target > pre_target3) bits_target = pre_target3;
+            auto bits = chain::target_to_bits_upper_bound(bits_target);
+            return {max_bits, bits};
+        }
 
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
