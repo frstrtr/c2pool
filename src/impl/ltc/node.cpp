@@ -971,22 +971,19 @@ void NodeImpl::run_think()
         ? m_block_rel_height_fn
         : std::function<int32_t(uint256)>([](uint256) -> int32_t { return 0; });
 
-    boost::asio::post(m_think_pool,
-        [this, block_rel_height]()
-        {
+    // Run think() synchronously on the ioc thread (matching p2pool).
+    // p2pool's think() runs synchronously in set_best_share() — no thread pool.
+    // Running on a separate thread caused SIGSEGV: prune_shares() freed shares
+    // that think() was traversing via prev pointers.
+    {
           try {
             uint256 prev_block;
             uint32_t bits = 0;
 
             auto result = m_tracker.think(block_rel_height, prev_block, bits);
 
-            // Post results + trim to ioc thread.
-            // Trim MUST run on ioc to avoid racing with phase2's add().
-            // think() itself only reads chain and adds to verified — both
-            // tolerate concurrent phase2 chain inserts.
-            boost::asio::post(*m_context,
-                [this, result = std::move(result)]()
-                {
+            // Process results inline (same ioc thread — no race with phase2)
+            {
                     // Unified share retention (single pass)
                     prune_shares(result.best);
 
@@ -1048,7 +1045,7 @@ void NodeImpl::run_think()
                     }
 
                     m_think_running.store(false);
-                });
+            }
 
           } catch (const std::exception& e) {
             LOG_ERROR << "run_think() failed: " << e.what();
@@ -1057,7 +1054,7 @@ void NodeImpl::run_think()
             LOG_ERROR << "run_think() failed: unknown error";
             m_think_running.store(false);
           }
-        });
+    }
 }
 
 bool NodeImpl::is_banned(const NetService& addr) const
