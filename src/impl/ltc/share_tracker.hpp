@@ -275,6 +275,12 @@ public:
         {
             // Snapshot heads — we'll modify chain during iteration
             auto heads_snapshot = chain.get_heads();
+            {
+                static int p1_log = 0;
+                if (p1_log++ % 10 == 0)
+                    LOG_INFO << "[think-P1] raw_heads=" << heads_snapshot.size()
+                             << " verified_heads=" << verified.get_heads().size();
+            }
             for (auto& [head_hash, tail_hash] : heads_snapshot)
             {
                 if (verified.get_heads().contains(head_hash))
@@ -285,14 +291,28 @@ public:
                     ? head_height
                     : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
 
+                {
+                    static int p1_head_log = 0;
+                    if (p1_head_log++ < 20)
+                        LOG_INFO << "[think-P1-head] hash=" << head_hash.GetHex().substr(0,16)
+                                 << " height=" << head_height << " last=" << (last.IsNull() ? "null" : last.GetHex().substr(0,16))
+                                 << " walk=" << walk_count;
+                }
+
                 if (walk_count <= 0) {
-                    // Chain too short for verification — request parents
                     if (!last.IsNull()) {
-                        NetService peer;
-                        chain.get_share(head_hash).invoke([&](auto* obj) {
-                            peer = obj->peer_addr;
-                        });
-                        desired.emplace_back(peer, last);
+                        if (head_height <= 1) {
+                            // Orphaned stump: parent was removed, can never verify.
+                            // Remove it (and descendants via cascade in bad removal below).
+                            bads.push_back(head_hash);
+                        } else {
+                            // Chain too short for verification — request parents
+                            NetService peer;
+                            chain.get_share(head_hash).invoke([&](auto* obj) {
+                                peer = obj->peer_addr;
+                            });
+                            desired.emplace_back(peer, last);
+                        }
                     }
                     continue;
                 }
@@ -326,26 +346,55 @@ public:
             }
         }
 
-        // Remove bad shares (p2pool data.py:2096-2108)
-        for (const auto& bad : bads)
+        // Remove bad shares AND their orphaned descendants.
+        // When a bad share is removed, its children become unrooted
+        // (last != null, walk_count=0) and can never be verified.
+        // p2pool's forest.py cascades removal. We do the same here.
         {
-            if (verified.contains(bad))
-                continue; // safety: never remove verified shares
+            std::vector<uint256> to_remove;
+            for (const auto& bad : bads)
+            {
+                if (verified.contains(bad))
+                    continue;
+                to_remove.push_back(bad);
+            }
+            // Cascade: collect all descendants of bad shares
+            for (size_t i = 0; i < to_remove.size(); ++i)
+            {
+                auto rev_it = chain.get_reverse().find(to_remove[i]);
+                if (rev_it != chain.get_reverse().end())
+                {
+                    for (const auto& child : rev_it->second)
+                    {
+                        if (!verified.contains(child))
+                            to_remove.push_back(child);
+                    }
+                }
+            }
+            for (const auto& bad : to_remove)
+            {
+                if (!chain.contains(bad)) continue;
 
-            NetService bad_peer;
-            chain.get_share(bad).invoke([&](auto* obj) {
-                bad_peer = obj->peer_addr;
-            });
-            if (bad_peer.port() != 0) // skip local shares
-                bad_peer_addresses.insert(bad_peer);
+                NetService bad_peer;
+                try {
+                    chain.get_share(bad).invoke([&](auto* obj) {
+                        bad_peer = obj->peer_addr;
+                    });
+                } catch (...) {}
+                if (bad_peer.port() != 0)
+                    bad_peer_addresses.insert(bad_peer);
 
-            try {
-                invalidate_weight_caches(bad);
-                chain.remove(bad);
-            } catch (...) {}
-        }
-        if (!bads.empty()) {
-            LOG_INFO << "[think-P1] removed " << bads.size() << " bad shares";
+                try {
+                    invalidate_weight_caches(bad);
+                    if (verified.contains(bad))
+                        verified.remove(bad);
+                    chain.remove(bad);
+                } catch (...) {}
+            }
+            if (!to_remove.empty()) {
+                LOG_INFO << "[think-P1] removed " << to_remove.size()
+                         << " shares (bads=" << bads.size() << " + descendants)";
+            }
         }
 
         // Phase 2: Extend verification from verified heads.
