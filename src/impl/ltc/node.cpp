@@ -1020,9 +1020,10 @@ void NodeImpl::clean_tracker()
                 if (m_tracker.verified.contains(head_hash))
                     m_tracker.verified.remove(head_hash);
                 m_tracker.chain.remove(head_hash);
-                LOG_INFO << "[clean_tracker] ate stale head " << head_hash.GetHex().substr(0,16);
             } catch (...) {}
-            break; // one per cycle
+            // Remove up to 10 per cycle (enough to keep up with head growth)
+            static int removed_this_cycle = 0;
+            if (++removed_this_cycle >= 10) { removed_this_cycle = 0; break; }
         }
     }
 
@@ -1048,7 +1049,7 @@ void NodeImpl::clean_tracker()
                             m_tracker.verified.remove(child);
                         m_tracker.chain.remove(child);
                     } catch (...) {}
-                    break; // one per cycle
+                    // Don't break — remove all children of this tail
                 }
             }
         }
