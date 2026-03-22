@@ -284,7 +284,7 @@ SharechainLevelDBStore::SharechainLevelDBStore(const std::string& base_path, con
     m_options.use_compression = true;   // Enable compression
     m_options.sync_writes = false;      // Async writes for performance
     m_options.verify_checksums = true;
-    m_options.paranoid_checks = false;
+    m_options.paranoid_checks = true;  // Detect corruption on read (~5% perf cost)
     
     m_store = std::make_unique<LevelDBStore>(m_db_path, m_options);
 }
@@ -392,6 +392,61 @@ bool SharechainLevelDBStore::store_share(const uint256& hash, const std::vector<
         
     } catch (const std::exception& e) {
         LOG_ERROR << "Exception storing share " << hash.ToString() << ": " << e.what();
+        return false;
+    }
+}
+
+bool SharechainLevelDBStore::store_shares_batch(const std::vector<BatchShareEntry>& entries)
+{
+    if (!m_store || entries.empty())
+        return true;
+
+    try {
+        auto batch = m_store->create_batch();
+
+        for (const auto& e : entries) {
+            // Share data
+            batch.put(make_share_key(e.hash), e.serialized_share);
+
+            // Index metadata
+            PackStream metadata_stream;
+            metadata_stream << e.metadata.prev_hash;
+            metadata_stream << e.metadata.height;
+            metadata_stream << e.metadata.timestamp;
+            metadata_stream << e.metadata.work;
+            metadata_stream << e.metadata.target;
+            metadata_stream << static_cast<uint8_t>(e.metadata.is_orphan ? 1 : 0);
+            auto span = metadata_stream.get_span();
+            std::vector<uint8_t> metadata_data(
+                reinterpret_cast<const uint8_t*>(span.data()),
+                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            batch.put(make_index_key(e.hash), metadata_data);
+
+            // Height mapping
+            if (e.metadata.height > 0) {
+                std::vector<uint8_t> hash_data(e.hash.data(), e.hash.data() + 32);
+                batch.put(make_height_key(e.metadata.height), hash_data);
+            }
+        }
+
+        if (!batch.commit()) {
+            LOG_ERROR << "Failed to commit share batch (" << entries.size() << " shares)";
+            return false;
+        }
+
+        // Update in-memory metadata
+        for (const auto& e : entries) {
+            m_metadata.total_shares++;
+            if (e.metadata.height > m_metadata.max_height) {
+                m_metadata.max_height = e.metadata.height;
+                m_metadata.best_hash = e.hash;
+            }
+        }
+
+        return true;
+
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Exception storing share batch: " << e.what();
         return false;
     }
 }

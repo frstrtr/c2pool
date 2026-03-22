@@ -132,6 +132,34 @@ public:
 
     // Share operations
     bool store_share(const uint256& hash, const std::vector<uint8_t>& serialized_share, const ShareMetadata& metadata);
+
+    /// Store multiple shares in one atomic WriteBatch. Crash-safe.
+    struct BatchShareEntry {
+        uint256 hash;
+        std::vector<uint8_t> serialized_share;
+        ShareMetadata metadata;
+    };
+    bool store_shares_batch(const std::vector<BatchShareEntry>& entries);
+
+    // Forward-compatible overload for SharechainStorage::ShareBatchEntry
+    template <typename T>
+    bool store_shares_batch(const std::vector<T>& entries) {
+        std::vector<BatchShareEntry> converted;
+        converted.reserve(entries.size());
+        for (auto& e : entries) {
+            BatchShareEntry b;
+            b.hash = e.hash;
+            b.serialized_share = e.serialized_data;
+            b.metadata.prev_hash = e.prev_hash;
+            b.metadata.height = e.height;
+            b.metadata.timestamp = e.timestamp;
+            b.metadata.work = e.work;
+            b.metadata.target = e.target;
+            converted.push_back(std::move(b));
+        }
+        return store_shares_batch(converted);
+    }
+
     bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_share, ShareMetadata& metadata);
     bool has_share(const uint256& hash);
     bool remove_share(const uint256& hash);

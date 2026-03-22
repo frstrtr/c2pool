@@ -72,10 +72,25 @@ public:
      * @param is_orphan Whether share is orphaned
      * @return True if successful
      */
-    bool store_share(const uint256& hash, const std::vector<uint8_t>& serialized_data, 
+    bool store_share(const uint256& hash, const std::vector<uint8_t>& serialized_data,
                      const uint256& prev_hash, uint64_t height, uint64_t timestamp,
                      const uint256& work, const uint256& target, bool is_orphan = false);
-    
+
+    /// Batch entry for store_shares_batch()
+    struct ShareBatchEntry {
+        uint256 hash;
+        std::vector<uint8_t> serialized_data;
+        uint256 prev_hash;
+        uint64_t height;
+        uint64_t timestamp;
+        uint256 work;
+        uint256 target;
+    };
+
+    /// Store multiple shares atomically in one LevelDB WriteBatch.
+    /// Either ALL shares are committed or NONE (crash-safe).
+    bool store_shares_batch(const std::vector<ShareBatchEntry>& entries);
+
     /**
      * @brief Load a specific share from the database
      * @param hash Share hash to load

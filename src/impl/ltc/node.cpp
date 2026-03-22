@@ -268,6 +268,7 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     int32_t new_count = 0;
     int32_t dup_count = 0;
     std::map<uint256, coin::MutableTransaction> all_new_txs;
+    std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry> db_batch;
     for (int i = 0; i < (int)shares.size(); ++i)
     {
         auto& share = shares[i];
@@ -330,7 +331,7 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         // shares added at the tail can be freed while the loop still holds
         // dangling raw pointers to them (use-after-free).
 
-        // Persist to LevelDB
+        // Collect for batch LevelDB persist (committed atomically after loop)
         if (m_storage && m_storage->is_available())
         {
             std::vector<uint8_t> bytes;
@@ -357,14 +358,25 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
             share.ACTION({
                 uint256 target = chain::bits_to_target(obj->m_bits);
-                // Convert m_abswork (uint128) to uint256 by zero-padding high 128 bits
                 uint256 abswork_256;
                 std::copy(obj->m_abswork.begin(), obj->m_abswork.end(), abswork_256.begin());
-                m_storage->store_share(obj->m_hash, versioned, obj->m_prev_hash,
-                                       obj->m_absheight, obj->m_timestamp,
-                                       abswork_256, target);
+                c2pool::storage::SharechainStorage::ShareBatchEntry entry;
+                entry.hash = obj->m_hash;
+                entry.serialized_data = std::move(versioned);
+                entry.prev_hash = obj->m_prev_hash;
+                entry.height = obj->m_absheight;
+                entry.timestamp = obj->m_timestamp;
+                entry.work = abswork_256;
+                entry.target = target;
+                db_batch.push_back(std::move(entry));
             });
         }
+    }
+
+    // Commit all shares to LevelDB atomically (one WriteBatch for entire batch).
+    // Crash-safe: either ALL shares persisted or NONE.
+    if (!db_batch.empty() && m_storage && m_storage->is_available()) {
+        m_storage->store_shares_batch(db_batch);
     }
 
     if (new_count > 0) {

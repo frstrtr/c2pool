@@ -118,6 +118,20 @@ bool SharechainStorage::store_share(const uint256& hash, const std::vector<uint8
     }
 }
 
+bool SharechainStorage::store_shares_batch(const std::vector<ShareBatchEntry>& entries)
+{
+    if (!m_leveldb_store || entries.empty())
+        return false;
+
+    try {
+        // Delegate to LevelDB store's batch method
+        return m_leveldb_store->store_shares_batch(entries);
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Error storing share batch (" << entries.size() << " shares): " << e.what();
+        return false;
+    }
+}
+
 bool SharechainStorage::load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
                 uint256& prev_hash, uint64_t& height, uint64_t& timestamp,
                 uint256& work, uint256& target, bool& is_orphan)
