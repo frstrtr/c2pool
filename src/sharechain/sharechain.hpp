@@ -576,8 +576,9 @@ public:
                     m_tails.erase(our_tail);
             }
 
-            // If prev share exists, it might become a new head or the tail ref
-            // moves. If prev is not itself a head, make it one.
+            // Parent becomes a new head (necessary for chain traversal).
+            // clean_tracker will eat this new head on the next cycle if it's
+            // also stale (>300s old). This progressively shortens the fork.
             if (idx->prev)
             {
                 hash_t prev_hash = idx->prev->head;
@@ -586,9 +587,6 @@ public:
                     m_heads[prev_hash] = our_tail;
                     m_tails[our_tail].insert(prev_hash);
                 }
-                // Subtract this share's contribution from the prev chain
-                // (idx has height 1 for this single share, but cumulative
-                //  values were already folded in calculate_head_tail)
             }
         }
         else

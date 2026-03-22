@@ -322,6 +322,28 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
         m_tracker.add(share);
 
+        // Log fork detection: if this share's prev_hash has other children, it forks
+        {
+            uint256 prev;
+            bool is_local = false;
+            share.invoke([&](auto* obj) {
+                prev = obj->m_prev_hash;
+                is_local = (obj->peer_addr == NetService{"0.0.0.0", 0} ||
+                            obj->peer_addr == NetService{});
+            });
+            if (is_local && !prev.IsNull()) {
+                auto& rev = m_tracker.chain.get_reverse();
+                auto it = rev.find(prev);
+                if (it != rev.end() && it->second.size() > 1) {
+                    static int fork_log = 0;
+                    if (fork_log++ < 50)
+                        LOG_WARNING << "[FORK] Local share forks! prev=" << prev.GetHex().substr(0,16)
+                                    << " siblings=" << it->second.size()
+                                    << " verified_best=" << m_best_share_hash.GetHex().substr(0,16);
+                }
+            }
+        }
+
         // Verification is deferred to think() Phase 1 (called after this batch).
         // p2pool: handle_shares() only adds, set_best_share()→think() verifies.
         // Inline verification was redundant and caused double-verify CPU waste.
@@ -1069,6 +1091,41 @@ void NodeImpl::clean_tracker()
 
     // Step 4: Update best share (p2pool node.py:402)
     run_think();
+
+    // Orphan/fork diagnostics — understand chain topology
+    {
+        auto& chain = m_tracker.chain;
+        auto& verified = m_tracker.verified;
+        size_t total_heads = chain.get_heads().size();
+        size_t verified_heads = verified.get_heads().size();
+        size_t total_tails = chain.get_tails().size();
+
+        // Count c2pool's own shares in verified vs total
+        int local_in_chain = 0, local_in_verified = 0;
+        int total_in_chain = 0;
+        for (auto& [head_hash, tail_hash] : chain.get_heads()) {
+            auto height = chain.get_height(head_hash);
+            total_in_chain += height;
+            // Check if this head is in verified
+            if (verified.contains(head_hash)) {
+                // Walk backward and count local shares
+                // (expensive — only sample first 50)
+            }
+        }
+
+        static int diag_count = 0;
+        if (diag_count++ % 6 == 0) { // every 30s (5s * 6)
+            LOG_INFO << "[FORK-DIAG] heads=" << total_heads
+                     << " verified_heads=" << verified_heads
+                     << " tails=" << total_tails
+                     << " chain=" << chain.size()
+                     << " verified=" << verified.size()
+                     << " gap=" << (chain.size() - verified.size())
+                     << " best_h=" << (m_best_share_hash.IsNull() ? 0
+                         : (verified.contains(m_best_share_hash)
+                            ? verified.get_height(m_best_share_hash) : -1));
+        }
+    }
 }
 
 bool NodeImpl::is_banned(const NetService& addr) const
