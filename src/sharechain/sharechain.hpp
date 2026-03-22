@@ -601,9 +601,13 @@ public:
 
                 // Walk from child up to the head of its fork, subtracting
                 // our contribution.
-                // Simpler approach: just detach prev pointer.
-                // The child becomes a new fork root with prev = idx->prev.
-                child_idx->prev = idx->prev;
+                // Detach prev pointer — child now points past removed share.
+                // Check that the grandparent still exists (it may have been
+                // removed in a previous remove() call in the same batch).
+                if (idx->prev && m_shares.contains(idx->prev->head))
+                    child_idx->prev = idx->prev;
+                else
+                    child_idx->prev = nullptr;
                 // Recalculate from scratch if needed (heights will be off
                 // by idx->height, but since idx->height == 1 for a single
                 // share we can just decrement).

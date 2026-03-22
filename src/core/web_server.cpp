@@ -5048,9 +5048,11 @@ bool WebServer::start()
             auto stat_fn = std::make_shared<std::function<void(beast::error_code)>>();
             *stat_fn = [this, stat_timer, stat_fn](beast::error_code ec) {
                 if (ec || !running_) return;
-                try { mining_interface_->update_stat_log(); }
-                catch (const std::exception& e) { LOG_WARNING << "update_stat_log failed: " << e.what(); }
-                catch (...) {}
+                // Stat log temporarily disabled — accesses share chain that
+                // clean_tracker may have modified, causing SIGSEGV.
+                // TODO: make sharechain_stats_fn robust to concurrent removal.
+                // try { mining_interface_->update_stat_log(); }
+                // catch (...) {}
                 stat_timer->expires_after(std::chrono::seconds(60));
                 stat_timer->async_wait(*stat_fn);
             };

@@ -1856,8 +1856,10 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < SLOTS; ++i)
                     slots[i].ts = window_start + (i + 1) * SLOT_SEC;
 
-                // Walk up to 2000 shares from best head backwards
-                if (!best.IsNull()) {
+                // Walk up to 2000 shares from best head backwards.
+                // Chain may be concurrently modified by clean_tracker —
+                // use contains() guard and limit walk to actual height.
+                if (!best.IsNull() && chain.contains(best)) {
                     int height = chain.get_height(best);
                     int walk = std::min(height, 2000);
                     if (walk > 0) {
