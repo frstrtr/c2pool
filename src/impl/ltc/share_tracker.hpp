@@ -150,19 +150,41 @@ public:
 
         auto [height, last] = chain.get_height_and_last(share_hash);
 
-        // Need CHAIN_LENGTH + 1 depth, or the chain must be rooted (last == null)
+        // p2pool: need CHAIN_LENGTH + 1 depth, or chain must be rooted (last == null).
+        // Extension: also allow if the share's PARENT is already verified —
+        // this enables forward-extension of the verified chain through unrooted
+        // peer branches. Without this, shares on unrooted chains can never be
+        // verified and the verified gap grows indefinitely.
         if (height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
-            return false;
+        {
+            // Check if parent is already verified — if so, we can verify this share
+            uint256 prev_hash;
+            chain.get_share(share_hash).invoke([&](auto* obj) {
+                prev_hash = obj->m_prev_hash;
+            });
+            if (prev_hash.IsNull() || !verified.contains(prev_hash))
+                return false;
+            // Parent is verified — proceed with verification
+        }
 
         // P2: init-phase verification (hash-link, merkle, PoW) + check-phase
         try
         {
+            auto t0 = std::chrono::steady_clock::now();
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
                 auto computed_hash = verify_share(*obj, *this);
-                // verify_share runs both init (PoW/hash-link) and check (PPLNS/gentx)
                 (void)computed_hash;
             });
+            {
+                auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                static int64_t total_us = 0, count = 0;
+                total_us += dt; ++count;
+                if (count % 50 == 0)
+                    LOG_INFO << "[VERIFY-PERF] last=" << dt << "us avg="
+                             << (total_us/count) << "us count=" << count;
+            }
         }
         catch (const std::exception& e)
         {
@@ -287,6 +309,10 @@ public:
                     continue;
 
                 auto [head_height, last] = chain.get_height_and_last(head_hash);
+                // p2pool: min(5, max(0, head_height - CHAIN_LENGTH)) for unrooted.
+                // But p2pool relies on Phase 2 (rooted chains) to verify the rest.
+                // c2pool's peer chains may be unrooted → Phase 2 has can=0.
+                // Use full depth for rooted, p2pool limit for unrooted.
                 auto walk_count = last.IsNull()
                     ? head_height
                     : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
@@ -343,6 +369,51 @@ public:
                     });
                     desired.emplace_back(peer, last);
                 }
+            }
+        }
+
+        // Phase 1.5: Forward-extend verification using reverse map.
+        // After Phase 1 verified some shares, try to verify their CHILDREN
+        // that are in chain but not yet verified. This propagates verification
+        // forward through unrooted peer chains in a single think() cycle.
+        // p2pool doesn't need this because Phase 2 handles it (rooted chains).
+        {
+            bool extended = true;
+            int fwd_count = 0;
+            // Start from ALL verified shares that have unverified children
+            // Use a queue starting from verified heads
+            std::vector<uint256> to_check;
+            for (auto& [vh, vt] : verified.get_heads())
+                to_check.push_back(vh);
+
+            while (!to_check.empty() && fwd_count < 2000) {
+                auto parent = to_check.back();
+                to_check.pop_back();
+                auto rev_it = chain.get_reverse().find(parent);
+                if (rev_it == chain.get_reverse().end()) {
+                    static int no_children = 0;
+                    if (no_children++ < 5)
+                        LOG_INFO << "[P1.5] no children for " << parent.GetHex().substr(0,16);
+                    continue;
+                }
+                for (const auto& child : rev_it->second) {
+                    if (verified.contains(child)) continue;
+                    if (!chain.contains(child)) continue;
+                    auto [ch, cl] = chain.get_height_and_last(child);
+                    static int child_log = 0;
+                    if (child_log++ < 10)
+                        LOG_INFO << "[P1.5] trying child " << child.GetHex().substr(0,16)
+                                 << " height=" << ch << " last=" << (cl.IsNull() ? "null" : cl.GetHex().substr(0,16));
+                    if (attempt_verify(child)) {
+                        ++fwd_count;
+                        to_check.push_back(child);
+                    }
+                }
+            }
+            if (fwd_count > 0) {
+                static int fwd_log = 0;
+                if (fwd_log++ < 10 || fwd_count > 10)
+                    LOG_INFO << "[think-P1.5] forward-extended " << fwd_count << " shares";
             }
         }
 
