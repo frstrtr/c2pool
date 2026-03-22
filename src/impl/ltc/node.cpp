@@ -950,10 +950,12 @@ void NodeImpl::run_think()
                 ++incoming_peers;
         }
 
-        // Chain height from best_share
+        // Chain height from best_share (fall back to verified size if best not set yet)
         int height = 0;
         if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash))
             height = m_tracker.chain.get_height(m_best_share_hash);
+        else if (verified > 0)
+            height = static_cast<int>(verified);
 
         // Line 1: chain status (matches p2pool format exactly)
         LOG_INFO << "c2pool: " << height << " shares in chain ("
