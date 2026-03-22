@@ -1601,9 +1601,11 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Outbound peer connection loop started";
 
             // When a peer announces a new best block, refresh our mining template
-            p2p_node->set_on_bestblock([&web_server]() {
+            p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
                 web_server.trigger_work_refresh();
-                LOG_INFO << "[LTC] bestblock received from P2P peer — work template refreshed";
+                // p2pool: bitcoind_work.changed → set_best_share() → think()
+                p2p_node->run_think();
+                LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
             });
 
             // When best_share changes (new share on chain), immediately refresh

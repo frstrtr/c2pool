@@ -321,26 +321,9 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
         m_tracker.add(share);
 
-        // Verify inline (p2pool pattern): each share is verified immediately
-        // after adding to the tracker, before the next share is processed.
-        // This keeps verified chain in sync with raw chain — no gap.
-        // p2pool does this synchronously in handle_shares().
-        {
-            uint256 share_hash;
-            share.invoke([&](auto* obj) { share_hash = obj->m_hash; });
-            if (!share_hash.IsNull()) {
-                bool ok = m_tracker.attempt_verify(share_hash);
-                static int verify_log = 0;
-                if (!ok && verify_log++ < 200) {
-                    auto [h, l] = m_tracker.chain.get_height_and_last(share_hash);
-                    LOG_WARNING << "[inline-verify] FAILED hash=" << share_hash.GetHex().substr(0,16)
-                                << " height=" << h << " last=" << (l.IsNull() ? "null" : l.GetHex().substr(0,16))
-                                << " verified_contains_parent="
-                                << m_tracker.verified.contains(
-                                    [&]{ uint256 p; share.invoke([&](auto* obj){ p = obj->m_prev_hash; }); return p; }());
-                }
-            }
-        }
+        // Verification is deferred to think() Phase 1 (called after this batch).
+        // p2pool: handle_shares() only adds, set_best_share()→think() verifies.
+        // Inline verification was redundant and caused double-verify CPU waste.
 
         // NOTE: Do NOT trim inside the processing loop. The trim in run_think()
         // handles pruning between batches. Trimming here is unsafe because
@@ -795,62 +778,9 @@ void NodeImpl::prune_shares(const uint256& best_share)
     // Unified share retention (SHARE_RETENTION_DESIGN.md §4):
     // Single pass replaces 5 independent pruning steps.
     //
-    // retention_depth = 3 * pplns_depth (§3.3: pplns + vesting + reorg buffer)
-    // Dead heads: work deficit > catchup_work (mathematically provable)
-    // Cascade: verified before chain (deferred destruction)
-    // TX cleanup: reference-counted (pending — currently cap-based)
-
-    const size_t pplns_depth = PoolConfig::chain_length();
-    const size_t retention_depth = pplns_depth * 3;
-
-    // --- Phase 1: Dead head detection ---
-    // A fork head is dead if its height is less than half the best chain's height.
-    // This is a conservative proxy for work comparison — a fork that's significantly
-    // shorter than the best chain cannot catch up within the retention window.
-    // (V37 will use actual work comparison via adaptive window formula.)
-    if (!best_share.IsNull() && m_tracker.chain.contains(best_share))
-    {
-        auto best_height = m_tracker.chain.get_height(best_share);
-        auto heads_copy = m_tracker.chain.get_heads();
-
-        for (auto& [head_hash, tail_hash] : heads_copy)
-        {
-            if (head_hash == best_share)
-                continue;
-
-            auto head_height = m_tracker.chain.get_height(head_hash);
-            if (head_height <= 0)
-                continue;
-
-            // Dead if height < best_height / 2 (cannot catch up)
-            if (head_height < best_height / 2)
-            {
-                // Collect shares on this fork for removal
-                auto view = m_tracker.chain.get_chain(head_hash, head_height);
-                std::vector<uint256> to_remove;
-                for (auto& [h, data] : view)
-                    to_remove.push_back(h);
-
-                size_t removed = 0;
-                for (const auto& h : to_remove)
-                {
-                    if (m_tracker.verified.contains(h))
-                        m_tracker.verified.remove(h, /*owns_data=*/false);
-                    if (m_tracker.chain.contains(h))
-                    {
-                        m_tracker.chain.remove(h, /*owns_data=*/true);
-                        if (m_storage && m_storage->is_available())
-                            m_storage->remove_share(h);
-                        ++removed;
-                    }
-                }
-                if (removed > 0)
-                    LOG_INFO << "[Pool] Pruned dead fork: " << removed << " shares"
-                             << " (head=" << head_hash.GetHex().substr(0, 16) << "..."
-                             << " height=" << head_height << " vs best=" << best_height << ")";
-            }
-        }
-    }
+    // Phase 1 (dead head detection) now handled by clean_tracker() every 5s.
+    // Retention: 2*CHAIN_LENGTH+10 matches p2pool clean_tracker tail-drop.
+    const size_t retention_depth = 2 * PoolConfig::chain_length() + 10;
 
     // --- Phase 2: Tail trim (retention_depth) with deferred destruction ---
     std::vector<uint256> evicted_from_chain;
