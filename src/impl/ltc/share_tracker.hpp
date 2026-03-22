@@ -266,29 +266,87 @@ public:
         std::vector<std::pair<NetService, uint256>> desired;
         std::set<NetService> bad_peer_addresses;
 
-        // Phase 1: Verification now happens inline in processing_shares_phase2
-        // (each share verified immediately after tracker.add). No need to
-        // batch-verify here. This matches p2pool's synchronous pattern.
-
-        // Request shares for unrooted chains
-        for (auto& [head_hash, tail_hash] : chain.get_heads())
+        // Phase 1: Verify unverified heads, remove bad shares.
+        // Exact translation of p2pool data.py:2077-2108.
+        // For each unverified head: walk backward, try to verify.
+        // If verification fails: remove the share (it's bad).
+        // If no verification possible and chain unrooted: request parents.
+        std::vector<uint256> bads;
         {
-            if (verified.get_heads().contains(head_hash))
-                continue;
+            // Snapshot heads — we'll modify chain during iteration
+            auto heads_snapshot = chain.get_heads();
+            for (auto& [head_hash, tail_hash] : heads_snapshot)
+            {
+                if (verified.get_heads().contains(head_hash))
+                    continue;
 
-            auto [head_height, last] = chain.get_height_and_last(head_hash);
-            if (!last.IsNull()) {
-                NetService peer;
-                chain.get_share(head_hash).invoke([&](auto* obj) {
-                    peer = obj->peer_addr;
-                });
-                desired.emplace_back(peer, last);
+                auto [head_height, last] = chain.get_height_and_last(head_hash);
+                auto walk_count = last.IsNull()
+                    ? head_height
+                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
+
+                if (walk_count <= 0) {
+                    // Chain too short for verification — request parents
+                    if (!last.IsNull()) {
+                        NetService peer;
+                        chain.get_share(head_hash).invoke([&](auto* obj) {
+                            peer = obj->peer_addr;
+                        });
+                        desired.emplace_back(peer, last);
+                    }
+                    continue;
+                }
+
+                bool verified_one = false;
+                try {
+                    auto chain_view = chain.get_chain(head_hash, walk_count);
+                    for (auto& [hash, data] : chain_view)
+                    {
+                        if (attempt_verify(hash))
+                        {
+                            verified_one = true;
+                            break;
+                        }
+                        bads.push_back(hash);
+                    }
+                } catch (const std::exception&) {
+                    // Chain concurrently modified — skip this head
+                    continue;
+                }
+
+                // Python for/else: if loop completed without break AND unrooted
+                if (!verified_one && !last.IsNull())
+                {
+                    NetService peer;
+                    chain.get_share(head_hash).invoke([&](auto* obj) {
+                        peer = obj->peer_addr;
+                    });
+                    desired.emplace_back(peer, last);
+                }
             }
         }
 
-        // No bad share removal in Phase 1 — unverified shares stay in the
-        // raw chain until verified or pruned by age. This prevents cascade
-        // deletion when verification falls behind (async think).
+        // Remove bad shares (p2pool data.py:2096-2108)
+        for (const auto& bad : bads)
+        {
+            if (verified.contains(bad))
+                continue; // safety: never remove verified shares
+
+            NetService bad_peer;
+            chain.get_share(bad).invoke([&](auto* obj) {
+                bad_peer = obj->peer_addr;
+            });
+            if (bad_peer.port() != 0) // skip local shares
+                bad_peer_addresses.insert(bad_peer);
+
+            try {
+                invalidate_weight_caches(bad);
+                chain.remove(bad);
+            } catch (...) {}
+        }
+        if (!bads.empty()) {
+            LOG_INFO << "[think-P1] removed " << bads.size() << " bad shares";
+        }
 
         // Phase 2: Extend verification from verified heads.
         // Matches p2pool: verify ALL shares in one pass (no budget limit).
