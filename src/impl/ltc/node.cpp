@@ -27,6 +27,36 @@ static long get_rss_mb() {
 
 static long g_rss_limit_mb = 4000;  // abort if RSS exceeds this (configurable)
 
+// p2pool-style hashrate formatting: auto-scale to H/s, kH/s, MH/s, GH/s, TH/s
+static std::string format_hashrate(double hs) {
+    std::ostringstream os;
+    os << std::fixed;
+    if (hs >= 1e12)      os << std::setprecision(2) << hs / 1e12 << "TH/s";
+    else if (hs >= 1e9)  os << std::setprecision(2) << hs / 1e9  << "GH/s";
+    else if (hs >= 1e6)  os << std::setprecision(2) << hs / 1e6  << "MH/s";
+    else if (hs >= 1e3)  os << std::setprecision(1) << hs / 1e3  << "kH/s";
+    else                 os << std::setprecision(0) << hs         << "H/s";
+    return os.str();
+}
+
+// p2pool-style duration formatting: auto-scale to seconds, hours, days, years
+static std::string format_duration(double secs) {
+    if (secs <= 0 || !std::isfinite(secs)) return "???";
+    std::ostringstream os;
+    os << std::fixed;
+    if (secs >= 86400.0 * 365.25)
+        os << std::setprecision(1) << secs / (86400.0 * 365.25) << " years";
+    else if (secs >= 86400.0)
+        os << std::setprecision(1) << secs / 86400.0 << " days";
+    else if (secs >= 3600.0)
+        os << std::setprecision(1) << secs / 3600.0 << " hours";
+    else if (secs >= 60.0)
+        os << std::setprecision(1) << secs / 60.0 << " minutes";
+    else
+        os << std::setprecision(1) << secs << " seconds";
+    return os.str();
+}
+
 namespace ltc
 {
 
@@ -933,8 +963,7 @@ void NodeImpl::run_think()
         // Line 2: Local hashrate + DOA
         if (m_local_hashrate_fn) {
             double local_hs = m_local_hashrate_fn();
-            LOG_INFO << " Local: " << std::fixed << std::setprecision(0)
-                     << local_hs << "H/s";
+            LOG_INFO << " Local: " << format_hashrate(local_hs);
         }
 
         // Count orphan/DOA shares in recent chain (matching p2pool get_stale_counts)
@@ -962,6 +991,8 @@ void NodeImpl::run_think()
                  << " rss=" << get_rss_mb() << "MB";
 
         // Line 4: Pool hashrate + expected time to block
+        // p2pool: real_att_s = pool_aps / (1 - stale_prop)
+        //         etb = 2^256 / block_target / real_att_s
         if (height > 2) {
             try {
                 auto aps = m_tracker.get_pool_attempts_per_second(
@@ -969,30 +1000,31 @@ void NodeImpl::run_think()
                     std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
                     /*min_work=*/false);
                 double pool_hs = static_cast<double>(aps.GetLow64());
-                // Expected time to block: 2^256 / block_target / pool_hashrate
-                double etb_secs = 0;
-                if (pool_hs > 0 && stale_pct < 100.0) {
-                    double real_pool_hs = pool_hs / (1.0 - stale_pct / 100.0);
-                    // Block target from cached template
-                    auto max_target = PoolConfig::max_target();
-                    double target_d = static_cast<double>(max_target.GetLow64());
-                    if (target_d > 0)
-                        etb_secs = std::pow(2.0, 256) / target_d / real_pool_hs;
-                }
-                std::string etb_str;
-                if (etb_secs > 86400 * 365)
-                    etb_str = std::to_string(static_cast<int>(etb_secs / 86400 / 365)) + " years";
-                else if (etb_secs > 86400)
-                    etb_str = std::to_string(static_cast<int>(etb_secs / 86400)) + " days";
-                else if (etb_secs > 3600)
-                    etb_str = std::to_string(static_cast<int>(etb_secs / 3600)) + " hours";
-                else
-                    etb_str = std::to_string(static_cast<int>(etb_secs)) + " seconds";
+                double real_pool_hs = (stale_pct < 99.9 && pool_hs > 0)
+                    ? pool_hs / (1.0 - stale_pct / 100.0) : pool_hs;
 
-                LOG_INFO << " Pool: " << std::fixed << std::setprecision(0)
-                         << pool_hs << "H/s Stale rate: "
-                         << std::setprecision(1) << stale_pct << "%"
-                         << " Expected time to block: " << etb_str;
+                // ETB: use block target (network difficulty) from best share's header
+                double etb_secs = 0;
+                uint32_t block_bits = 0;
+                if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+                    m_tracker.chain.get(m_best_share_hash).share.invoke([&](auto* s) {
+                        block_bits = s->m_min_header.m_bits;
+                    });
+                }
+                if (real_pool_hs > 0 && block_bits != 0) {
+                    auto block_target = chain::bits_to_target(block_bits);
+                    // target_to_average_attempts = 2^256 / (target + 1)
+                    auto block_aps = chain::target_to_average_attempts(block_target);
+                    etb_secs = static_cast<double>(block_aps.GetLow64()) / real_pool_hs;
+                    // For very high targets (testnet), use high bits too
+                    if (block_aps.IsNull() && !block_target.IsNull())
+                        etb_secs = 1e18; // effectively infinite
+                }
+
+                LOG_INFO << " Pool: " << format_hashrate(real_pool_hs)
+                         << " Stale rate: " << std::fixed << std::setprecision(1)
+                         << stale_pct << "% Expected time to block: "
+                         << format_duration(etb_secs);
             } catch (...) {}
         }
     }
