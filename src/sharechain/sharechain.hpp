@@ -145,16 +145,10 @@ private:
             {
                 m_heads[head] = tail;
                 m_tails[tail].insert(head);
-                // If prev_hash (tail) is already in the chain, connect the
-                // prev pointer so get_height_and_last() can walk through it.
-                // p2pool's forest also creates a new_fork here, but p2pool's
-                // get_height_and_last uses items[prev_hash] lookup instead of
-                // prev pointers, so it works for forks automatically.
-                if (m_shares.contains(tail))
-                {
-                    index->prev = m_shares[tail].index;
-                    index->calculate_index(index->prev);
-                }
+                // NOTE: do NOT set index->prev here.  The parent share's
+                // index may be freed later (remove/prune), leaving a dangling
+                // pointer.  Instead, Phase 1 in think() handles fork heads
+                // by computing real depth via contains(tail) fallback.
             }
             break;
         case merge:
@@ -302,19 +296,43 @@ public:
 
     int32_t get_height(const hash_t& hash)
     {
-        return get_index(hash)->height;
+        // Walk through chain segments.  For new_fork shares (fork off
+        // mid-chain), index->prev is null but index->tail (= prev_hash)
+        // may be in the chain.  Follow the tail to get the true height.
+        // This matches p2pool's items[prev_hash] navigation.
+        int32_t total = 0;
+        hash_t cur = hash;
+        for (;;)
+        {
+            auto it = m_shares.find(cur);
+            if (it == m_shares.end()) break;
+            total += it->second.index->height;
+            // Walk prev pointers to the bottom of this segment
+            auto* idx = it->second.index;
+            while (idx->prev) idx = idx->prev;
+            // If the tail is also in the chain, follow to the next segment
+            if (idx->tail.IsNull() || !m_shares.contains(idx->tail))
+                break;
+            cur = idx->tail;
+        }
+        return total;
     }
 
     hash_t get_last(const hash_t& hash)
     {
-        //todo: check exist?
-        // return m_heads[hash];
-        auto index = m_shares[hash].index;
-        while (index->prev)
+        // Walk through chain segments to find the true last (tail
+        // that is NOT in the chain).  Matches p2pool's navigation.
+        hash_t cur = hash;
+        for (;;)
         {
-            index = index->prev;
+            auto it = m_shares.find(cur);
+            if (it == m_shares.end()) return cur;
+            auto* idx = it->second.index;
+            while (idx->prev) idx = idx->prev;
+            if (idx->tail.IsNull() || !m_shares.contains(idx->tail))
+                return idx->tail;
+            cur = idx->tail;
         }
-        return index->tail;
     }
 
     struct height_and_last
@@ -330,13 +348,22 @@ public:
 
     hash_t get_nth_parent_key(const hash_t& hash, int32_t n)
     {
-        auto index = get_index(hash);
+        auto* index = get_index(hash);
         for (int i = 0; i < n; i++)
         {
             if (index->prev)
+            {
                 index = index->prev;
+            }
+            else if (!index->tail.IsNull() && m_shares.contains(index->tail))
+            {
+                // Cross segment boundary (new_fork case)
+                index = m_shares[index->tail].index;
+            }
             else
-                throw std::invalid_argument("get_nth_parent_key: m_shares not exis't hash");
+            {
+                throw std::invalid_argument("get_nth_parent_key: chain too short");
+            }
         }
         return index->head;
     }

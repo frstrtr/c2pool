@@ -1182,7 +1182,7 @@ void NodeImpl::clean_tracker()
             {
                 try {
                     if (m_tracker.verified.contains(h))
-                        m_tracker.verified.remove(h);
+                        m_tracker.verified.remove(h, /*owns_data=*/false);
                     if (m_tracker.chain.contains(h))
                         m_tracker.chain.remove(h);
                 } catch (...) {}
@@ -1223,7 +1223,7 @@ void NodeImpl::clean_tracker()
                     // Safety: only remove if parent is a tail (p2pool node.py:391)
                     if (!m_tracker.chain.contains(h)) continue;
                     if (m_tracker.verified.contains(h))
-                        m_tracker.verified.remove(h);
+                        m_tracker.verified.remove(h, /*owns_data=*/false);
                     m_tracker.chain.remove(h);
                 } catch (...) {}
             }

@@ -317,13 +317,27 @@ public:
                 if (!chain.contains(head_hash)) continue;
 
                 auto [head_height, last] = chain.get_height_and_last(head_hash);
+
+                // Fork detection: if head_height==1 and last is in the chain,
+                // this is a fork share whose prev_hash is mid-chain.  The forest
+                // new_fork case doesn't set prev pointers, so height=1/last=parent.
+                // Compute the REAL depth by adding the parent's height.
+                bool is_fork = (head_height == 1 && !last.IsNull() && chain.contains(last));
+                int32_t effective_height = head_height;
+                bool effectively_rooted = last.IsNull();
+                if (is_fork) {
+                    auto [parent_height, parent_last] = chain.get_height_and_last(last);
+                    effective_height = head_height + parent_height;
+                    effectively_rooted = parent_last.IsNull();
+                }
+
                 // p2pool: min(5, max(0, head_height - CHAIN_LENGTH)) for unrooted.
                 // But p2pool relies on Phase 2 (rooted chains) to verify the rest.
                 // c2pool's peer chains may be unrooted → Phase 2 has can=0.
                 // Use full depth for rooted, p2pool limit for unrooted.
-                auto walk_count = last.IsNull()
-                    ? head_height
-                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
+                auto walk_count = effectively_rooted
+                    ? head_height  // Only walk THIS fork branch (1 share for forks)
+                    : std::min(5, std::max(0, effective_height - static_cast<int32_t>(PoolConfig::chain_length())));
 
                 if (walk_count <= 0) {
                     ++p1_walk0;
