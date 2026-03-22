@@ -188,16 +188,11 @@ std::vector<unsigned char> address_to_script(const std::string& address)
         }
     }
 
-    // Try Base58Check (P2PKH)
-    auto h160 = base58check_to_hash160(address);
+    // Try Base58Check (P2PKH or P2SH)
+    std::string addr_type;
+    auto h160 = address_to_hash160(address, addr_type);
     if (h160.size() == 40) {
-        std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
-        for (size_t i = 0; i < h160.size(); i += 2)
-            script.push_back(static_cast<unsigned char>(
-                std::stoul(h160.substr(i, 2), nullptr, 16)));
-        script.push_back(0x88);
-        script.push_back(0xac);
-        return script;
+        return hash160_to_merged_script(h160, addr_type);
     }
 
     return {};

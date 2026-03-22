@@ -191,7 +191,7 @@ private:
             double total_work = 0;
 
             auto chain_view = tracker.chain.get_chain(best, depth);
-            for (auto& [hash, data] : chain_view)
+            for (auto [hash, data] : chain_view)
             {
                 double w = 0;
                 std::vector<unsigned char> addr_bytes;

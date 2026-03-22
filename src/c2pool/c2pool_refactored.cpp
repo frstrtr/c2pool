@@ -1867,7 +1867,7 @@ int main(int argc, char* argv[]) {
                     if (walk > 0) {
                         try {
                             auto view = chain.get_chain(best, walk);
-                            for (auto& [hash, data] : view) {
+                            for (auto [hash, data] : view) {
                                 data.share.invoke([&](auto* s) {
                                     // Version
                                     auto ver_key = std::to_string(s->version);
@@ -1952,7 +1952,7 @@ int main(int argc, char* argv[]) {
                         try {
                             int pos = 0;
                             auto view = chain.get_chain(best, walk);
-                            for (auto& [hash, data] : view) {
+                            for (auto [hash, data] : view) {
                                 nlohmann::json s;
                                 s["hash"] = hash.GetHex().substr(0, 16);
                                 s["pos"] = pos++;
@@ -2109,17 +2109,28 @@ int main(int argc, char* argv[]) {
                                  << " share_diff=" << sd << " max_diff=" << md;
                     }
 
-                    // Extract pubkey_hash and type from payout_script
+                    // Extract pubkey_hash and type from payout_script.
+                    // Must match p2pool V36: 0=P2PKH, 1=P2WPKH, 2=P2SH.
                     if (payout_script.size() == 25 &&
                         payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
-                        payout_script[2] == 0x14) {
+                        payout_script[2] == 0x14 && payout_script[23] == 0x88 &&
+                        payout_script[24] == 0xac) {
+                        // P2PKH: 76 a9 14 <hash160> 88 ac
                         std::memcpy(params.pubkey_hash.data(), payout_script.data() + 3, 20);
-                        params.pubkey_type = 0; // P2PKH
-                    } else if (payout_script.size() >= 22 &&
-                               payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+                        params.pubkey_type = 0;
+                    } else if (payout_script.size() == 23 &&
+                               payout_script[0] == 0xa9 && payout_script[1] == 0x14 &&
+                               payout_script[22] == 0x87) {
+                        // P2SH: a9 14 <hash160> 87
                         std::memcpy(params.pubkey_hash.data(), payout_script.data() + 2, 20);
-                        params.pubkey_type = 1; // P2WPKH
+                        params.pubkey_type = 2;
+                    } else if (payout_script.size() == 22 &&
+                               payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+                        // P2WPKH: 00 14 <hash160>
+                        std::memcpy(params.pubkey_hash.data(), payout_script.data() + 2, 20);
+                        params.pubkey_type = 1;
                     } else if (payout_script.size() >= 20) {
+                        // Fallback: store first 20 bytes as P2PKH
                         std::memcpy(params.pubkey_hash.data(), payout_script.data(), 20);
                         params.pubkey_type = 0;
                     }

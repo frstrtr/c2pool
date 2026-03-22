@@ -821,7 +821,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             auto walk_count = static_cast<size_t>(chain_len);
             auto walk_view = tracker.chain.get_chain(prev_hash, walk_count);
 
-            for (auto& [hash, data] : walk_view)
+            for (auto [hash, data] : walk_view)
             {
                 uint288 share_att;
                 uint32_t share_don = 0;
@@ -1261,7 +1261,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                                static_cast<int32_t>(PoolConfig::real_chain_length()));
             auto wv = tracker.chain.get_chain(share.m_prev_hash, std::min(cl, int32_t(5)));
             int si = 0;
-            for (auto& [h, d] : wv) {
+            for (auto [h, d] : wv) {
                 d.share.invoke([&](auto* obj) {
                     auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
                     auto sc = get_share_script(obj);
@@ -1458,13 +1458,19 @@ bool share_check(const ShareT& share,
     // 2. Version counting — AutoRatchet upgrade enforcement
     // If 95% of recent shares desire a higher version, this share's version
     // is considered obsolete and must be rejected.
+    // Use share.m_hash (the stored identity) for chain lookups, not the
+    // recomputed share_hash — they may differ during genesis or hash_link
+    // reconstruction edge cases. p2pool uses self.share_data['previous_share_hash']
+    // for chain depth, not the share's own recomputed hash.
     {
         auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-        auto height = tracker.chain.get_height(share_hash);
-        if (height >= lookbehind)
-        {
-            if (tracker.should_punish_version(share_hash, share.version, lookbehind))
-                throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+        if (tracker.chain.contains(share.m_hash)) {
+            auto height = tracker.chain.get_height(share.m_hash);
+            if (height >= lookbehind)
+            {
+                if (tracker.should_punish_version(share.m_hash, share.version, lookbehind))
+                    throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+            }
         }
     }
 
@@ -1561,6 +1567,18 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
     // Skip scrypt PoW re-check when hash was already computed in Phase 1
     // (processing_shares offloads scrypt to m_verify_pool; no need to repeat).
     uint256 hash = share_init_verify(share, share.m_hash.IsNull());
+
+    // Verify recomputed hash matches stored hash (informational).
+    // For locally created shares the hash was set during create_local_share;
+    // a mismatch means the header reconstruction diverged (e.g., genesis PPLNS
+    // race). The share_check phase uses share.m_hash for chain lookups.
+    if (!share.m_hash.IsNull() && hash != share.m_hash) {
+        static int hash_mismatch_log = 0;
+        if (hash_mismatch_log++ < 10)
+            LOG_WARNING << "[verify_share] hash mismatch: recomputed="
+                        << hash.GetHex().substr(0, 16)
+                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
+    }
 
     // Re-derive gentx_hash for the check phase
     constexpr int64_t ver = ShareT::version;
@@ -1794,19 +1812,31 @@ uint256 create_local_share(
             prev_share, block_target);
     }
 
-    // Payout identity
+    // Payout identity — extract pubkey_hash + pubkey_type from scriptPubKey.
+    // Must match p2pool V36: 0=P2PKH, 1=P2WPKH, 2=P2SH.
     if (payout_script.size() >= 20) {
-        // Extract hash160 from P2PKH script: 76 a9 14 <hash160> 88 ac
         if (payout_script.size() == 25 &&
             payout_script[0] == 0x76 && payout_script[1] == 0xa9 &&
             payout_script[2] == 0x14 && payout_script[23] == 0x88 &&
             payout_script[24] == 0xac) {
+            // P2PKH: 76 a9 14 <hash160> 88 ac
             std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 3, 20);
-            share.m_pubkey_type = 0; // P2PKH
+            share.m_pubkey_type = 0;
+        } else if (payout_script.size() == 23 &&
+                   payout_script[0] == 0xa9 && payout_script[1] == 0x14 &&
+                   payout_script[22] == 0x87) {
+            // P2SH: a9 14 <hash160> 87
+            std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
+            share.m_pubkey_type = 2;
+        } else if (payout_script.size() == 22 &&
+                   payout_script[0] == 0x00 && payout_script[1] == 0x14) {
+            // P2WPKH: 00 14 <hash160>
+            std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
+            share.m_pubkey_type = 1;
         } else {
-            // Store first 20 bytes as hash
+            // Fallback: store first 20 bytes as P2PKH
             std::memcpy(share.m_pubkey_hash.data(), payout_script.data(), 20);
-            share.m_pubkey_type = 1; // raw/other
+            share.m_pubkey_type = 0;
         }
     }
 

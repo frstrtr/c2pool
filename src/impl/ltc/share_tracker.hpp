@@ -230,7 +230,7 @@ public:
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
         auto tail_view = verified.get_chain(end_point, tail_count);
-        for (auto& [hash, data] : tail_view)
+        for (auto [hash, data] : tail_view)
         {
             // Access the share's min_header.previous_block via the variant
             uint256 prev_block;
@@ -300,7 +300,7 @@ public:
                 bool verified_one = false;
                 try {
                     auto chain_view = chain.get_chain(head_hash, walk_count);
-                    for (auto& [hash, data] : chain_view)
+                    for (auto [hash, data] : chain_view)
                     {
                         if (attempt_verify(hash))
                         {
@@ -352,14 +352,27 @@ public:
         // Matches p2pool: verify ALL shares in one pass (no budget limit).
         // p2pool does this in a single think() call — any artificial budget
         // causes c2pool to fall behind the growing chain, creating forks.
+        {
+            static int p2_skip_log = 0;
+            if (p2_skip_log++ % 20 == 0)
+                LOG_INFO << "[think-P2-iter] verified_heads=" << verified.get_heads().size()
+                         << " chain=" << chain.size() << " verified=" << verified.size();
+        }
         for (auto& [head_hash, tail_hash] : verified.get_heads())
         {
-            if (!chain.contains(head_hash))
+            if (!chain.contains(head_hash)) {
+                static int skip1 = 0;
+                if (skip1++ < 5) LOG_WARNING << "[think-P2] skip: head not in chain " << head_hash.GetHex().substr(0,16);
                 continue;
+            }
 
             auto [head_height, last_hash] = verified.get_height_and_last(head_hash);
-            if (!chain.contains(last_hash))
+            if (!chain.contains(last_hash)) {
+                static int skip2 = 0;
+                if (skip2++ < 5) LOG_WARNING << "[think-P2] skip: last not in chain " << last_hash.GetHex().substr(0,16)
+                                             << " head_height=" << head_height;
                 continue;
+            }
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
@@ -377,7 +390,7 @@ public:
             if (to_get > 0)
             {
                 auto chain_view = chain.get_chain(last_hash, to_get);
-                for (auto& [hash, data] : chain_view)
+                for (auto [hash, data] : chain_view)
                 {
                     if (!attempt_verify(hash))
                         break;
@@ -913,7 +926,7 @@ public:
         static int decay_dump = 0;
         bool do_dump = (decay_dump++ < 2);
 
-        for (auto& [hash, data] : walk_view)
+        for (auto [hash, data] : walk_view)
         {
             data.share.invoke([&](auto* obj) {
                 auto att = chain::target_to_average_attempts(
@@ -1062,7 +1075,7 @@ public:
 
         float stale_count = 0;
         auto view = chain.get_chain(share_hash, actual_lookbehind);
-        for (auto& [hash, data] : view)
+        for (auto [hash, data] : view)
         {
             StaleInfo si = StaleInfo::none;
             data.share.invoke([&](auto* obj) { si = obj->m_stale_info; });
@@ -1083,7 +1096,7 @@ public:
             return counts;
 
         auto view = chain.get_chain(share_hash, actual_lookbehind);
-        for (auto& [hash, data] : view)
+        for (auto [hash, data] : view)
         {
             StaleInfo si = StaleInfo::none;
             data.share.invoke([&](auto* obj) { si = obj->m_stale_info; });
@@ -1125,7 +1138,7 @@ public:
             return counts;
 
         auto view = chain.get_chain(share_hash, actual);
-        for (auto& [hash, data] : view)
+        for (auto [hash, data] : view)
         {
             uint64_t dv = 0;
             data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });

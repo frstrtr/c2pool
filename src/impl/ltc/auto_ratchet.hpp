@@ -105,7 +105,7 @@ public:
         int32_t total = 0;
 
         auto chain_view = tracker.chain.get_chain(best_share_hash, sample);
-        for (auto& [hash, data] : chain_view)
+        for (auto [hash, data] : chain_view)
         {
             ++total;
             data.share.invoke([&](auto* obj) {

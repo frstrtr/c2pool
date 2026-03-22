@@ -457,7 +457,7 @@ private:
         struct AccumEntry { std::vector<unsigned char> script; uint160 hash; uint8_t type; uint64_t weight; };
         std::map<std::vector<unsigned char>, AccumEntry> addr_work;
         auto chain_view = tracker.chain.get_chain(best, depth);
-        for (auto& [hash, data] : chain_view)
+        for (auto [hash, data] : chain_view)
         {
             std::vector<unsigned char> script;
             uint160 pk_hash;

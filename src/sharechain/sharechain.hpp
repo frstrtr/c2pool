@@ -401,22 +401,53 @@ public:
     public:
         ChainView(ShareChain& chain, hash_t start, size_t n) : m_chain(chain), m_start(start), m_count(n) { }
 
-        Iterator begin()
+        // Counter-based iterator: O(1) construction, O(1) per step.
+        // Replaces old end() which was O(n) — walked the entire chain.
+        class CIterator
         {
-            return Iterator(m_chain, m_chain.m_shares.find(m_start));
+            ShareChain& m_chain;
+            typename data_t::iterator m_it;
+            size_t m_remaining;
+        public:
+            CIterator(ShareChain& chain, typename data_t::iterator it, size_t rem)
+                : m_chain(chain), m_it(it), m_remaining(rem) { }
+
+            std::pair<hash_t, chain_data&> operator*()
+            {
+                return {m_it->first, m_it->second};
+            }
+
+            CIterator& operator++()
+            {
+                if (m_remaining > 0) {
+                    --m_remaining;
+                }
+                if (m_remaining == 0) {
+                    m_it = m_chain.m_shares.end();
+                } else if (m_it != m_chain.m_shares.end() && m_it->second.index->prev) {
+                    auto tail = m_it->second.index->tail;
+                    m_it = m_chain.m_shares.find(tail);
+                } else {
+                    m_it = m_chain.m_shares.end();
+                    m_remaining = 0;
+                }
+                return *this;
+            }
+
+            bool operator!=(const CIterator& other) const
+            {
+                return m_it != other.m_it;
+            }
+        };
+
+        CIterator begin()
+        {
+            return CIterator(m_chain, m_chain.m_shares.find(m_start), m_count);
         }
 
-        Iterator end()
+        CIterator end()
         {
-            typename data_t::iterator it = m_chain.m_shares.find(m_start);
-            for (int i = 0; i < m_count; i++)
-            {
-                if (m_chain.m_shares.contains(it->second.index->tail))
-                    it = m_chain.m_shares.find(it->second.index->tail);
-                else
-                    it = m_chain.m_shares.end();
-            }
-            return Iterator(m_chain, it);
+            return CIterator(m_chain, m_chain.m_shares.end(), 0);
         }
     };
 

@@ -1258,7 +1258,21 @@ MiningInterface::build_connection_coinbase(
     // recompute PPLNS from the frozen share. This ensures the coinbase amounts match
     // what generate_share_transaction will compute during verification.
     // (Matches p2pool's closure pattern: coinbase is frozen at template time.)
-    if (m_pplns_fn && prev_share_hash != m_cached_pplns_best_share && !prev_share_hash.IsNull())
+    if (prev_share_hash.IsNull())
+    {
+        // Genesis: no PPLNS walk possible. p2pool puts 100% of subsidy to donation.
+        // Matching p2pool generate_transaction: empty weights → amounts={} → total_donation=subsidy
+        auto& self = const_cast<MiningInterface&>(*this);
+        self.m_cached_pplns_outputs.clear();
+        uint64_t subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        static const char* HX = "0123456789abcdef";
+        std::string donation_hex;
+        for (unsigned char b : m_donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
+        self.m_cached_pplns_outputs.push_back({donation_hex, subsidy});
+        self.m_cached_raw_scripts = true;
+        self.m_cached_pplns_best_share = prev_share_hash;
+    }
+    else if (m_pplns_fn && prev_share_hash != m_cached_pplns_best_share)
     {
         uint32_t nbits = 0;
         if (m_cached_template.contains("bits"))

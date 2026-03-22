@@ -434,7 +434,7 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 			continue;
 		}
 		uint64_t n = std::min(parents+1, (uint64_t) m_chain->get_height(handle_hash));
-		for (auto& [hash, data] : m_chain->get_chain(handle_hash, n))
+		for (auto [hash, data] : m_chain->get_chain(handle_hash, n))
         {
 			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
 				break;
@@ -458,7 +458,7 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
         if (!m_chain->contains(hash))
             continue;
         // Retrieve the share via get_chain(hash, 1) — first element is the share itself
-        for (auto& [h, data] : m_chain->get_chain(hash, 1))
+        for (auto [h, data] : m_chain->get_chain(hash, 1))
         {
             shares.push_back(data.share);
             break;
@@ -550,7 +550,7 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     int32_t height = m_chain->get_height(share_hash);
     int32_t walk = std::min(height, 5);
 
-    for (auto& [hash, data] : m_chain->get_chain(share_hash, walk))
+    for (auto [hash, data] : m_chain->get_chain(share_hash, walk))
     {
         if (m_shared_share_hashes.count(hash))
             break;

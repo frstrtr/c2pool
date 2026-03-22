@@ -1024,18 +1024,10 @@ void StratumSession::send_notify_work(bool force_clean)
     if (auto fn = mining_interface_->get_best_share_hash_fn())
         frozen_prev_share = fn();
     {
-        // Build P2PKH payout script from username (authorized address)
+        // Build payout script from username (authorized address: P2PKH, P2SH, or bech32)
         std::vector<unsigned char> payout_script;
         if (!username_.empty()) {
-            auto h160 = base58check_to_hash160(username_);
-            if (h160.size() == 40) {
-                payout_script = {0x76, 0xa9, 0x14};
-                for (size_t i = 0; i < h160.size(); i += 2)
-                    payout_script.push_back(static_cast<unsigned char>(
-                        std::stoul(h160.substr(i, 2), nullptr, 16)));
-                payout_script.push_back(0x88);
-                payout_script.push_back(0xac);
-            }
+            payout_script = address_to_script(username_);
         }
 
         // Build merged address entries (bech32+base58, P2PKH+P2SH)
