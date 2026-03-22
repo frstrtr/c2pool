@@ -256,24 +256,11 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
 
 void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
-    // Guard: if think() is running on m_think_pool, defer phase2.
-    // think() and phase2 both access m_tracker — the internal data
-    // structures are not thread-safe for concurrent mutation.
-    if (m_think_running.load())
-    {
-        auto data_ptr = std::make_shared<HandleSharesData>(std::move(data));
-        auto retry_timer = std::make_shared<boost::asio::steady_timer>(
-            *m_context, std::chrono::milliseconds(500));
-        retry_timer->async_wait(
-            [this, data_ptr, addr, retry_timer](const boost::system::error_code& ec)
-            {
-                if (!ec) processing_shares_phase2(*data_ptr, addr);
-            });
-        return;
-    }
-
     // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
     // All shared state (m_tracker, m_chain, m_raw_share_cache, m_storage) touched here.
+    // NOTE: think() runs synchronously on the same ioc thread, so ASIO guarantees
+    // handlers don't overlap.  The old 500ms defer was unnecessary and caused
+    // cascading delays under high share arrival rate (ROOT CAUSE 3 of verified lag).
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
@@ -1103,6 +1090,9 @@ void NodeImpl::run_think()
                         }
                     }
 
+                    // Save top-5 heads for clean_tracker (p2pool node.py:363)
+                    m_last_top5_heads = std::move(result.top5_heads);
+
                     // Update best share — trigger work update if changed (p2pool: new_work_event)
                     if (!result.best.IsNull()) {
                         bool changed = (m_best_share_hash != result.best);
@@ -1135,56 +1125,107 @@ void NodeImpl::run_think()
 void NodeImpl::clean_tracker()
 {
     // Step 1: Run think() to get current scoring + remove bad shares
+    // (also populates m_last_top5_heads)
     run_think();
 
     auto now_sec = static_cast<int64_t>(std::time(nullptr));
+    auto CL = static_cast<int32_t>(ltc::PoolConfig::chain_length());
 
     // Step 2: Eat stale heads (p2pool node.py:358-378)
-    // Remove ONE stale head per clean_tracker call (safe — no cascading removes).
-    // The 5s timer will clean more on the next cycle.
+    // Three guards protect useful heads:
+    //   1. Top-5 scored heads (decorated_heads[-5:])
+    //   2. Heads seen < 300s ago
+    //   3. Unverified heads whose tail has recent child activity (< 120s)
     {
-        auto heads_copy = m_tracker.chain.get_heads();
-        for (auto& [head_hash, tail_hash] : heads_copy) {
-            if (!m_tracker.chain.contains(head_hash)) continue;
-            if (m_tracker.verified.get_heads().contains(head_hash)) continue;
-            auto* idx = m_tracker.chain.get_index(head_hash);
-            if (!idx || idx->time_seen > now_sec - 300) continue;
-            // Safe to remove this stale head
-            try {
-                if (m_tracker.verified.contains(head_hash))
-                    m_tracker.verified.remove(head_hash);
-                m_tracker.chain.remove(head_hash);
-            } catch (...) {}
-            // Remove up to 10 per cycle (enough to keep up with head growth)
-            static int removed_this_cycle = 0;
-            if (++removed_this_cycle >= 10) { removed_this_cycle = 0; break; }
+        // Build top-5 set for O(1) lookup
+        std::set<uint256> top5_set(m_last_top5_heads.begin(), m_last_top5_heads.end());
+
+        for (int iter = 0; iter < 1000; ++iter)
+        {
+            std::vector<uint256> to_remove;
+            auto heads_copy = m_tracker.chain.get_heads();
+            for (auto& [head_hash, tail_hash] : heads_copy)
+            {
+                if (!m_tracker.chain.contains(head_hash)) continue;
+
+                // Guard 1: keep top-5 scored heads (p2pool node.py:363)
+                if (top5_set.count(head_hash)) continue;
+
+                // Guard 2: keep heads seen < 300s ago (p2pool node.py:366)
+                auto* idx = m_tracker.chain.get_index(head_hash);
+                if (!idx || idx->time_seen > now_sec - 300) continue;
+
+                // Guard 3: keep unverified heads with recent tail activity (p2pool node.py:369)
+                if (!m_tracker.verified.contains(head_hash))
+                {
+                    auto& rev = m_tracker.chain.get_reverse();
+                    auto rev_it = rev.find(tail_hash);
+                    if (rev_it != rev.end() && !rev_it->second.empty())
+                    {
+                        int64_t max_child_ts = 0;
+                        for (const auto& child : rev_it->second)
+                        {
+                            auto* cidx = m_tracker.chain.get_index(child);
+                            if (cidx && cidx->time_seen > max_child_ts)
+                                max_child_ts = cidx->time_seen;
+                        }
+                        if (max_child_ts > now_sec - 120) continue;
+                    }
+                }
+
+                to_remove.push_back(head_hash);
+            }
+
+            if (to_remove.empty()) break;
+
+            for (const auto& h : to_remove)
+            {
+                try {
+                    if (m_tracker.verified.contains(h))
+                        m_tracker.verified.remove(h);
+                    if (m_tracker.chain.contains(h))
+                        m_tracker.chain.remove(h);
+                } catch (...) {}
+            }
         }
     }
 
-    // Step 3: Drop tails — remove ONE tail child per cycle (safe).
+    // Step 3: Drop tails — remove ALL children of qualifying tails (p2pool node.py:382-396)
     {
-        auto chain_length = static_cast<int32_t>(ltc::PoolConfig::chain_length());
-        auto tails_copy = m_tracker.chain.get_tails();
-        for (auto& [tail_hash, head_hashes] : tails_copy) {
-            int32_t min_height = std::numeric_limits<int32_t>::max();
-            for (auto& hh : head_hashes) {
-                if (!m_tracker.chain.contains(hh)) continue;
-                min_height = std::min(min_height, m_tracker.chain.get_height(hh));
-            }
-            if (min_height < 2 * chain_length + 10) continue;
-            // Find one child of this tail to remove
-            auto& rev = m_tracker.chain.get_reverse();
-            auto rev_it = rev.find(tail_hash);
-            if (rev_it != rev.end() && !rev_it->second.empty()) {
-                auto child = *rev_it->second.begin();
-                if (m_tracker.chain.contains(child)) {
-                    try {
-                        if (m_tracker.verified.contains(child))
-                            m_tracker.verified.remove(child);
-                        m_tracker.chain.remove(child);
-                    } catch (...) {}
-                    // Don't break — remove all children of this tail
+        for (int iter = 0; iter < 1000; ++iter)
+        {
+            std::vector<uint256> to_remove;
+            auto tails_copy = m_tracker.chain.get_tails();
+            for (auto& [tail_hash, head_hashes] : tails_copy)
+            {
+                int32_t min_height = std::numeric_limits<int32_t>::max();
+                for (auto& hh : head_hashes) {
+                    if (!m_tracker.chain.contains(hh)) continue;
+                    min_height = std::min(min_height, m_tracker.chain.get_height(hh));
                 }
+                if (min_height < 2 * CL + 10) continue;
+
+                // Remove ALL children of this tail (p2pool node.py:386)
+                auto& rev = m_tracker.chain.get_reverse();
+                auto rev_it = rev.find(tail_hash);
+                if (rev_it != rev.end())
+                {
+                    for (const auto& child : rev_it->second)
+                        to_remove.push_back(child);
+                }
+            }
+
+            if (to_remove.empty()) break;
+
+            for (const auto& h : to_remove)
+            {
+                try {
+                    // Safety: only remove if parent is a tail (p2pool node.py:391)
+                    if (!m_tracker.chain.contains(h)) continue;
+                    if (m_tracker.verified.contains(h))
+                        m_tracker.verified.remove(h);
+                    m_tracker.chain.remove(h);
+                } catch (...) {}
             }
         }
     }

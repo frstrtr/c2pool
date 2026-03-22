@@ -91,6 +91,9 @@ struct TrackerThinkResult
     std::vector<std::pair<NetService, uint256>> desired;
     std::set<NetService> bad_peer_addresses;
     bool punish_aggressively{false};
+    // Top-5 scored heads from Phase 4 — used by clean_tracker() to protect
+    // the best chains from head pruning (p2pool node.py:363).
+    std::vector<uint256> top5_heads;
 };
 
 struct CumulativeWeights
@@ -297,6 +300,7 @@ public:
         {
             // Snapshot heads — we'll modify chain during iteration
             auto heads_snapshot = chain.get_heads();
+            int p1_skipped = 0, p1_walk0 = 0, p1_walked = 0, p1_verified = 0, p1_caught = 0;
             {
                 static int p1_log = 0;
                 if (p1_log++ % 10 == 0)
@@ -305,8 +309,12 @@ public:
             }
             for (auto& [head_hash, tail_hash] : heads_snapshot)
             {
-                if (verified.get_heads().contains(head_hash))
+                if (verified.get_heads().contains(head_hash)) {
+                    ++p1_skipped;
                     continue;
+                }
+
+                if (!chain.contains(head_hash)) continue;
 
                 auto [head_height, last] = chain.get_height_and_last(head_hash);
                 // p2pool: min(5, max(0, head_height - CHAIN_LENGTH)) for unrooted.
@@ -317,32 +325,24 @@ public:
                     ? head_height
                     : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
 
-                {
-                    static int p1_head_log = 0;
-                    if (p1_head_log++ < 20)
-                        LOG_INFO << "[think-P1-head] hash=" << head_hash.GetHex().substr(0,16)
-                                 << " height=" << head_height << " last=" << (last.IsNull() ? "null" : last.GetHex().substr(0,16))
-                                 << " walk=" << walk_count;
-                }
-
                 if (walk_count <= 0) {
+                    ++p1_walk0;
+                    // p2pool: when walk_count=0, get_chain returns nothing,
+                    // no shares added to bads.  for/else requests parents.
+                    // Do NOT remove height-1 unrooted heads as "stumps" —
+                    // they're new peer shares whose parents haven't arrived yet.
+                    // clean_tracker() eats truly stale heads after 300s.
                     if (!last.IsNull()) {
-                        if (head_height <= 1) {
-                            // Orphaned stump: parent was removed, can never verify.
-                            // Remove it (and descendants via cascade in bad removal below).
-                            bads.push_back(head_hash);
-                        } else {
-                            // Chain too short for verification — request parents
-                            NetService peer;
-                            chain.get_share(head_hash).invoke([&](auto* obj) {
-                                peer = obj->peer_addr;
-                            });
-                            desired.emplace_back(peer, last);
-                        }
+                        NetService peer;
+                        chain.get_share(head_hash).invoke([&](auto* obj) {
+                            peer = obj->peer_addr;
+                        });
+                        desired.emplace_back(peer, last);
                     }
                     continue;
                 }
 
+                ++p1_walked;
                 bool verified_one = false;
                 try {
                     auto chain_view = chain.get_chain(head_hash, walk_count);
@@ -351,12 +351,16 @@ public:
                         if (attempt_verify(hash))
                         {
                             verified_one = true;
+                            ++p1_verified;
                             break;
                         }
                         bads.push_back(hash);
                     }
-                } catch (const std::exception&) {
-                    // Chain concurrently modified — skip this head
+                } catch (const std::exception& ex) {
+                    ++p1_caught;
+                    LOG_WARNING << "[think-P1] exception walking head " << head_hash.GetHex().substr(0,16)
+                                << " height=" << head_height << " walk=" << walk_count
+                                << ": " << ex.what();
                     continue;
                 }
 
@@ -369,6 +373,19 @@ public:
                     });
                     desired.emplace_back(peer, last);
                 }
+            }
+
+            // Diagnostic: per-cycle summary
+            {
+                static int p1_sum_log = 0;
+                if (p1_sum_log++ % 5 == 0)
+                    LOG_INFO << "[think-P1-summary] heads=" << heads_snapshot.size()
+                             << " skipped_verified=" << p1_skipped
+                             << " walk0=" << p1_walk0
+                             << " walked=" << p1_walked
+                             << " verified=" << p1_verified
+                             << " caught=" << p1_caught
+                             << " bads=" << bads.size();
             }
         }
 
@@ -496,22 +513,28 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            auto want = std::max(static_cast<int32_t>(PoolConfig::chain_length()) - head_height, 0);
-            // p2pool: can = last_height if rooted, else max(last_height-1-CHAIN_LENGTH, 0).
-            // Extension: for unrooted chains with enough total depth (head_height + last_height
-            // >= CHAIN_LENGTH), treat as rooted. This handles pruned peer genesis on testnet
-            // where the chain has enough depth for PPLNS but the genesis is gone.
-            auto can = last_last_hash.IsNull()
+            // p2pool data.py:2152-2155: want is overwritten to equal can on line 2153,
+            // so get = min(want, can) = can ALWAYS.  c2pool previously used the FIRST
+            // want = max(CL - head_height, 0) which becomes 0 when head_height >= CL,
+            // killing Phase 2 for long verified chains.  Fix: use can directly.
+            //
+            // Extension for pruned-genesis testnet: when the total chain depth
+            // (head_height + last_height) >= CL, treat unrooted chains as rooted.
+            auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+            auto to_get = last_last_hash.IsNull()
                 ? last_height
-                : (head_height + last_height >= static_cast<int32_t>(PoolConfig::chain_length()))
+                : (head_height + last_height >= CL)
                     ? last_height  // Deep enough — treat as rooted
-                    : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
-            auto to_get = std::min(want, can);
+                    : std::max(last_height - 1 - CL, 0);
 
-            LOG_INFO << "[think-P2] head_height=" << head_height
-                     << " last_height=" << last_height
-                     << " last_rooted=" << last_last_hash.IsNull()
-                     << " want=" << want << " can=" << can << " to_get=" << to_get;
+            {
+                static int p2_log = 0;
+                if (p2_log++ % 20 == 0)
+                    LOG_INFO << "[think-P2] head_height=" << head_height
+                             << " last_height=" << last_height
+                             << " last_rooted=" << last_last_hash.IsNull()
+                             << " to_get=" << to_get;
+            }
 
             if (to_get > 0)
             {
@@ -644,7 +667,15 @@ public:
         // For now, pass through all desired (timestamp filtering requires share timestamps at tail)
         desired_result = std::move(desired);
 
-        return {best, desired_result, bad_peer_addresses, punish_aggressively};
+        // Extract top-5 scored heads for clean_tracker (p2pool node.py:363)
+        std::vector<uint256> top5;
+        {
+            size_t start = decorated_heads.size() > 5 ? decorated_heads.size() - 5 : 0;
+            for (size_t i = start; i < decorated_heads.size(); ++i)
+                top5.push_back(decorated_heads[i].hash);
+        }
+
+        return {best, desired_result, bad_peer_addresses, punish_aggressively, std::move(top5)};
     }
 
     // -- Pool hashrate estimation --

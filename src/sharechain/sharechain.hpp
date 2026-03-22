@@ -143,8 +143,18 @@ private:
         case new_fork:
             // create a new fork
             {
-                m_heads[head] = tail;    
+                m_heads[head] = tail;
                 m_tails[tail].insert(head);
+                // If prev_hash (tail) is already in the chain, connect the
+                // prev pointer so get_height_and_last() can walk through it.
+                // p2pool's forest also creates a new_fork here, but p2pool's
+                // get_height_and_last uses items[prev_hash] lookup instead of
+                // prev pointers, so it works for forks automatically.
+                if (m_shares.contains(tail))
+                {
+                    index->prev = m_shares[tail].index;
+                    index->calculate_index(index->prev);
+                }
             }
             break;
         case merge:

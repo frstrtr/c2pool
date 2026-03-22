@@ -58,6 +58,10 @@ protected:
     std::atomic<bool> m_think_running{false};
     std::recursive_mutex m_cs_tracker;
 
+    // Top-5 scored heads from last think() — used by clean_tracker()
+    // to protect the best chains from head pruning (p2pool node.py:363).
+    std::vector<uint256> m_last_top5_heads;
+
 public:
     NodeImpl()
         : m_share_getter(nullptr,
