@@ -266,68 +266,75 @@ public:
         std::vector<std::pair<NetService, uint256>> desired;
         std::set<NetService> bad_peer_addresses;
 
-        // Phase 1: Try to verify unverified heads
-        std::vector<uint256> bads;
+        // Phase 1: Verify shares from verified frontier forward (not head backward).
+        // p2pool verifies synchronously so the gap never grows. c2pool's async think
+        // can fall behind — walking from head backward would remove valid unverified
+        // shares (they fail because their parent isn't verified yet).
+        // Instead: find unverified shares whose parent IS verified, and verify them.
+        // This advances the verified frontier one share at a time, in order.
+        {
+            // Collect verified heads — these are the frontier
+            std::set<uint256> verified_head_set;
+            for (auto& [hh, _] : verified.get_heads())
+                verified_head_set.insert(hh);
+
+            // For each verified head, check if there are children in the raw chain
+            // that can be verified (their prev_hash is in verified)
+            int verified_this_cycle = 0;
+            static constexpr int MAX_VERIFY_PER_CYCLE = 50;
+            bool progress = true;
+            while (progress && verified_this_cycle < MAX_VERIFY_PER_CYCLE) {
+                progress = false;
+                for (auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    if (verified.get_heads().contains(head_hash))
+                        continue; // already fully verified
+
+                    // Walk from head backward to find the first unverified share
+                    // whose parent IS verified
+                    auto [head_height, last] = chain.get_height_and_last(head_hash);
+                    if (head_height <= 0) continue;
+
+                    auto chain_view = chain.get_chain(head_hash, head_height);
+                    for (auto& [hash, data] : chain_view) {
+                        if (verified.contains(hash)) continue; // already verified
+
+                        // Check if parent is verified
+                        uint256 prev;
+                        chain.get_share(hash).invoke([&](auto* obj) {
+                            prev = obj->m_prev_hash;
+                        });
+                        if (prev.IsNull() || verified.contains(prev)) {
+                            if (attempt_verify(hash)) {
+                                ++verified_this_cycle;
+                                progress = true;
+                            }
+                            break; // only verify one per branch per pass
+                        }
+                        break; // parent not verified — can't proceed further
+                    }
+                }
+            }
+        }
+
+        // Request shares for unrooted chains
         for (auto& [head_hash, tail_hash] : chain.get_heads())
         {
-            // Skip heads that are already verified heads
             if (verified.get_heads().contains(head_hash))
                 continue;
 
             auto [head_height, last] = chain.get_height_and_last(head_hash);
-            auto walk_count = last.IsNull()
-                ? head_height
-                : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
-
-            if (walk_count <= 0)
-                continue;
-
-            bool any_verified = false;
-            auto chain_view = chain.get_chain(head_hash, walk_count);
-            for (auto& [hash, data] : chain_view)
-            {
-                if (attempt_verify(hash))
-                {
-                    any_verified = true;
-                    break;
-                }
-                bads.push_back(hash);
-            }
-
-            // If we couldn't verify anything and chain isn't rooted, request more shares
-            if (!any_verified && !last.IsNull())
-            {
-                uint32_t desired_timestamp = 0;
-                uint32_t desired_bits = 0;
+            if (!last.IsNull()) {
                 NetService peer;
-
-                // Get info from the head share
                 chain.get_share(head_hash).invoke([&](auto* obj) {
-                    desired_timestamp = obj->m_timestamp;
-                    desired_bits = obj->m_bits;
                     peer = obj->peer_addr;
                 });
-
                 desired.emplace_back(peer, last);
             }
         }
 
-        // Remove bad shares and collect bad peers
-        for (const auto& bad : bads)
-        {
-            if (verified.contains(bad))
-                continue; // safety check
-
-            NetService bad_peer;
-            chain.get_share(bad).invoke([&](auto* obj) {
-                bad_peer = obj->peer_addr;
-            });
-            bad_peer_addresses.insert(bad_peer);
-
-            invalidate_weight_caches(bad);
-            chain.remove(bad);
-            LOG_WARNING << "Removed bad share " << bad.GetHex().substr(0, 16) << "... from chain";
-        }
+        // No bad share removal in Phase 1 — unverified shares stay in the
+        // raw chain until verified or pruned by age. This prevents cascade
+        // deletion when verification falls behind (async think).
 
         // Phase 2: Extend verification from verified heads.
         // Matches p2pool: verify ALL shares in one pass (no budget limit).
