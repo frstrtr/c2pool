@@ -969,9 +969,17 @@ void NodeImpl::run_think()
         }
 
         // Count orphan/DOA shares in recent chain (matching p2pool get_stale_counts)
+        // Use best_share if available, otherwise walk from verified head
         int orphan_count = 0, doa_count = 0, total_recent = 0;
-        if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
-            uint256 cur = m_best_share_hash;
+        uint256 walk_start = m_best_share_hash;
+        if (walk_start.IsNull() || !m_tracker.chain.contains(walk_start)) {
+            // Fall back to first verified head
+            auto& vheads = m_tracker.verified.get_heads();
+            if (!vheads.empty())
+                walk_start = vheads.begin()->first;
+        }
+        if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
+            uint256 cur = walk_start;
             int window = std::min(height, static_cast<int>(
                 std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
             for (int i = 0; i < window && !cur.IsNull() && m_tracker.chain.contains(cur); ++i) {
