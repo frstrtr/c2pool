@@ -145,10 +145,9 @@ private:
             {
                 m_heads[head] = tail;
                 m_tails[tail].insert(head);
-                // NOTE: do NOT set index->prev here.  The parent share's
-                // index may be freed later (remove/prune), leaving a dangling
-                // pointer.  Instead, Phase 1 in think() handles fork heads
-                // by computing real depth via contains(tail) fallback.
+                // Do NOT set prev or call calculate_index here.
+                // Navigation (get_height, get_last, CIterator) follows
+                // tail across segment boundaries instead.
             }
             break;
         case merge:
@@ -296,10 +295,8 @@ public:
 
     int32_t get_height(const hash_t& hash)
     {
-        // Walk through chain segments.  For new_fork shares (fork off
-        // mid-chain), index->prev is null but index->tail (= prev_hash)
-        // may be in the chain.  Follow the tail to get the true height.
-        // This matches p2pool's items[prev_hash] navigation.
+        // Walk through chain segments for new_fork shares where
+        // accumulated values only cover the fork branch, not the parent.
         int32_t total = 0;
         hash_t cur = hash;
         for (;;)
@@ -307,10 +304,8 @@ public:
             auto it = m_shares.find(cur);
             if (it == m_shares.end()) break;
             total += it->second.index->height;
-            // Walk prev pointers to the bottom of this segment
             auto* idx = it->second.index;
             while (idx->prev) idx = idx->prev;
-            // If the tail is also in the chain, follow to the next segment
             if (idx->tail.IsNull() || !m_shares.contains(idx->tail))
                 break;
             cur = idx->tail;
@@ -320,19 +315,20 @@ public:
 
     hash_t get_last(const hash_t& hash)
     {
-        // Walk through chain segments to find the true last (tail
-        // that is NOT in the chain).  Matches p2pool's navigation.
-        hash_t cur = hash;
-        for (;;)
+        // Walk prev pointers to the segment bottom, then follow tail
+        // across new_fork boundaries until we reach a true last (hash
+        // NOT in the chain).
+        auto* idx = m_shares[hash].index;
+        while (idx->prev)
+            idx = idx->prev;
+        // Follow through segment boundaries (new_fork: prev=null but tail in chain)
+        while (!idx->tail.IsNull() && m_shares.contains(idx->tail))
         {
-            auto it = m_shares.find(cur);
-            if (it == m_shares.end()) return cur;
-            auto* idx = it->second.index;
-            while (idx->prev) idx = idx->prev;
-            if (idx->tail.IsNull() || !m_shares.contains(idx->tail))
-                return idx->tail;
-            cur = idx->tail;
+            idx = m_shares[idx->tail].index;
+            while (idx->prev)
+                idx = idx->prev;
         }
+        return idx->tail;
     }
 
     struct height_and_last
@@ -386,15 +382,14 @@ public:
     // last------(ancestor------item]--->best
     index_t get_interval(hash_t item, hash_t ancestor)
     {
-        if (!is_child_of(ancestor, item))
-            throw std::invalid_argument("get interval: item not child for ancestor!");
-            // throw std::invalid_argument("get_sum item[" + item + "] not child for ancestor[" + ancestor + "]");
-
+        // Subtracts ancestor's accumulated values from item's.
+        // Works correctly when both shares are on the same segment
+        // (connected via prev pointers with correct accumulated values).
+        // Callers that may cross segments (pool hashrate) should use
+        // the verified chain which has no new_fork issues.
         index_t result = *get_index(item);
         index_t* ances = get_index(ancestor);
-
         result.operation(ances, index_t::operation_type::minus);
-
         return result;
     }
 

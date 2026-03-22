@@ -318,26 +318,12 @@ public:
 
                 auto [head_height, last] = chain.get_height_and_last(head_hash);
 
-                // Fork detection: if head_height==1 and last is in the chain,
-                // this is a fork share whose prev_hash is mid-chain.  The forest
-                // new_fork case doesn't set prev pointers, so height=1/last=parent.
-                // Compute the REAL depth by adding the parent's height.
-                bool is_fork = (head_height == 1 && !last.IsNull() && chain.contains(last));
-                int32_t effective_height = head_height;
-                bool effectively_rooted = last.IsNull();
-                if (is_fork) {
-                    auto [parent_height, parent_last] = chain.get_height_and_last(last);
-                    effective_height = head_height + parent_height;
-                    effectively_rooted = parent_last.IsNull();
-                }
-
-                // p2pool: min(5, max(0, head_height - CHAIN_LENGTH)) for unrooted.
-                // But p2pool relies on Phase 2 (rooted chains) to verify the rest.
-                // c2pool's peer chains may be unrooted → Phase 2 has can=0.
-                // Use full depth for rooted, p2pool limit for unrooted.
-                auto walk_count = effectively_rooted
-                    ? head_height  // Only walk THIS fork branch (1 share for forks)
-                    : std::min(5, std::max(0, effective_height - static_cast<int32_t>(PoolConfig::chain_length())));
+                // get_height now returns accumulated height (including parent
+                // chain for new_fork shares). get_last follows segments to
+                // the true last. No special fork detection needed.
+                auto walk_count = last.IsNull()
+                    ? head_height
+                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
 
                 if (walk_count <= 0) {
                     ++p1_walk0;
@@ -695,18 +681,20 @@ public:
     // -- Pool hashrate estimation --
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
-        if (dist < 2 || !chain.contains(share_hash))
+        // Use VERIFIED chain — it has correct accumulated values (shares
+        // added in order via Phase 2, no new_fork segment issues).
+        // The raw chain's get_interval breaks for fork shares.
+        if (dist < 2 || !verified.contains(share_hash))
             return uint288(0);
 
-        // Guard: ensure chain is deep enough (p2pool checks height before walking)
-        auto actual_height = chain.get_height(share_hash);
+        auto actual_height = verified.get_height(share_hash);
         if (actual_height < dist)
             return uint288(0);
 
-        auto far_hash = chain.get_nth_parent_key(share_hash, dist - 1);
-        auto interval = chain.get_interval(share_hash, far_hash);
+        auto far_hash = verified.get_nth_parent_key(share_hash, dist - 1);
+        auto interval = verified.get_interval(share_hash, far_hash);
 
-        // Get timestamps
+        // Get timestamps from chain (shares have same data in both)
         uint32_t near_ts = 0, far_ts = 0;
         chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
         chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
