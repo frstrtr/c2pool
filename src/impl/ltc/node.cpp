@@ -532,17 +532,16 @@ uint256 NodeImpl::best_share_hash()
 {
     // p2pool's think() returns the best VERIFIED head — not the raw chain tip.
     // This ensures shares are built on a chain that all peers agree on.
-    // Use the result from think() directly — this is what p2pool uses.
-    // think() scores heads by accumulated work and applies punishment,
-    // matching the network consensus on which chain is best.
-    // No skip-local: with matching desired_target (pre_target3/30),
-    // c2pool shares have the same bits as p2pool's. Building on our
-    // own shares is correct cooperative behavior.
-    if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+    // Use think().best ONLY if it's on the VERIFIED chain.
+    // p2pool's think() only considers verified shares for the best head.
+    // If think().best is on an unverified fork (e.g., our own shares that
+    // p2pool hasn't verified yet), fall back to the best verified head.
+    // This prevents building a self-reinforcing fork that never joins
+    // the main chain.
+    if (!m_best_share_hash.IsNull() && m_tracker.verified.contains(m_best_share_hash)) {
         static int log_count = 0;
         if (log_count++ % 60 == 0) {
-            auto h = m_tracker.verified.contains(m_best_share_hash)
-                ? m_tracker.verified.get_height(m_best_share_hash) : 0;
+            auto h = m_tracker.verified.get_height(m_best_share_hash);
             LOG_INFO << "[best_share] using think() result height=" << h
                      << " verified=" << m_tracker.verified.size()
                      << " raw=" << (m_chain ? m_chain->size() : 0);
