@@ -187,6 +187,10 @@ public:
     /// Should be called periodically (e.g. after processing_shares or on a timer).
     void run_think();
 
+    /// Periodic maintenance: eat stale heads, drop tails, then run_think().
+    /// Matches p2pool's clean_tracker() (node.py:355-402).
+    void clean_tracker();
+
     /// Set the block_rel_height function used by run_think() for chain scoring.
     /// fn(block_hash) should return confirmations from the coin daemon:
     ///   >= 0 : block is in main chain (0 = tip, higher = deeper)

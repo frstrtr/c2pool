@@ -2835,9 +2835,9 @@ int main(int argc, char* argv[]) {
             think_tick = [&, think_timer](boost::system::error_code ec) {
                 if (ec || g_shutdown_requested) return;
                 try {
-                    p2p_node->run_think();
+                    p2p_node->clean_tracker();
                 } catch (const std::exception& e) {
-                    LOG_ERROR << "[THINK] error: " << e.what();
+                    LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
                 }
                 think_timer->expires_after(std::chrono::seconds(5));
                 think_timer->async_wait(think_tick);

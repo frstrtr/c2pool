@@ -104,12 +104,20 @@ public:
         for (auto& [h, cd] : m_shares)
             delete cd.index;
         m_shares.clear();
+        m_reverse.clear();
         m_heads.clear();
         m_tails.clear();
     }
 
+public:
+    // Reverse map: prev_hash → set of children hashes.
+    // Matches p2pool's tracker.reverse (forest.py).
+    // Enables O(1) child lookup instead of O(N) scan.
+    const auto& get_reverse() const { return m_reverse; }
+
 private:
     std::unordered_map<hash_t, chain_data, hasher_t> m_shares;
+    std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_reverse;
 
     std::unordered_map<hash_t, hash_t, hasher_t> m_heads;
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
@@ -240,6 +248,9 @@ public:
 
         calculate_head_tail(share->m_hash, share->m_prev_hash, index);
         m_shares[share->m_hash] = chain_data{index, share_var};
+        // Maintain reverse map (prev → children)
+        if (!share->m_prev_hash.IsNull())
+            m_reverse[share->m_prev_hash].insert(share->m_hash);
     }
 
     void add(share_t share)
@@ -531,13 +542,25 @@ public:
         // Determine if this share is currently a head
         bool is_head = m_heads.contains(hash);
 
-        // Find any child shares whose prev == hash (shares that point to us)
+        // Find child shares via reverse map (O(1) instead of O(N) scan)
         std::vector<hash_t> children;
-        for (auto& [h, cd] : m_shares)
         {
-            if (h != hash && cd.index->tail == hash && cd.index->prev == idx)
-                children.push_back(h);
+            auto rev_it = m_reverse.find(hash);
+            if (rev_it != m_reverse.end())
+                children.assign(rev_it->second.begin(), rev_it->second.end());
         }
+
+        // Remove this share from parent's reverse entry
+        if (!share_tail.IsNull()) {
+            auto parent_rev = m_reverse.find(share_tail);
+            if (parent_rev != m_reverse.end()) {
+                parent_rev->second.erase(hash);
+                if (parent_rev->second.empty())
+                    m_reverse.erase(parent_rev);
+            }
+        }
+        // Remove our reverse entry (children will update theirs)
+        m_reverse.erase(hash);
 
         if (is_head && children.empty())
         {

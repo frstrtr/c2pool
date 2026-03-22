@@ -1066,6 +1066,91 @@ void NodeImpl::run_think()
     }
 }
 
+// Periodic maintenance: eat stale heads, drop tails.
+// Direct translation of p2pool node.py:355-402 clean_tracker().
+void NodeImpl::clean_tracker()
+{
+    // Step 1: Run think() to get current scoring + remove bad shares
+    run_think();
+
+    auto now_sec = static_cast<int64_t>(std::time(nullptr));
+
+    // Step 2: Eat stale heads (p2pool node.py:358-378)
+    // Remove heads that are: old (>300s), not top-5 scored, and either
+    // verified or have children older than 120s.
+    for (int iter = 0; iter < 1000; ++iter) {
+        std::vector<uint256> to_remove;
+        for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+            // Keep top-5 scored heads (approximate: keep verified heads)
+            if (m_tracker.verified.get_heads().contains(head_hash))
+                continue;
+
+            // Keep recent heads (< 300s old)
+            auto* idx = m_tracker.chain.get_index(head_hash);
+            if (!idx || idx->time_seen > now_sec - 300)
+                continue;
+
+            // For unverified heads: keep if children are recent (< 120s)
+            if (!m_tracker.verified.contains(head_hash)) {
+                auto& rev = m_tracker.chain.get_reverse();
+                auto rev_it = rev.find(tail_hash);
+                if (rev_it != rev.end()) {
+                    int64_t max_child_time = 0;
+                    for (auto& child : rev_it->second) {
+                        auto* ci = m_tracker.chain.get_index(child);
+                        if (ci && ci->time_seen > max_child_time)
+                            max_child_time = ci->time_seen;
+                    }
+                    if (max_child_time > now_sec - 120)
+                        continue;
+                }
+            }
+
+            to_remove.push_back(head_hash);
+        }
+        if (to_remove.empty()) break;
+        for (auto& h : to_remove) {
+            if (m_tracker.verified.contains(h))
+                m_tracker.verified.remove(h);
+            try { m_tracker.chain.remove(h); } catch (...) {}
+        }
+    }
+
+    // Step 3: Drop tails (p2pool node.py:381-398)
+    // When all heads reaching a tail have height > 2*CHAIN_LENGTH+10,
+    // remove the tail's immediate children.
+    auto chain_length = static_cast<int32_t>(ltc::PoolConfig::chain_length());
+    for (int iter = 0; iter < 1000; ++iter) {
+        std::vector<uint256> to_remove;
+        for (auto& [tail_hash, head_hashes] : m_tracker.chain.get_tails()) {
+            int32_t min_height = std::numeric_limits<int32_t>::max();
+            for (auto& hh : head_hashes) {
+                auto h = m_tracker.chain.get_height(hh);
+                if (h < min_height) min_height = h;
+            }
+            if (min_height < 2 * chain_length + 10)
+                continue;
+            // Remove direct children of this tail
+            auto& rev = m_tracker.chain.get_reverse();
+            auto rev_it = rev.find(tail_hash);
+            if (rev_it != rev.end()) {
+                for (auto& child : rev_it->second)
+                    to_remove.push_back(child);
+            }
+        }
+        if (to_remove.empty()) break;
+        for (auto& h : to_remove) {
+            if (!m_tracker.chain.contains(h)) continue;
+            if (m_tracker.verified.contains(h))
+                m_tracker.verified.remove(h);
+            try { m_tracker.chain.remove(h); } catch (...) {}
+        }
+    }
+
+    // Step 4: Update best share (p2pool node.py:402)
+    run_think();
+}
+
 bool NodeImpl::is_banned(const NetService& addr) const
 {
     auto it = m_ban_list.find(addr);
