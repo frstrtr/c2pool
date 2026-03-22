@@ -1080,7 +1080,12 @@ void NodeImpl::clean_tracker()
     // verified or have children older than 120s.
     for (int iter = 0; iter < 1000; ++iter) {
         std::vector<uint256> to_remove;
-        for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+        // Snapshot heads — remove() modifies heads map
+        auto heads_copy = m_tracker.chain.get_heads();
+        for (auto& [head_hash, tail_hash] : heads_copy) {
+            if (!m_tracker.chain.contains(head_hash))
+                continue; // already removed in previous iteration
+
             // Keep top-5 scored heads (approximate: keep verified heads)
             if (m_tracker.verified.get_heads().contains(head_hash))
                 continue;
@@ -1090,13 +1095,14 @@ void NodeImpl::clean_tracker()
             if (!idx || idx->time_seen > now_sec - 300)
                 continue;
 
-            // For unverified heads: keep if children are recent (< 120s)
+            // For unverified heads: keep if children of the TAIL are recent (< 120s)
             if (!m_tracker.verified.contains(head_hash)) {
                 auto& rev = m_tracker.chain.get_reverse();
                 auto rev_it = rev.find(tail_hash);
                 if (rev_it != rev.end()) {
                     int64_t max_child_time = 0;
                     for (auto& child : rev_it->second) {
+                        if (!m_tracker.chain.contains(child)) continue;
                         auto* ci = m_tracker.chain.get_index(child);
                         if (ci && ci->time_seen > max_child_time)
                             max_child_time = ci->time_seen;
@@ -1110,6 +1116,7 @@ void NodeImpl::clean_tracker()
         }
         if (to_remove.empty()) break;
         for (auto& h : to_remove) {
+            if (!m_tracker.chain.contains(h)) continue;
             if (m_tracker.verified.contains(h))
                 m_tracker.verified.remove(h);
             try { m_tracker.chain.remove(h); } catch (...) {}
@@ -1122,9 +1129,12 @@ void NodeImpl::clean_tracker()
     auto chain_length = static_cast<int32_t>(ltc::PoolConfig::chain_length());
     for (int iter = 0; iter < 1000; ++iter) {
         std::vector<uint256> to_remove;
-        for (auto& [tail_hash, head_hashes] : m_tracker.chain.get_tails()) {
+        // Snapshot tails — remove() modifies tails map
+        auto tails_copy = m_tracker.chain.get_tails();
+        for (auto& [tail_hash, head_hashes] : tails_copy) {
             int32_t min_height = std::numeric_limits<int32_t>::max();
             for (auto& hh : head_hashes) {
+                if (!m_tracker.chain.contains(hh)) continue;
                 auto h = m_tracker.chain.get_height(hh);
                 if (h < min_height) min_height = h;
             }
@@ -1134,7 +1144,9 @@ void NodeImpl::clean_tracker()
             auto& rev = m_tracker.chain.get_reverse();
             auto rev_it = rev.find(tail_hash);
             if (rev_it != rev.end()) {
-                for (auto& child : rev_it->second)
+                // Copy children — iterator invalidated by remove
+                auto children = rev_it->second;
+                for (auto& child : children)
                     to_remove.push_back(child);
             }
         }
