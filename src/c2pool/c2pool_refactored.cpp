@@ -2276,10 +2276,10 @@ int main(int argc, char* argv[]) {
                 }
 
                 try {
-                    // prev_share_hash must be non-null — the job needs a valid chain tip.
-                    // p2pool creates shares as soon as it has a chain (no verification guard).
-                    // PPLNS walks chain data directly, not verified data.
-                    if (p.prev_share_hash.IsNull()) {
+                    // Allow null prev_share for genesis (empty chain, no peers).
+                    // p2pool creates genesis share with previous_share_hash=None.
+                    // Only block if chain has shares but best_share is null (sync issue).
+                    if (p.prev_share_hash.IsNull() && p2p_node->tracker().chain.size() > 0) {
                         ++s_guard_blocked;
                         static std::atomic<int64_t> s_last_warn{0};
                         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
