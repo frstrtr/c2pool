@@ -461,9 +461,17 @@ public:
                 }
                 if (m_remaining == 0) {
                     m_it = m_chain.m_shares.end();
-                } else if (m_it != m_chain.m_shares.end() && m_it->second.index->prev) {
+                } else if (m_it != m_chain.m_shares.end()) {
+                    // Follow tail (= prev_hash) to the next share.
+                    // Works across new_fork segment boundaries: even when
+                    // index->prev is null, tail is still the share's prev_hash.
                     auto tail = m_it->second.index->tail;
-                    m_it = m_chain.m_shares.find(tail);
+                    if (!tail.IsNull())
+                        m_it = m_chain.m_shares.find(tail);
+                    else {
+                        m_it = m_chain.m_shares.end();
+                        m_remaining = 0;
+                    }
                 } else {
                     m_it = m_chain.m_shares.end();
                     m_remaining = 0;
