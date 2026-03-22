@@ -266,55 +266,9 @@ public:
         std::vector<std::pair<NetService, uint256>> desired;
         std::set<NetService> bad_peer_addresses;
 
-        // Phase 1: Verify shares from verified frontier forward (not head backward).
-        // p2pool verifies synchronously so the gap never grows. c2pool's async think
-        // can fall behind — walking from head backward would remove valid unverified
-        // shares (they fail because their parent isn't verified yet).
-        // Instead: find unverified shares whose parent IS verified, and verify them.
-        // This advances the verified frontier one share at a time, in order.
-        {
-            // Collect verified heads — these are the frontier
-            std::set<uint256> verified_head_set;
-            for (auto& [hh, _] : verified.get_heads())
-                verified_head_set.insert(hh);
-
-            // For each verified head, check if there are children in the raw chain
-            // that can be verified (their prev_hash is in verified)
-            int verified_this_cycle = 0;
-            static constexpr int MAX_VERIFY_PER_CYCLE = 50;
-            bool progress = true;
-            while (progress && verified_this_cycle < MAX_VERIFY_PER_CYCLE) {
-                progress = false;
-                for (auto& [head_hash, tail_hash] : chain.get_heads()) {
-                    if (verified.get_heads().contains(head_hash))
-                        continue; // already fully verified
-
-                    // Walk from head backward to find the first unverified share
-                    // whose parent IS verified
-                    auto [head_height, last] = chain.get_height_and_last(head_hash);
-                    if (head_height <= 0) continue;
-
-                    auto chain_view = chain.get_chain(head_hash, head_height);
-                    for (auto& [hash, data] : chain_view) {
-                        if (verified.contains(hash)) continue; // already verified
-
-                        // Check if parent is verified
-                        uint256 prev;
-                        chain.get_share(hash).invoke([&](auto* obj) {
-                            prev = obj->m_prev_hash;
-                        });
-                        if (prev.IsNull() || verified.contains(prev)) {
-                            if (attempt_verify(hash)) {
-                                ++verified_this_cycle;
-                                progress = true;
-                            }
-                            break; // only verify one per branch per pass
-                        }
-                        break; // parent not verified — can't proceed further
-                    }
-                }
-            }
-        }
+        // Phase 1: Verification now happens inline in processing_shares_phase2
+        // (each share verified immediately after tracker.add). No need to
+        // batch-verify here. This matches p2pool's synchronous pattern.
 
         // Request shares for unrooted chains
         for (auto& [head_hash, tail_hash] : chain.get_heads())

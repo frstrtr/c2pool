@@ -321,6 +321,17 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
         m_tracker.add(share);
 
+        // Verify inline (p2pool pattern): each share is verified immediately
+        // after adding to the tracker, before the next share is processed.
+        // This keeps verified chain in sync with raw chain — no gap.
+        // p2pool does this synchronously in handle_shares().
+        {
+            uint256 share_hash;
+            share.invoke([&](auto* obj) { share_hash = obj->m_hash; });
+            if (!share_hash.IsNull())
+                m_tracker.attempt_verify(share_hash);
+        }
+
         // NOTE: Do NOT trim inside the processing loop. The trim in run_think()
         // handles pruning between batches. Trimming here is unsafe because
         // shares added at the tail can be freed while the loop still holds
