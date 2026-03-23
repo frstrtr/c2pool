@@ -944,10 +944,13 @@ void NodeImpl::run_think()
         else if (verified > 0)
             height = static_cast<int>(verified);
 
-        // Line 1: chain status (matches p2pool format exactly)
-        LOG_INFO << "c2pool: " << height << " shares in chain ("
-                 << verified << " verified/" << chain_sz << " total) Peers: "
-                 << peers << " (" << incoming_peers << " incoming)";
+        // Line 1: chain status
+        auto fork_count = static_cast<int>(chain_sz) > height ? static_cast<int>(chain_sz) - height : 0;
+        LOG_INFO << "c2pool: best=" << height
+                 << " verified=" << verified
+                 << " total=" << chain_sz
+                 << (fork_count > 0 ? " forks=" + std::to_string(fork_count) : "")
+                 << " Peers: " << peers << " (" << incoming_peers << " incoming)";
 
         // Line 2: Local hashrate + DOA
         if (m_local_hashrate_fn) {
@@ -955,36 +958,46 @@ void NodeImpl::run_think()
             LOG_INFO << " Local: " << format_hashrate(local_hs);
         }
 
-        // Count orphan/DOA shares in recent chain (matching p2pool get_stale_counts)
-        // Use best_share if available, otherwise walk from verified head
+        // Count orphan/DOA shares in best chain via CIterator (handles segments)
         int orphan_count = 0, doa_count = 0, total_recent = 0;
         uint256 walk_start = m_best_share_hash;
         if (walk_start.IsNull() || !m_tracker.chain.contains(walk_start)) {
-            // Fall back to first verified head
             auto& vheads = m_tracker.verified.get_heads();
             if (!vheads.empty())
                 walk_start = vheads.begin()->first;
         }
         if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
-            uint256 cur = walk_start;
             int window = std::min(height, static_cast<int>(
                 std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
-            for (int i = 0; i < window && !cur.IsNull() && m_tracker.chain.contains(cur); ++i) {
-                m_tracker.chain.get(cur).share.invoke([&](auto* s) {
-                    if (s->m_stale_info == ltc::StaleInfo::orphan) ++orphan_count;
-                    else if (s->m_stale_info == ltc::StaleInfo::doa) ++doa_count;
-                    cur = s->m_prev_hash;
-                });
-                ++total_recent;
+            if (window > 0) {
+                // Clamp to actual walkable depth (get_height may differ
+                // from the height computed above if the chain was modified
+                // between the two calls, or if segment-walking gives a
+                // different result than the raw index height).
+                auto walkable = m_tracker.chain.get_height(walk_start);
+                auto walk_n = std::min(window, walkable);
+                if (walk_n > 0) {
+                    try {
+                        auto view = m_tracker.chain.get_chain(walk_start, walk_n);
+                        for (auto [hash, data] : view) {
+                            data.share.invoke([&](auto* s) {
+                                if (s->m_stale_info == ltc::StaleInfo::orphan) ++orphan_count;
+                                else if (s->m_stale_info == ltc::StaleInfo::doa) ++doa_count;
+                            });
+                            ++total_recent;
+                        }
+                    } catch (...) {}
+                }
             }
         }
         double stale_pct = total_recent > 0 ? 100.0 * (orphan_count + doa_count) / total_recent : 0.0;
 
-        // Line 3: Shares + stale rate (matching p2pool format)
-        LOG_INFO << " Shares: " << total_recent << " (" << orphan_count << " orphan, "
-                 << doa_count << " dead) Stale rate: ~"
-                 << std::fixed << std::setprecision(1) << stale_pct << "%"
+        // Line 3: Best chain stale breakdown + topology
+        LOG_INFO << " Best chain: " << total_recent << " shares ("
+                 << orphan_count << " orphan, " << doa_count << " dead"
+                 << ") stale=" << std::fixed << std::setprecision(1) << stale_pct << "%"
                  << " heads=" << m_tracker.chain.get_heads().size()
+                 << " v_heads=" << m_tracker.verified.get_heads().size()
                  << " rss=" << get_rss_mb() << "MB";
 
         // Line 4: Pool hashrate + expected time to block
