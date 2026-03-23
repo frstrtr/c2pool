@@ -845,12 +845,17 @@ public:
 
         {
             static int cst_log = 0;
-            if (cst_log++ < 5) {
-                auto pre_diff = chain::target_to_difficulty(pre_target);
+            if (cst_log++ % 20 == 0) {
+                // Check if the walk went through local shares
+                bool is_local = false;
+                chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+                    is_local = (obj->peer_addr.port() == 0);
+                });
                 LOG_INFO << "[CST] aps=" << aps.GetLow64()
-                         << " share_period=" << PoolConfig::share_period()
-                         << " pre_target_diff=" << pre_diff
-                         << " height=" << height;
+                         << " period=" << PoolConfig::share_period()
+                         << " height=" << height
+                         << " prev=" << prev_share_hash.GetHex().substr(0,16)
+                         << " prev_is_local=" << is_local;
             }
         }
 
