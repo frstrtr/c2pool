@@ -578,16 +578,16 @@ public:
         std::vector<DecoratedData<TailScore>> decorated_tails;
         for (auto& [tail_hash, head_hashes] : verified.get_tails())
         {
-            // Find the head with the most accumulated work
+            // Find the head with the most accumulated work (walk per head)
             uint256 best_head;
             uint288 best_work;
             bool first = true;
             for (const auto& hh : head_hashes)
             {
-                auto idx = verified.get_index(hh);
-                if (first || idx->work > best_work)
+                auto w = verified.get_work(hh);
+                if (first || w > best_work)
                 {
-                    best_work = idx->work;
+                    best_work = w;
                     best_head = hh;
                     first = false;
                 }
@@ -627,9 +627,11 @@ public:
                     continue;
 
                 try {
+                    // Work score: accumulated work from this head back to
+                    // 5th ancestor. Matches p2pool: get_work(get_nth_parent(h, 5)).
                     auto v_height = verified.get_height(hh);
                     auto recent_ancestor = verified.get_nth_parent_key(hh, std::min(5, v_height));
-                    uint288 work_score = verified.get_index(recent_ancestor)->work;
+                    uint288 work_score = verified.get_work(recent_ancestor);
 
                     auto* head_idx = chain.get_index(hh);
                     if (!head_idx) continue;

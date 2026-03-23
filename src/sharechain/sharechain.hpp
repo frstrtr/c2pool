@@ -11,7 +11,11 @@
 namespace chain
 {
 
-// Base for ShareIndexType
+// Base for ShareIndexType.
+// Stores per-share metadata only (no accumulated prefix-sums).
+// Navigation is via hash lookup in m_shares[tail], matching p2pool's
+// items[previous_hash] approach.  No prev pointers — eliminates
+// dangling pointer crashes and new_fork segment issues entirely.
 template <typename HashType, typename VarShareType, typename HasherType, typename HighIndex>
 class ShareIndex
 {
@@ -23,51 +27,13 @@ public:
     using hasher_t = HasherType;
     using high_index_t = HighIndex;
 
-    hash_t head;
-    hash_t tail;
-    int32_t height; 
+    hash_t head;    // this share's own hash
+    hash_t tail;    // this share's prev_hash (navigation key)
 
-    high_index_t* prev {nullptr};
-    
 public:
-    ShareIndex() : head{}, height{0} {}
-    template <typename ShareT> 
-    ShareIndex(ShareT* share) : head{share->m_hash}, tail{share->m_prev_hash}, height{1} {}
-
-    void calculate_index(high_index_t* index)
-    {
-        if (!index)
-            throw std::invalid_argument("nullptr index");
-
-        operation(index, plus);
-    }
-
-    enum operation_type
-    {
-        plus,
-        minus
-    };
-
-    void operation(high_index_t* index, operation_type operation)
-    {
-        switch (operation)
-        {
-        case plus:
-            height += index->height;
-            add(index);
-            break;
-        case minus:
-            height -= index->height;
-            sub(index);
-            break;
-        default:
-            break;
-        }
-    }
-
-protected:
-    virtual void add(high_index_t* index) = 0;
-    virtual void sub(high_index_t* index) = 0;
+    ShareIndex() : head{} {}
+    template <typename ShareT>
+    ShareIndex(ShareT* share) : head{share->m_hash}, tail{share->m_prev_hash} {}
 };
 
 template <typename ShareIndexType>
@@ -122,119 +88,66 @@ private:
     std::unordered_map<hash_t, hash_t, hasher_t> m_heads;
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
     
-    void calculate_head_tail(hash_t head, hash_t tail, index_t* index)
+    void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
-        enum fork_state
+        // Matches p2pool forest.py add() logic.
+        // No prev pointers, no accumulated values.
+        // Just maintain heads/tails/reverse maps.
+        //
+        // head = new share's hash, tail = new share's prev_hash
+        //
+        // Cases:
+        //   tail in heads → only_heads: new share extends existing chain top
+        //   head in tails → only_tails: new share fills gap below existing chain
+        //   both          → merge: new share connects two chains
+        //   neither       → new_fork: new disconnected chain segment
+
+        bool tail_in_heads = m_heads.contains(tail);
+        bool head_in_tails = m_tails.contains(head);
+
+        if (tail_in_heads && head_in_tails)
         {
-            new_fork = 0,
-            only_heads = 1,
-            only_tails = 1 << 1,
-            merge = only_heads | only_tails,
-        };
+            // MERGE: connect two chains.
+            // tail was a head of chain A, head was a tail of chain B.
+            // After adding this share: A ← new_share ← B become one chain.
+            auto old_tail_of_A = m_heads[tail]; // A's deepest tail
+            auto heads_of_B = m_tails[head];    // all heads that reached B's tail
 
-        int state = new_fork;
-        if (m_heads.contains(tail))
-            state |= only_heads;
-        if (m_tails.contains(head))
-            state |= only_tails;
+            // Remove old entries
+            m_heads.erase(tail);
+            m_tails.erase(head);
 
-        switch (state)
+            // All B's heads now reach A's tail
+            for (auto& h : heads_of_B)
+                m_heads[h] = old_tail_of_A;
+            m_tails[old_tail_of_A].insert(heads_of_B.begin(), heads_of_B.end());
+            m_tails[old_tail_of_A].erase(tail);
+        }
+        else if (tail_in_heads)
         {
-        case new_fork:
-            // create a new fork
-            {
-                m_heads[head] = tail;
-                m_tails[tail].insert(head);
-                // Do NOT set prev or call calculate_index here.
-                // Navigation (get_height, get_last, CIterator) follows
-                // tail across segment boundaries instead.
-            }
-            break;
-        case merge:
-            // merge two forks at the junction of a new element
-            {
-                auto left = m_heads.extract(tail); // heads[t]
-                auto& l_tail = left.mapped(); auto& l_head = left.key();
-                auto right = m_tails.extract(head); // tails[h]
-                auto& r_tail = right.key(); auto& r_heads = right.mapped();
-
-                m_tails[l_tail].insert(r_heads.begin(), r_heads.end());
-                m_tails[l_tail].erase(tail);
-
-                for (auto& i : m_tails[l_tail])
-                    m_heads[i] = l_tail;
-
-                index->prev = m_shares[tail].index;
-                index->calculate_index(index->prev);
-
-                std::unordered_set<hash_t, hasher_t> dirty_indexs;
-                for (auto& part : right.mapped())
-                {
-                    index_t* cur = m_shares[part].index;
-                    while(cur)
-                    {
-                        if (dirty_indexs.contains(cur->head))
-                            break;
-                        
-                        dirty_indexs.insert(cur->head);
-                        cur->calculate_index(index);
-
-                        if (!cur->prev)
-                        {
-                            cur->prev = index;
-                            break;
-                        }
-
-                        cur = cur->prev;
-                    }
-                }
-            }
-            break;
-        case only_tails:
-            // element on the left (tail side)
-            {
-                std::unordered_set<hash_t, hasher_t> dirty_indexs;
-                auto right = m_tails.extract(head);
-                for (auto& part : right.mapped())
-                {
-                    index_t* cur = m_shares[part].index;
-                    while(cur)
-                    {
-                        if (dirty_indexs.contains(cur->head))
-                            break;
-                        
-                        dirty_indexs.insert(cur->head);
-                        cur->calculate_index(index);
-
-                        if (!cur->prev)
-                        {
-                            cur->prev = index;
-                            break;
-                        }
-
-                        cur = cur->prev;
-                    }
-                }
-
-                for (auto& v : right.mapped())
-                    m_heads[v] = tail;
-                right.key() = tail;
-                m_tails.insert(std::move(right));
-            }
-            break;
-        case only_heads:
-            // element on the right (head side)
-            {
-                auto left_part = m_heads.extract(tail);
-
-                index->prev = m_shares[tail].index;
-                index->calculate_index(index->prev);
-
-                m_heads[head] = left_part.mapped();
-                m_tails[left_part.mapped()].erase(left_part.key());
-                m_tails[left_part.mapped()].insert(head);
-            }
-            break;
+            // ONLY_HEADS: extend chain from the top.
+            // tail was a head → new share becomes the new head.
+            auto old_tail = m_heads[tail];
+            m_heads.erase(tail);
+            m_heads[head] = old_tail;
+            m_tails[old_tail].erase(tail);
+            m_tails[old_tail].insert(head);
+        }
+        else if (head_in_tails)
+        {
+            // ONLY_TAILS: extend chain from the bottom.
+            // head was a tail → shares above now reach deeper via new share.
+            auto heads_above = m_tails[head];
+            m_tails.erase(head);
+            for (auto& h : heads_above)
+                m_heads[h] = tail;
+            m_tails[tail].insert(heads_above.begin(), heads_above.end());
+        }
+        else
+        {
+            // NEW_FORK: disconnected chain segment.
+            m_heads[head] = tail;
+            m_tails[tail].insert(head);
         }
     }
 
@@ -295,40 +208,25 @@ public:
 
     int32_t get_height(const hash_t& hash)
     {
-        // Walk through chain segments for new_fork shares where
-        // accumulated values only cover the fork branch, not the parent.
-        int32_t total = 0;
+        // Walk via m_shares[tail] hash lookup — matches p2pool's
+        // get_delta_to_last(). O(n) but n ≤ 2*CHAIN_LENGTH.
+        int32_t h = 0;
         hash_t cur = hash;
-        for (;;)
+        while (!cur.IsNull() && m_shares.contains(cur))
         {
-            auto it = m_shares.find(cur);
-            if (it == m_shares.end()) break;
-            total += it->second.index->height;
-            auto* idx = it->second.index;
-            while (idx->prev) idx = idx->prev;
-            if (idx->tail.IsNull() || !m_shares.contains(idx->tail))
-                break;
-            cur = idx->tail;
+            ++h;
+            cur = m_shares[cur].index->tail;
         }
-        return total;
+        return h;
     }
 
     hash_t get_last(const hash_t& hash)
     {
-        // Walk prev pointers to the segment bottom, then follow tail
-        // across new_fork boundaries until we reach a true last (hash
-        // NOT in the chain).
-        auto* idx = m_shares[hash].index;
-        while (idx->prev)
-            idx = idx->prev;
-        // Follow through segment boundaries (new_fork: prev=null but tail in chain)
-        while (!idx->tail.IsNull() && m_shares.contains(idx->tail))
-        {
-            idx = m_shares[idx->tail].index;
-            while (idx->prev)
-                idx = idx->prev;
-        }
-        return idx->tail;
+        // Walk via tail until we reach a hash NOT in the chain.
+        hash_t cur = hash;
+        while (!cur.IsNull() && m_shares.contains(cur))
+            cur = m_shares[cur].index->tail;
+        return cur;
     }
 
     struct height_and_last
@@ -344,24 +242,15 @@ public:
 
     hash_t get_nth_parent_key(const hash_t& hash, int32_t n)
     {
-        auto* index = get_index(hash);
+        // Walk n steps via tail (prev_hash) lookup.
+        hash_t cur = hash;
         for (int i = 0; i < n; i++)
         {
-            if (index->prev)
-            {
-                index = index->prev;
-            }
-            else if (!index->tail.IsNull() && m_shares.contains(index->tail))
-            {
-                // Cross segment boundary (new_fork case)
-                index = m_shares[index->tail].index;
-            }
-            else
-            {
+            if (cur.IsNull() || !m_shares.contains(cur))
                 throw std::invalid_argument("get_nth_parent_key: chain too short");
-            }
+            cur = m_shares[cur].index->tail;
         }
-        return index->head;
+        return cur;
     }
 
     bool is_child_of(const hash_t& item, const hash_t& possible_child)
@@ -379,18 +268,18 @@ public:
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
-    // last------(ancestor------item]--->best
-    index_t get_interval(hash_t item, hash_t ancestor)
+    // Compute accumulated work from hash back to chain tail.
+    // O(n) walk — used by scoring (Phase 3/4) to compare chain quality.
+    uint288 get_work(const hash_t& hash)
     {
-        // Subtracts ancestor's accumulated values from item's.
-        // Works correctly when both shares are on the same segment
-        // (connected via prev pointers with correct accumulated values).
-        // Callers that may cross segments (pool hashrate) should use
-        // the verified chain which has no new_fork issues.
-        index_t result = *get_index(item);
-        index_t* ances = get_index(ancestor);
-        result.operation(ances, index_t::operation_type::minus);
-        return result;
+        uint288 total;
+        hash_t cur = hash;
+        while (!cur.IsNull() && m_shares.contains(cur))
+        {
+            total += m_shares[cur].index->work;
+            cur = m_shares[cur].index->tail;
+        }
+        return total;
     }
 
     
@@ -518,44 +407,25 @@ public:
         if (!m_shares.contains(head) || max_size == 0)
             return 0;
 
-        // Walk from head toward tail via prev pointers
-        std::vector<index_t*> chain_indexes;
-        auto* current = get_index(head);
-        chain_indexes.push_back(current);
-        while (current->prev)
+        // Walk from head toward tail via hash lookup, collect all hashes
+        std::vector<hash_t> chain_hashes;
+        hash_t cur = head;
+        while (!cur.IsNull() && m_shares.contains(cur))
         {
-            current = current->prev;
-            chain_indexes.push_back(current);
+            chain_hashes.push_back(cur);
+            cur = m_shares[cur].index->tail;
         }
 
-        if (chain_indexes.size() <= max_size)
+        if (chain_hashes.size() <= max_size)
             return 0;
 
-        // chain_indexes[max_size-1] = boundary (new tail-end)
-        // chain_indexes[max_size]   = first share to evict
-        index_t* boundary = chain_indexes[max_size - 1];
-        index_t* evicted_top = chain_indexes[max_size];
-
-        // Subtract the evicted portion's accumulated data from every
-        // index above (and including) the boundary
-        for (size_t i = 0; i < max_size; ++i)
-            chain_indexes[i]->operation(evicted_top, index_t::operation_type::minus);
-
-        // Detach boundary from the evicted portion
-        boundary->prev = nullptr;
-
-        // Collect hashes to remove
-        std::vector<hash_t> to_remove;
-        to_remove.reserve(chain_indexes.size() - max_size);
-        for (size_t i = max_size; i < chain_indexes.size(); ++i)
-            to_remove.push_back(chain_indexes[i]->head);
+        // chain_hashes[max_size-1] = boundary (kept, new deepest share)
+        hash_t boundary_hash = chain_hashes[max_size - 1];
+        hash_t new_tail_ref = m_shares[boundary_hash].index->tail;
 
         // Update head/tail tracking
         hash_t old_tail_ref = m_heads[head];
-        hash_t new_tail_ref = boundary->tail; // boundary share's prev_hash
-
         m_heads[head] = new_tail_ref;
-
         if (m_tails.contains(old_tail_ref))
         {
             m_tails[old_tail_ref].erase(head);
@@ -564,31 +434,34 @@ public:
         }
         m_tails[new_tail_ref].insert(head);
 
-        // Remove evicted shares and free their indexes
+        // Remove evicted shares (from max_size onward)
+        std::vector<hash_t> to_remove(chain_hashes.begin() + max_size, chain_hashes.end());
         for (auto& h : to_remove)
         {
-            // Clean up any stale head/tail entries
             m_heads.erase(h);
             m_tails.erase(h);
-
+            // Clean reverse map
             auto it = m_shares.find(h);
             if (it != m_shares.end())
             {
+                auto& t = it->second.index->tail;
+                if (!t.IsNull()) {
+                    auto pr = m_reverse.find(t);
+                    if (pr != m_reverse.end()) {
+                        pr->second.erase(h);
+                        if (pr->second.empty()) m_reverse.erase(pr);
+                    }
+                }
+                m_reverse.erase(h);
                 if (deferred_destroy && owns_data)
-                {
-                    // Move share variant out for deferred destruction
                     deferred_destroy->push_back(std::move(it->second.share));
-                }
                 else if (owns_data)
-                {
                     it->second.share.destroy();
-                }
                 delete it->second.index;
                 m_shares.erase(it);
             }
         }
 
-        // Collect evicted hashes for caller (e.g. LevelDB pruning)
         if (evicted_hashes)
             evicted_hashes->insert(evicted_hashes->end(), to_remove.begin(), to_remove.end());
 
@@ -596,11 +469,8 @@ public:
     }
 
     /// Remove a single share from the chain.
-    /// If the share is a head (tip), the chain is shortened and its
-    /// predecessor becomes the new head.
-    /// If the share is mid-chain, the chain is split: children above it
-    /// become a separate fork whose tail now points past the removed share.
-    /// Returns true if the share was found and removed.
+    /// Matches p2pool forest.py remove() — pure set operations on heads/tails/reverse.
+    /// No pointer fixup needed (no prev pointers exist).
     bool remove(const hash_t& hash, bool owns_data = true)
     {
         auto it = m_shares.find(hash);
@@ -608,12 +478,9 @@ public:
             return false;
 
         index_t* idx = it->second.index;
-        hash_t share_tail = idx->tail; // == share->m_prev_hash
+        hash_t share_tail = idx->tail; // share's prev_hash
 
-        // Determine if this share is currently a head
-        bool is_head = m_heads.contains(hash);
-
-        // Find child shares via reverse map (O(1) instead of O(N) scan)
+        // Find children via reverse map
         std::vector<hash_t> children;
         {
             auto rev_it = m_reverse.find(hash);
@@ -621,116 +488,86 @@ public:
                 children.assign(rev_it->second.begin(), rev_it->second.end());
         }
 
-        // Remove this share from parent's reverse entry
+        // Remove from parent's reverse entry
         if (!share_tail.IsNull()) {
-            auto parent_rev = m_reverse.find(share_tail);
-            if (parent_rev != m_reverse.end()) {
-                parent_rev->second.erase(hash);
-                if (parent_rev->second.empty())
-                    m_reverse.erase(parent_rev);
+            auto pr = m_reverse.find(share_tail);
+            if (pr != m_reverse.end()) {
+                pr->second.erase(hash);
+                if (pr->second.empty()) m_reverse.erase(pr);
             }
         }
-        // Remove our reverse entry (children will update theirs)
         m_reverse.erase(hash);
+
+        bool is_head = m_heads.contains(hash);
 
         if (is_head && children.empty())
         {
-            // Simple case: head with no children above us.
-            // Remove from heads, update tails.
-            hash_t our_tail = m_heads[hash]; // the tail this fork reaches
+            // Leaf share (head, no children): just remove from heads/tails.
+            hash_t our_tail = m_heads[hash];
             m_heads.erase(hash);
-
-            if (m_tails.contains(our_tail))
-            {
+            if (m_tails.contains(our_tail)) {
                 m_tails[our_tail].erase(hash);
                 if (m_tails[our_tail].empty())
                     m_tails.erase(our_tail);
             }
-
-            // Parent becomes a new head (necessary for chain traversal).
-            // clean_tracker will eat this new head on the next cycle if it's
-            // also stale (>300s old). This progressively shortens the fork.
-            if (idx->prev)
+            // If parent is in the chain, it becomes a new head
+            if (!share_tail.IsNull() && m_shares.contains(share_tail)
+                && !m_heads.contains(share_tail))
             {
-                hash_t prev_hash = idx->prev->head;
-                if (!m_heads.contains(prev_hash))
-                {
-                    m_heads[prev_hash] = our_tail;
-                    m_tails[our_tail].insert(prev_hash);
+                m_heads[share_tail] = our_tail;
+                m_tails[our_tail].insert(share_tail);
+            }
+        }
+        else if (is_head && !children.empty())
+        {
+            // Head with children above: children stay, our head entry is replaced.
+            // Each child's chain now has tail = share_tail (our parent).
+            hash_t our_tail = m_heads[hash];
+            m_heads.erase(hash);
+            if (m_tails.contains(our_tail)) {
+                m_tails[our_tail].erase(hash);
+                if (m_tails[our_tail].empty())
+                    m_tails.erase(our_tail);
+            }
+            // Children become roots of new segments with tail = share_tail
+            for (auto& ch : children) {
+                // Find the head that reaches this child
+                // Walk from ch upward via reverse map to find its head
+                hash_t h = ch;
+                while (!m_heads.contains(h)) {
+                    auto r = m_reverse.find(h);
+                    if (r == m_reverse.end() || r->second.empty()) break;
+                    h = *r->second.begin();
+                }
+                if (m_heads.contains(h)) {
+                    m_heads[h] = share_tail;
+                    m_tails[share_tail].insert(h);
                 }
             }
         }
         else
         {
-            // Mid-chain or has children: detach children so they form
-            // new forks whose tail points past us to share_tail.
-            for (auto& child_hash : children)
-            {
-                index_t* child_idx = m_shares[child_hash].index;
-
-                // Walk from child up to the head of its fork, subtracting
-                // our contribution.
-                // Detach prev pointer — child now points past removed share.
-                // Check that the grandparent still exists (it may have been
-                // removed in a previous remove() call in the same batch).
-                if (idx->prev && m_shares.contains(idx->prev->head))
-                    child_idx->prev = idx->prev;
-                else
-                    child_idx->prev = nullptr;
-                // Recalculate from scratch if needed (heights will be off
-                // by idx->height, but since idx->height == 1 for a single
-                // share we can just decrement).
-                // Walk up from child_hash to its head:
-                hash_t head_of_fork = child_hash;
-                for (auto& [h, _] : m_heads)
-                {
-                    // Check if child_hash's fork reaches this head
-                    if (m_shares.contains(h))
-                    {
-                        index_t* cur = m_shares[h].index;
-                        while (cur)
-                        {
-                            if (cur->head == child_hash)
-                            {
-                                head_of_fork = h;
-                                break;
-                            }
-                            cur = cur->prev;
-                        }
-                    }
-                }
-
-                // Update the head→tail mapping
-                if (m_heads.contains(head_of_fork))
-                {
-                    hash_t old_tail = m_heads[head_of_fork];
-                    m_heads[head_of_fork] = share_tail;
-
-                    if (m_tails.contains(old_tail))
-                    {
-                        m_tails[old_tail].erase(head_of_fork);
-                        if (m_tails[old_tail].empty())
-                            m_tails.erase(old_tail);
-                    }
-                    m_tails[share_tail].insert(head_of_fork);
-                }
+            // Mid-chain (not a head): children's chains now skip over us.
+            // Find all heads that pass through us and update their tails.
+            for (auto& ch : children) {
+                // Add children to parent's reverse map
+                if (!share_tail.IsNull())
+                    m_reverse[share_tail].insert(ch);
             }
-
-            // If we were a head, remove that entry
-            if (is_head)
-            {
-                hash_t our_tail = m_heads[hash];
-                m_heads.erase(hash);
-                if (m_tails.contains(our_tail))
-                {
-                    m_tails[our_tail].erase(hash);
-                    if (m_tails[our_tail].empty())
-                        m_tails.erase(our_tail);
+            // Update head→tail mappings: any head whose chain passed
+            // through us now has a deeper tail (share_tail instead of hash).
+            // Since we're mid-chain, our hash was in some tails entry.
+            if (m_tails.contains(hash)) {
+                auto heads_above = m_tails[hash];
+                m_tails.erase(hash);
+                for (auto& h : heads_above) {
+                    m_heads[h] = share_tail;
+                    m_tails[share_tail].insert(h);
                 }
             }
         }
 
-        // Free the share object and index, then remove from m_shares
+        // Free share data and index
         if (owns_data)
             it->second.share.destroy();
         delete idx;

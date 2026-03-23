@@ -285,75 +285,23 @@ class ShareIndex : public chain::ShareIndex<uint256, ShareType, ShareHasher, Sha
     using base_index = chain::ShareIndex<uint256, ShareType, ShareHasher, ShareIndex>;
 
 public:
-    // Accumulation fields for prefix-sum computation
-    uint288 work;
-    uint288 min_work;
-    uint288 total_weight;
-    uint288 total_donation_weight;
-    std::map<std::vector<unsigned char>, uint288> weight_amounts;
+    // Per-share fields (NOT accumulated — each share stores only its own values).
+    // Accumulated values are computed on-the-fly by walking m_shares[tail].
+    uint288 work;       // target_to_average_attempts(bits)
+    uint288 min_work;   // target_to_average_attempts(max_bits)
 
-    // Per-share metadata (not accumulated)
+    // Per-share metadata
     int64_t time_seen{0};
-    int32_t naughty{0};  // >0 = this share or ancestor would make invalid block (weight/size)
+    int32_t naughty{0};
 
-    ShareIndex() : base_index(), work(0), min_work(0), total_weight(0), total_donation_weight(0) {}
+    ShareIndex() : base_index(), work(0), min_work(0) {}
 
     template <typename ShareT> ShareIndex(ShareT* share) : base_index(share)
     {
-        auto target = chain::bits_to_target(share->m_bits);
-        auto max_target = chain::bits_to_target(share->m_max_bits);
-
-        auto att = chain::target_to_average_attempts(target);
-        work = att;
-        min_work = chain::target_to_average_attempts(max_target);
-
-        // Get address as byte vector for weight tracking
-        std::vector<unsigned char> addr_bytes;
-        if constexpr (requires { std::declval<ShareT>().m_address; })
-        {
-            addr_bytes = share->m_address.m_data;
-        }
-        else if constexpr (requires { std::declval<ShareT>().m_pubkey_hash; })
-        {
-            addr_bytes = share->m_pubkey_hash.GetChars();
-        }
-
-        total_weight = att * 65535;
-        total_donation_weight = att * static_cast<uint32_t>(share->m_donation);
-        weight_amounts[addr_bytes] = att * static_cast<uint32_t>(65535 - share->m_donation);
-
+        work = chain::target_to_average_attempts(chain::bits_to_target(share->m_bits));
+        min_work = chain::target_to_average_attempts(chain::bits_to_target(share->m_max_bits));
         time_seen = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-    }
-
-protected:
-    void add(ShareIndex* index) override
-    {
-        work += index->work;
-        min_work += index->min_work;
-        total_weight += index->total_weight;
-        total_donation_weight += index->total_donation_weight;
-        for (const auto& [k, v] : index->weight_amounts)
-        {
-            if (weight_amounts.contains(k))
-                weight_amounts[k] += v;
-            else
-                weight_amounts[k] = v;
-        }
-    }
-
-    void sub(ShareIndex* index) override
-    {
-        work -= index->work;
-        min_work -= index->min_work;
-        total_weight -= index->total_weight;
-        total_donation_weight -= index->total_donation_weight;
-        for (const auto& [k, v] : index->weight_amounts)
-        {
-            weight_amounts[k] -= v;
-            if (weight_amounts[k].IsNull())
-                weight_amounts.erase(k);
-        }
     }
 };
 
