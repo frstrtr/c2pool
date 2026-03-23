@@ -1116,6 +1116,18 @@ void StratumSession::send_notify_work(bool force_clean)
         }
     }
 
+    // p2pool model: stratum difficulty = pool share target.
+    // Every submission that meets this difficulty IS a pool share.
+    // No separate VARDIFF — the share target IS the miner's difficulty.
+    uint32_t sb = mining_interface_->m_share_bits.load();
+    if (sb != 0) {
+        double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
+        if (share_diff > 0 && std::abs(share_diff - hashrate_tracker_.get_current_difficulty()) > 1e-12) {
+            send_set_difficulty(share_diff);
+            hashrate_tracker_.set_difficulty_hint(share_diff);
+        }
+    }
+
     notification["params"] = nlohmann::json::array({
         job_id, prevhash, coinb1, coinb2, merkle_branches,
         version, nbits, ntime, clean_jobs
