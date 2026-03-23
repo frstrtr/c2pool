@@ -1019,10 +1019,12 @@ public:
         if (start_height > max_shares)
             end_hash = chain.get_nth_parent_key(start, max_shares);
 
-        // If end_hash is the chain tail (not an actual share), walk manually
-        // to collect weights. This happens when the chain is shorter than
-        // max_shares — the tail is the null prev_hash of the genesis share.
-        if (!chain.contains(end_hash)) {
+        // Walk shares individually via prev_hash (hash-dict navigation).
+        // This works across new_fork segment boundaries — unlike
+        // get_interval() which subtracts accumulated values that are
+        // wrong for fork shares.  O(max_shares) but max_shares ≤
+        // CHAIN_LENGTH (800), each step is O(1) hash lookup.
+        {
             CumulativeWeights result;
             uint256 cur = start;
             for (int32_t i = 0; i < max_shares && !cur.IsNull() && chain.contains(cur); ++i) {
@@ -1069,24 +1071,6 @@ public:
             }
             return result;
         }
-
-        // Get the full interval from start to end
-        auto interval = chain.get_interval(start, end_hash);
-
-        // If total weight is within desired, return the full interval's weights (O(1))
-        if (interval.total_weight <= desired_weight)
-        {
-            return {
-                interval.weight_amounts,
-                interval.total_weight,
-                interval.total_donation_weight
-            };
-        }
-
-        // Slow path: O(log n) skip list query
-        ensure_weights_skiplist();
-        auto result = m_weights_skiplist->query(start, max_shares, desired_weight);
-        return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
     // -- V36 PPLNS with exponential depth-decay --
