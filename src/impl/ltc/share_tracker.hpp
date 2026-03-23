@@ -448,10 +448,12 @@ public:
             }
         }
 
-        // Remove bad shares AND their orphaned descendants.
-        // When a bad share is removed, its children become unrooted
-        // (last != null, walk_count=0) and can never be verified.
-        // p2pool's forest.py cascades removal. We do the same here.
+        // Remove bad shares (p2pool data.py:2133-2145).
+        // p2pool removes ONLY the bad shares themselves — NO cascade.
+        // clean_tracker() handles stale heads later (300s age check).
+        // The previous cascade removal was catastrophically wrong:
+        // it followed reverse map which includes MAIN CHAIN children,
+        // destroying the entire chain above the fork point.
         {
             std::vector<uint256> to_remove;
             for (const auto& bad : bads)
@@ -459,19 +461,6 @@ public:
                 if (verified.contains(bad))
                     continue;
                 to_remove.push_back(bad);
-            }
-            // Cascade: collect all descendants of bad shares
-            for (size_t i = 0; i < to_remove.size(); ++i)
-            {
-                auto rev_it = chain.get_reverse().find(to_remove[i]);
-                if (rev_it != chain.get_reverse().end())
-                {
-                    for (const auto& child : rev_it->second)
-                    {
-                        if (!verified.contains(child))
-                            to_remove.push_back(child);
-                    }
-                }
             }
             for (const auto& bad : to_remove)
             {
