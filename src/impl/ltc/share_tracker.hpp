@@ -160,6 +160,15 @@ public:
         // verified and the verified gap grows indefinitely.
         if (height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
         {
+            // Debug: why is the chain unrooted?
+            static int unrooted_log = 0;
+            if (unrooted_log++ < 10) {
+                bool last_in_chain = chain.contains(last);
+                LOG_WARNING << "[UNROOTED] share=" << share_hash.GetHex().substr(0,16)
+                            << " height=" << height << " last=" << last.GetHex().substr(0,16)
+                            << " last_in_chain=" << last_in_chain
+                            << " chain_size=" << chain.size();
+            }
             // Check if parent is already verified — if so, we can verify this share
             uint256 prev_hash;
             chain.get_share(share_hash).invoke([&](auto* obj) {

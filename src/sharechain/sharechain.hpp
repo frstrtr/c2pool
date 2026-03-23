@@ -224,8 +224,13 @@ public:
     {
         // Walk via tail until we reach a hash NOT in the chain.
         hash_t cur = hash;
+        int steps = 0;
         while (!cur.IsNull() && m_shares.contains(cur))
+        {
             cur = m_shares[cur].index->tail;
+            if (++steps > 100000)
+                break; // cycle guard
+        }
         return cur;
     }
 
