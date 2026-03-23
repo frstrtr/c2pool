@@ -675,6 +675,9 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
 {
     std::vector<unsigned char> script;
     auto h = hash.GetChars();
+    // uint160::GetChars() returns little-endian (internal storage order).
+    // Script pubkey_hash is big-endian (network byte order).
+    std::reverse(h.begin(), h.end());
     switch (type)
     {
     case 1: // P2WPKH: OP_0 <20>
@@ -1500,7 +1503,7 @@ bool share_check(const ShareT& share,
 
             // --- Detailed diagnostics: re-run with full dump ---
             static int s_diag_count = 0;
-            if (s_diag_count++ < 2)
+            if (s_diag_count++ < 5)
             {
                 LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump:";
                 generate_share_transaction(share, tracker, true);
