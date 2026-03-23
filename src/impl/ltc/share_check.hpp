@@ -674,13 +674,14 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uint8_t type = 0)
 {
     std::vector<unsigned char> script;
-    auto h = hash.GetChars();
-    // uint160::GetChars() returns little-endian (internal storage order).
-    // Script pubkey_hash is big-endian (network byte order).
-    std::reverse(h.begin(), h.end());
+    auto h = hash.GetChars(); // little-endian (internal storage order)
     switch (type)
     {
     case 1: // P2WPKH: OP_0 <20>
+        // p2pool uses '{:040x}'.format(hash) for P2WPKH → big-endian.
+        // But IntType(160).pack() for P2PKH/P2SH → little-endian.
+        // So ONLY P2WPKH needs reversal.
+        std::reverse(h.begin(), h.end());
         script.reserve(22);
         script.push_back(0x00);
         script.push_back(0x14);

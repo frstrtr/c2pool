@@ -191,24 +191,10 @@ public:
         }
         catch (const std::exception& e)
         {
-            // GENTX mismatch: c2pool's PPLNS walk may differ from p2pool's.
-            // Accept the share anyway so peer chains can be adopted.
-            // TODO: fix PPLNS walk to match p2pool exactly (Pass 2 blueprint)
-            bool is_gentx = std::string(e.what()).find("GenerateShareTransaction") != std::string::npos
-                         || std::string(e.what()).find("GENTX") != std::string::npos
-                         || std::string(e.what()).find("coinbase") != std::string::npos;
-            if (is_gentx) {
-                static int gentx_warn = 0;
-                if (gentx_warn++ < 20)
-                    LOG_WARNING << "GENTX-ACCEPT (trusting peer): " << share_hash.ToString().substr(0,16)
-                                << " height=" << height << ": " << e.what();
-                // Fall through to add to verified despite mismatch
-            } else {
-                LOG_WARNING << "attempt_verify FAILED for " << share_hash.ToString().substr(0,16)
-                            << " height=" << height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
-                            << " error: " << e.what();
-                return false;
-            }
+            LOG_WARNING << "attempt_verify FAILED for " << share_hash.ToString().substr(0,16)
+                        << " height=" << height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                        << " error: " << e.what();
+            return false;
         }
 
         // Add to verified chain
