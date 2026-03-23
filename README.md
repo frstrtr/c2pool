@@ -4,8 +4,10 @@
 
 C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC). DigiByte Scrypt support planned as an additional parent chain.
 
-Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>  
+Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
+
+> **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
 
 ---
 
