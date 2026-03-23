@@ -271,15 +271,29 @@ public:
         if (!block_height.has_value() || block_height.value() >= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
-        // Get accumulated work between share_hash and end_point on the verified chain.
-        // May throw if concurrent trim removed end_point between the
-        // get_nth_parent_key call above and this point.
-        auto interval = verified.get_interval(share_hash, end_point);
+        // Compute work between share_hash and end_point by walking shares
+        // individually. get_interval() breaks for new_fork shares in
+        // verified chain (accumulated values don't span segments).
+        uint288 total_work;
+        auto v_dist = verified.get_height(share_hash) - verified.get_height(end_point);
+        if (v_dist > 0) {
+            try {
+                auto view = verified.get_chain(share_hash, v_dist);
+                for (auto [hash, data] : view) {
+                    if (hash == end_point) break;
+                    data.share.invoke([&](auto* obj) {
+                        total_work += chain::target_to_average_attempts(
+                            chain::bits_to_target(obj->m_bits));
+                    });
+                }
+            } catch (...) {}
+        }
+
         auto time_span = (-block_height.value() + 1) * 150; // LTC BLOCK_PERIOD = 150s
         if (time_span <= 0)
             time_span = 1;
 
-        score_res = interval.work / static_cast<uint32_t>(time_span);
+        score_res = total_work / static_cast<uint32_t>(time_span);
         return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
     }
 
@@ -681,35 +695,56 @@ public:
     // -- Pool hashrate estimation --
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
-        // Use VERIFIED chain — it has correct accumulated values (shares
-        // added in order via Phase 2, no new_fork segment issues).
-        // The raw chain's get_interval breaks for fork shares.
-        if (dist < 2 || !verified.contains(share_hash))
+        if (dist < 2 || !chain.contains(share_hash))
             return uint288(0);
 
-        auto actual_height = verified.get_height(share_hash);
+        auto actual_height = chain.get_height(share_hash);
         if (actual_height < dist)
             return uint288(0);
 
-        auto far_hash = verified.get_nth_parent_key(share_hash, dist - 1);
-        auto interval = verified.get_interval(share_hash, far_hash);
-
-        // Get timestamps from chain (shares have same data in both)
+        // Walk the chain via CIterator (handles new_fork segment boundaries)
+        // and sum each share's individual work. This avoids get_interval()
+        // which breaks for fork shares (accumulated values don't include
+        // parent segment). O(dist) but dist ≤ TARGET_LOOKBEHIND (200).
+        uint288 total_work;
+        uint288 total_min_work;
         uint32_t near_ts = 0, far_ts = 0;
-        chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
-        chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+        int walked = 0;
+        try {
+            auto view = chain.get_chain(share_hash, dist);
+            for (auto [hash, data] : view)
+            {
+                data.share.invoke([&](auto* obj) {
+                    if (walked == 0)
+                        near_ts = obj->m_timestamp;
+                    far_ts = obj->m_timestamp;
+                    auto target = chain::bits_to_target(obj->m_bits);
+                    auto att = chain::target_to_average_attempts(target);
+                    total_work += att;
+                    // min_work: use max_target (easier target = min work per share)
+                    auto max_target = chain::bits_to_target(obj->m_max_bits);
+                    total_min_work += chain::target_to_average_attempts(max_target);
+                });
+                ++walked;
+            }
+        } catch (...) {
+            return uint288(0);
+        }
+
+        if (walked < 2)
+            return uint288(0);
 
         auto time = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
         if (time <= 0)
             time = 1;
 
-        auto result = (use_min_work ? interval.min_work : interval.work) / static_cast<uint32_t>(time);
+        auto result = (use_min_work ? total_min_work : total_work) / static_cast<uint32_t>(time);
         {
             static int aps_log = 0;
             if (aps_log++ < 5)
                 LOG_INFO << "[APS] dist=" << dist << " time=" << time
-                         << " min_work=" << interval.min_work.GetLow64()
-                         << " work=" << interval.work.GetLow64()
+                         << " min_work=" << total_min_work.GetLow64()
+                         << " work=" << total_work.GetLow64()
                          << " use_min=" << use_min_work
                          << " aps=" << result.GetLow64();
         }
