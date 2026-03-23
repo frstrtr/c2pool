@@ -2920,17 +2920,9 @@ int main(int argc, char* argv[]) {
                     LOG_INFO << "[Sharechain] No shares loaded from storage";
                     LOG_INFO << "[Sharechain] Startup mode: " << mode_str;
 
-                    if (startup_mode == StartupMode::GENESIS) {
-                        LOG_INFO << "[Sharechain] GENESIS MODE — creating new chain immediately";
-                        LOG_INFO << "[Sharechain] First share will have previous_share_hash=null";
-                        if (network_id != 0)
-                            LOG_INFO << "[Sharechain] Private chain network_id="
-                                     << std::hex << network_id << std::dec;
-                    }
-                    else if (startup_mode == StartupMode::WAIT) {
+                    if (startup_mode == StartupMode::WAIT) {
                         LOG_INFO << "[Sharechain] WAIT MODE — waiting indefinitely for peers with shares";
                         LOG_INFO << "[Sharechain] Will NOT create genesis. Use --genesis to override.";
-                        // Pump ioc until shares arrive or shutdown
                         while (!g_shutdown_requested) {
                             ioc.restart();
                             ioc.run_for(std::chrono::seconds(1));
@@ -2943,26 +2935,16 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     else {
-                        // AUTO mode: wait startup_timeout seconds for peers
-                        LOG_INFO << "[Sharechain] AUTO MODE — waiting " << startup_timeout
-                                 << "s for peers, then genesis if none";
-                        auto deadline = std::chrono::steady_clock::now()
-                                      + std::chrono::seconds(startup_timeout);
-                        while (!g_shutdown_requested
-                               && std::chrono::steady_clock::now() < deadline) {
-                            ioc.restart();
-                            ioc.run_for(std::chrono::seconds(1));
-                            best = p2p_node->best_share_hash();
-                            if (!best.IsNull()) {
-                                LOG_INFO << "[Sharechain] Received shares from peer! best="
-                                         << best.GetHex().substr(0, 16) << "...";
-                                break;
-                            }
-                        }
-                        if (best.IsNull() && !g_shutdown_requested) {
-                            LOG_INFO << "[Sharechain] No peers found after "
-                                     << startup_timeout << "s — entering GENESIS MODE";
-                        }
+                        // AUTO/GENESIS: proceed immediately (p2pool PERSIST=False behavior).
+                        // Genesis share is created on-demand when the miner asks for work
+                        // and best_share is still null.  If peers send shares first,
+                        // best_share gets set → no genesis needed.
+                        // This matches p2pool: get_work() checks best_share_var.value,
+                        // creates genesis only when it's None at the time of work generation.
+                        LOG_INFO << "[Sharechain] Ready — genesis on first work request if no peers";
+                        if (network_id != 0)
+                            LOG_INFO << "[Sharechain] Private chain network_id="
+                                     << std::hex << network_id << std::dec;
                     }
                 } else {
                     LOG_INFO << "[Sharechain] Shares available, best="
