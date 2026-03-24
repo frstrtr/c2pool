@@ -35,10 +35,12 @@ struct TailScore
 {
     int32_t chain_len{};
     uint288 hashrate;
+    uint288 best_head_work;  // tiebreak: raw chain work of best head
 
     friend bool operator<(const TailScore& a, const TailScore& b)
     {
-        return std::tie(a.chain_len, a.hashrate) < std::tie(b.chain_len, b.hashrate);
+        return std::tie(a.chain_len, a.hashrate, a.best_head_work)
+             < std::tie(b.chain_len, b.hashrate, b.best_head_work);
     }
 };
 
@@ -621,6 +623,7 @@ public:
             {
                 try {
                     auto s = score(best_head, block_rel_height_func);
+                    s.best_head_work = best_work;  // tiebreak by total work
                     decorated_tails.push_back({s, tail_hash});
                 } catch (const std::exception&) {
                     // Chain was concurrently modified (trim removed an
