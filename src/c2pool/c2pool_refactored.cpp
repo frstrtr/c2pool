@@ -1832,6 +1832,24 @@ int main(int argc, char* argv[]) {
                 return p2p_node->best_share_hash();
             });
 
+            // Walk back from best_share to find nearest PEER share for work template.
+            // c2pool fork shares as prev → shares on side branches → 0% PPLNS.
+            // Peer share as prev → shares extend main chain → 33% PPLNS.
+            web_server.get_mining_interface()->set_find_peer_prev_fn(
+                [&p2p_node](const uint256& best) -> uint256 {
+                    auto& chain = p2p_node->tracker().chain;
+                    uint256 cur = best;
+                    for (int i = 0; i < 50 && !cur.IsNull() && chain.contains(cur); ++i) {
+                        bool is_local = false;
+                        chain.get_share(cur).invoke([&](auto* obj) {
+                            is_local = (obj->peer_addr.port() == 0);
+                        });
+                        if (!is_local) return cur; // found peer share
+                        cur = chain.get_index(cur)->tail;
+                    }
+                    return best; // fallback: no peer share found
+                });
+
             // Wire live sharechain statistics into the REST API.
             web_server.get_mining_interface()->set_sharechain_stats_fn([&p2p_node]() {
                 nlohmann::json result;

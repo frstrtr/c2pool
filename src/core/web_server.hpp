@@ -334,6 +334,12 @@ public:
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = std::move(fn); }
     std::function<uint256()> get_best_share_hash_fn() const { return m_best_share_hash_fn; }
 
+    // Hook: walk back from best_share to find nearest peer share for work template.
+    // Ensures c2pool shares extend the main chain, not local forks.
+    using find_peer_prev_fn_t = std::function<uint256(const uint256&)>;
+    void set_find_peer_prev_fn(find_peer_prev_fn_t fn) { m_find_peer_prev_fn = std::move(fn); }
+    find_peer_prev_fn_t get_find_peer_prev_fn() const { return m_find_peer_prev_fn; }
+
     // Hook: computes PPLNS expected payouts from the share tracker
     using pplns_fn_t = std::function<std::map<std::vector<unsigned char>, double>(
         const uint256& best_hash, const uint256& block_target,
@@ -676,6 +682,8 @@ private:
 
     // Block-found callback (header_hex, stale_info: 0=none, 253=orphan, 254=doa)
     std::function<void(const std::string&, int)> m_on_block_submitted;
+
+    find_peer_prev_fn_t m_find_peer_prev_fn;
 
     // P2P block relay callback — receives the full block hex for direct P2P broadcast.
     // Only called for accepted blocks (not stale/orphan/doa).

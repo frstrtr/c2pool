@@ -1016,10 +1016,17 @@ void StratumSession::send_notify_work(bool force_clean)
     // This ensures the OP_RETURN commitment matches this miner's specific coinbase.
     // Freeze share chain tip ONCE — used for both ref_hash computation
     // and the job's stored prev_share_hash to avoid race conditions.
+    // Walk back from best_share to find the nearest PEER share.
+    // c2pool fork shares as prev → shares end up on fork branches → 0% PPLNS.
+    // Using a peer share as prev → shares extend the main chain → competitive PPLNS.
     uint256 frozen_prev_share;
     MiningInterface::CoinbaseResult cbr;
     if (auto fn = mining_interface_->get_best_share_hash_fn())
+    {
         frozen_prev_share = fn();
+        if (auto find_fn = mining_interface_->get_find_peer_prev_fn())
+            frozen_prev_share = find_fn(frozen_prev_share);
+    }
     {
         // Build payout script from username (authorized address: P2PKH, P2SH, or bech32)
         std::vector<unsigned char> payout_script;
