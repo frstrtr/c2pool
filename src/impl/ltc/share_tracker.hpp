@@ -158,21 +158,24 @@ public:
         // Fragmentation doesn't affect scoring because scoring uses
         // chain.get_work() (SubsetTracker pattern), not verified.get_work().
 
-        auto [height, last] = chain.get_height_and_last(share_hash);
+        // p2pool: height, last = self.get_height_and_last(share.hash)
+        // p2pool's get_height uses get_delta_to_last() which walks through
+        // SubsetTracker's cached deltas — equivalent to our acc cache.
+        // Using acc cache height (not O(n) walk) matches p2pool's pattern
+        // and gives correct height after pruning.
+        auto acc_height = chain.get_acc_height(share_hash);
+        auto last = chain.get_last(share_hash);
 
-        // p2pool: need CHAIN_LENGTH + 1 depth, or chain must be rooted (last == null).
-        // Extension: also allow if the share's PARENT is already verified —
-        // this enables forward-extension of the verified chain through unrooted
-        // peer branches. Without this, shares on unrooted chains can never be
-        // verified and the verified gap grows indefinitely.
-        if (height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
+        // p2pool: if height < self.net.CHAIN_LENGTH + 1 and last is not None:
+        //             raise AssertionError()
+        if (acc_height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
         {
             // Debug: why is the chain unrooted?
             static int unrooted_log = 0;
             if (unrooted_log++ < 10) {
                 bool last_in_chain = chain.contains(last);
                 LOG_WARNING << "[UNROOTED] share=" << share_hash.GetHex().substr(0,16)
-                            << " height=" << height << " last=" << last.GetHex().substr(0,16)
+                            << " acc_height=" << acc_height << " last=" << last.GetHex().substr(0,16)
                             << " last_in_chain=" << last_in_chain
                             << " chain_size=" << chain.size();
             }
@@ -208,7 +211,7 @@ public:
         catch (const std::exception& e)
         {
             LOG_WARNING << "attempt_verify FAILED for " << share_hash.ToString().substr(0,16)
-                        << " height=" << height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                        << " acc_height=" << acc_height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
                         << " error: " << e.what();
             return false;
         }
