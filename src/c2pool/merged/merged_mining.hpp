@@ -271,7 +271,7 @@ public:
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
     get_payouts(uint32_t chain_id, uint64_t coinbase_value) const
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (m_payout_provider) return m_payout_provider(chain_id, coinbase_value);
         return {};
     }

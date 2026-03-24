@@ -954,13 +954,19 @@ MergedMiningManager::build_merged_header_info() const
                 info.block_height, payouts, state_root);
             LOG_TRACE << "[MM-header] build_pplns_coinbase_hex returned len=" << coinbase_hex.size();
             if (coinbase_hex.empty()) continue;
+            LOG_TRACE << "[MM-header] computing hashes...";
 
             auto coinbase_bytes = from_hex(coinbase_hex);
+            LOG_TRACE << "[MM-header] cb_bytes=" << coinbase_bytes.size();
             uint256 cb_hash = Hash(coinbase_bytes);
+            LOG_TRACE << "[MM-header] collecting tx hashes...";
             auto tx_hashes = collect_tx_hashes(cb_hash, tmpl);
+            LOG_TRACE << "[MM-header] tx_hashes=" << tx_hashes.size() << " computing merkle...";
             uint256 merkle_root = compute_tx_merkle_root(tx_hashes);
+            LOG_TRACE << "[MM-header] merkle done, computing link...";
             info.coinbase_merkle_branches = compute_merkle_link(tx_hashes, 0);
-            info.coinbase_hex = coinbase_hex;  // freeze for block submission
+            LOG_TRACE << "[MM-header] link done, freezing coinbase...";
+            info.coinbase_hex = coinbase_hex;
 
             // Extract scriptSig from the coinbase for the coinbase_script field
             // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) = 41 bytes
