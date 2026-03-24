@@ -1011,10 +1011,14 @@ MergedMiningManager::build_merged_header_info_with_commitment()
     // Each MergedHeaderInfo now contains coinbase_hex — the pre-built PPLNS coinbase.
     auto header_infos = build_merged_header_info();
 
-    // Step 2: Freeze coinbase_hex + template per chain AND update commitment atomically.
-    // Matches p2pool's Phase A pattern: freeze doge_coinbase + doge_header at get_work time,
-    // then use the frozen data at submission time (Phase C).
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // Step 2: Freeze coinbase_hex + template per chain AND update commitment.
+    // Use try_lock to avoid deadlock with MM poll timer on separate thread.
+    // If locked, skip freezing — the next work push will catch up.
+    std::unique_lock<std::recursive_mutex> lock(m_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        LOG_DEBUG_POOL << "[MM] build_merged_header_info_with_commitment: mutex busy, skipping freeze";
+        return {std::move(header_infos), {}};
+    }
     for (const auto& hi : header_infos) {
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
