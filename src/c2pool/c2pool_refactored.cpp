@@ -1832,22 +1832,50 @@ int main(int argc, char* argv[]) {
                 return p2p_node->best_share_hash();
             });
 
-            // Walk back from best_share to find nearest PEER share for work template.
+            // Find the LATEST peer share for work template.
+            // Scan ALL chain heads to find the most recent peer share.
             // c2pool fork shares as prev → shares on side branches → 0% PPLNS.
-            // Peer share as prev → shares extend main chain → 33% PPLNS.
+            // Latest peer share as prev → shares extend main chain tip → 33% PPLNS.
             web_server.get_mining_interface()->set_find_peer_prev_fn(
                 [&p2p_node](const uint256& best) -> uint256 {
                     auto& chain = p2p_node->tracker().chain;
-                    uint256 cur = best;
-                    for (int i = 0; i < 50 && !cur.IsNull() && chain.contains(cur); ++i) {
+                    // Strategy: check the best share first, then scan heads
+                    // for the most recently seen peer share.
+                    uint256 best_peer;
+                    int64_t best_ts = 0;
+
+                    // Check best_share itself
+                    if (!best.IsNull() && chain.contains(best)) {
                         bool is_local = false;
-                        chain.get_share(cur).invoke([&](auto* obj) {
+                        int64_t ts = 0;
+                        chain.get_share(best).invoke([&](auto* obj) {
                             is_local = (obj->peer_addr.port() == 0);
+                            ts = obj->m_timestamp;
                         });
-                        if (!is_local) return cur; // found peer share
-                        cur = chain.get_index(cur)->tail;
+                        if (!is_local) return best;
                     }
-                    return best; // fallback: no peer share found
+
+                    // Scan heads for the most recent peer share
+                    for (auto& [head, tail] : chain.get_heads()) {
+                        if (!chain.contains(head)) continue;
+                        // Walk up to 5 shares from each head
+                        uint256 cur = head;
+                        for (int i = 0; i < 5 && !cur.IsNull() && chain.contains(cur); ++i) {
+                            bool is_local = false;
+                            int64_t ts = 0;
+                            chain.get_share(cur).invoke([&](auto* obj) {
+                                is_local = (obj->peer_addr.port() == 0);
+                                ts = obj->m_timestamp;
+                            });
+                            if (!is_local && ts > best_ts) {
+                                best_peer = cur;
+                                best_ts = ts;
+                            }
+                            cur = chain.get_index(cur)->tail;
+                        }
+                    }
+
+                    return best_peer.IsNull() ? best : best_peer;
                 });
 
             // Wire live sharechain statistics into the REST API.
