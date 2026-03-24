@@ -2138,9 +2138,8 @@ int main(int argc, char* argv[]) {
                     // NOTE: If both p2pool nodes also use pre_target3/30 (confirmed
                     // via diff=9.16e-03 on fresh chain), this will match.
                     auto desired_target = uint256();
-                    // Use frozen_prev_share for share target computation.
-                    // frozen_prev_share is already a PEER share (via find_peer_prev_fn).
-                    // This ensures aps walks through the main chain, not local forks.
+                    // With fork shares excluded from verified, best_share (= frozen_prev)
+                    // is always the main chain head. CST walks the main chain directly.
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         frozen_prev_share, timestamp, desired_target);
                     // No bits guard needed: compute_share_target's ±10% clamp

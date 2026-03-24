@@ -151,6 +151,19 @@ public:
         if (verified.contains(share_hash))
             return true;
 
+        // Only verify shares that EXTEND the verified chain:
+        // prev_hash must be in verified (or null for genesis).
+        // Fork shares (prev not verified) are skipped — they pollute
+        // verified scoring and cause best_share to pick local forks.
+        // p2pool rarely has forks so this doesn't matter there.
+        // c2pool creates many forks → must filter.
+        {
+            uint256 prev;
+            chain.get_share(share_hash).invoke([&](auto* obj) { prev = obj->m_prev_hash; });
+            if (!prev.IsNull() && !verified.contains(prev))
+                return false; // fork share — parent not verified
+        }
+
         auto [height, last] = chain.get_height_and_last(share_hash);
 
         // p2pool: need CHAIN_LENGTH + 1 depth, or chain must be rooted (last == null).
