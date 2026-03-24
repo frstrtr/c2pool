@@ -1,6 +1,7 @@
 #pragma once
 
 #include "skip_list.hpp"
+#include "tracker_view.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -57,18 +58,35 @@ class ShareChain
 public:
     ShareChain()
     {
-        // Subscribe to removed signal for skip list invalidation.
-        // Matches p2pool: TrackerSkipList.__init__ → tracker.removed.watch_weakref(self, forget_item)
-        on_removed([this](const hash_t& hash) { m_skip_list.forget_item(hash); });
+        // Subscribe to removed signal for cache invalidation.
+        // Matches p2pool: TrackerSkipList + TrackerView both subscribe to removed.
+        on_removed([this](const hash_t& hash) {
+            m_skip_list.forget_item(hash);  // skip list: clear jump entry
+            m_view.handle_removed(hash);     // tracker view: clear delta cache
+        });
 
-        // Init skip list with chain navigation callbacks
-        m_skip_list.init(
-            [this](const hash_t& h) -> hash_t {
+        auto contains_fn = [this](const hash_t& h) -> bool {
+            return m_shares.contains(h);
+        };
+        auto prev_fn = [this](const hash_t& h) -> hash_t {
+            auto it = m_shares.find(h);
+            return it != m_shares.end() ? it->second.index->tail : hash_t();
+        };
+
+        // Init skip list (O(log n) get_nth_parent)
+        m_skip_list.init(prev_fn, contains_fn);
+
+        // Init TrackerView (cached get_height/get_work/get_last)
+        m_view.init(
+            contains_fn,
+            prev_fn,
+            [this](const hash_t& h) -> uint288 {
                 auto it = m_shares.find(h);
-                return it != m_shares.end() ? it->second.index->tail : hash_t();
+                return it != m_shares.end() ? it->second.index->work : uint288();
             },
-            [this](const hash_t& h) -> bool {
-                return m_shares.contains(h);
+            [this](const hash_t& h) -> uint288 {
+                auto it = m_shares.find(h);
+                return it != m_shares.end() ? it->second.index->min_work : uint288();
             }
         );
     }
@@ -93,6 +111,7 @@ public:
         m_heads.clear();
         m_tails.clear();
         m_skip_list.clear();
+        m_view.clear();
     }
 
 public:
@@ -139,12 +158,13 @@ private:
         }
     }
 
-    // ─── Bitcoin Core deterministic skip list (MIT licensed) ──────────
-    // Adapted from CBlockIndex::pskip + GetAncestor() (chain.cpp).
-    // Each share stores skip_hash (hash of ancestor at GetSkipHeight distance).
-    // O(log n) ancestor lookups. O(1) forget_item. No BFS needed.
-    // Hash-based (no raw pointers — safe from use-after-free).
+    // ─── Skip list for O(log n) get_nth_parent (Bitcoin Core pattern) ──
     chain::ShareSkipList<hash_t, hasher_t> m_skip_list;
+
+    // ─── TrackerView for cached get_height/get_work/get_last ──────────
+    // Matches p2pool forest.py TrackerView: caches forward-walk deltas.
+    // Height is MUTABLE — cache updated when shares are removed.
+    chain::TrackerView<hash_t, uint288, hasher_t> m_view;
 
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
@@ -340,59 +360,44 @@ public:
     // Matches p2pool's SubsetTracker + DistanceSkipList pattern.
 
     /// Current chain depth — O(n) walk from hash to chain end.
-    /// NOT skip list height (which is stale after pruning).
-    /// Matches p2pool's get_delta_to_last().height which walks through
-    /// items[] and stops at pruned boundary.
-    /// Used by attempt_verify guard and compute_share_target.
+    // ─── Navigation via TrackerView + Skip List ──────────────────────
+    // TrackerView: cached get_height/get_work/get_last (p2pool forest.py)
+    // Skip list: O(log n) get_nth_parent (Bitcoin Core chain.cpp)
+
+    /// Height via TrackerView — cached, MUTABLE after pruning.
+    /// Matches p2pool: tracker.get_height() → get_delta_to_last().height
     int32_t get_acc_height(const hash_t& hash)
     {
-        int32_t height = 0;
-        hash_t cur = hash;
-        while (!cur.IsNull() && m_shares.contains(cur))
-        {
-            ++height;
-            cur = m_shares[cur].index->tail;
-        }
-        return height;
+        if (!m_shares.contains(hash)) return 0;
+        return m_view.get_height(hash);
     }
 
-    /// O(log n) ancestor lookup via skip list.
-    /// Matches p2pool tracker.get_nth_parent_hash(hash, n)
-    hash_t get_nth_parent_via_skip(const hash_t& hash, int32_t n) const
-    {
-        return m_skip_list.get_nth_parent(hash, n);
-    }
-
-    /// Accumulated work — O(n) walk (skip list stores height only, not work).
-    /// Work accumulation uses per-share walk like p2pool's get_delta_to_last.
-    /// TODO: extend skip list to cache work deltas for O(log n).
+    /// Work via TrackerView — cached.
+    /// Matches p2pool: tracker.get_work() → get_delta_to_last().work
     uint288 get_work(const hash_t& hash)
     {
-        uint288 total;
-        hash_t cur = hash;
-        while (!cur.IsNull() && m_shares.contains(cur))
-        {
-            total += m_shares[cur].index->work;
-            cur = m_shares[cur].index->tail;
-        }
-        return total;
+        if (!m_shares.contains(hash)) return uint288();
+        return m_view.get_work(hash);
     }
 
+    /// Min work via TrackerView — cached.
     uint288 get_min_work(const hash_t& hash)
     {
-        uint288 total;
-        hash_t cur = hash;
-        while (!cur.IsNull() && m_shares.contains(cur))
-        {
-            total += m_shares[cur].index->min_work;
-            cur = m_shares[cur].index->tail;
-        }
-        return total;
+        if (!m_shares.contains(hash)) return uint288();
+        return m_view.get_min_work(hash);
     }
 
+    /// Delta work between two shares.
     uint288 get_delta_work(const hash_t& near, const hash_t& far)
     {
         return get_work(near) - get_work(far);
+    }
+
+    /// O(log n) ancestor lookup via skip list.
+    /// Matches p2pool: tracker.get_nth_parent_hash(hash, n)
+    hash_t get_nth_parent_via_skip(const hash_t& hash, int32_t n) const
+    {
+        return m_skip_list.get_nth_parent(hash, n);
     }
 
     
