@@ -1082,8 +1082,10 @@ void NodeImpl::run_think()
 
             // Process results inline (same ioc thread — no race with phase2)
             {
-                    // Unified share retention (single pass)
-                    prune_shares(result.best);
+                    // p2pool: pruning happens in clean_tracker() (every 5s timer),
+                    // NOT in set_best_share(). Verification must complete BEFORE
+                    // pruning — otherwise pruned shares break cached deltas.
+                    // prune_shares moved to clean_tracker() below.
 
                     // Ban peers that provided invalid/unverifiable shares.
                     // Skip localhost:0 — that's our own locally created shares
