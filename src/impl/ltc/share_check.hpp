@@ -1502,6 +1502,22 @@ bool share_check(const ShareT& share,
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
 
+            // Compare share target: what c2pool computes vs what the share has
+            {
+                static int target_diag = 0;
+                if (target_diag++ < 10) {
+                    auto [cst_max_bits, cst_bits] = tracker.compute_share_target(
+                        share.m_prev_hash, share.m_timestamp, uint256());
+                    auto share_aps = tracker.get_pool_attempts_per_second(
+                        share.m_prev_hash, PoolConfig::TARGET_LOOKBEHIND, true);
+                    LOG_WARNING << "[GENTX-TARGET] share_bits=0x" << std::hex << share.m_bits
+                                << " share_max_bits=0x" << share.m_max_bits
+                                << " c2pool_bits=0x" << cst_bits
+                                << " c2pool_max_bits=0x" << cst_max_bits << std::dec
+                                << " aps_min=" << share_aps.GetLow64()
+                                << " prev=" << share.m_prev_hash.GetHex().substr(0,16);
+                }
+            }
             // --- Detailed diagnostics: re-run with full dump ---
             static int s_diag_count = 0;
             if (s_diag_count++ < 5)
