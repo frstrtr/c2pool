@@ -837,14 +837,13 @@ public:
             return {max_bits, bits};
         }
 
-        auto [height, last] = chain.get_height_and_last(prev_share_hash);
+        // Use accumulated height from skip list cache — O(1) and correct
+        // even after pruning (get_height walks until chain end, stops at
+        // pruned tail → returns short value → triggers MAX_TARGET fallback).
+        auto acc_height = chain.get_acc_height(prev_share_hash);
 
         // Not enough chain depth for proper difficulty calculation.
-        // p2pool (data.py:746-747): pre_target3 = MAX_TARGET, then computes
-        // max_bits and bits from that. Do NOT inherit from prev share —
-        // that would produce different bits than what p2pool computes during
-        // check(), causing GENTX-FAIL (ref_hash mismatch).
-        if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
+        if (acc_height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
             auto pre_target3 = MAX_TARGET;
             auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
