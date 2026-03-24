@@ -762,24 +762,13 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     double new_difficulty = hashrate_tracker_.get_current_difficulty();
 
-    // Clamp VARDIFF to p2pool's share target range [max_bits, share_bits].
-    // share_bits = pool share target (hardest, most PPLNS weight)
-    // max_bits = maximum share target (easiest allowed by network)
+    // Force stratum difficulty to match pool share target.
+    // No VARDIFF adjustment — p2pool model.
     {
         uint32_t sb = mining_interface_->m_share_bits.load();
-        uint32_t mb = mining_interface_->m_share_max_bits.load();
         if (sb != 0) {
             double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
-            double max_diff = (mb != 0)
-                ? chain::target_to_difficulty(chain::bits_to_target(mb))
-                : share_diff;
-            // Floor: never easier than max_bits
-            if (new_difficulty < max_diff) {
-                new_difficulty = max_diff;
-                hashrate_tracker_.set_difficulty_hint(max_diff);
-            }
-            // Ceiling: don't exceed share_bits (no benefit, wastes miner effort)
-            if (new_difficulty > share_diff)
+            if (share_diff > 0)
                 new_difficulty = share_diff;
         }
     }
@@ -1126,29 +1115,16 @@ void StratumSession::send_notify_work(bool force_clean)
     }
 
     // p2pool model: stratum difficulty = pool share target (share_bits).
-    // VARDIFF may adjust per-miner within [max_bits_diff, share_bits_diff]:
-    //   - share_bits = computed pool share target (hardest allowed = most PPLNS weight)
-    //   - max_bits = maximum share target (easiest allowed = floor)
-    // All shares MUST be within this range to be accepted by the p2pool network.
+    // No VARDIFF range — every miner gets the SAME pool target.
+    // This matches p2pool exactly: all miners work at the pool share target.
     {
         uint32_t sb = mining_interface_->m_share_bits.load();
-        uint32_t mb = mining_interface_->m_share_max_bits.load();
         if (sb != 0) {
             double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
-            double max_diff = (mb != 0) ? chain::target_to_difficulty(chain::bits_to_target(mb)) : share_diff;
-            // Clamp VARDIFF to p2pool's acceptable range
             double current = hashrate_tracker_.get_current_difficulty();
-            double target_diff = share_diff; // default: use pool share target
-            if (current > 0 && current < max_diff)
-                target_diff = max_diff; // floor: never easier than max_bits
-            else if (current > share_diff)
-                target_diff = share_diff; // ceiling: don't exceed share target
-            else if (current >= max_diff)
-                target_diff = current; // within range: keep VARDIFF's choice
-
-            if (std::abs(target_diff - current) > 1e-12) {
-                send_set_difficulty(target_diff);
-                hashrate_tracker_.set_difficulty_hint(target_diff);
+            if (share_diff > 0 && std::abs(share_diff - current) > 1e-12) {
+                send_set_difficulty(share_diff);
+                hashrate_tracker_.set_difficulty_hint(share_diff);
             }
         }
     }
