@@ -820,9 +820,30 @@ public:
             return {max_bits, bits};
         }
 
-        // Step 1: Derive target from pool hashrate
-        auto aps = get_pool_attempts_per_second(prev_share_hash,
-            PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
+        // Step 1: Derive target from pool hashrate.
+        // Walk from a PEER share (not local) to avoid contaminating aps
+        // with c2pool's easy fork shares. Find the nearest peer share
+        // by walking back from prev_share_hash until we find one.
+        uint256 aps_start = prev_share_hash;
+        {
+            uint256 cur = prev_share_hash;
+            int walk = 0;
+            while (!cur.IsNull() && chain.contains(cur) && walk < 20) {
+                bool is_local = false;
+                chain.get_share(cur).invoke([&](auto* obj) {
+                    is_local = (obj->peer_addr.port() == 0);
+                });
+                if (!is_local) { aps_start = cur; break; }
+                cur = chain.get_index(cur)->tail;
+                ++walk;
+            }
+        }
+
+        auto aps_height = chain.get_height(aps_start);
+        auto aps = (aps_height >= static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
+            ? get_pool_attempts_per_second(aps_start,
+                PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true)
+            : uint288(0);
 
         uint256 pre_target;
         if (aps.IsNull())
