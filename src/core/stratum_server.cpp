@@ -753,25 +753,22 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         job.coinb1, job.coinb2,
         extranonce1_, extranonce2, ntime, nonce,
         effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
+    // Use pool share target as required difficulty (p2pool model).
+    // VARDIFF is bypassed — all submissions measured against share_bits.
     double required_difficulty = hashrate_tracker_.get_current_difficulty();
-
-    // Record ALL submissions for vardiff timing (accepted + rejected), like Python p2pool.
-    // This lets vardiff discover the miner's actual hashrate even when shares are below target.
-    double old_difficulty = required_difficulty;
-    hashrate_tracker_.record_mining_share_submission(share_difficulty, share_difficulty >= required_difficulty);
-
-    double new_difficulty = hashrate_tracker_.get_current_difficulty();
-
-    // Force stratum difficulty to match pool share target.
-    // No VARDIFF adjustment — p2pool model.
-    {
-        uint32_t sb = mining_interface_->m_share_bits.load();
-        if (sb != 0) {
-            double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
-            if (share_diff > 0)
-                new_difficulty = share_diff;
+    uint32_t sb = mining_interface_->m_share_bits.load();
+    if (sb != 0) {
+        double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
+        if (share_diff > 0) {
+            required_difficulty = share_diff;
+            hashrate_tracker_.set_difficulty_hint(share_diff);
         }
     }
+
+    // Record submission at the POOL share difficulty (not VARDIFF).
+    double old_difficulty = required_difficulty;
+    hashrate_tracker_.record_mining_share_submission(share_difficulty, share_difficulty >= required_difficulty);
+    double new_difficulty = required_difficulty; // no VARDIFF adjustment
 
     if (std::abs(new_difficulty - old_difficulty) > 1e-9) {
         send_set_difficulty(new_difficulty);
