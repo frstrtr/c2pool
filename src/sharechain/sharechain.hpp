@@ -54,6 +54,13 @@ class ShareChain
     };
 
 public:
+    ShareChain()
+    {
+        // Self-subscribe to removed signal for cache invalidation.
+        // Matches p2pool: TrackerSkipList.__init__ → tracker.removed.watch_weakref(self, forget_item)
+        on_removed([this](const hash_t& hash) { forget_item(hash); });
+    }
+
     ~ShareChain()
     {
         for (auto& [h, cd] : m_shares)
@@ -73,7 +80,7 @@ public:
         m_reverse.clear();
         m_heads.clear();
         m_tails.clear();
-        m_acc.clear();
+        m_acc_cache.clear();
     }
 
 public:
@@ -89,16 +96,97 @@ private:
     std::unordered_map<hash_t, hash_t, hasher_t> m_heads;
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
 
-    // Accumulated prefix sums — p2pool skip list equivalent.
-    // acc_work[hash] = total work from chain root to this share.
-    // Computed once at add() time, O(1) lookup, consistent snapshot.
-    // get_delta(near, far) = acc_work[near] - acc_work[far] → O(1).
+    // ─── Signal system (matches p2pool Twisted Event pattern) ──────────
+    // p2pool: tracker.removed = variable.Event()
+    //         TrackerSkipList subscribes: removed.watch_weakref(self, lambda self, item: self.forget_item(item.hash))
+    //         On remove: removed.happened(item) → forget_item clears only that hash from skips{}
+    //
+    // c2pool: ShareChain fires signals, AccWorkCache subscribes.
+    // Signals use std::function callbacks (equivalent to Twisted Event.watch).
+public:
+    using signal_fn = std::function<void(const hash_t&)>;
+
+    // Register a callback for share removal events.
+    // Returns an ID for unwatch (matches Event.watch → id pattern).
+    uint64_t on_removed(signal_fn fn) {
+        auto id = m_signal_id_gen++;
+        m_removed_watchers[id] = std::move(fn);
+        return id;
+    }
+    void unwatch_removed(uint64_t id) { m_removed_watchers.erase(id); }
+
+private:
+    uint64_t m_signal_id_gen{0};
+    std::unordered_map<uint64_t, signal_fn> m_removed_watchers;
+
+    // Fire removed signal — calls all registered watchers.
+    // Matches p2pool: self.removed.happened(item)
+    void fire_removed(const hash_t& hash) {
+        for (auto& [id, fn] : m_removed_watchers) {
+            try { fn(hash); } catch (...) {}
+        }
+    }
+
+    // ─── Lazy accumulated work cache (p2pool SkipList pattern) ──────────
+    // Values computed on first access, cached.
+    // Invalidated per-item via removed signal (NOT full clear).
+    // p2pool: TrackerSkipList.forget_item(hash) → self.skips.pop(hash, None)
     struct AccWork {
         uint288 work;        // accumulated target_to_average_attempts(bits)
         uint288 min_work;    // accumulated target_to_average_attempts(max_bits)
         int32_t height{0};   // accumulated height (share count from root)
     };
-    std::unordered_map<hash_t, AccWork, hasher_t> m_acc;
+    mutable std::unordered_map<hash_t, AccWork, hasher_t> m_acc_cache;
+
+    // p2pool forget_item: clears THIS hash from cache.
+    // Descendants will be lazily recomputed on next access
+    // (they'll walk to parent, find it missing from cache, walk further).
+    void forget_item(const hash_t& hash) {
+        m_acc_cache.erase(hash);
+    }
+
+    // Lazily compute accumulated work for a share by walking to chain root.
+    // Result is cached. Subsequent calls return cached value in O(1).
+    // Cache is invalidated on any add/remove (generation change).
+    AccWork compute_acc(const hash_t& hash) const
+    {
+        // Check cache first
+        auto it = m_acc_cache.find(hash);
+        if (it != m_acc_cache.end()) return it->second;
+
+        // Walk to root, building stack of shares to compute
+        std::vector<std::pair<hash_t, const index_t*>> stack;
+        hash_t cur = hash;
+        while (!cur.IsNull() && m_shares.contains(cur))
+        {
+            auto cache_it = m_acc_cache.find(cur);
+            if (cache_it != m_acc_cache.end()) break;  // found cached ancestor
+            auto& cd = m_shares.at(cur);
+            stack.push_back({cur, cd.index});
+            cur = cd.index->tail;  // prev_hash
+        }
+
+        // Base: either cached ancestor or chain root
+        AccWork base;
+        if (!cur.IsNull()) {
+            auto cache_it = m_acc_cache.find(cur);
+            if (cache_it != m_acc_cache.end())
+                base = cache_it->second;
+        }
+
+        // Unwind stack, computing accumulated values bottom-up
+        for (auto rit = stack.rbegin(); rit != stack.rend(); ++rit)
+        {
+            AccWork acc;
+            acc.work = base.work + rit->second->work;
+            acc.min_work = base.min_work + rit->second->min_work;
+            acc.height = base.height + 1;
+            m_acc_cache[rit->first] = acc;
+            base = acc;
+        }
+
+        return base;
+    }
     
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
@@ -180,21 +268,9 @@ public:
         if (!share->m_prev_hash.IsNull())
             m_reverse[share->m_prev_hash].insert(share->m_hash);
 
-        // Accumulated prefix sums — O(1) computation from parent.
-        // p2pool skip list equivalent: values computed once at add() time.
-        AccWork acc;
-        if (!share->m_prev_hash.IsNull() && m_acc.contains(share->m_prev_hash)) {
-            const auto& parent = m_acc[share->m_prev_hash];
-            acc.work = parent.work + index->work;
-            acc.min_work = parent.min_work + index->min_work;
-            acc.height = parent.height + 1;
-        } else {
-            // Root share or disconnected (parent not in chain yet)
-            acc.work = index->work;
-            acc.min_work = index->min_work;
-            acc.height = 1;
-        }
-        m_acc[share->m_hash] = acc;
+        // Don't invalidate cache on add() — existing cached values remain correct.
+        // New share's values will be computed lazily on first access.
+        // p2pool's SkipList only clears cache entries on remove (removed_signal).
     }
 
     void add(share_t share)
@@ -301,41 +377,33 @@ public:
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
-    // O(1) accumulated work lookup — p2pool skip list equivalent.
-    // Returns total work from chain root to this share.
-    // Computed once at add() time, consistent snapshot.
+    // Lazy accumulated work — p2pool SkipList pattern.
+    // First call computes by walking to root, caches result.
+    // Subsequent calls return cached value. Cache cleared on chain modification.
     uint288 get_work(const hash_t& hash)
     {
-        auto it = m_acc.find(hash);
-        if (it != m_acc.end()) return it->second.work;
-        return uint288();
+        if (!m_shares.contains(hash)) return uint288();
+        return compute_acc(hash).work;
     }
 
-    // O(1) accumulated min_work lookup.
     uint288 get_min_work(const hash_t& hash)
     {
-        auto it = m_acc.find(hash);
-        if (it != m_acc.end()) return it->second.min_work;
-        return uint288();
+        if (!m_shares.contains(hash)) return uint288();
+        return compute_acc(hash).min_work;
     }
 
-    // O(1) accumulated height lookup.
     int32_t get_acc_height(const hash_t& hash)
     {
-        auto it = m_acc.find(hash);
-        if (it != m_acc.end()) return it->second.height;
-        return 0;
+        if (!m_shares.contains(hash)) return 0;
+        return compute_acc(hash).height;
     }
 
-    // O(1) delta between two shares — matches p2pool get_delta(near, far).
-    // Returns work between near and far (near.acc - far.acc).
+    // Delta between two shares — matches p2pool get_delta(near, far).
     uint288 get_delta_work(const hash_t& near, const hash_t& far)
     {
-        auto n = m_acc.find(near);
-        auto f = m_acc.find(far);
-        if (n == m_acc.end()) return uint288();
-        if (f == m_acc.end()) return n->second.work;
-        return n->second.work - f->second.work;
+        auto n = get_work(near);
+        auto f = get_work(far);
+        return n - f;
     }
 
     
@@ -515,7 +583,7 @@ public:
                     it->second.share.destroy();
                 delete it->second.index;
                 m_shares.erase(it);
-                m_acc.erase(h);
+                fire_removed(h);  // p2pool: self.removed.happened(item)
             }
         }
 
@@ -629,7 +697,7 @@ public:
             it->second.share.destroy();
         delete idx;
         m_shares.erase(it);
-        m_acc.erase(hash);
+        fire_removed(hash);  // p2pool: self.removed.happened(item)
         return true;
     }
 

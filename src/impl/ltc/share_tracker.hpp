@@ -902,7 +902,7 @@ public:
                 });
                 LOG_INFO << "[CST] aps=" << aps.GetLow64()
                          << " period=" << PoolConfig::share_period()
-                         << " height=" << height
+                         << " height=" << acc_height
                          << " prev=" << prev_share_hash.GetHex().substr(0,16)
                          << " prev_is_local=" << is_local;
             }
