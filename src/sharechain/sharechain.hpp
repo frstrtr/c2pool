@@ -138,11 +138,33 @@ private:
     };
     mutable std::unordered_map<hash_t, AccWork, hasher_t> m_acc_cache;
 
-    // p2pool forget_item: clears THIS hash from cache.
-    // Descendants will be lazily recomputed on next access
-    // (they'll walk to parent, find it missing from cache, walk further).
+    // Clear removed share AND all descendants from cache.
+    // p2pool's SkipList.forget_item only clears the removed hash because
+    // p2pool's skip jumps skip over removed shares. Our prefix sums are
+    // different — each share's acc depends on its parent chain. Removing
+    // a parent makes all descendants' cached values stale (they include
+    // the removed parent's contribution).
+    // Since removes are rare (pruning only), clearing descendants is acceptable.
     void forget_item(const hash_t& hash) {
         m_acc_cache.erase(hash);
+        // BFS: clear all descendants via reverse map
+        std::vector<hash_t> queue;
+        auto rev_it = m_reverse.find(hash);
+        if (rev_it != m_reverse.end()) {
+            for (const auto& child : rev_it->second)
+                queue.push_back(child);
+        }
+        while (!queue.empty()) {
+            auto cur = queue.back();
+            queue.pop_back();
+            if (m_acc_cache.erase(cur) > 0) {
+                auto crev = m_reverse.find(cur);
+                if (crev != m_reverse.end()) {
+                    for (const auto& gc : crev->second)
+                        queue.push_back(gc);
+                }
+            }
+        }
     }
 
     // Lazily compute accumulated work for a share by walking to chain root.
@@ -576,6 +598,10 @@ public:
                         if (pr->second.empty()) m_reverse.erase(pr);
                     }
                 }
+                // Fire signal BEFORE erasing reverse map — BFS needs it
+                // to find descendants for cache invalidation.
+                // (p2pool fires after, but p2pool doesn't BFS descendants)
+                fire_removed(h);
                 m_reverse.erase(h);
                 if (deferred_destroy && owns_data)
                     deferred_destroy->push_back(std::move(it->second.share));
@@ -583,7 +609,6 @@ public:
                     it->second.share.destroy();
                 delete it->second.index;
                 m_shares.erase(it);
-                fire_removed(h);  // p2pool: self.removed.happened(item)
             }
         }
 
@@ -621,6 +646,8 @@ public:
                 if (pr->second.empty()) m_reverse.erase(pr);
             }
         }
+        // Fire signal BEFORE erasing reverse map — BFS needs children entries
+        fire_removed(hash);
         m_reverse.erase(hash);
 
         bool is_head = m_heads.contains(hash);
@@ -697,7 +724,6 @@ public:
             it->second.share.destroy();
         delete idx;
         m_shares.erase(it);
-        fire_removed(hash);  // p2pool: self.removed.happened(item)
         return true;
     }
 
