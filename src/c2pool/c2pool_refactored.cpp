@@ -2135,9 +2135,13 @@ int main(int argc, char* argv[]) {
                     // measurement produces a target below pre_target3/30 for any real
                     // miner, it always clips to pre_target3/30. Using uint256(0) here
                     // produces the same result: clips to pre_target3/30 (hardest).
-                    // NOTE: If both p2pool nodes also use pre_target3/30 (confirmed
-                    // via diff=9.16e-03 on fresh chain), this will match.
-                    auto desired_target = uint256();
+                    // p2pool work.py:2442-2443:
+                    //   if desired_share_target is None:
+                    //       desired_share_target = 2**256-1
+                    // Default: easiest possible → clips to pre_target3 (ceiling).
+                    // c2pool had uint256() = 0 (HARDEST) → clipped to pre_target3/30
+                    // → 30x harder than p2pool → GENTX mismatch (different bits).
+                    auto desired_target = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
                     // With fork shares excluded from verified, best_share (= frozen_prev)
                     // is always the main chain head. CST walks the main chain directly.
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
