@@ -842,7 +842,10 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Valid share — meets pool difficulty target
     ++accepted_shares_;
-    hashrate_tracker_.record_mining_share_submission(share_difficulty, true);
+    // Record REQUIRED difficulty, not actual hash difficulty.
+    // p2pool uses target_to_average_attempts(target) — the pool target.
+    // Recording actual hash diff inflates hashrate (lucky shares contribute extra).
+    hashrate_tracker_.record_mining_share_submission(required_difficulty, true);
 
     LOG_INFO << "[Stratum] Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_

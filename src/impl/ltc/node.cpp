@@ -824,84 +824,62 @@ void NodeImpl::start_outbound_connections()
     m_connect_timer->start(30, try_connect_peers);
 }
 
-void NodeImpl::prune_shares(const uint256& best_share)
+void NodeImpl::prune_shares(const uint256& /*best_share*/)
 {
-    // Unified share retention (SHARE_RETENTION_DESIGN.md §4):
-    // Single pass replaces 5 independent pruning steps.
-    //
-    // Phase 1 (dead head detection) now handled by clean_tracker() every 5s.
-    // Retention: 2*CHAIN_LENGTH+10 matches p2pool clean_tracker tail-drop.
-    const size_t retention_depth = 2 * PoolConfig::chain_length() + 10;
+    // Matches p2pool node.py:381-398 tail-dropping exactly:
+    // - Check each tail: if min(height(head) for heads) < 2*CL+10 → skip
+    // - Remove ONE child of qualifying tail per iteration
+    // - Loop up to 1000 times (gradual, not bulk)
+    // - Also cascade removal to verified
+    const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+    const int32_t min_depth = 2 * CL + 10;
 
-    // --- Phase 2: Tail trim (retention_depth) with deferred destruction ---
-    std::vector<uint256> evicted_from_chain;
-    std::vector<ltc::ShareType> deferred_shares;
-
-    if (m_tracker.chain.size() > retention_depth)
+    for (int iter = 0; iter < 1000; ++iter)
     {
-        auto heads_copy = m_tracker.chain.get_heads();
-        size_t total_removed = 0;
-        for (auto& [head_hash, tail_hash] : heads_copy) {
-            auto removed = m_tracker.chain.trim(head_hash, retention_depth,
-                /*owns_data=*/true, &evicted_from_chain, &deferred_shares);
-            total_removed += removed;
-        }
-        if (total_removed > 0)
-            LOG_INFO << "[Pool] Trimmed " << total_removed
-                     << " old shares from chain (now " << m_tracker.chain.size() << ")";
-    }
-
-    // --- Phase 3: Cascade evictions to verified ---
-    if (!evicted_from_chain.empty())
-    {
-        size_t cascade_removed = 0;
-        for (const auto& h : evicted_from_chain)
+        // p2pool node.py:382-398: find ONE qualifying tail child to remove
+        uint256 to_remove;
+        bool found = false;
+        auto tails_copy = m_tracker.chain.get_tails();
+        for (auto& [tail_hash, head_hashes] : tails_copy)
         {
-            if (m_tracker.verified.contains(h))
-            {
-                m_tracker.verified.remove(h, /*owns_data=*/false);
-                ++cascade_removed;
+            // Check min height across ALL heads for this tail
+            int32_t min_height = std::numeric_limits<int32_t>::max();
+            for (auto& hh : head_hashes) {
+                if (!m_tracker.chain.contains(hh)) continue;
+                try {
+                    min_height = std::min(min_height, m_tracker.chain.get_height(hh));
+                } catch (...) { continue; }
+            }
+            if (min_height < min_depth) continue;
+
+            // Find ONE child of this tail (p2pool removes one at a time)
+            auto& rev = m_tracker.chain.get_reverse();
+            auto rev_it = rev.find(tail_hash);
+            if (rev_it != rev.end() && !rev_it->second.empty()) {
+                to_remove = *rev_it->second.begin();
+                found = true;
+                break;  // one per iteration
             }
         }
-        if (cascade_removed > 0)
-            LOG_INFO << "[Pool] Cascaded " << cascade_removed
-                     << " evictions to verified (now " << m_tracker.verified.size() << ")";
-    }
 
-    // --- Phase 4: Destroy deferred share data (safe — no references remain) ---
-    for (auto& share : deferred_shares)
-        share.destroy();
-    deferred_shares.clear();
+        if (!found) break;
 
-    // --- Phase 5: Trim verified independently ---
-    if (m_tracker.verified.size() > retention_depth)
-    {
-        auto heads_copy = m_tracker.verified.get_heads();
-        size_t total_removed = 0;
-        for (auto& [head_hash, tail_hash] : heads_copy) {
-            auto removed = m_tracker.verified.trim(head_hash, retention_depth,
-                /*owns_data=*/false);
-            total_removed += removed;
+        if (!m_tracker.chain.contains(to_remove)) continue;
+        // p2pool node.py:393 — safety check: parent must be a tail
+        auto* idx = m_tracker.chain.get_index(to_remove);
+        if (!idx) continue;
+        bool parent_is_tail = m_tracker.chain.get_tails().contains(idx->tail);
+        if (!parent_is_tail) {
+            LOG_DEBUG_POOL << "prune skip: parent " << idx->tail.ToString().substr(0,16)
+                           << " not a tail";
+            continue;
         }
-        if (total_removed > 0)
-            LOG_INFO << "[Pool] Trimmed " << total_removed
-                     << " old shares from verified (now " << m_tracker.verified.size() << ")";
+        if (m_tracker.verified.contains(to_remove))
+            m_tracker.verified.remove(to_remove, /*owns_data=*/false);
+        m_tracker.chain.remove(to_remove);
     }
 
-    // --- Phase 6: Prune evicted shares from LevelDB ---
-    if (!evicted_from_chain.empty() && m_storage && m_storage->is_available())
-    {
-        size_t pruned = 0;
-        for (const auto& h : evicted_from_chain)
-        {
-            if (m_storage->remove_share(h))
-                ++pruned;
-        }
-        if (pruned > 0)
-            LOG_INFO << "[Pool] Pruned " << pruned << " evicted shares from LevelDB";
-    }
-
-    // --- Phase 7: Cache cleanup ---
+    // Cache cleanup (kept from original)
     if (m_shared_share_hashes.size() > m_max_shared_hashes)
         m_shared_share_hashes.clear();
     if (m_known_txs.size() > m_max_known_txs)
@@ -909,6 +887,8 @@ void NodeImpl::prune_shares(const uint256& best_share)
     if (m_raw_share_cache.size() > m_max_raw_shares)
         m_raw_share_cache.clear();
 }
+
+// (old phases 5-7 removed — replaced by p2pool-style pruning above)
 
 void NodeImpl::run_think()
 {
