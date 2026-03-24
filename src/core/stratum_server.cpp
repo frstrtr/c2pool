@@ -765,10 +765,11 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         }
     }
 
-    // Record submission at the POOL share difficulty (not VARDIFF).
+    // Do NOT record rejected pseudoshares in the hashrate tracker.
+    // Only accepted shares (meeting pool target) count for Local hashrate.
+    // Recording easy pseudoshares inflates Local by 3-5x.
     double old_difficulty = required_difficulty;
-    hashrate_tracker_.record_mining_share_submission(share_difficulty, share_difficulty >= required_difficulty);
-    double new_difficulty = required_difficulty; // no VARDIFF adjustment
+    double new_difficulty = required_difficulty;
 
     if (std::abs(new_difficulty - old_difficulty) > 1e-9) {
         send_set_difficulty(new_difficulty);
@@ -841,6 +842,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Valid share — meets pool difficulty target
     ++accepted_shares_;
+    hashrate_tracker_.record_mining_share_submission(share_difficulty, true);
 
     LOG_INFO << "[Stratum] Share accepted from " << username_ << " (diff=" << share_difficulty
              << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
