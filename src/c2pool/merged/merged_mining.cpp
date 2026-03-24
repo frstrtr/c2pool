@@ -512,7 +512,7 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config)
 
 void MergedMiningManager::add_chain(const AuxChainConfig& config, std::unique_ptr<IAuxChainBackend> backend)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     ChainState state;
     state.config = config;
@@ -532,7 +532,7 @@ void MergedMiningManager::add_chain(const AuxChainConfig& config, std::unique_pt
 
 void MergedMiningManager::set_fallback_backend(uint32_t chain_id, std::unique_ptr<IAuxChainBackend> fallback)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     for (auto& chain : m_chains) {
         if (chain.config.chain_id == chain_id) {
             chain.fallback = std::move(fallback);
@@ -544,7 +544,7 @@ void MergedMiningManager::set_fallback_backend(uint32_t chain_id, std::unique_pt
 
 IAuxChainBackend* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     for (auto& chain : m_chains) {
         if (chain.config.chain_id == chain_id)
             return chain.rpc.get();
@@ -588,7 +588,7 @@ void MergedMiningManager::poll_loop()
 
 void MergedMiningManager::refresh_aux_work()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     bool any_changed = false;
 
@@ -696,13 +696,13 @@ void MergedMiningManager::refresh_aux_work()
 
 std::vector<uint8_t> MergedMiningManager::get_auxpow_commitment()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     return m_cached_commitment;
 }
 
 std::vector<uint8_t> MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     for (auto& chain : m_chains) {
         if (chain.config.chain_id == chain_id) {
             chain.current_work.block_hash = pplns_block_hash;
@@ -734,7 +734,7 @@ void MergedMiningManager::try_submit_merged_blocks(
     uint32_t parent_merkle_index,
     const uint256& parent_hash)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     // For each aux chain, check if the parent PoW meets the aux target
     for (auto& chain : m_chains) {
@@ -883,7 +883,7 @@ void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::str
 
 std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     std::map<uint32_t, AuxWork> result;
     for (const auto& c : m_chains) {
         result[c.config.chain_id] = c.current_work;
@@ -904,7 +904,7 @@ MergedMiningManager::build_merged_header_info() const
     PayoutProvider payout_fn;
     StateRootProvider state_fn;
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         payout_fn = m_payout_provider;
         state_fn = m_state_root_provider;
         for (const auto& chain : m_chains) {
@@ -1008,7 +1008,7 @@ MergedMiningManager::build_merged_header_info_with_commitment()
     // Step 2: Freeze coinbase_hex + template per chain AND update commitment atomically.
     // Matches p2pool's Phase A pattern: freeze doge_coinbase + doge_header at get_work time,
     // then use the frozen data at submission time (Phase C).
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     for (const auto& hi : header_infos) {
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
@@ -1039,19 +1039,19 @@ MergedMiningManager::build_merged_header_info_with_commitment()
 
 void MergedMiningManager::set_payout_provider(PayoutProvider provider)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_payout_provider = std::move(provider);
 }
 
 void MergedMiningManager::set_state_root_provider(StateRootProvider provider)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_state_root_provider = std::move(provider);
 }
 
 void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_block_relay_fn = std::move(fn);
 }
 
@@ -1430,13 +1430,13 @@ void MergedMiningManager::record_discovered_block(
 
 std::vector<DiscoveredMergedBlock> MergedMiningManager::get_discovered_blocks() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     return m_discovered_blocks;
 }
 
 std::vector<DiscoveredMergedBlock> MergedMiningManager::get_recent_blocks(size_t limit) const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_discovered_blocks.size() <= limit)
         return m_discovered_blocks;
     return std::vector<DiscoveredMergedBlock>(
@@ -1446,20 +1446,20 @@ std::vector<DiscoveredMergedBlock> MergedMiningManager::get_recent_blocks(size_t
 
 uint64_t MergedMiningManager::get_total_blocks() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     return m_discovered_blocks.size();
 }
 
 uint64_t MergedMiningManager::get_chain_block_count(uint32_t chain_id) const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     auto it = m_blocks_per_chain.find(chain_id);
     return (it != m_blocks_per_chain.end()) ? it->second : 0;
 }
 
 std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos() const
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     std::vector<ChainInfo> result;
     result.reserve(m_chains.size());
     for (const auto& c : m_chains) {
