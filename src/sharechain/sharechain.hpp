@@ -442,14 +442,20 @@ public:
         return m_view.get_delta_to_last(hash);
     }
 
-    /// O(log n) ancestor lookup via skip list.
-    /// Matches p2pool: tracker.get_nth_parent_hash(hash, n)
-    /// If parent chain is set (SubsetTracker pattern), uses parent's skip list.
+    /// Ancestor lookup — uses O(n) hash walk (matching p2pool's
+    /// DistanceSkipList which walks via previous(element)).
+    /// Bitcoin Core skip list uses stored heights which become stale
+    /// after pruning. p2pool's DistanceSkipList walks actual items.
+    /// TODO: implement proper DistanceSkipList with geometric jumps
+    /// for O(log n) that doesn't depend on stored heights.
     hash_t get_nth_parent_via_skip(const hash_t& hash, int32_t n) const
     {
-        if (m_parent_skip_list)
-            return m_parent_skip_list->get_nth_parent(hash, n);
-        return m_skip_list.get_nth_parent(hash, n);
+        // Use parent's chain for navigation if set (SubsetTracker pattern)
+        if (m_parent_skip_list) {
+            // Walk through parent chain's items
+            return get_nth_parent_key(hash, n);
+        }
+        return get_nth_parent_key(hash, n);
     }
 
     /// Set parent chain for SubsetTracker pattern.
