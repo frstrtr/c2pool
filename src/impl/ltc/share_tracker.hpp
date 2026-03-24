@@ -151,18 +151,12 @@ public:
         if (verified.contains(share_hash))
             return true;
 
-        // Only verify shares that EXTEND the verified chain.
-        // Fork shares (prev not in verified) would pollute scoring.
-        // p2pool handles this via time_seen tiebreak, but c2pool has
-        // many more forks → filter is needed for clean scoring.
-        // Bootstrap: allow all when verified is empty.
-        if (verified.size() > 0)
-        {
-            uint256 prev;
-            chain.get_share(share_hash).invoke([&](auto* obj) { prev = obj->m_prev_hash; });
-            if (!prev.IsNull() && !verified.contains(prev))
-                return false;
-        }
+        // p2pool: attempt_verify on ANY share. Fork shares that fail GENTX
+        // are removed as bads by Phase 1. Scoring handles fork vs main chain
+        // via 5th-ancestor tiebreak (same ancestor = same work = time_seen wins).
+        // The previous "chain-extending only" filter caused verified=116 with
+        // total=994 because out-of-order share arrivals permanently blocked
+        // verification.
 
         auto [height, last] = chain.get_height_and_last(share_hash);
 
