@@ -564,19 +564,16 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            // p2pool data.py:2152-2155: want is overwritten to equal can on line 2153,
-            // so get = min(want, can) = can ALWAYS.  c2pool previously used the FIRST
-            // want = max(CL - head_height, 0) which becomes 0 when head_height >= CL,
-            // killing Phase 2 for long verified chains.  Fix: use can directly.
-            //
-            // Extension for pruned-genesis testnet: when the total chain depth
-            // (head_height + last_height) >= CL, treat unrooted chains as rooted.
+            // p2pool data.py:2098-2103 EXACTLY:
+            //   want = max(self.net.CHAIN_LENGTH - head_height, 0)
+            //   can = max(last_height - 1 - self.net.CHAIN_LENGTH, 0) if last_last_hash is not None else last_height
+            //   get = min(want, can)
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
-            auto to_get = last_last_hash.IsNull()
+            auto want = std::max(CL - head_height, 0);
+            auto can = last_last_hash.IsNull()
                 ? last_height
-                : (head_height + last_height >= CL)
-                    ? last_height  // Deep enough — treat as rooted
-                    : std::max(last_height - 1 - CL, 0);
+                : std::max(last_height - 1 - CL, 0);
+            auto to_get = std::min(want, can);
 
             {
                 static int p2_log = 0;
@@ -609,23 +606,21 @@ public:
         }
 
         // Phase 3: Score tails — pick the best tail
-        // Iterate verified.get_tails() (matches p2pool exactly).
-        // Use chain.get_work() for work computation (SubsetTracker pattern).
-        // With parent-in-verified filter, verified is contiguous (1 tail).
+        // p2pool: decorated_tails = sorted((self.score(
+        //   max(self.verified.tails[tail_hash], key=self.verified.get_work), ...
+        // Uses VERIFIED.get_work (verified TrackerView), NOT chain.get_work.
+        // SubsetTracker.get_work walks verified items only.
         std::vector<DecoratedData<TailScore>> decorated_tails;
         for (auto& [tail_hash, head_hashes] : verified.get_tails())
         {
-            // Find the head with the most accumulated work.
-            // Use CHAIN (raw tracker) for work, not verified — matches p2pool's
-            // SubsetTracker which delegates get_work to the main tracker.
-            // This works correctly even when verified has gaps (55% verified).
+            // p2pool: max(verified.tails[tail_hash], key=verified.get_work)
             uint256 best_head;
             uint288 best_work;
             bool first = true;
             for (const auto& hh : head_hashes)
             {
-                if (!chain.contains(hh)) continue;
-                auto w = chain.get_work(hh);
+                if (!verified.contains(hh)) continue;
+                auto w = verified.get_work(hh);
                 if (first || w > best_work)
                 {
                     best_work = w;
@@ -678,16 +673,18 @@ public:
             const auto& head_hashes = verified.get_tails().at(best_tail);
             for (const auto& hh : head_hashes)
             {
-                if (!chain.contains(hh))
+                if (!verified.contains(hh))
                     continue;
 
                 try {
-                    // Work score: use CHAIN (raw tracker) for navigation + work.
-                    // p2pool's SubsetTracker delegates get_nth_parent_hash to main tracker.
-                    // This works correctly even when verified has gaps.
-                    auto c_height = chain.get_height(hh);
-                    auto recent_ancestor = chain.get_nth_parent_key(hh, std::min(5, c_height));
-                    uint288 work_score = chain.get_work(recent_ancestor);
+                    // p2pool Phase 4:
+                    // self.verified.get_work(self.verified.get_nth_parent_hash(h, min(5, self.verified.get_height(h))))
+                    // verified.get_height uses verified TrackerView
+                    // verified.get_nth_parent_hash uses SHARED skip list (main tracker)
+                    // verified.get_work uses verified TrackerView
+                    auto v_height = verified.get_acc_height(hh);
+                    auto recent_ancestor = verified.get_nth_parent_via_skip(hh, std::min(5, v_height));
+                    uint288 work_score = verified.get_work(recent_ancestor);
 
                     auto* head_idx = chain.get_index(hh);
                     if (!head_idx) continue;
@@ -718,12 +715,62 @@ public:
             std::sort(traditional_sort.begin(), traditional_sort.end());
         }
 
+        // p2pool: self.punish = punish value from Phase 5 (walk-back result)
         bool punish_aggressively = !traditional_sort.empty() && traditional_sort.back().score.reason != 0;
 
-        // Phase 5: Determine best share
+        // Phase 5: Determine best share — p2pool data.py:2142-2166
+        // Walk back through punished shares, then find best non-naughty descendent.
         uint256 best;
+        int32_t punish_val = 0;
         if (!decorated_heads.empty())
             best = decorated_heads.back().hash;
+
+        if (!best.IsNull() && chain.contains(best))
+        {
+            // Check if best share should be punished
+            auto* best_idx = chain.get_index(best);
+            if (best_idx && best_idx->naughty > 0)
+            {
+                // Walk back through punished shares
+                while (best_idx && best_idx->naughty > 0)
+                {
+                    uint256 prev;
+                    chain.get_share(best).invoke([&](auto* obj) {
+                        prev = obj->m_prev_hash;
+                    });
+                    if (prev.IsNull() || !chain.contains(prev)) break;
+                    best = prev;
+                    best_idx = chain.get_index(best);
+
+                    // p2pool: if not punish, find best descendent
+                    if (best_idx && best_idx->naughty == 0)
+                    {
+                        // Find deepest non-naughty child via reverse map
+                        std::function<std::pair<int,uint256>(const uint256&, int)> best_desc;
+                        best_desc = [&](const uint256& h, int limit) -> std::pair<int,uint256> {
+                            if (limit < 0) return {0, h};
+                            auto& rev = chain.get_reverse();
+                            auto rit = rev.find(h);
+                            if (rit == rev.end() || rit->second.empty())
+                                return {0, h};
+                            std::pair<int,uint256> best_kid = {-1, h};
+                            for (const auto& child : rit->second) {
+                                auto* cidx = chain.get_index(child);
+                                if (cidx && cidx->naughty > 0) continue;
+                                auto [gen, hash] = best_desc(child, limit - 1);
+                                if (gen + 1 > best_kid.first)
+                                    best_kid = {gen + 1, hash};
+                            }
+                            return best_kid.first >= 0 ? best_kid : std::pair<int,uint256>{0, h};
+                        };
+                        auto [gens, desc_hash] = best_desc(best, 20);
+                        best = desc_hash;
+                        break;
+                    }
+                }
+            }
+            punish_val = (best_idx && best_idx->naughty > 0) ? best_idx->naughty : 0;
+        }
 
         // Phase 6: Compute cutoffs for desired shares filtering
         uint32_t timestamp_cutoff;
@@ -757,20 +804,49 @@ public:
     }
 
     // -- Pool hashrate estimation --
+    /// Pool hashrate estimation — matches p2pool get_pool_attempts_per_second exactly.
+    /// Uses skip list (O(log n)) + TrackerView delta cache (O(1)).
+    /// p2pool: tracker.get_delta(near.hash, far.hash).work / time
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
         if (dist < 2 || !chain.contains(share_hash))
             return uint288(0);
 
-        auto actual_height = chain.get_height(share_hash);
+        auto actual_height = chain.get_acc_height(share_hash);
         if (actual_height < dist)
             return uint288(0);
 
-        // Walk the chain summing work and timestamps.
-        // All shares counted equally (no origin filtering).
-        // Walk dist shares, exclude last share's work (matching p2pool delta).
-        uint288 total_work;
-        uint288 total_min_work;
+        // p2pool: far = tracker.get_nth_parent_hash(prev, dist - 1) — O(log n)
+        auto far_hash = chain.get_nth_parent_via_skip(share_hash, dist - 1);
+        if (far_hash.IsNull() || !chain.contains(far_hash))
+            return uint288(0);
+
+        // p2pool: attempts = tracker.get_delta(near, far).work — O(1) via TrackerView
+        uint288 attempts;
+        if (use_min_work) {
+            attempts = chain.get_min_work(share_hash) - chain.get_min_work(far_hash);
+        } else {
+            attempts = chain.get_work(share_hash) - chain.get_work(far_hash);
+        }
+
+        // Timestamps from the shares directly
+        uint32_t near_ts = 0, far_ts = 0;
+        chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
+        chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+
+        int32_t time_span = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
+        if (time_span <= 0) time_span = 1;
+
+        // Prevent unrealistic values
+        uint288 result = attempts / uint288(time_span);
+        return result;
+    }
+
+    // Legacy compatibility — keep old O(n) walk for reference
+    uint288 _get_pool_attempts_per_second_legacy(const uint256& share_hash, int32_t dist, bool use_min_work = false)
+    {
+        // (keeping old implementation for debugging comparison)
+        uint288 total_work, total_min_work;
         uint32_t near_ts = 0, far_ts = 0;
         int walked = 0;
         try {

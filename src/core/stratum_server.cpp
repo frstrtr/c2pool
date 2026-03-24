@@ -1019,8 +1019,9 @@ void StratumSession::send_notify_work(bool force_clean)
     // This ensures the OP_RETURN commitment matches this miner's specific coinbase.
     // Freeze share chain tip ONCE — used for both ref_hash computation
     // and the job's stored prev_share_hash to avoid race conditions.
-    // With fork shares excluded from verified, best_share is always
-    // the main chain head — no peer-walk needed.
+    // p2pool: previous_share_hash = self.node.best_share_var.value
+    // Uses best_share directly — no peer filtering.
+    // think() Phase 5 (punish walk + best_descendent) ensures best is correct.
     uint256 frozen_prev_share;
     MiningInterface::CoinbaseResult cbr;
     if (auto fn = mining_interface_->get_best_share_hash_fn())
