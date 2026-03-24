@@ -256,22 +256,24 @@ public:
     {
         uint288 score_res;
 
-        auto head_height = verified.get_height(share_hash);
+        // Use CHAIN for navigation (p2pool SubsetTracker pattern).
+        // verified is only for membership checks, not navigation.
+        auto head_height = chain.get_height(share_hash);
         if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
             return {head_height, score_res};
 
-        auto end_point = verified.get_nth_parent_key(share_hash,
+        auto end_point = chain.get_nth_parent_key(share_hash,
             (PoolConfig::chain_length() * 15) / 16);
 
         // Find max block_rel_height in the tail 1/16 of the chain
         std::optional<int32_t> block_height;
         auto tail_count = std::min(
             static_cast<int32_t>(PoolConfig::chain_length() / 16),
-            verified.get_height(end_point));
+            chain.get_height(end_point));
         if (tail_count <= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
-        auto tail_view = verified.get_chain(end_point, tail_count);
+        auto tail_view = chain.get_chain(end_point, tail_count);
         for (auto [hash, data] : tail_view)
         {
             // Access the share's min_header.previous_block via the variant
@@ -288,14 +290,12 @@ public:
         if (!block_height.has_value() || block_height.value() >= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
-        // Compute work between share_hash and end_point by walking shares
-        // individually. get_interval() breaks for new_fork shares in
-        // verified chain (accumulated values don't span segments).
+        // Compute work using CHAIN (raw tracker), not verified.
         uint288 total_work;
-        auto v_dist = verified.get_height(share_hash) - verified.get_height(end_point);
-        if (v_dist > 0) {
+        auto c_dist = chain.get_height(share_hash) - chain.get_height(end_point);
+        if (c_dist > 0) {
             try {
-                auto view = verified.get_chain(share_hash, v_dist);
+                auto view = chain.get_chain(share_hash, c_dist);
                 for (auto [hash, data] : view) {
                     if (hash == end_point) break;
                     data.share.invoke([&](auto* obj) {
@@ -598,13 +598,17 @@ public:
         std::vector<DecoratedData<TailScore>> decorated_tails;
         for (auto& [tail_hash, head_hashes] : verified.get_tails())
         {
-            // Find the head with the most accumulated work (walk per head)
+            // Find the head with the most accumulated work.
+            // Use CHAIN (raw tracker) for work, not verified — matches p2pool's
+            // SubsetTracker which delegates get_work to the main tracker.
+            // This works correctly even when verified has gaps (55% verified).
             uint256 best_head;
             uint288 best_work;
             bool first = true;
             for (const auto& hh : head_hashes)
             {
-                auto w = verified.get_work(hh);
+                if (!chain.contains(hh)) continue;
+                auto w = chain.get_work(hh);
                 if (first || w > best_work)
                 {
                     best_work = w;
@@ -660,11 +664,12 @@ public:
                     continue;
 
                 try {
-                    // Work score: accumulated work from this head back to
-                    // 5th ancestor. Matches p2pool: get_work(get_nth_parent(h, 5)).
-                    auto v_height = verified.get_height(hh);
-                    auto recent_ancestor = verified.get_nth_parent_key(hh, std::min(5, v_height));
-                    uint288 work_score = verified.get_work(recent_ancestor);
+                    // Work score: use CHAIN (raw tracker) for navigation + work.
+                    // p2pool's SubsetTracker delegates get_nth_parent_hash to main tracker.
+                    // This works correctly even when verified has gaps.
+                    auto c_height = chain.get_height(hh);
+                    auto recent_ancestor = chain.get_nth_parent_key(hh, std::min(5, c_height));
+                    uint288 work_score = chain.get_work(recent_ancestor);
 
                     auto* head_idx = chain.get_index(hh);
                     if (!head_idx) continue;
