@@ -58,11 +58,18 @@ class ShareChain
 public:
     ShareChain()
     {
-        // Subscribe to removed signal for cache invalidation.
-        // Matches p2pool: TrackerSkipList + TrackerView both subscribe to removed.
+        // Subscribe to ALL 3 removal signals (p2pool forest.py:108-110).
+        // TrackerView uses all 3 for precise delta cache invalidation.
+        // SkipList only needs 'removed'.
         on_removed([this](const hash_t& hash) {
-            m_skip_list.forget_item(hash);  // skip list: clear jump entry
-            m_view.handle_removed(hash);     // tracker view: clear delta cache
+            m_skip_list.forget_item(hash);
+            m_view.handle_removed(hash);
+        });
+        on_remove_special([this](const hash_t& hash) {
+            m_view.handle_remove_special(hash);
+        });
+        on_remove_special2([this](const hash_t& hash) {
+            m_view.handle_remove_special2(hash);
         });
 
         auto contains_fn = [this](const hash_t& h) -> bool {
@@ -128,6 +135,10 @@ private:
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
 
     // ─── Signal system (matches p2pool Twisted Event pattern) ──────────
+    // Three signals matching p2pool forest.py Tracker:
+    //   removed         — fired for ALL removals (line 330)
+    //   remove_special  — tail with ≤1 child removed (line 310)
+    //   remove_special2 — tail with >1 child removed (line 321)
     // p2pool: tracker.removed = variable.Event()
     //         TrackerSkipList subscribes: removed.watch_weakref(self, lambda self, item: self.forget_item(item.hash))
     //         On remove: removed.happened(item) → forget_item clears only that hash from skips{}
@@ -144,16 +155,35 @@ public:
         m_removed_watchers[id] = std::move(fn);
         return id;
     }
-    void unwatch_removed(uint64_t id) { m_removed_watchers.erase(id); }
+    uint64_t on_remove_special(signal_fn fn) {
+        auto id = m_signal_id_gen++;
+        m_remove_special_watchers[id] = std::move(fn);
+        return id;
+    }
+    uint64_t on_remove_special2(signal_fn fn) {
+        auto id = m_signal_id_gen++;
+        m_remove_special2_watchers[id] = std::move(fn);
+        return id;
+    }
 
 private:
     uint64_t m_signal_id_gen{0};
     std::unordered_map<uint64_t, signal_fn> m_removed_watchers;
+    std::unordered_map<uint64_t, signal_fn> m_remove_special_watchers;
+    std::unordered_map<uint64_t, signal_fn> m_remove_special2_watchers;
 
-    // Fire removed signal — calls all registered watchers.
-    // Matches p2pool: self.removed.happened(item)
     void fire_removed(const hash_t& hash) {
         for (auto& [id, fn] : m_removed_watchers) {
+            try { fn(hash); } catch (...) {}
+        }
+    }
+    void fire_remove_special(const hash_t& hash) {
+        for (auto& [id, fn] : m_remove_special_watchers) {
+            try { fn(hash); } catch (...) {}
+        }
+    }
+    void fire_remove_special2(const hash_t& hash) {
+        for (auto& [id, fn] : m_remove_special2_watchers) {
             try { fn(hash); } catch (...) {}
         }
     }
@@ -633,11 +663,21 @@ public:
                 if (pr->second.empty()) m_reverse.erase(pr);
             }
         }
-        // Fire signal BEFORE erasing reverse map — BFS needs children entries
+        bool is_head = m_heads.contains(hash);
+
+        // Fire remove_special/remove_special2 BEFORE erasing (p2pool forest.py:310,321).
+        // These fire when removing a share whose parent is a tail (mid-chain removal).
+        if (!is_head && m_tails.contains(share_tail)) {
+            auto rev_it = m_reverse.find(share_tail);
+            int sibling_count = rev_it != m_reverse.end() ? static_cast<int>(rev_it->second.size()) : 0;
+            if (sibling_count <= 1)
+                fire_remove_special(hash);  // p2pool: self.remove_special.happened(item)
+            else
+                fire_remove_special2(hash); // p2pool: self.remove_special2.happened(item)
+        }
+        // Fire removed signal for ALL removals (p2pool forest.py:330)
         fire_removed(hash);
         m_reverse.erase(hash);
-
-        bool is_head = m_heads.contains(hash);
 
         if (is_head && children.empty())
         {

@@ -2,20 +2,11 @@
 /**
  * TrackerView — C++ implementation of p2pool forest.py TrackerView.
  *
- * Provides cached delta accumulation for get_height, get_work, get_last.
- * Deltas are cached on first access and reorganized on share removal.
+ * Full ref-based delta caching matching p2pool EXACTLY.
+ * Stores deltas in two parts: (item→ref, ref→chain_end).
+ * Selective invalidation on share removal — no full cache clear.
  *
  * p2pool source: forest.py lines 96-222
- *
- * The delta type stores accumulated {height, work, min_work} between
- * a share and a reference point. get_delta_to_last() walks from a share
- * to the chain end, caching intermediate deltas for O(1) subsequent access.
- *
- * Signal handling:
- *   remove_special  → delta refs pointing through removed share are shortened
- *   remove_special2 → delta refs pointing to removed share's tail are dropped
- *   removed         → removed share's delta entry is cleaned up
- *
  * MIT License (c2pool project)
  */
 
@@ -24,22 +15,15 @@
 #include <functional>
 #include <cstdint>
 #include <vector>
+#include <atomic>
 
 namespace chain {
 
-/**
- * AttributeDelta — accumulated path delta.
- * Matches p2pool's get_attributedelta_type({height, work, min_work}).
- *
- * Supports:
- *   operator+= (path concatenation: self.tail must == other.head)
- *   operator-  (path subtraction for caching)
- */
 template <typename HashType, typename WorkType>
 struct AttributeDelta
 {
-    HashType head;      // start of path segment
-    HashType tail;      // end of path segment (prev_hash of deepest share)
+    HashType head;
+    HashType tail;
     int32_t height{0};
     WorkType work{};
     WorkType min_work{};
@@ -52,7 +36,6 @@ struct AttributeDelta
     }
 
     AttributeDelta& operator+=(const AttributeDelta& other) {
-        // self.tail == other.head (path concatenation)
         tail = other.tail;
         height += other.height;
         work += other.work;
@@ -66,9 +49,6 @@ struct AttributeDelta
         return result;
     }
 
-    // Subtraction: extract sub-path
-    // If self.head == other.head: return (other.tail → self.tail)
-    // If self.tail == other.tail: return (self.head → other.head)
     AttributeDelta operator-(const AttributeDelta& other) const {
         AttributeDelta result;
         if (head == other.head) {
@@ -78,7 +58,6 @@ struct AttributeDelta
             result.head = head;
             result.tail = other.head;
         } else {
-            // Should not happen in correct usage
             result.head = head;
             result.tail = tail;
         }
@@ -90,15 +69,17 @@ struct AttributeDelta
 };
 
 /**
- * TrackerView — delta caching layer.
+ * TrackerView — ref-based delta caching (p2pool forest.py:96-222).
  *
- * Direct translation of p2pool forest.py TrackerView.
- * Caches deltas from shares to reference points for O(1) repeated access.
+ * Cache structure (matching p2pool exactly):
+ *   _deltas[item_hash] = (delta_from_item_to_ref, ref_id)
+ *   _delta_refs[ref_id] = delta_from_ref_to_chain_end
+ *   _reverse_deltas[ref_id] = set of item_hashes using this ref
+ *   _reverse_delta_refs[delta_tail] = ref_id
  *
- * Template params:
- *   HashType — hash type (uint256)
- *   WorkType — work accumulation type (uint288)
- *   HasherType — hash function
+ * This allows O(1) invalidation when a share is removed:
+ *   - Only entries referencing the removed share are affected
+ *   - Other entries remain valid (they reference different chain endpoints)
  */
 template <typename HashType, typename WorkType, typename HasherType>
 class TrackerView
@@ -107,18 +88,77 @@ class TrackerView
     using work_t = WorkType;
     using hasher_t = HasherType;
     using delta_t = AttributeDelta<hash_t, work_t>;
+    using ref_t = uint64_t;
 
-    // Callbacks to access share data
     std::function<bool(const hash_t&)> m_contains_fn;
-    std::function<hash_t(const hash_t&)> m_get_prev_fn;    // share.prev_hash
-    std::function<work_t(const hash_t&)> m_get_work_fn;    // target_to_avg_attempts(bits)
-    std::function<work_t(const hash_t&)> m_get_min_work_fn; // target_to_avg_attempts(max_bits)
+    std::function<hash_t(const hash_t&)> m_get_prev_fn;
+    std::function<work_t(const hash_t&)> m_get_work_fn;
+    std::function<work_t(const hash_t&)> m_get_min_work_fn;
 
-    // Delta cache (p2pool: self._deltas, self._delta_refs, etc.)
-    // Simplified: we cache the full delta_to_last for each share.
-    // p2pool uses a more complex ref-based system for memory efficiency.
-    // Our approach: direct cache per share hash. Clear on remove.
-    mutable std::unordered_map<hash_t, delta_t, hasher_t> m_cache;
+    // p2pool: self._deltas = {}  # item_hash -> (delta, ref)
+    mutable std::unordered_map<hash_t, std::pair<delta_t, ref_t>, hasher_t> m_deltas;
+    // p2pool: self._reverse_deltas = {}  # ref -> set of item_hashes
+    mutable std::unordered_map<ref_t, std::unordered_set<hash_t, hasher_t>> m_reverse_deltas;
+    // p2pool: self._delta_refs = {}  # ref -> delta
+    mutable std::unordered_map<ref_t, delta_t> m_delta_refs;
+    // p2pool: self._reverse_delta_refs = {}  # delta.tail -> ref
+    mutable std::unordered_map<hash_t, ref_t, hasher_t> m_reverse_delta_refs;
+    // p2pool: self._ref_generator = itertools.count()
+    mutable std::atomic<ref_t> m_ref_gen{0};
+
+    delta_t make_element_delta(const hash_t& hash) const {
+        delta_t d;
+        d.head = hash;
+        d.tail = m_get_prev_fn(hash);
+        d.height = 1;
+        d.work = m_get_work_fn(hash);
+        d.min_work = m_get_min_work_fn(hash);
+        return d;
+    }
+
+    // p2pool: _get_delta (forest.py:175-183)
+    delta_t _get_delta(const hash_t& item_hash) const {
+        auto it = m_deltas.find(item_hash);
+        if (it != m_deltas.end()) {
+            auto& [delta1, ref] = it->second;
+            auto ref_it = m_delta_refs.find(ref);
+            if (ref_it != m_delta_refs.end())
+                return delta1 + ref_it->second;
+        }
+        return make_element_delta(item_hash);
+    }
+
+    // p2pool: _set_delta (forest.py:185-206)
+    void _set_delta(const hash_t& item_hash, const delta_t& delta) const {
+        auto other_item_hash = delta.tail;
+
+        if (m_reverse_delta_refs.find(other_item_hash) == m_reverse_delta_refs.end()) {
+            ref_t ref = m_ref_gen++;
+            m_delta_refs[ref] = delta_t::get_none(other_item_hash);
+            m_reverse_delta_refs[other_item_hash] = ref;
+        }
+
+        ref_t ref = m_reverse_delta_refs[other_item_hash];
+        auto& ref_delta = m_delta_refs[ref];
+
+        // Remove from old ref group if exists
+        auto old_it = m_deltas.find(item_hash);
+        if (old_it != m_deltas.end()) {
+            ref_t prev_ref = old_it->second.second;
+            m_reverse_deltas[prev_ref].erase(item_hash);
+            if (m_reverse_deltas[prev_ref].empty() && prev_ref != ref) {
+                m_reverse_deltas.erase(prev_ref);
+                auto x_it = m_delta_refs.find(prev_ref);
+                if (x_it != m_delta_refs.end()) {
+                    m_reverse_delta_refs.erase(x_it->second.tail);
+                    m_delta_refs.erase(x_it);
+                }
+            }
+        }
+
+        m_deltas[item_hash] = {delta - ref_delta, ref};
+        m_reverse_deltas[ref].insert(item_hash);
+    }
 
 public:
     TrackerView() = default;
@@ -135,22 +175,7 @@ public:
         m_get_min_work_fn = std::move(get_min_work_fn);
     }
 
-    /**
-     * get_delta_to_last — walk from hash to chain end, accumulating deltas.
-     *
-     * Matches p2pool forest.py:208-218 exactly:
-     *   delta = delta_type.get_none(item_hash)
-     *   updates = []
-     *   while delta.tail in self._tracker.items:
-     *       updates.append((delta.tail, delta))
-     *       this_delta = self._get_delta(delta.tail)
-     *       delta += this_delta
-     *   for update_hash, delta_then in updates:
-     *       self._set_delta(update_hash, delta - delta_then)
-     *   return delta
-     *
-     * Caches intermediate results for O(1) subsequent access.
-     */
+    // p2pool: get_delta_to_last (forest.py:208-218)
     delta_t get_delta_to_last(const hash_t& item_hash) const
     {
         delta_t delta = delta_t::get_none(item_hash);
@@ -158,30 +183,14 @@ public:
 
         while (!delta.tail.IsNull() && m_contains_fn(delta.tail))
         {
-            // Check cache for this position
-            auto cache_it = m_cache.find(delta.tail);
-            if (cache_it != m_cache.end()) {
-                // Found cached delta — use it and stop walking
-                delta += cache_it->second;
-                break;
-            }
-
             updates.push_back({delta.tail, delta});
-
-            // Build single-share delta
-            delta_t this_delta;
-            this_delta.head = delta.tail;
-            this_delta.tail = m_get_prev_fn(delta.tail);
-            this_delta.height = 1;
-            this_delta.work = m_get_work_fn(delta.tail);
-            this_delta.min_work = m_get_min_work_fn(delta.tail);
-
+            delta_t this_delta = _get_delta(delta.tail);
             delta += this_delta;
         }
 
-        // Cache intermediate results (p2pool: _set_delta)
+        // Cache intermediate results
         for (auto& [update_hash, delta_then] : updates) {
-            m_cache[update_hash] = delta - delta_then;
+            _set_delta(update_hash, delta - delta_then);
         }
 
         return delta;
@@ -212,34 +221,80 @@ public:
         return get_delta_to_last(item) - get_delta_to_last(ancestor);
     }
 
-    /**
-     * handle_removed — clear cache entry for removed share.
-     *
-     * Matches p2pool forest.py:149-159 _handle_removed().
-     * Also clears all entries that DEPENDED on the removed share
-     * (entries whose walk went through the removed share).
-     *
-     * Simple approach: clear the removed hash AND all entries
-     * whose cached path includes the removed hash as tail.
-     * This is correct because cached deltas ending at the removed
-     * hash are now stale (the chain changed below them).
-     */
+    // p2pool: _handle_removed (forest.py:149-159)
     void handle_removed(const hash_t& hash) {
-        m_cache.erase(hash);
-        // Also clear entries whose delta.tail == hash (they depend on it)
-        // p2pool handles this via ref-based indirection; we scan directly.
-        // Since removes are rare (pruning only), this is acceptable.
-        std::vector<hash_t> to_clear;
-        for (auto& [k, v] : m_cache) {
-            if (v.tail == hash)
-                to_clear.push_back(k);
+        auto delta = make_element_delta(hash);
+
+        auto it = m_deltas.find(delta.head);
+        if (it != m_deltas.end()) {
+            auto [delta1, ref] = it->second;
+            m_deltas.erase(it);
+            m_reverse_deltas[ref].erase(delta.head);
+            if (m_reverse_deltas[ref].empty()) {
+                m_reverse_deltas.erase(ref);
+                auto ref_it = m_delta_refs.find(ref);
+                if (ref_it != m_delta_refs.end()) {
+                    m_reverse_delta_refs.erase(ref_it->second.tail);
+                    m_delta_refs.erase(ref_it);
+                }
+            }
         }
-        for (auto& k : to_clear)
-            m_cache.erase(k);
     }
 
-    void clear() { m_cache.clear(); }
-    size_t cache_size() const { return m_cache.size(); }
+    // p2pool: _handle_remove_special (forest.py:112-135)
+    void handle_remove_special(const hash_t& hash) {
+        auto delta = make_element_delta(hash);
+
+        if (m_reverse_delta_refs.find(delta.tail) == m_reverse_delta_refs.end())
+            return;
+
+        // Move delta refs referencing children down
+        auto head_ref_it = m_reverse_delta_refs.find(delta.head);
+        if (head_ref_it != m_reverse_delta_refs.end()) {
+            auto& items = m_reverse_deltas[head_ref_it->second];
+            for (auto x : std::vector<hash_t>(items.begin(), items.end()))
+                get_last(x);  // forces cache rebuild through new path
+        }
+
+        if (m_reverse_delta_refs.find(delta.tail) == m_reverse_delta_refs.end())
+            return;
+
+        // Move ref pointing to this up
+        ref_t ref = m_reverse_delta_refs[delta.tail];
+        auto& cur_delta = m_delta_refs[ref];
+        cur_delta = cur_delta - delta;
+        m_reverse_delta_refs.erase(delta.tail);
+        m_reverse_delta_refs[delta.head] = ref;
+    }
+
+    // p2pool: _handle_remove_special2 (forest.py:137-147)
+    void handle_remove_special2(const hash_t& hash) {
+        auto delta = make_element_delta(hash);
+
+        auto tail_ref_it = m_reverse_delta_refs.find(delta.tail);
+        if (tail_ref_it == m_reverse_delta_refs.end())
+            return;
+
+        ref_t ref = tail_ref_it->second;
+        m_reverse_delta_refs.erase(tail_ref_it);
+        m_delta_refs.erase(ref);
+
+        auto rev_it = m_reverse_deltas.find(ref);
+        if (rev_it != m_reverse_deltas.end()) {
+            for (auto& x : rev_it->second)
+                m_deltas.erase(x);
+            m_reverse_deltas.erase(rev_it);
+        }
+    }
+
+    void clear() {
+        m_deltas.clear();
+        m_reverse_deltas.clear();
+        m_delta_refs.clear();
+        m_reverse_delta_refs.clear();
+    }
+
+    size_t cache_size() const { return m_deltas.size(); }
 };
 
 } // namespace chain
