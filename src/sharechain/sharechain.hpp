@@ -273,25 +273,17 @@ public:
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
-    // Compute accumulated work from hash back to its FOREST TAIL.
-    // Matches p2pool: verified.get_work(head) returns work within
-    // the head's forest segment only — does NOT cross into parent
-    // segments. This ensures fork heads count only fork work, not
-    // the entire main chain below the fork point.
+    // Compute accumulated work from hash back to chain end.
+    // Matches p2pool: verified.get_work = get_delta_to_last().work
+    // which walks through ALL shares via items[prev_hash] — crossing
+    // all forest boundaries. The tiebreak in Phase 4 scoring
+    // (time_seen) determines which head wins, not the work boundary.
     uint288 get_work(const hash_t& hash)
     {
-        // Find this hash's forest tail (segment boundary)
-        hash_t seg_tail;
-        if (m_heads.contains(hash))
-            seg_tail = m_heads[hash];
-        else
-            seg_tail = hash_t(); // not a head — walk to end
-
         uint288 total;
         hash_t cur = hash;
         while (!cur.IsNull() && m_shares.contains(cur))
         {
-            if (cur == seg_tail) break; // stop at forest tail
             total += m_shares[cur].index->work;
             cur = m_shares[cur].index->tail;
         }

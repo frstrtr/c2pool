@@ -151,18 +151,17 @@ public:
         if (verified.contains(share_hash))
             return true;
 
-        // Only verify shares that EXTEND the verified chain:
-        // prev_hash must be in verified (or null for genesis).
-        // Fork shares (prev not verified) are skipped — they pollute
-        // verified scoring and cause best_share to pick local forks.
-        // Exception: when verified is empty (bootstrap), allow all shares
-        // so the first batch can seed the verified chain.
+        // Only verify shares that EXTEND the verified chain.
+        // Fork shares (prev not in verified) would pollute scoring.
+        // p2pool handles this via time_seen tiebreak, but c2pool has
+        // many more forks → filter is needed for clean scoring.
+        // Bootstrap: allow all when verified is empty.
         if (verified.size() > 0)
         {
             uint256 prev;
             chain.get_share(share_hash).invoke([&](auto* obj) { prev = obj->m_prev_hash; });
             if (!prev.IsNull() && !verified.contains(prev))
-                return false; // fork share — parent not verified
+                return false;
         }
 
         auto [height, last] = chain.get_height_and_last(share_hash);
@@ -666,8 +665,11 @@ public:
                             reason = std::max(reason, idx->naughty);
                     }
 
-                    decorated_heads.push_back({{work_score, reason, ts}, hh});
-                    traditional_sort.push_back({{work_score, ts, reason}, hh});
+                    // p2pool: sort key = (work, -reason, -time_seen)
+                    // Negate time_seen: share seen FIRST (earliest) wins tiebreak.
+                    // p2pool uses -time_seen; c2pool sorts ascending so negate.
+                    decorated_heads.push_back({{work_score, reason, -ts}, hh});
+                    traditional_sort.push_back({{work_score, -ts, reason}, hh});
                 } catch (const std::exception&) {
                     // Chain concurrently modified — skip this head, retry next cycle
                 }
