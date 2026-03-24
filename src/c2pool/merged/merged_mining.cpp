@@ -965,10 +965,9 @@ MergedMiningManager::build_merged_header_info() const
             uint256 merkle_root = compute_tx_merkle_root(tx_hashes);
             LOG_TRACE << "[MM-header] merkle done, computing link...";
             info.coinbase_merkle_branches = compute_merkle_link(tx_hashes, 0);
-            LOG_TRACE << "[MM-header] link done, freezing coinbase...";
+            LOG_INFO << "[MM-header] link done, freezing coinbase len=" << coinbase_hex.size();
             info.coinbase_hex = coinbase_hex;
-
-            // Extract scriptSig from the coinbase for the coinbase_script field
+            LOG_INFO << "[MM-header] coinbase frozen, extracting scriptSig...";
             // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) = 41 bytes
             if (coinbase_bytes.size() > 42) {
                 size_t pos = 41;
@@ -995,7 +994,9 @@ MergedMiningManager::build_merged_header_info() const
             uint32_t nonce = 0;
             std::memcpy(p, &nonce, 4);
 
+            LOG_TRACE << "[MM-header] header built, pushing result";
             result.push_back(std::move(info));
+            LOG_TRACE << "[MM-header] chain done";
         } catch (const std::exception& e) {
             LOG_WARNING << "[MM:chain_" << snap.chain_id
                         << "] build_merged_header_info failed: " << e.what();
@@ -1009,7 +1010,9 @@ MergedMiningManager::build_merged_header_info_with_commitment()
 {
     // Step 1: Build header infos (releases lock internally for payout_fn callback).
     // Each MergedHeaderInfo now contains coinbase_hex — the pre-built PPLNS coinbase.
+    LOG_TRACE << "[MM-commit] Step 1: building header infos...";
     auto header_infos = build_merged_header_info();
+    LOG_TRACE << "[MM-commit] Step 1 done, " << header_infos.size() << " infos";
 
     // Step 2: Freeze coinbase_hex + template per chain AND update commitment.
     // Use try_lock to avoid deadlock with MM poll timer on separate thread.
