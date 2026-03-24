@@ -946,16 +946,13 @@ MergedMiningManager::build_merged_header_info() const
         std::string bits_hex = tmpl.value("bits", std::string("1d00ffff"));
 
         try {
-            LOG_TRACE << "[MM-header] building coinbase hex...";
-            // NOTE: state_root is NOT fetched here — it would deadlock
-            // (state_fn → MiningInterface::get_the_state_root → m_work_mutex).
-            // The state_root in merged coinbase is informational, not consensus.
-            // Use a zero root; the actual THE commitment is in the LTC coinbase.
+            LOG_TRACE << "[MM-header] building coinbase hex (height="
+                      << info.block_height << " payouts=" << payouts.size() << ")...";
             uint256 state_root; // zero — avoid deadlock
-
-            // Build coinbase, compute merkle root + link using shared helpers
+            LOG_TRACE << "[MM-header] calling build_pplns_coinbase_hex...";
             std::string coinbase_hex = build_pplns_coinbase_hex(
                 info.block_height, payouts, state_root);
+            LOG_TRACE << "[MM-header] build_pplns_coinbase_hex returned len=" << coinbase_hex.size();
             if (coinbase_hex.empty()) continue;
 
             auto coinbase_bytes = from_hex(coinbase_hex);

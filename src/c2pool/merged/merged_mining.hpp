@@ -375,7 +375,10 @@ private:
     void record_discovered_block(const ChainState& chain, bool accepted,
                                  const std::string& parent_hash = "");
 
-    mutable std::mutex m_mutex;
+    // recursive_mutex: build_merged_header_info_with_commitment called from
+    // ASIO io_context can be triggered while MM timer holds the mutex on
+    // another thread → cross-thread deadlock with plain std::mutex.
+    mutable std::recursive_mutex m_mutex;
 };
 
 } // namespace merged
