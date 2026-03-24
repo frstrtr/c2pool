@@ -120,6 +120,24 @@ double StratumServer::get_total_hashrate() const
     return total;
 }
 
+AddrRateMap StratumServer::get_local_addr_rates() const
+{
+    // p2pool: get_local_addr_rates() — sum hashrate by pubkey_hash across all connections.
+    // p2pool ref: work.py:1975-1990
+    AddrRateMap rates;
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    for (const auto& s : sessions_) {
+        if (!s->is_connected()) continue;
+        const auto& pk = s->get_pubkey_hash();
+        // Skip sessions that haven't authorized yet (null pubkey_hash)
+        bool has_pk = false;
+        for (auto b : pk) { if (b != 0) { has_pk = true; break; } }
+        if (!has_pk) continue;
+        rates[pk] += s->get_hashrate();
+    }
+    return rates;
+}
+
 void StratumServer::notify_all()
 {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -413,6 +431,13 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         if (mining_interface_) {
             std::string atype;
             auto h160 = address_to_hash160(username_, atype);
+            // Store pubkey_hash for per-address hashrate aggregation
+            // p2pool: get_local_addr_rates uses pubkey_hash as key
+            if (h160.size() == 40) {
+                auto h160_bytes = ParseHex(h160);
+                if (h160_bytes.size() == 20)
+                    std::copy(h160_bytes.begin(), h160_bytes.end(), pubkey_hash_.begin());
+            }
             if (h160.size() == 40 && (atype == "p2pkh" || atype == "p2wpkh" || atype == "p2sh")) {
                 for (const auto& chain : MERGED_CHAINS) {
                     if (mining_interface_->has_merged_chain(chain.chain_id) &&

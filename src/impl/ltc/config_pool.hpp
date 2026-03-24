@@ -44,6 +44,14 @@ public:
     static constexpr uint32_t CHAIN_LENGTH              = 8640;    // 24*60*60 / 10
     static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
 
+    // DUST_THRESHOLD: minimum payout per block to justify a share output.
+    // p2pool: PARENT.DUST_THRESHOLD (used in desired_target dust check).
+    // Mainnet: 0.03 LTC = 3000000 litoshis (litecoin/networks/litecoin.py:35)
+    // Testnet: 1.0 LTC = 100000000 litoshis (litecoin/networks/litecoin_testnet.py:33)
+    static constexpr uint64_t DUST_THRESHOLD            = 3000000;  // litoshis (mainnet)
+    static constexpr uint64_t TESTNET_DUST_THRESHOLD    = 100000000; // litoshis (testnet)
+    static uint64_t dust_threshold() { return is_testnet ? TESTNET_DUST_THRESHOLD : DUST_THRESHOLD; }
+
     // Testnet constants (selected at runtime via is_testnet)
     static constexpr uint32_t TESTNET_SHARE_PERIOD      = 4;       // seconds
     static constexpr uint32_t TESTNET_CHAIN_LENGTH      = 400;     // 20*60//3

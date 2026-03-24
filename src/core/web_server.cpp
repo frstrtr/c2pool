@@ -5094,6 +5094,19 @@ void WebServer::set_on_block_relay(std::function<void(const std::string&)> fn)
     mining_interface_->set_on_block_relay(std::move(fn));
 }
 
+std::map<std::array<uint8_t, 20>, double> WebServer::get_local_addr_rates() const
+{
+    // Forward to StratumServer. Converts unordered_map → sorted map.
+    // p2pool ref: work.py:1975-1990
+    std::map<std::array<uint8_t, 20>, double> result;
+    if (stratum_server_) {
+        auto rates = stratum_server_->get_local_addr_rates();
+        for (auto& [k, v] : rates)
+            result[k] = v;
+    }
+    return result;
+}
+
 void WebServer::trigger_work_refresh()
 {
     // Update local hashrate from stratum sessions (p2pool: get_local_addr_rates)

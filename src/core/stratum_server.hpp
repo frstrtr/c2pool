@@ -11,6 +11,7 @@
 #include <ctime>
 #include <chrono>
 #include <set>
+#include <array>
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
@@ -26,6 +27,18 @@ using tcp = net::ip::tcp;
 
 // Forward declaration — defined in web_server.hpp
 class MiningInterface;
+
+/// Hasher for 20-byte pubkey_hash (used in per-address hashrate maps).
+struct PubkeyHashHasher {
+    size_t operator()(const std::array<uint8_t, 20>& a) const {
+        size_t h = 0;
+        for (int i = 0; i < 8 && i < 20; ++i)
+            h |= size_t(a[i]) << (8 * i);
+        return h;
+    }
+};
+/// Per-address hashrate map type (p2pool: get_local_addr_rates return type).
+using AddrRateMap = std::unordered_map<std::array<uint8_t, 20>, double, PubkeyHashHasher>;
 
 /// Stratum mining session — one per TCP connection from a miner.
 ///
@@ -49,6 +62,10 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
 
     // Per-connection VARDIFF via HashrateTracker
     c2pool::hashrate::HashrateTracker hashrate_tracker_;
+
+    // Miner's pubkey_hash (20 bytes, extracted from address at authorize time).
+    // Used for per-address hashrate aggregation (p2pool: get_local_addr_rates).
+    std::array<uint8_t, 20> pubkey_hash_{};
 
     // Active jobs for stale detection (job_id → prevhash at time of issue)
     struct JobEntry {
@@ -116,6 +133,7 @@ public:
 
     bool is_connected() const { return socket_.is_open(); }
     double get_hashrate() const { return hashrate_tracker_.get_current_hashrate(); }
+    const std::array<uint8_t, 20>& get_pubkey_hash() const { return pubkey_hash_; }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
 
 private:
@@ -170,8 +188,12 @@ public:
     void notify_all();
 
     /// Sum of all connected miners' hashrate (H/s).
-    /// Matches p2pool's get_local_addr_rates() aggregation.
     double get_total_hashrate() const;
+
+    /// Per-address hashrate aggregation.
+    /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
+    /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
+    AddrRateMap get_local_addr_rates() const;
 
     /// Register/unregister sessions for broadcast
     void register_session(std::shared_ptr<StratumSession> s);

@@ -9,6 +9,7 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <array>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -947,6 +948,11 @@ public:
     // Payout system integration
     void set_payout_manager(c2pool::payout::PayoutManager* manager) { payout_manager_ptr_ = manager; }
     c2pool::payout::PayoutManager* get_payout_manager_ptr() const { return payout_manager_ptr_; }
+
+    /// Per-address hashrate aggregation from stratum.
+    /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
+    /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
+    std::map<std::array<uint8_t, 20>, double> get_local_addr_rates() const;
 
     // Stratum server control methods
     bool start_stratum_server();

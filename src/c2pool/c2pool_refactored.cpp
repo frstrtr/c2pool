@@ -2108,7 +2108,7 @@ int main(int argc, char* argv[]) {
             // creation use the share difficulty (not block difficulty).
             auto* mi_for_share_bits = web_server.get_mining_interface();
             web_server.get_mining_interface()->set_ref_hash_fn(
-                [&p2p_node, &whale_detector, mi_for_share_bits, dev_donation](
+                [&p2p_node, &whale_detector, mi_for_share_bits, dev_donation, &web_server](
                     const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
@@ -2129,19 +2129,93 @@ int main(int argc, char* argv[]) {
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
                     params.desired_version = 36;
 
-                    // p2pool computes desired_target from miner hashrate but it
-                    // clips to [pre_target3/30, pre_target3]. Both p2pool and c2pool
-                    // must use the SAME bits to share a chain. Since p2pool's hashrate
-                    // measurement produces a target below pre_target3/30 for any real
-                    // miner, it always clips to pre_target3/30. Using uint256(0) here
-                    // produces the same result: clips to pre_target3/30 (hardest).
-                    // p2pool work.py:2442-2443:
-                    //   if desired_share_target is None:
-                    //       desired_share_target = 2**256-1
-                    // Default: easiest possible → clips to pre_target3 (ceiling).
-                    // c2pool had uint256() = 0 (HARDEST) → clipped to pre_target3/30
-                    // → 30x harder than p2pool → GENTX mismatch (different bits).
+                    // Per-miner desired_target — matches p2pool work.py:2490-2505.
+                    // 1) Start with 2^256-1 (easiest possible)
+                    // 2) Cap to 1.67% of pool shares by local hashrate
+                    // 3) Dust threshold: if expected payout < DUST, use block-proportional target
+                    // Result: clips to [pre_target3/30, pre_target3] in compute_share_target.
                     auto desired_target = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+                    // Extract pubkey_hash from payout_script for hashrate lookup
+                    std::array<uint8_t, 20> miner_pubkey{};
+                    if (payout_script.size() == 25 && payout_script[0] == 0x76) {
+                        std::copy(payout_script.begin() + 3, payout_script.begin() + 23, miner_pubkey.begin());
+                    } else if (payout_script.size() == 23 && payout_script[0] == 0xa9) {
+                        std::copy(payout_script.begin() + 2, payout_script.begin() + 22, miner_pubkey.begin());
+                    } else if (payout_script.size() == 22 && payout_script[0] == 0x00) {
+                        std::copy(payout_script.begin() + 2, payout_script.begin() + 22, miner_pubkey.begin());
+                    }
+
+                    // p2pool work.py:2488-2505: per-miner desired_target computation
+                    auto local_addr_rates = web_server.get_local_addr_rates();
+                    double local_hash_rate = 0.0;
+                    {
+                        auto rate_it = local_addr_rates.find(miner_pubkey);
+                        if (rate_it != local_addr_rates.end())
+                            local_hash_rate = rate_it->second;
+                    }
+
+                    // Cap 1: limit to 1.67% of pool shares (work.py:2492-2495)
+                    // desired_target = min(desired_target,
+                    //   average_attempts_to_target(local_hash_rate * SHARE_PERIOD / 0.0167))
+                    if (local_hash_rate > 0.0) {
+                        double avg_attempts = local_hash_rate * ltc::PoolConfig::share_period() / 0.0167;
+                        if (avg_attempts > 1.0) {
+                            // average_attempts_to_target(n) = min(2^256/n - 1, 2^256-1)
+                            uint288 two_256;
+                            two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+                            uint288 avg_288(static_cast<uint64_t>(avg_attempts));
+                            uint288 cap_288 = two_256 / avg_288;
+                            if (cap_288 > uint288(1)) cap_288 = cap_288 - uint288(1);
+                            uint256 cap_target;
+                            cap_target.SetHex(cap_288.GetHex());
+                            if (cap_target < desired_target)
+                                desired_target = cap_target;
+                        }
+                    }
+
+                    // Cap 2: dust threshold (work.py:2497-2505)
+                    // If expected payout per block < DUST_THRESHOLD, ease the target
+                    // so small miners still get meaningful payouts.
+                    {
+                        auto& trk = p2p_node->tracker();
+                        if (!frozen_prev_share.IsNull() && trk.chain.contains(frozen_prev_share)) {
+                            int32_t lookbehind = 3600 / ltc::PoolConfig::share_period();
+                            auto height = trk.chain.get_acc_height(frozen_prev_share);
+                            if (height > lookbehind && local_hash_rate > 0.0) {
+                                auto pool_aps = trk.get_pool_attempts_per_second(
+                                    frozen_prev_share, lookbehind, /*min_work=*/false);
+                                double pool_aps_d = static_cast<double>(pool_aps.GetLow64());
+                                if (pool_aps_d > 0.0) {
+                                    double expected_payout = (local_hash_rate / pool_aps_d)
+                                        * subsidy * (1.0 - dev_donation / 100.0);
+                                    if (expected_payout < ltc::PoolConfig::dust_threshold()) {
+                                        // p2pool: average_attempts_to_target(
+                                        //   target_to_average_attempts(block_target) * SPREAD * DUST / subsidy)
+                                        uint256 block_target = chain::bits_to_target(bits);
+                                        uint288 block_aps = chain::target_to_average_attempts(block_target);
+                                        // Use double arithmetic to avoid uint288 overflow
+                                        double dust_avg = static_cast<double>(block_aps.GetLow64())
+                                            * ltc::PoolConfig::SPREAD
+                                            * ltc::PoolConfig::dust_threshold()
+                                            / static_cast<double>(subsidy);
+                                        if (dust_avg > 1.0) {
+                                            uint288 two_256;
+                                            two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+                                            uint288 dust_avg_288(static_cast<uint64_t>(dust_avg));
+                                            uint288 dust_target_288 = two_256 / dust_avg_288;
+                                            if (dust_target_288 > uint288(1))
+                                                dust_target_288 = dust_target_288 - uint288(1);
+                                            uint256 dust_target;
+                                            dust_target.SetHex(dust_target_288.GetHex());
+                                            if (dust_target < desired_target)
+                                                desired_target = dust_target;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // With fork shares excluded from verified, best_share (= frozen_prev)
                     // is always the main chain head. CST walks the main chain directly.
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
@@ -2165,7 +2239,9 @@ int main(int argc, char* argv[]) {
                         double md = chain::target_to_difficulty(mt);
                         LOG_INFO << "[ShareTarget] share_bits=" << std::hex << share_bits
                                  << " max_bits=" << share_max_bits << std::dec
-                                 << " share_diff=" << sd << " max_diff=" << md;
+                                 << " share_diff=" << sd << " max_diff=" << md
+                                 << " local_hr=" << local_hash_rate
+                                 << " desired=" << desired_target.GetHex().substr(0, 16);
                     }
 
                     // Extract pubkey_hash and type from payout_script.

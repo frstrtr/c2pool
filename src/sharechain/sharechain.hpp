@@ -80,8 +80,8 @@ public:
             return it != m_shares.end() ? it->second.index->tail : hash_t();
         };
 
-        // Init skip list (O(log n) get_nth_parent)
-        m_skip_list.init(prev_fn, contains_fn);
+        // Init skip list (O(log n) get_nth_parent — p2pool DistanceSkipList)
+        m_skip_list.init(prev_fn);
 
         // Init TrackerView (cached get_height/get_work/get_last)
         m_view.init(
@@ -188,12 +188,12 @@ private:
         }
     }
 
-    // ─── Skip list for O(log n) get_nth_parent (Bitcoin Core pattern) ──
-    chain::ShareSkipList<hash_t, hasher_t> m_skip_list;
+    // ─── Skip list for O(log n) get_nth_parent (p2pool DistanceSkipList) ──
+    chain::DistanceSkipList<hash_t, hasher_t> m_skip_list;
     // Pointer to parent chain's skip list (SubsetTracker pattern).
     // If set, get_nth_parent uses parent's skip list (shared navigation).
     // p2pool: SubsetTracker.get_nth_parent_hash = subset_of.get_nth_parent_hash
-    chain::ShareSkipList<hash_t, hasher_t>* m_parent_skip_list{nullptr};
+    chain::DistanceSkipList<hash_t, hasher_t>* m_parent_skip_list{nullptr};
 
     // ─── TrackerView for cached get_height/get_work/get_last ──────────
     // Matches p2pool forest.py TrackerView: caches forward-walk deltas.
@@ -280,9 +280,9 @@ public:
         if (!share->m_prev_hash.IsNull())
             m_reverse[share->m_prev_hash].insert(share->m_hash);
 
-        // Build skip pointer for O(log n) ancestor lookups.
-        // Bitcoin Core: CBlockIndex::BuildSkip() — called once at add time.
-        m_skip_list.build_skip(share->m_hash, share->m_prev_hash);
+        // p2pool DistanceSkipList: no explicit build needed at add time.
+        // Skip pointers are built lazily during get_nth_parent queries.
+        // forget_item is called on removal (via removed signal in constructor).
     }
 
     void add(share_t share)
@@ -361,15 +361,18 @@ public:
         return {get_height(item), get_last(item)};
     }
 
-    hash_t get_nth_parent_key(const hash_t& hash, int32_t n)
+    hash_t get_nth_parent_key(const hash_t& hash, int32_t n) const
     {
-        // Walk n steps via tail (prev_hash) lookup.
+        // Walk n steps via tail (prev_hash) lookup. O(n) fallback.
         hash_t cur = hash;
         for (int i = 0; i < n; i++)
         {
-            if (cur.IsNull() || !m_shares.contains(cur))
+            if (cur.IsNull())
                 throw std::invalid_argument("get_nth_parent_key: chain too short");
-            cur = m_shares[cur].index->tail;
+            auto it = m_shares.find(cur);
+            if (it == m_shares.end())
+                throw std::invalid_argument("get_nth_parent_key: chain too short");
+            cur = it->second.index->tail;
         }
         return cur;
     }
@@ -442,20 +445,15 @@ public:
         return m_view.get_delta_to_last(hash);
     }
 
-    /// Ancestor lookup — uses O(n) hash walk (matching p2pool's
-    /// DistanceSkipList which walks via previous(element)).
-    /// Bitcoin Core skip list uses stored heights which become stale
-    /// after pruning. p2pool's DistanceSkipList walks actual items.
-    /// TODO: implement proper DistanceSkipList with geometric jumps
-    /// for O(log n) that doesn't depend on stored heights.
+    /// O(log n) ancestor lookup via p2pool DistanceSkipList.
+    /// Matches p2pool: tracker.get_nth_parent_hash(hash, n)
+    /// If parent chain is set (SubsetTracker pattern), uses parent's skip list.
+    /// p2pool: SubsetTracker.get_nth_parent_hash = subset_of.get_nth_parent_hash
     hash_t get_nth_parent_via_skip(const hash_t& hash, int32_t n) const
     {
-        // Use parent's chain for navigation if set (SubsetTracker pattern)
-        if (m_parent_skip_list) {
-            // Walk through parent chain's items
-            return get_nth_parent_key(hash, n);
-        }
-        return get_nth_parent_key(hash, n);
+        if (m_parent_skip_list)
+            return m_parent_skip_list->get_nth_parent(hash, n);
+        return m_skip_list.get_nth_parent(hash, n);
     }
 
     /// Set parent chain for SubsetTracker pattern.
