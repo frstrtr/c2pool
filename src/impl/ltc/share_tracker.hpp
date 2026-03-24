@@ -121,7 +121,19 @@ private:
     }
 
 public:
-    ShareTracker() = default;
+    ShareTracker() {
+        // p2pool SubsetTracker pattern: verified shares navigation
+        // through the MAIN tracker's skip list.
+        // SubsetTracker.get_nth_parent_hash = subset_of.get_nth_parent_hash
+        verified.set_parent_chain(&chain);
+
+        // Connect weight skip list invalidation to chain's removed signal.
+        // p2pool: WeightsSkipList subscribes to tracker.removed via watch_weakref.
+        // Without this, pruned shares leave stale entries in weight caches.
+        chain.on_removed([this](const uint256& hash) {
+            invalidate_weight_caches(hash);
+        });
+    }
     ~ShareTracker()
     {
         // verified borrows raw share pointers from chain — free its

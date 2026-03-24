@@ -160,6 +160,10 @@ private:
 
     // ─── Skip list for O(log n) get_nth_parent (Bitcoin Core pattern) ──
     chain::ShareSkipList<hash_t, hasher_t> m_skip_list;
+    // Pointer to parent chain's skip list (SubsetTracker pattern).
+    // If set, get_nth_parent uses parent's skip list (shared navigation).
+    // p2pool: SubsetTracker.get_nth_parent_hash = subset_of.get_nth_parent_hash
+    chain::ShareSkipList<hash_t, hasher_t>* m_parent_skip_list{nullptr};
 
     // ─── TrackerView for cached get_height/get_work/get_last ──────────
     // Matches p2pool forest.py TrackerView: caches forward-walk deltas.
@@ -395,9 +399,20 @@ public:
 
     /// O(log n) ancestor lookup via skip list.
     /// Matches p2pool: tracker.get_nth_parent_hash(hash, n)
+    /// If parent chain is set (SubsetTracker pattern), uses parent's skip list.
     hash_t get_nth_parent_via_skip(const hash_t& hash, int32_t n) const
     {
+        if (m_parent_skip_list)
+            return m_parent_skip_list->get_nth_parent(hash, n);
         return m_skip_list.get_nth_parent(hash, n);
+    }
+
+    /// Set parent chain for SubsetTracker pattern.
+    /// p2pool: SubsetTracker.get_nth_parent_hash = subset_of.get_nth_parent_hash
+    /// The verified chain shares the main chain's skip list for navigation.
+    void set_parent_chain(ShareChain* parent) {
+        if (parent)
+            m_parent_skip_list = &parent->m_skip_list;
     }
 
     
