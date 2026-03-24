@@ -153,13 +153,10 @@ public:
         if (verified.contains(share_hash))
             return true;
 
-        // No parent-in-verified filter. p2pool doesn't have one.
-        // The guard at line 175 (height < CL+1 && unrooted) correctly limits
-        // verification to shares deep enough in the chain. After pruning,
-        // shares near the head pass (height ≥ CL+1). Phase 2 extends downward
-        // contiguously from verified head. Fragmentation is prevented by the
-        // guard itself — shares with height < CL+1 on unrooted chains are
-        // blocked unless their parent is already verified (line 191).
+        // NO parent-in-verified filter. p2pool doesn't have one.
+        // p2pool's attempt_verify has only the guard (height < CL+1 && unrooted).
+        // Fragmentation doesn't affect scoring because scoring uses
+        // chain.get_work() (SubsetTracker pattern), not verified.get_work().
 
         auto [height, last] = chain.get_height_and_last(share_hash);
 
@@ -597,6 +594,9 @@ public:
         }
 
         // Phase 3: Score tails — pick the best tail
+        // Iterate verified.get_tails() (matches p2pool exactly).
+        // Use chain.get_work() for work computation (SubsetTracker pattern).
+        // With parent-in-verified filter, verified is contiguous (1 tail).
         std::vector<DecoratedData<TailScore>> decorated_tails;
         for (auto& [tail_hash, head_hashes] : verified.get_tails())
         {
