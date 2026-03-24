@@ -647,29 +647,74 @@ uint256 NodeImpl::best_share_hash()
     return best;
 }
 
-void NodeImpl::download_shares(peer_ptr peer, const uint256& target_hash)
+void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
 {
+    // p2pool node.py:108-141 download_shares() — exact translation.
+    //
+    // Key differences from old c2pool implementation:
+    // 1. RANDOM peer selection (not the reporting peer)
+    // 2. RANDOM parent count 0-499 (not fixed 500)
+    // 3. STOPS list: known heads + their 10th parents (not empty)
+    // 4. Log format: "Requesting parent share XXXX from IP:PORT"
+
     // Already downloading this hash — avoid duplicate requests
     if (m_downloading_shares.count(target_hash))
         return;
     m_downloading_shares.insert(target_hash);
 
+    // p2pool: if len(self.peers) == 0: sleep(1); continue
+    if (m_peers.empty()) {
+        m_downloading_shares.erase(target_hash);
+        return;
+    }
+
+    // p2pool: peer = random.choice(self.peers.values())
+    auto peer_it = m_peers.begin();
+    if (m_peers.size() > 1) {
+        std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
+    }
+    auto& peer = peer_it->second;
+
+    // p2pool: parents=random.randrange(500)
+    uint64_t parents = core::random::random_uint256().GetLow64() % 500;
+
+    // p2pool: stops=list(set(tracker.heads) | set(
+    //   tracker.get_nth_parent_hash(head, min(max(0, height-1), 10))
+    //   for head in tracker.heads))[:100]
+    std::vector<uint256> stops;
+    {
+        std::set<uint256> stop_set;
+        for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+            stop_set.insert(head_hash);
+            auto h = m_tracker.chain.get_acc_height(head_hash);
+            auto nth = std::min(std::max(0, h - 1), 10);
+            if (nth > 0) {
+                auto parent = m_tracker.chain.get_nth_parent_via_skip(head_hash, nth);
+                if (!parent.IsNull())
+                    stop_set.insert(parent);
+            }
+        }
+        int count = 0;
+        for (auto& s : stop_set) {
+            if (count++ >= 100) break;
+            stops.push_back(s);
+        }
+    }
+
     auto req_id = core::random::random_uint256();
-
-    // Request up to 500 parents starting from target
-    constexpr uint64_t PARENTS_PER_REQUEST = 500;
     std::vector<uint256> hashes = { target_hash };
-    std::vector<uint256> stops;  // empty — don't stop early, let handle_get_share apply limits
 
-    LOG_INFO << "[Pool] Requesting shares from " << peer->addr().to_string()
-             << " starting at " << target_hash.ToString()
-             << " (parents=" << PARENTS_PER_REQUEST << ")";
+    // p2pool: print 'Requesting parent share %s from %s'
+    LOG_INFO << "[Pool] Requesting parent share "
+             << target_hash.ToString().substr(0,16)
+             << " from " << peer->addr().to_string()
+             << " (parents=" << parents << " stops=" << stops.size() << ")";
 
     // weak_ptr prevents use-after-free if peer disconnects before reply
     std::weak_ptr<pool::Peer<ltc::Peer>> weak_peer = peer;
     auto peer_addr_for_log = peer->addr();
 
-    request_shares(req_id, peer, hashes, PARENTS_PER_REQUEST, stops,
+    request_shares(req_id, peer, hashes, parents, stops,
         [this, weak_peer, target_hash, peer_addr_for_log](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
@@ -1060,26 +1105,17 @@ void NodeImpl::run_think()
                             ++it;
                     }
 
-                    // Request desired shares from peers
-                    // Try the original peer first, then any peer if not found.
-                    // The share's peer_addr may be stale (reconnected with different port).
-                    for (const auto& [peer_addr, hash] : result.desired) {
-                        bool sent = false;
-                        // Try exact match first
-                        for (auto& [nonce, peer] : m_peers) {
-                            if (peer->addr() == peer_addr) {
-                                download_shares(peer, hash);
-                                sent = true;
-                                break;
-                            }
-                        }
-                        // Fallback: send to any peer (same IP or first available)
-                        if (!sent && !m_peers.empty()) {
+                    // p2pool node.py:111: peer_addr, share_hash = random.choice(desired)
+                    // Pick ONE random desired entry per cycle (not all).
+                    if (!result.desired.empty()) {
+                        auto idx = core::random::random_uint256().GetLow64() % result.desired.size();
+                        auto& [peer_addr, hash] = result.desired[idx];
+                        // download_shares picks its own random peer (p2pool pattern)
+                        // The peer_addr from desired is ignored — matching p2pool's
+                        // random.choice(self.peers.values()) in download_shares().
+                        if (!m_peers.empty()) {
                             auto& [nonce, peer] = *m_peers.begin();
                             download_shares(peer, hash);
-                            LOG_INFO << "[Pool] Requesting shares from fallback peer "
-                                     << peer->addr().to_string()
-                                     << " (original " << peer_addr.to_string() << " not found)";
                         }
                     }
 
