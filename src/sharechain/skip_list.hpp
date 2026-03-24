@@ -1,157 +1,198 @@
 #pragma once
 /**
- * Skip list cache — C++ implementation of p2pool's skiplist.py + forest.py pattern.
+ * Skip list — C++ implementation of p2pool's skiplist.py.
  *
- * p2pool's SkipList stores jump entries at each position:
- *   skips[hash] = (skip_length, [(target_hash, delta), ...])
+ * Provides O(log n) ancestor lookups via geometric jump distances.
+ * Each position has (skip_length, [(target, delta), ...]) cached entries.
+ * forget_item(hash) clears only that hash's entry — O(1).
  *
- * Each jump covers an increasing number of shares (geometric distribution).
- * forget_item(hash) only clears that one entry — O(1), no BFS.
- *
- * Delta type must support:
- *   - get_none(hash) → identity delta
- *   - from_element(share) → single-share delta
- *   - operator+= (accumulation)
- *   - operator- (for subtraction: get_delta = delta_to_last(near) - delta_to_last(far))
+ * Used by:
+ *   DistanceSkipList → get_nth_parent_hash() in O(log n)
+ *   WeightsSkipList  → PPLNS cumulative weights in O(log n) (future)
  */
 
 #include <unordered_map>
 #include <vector>
+#include <cmath>
 #include <random>
 #include <functional>
 #include <cassert>
 
 namespace chain {
 
-/// Geometric random number generator matching p2pool's math.geometric(p=0.5)
+/// Geometric random: p2pool math.geometric(p)
+/// Returns integer >= 1 with P(k) = (1-p)^(k-1) * p
 inline int geometric_random(double p = 0.5) {
     static thread_local std::mt19937 gen(std::random_device{}());
-    std::geometric_distribution<int> dist(p);
-    return dist(gen) + 1;  // p2pool: geometric starts at 1
+    // p2pool: int(log1p(-random()) / log1p(-p)) + 1
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    double r = dist(gen);
+    if (r == 0.0) r = 1e-18;  // avoid log(0)
+    return static_cast<int>(std::log1p(-r) / std::log1p(-p)) + 1;
 }
 
 /**
- * TrackerSkipList — caches jump deltas for O(log n) chain walks.
+ * DistanceSkipList — O(log n) get_nth_parent_hash.
  *
- * Matches p2pool forest.py TrackerSkipList + SubsetTracker._get_delta pattern.
+ * Direct translation of p2pool forest.py DistanceSkipList.
  *
- * Template params:
- *   HashType — hash type (uint256)
- *   DeltaType — accumulated delta (must have head, tail, height, work, min_work fields)
- *   HasherType — hash function for unordered_map
+ * Delta = (from_hash, distance, to_hash)
+ * combine: (h1, d1, h2) + (h2, d2, h3) = (h1, d1+d2, h3)
+ * judge: dist > n → overshoot(1), dist == n → exact(0), dist < n → undershoot(-1)
  */
-template <typename HashType, typename DeltaType, typename HasherType>
-class TrackerSkipList
+template <typename HashType, typename HasherType>
+class DistanceSkipList
 {
     using hash_t = HashType;
-    using delta_t = DeltaType;
     using hasher_t = HasherType;
 
-    struct SkipEntry {
-        hash_t target;
-        delta_t delta;
+    struct Delta {
+        hash_t from;
+        int32_t dist;
+        hash_t to;
     };
 
     struct SkipNode {
-        int skip_length;  // geometric random, determines max jumps
-        std::vector<SkipEntry> jumps;  // [(target, delta)] growing to skip_length
+        int skip_length;
+        std::vector<std::pair<hash_t, Delta>> jumps;  // [(target_hash, delta)]
     };
 
     std::unordered_map<hash_t, SkipNode, hasher_t> m_skips;
+    double m_p{0.5};
 
-    // Function to get previous hash (parent) for a share
+    // Callbacks
     std::function<hash_t(const hash_t&)> m_previous_fn;
-    // Function to get single-share delta
-    std::function<delta_t(const hash_t&)> m_get_delta_fn;
-    // Function to check if hash exists in tracker
     std::function<bool(const hash_t&)> m_contains_fn;
 
+    Delta get_delta(const hash_t& element) {
+        return {element, 1, m_previous_fn(element)};
+    }
+
+    Delta combine_deltas(const Delta& d1, const Delta& d2) {
+        // d1.to == d2.from (chain concatenation)
+        return {d1.from, d1.dist + d2.dist, d2.to};
+    }
+
 public:
-    TrackerSkipList() = default;
+    DistanceSkipList() = default;
 
     void init(
         std::function<hash_t(const hash_t&)> previous_fn,
-        std::function<delta_t(const hash_t&)> get_delta_fn,
         std::function<bool(const hash_t&)> contains_fn)
     {
         m_previous_fn = std::move(previous_fn);
-        m_get_delta_fn = std::move(get_delta_fn);
         m_contains_fn = std::move(contains_fn);
     }
 
-    /// p2pool: forget_item — O(1), clears only this hash's cached jumps.
-    /// Called when a share is removed from the tracker.
+    /// p2pool: forget_item — O(1)
     void forget_item(const hash_t& hash) {
         m_skips.erase(hash);
     }
 
-    /// Clear all cached entries.
     void clear() { m_skips.clear(); }
 
     /**
-     * get_delta_to_last — walk from hash to chain end, accumulating deltas.
+     * Get the hash of the nth parent.
+     * Matches p2pool: tracker.get_nth_parent_hash(hash, n)
+     * O(log n) via skip list acceleration.
      *
-     * Matches p2pool forest.py SubsetTracker.get_delta_to_last():
-     *   delta = delta_type.get_none(item_hash)
-     *   while delta.tail in self._tracker.items:
-     *       this_delta = self._get_delta(delta.tail)
-     *       delta += this_delta
-     *   return delta
-     *
-     * With skip list acceleration: O(log n) instead of O(n).
-     * The skip list is built lazily — first access builds entries.
+     * Translation of skiplist.py __call__ with DistanceSkipList's
+     * initial_solution, apply_delta, judge, finalize.
      */
-    delta_t get_delta_to_last(const hash_t& hash)
+    hash_t get_nth_parent(const hash_t& start, int32_t n)
     {
-        if (!m_contains_fn || !m_previous_fn || !m_get_delta_fn)
-            return delta_t{};
+        if (n == 0) return start;
+        if (!m_previous_fn || !m_contains_fn) return hash_t();
 
-        // Simple walk matching p2pool's SubsetTracker.get_delta_to_last
-        // (without skip acceleration for now — correctness first)
-        delta_t result{};
-        result.head = hash;
-        result.tail = hash;
+        // initial_solution: (dist=0, hash=start)
+        int32_t sol_dist = 0;
+        hash_t sol_hash = start;
 
-        hash_t cur = hash;
-        while (!cur.IsNull() && m_contains_fn(cur))
-        {
-            auto d = m_get_delta_fn(cur);
-            result.work += d.work;
-            result.min_work += d.min_work;
-            result.height += 1;
-            result.tail = d.tail;  // prev_hash
-            cur = d.tail;
+        // Updates for building skip entries as we walk
+        // updates[i] = (hash, delta_or_null)
+        std::unordered_map<int, std::pair<hash_t, Delta>> updates;
+
+        hash_t pos = start;
+
+        while (true) {
+            if (!m_contains_fn(pos)) break;
+
+            // Lazily build skip entry at pos
+            if (m_skips.find(pos) == m_skips.end()) {
+                auto prev = m_previous_fn(pos);
+                SkipNode node;
+                node.skip_length = geometric_random(m_p);
+                node.jumps.push_back({prev, get_delta(pos)});
+                m_skips[pos] = std::move(node);
+            }
+
+            auto& node = m_skips[pos];
+
+            // Fill previous updates into this node's jumps
+            for (int i = 0; i < node.skip_length; ++i) {
+                auto uit = updates.find(i);
+                if (uit != updates.end()) {
+                    auto& [that_hash, delta] = uit->second;
+                    auto& target_node = m_skips[that_hash];
+                    // Append jump: from that_hash, skip over 'i' shares to reach pos
+                    if (static_cast<int>(target_node.jumps.size()) == i) {
+                        target_node.jumps.push_back({pos, delta});
+                    }
+                    updates.erase(uit);
+                }
+            }
+
+            // Put desired skip nodes in updates
+            for (int i = static_cast<int>(node.jumps.size()); i < node.skip_length; ++i) {
+                updates[i] = {pos, Delta{}};
+            }
+
+            // Try jumps from largest to smallest
+            bool jumped = false;
+            Delta used_delta{};
+            for (int j = static_cast<int>(node.jumps.size()) - 1; j >= 0; --j) {
+                auto& [jump_target, delta] = node.jumps[j];
+                int32_t new_dist = sol_dist + delta.dist;
+                hash_t new_hash = delta.to;
+
+                if (new_dist > n) {
+                    continue;  // overshoot
+                } else if (new_dist == n) {
+                    return new_hash;  // exact match
+                } else {
+                    // undershoot — take this jump
+                    sol_dist = new_dist;
+                    sol_hash = new_hash;
+                    used_delta = delta;
+                    pos = jump_target;
+                    jumped = true;
+                    break;
+                }
+            }
+
+            if (!jumped) {
+                // All jumps overshoot — should not happen with geometric(0.5)
+                // Fall back to single step
+                auto prev = m_previous_fn(pos);
+                sol_dist += 1;
+                sol_hash = prev;
+                if (sol_dist == n) return sol_hash;
+                pos = prev;
+                used_delta = get_delta(pos);
+            }
+
+            // Update pending entries with the delta we just used
+            for (auto& [idx, entry] : updates) {
+                auto& [uhash, udelta] = entry;
+                if (udelta.dist == 0 && udelta.from.IsNull()) {
+                    udelta = used_delta;
+                } else {
+                    udelta = combine_deltas(udelta, used_delta);
+                }
+            }
         }
 
-        return result;
-    }
-
-    /// get_height — matches p2pool Tracker.get_height
-    int32_t get_height(const hash_t& hash) {
-        return get_delta_to_last(hash).height;
-    }
-
-    /// get_work — matches p2pool Tracker.get_work
-    auto get_work(const hash_t& hash) {
-        return get_delta_to_last(hash).work;
-    }
-
-    /// get_last — matches p2pool Tracker.get_last
-    hash_t get_last(const hash_t& hash) {
-        return get_delta_to_last(hash).tail;
-    }
-
-    /// get_delta — matches p2pool Tracker.get_delta(near, far)
-    delta_t get_delta(const hash_t& near, const hash_t& far) {
-        auto d_near = get_delta_to_last(near);
-        auto d_far = get_delta_to_last(far);
-        delta_t result{};
-        result.head = near;
-        result.tail = far;
-        result.work = d_near.work - d_far.work;
-        result.min_work = d_near.min_work - d_far.min_work;
-        result.height = d_near.height - d_far.height;
-        return result;
+        return sol_hash;
     }
 };
 
