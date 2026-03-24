@@ -469,6 +469,14 @@ public:
             {
                 if (verified.contains(bad))
                     continue;
+                // Only remove LEAF shares (no children in the chain).
+                // Removing a share with children breaks their prev_hash
+                // chain → cascading GENTX failures. p2pool avoids this
+                // because GENTX rarely fails between p2pool nodes.
+                auto& rev = chain.get_reverse();
+                auto rit = rev.find(bad);
+                if (rit != rev.end() && !rit->second.empty())
+                    continue; // has children — don't remove
                 to_remove.push_back(bad);
             }
             for (const auto& bad : to_remove)
@@ -702,10 +710,10 @@ public:
         if (actual_height < dist)
             return uint288(0);
 
-        // Walk the chain via CIterator (handles new_fork segment boundaries)
-        // and sum each share's individual work. This avoids get_interval()
-        // which breaks for fork shares (accumulated values don't include
-        // parent segment). O(dist) but dist ≤ TARGET_LOOKBEHIND (200).
+        // Match p2pool: delta(near, far) where far = get_nth_parent(near, dist-1).
+        // delta covers near..far exclusive = dist-1 shares' work.
+        // time = near.timestamp - far.timestamp.
+        // Walk dist shares but exclude the LAST share's work (only use its timestamp).
         uint288 total_work;
         uint288 total_min_work;
         uint32_t near_ts = 0, far_ts = 0;
@@ -718,12 +726,14 @@ public:
                     if (walked == 0)
                         near_ts = obj->m_timestamp;
                     far_ts = obj->m_timestamp;
-                    auto target = chain::bits_to_target(obj->m_bits);
-                    auto att = chain::target_to_average_attempts(target);
-                    total_work += att;
-                    // min_work: use max_target (easier target = min work per share)
-                    auto max_target = chain::bits_to_target(obj->m_max_bits);
-                    total_min_work += chain::target_to_average_attempts(max_target);
+                    // p2pool: delta excludes the far share's work.
+                    // Include all shares EXCEPT the last one.
+                    if (walked < dist - 1) {
+                        auto target = chain::bits_to_target(obj->m_bits);
+                        total_work += chain::target_to_average_attempts(target);
+                        auto max_target = chain::bits_to_target(obj->m_max_bits);
+                        total_min_work += chain::target_to_average_attempts(max_target);
+                    }
                 });
                 ++walked;
             }
@@ -906,7 +916,19 @@ public:
 
         // Step 4: Clamp pre_target to ±10% of clamp_ref_target
         // pre_target2 = clip(pre_target, (clamp_ref * 9/10, clamp_ref * 11/10))
-        uint256 lo = clamp_ref_target / 10 * 9;
+        // p2pool: target * 9 // 10 (multiply first, then divide)
+        uint256 lo;
+        {
+            uint288 lo_288;
+            lo_288.SetHex(clamp_ref_target.GetHex());
+            lo_288 = lo_288 * 9 / 10;
+            uint288 max_288;
+            max_288.SetHex(MAX_TARGET.GetHex());
+            if (lo_288 > max_288)
+                lo = MAX_TARGET;
+            else
+                lo.SetHex(lo_288.GetHex());
+        }
         uint256 hi;
         {
             uint288 hi_288;
