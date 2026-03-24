@@ -48,14 +48,16 @@ struct HeadScore
 {
     uint288 work;
     int32_t reason{};
+    int32_t is_local{};  // 1=local, 0=peer — peer wins tiebreak
     int64_t time_seen{};
 
     friend bool operator<(const HeadScore& a, const HeadScore& b)
     {
         if (a.work < b.work) return true;
         if (b.work < a.work) return false;
-        // Higher reason and higher time_seen sort LOWER (punished shares rank below)
-        return std::tie(a.reason, a.time_seen) > std::tie(b.reason, b.time_seen);
+        // p2pool: sort by (-reason, peer_addr is None, -time_seen)
+        // is_local=0 (peer) sorts BEFORE is_local=1 (local) → peer wins
+        return std::tie(a.reason, a.is_local, a.time_seen) > std::tie(b.reason, b.is_local, b.time_seen);
     }
 };
 
@@ -63,13 +65,14 @@ struct TraditionalScore
 {
     uint288 work;
     int64_t time_seen{};
+    int32_t is_local{};
     int32_t reason{};
 
     friend bool operator<(const TraditionalScore& a, const TraditionalScore& b)
     {
         if (a.work < b.work) return true;
         if (b.work < a.work) return false;
-        return std::tie(a.time_seen, a.reason) > std::tie(b.time_seen, b.reason);
+        return std::tie(a.time_seen, a.is_local, a.reason) > std::tie(b.time_seen, b.is_local, b.reason);
     }
 };
 
@@ -702,11 +705,17 @@ public:
                             reason = std::max(reason, idx->naughty);
                     }
 
-                    // p2pool: sort key = (work, -reason, -time_seen)
-                    // Negate time_seen: share seen FIRST (earliest) wins tiebreak.
-                    // p2pool uses -time_seen; c2pool sorts ascending so negate.
-                    decorated_heads.push_back({{work_score, reason, -ts}, hh});
-                    traditional_sort.push_back({{work_score, -ts, reason}, hh});
+                    // p2pool: sort key = (work - punish*att, -reason, -time_seen)
+                    // p2pool has commented-out: self.items[h].peer_addr is None
+                    // which deprioritizes local shares. c2pool enables this to break
+                    // the local fork feedback loop (local→best→local→best cycle).
+                    bool is_local = false;
+                    chain.get_share(hh).invoke([&](auto* obj) {
+                        is_local = (obj->peer_addr.port() == 0);
+                    });
+                    // is_local=true sorts AFTER is_local=false (peer wins tiebreak)
+                    decorated_heads.push_back({{work_score, reason, is_local ? 1 : 0, -ts}, hh});
+                    traditional_sort.push_back({{work_score, -ts, is_local ? 1 : 0, reason}, hh});
                 } catch (const std::exception&) {
                     // Chain concurrently modified — skip this head, retry next cycle
                 }
