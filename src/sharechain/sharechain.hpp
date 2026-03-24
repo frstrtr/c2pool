@@ -427,6 +427,21 @@ public:
         return get_work(near) - get_work(far);
     }
 
+    /// Full delta between two shares via TrackerView.
+    /// Matches p2pool: tracker.get_delta(item, ancestor)
+    /// = get_delta_to_last(item) - get_delta_to_last(ancestor)
+    auto get_delta(const hash_t& item, const hash_t& ancestor)
+    {
+        return m_view.get_delta(item, ancestor);
+    }
+
+    /// Delta from share to chain end via TrackerView.
+    /// Matches p2pool: tracker.get_delta_to_last(hash)
+    auto get_delta_to_last(const hash_t& hash)
+    {
+        return m_view.get_delta_to_last(hash);
+    }
+
     /// O(log n) ancestor lookup via skip list.
     /// Matches p2pool: tracker.get_nth_parent_hash(hash, n)
     /// If parent chain is set (SubsetTracker pattern), uses parent's skip list.

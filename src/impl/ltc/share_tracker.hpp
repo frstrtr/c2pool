@@ -830,73 +830,22 @@ public:
         if (far_hash.IsNull() || !chain.contains(far_hash))
             return uint288(0);
 
-        // p2pool: attempts = tracker.get_delta(near, far).work — O(1) via TrackerView
-        uint288 attempts;
-        if (use_min_work) {
-            attempts = chain.get_min_work(share_hash) - chain.get_min_work(far_hash);
-        } else {
-            attempts = chain.get_work(share_hash) - chain.get_work(far_hash);
-        }
+        // p2pool: attempts = tracker.get_delta(near.hash, far.hash).work
+        // p2pool uses get_delta which calls get_delta_to_last for BOTH shares.
+        // Both walks reach the same chain end → subtraction is valid.
+        // get_delta_to_last ALWAYS walks the actual chain (no stale cache) because
+        // _get_delta combines cached delta with ref delta, and refs are updated
+        // by handle_remove_special on pruning.
+        auto delta = chain.get_delta(share_hash, far_hash);
+        uint288 attempts = use_min_work ? delta.min_work : delta.work;
 
-        // Timestamps from the shares directly
         uint32_t near_ts = 0, far_ts = 0;
         chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
         chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
-
         int32_t time_span = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
         if (time_span <= 0) time_span = 1;
 
-        // Prevent unrealistic values
-        uint288 result = attempts / uint288(time_span);
-        return result;
-    }
-
-    // Legacy compatibility — keep old O(n) walk for reference
-    uint288 _get_pool_attempts_per_second_legacy(const uint256& share_hash, int32_t dist, bool use_min_work = false)
-    {
-        // (keeping old implementation for debugging comparison)
-        uint288 total_work, total_min_work;
-        uint32_t near_ts = 0, far_ts = 0;
-        int walked = 0;
-        try {
-            auto view = chain.get_chain(share_hash, dist);
-            for (auto [hash, data] : view)
-            {
-                data.share.invoke([&](auto* obj) {
-                    if (walked == 0)
-                        near_ts = obj->m_timestamp;
-                    far_ts = obj->m_timestamp;
-                    if (walked < dist - 1) {
-                        auto target = chain::bits_to_target(obj->m_bits);
-                        total_work += chain::target_to_average_attempts(target);
-                        auto max_target = chain::bits_to_target(obj->m_max_bits);
-                        total_min_work += chain::target_to_average_attempts(max_target);
-                    }
-                });
-                ++walked;
-            }
-        } catch (...) {
-            return uint288(0);
-        }
-
-        if (walked < 2)
-            return uint288(0);
-
-        auto time = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
-        if (time <= 0)
-            time = 1;
-
-        auto result = (use_min_work ? total_min_work : total_work) / static_cast<uint32_t>(time);
-        {
-            static int aps_log = 0;
-            if (aps_log++ < 5)
-                LOG_INFO << "[APS] dist=" << dist << " time=" << time
-                         << " min_work=" << total_min_work.GetLow64()
-                         << " work=" << total_work.GetLow64()
-                         << " use_min=" << use_min_work
-                         << " aps=" << result.GetLow64();
-        }
-        return result;
+        return attempts / uint288(time_span);
     }
 
     // -- Share target computation --
