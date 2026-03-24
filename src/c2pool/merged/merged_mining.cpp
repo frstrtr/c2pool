@@ -1014,27 +1014,27 @@ MergedMiningManager::build_merged_header_info_with_commitment()
     auto header_infos = build_merged_header_info();
     LOG_TRACE << "[MM-commit] Step 1 done, " << header_infos.size() << " infos";
 
-    // Step 2: Freeze coinbase_hex + template per chain AND update commitment.
-    // Use try_lock to avoid deadlock with MM poll timer on separate thread.
-    // If locked, skip freezing — the next work push will catch up.
+    LOG_TRACE << "[MM-commit] Step 2: acquiring lock...";
     std::unique_lock<std::recursive_mutex> lock(m_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        LOG_DEBUG_POOL << "[MM] build_merged_header_info_with_commitment: mutex busy, skipping freeze";
+        LOG_INFO << "[MM-commit] mutex busy, skipping freeze";
         return {std::move(header_infos), {}};
     }
+    LOG_TRACE << "[MM-commit] lock acquired, freezing " << header_infos.size() << " chains";
     for (const auto& hi : header_infos) {
+        LOG_TRACE << "[MM-commit] freezing chain " << hi.chain_id;
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
             if (hi.block_header.size() == 80)
                 chain.current_work.block_hash = Hash(hi.block_header);
-            // Freeze the pre-built coinbase + template (matches what produced the block hash)
             chain.frozen_coinbase_hex = hi.coinbase_hex;
             chain.frozen_template = chain.current_work.block_template;
+            LOG_TRACE << "[MM-commit] chain " << hi.chain_id << " frozen";
             break;
         }
     }
 
-    // Rebuild commitment with PPLNS-derived hashes (all under lock — no poll race)
+    LOG_TRACE << "[MM-commit] rebuilding commitment...";
     std::map<uint32_t, uint256> slot_hashes;
     for (const auto& chain : m_chains) {
         if (!chain.current_work.block_hash.IsNull()) {
@@ -1043,10 +1043,12 @@ MergedMiningManager::build_merged_header_info_with_commitment()
                 slot_hashes[it->second] = chain.current_work.block_hash;
         }
     }
+    LOG_TRACE << "[MM-commit] slots=" << slot_hashes.size();
     if (!slot_hashes.empty()) {
         auto proof = m_tree.compute_root(slot_hashes, 0);
         m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
     }
+    LOG_TRACE << "[MM-commit] done, returning";
     return {std::move(header_infos), m_cached_commitment};
 }
 
