@@ -1,5 +1,6 @@
 #pragma once
 
+#include "skip_list.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -56,9 +57,20 @@ class ShareChain
 public:
     ShareChain()
     {
-        // Self-subscribe to removed signal for cache invalidation.
+        // Subscribe to removed signal for skip list invalidation.
         // Matches p2pool: TrackerSkipList.__init__ → tracker.removed.watch_weakref(self, forget_item)
-        on_removed([this](const hash_t& hash) { forget_item(hash); });
+        on_removed([this](const hash_t& hash) { m_skip_list.forget_item(hash); });
+
+        // Init skip list with chain navigation callbacks
+        m_skip_list.init(
+            [this](const hash_t& h) -> hash_t {
+                auto it = m_shares.find(h);
+                return it != m_shares.end() ? it->second.index->tail : hash_t();
+            },
+            [this](const hash_t& h) -> bool {
+                return m_shares.contains(h);
+            }
+        );
     }
 
     ~ShareChain()
@@ -80,7 +92,7 @@ public:
         m_reverse.clear();
         m_heads.clear();
         m_tails.clear();
-        m_acc_cache.clear();
+        m_skip_list.clear();
     }
 
 public:
@@ -127,89 +139,13 @@ private:
         }
     }
 
-    // ─── Lazy accumulated work cache (p2pool SkipList pattern) ──────────
-    // Values computed on first access, cached.
-    // Invalidated per-item via removed signal (NOT full clear).
-    // p2pool: TrackerSkipList.forget_item(hash) → self.skips.pop(hash, None)
-    struct AccWork {
-        uint288 work;        // accumulated target_to_average_attempts(bits)
-        uint288 min_work;    // accumulated target_to_average_attempts(max_bits)
-        int32_t height{0};   // accumulated height (share count from root)
-    };
-    mutable std::unordered_map<hash_t, AccWork, hasher_t> m_acc_cache;
+    // ─── Bitcoin Core deterministic skip list (MIT licensed) ──────────
+    // Adapted from CBlockIndex::pskip + GetAncestor() (chain.cpp).
+    // Each share stores skip_hash (hash of ancestor at GetSkipHeight distance).
+    // O(log n) ancestor lookups. O(1) forget_item. No BFS needed.
+    // Hash-based (no raw pointers — safe from use-after-free).
+    chain::ShareSkipList<hash_t, hasher_t> m_skip_list;
 
-    // Clear removed share AND all descendants from cache.
-    // p2pool's SkipList.forget_item only clears the removed hash because
-    // p2pool's skip jumps skip over removed shares. Our prefix sums are
-    // different — each share's acc depends on its parent chain. Removing
-    // a parent makes all descendants' cached values stale (they include
-    // the removed parent's contribution).
-    // Since removes are rare (pruning only), clearing descendants is acceptable.
-    void forget_item(const hash_t& hash) {
-        m_acc_cache.erase(hash);
-        // BFS: clear all descendants via reverse map
-        std::vector<hash_t> queue;
-        auto rev_it = m_reverse.find(hash);
-        if (rev_it != m_reverse.end()) {
-            for (const auto& child : rev_it->second)
-                queue.push_back(child);
-        }
-        while (!queue.empty()) {
-            auto cur = queue.back();
-            queue.pop_back();
-            if (m_acc_cache.erase(cur) > 0) {
-                auto crev = m_reverse.find(cur);
-                if (crev != m_reverse.end()) {
-                    for (const auto& gc : crev->second)
-                        queue.push_back(gc);
-                }
-            }
-        }
-    }
-
-    // Lazily compute accumulated work for a share by walking to chain root.
-    // Result is cached. Subsequent calls return cached value in O(1).
-    // Cache is invalidated on any add/remove (generation change).
-    AccWork compute_acc(const hash_t& hash) const
-    {
-        // Check cache first
-        auto it = m_acc_cache.find(hash);
-        if (it != m_acc_cache.end()) return it->second;
-
-        // Walk to root, building stack of shares to compute
-        std::vector<std::pair<hash_t, const index_t*>> stack;
-        hash_t cur = hash;
-        while (!cur.IsNull() && m_shares.contains(cur))
-        {
-            auto cache_it = m_acc_cache.find(cur);
-            if (cache_it != m_acc_cache.end()) break;  // found cached ancestor
-            auto& cd = m_shares.at(cur);
-            stack.push_back({cur, cd.index});
-            cur = cd.index->tail;  // prev_hash
-        }
-
-        // Base: either cached ancestor or chain root
-        AccWork base;
-        if (!cur.IsNull()) {
-            auto cache_it = m_acc_cache.find(cur);
-            if (cache_it != m_acc_cache.end())
-                base = cache_it->second;
-        }
-
-        // Unwind stack, computing accumulated values bottom-up
-        for (auto rit = stack.rbegin(); rit != stack.rend(); ++rit)
-        {
-            AccWork acc;
-            acc.work = base.work + rit->second->work;
-            acc.min_work = base.min_work + rit->second->min_work;
-            acc.height = base.height + 1;
-            m_acc_cache[rit->first] = acc;
-            base = acc;
-        }
-
-        return base;
-    }
-    
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
         // Matches p2pool forest.py add() logic.
@@ -290,9 +226,9 @@ public:
         if (!share->m_prev_hash.IsNull())
             m_reverse[share->m_prev_hash].insert(share->m_hash);
 
-        // Don't invalidate cache on add() — existing cached values remain correct.
-        // New share's values will be computed lazily on first access.
-        // p2pool's SkipList only clears cache entries on remove (removed_signal).
+        // Build skip pointer for O(log n) ancestor lookups.
+        // Bitcoin Core: CBlockIndex::BuildSkip() — called once at add time.
+        m_skip_list.build_skip(share->m_hash, share->m_prev_hash);
     }
 
     void add(share_t share)
@@ -399,33 +335,54 @@ public:
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
-    // Lazy accumulated work — p2pool SkipList pattern.
-    // First call computes by walking to root, caches result.
-    // Subsequent calls return cached value. Cache cleared on chain modification.
+    // ─── Navigation via Bitcoin Core skip list ──────────────────────
+    // O(log n) ancestor lookup. O(1) height lookup.
+    // Matches p2pool's SubsetTracker + DistanceSkipList pattern.
+
+    /// Accumulated height from skip list — O(1).
+    /// Matches p2pool get_delta_to_last().height
+    int32_t get_acc_height(const hash_t& hash)
+    {
+        return m_skip_list.get_height(hash);
+    }
+
+    /// O(log n) ancestor lookup via skip list.
+    /// Matches p2pool tracker.get_nth_parent_hash(hash, n)
+    hash_t get_nth_parent_via_skip(const hash_t& hash, int32_t n) const
+    {
+        return m_skip_list.get_nth_parent(hash, n);
+    }
+
+    /// Accumulated work — O(n) walk (skip list stores height only, not work).
+    /// Work accumulation uses per-share walk like p2pool's get_delta_to_last.
+    /// TODO: extend skip list to cache work deltas for O(log n).
     uint288 get_work(const hash_t& hash)
     {
-        if (!m_shares.contains(hash)) return uint288();
-        return compute_acc(hash).work;
+        uint288 total;
+        hash_t cur = hash;
+        while (!cur.IsNull() && m_shares.contains(cur))
+        {
+            total += m_shares[cur].index->work;
+            cur = m_shares[cur].index->tail;
+        }
+        return total;
     }
 
     uint288 get_min_work(const hash_t& hash)
     {
-        if (!m_shares.contains(hash)) return uint288();
-        return compute_acc(hash).min_work;
+        uint288 total;
+        hash_t cur = hash;
+        while (!cur.IsNull() && m_shares.contains(cur))
+        {
+            total += m_shares[cur].index->min_work;
+            cur = m_shares[cur].index->tail;
+        }
+        return total;
     }
 
-    int32_t get_acc_height(const hash_t& hash)
-    {
-        if (!m_shares.contains(hash)) return 0;
-        return compute_acc(hash).height;
-    }
-
-    // Delta between two shares — matches p2pool get_delta(near, far).
     uint288 get_delta_work(const hash_t& near, const hash_t& far)
     {
-        auto n = get_work(near);
-        auto f = get_work(far);
-        return n - f;
+        return get_work(near) - get_work(far);
     }
 
     
