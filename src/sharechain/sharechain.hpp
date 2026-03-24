@@ -339,11 +339,21 @@ public:
     // O(log n) ancestor lookup. O(1) height lookup.
     // Matches p2pool's SubsetTracker + DistanceSkipList pattern.
 
-    /// Accumulated height from skip list — O(1).
-    /// Matches p2pool get_delta_to_last().height
+    /// Current chain depth — O(n) walk from hash to chain end.
+    /// NOT skip list height (which is stale after pruning).
+    /// Matches p2pool's get_delta_to_last().height which walks through
+    /// items[] and stops at pruned boundary.
+    /// Used by attempt_verify guard and compute_share_target.
     int32_t get_acc_height(const hash_t& hash)
     {
-        return m_skip_list.get_height(hash);
+        int32_t height = 0;
+        hash_t cur = hash;
+        while (!cur.IsNull() && m_shares.contains(cur))
+        {
+            ++height;
+            cur = m_shares[cur].index->tail;
+        }
+        return height;
     }
 
     /// O(log n) ancestor lookup via skip list.
