@@ -2092,8 +2092,15 @@ int main(int argc, char* argv[]) {
                     // NOTE: If both p2pool nodes also use pre_target3/30 (confirmed
                     // via diff=9.16e-03 on fresh chain), this will match.
                     auto desired_target = uint256();
+                    // Use think()'s best_share for share target computation.
+                    // The frozen prev_share may be a c2pool fork share (between
+                    // think() cycles), whose chain walk contaminates aps.
+                    // think()'s best_share is always the highest-work chain head.
+                    auto cst_prev = p2p_node->best_share_hash();
+                    if (cst_prev.IsNull() || !p2p_node->tracker().chain.contains(cst_prev))
+                        cst_prev = params.prev_share; // fallback
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
-                        params.prev_share, timestamp, desired_target);
+                        cst_prev, timestamp, desired_target);
                     // No bits guard needed: compute_share_target's ±10% clamp
                     // (matching p2pool) prevents drift. The old guard was a workaround
                     // for VARDIFF setting 3x harder difficulty → APS contamination.

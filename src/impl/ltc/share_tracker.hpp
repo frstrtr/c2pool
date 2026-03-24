@@ -710,10 +710,9 @@ public:
         if (actual_height < dist)
             return uint288(0);
 
-        // Match p2pool: delta(near, far) where far = get_nth_parent(near, dist-1).
-        // delta covers near..far exclusive = dist-1 shares' work.
-        // time = near.timestamp - far.timestamp.
-        // Walk dist shares but exclude the LAST share's work (only use its timestamp).
+        // Walk the chain summing work and timestamps.
+        // All shares counted equally (no origin filtering).
+        // Walk dist shares, exclude last share's work (matching p2pool delta).
         uint288 total_work;
         uint288 total_min_work;
         uint32_t near_ts = 0, far_ts = 0;
@@ -726,8 +725,6 @@ public:
                     if (walked == 0)
                         near_ts = obj->m_timestamp;
                     far_ts = obj->m_timestamp;
-                    // p2pool: delta excludes the far share's work.
-                    // Include all shares EXCEPT the last one.
                     if (walked < dist - 1) {
                         auto target = chain::bits_to_target(obj->m_bits);
                         total_work += chain::target_to_average_attempts(target);
@@ -821,29 +818,10 @@ public:
         }
 
         // Step 1: Derive target from pool hashrate.
-        // Walk from a PEER share (not local) to avoid contaminating aps
-        // with c2pool's easy fork shares. Find the nearest peer share
-        // by walking back from prev_share_hash until we find one.
-        uint256 aps_start = prev_share_hash;
-        {
-            uint256 cur = prev_share_hash;
-            int walk = 0;
-            while (!cur.IsNull() && chain.contains(cur) && walk < 20) {
-                bool is_local = false;
-                chain.get_share(cur).invoke([&](auto* obj) {
-                    is_local = (obj->peer_addr.port() == 0);
-                });
-                if (!is_local) { aps_start = cur; break; }
-                cur = chain.get_index(cur)->tail;
-                ++walk;
-            }
-        }
-
-        auto aps_height = chain.get_height(aps_start);
-        auto aps = (aps_height >= static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
-            ? get_pool_attempts_per_second(aps_start,
-                PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true)
-            : uint288(0);
+        // Use prev_share_hash directly — all shares counted equally.
+        // p2pool's algorithm: aps from the entire chain, no filtering.
+        auto aps = get_pool_attempts_per_second(prev_share_hash,
+            PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
 
         uint256 pre_target;
         if (aps.IsNull())
