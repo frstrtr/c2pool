@@ -122,7 +122,10 @@ public:
 
         hash_t pos = start;
 
-        while (true) {
+        // Safety: max iterations = 2*n (each iteration makes progress of ≥1)
+        for (int32_t safety = 0; safety < 2 * n + 100; ++safety) {
+            if (pos.IsNull()) return hash_t();  // chain too short
+
             // p2pool: if pos not in self.skips:
             //   self.skips[pos] = math.geometric(self.p), [(self.previous(pos), self.get_delta(pos))]
             auto it = m_skips.find(pos);
@@ -182,7 +185,7 @@ public:
                 if (new_dist == n) {
                     // finalize: assert dist == n; return hash
                     return delta.to_hash;
-                } else if (new_dist < n) {
+                } else if (new_dist < n && !delta.to_hash.IsNull()) {
                     // Undershoot — take this jump, continue from delta.to_hash
                     sol_dist = new_dist;
                     sol_hash = delta.to_hash;
