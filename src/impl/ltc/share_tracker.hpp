@@ -155,8 +155,9 @@ public:
         // prev_hash must be in verified (or null for genesis).
         // Fork shares (prev not verified) are skipped — they pollute
         // verified scoring and cause best_share to pick local forks.
-        // p2pool rarely has forks so this doesn't matter there.
-        // c2pool creates many forks → must filter.
+        // Exception: when verified is empty (bootstrap), allow all shares
+        // so the first batch can seed the verified chain.
+        if (verified.size() > 0)
         {
             uint256 prev;
             chain.get_share(share_hash).invoke([&](auto* obj) { prev = obj->m_prev_hash; });
