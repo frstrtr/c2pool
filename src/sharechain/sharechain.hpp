@@ -73,6 +73,7 @@ public:
         m_reverse.clear();
         m_heads.clear();
         m_tails.clear();
+        m_acc.clear();
     }
 
 public:
@@ -87,6 +88,17 @@ private:
 
     std::unordered_map<hash_t, hash_t, hasher_t> m_heads;
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
+
+    // Accumulated prefix sums — p2pool skip list equivalent.
+    // acc_work[hash] = total work from chain root to this share.
+    // Computed once at add() time, O(1) lookup, consistent snapshot.
+    // get_delta(near, far) = acc_work[near] - acc_work[far] → O(1).
+    struct AccWork {
+        uint288 work;        // accumulated target_to_average_attempts(bits)
+        uint288 min_work;    // accumulated target_to_average_attempts(max_bits)
+        int32_t height{0};   // accumulated height (share count from root)
+    };
+    std::unordered_map<hash_t, AccWork, hasher_t> m_acc;
     
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
@@ -167,6 +179,22 @@ public:
         // Maintain reverse map (prev → children)
         if (!share->m_prev_hash.IsNull())
             m_reverse[share->m_prev_hash].insert(share->m_hash);
+
+        // Accumulated prefix sums — O(1) computation from parent.
+        // p2pool skip list equivalent: values computed once at add() time.
+        AccWork acc;
+        if (!share->m_prev_hash.IsNull() && m_acc.contains(share->m_prev_hash)) {
+            const auto& parent = m_acc[share->m_prev_hash];
+            acc.work = parent.work + index->work;
+            acc.min_work = parent.min_work + index->min_work;
+            acc.height = parent.height + 1;
+        } else {
+            // Root share or disconnected (parent not in chain yet)
+            acc.work = index->work;
+            acc.min_work = index->min_work;
+            acc.height = 1;
+        }
+        m_acc[share->m_hash] = acc;
     }
 
     void add(share_t share)
@@ -273,21 +301,41 @@ public:
         return height_up >= 0 && get_nth_parent_key(possible_child, height_up) == item;
     }
 
-    // Compute accumulated work from hash back to chain end.
-    // Matches p2pool: verified.get_work = get_delta_to_last().work
-    // which walks through ALL shares via items[prev_hash] — crossing
-    // all forest boundaries. The tiebreak in Phase 4 scoring
-    // (time_seen) determines which head wins, not the work boundary.
+    // O(1) accumulated work lookup — p2pool skip list equivalent.
+    // Returns total work from chain root to this share.
+    // Computed once at add() time, consistent snapshot.
     uint288 get_work(const hash_t& hash)
     {
-        uint288 total;
-        hash_t cur = hash;
-        while (!cur.IsNull() && m_shares.contains(cur))
-        {
-            total += m_shares[cur].index->work;
-            cur = m_shares[cur].index->tail;
-        }
-        return total;
+        auto it = m_acc.find(hash);
+        if (it != m_acc.end()) return it->second.work;
+        return uint288();
+    }
+
+    // O(1) accumulated min_work lookup.
+    uint288 get_min_work(const hash_t& hash)
+    {
+        auto it = m_acc.find(hash);
+        if (it != m_acc.end()) return it->second.min_work;
+        return uint288();
+    }
+
+    // O(1) accumulated height lookup.
+    int32_t get_acc_height(const hash_t& hash)
+    {
+        auto it = m_acc.find(hash);
+        if (it != m_acc.end()) return it->second.height;
+        return 0;
+    }
+
+    // O(1) delta between two shares — matches p2pool get_delta(near, far).
+    // Returns work between near and far (near.acc - far.acc).
+    uint288 get_delta_work(const hash_t& near, const hash_t& far)
+    {
+        auto n = m_acc.find(near);
+        auto f = m_acc.find(far);
+        if (n == m_acc.end()) return uint288();
+        if (f == m_acc.end()) return n->second.work;
+        return n->second.work - f->second.work;
     }
 
     
@@ -467,6 +515,7 @@ public:
                     it->second.share.destroy();
                 delete it->second.index;
                 m_shares.erase(it);
+                m_acc.erase(h);
             }
         }
 
@@ -580,6 +629,7 @@ public:
             it->second.share.destroy();
         delete idx;
         m_shares.erase(it);
+        m_acc.erase(hash);
         return true;
     }
 
