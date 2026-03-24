@@ -151,12 +151,13 @@ public:
         if (verified.contains(share_hash))
             return true;
 
-        // p2pool: attempt_verify on ANY share. Fork shares that fail GENTX
-        // are removed as bads by Phase 1. Scoring handles fork vs main chain
-        // via 5th-ancestor tiebreak (same ancestor = same work = time_seen wins).
-        // The previous "chain-extending only" filter caused verified=116 with
-        // total=994 because out-of-order share arrivals permanently blocked
-        // verification.
+        // No parent-in-verified filter. p2pool doesn't have one.
+        // The guard at line 175 (height < CL+1 && unrooted) correctly limits
+        // verification to shares deep enough in the chain. After pruning,
+        // shares near the head pass (height ≥ CL+1). Phase 2 extends downward
+        // contiguously from verified head. Fragmentation is prevented by the
+        // guard itself — shares with height < CL+1 on unrooted chains are
+        // blocked unless their parent is already verified (line 191).
 
         auto [height, last] = chain.get_height_and_last(share_hash);
 
@@ -427,13 +428,22 @@ public:
         {
             bool extended = true;
             int fwd_count = 0;
-            // Start from ALL verified shares that have unverified children
-            // Use a queue starting from verified heads
+            // Start from verified shares that have unverified children in raw chain.
+            // Check ALL verified shares (not just heads) — children may have
+            // arrived after the parent was verified but before it became a head.
             std::vector<uint256> to_check;
             for (auto& [vh, vt] : verified.get_heads())
                 to_check.push_back(vh);
+            // Also scan raw chain's reverse map for verified parents with unverified children
+            for (auto& [parent, children] : chain.get_reverse()) {
+                if (!verified.contains(parent)) continue;
+                for (const auto& child : children) {
+                    if (!verified.contains(child) && chain.contains(child))
+                        to_check.push_back(parent);
+                }
+            }
 
-            while (!to_check.empty() && fwd_count < 2000) {
+            while (!to_check.empty() && fwd_count < 10000) {
                 auto parent = to_check.back();
                 to_check.pop_back();
                 auto rev_it = chain.get_reverse().find(parent);
