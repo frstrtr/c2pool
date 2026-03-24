@@ -634,6 +634,19 @@ public:
             best_tail_score = decorated_tails.back().score;
         }
 
+        // Debug: log scoring when multiple tails compete
+        if (decorated_tails.size() > 1) {
+            static int score_log = 0;
+            if (score_log++ % 10 == 0) {
+                for (auto& dt : decorated_tails) {
+                    LOG_INFO << "[SCORE-TAIL] tail=" << dt.hash.GetHex().substr(0,16)
+                             << " chain_len=" << dt.score.chain_len
+                             << " hashrate=" << dt.score.hashrate.IsNull()
+                             << (dt.hash == best_tail ? " ← WINNER" : "");
+                }
+            }
+        }
+
         // Phase 4: Score heads within the best tail — pick the best head
         std::vector<DecoratedData<HeadScore>> decorated_heads;
         std::vector<DecoratedData<TraditionalScore>> traditional_sort;
