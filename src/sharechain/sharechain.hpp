@@ -710,8 +710,12 @@ public:
                 // p2pool line 302-303: parent becomes new head
                 m_tails[tail].insert(share_tail);
                 m_heads[share_tail] = tail;
+            } else {
+                // Has siblings — clean up empty tail entry.
+                // p2pool ignores empty sets (falsy in Python); C++ keeps them.
+                if (m_tails[tail].empty())
+                    m_tails.erase(tail);
             }
-            // else: has siblings → pass (do nothing)
             branch = only_child ? 22 : 21; // 22=promoted, 21=has siblings
         }
         else if (tail_in_tails)
