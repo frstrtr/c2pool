@@ -676,6 +676,8 @@ public:
 
         // ── 4-branch logic (p2pool forest.py:291-323) ──
         // Reverse map is NOT modified yet — sibling counts are accurate.
+        static int remove_log = 0;
+        int branch = 0;
 
         if (is_head && tail_in_tails)
         {
@@ -686,6 +688,7 @@ public:
             m_tails[tail].erase(hash);
             if (m_tails[share_tail].empty())
                 m_tails.erase(share_tail);
+            branch = 1;
         }
         else if (is_head)
         {
@@ -709,6 +712,7 @@ public:
                 m_heads[share_tail] = tail;
             }
             // else: has siblings → pass (do nothing)
+            branch = only_child ? 22 : 21; // 22=promoted, 21=has siblings
         }
         else if (tail_in_tails)
         {
@@ -727,6 +731,7 @@ public:
                 m_tails[hash] = std::move(heads_above);
 
                 fire_remove_special(hash);          // p2pool line 310
+                branch = 3;
             }
             else
             {
@@ -753,12 +758,23 @@ public:
                 m_tails[hash] = std::move(my_heads);
 
                 fire_remove_special2(hash);         // p2pool line 321
+                branch = 4;
             }
         }
         else
         {
             // p2pool line 323: raise NotImplementedError()
             // Should never happen if data structure is consistent.
+            branch = 99;
+        }
+
+        if (remove_log++ < 50 || branch == 99) {
+            // Diagnostic: log first 50 removals + all unexpected states
+            auto heads_sz = m_heads.size();
+            auto tails_sz = m_tails.size();
+            auto items_sz = m_shares.size();
+            std::fprintf(stderr, "[forest::remove] hash=%.16s branch=%d heads=%zu tails=%zu items=%zu\n",
+                         hash.GetHex().c_str(), branch, heads_sz, tails_sz, items_sz);
         }
 
         // ── Cleanup (p2pool forest.py:325-330) ──

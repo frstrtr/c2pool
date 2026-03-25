@@ -1228,6 +1228,7 @@ void NodeImpl::clean_tracker()
 
     // Step 3: Drop tails — remove ALL children of qualifying tails (p2pool node.py:382-396)
     {
+        int total_dropped = 0;
         for (int iter = 0; iter < 1000; ++iter)
         {
             std::vector<uint256> to_remove;
@@ -1235,11 +1236,13 @@ void NodeImpl::clean_tracker()
             for (auto& [tail_hash, head_hashes] : tails_copy)
             {
                 int32_t min_height = std::numeric_limits<int32_t>::max();
+                bool found_head = false;
                 for (auto& hh : head_hashes) {
                     if (!m_tracker.chain.contains(hh)) continue;
                     min_height = std::min(min_height, m_tracker.chain.get_height(hh));
+                    found_head = true;
                 }
-                if (min_height < 2 * CL + 10) continue;
+                if (!found_head || min_height < 2 * CL + 10) continue;
 
                 // Remove ALL children of this tail (p2pool node.py:386)
                 auto& rev = m_tracker.chain.get_reverse();
@@ -1249,6 +1252,11 @@ void NodeImpl::clean_tracker()
                     for (const auto& child : rev_it->second)
                         to_remove.push_back(child);
                 }
+                LOG_INFO << "[clean-drop-tails] iter=" << iter
+                         << " tail=" << tail_hash.GetHex().substr(0,16)
+                         << " min_height=" << min_height << " threshold=" << (2*CL+10)
+                         << " children_in_rev=" << (rev_it != rev.end() ? rev_it->second.size() : 0)
+                         << " to_remove_total=" << to_remove.size();
             }
 
             if (to_remove.empty()) break;
@@ -1256,14 +1264,27 @@ void NodeImpl::clean_tracker()
             for (const auto& h : to_remove)
             {
                 try {
-                    // Safety: only remove if parent is a tail (p2pool node.py:391)
                     if (!m_tracker.chain.contains(h)) continue;
+                    // p2pool node.py:393: if items[aftertail].previous_hash not in tails: continue
+                    // Safety: only remove if parent is STILL a tail.
+                    // Without this check, cascade eats the entire chain.
+                    auto* idx = m_tracker.chain.get_index(h);
+                    if (!idx) continue;
+                    if (!m_tracker.chain.get_tails().count(idx->tail)) {
+                        // "erk" — parent is no longer a tail, skip
+                        continue;
+                    }
                     if (m_tracker.verified.contains(h))
                         m_tracker.verified.remove(h, /*owns_data=*/false);
                     m_tracker.chain.remove(h);
+                    ++total_dropped;
                 } catch (...) {}
             }
         }
+        if (total_dropped > 0)
+            LOG_INFO << "[clean-drop-tails] dropped " << total_dropped << " shares total"
+                     << " chain_size=" << m_tracker.chain.size()
+                     << " heads=" << m_tracker.chain.get_heads().size();
     }
 
     // Step 4: Update best share (p2pool node.py:402)
