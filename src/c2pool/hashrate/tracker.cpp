@@ -165,10 +165,17 @@ void HashrateTracker::adjust_difficulty() {
     if (!should_adjust)
         return;
 
-    // p2pool algorithm: ratio = actual_time_per_share / target_time_per_share
-    // then target *= clip(ratio, 0.1, 10.0)  [target is inverse of difficulty]
-    // equivalent: difficulty /= clip(ratio, 0.1, 10.0)
-    double ratio = (num_shares > 0) ? elapsed / (static_cast<double>(num_shares) * target_time_per_mining_share_) : 1.0;
+    // p2pool algorithm (stratum.py:572-577):
+    //   old_time = self.recent_shares[0]
+    //   del self.recent_shares[0]          # remove first → len becomes N-1
+    //   ratio = (now - old_time) / (len(self.recent_shares) * share_rate)
+    //   target *= clip(ratio, 0.1, 10.0)
+    //
+    // N timestamps define N-1 intervals. elapsed spans from first to last.
+    // p2pool uses (N-1) in the denominator (after deleting [0]).
+    // We must do the same: num_shares - 1 intervals.
+    size_t intervals = num_shares - 1;  // N timestamps → N-1 intervals (matches p2pool del [0])
+    double ratio = (intervals > 0) ? elapsed / (static_cast<double>(intervals) * target_time_per_mining_share_) : 1.0;
 
     // Avoid extreme ratios from sub-millisecond bursts
     ratio = std::max(MIN_ADJUST, std::min(MAX_ADJUST, ratio));

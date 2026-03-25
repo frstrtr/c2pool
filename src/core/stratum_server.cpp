@@ -17,6 +17,48 @@
 
 namespace core {
 
+// ─── RateMonitor implementation (p2pool: util.math.RateMonitor) ───
+
+void RateMonitor::prune_locked() {
+    double start_time = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count() - max_lookback_time_;
+    while (!datums_.empty() && datums_.front().timestamp <= start_time)
+        datums_.pop_front();
+}
+
+void RateMonitor::add_datum(double work, const std::array<uint8_t, 20>& pubkey_hash,
+                            const std::string& user, bool dead) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prune_locked();
+    double t = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (first_timestamp_ == 0.0) {
+        // p2pool: first datum sets first_timestamp but is NOT added to datums
+        first_timestamp_ = t;
+    } else {
+        datums_.push_back({t, work, pubkey_hash, user, dead});
+    }
+}
+
+std::pair<std::vector<RateMonitor::Datum>, double>
+RateMonitor::get_datums_in_last(double dt) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const_cast<RateMonitor*>(this)->prune_locked();
+    if (dt <= 0) dt = max_lookback_time_;
+    double now = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    double cutoff = now - dt;
+    std::vector<Datum> result;
+    for (const auto& d : datums_) {
+        if (d.timestamp > cutoff)
+            result.push_back(d);
+    }
+    double effective_dt = (first_timestamp_ > 0.0)
+        ? std::min(dt, now - first_timestamp_)
+        : 0.0;
+    return {std::move(result), effective_dt};
+}
+
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
 
@@ -84,7 +126,7 @@ void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket sock
 {
     if (!ec) {
         // Create, register, and start Stratum session
-        auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_);
+        auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this);
         register_session(session);
         session->start();
     } else {
@@ -111,31 +153,65 @@ void StratumServer::unregister_session(std::shared_ptr<StratumSession> s)
 
 double StratumServer::get_total_hashrate() const
 {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-    double total = 0;
-    for (const auto& s : sessions_) {
-        if (s->is_connected())
-            total += s->get_hashrate();
-    }
-    return total;
+    // Sum all hashrate from the addr rate monitor (consistent with get_local_addr_rates)
+    auto [datums, dt] = local_addr_rate_monitor_.get_datums_in_last();
+    if (dt <= 0) return 0.0;
+    double total_work = 0.0;
+    for (const auto& d : datums)
+        total_work += d.work;
+    return total_work / dt;
 }
 
 AddrRateMap StratumServer::get_local_addr_rates() const
 {
-    // p2pool: get_local_addr_rates() — sum hashrate by pubkey_hash across all connections.
-    // p2pool ref: work.py:1975-1990
+    // p2pool: get_local_addr_rates() with 2-second cache (work.py:1975-1990).
+    // Uses RateMonitor (records ALL pseudoshares at VARDIFF target) instead of
+    // summing per-session hashrate (which only counted pool-quality shares).
+    double now = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (now - addr_rates_cache_ts_ < 2.0)
+            return addr_rates_cache_;
+    }
+
+    auto [datums, dt] = local_addr_rate_monitor_.get_datums_in_last();
     AddrRateMap rates;
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-    for (const auto& s : sessions_) {
-        if (!s->is_connected()) continue;
-        const auto& pk = s->get_pubkey_hash();
-        // Skip sessions that haven't authorized yet (null pubkey_hash)
-        bool has_pk = false;
-        for (auto b : pk) { if (b != 0) { has_pk = true; break; } }
-        if (!has_pk) continue;
-        rates[pk] += s->get_hashrate();
+    if (dt > 0) {
+        for (const auto& d : datums)
+            rates[d.pubkey_hash] += d.work / dt;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        addr_rates_cache_ = rates;
+        addr_rates_cache_ts_ = now;
     }
     return rates;
+}
+
+std::pair<std::unordered_map<std::string, double>,
+          std::unordered_map<std::string, double>>
+StratumServer::get_local_rates() const
+{
+    // p2pool: get_local_rates() (work.py:1965-1973)
+    auto [datums, dt] = local_rate_monitor_.get_datums_in_last();
+    std::unordered_map<std::string, double> hash_rates, dead_hash_rates;
+    if (dt > 0) {
+        for (const auto& d : datums) {
+            hash_rates[d.user] += d.work / dt;
+            if (d.dead)
+                dead_hash_rates[d.user] += d.work / dt;
+        }
+    }
+    return {hash_rates, dead_hash_rates};
+}
+
+void StratumServer::record_pseudoshare(double work, const std::array<uint8_t, 20>& pubkey_hash,
+                                        const std::string& user, bool dead)
+{
+    local_rate_monitor_.add_datum(work, pubkey_hash, user, dead);
+    local_addr_rate_monitor_.add_datum(work, pubkey_hash, user, dead);
 }
 
 void StratumServer::notify_all()
@@ -173,9 +249,11 @@ void StratumServer::notify_all()
 }
 
 /// StratumSession Implementation
-StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
+StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+                               StratumServer* server)
     : socket_(std::move(socket))
     , mining_interface_(mining_interface)
+    , server_(server)
     , connected_at_(std::chrono::steady_clock::now())
 {
     subscription_id_ = generate_subscription_id();
@@ -267,20 +345,13 @@ void StratumSession::process_message(std::size_t bytes_read)
 
         send_response(response);
 
-        // After subscribe response is sent, follow up with difficulty + work
+        // After subscribe response is sent, follow up with difficulty + work.
+        // p2pool: pseudoshare difficulty starts low and VARDIFF ramps it up.
+        // Do NOT floor at pool share_bits — that defeats VARDIFF.
         if (method == "mining.subscribe") {
             double initial_diff = (suggested_difficulty_ > 0.0)
                 ? suggested_difficulty_
                 : hashrate_tracker_.get_current_difficulty();
-            // Floor initial difficulty at share target so miner doesn't waste
-            // bandwidth submitting solutions that can never become real shares.
-            uint32_t sb = mining_interface_->m_share_bits.load();
-            if (sb == 0) sb = mining_interface_->m_share_max_bits.load(); // bootstrap: use max target
-            if (sb != 0) {
-                double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
-                if (initial_diff < share_diff)
-                    initial_diff = share_diff;
-            }
             send_set_difficulty(initial_diff);
             send_notify_work();
         }
@@ -795,29 +866,19 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         job.coinb1, job.coinb2,
         extranonce1_, extranonce2, ntime, nonce,
         effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
-    // Use pool share target as required difficulty (p2pool model).
-    // VARDIFF is bypassed — all submissions measured against share_bits.
-    double required_difficulty = hashrate_tracker_.get_current_difficulty();
+    // VARDIFF: acceptance threshold is the per-connection adaptive difficulty.
+    // p2pool accepts ALL pseudoshares meeting effective_target (VARDIFF level),
+    // not just those meeting pool share_bits. This gives smooth hashrate data.
+    double vardiff_difficulty = hashrate_tracker_.get_current_difficulty();
+
+    // Pool share difficulty (for P2P share creation threshold)
+    double pool_difficulty = 0.0;
     uint32_t sb = mining_interface_->m_share_bits.load();
-    if (sb != 0) {
-        double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
-        if (share_diff > 0) {
-            required_difficulty = share_diff;
-            hashrate_tracker_.set_difficulty_hint(share_diff);
-        }
-    }
+    if (sb != 0)
+        pool_difficulty = chain::target_to_difficulty(chain::bits_to_target(sb));
 
-    // Do NOT record rejected pseudoshares in the hashrate tracker.
-    // Only accepted shares (meeting pool target) count for Local hashrate.
-    // Recording easy pseudoshares inflates Local by 3-5x.
-    double old_difficulty = required_difficulty;
-    double new_difficulty = required_difficulty;
-
-    if (std::abs(new_difficulty - old_difficulty) > 1e-9) {
-        send_set_difficulty(new_difficulty);
-        LOG_INFO << "[Stratum] VARDIFF adjustment for " << username_ << ": "
-                 << old_difficulty << " -> " << new_difficulty;
-    }
+    // Use VARDIFF as stratum acceptance threshold
+    double required_difficulty = vardiff_difficulty;
 
     // Build JobSnapshot BEFORE the rejection gate — needed for block-level
     // checking which must run on ALL submissions, not just accepted ones.
@@ -868,13 +929,15 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // time would break ref_hash consistency. Future: compute stale_info
     // at ref_hash_fn time and freeze it, matching p2pool's get_work() pattern.
 
-    // Check EVERY submission for block-level PoW — even rejected shares
-    // can meet the blockchain target and must be submitted as blocks.
-    mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
-        &snapshot);
-
+    // ── Pseudoshare acceptance gate (VARDIFF level) ──
+    // p2pool accepts ALL submissions meeting effective_target (VARDIFF).
+    // Below VARDIFF → reject. Above VARDIFF → pseudoshare (record for hashrate).
+    // Above pool target → also a P2P share (broadcast to network).
     if (share_difficulty < required_difficulty) {
         ++rejected_shares_;
+        // Record rejection for VARDIFF timing (p2pool only records accepted,
+        // but we need the timing signal to avoid stalling VARDIFF).
+        hashrate_tracker_.record_mining_share_submission(vardiff_difficulty, false);
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = false;
@@ -882,31 +945,80 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         return response;
     }
 
-    // Valid share — meets pool difficulty target
+    // ── Pseudoshare accepted — record in RateMonitor ──
+    // p2pool: work = target_to_average_attempts(effective_target)
+    // For us: work = vardiff_difficulty × 2^32 (equivalent unit conversion)
     ++accepted_shares_;
-    // Record REQUIRED difficulty, not actual hash difficulty.
-    // p2pool uses target_to_average_attempts(target) — the pool target.
-    // Recording actual hash diff inflates hashrate (lucky shares contribute extra).
-    hashrate_tracker_.record_mining_share_submission(required_difficulty, true);
+    static constexpr double TWO_32 = 4294967296.0;
+    double work = vardiff_difficulty * TWO_32;
+    bool is_dead = (job.stale_info != 0);
 
-    LOG_INFO << "[Stratum] Share accepted from " << username_ << " (diff=" << share_difficulty
-             << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
-             << ", rejected=" << rejected_shares_ << ")";
+    // Record in global RateMonitor (for get_local_addr_rates)
+    if (server_)
+        server_->record_pseudoshare(work, pubkey_hash_, username_, is_dead);
+
+    // Record in per-connection tracker (for VARDIFF adjustment + per-session stats)
+    hashrate_tracker_.record_mining_share_submission(vardiff_difficulty, true);
+
+    // Check if VARDIFF changed → send new difficulty AND new work to miner.
+    // p2pool (stratum.py:594-595): after adjusting target, calls _send_work()
+    // which sends both set_difficulty and mining.notify. Without new work,
+    // the miner continues hashing at the OLD difficulty until the next natural
+    // work refresh, causing VARDIFF oscillation and hashrate undercount.
+    if (hashrate_tracker_.difficulty_changed_since(vardiff_difficulty)) {
+        double new_diff = hashrate_tracker_.get_current_difficulty();
+        send_set_difficulty(new_diff);
+        send_notify_work(true);  // p2pool: self._send_work() after VARDIFF
+        LOG_INFO << "[Stratum] VARDIFF: " << vardiff_difficulty << " -> " << new_diff
+                 << " for " << username_;
+    }
+
+    // ── Pool-quality share gate ──
+    // Only create P2P share + block check for submissions meeting pool target.
+    bool is_pool_share = (pool_difficulty > 0.0 && share_difficulty >= pool_difficulty);
+    if (is_pool_share) {
+        // Full share creation + block-level PoW check
+        mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
+            &snapshot);
+        LOG_INFO << "[Stratum] P2P share from " << username_ << " (diff=" << share_difficulty
+                 << " >= pool=" << pool_difficulty << ")";
+    } else {
+        // Pseudoshare only — still check for blocks.
+        // A pseudoshare can meet the block target on testnet where
+        // block_difficulty < vardiff_difficulty.
+        double block_difficulty = 0.0;
+        if (!job.gbt_block_nbits.empty()) {
+            uint32_t block_bits = static_cast<uint32_t>(std::stoul(job.gbt_block_nbits, nullptr, 16));
+            block_difficulty = chain::target_to_difficulty(chain::bits_to_target(block_bits));
+        }
+        if (block_difficulty > 0.0 && share_difficulty >= block_difficulty) {
+            // Rare: pseudoshare is a block! Submit it.
+            mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
+                &snapshot);
+            LOG_INFO << "[Stratum] Pseudoshare IS A BLOCK from " << username_
+                     << " (diff=" << share_difficulty << " >= block=" << block_difficulty << ")";
+        }
+    }
+
+    LOG_TRACE << "[Stratum] Pseudoshare accepted from " << username_
+              << " (hash_diff=" << share_difficulty << ", vardiff=" << vardiff_difficulty
+              << ", pool=" << pool_difficulty
+              << ", accepted=" << accepted_shares_ << ", rejected=" << rejected_shares_ << ")";
 
     // Update worker tracker with latest stats
     if (mining_interface_) {
         mining_interface_->update_stratum_worker(session_id_,
             hashrate_tracker_.get_current_hashrate(),
-            0.0,  // dead hashrate — tracked separately if needed
+            0.0,
             hashrate_tracker_.get_current_difficulty(),
             accepted_shares_, rejected_shares_, stale_shares_);
     }
-    
+
     nlohmann::json response;
     response["id"] = request_id;
     response["result"] = true;
     response["error"] = nullptr;
-    
+
     return response;
 }
 
@@ -1161,20 +1273,11 @@ void StratumSession::send_notify_work(bool force_clean)
         }
     }
 
-    // p2pool model: stratum difficulty = pool share target (share_bits).
-    // No VARDIFF range — every miner gets the SAME pool target.
-    // This matches p2pool exactly: all miners work at the pool share target.
-    {
-        uint32_t sb = mining_interface_->m_share_bits.load();
-        if (sb != 0) {
-            double share_diff = chain::target_to_difficulty(chain::bits_to_target(sb));
-            double current = hashrate_tracker_.get_current_difficulty();
-            if (share_diff > 0 && std::abs(share_diff - current) > 1e-12) {
-                send_set_difficulty(share_diff);
-                hashrate_tracker_.set_difficulty_hint(share_diff);
-            }
-        }
-    }
+    // VARDIFF: do NOT override per-connection difficulty with pool share_bits.
+    // p2pool sends pseudoshare difficulty (VARDIFF) to miners, NOT pool target.
+    // Miners submit many pseudoshares at low difficulty; only those meeting
+    // share_bits become P2P shares. This gives smooth hashrate estimation.
+    // VARDIFF adjustment happens in handle_submit after each pseudoshare.
 
     notification["params"] = nlohmann::json::array({
         job_id, prevhash, coinb1, coinb2, merkle_branches,

@@ -13,6 +13,8 @@
 #include <set>
 #include <array>
 
+#include <deque>
+
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 
@@ -28,6 +30,37 @@ using tcp = net::ip::tcp;
 // Forward declaration — defined in web_server.hpp
 class MiningInterface;
 
+/// Sliding-window rate monitor matching p2pool's util.math.RateMonitor.
+/// Records timestamped work datums for smooth hashrate estimation.
+/// Thread-safe: accessed from multiple StratumSession threads + ref_hash_fn.
+class RateMonitor {
+public:
+    struct Datum {
+        double timestamp;                     // epoch seconds
+        double work;                          // hashes (difficulty × 2^32)
+        std::array<uint8_t, 20> pubkey_hash;
+        std::string user;
+        bool dead;
+    };
+
+    explicit RateMonitor(double max_lookback_time)
+        : max_lookback_time_(max_lookback_time) {}
+
+    void add_datum(double work, const std::array<uint8_t, 20>& pubkey_hash,
+                   const std::string& user, bool dead);
+
+    /// Returns {datums_in_window, effective_time_span}.
+    /// If dt==0, uses max_lookback_time_.
+    std::pair<std::vector<Datum>, double> get_datums_in_last(double dt = 0) const;
+
+private:
+    void prune_locked();  // must hold mutex_
+    double max_lookback_time_;
+    double first_timestamp_ = 0.0;
+    mutable std::deque<Datum> datums_;
+    mutable std::mutex mutex_;
+};
+
 /// Hasher for 20-byte pubkey_hash (used in per-address hashrate maps).
 struct PubkeyHashHasher {
     size_t operator()(const std::array<uint8_t, 20>& a) const {
@@ -39,6 +72,9 @@ struct PubkeyHashHasher {
 };
 /// Per-address hashrate map type (p2pool: get_local_addr_rates return type).
 using AddrRateMap = std::unordered_map<std::array<uint8_t, 20>, double, PubkeyHashHasher>;
+
+// Forward declaration
+class StratumServer;
 
 /// Stratum mining session — one per TCP connection from a miner.
 ///
@@ -52,6 +88,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     tcp::socket socket_;
     boost::asio::streambuf buffer_;
     std::shared_ptr<MiningInterface> mining_interface_;
+    StratumServer* server_ = nullptr;  // back-pointer for RateMonitor recording
     std::string subscription_id_;
     std::string extranonce1_;
     std::string username_;
@@ -128,7 +165,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     std::shared_ptr<boost::asio::steady_timer> work_push_timer_;
 
 public:
-    explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
+    explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+                            StratumServer* server = nullptr);
     void start();
 
     bool is_connected() const { return socket_.is_open(); }
@@ -176,6 +214,19 @@ class StratumServer
     mutable std::mutex sessions_mutex_;
     std::set<std::shared_ptr<StratumSession>> sessions_;
 
+    // p2pool RateMonitor pair (work.py:223-226):
+    //   local_rate_monitor: per-user hashrate (for get_local_rates)
+    //   local_addr_rate_monitor: per-address hashrate (for get_local_addr_rates)
+    // Window = 100 × SHARE_PERIOD (p2pool: 100 × STRATUM_SHARE_RATE)
+    static constexpr double RATE_MONITOR_WINDOW = 1000.0;  // seconds
+    RateMonitor local_rate_monitor_{RATE_MONITOR_WINDOW};
+    RateMonitor local_addr_rate_monitor_{RATE_MONITOR_WINDOW};
+
+    // 2-second cache for get_local_addr_rates (p2pool: work.py:1978-1982)
+    mutable AddrRateMap addr_rates_cache_;
+    mutable double addr_rates_cache_ts_ = 0.0;
+    mutable std::mutex cache_mutex_;
+
 public:
     StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface);
     ~StratumServer();
@@ -190,10 +241,21 @@ public:
     /// Sum of all connected miners' hashrate (H/s).
     double get_total_hashrate() const;
 
-    /// Per-address hashrate aggregation.
+    /// Per-address hashrate aggregation via RateMonitor.
     /// Matches p2pool: get_local_addr_rates() (work.py:1975-1990).
     /// Returns {pubkey_hash → hashrate (H/s)} for all connected miners.
     AddrRateMap get_local_addr_rates() const;
+
+    /// Per-user hashrate + dead hashrate from RateMonitor.
+    /// Matches p2pool: get_local_rates() (work.py:1965-1973).
+    std::pair<std::unordered_map<std::string, double>,
+              std::unordered_map<std::string, double>> get_local_rates() const;
+
+    /// Record a pseudoshare in rate monitors.
+    /// Called from StratumSession::handle_submit for every accepted pseudoshare.
+    /// work = difficulty × 2^32 (hashes), matching p2pool's target_to_average_attempts.
+    void record_pseudoshare(double work, const std::array<uint8_t, 20>& pubkey_hash,
+                            const std::string& user, bool dead);
 
     /// Register/unregister sessions for broadcast
     void register_session(std::shared_ptr<StratumSession> s);

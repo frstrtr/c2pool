@@ -1344,6 +1344,16 @@ public:
 
         static int decay_dump = 0;
         bool do_dump = (decay_dump++ % 100 == 0); // dump every 100th call
+        // Per-miner bits summary: every 20th call, log share count and bits per miner
+        static int bits_summary_counter = 0;
+        bool do_bits_summary = (bits_summary_counter++ % 20 == 0);
+        struct MinerBitsStat {
+            int count = 0;
+            uint32_t min_bits = 0xFFFFFFFF;
+            uint32_t max_bits = 0;
+            bool is_local = false;
+        };
+        std::map<std::string, MinerBitsStat> miner_bits;
 
         for (const auto& hash : walk_hashes)
         {
@@ -1369,6 +1379,22 @@ public:
                              << " decay=" << decay_fp
                              << " script=" << script_hex.substr(0, 20)
                              << " hash=" << hash.GetHex().substr(0, 16);
+                }
+
+                // Track per-miner bits for diagnostic summary
+                if (do_bits_summary) {
+                    auto script = get_share_script(obj);
+                    auto script_hex = std::string();
+                    for (auto b : script) {
+                        static const char* H = "0123456789abcdef";
+                        script_hex += H[b >> 4]; script_hex += H[b & 0xf];
+                    }
+                    auto key = script_hex.substr(0, 20);
+                    auto& ms = miner_bits[key];
+                    ms.count++;
+                    if (obj->m_bits < ms.min_bits) ms.min_bits = obj->m_bits;
+                    if (obj->m_bits > ms.max_bits) ms.max_bits = obj->m_bits;
+                    ms.is_local = (obj->peer_addr.port() == 0);
                 }
 
                 auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
@@ -1420,6 +1446,22 @@ public:
                 }
                 LOG_INFO << "[DECAY-WALK]   " << script_hex.substr(0, 40)
                          << " weight=" << w.GetLow64();
+            }
+        }
+
+        // Per-miner bits summary — shows whether c2pool and p2pool shares
+        // have different bits (share difficulty). Different bits means
+        // different per-share weight, which with exponential decay causes
+        // PPLNS imbalance even with equal hashrate.
+        if (do_bits_summary && !miner_bits.empty()) {
+            for (auto& [script, ms] : miner_bits) {
+                LOG_INFO << "[BITS-PARITY] " << script
+                         << (ms.is_local ? " (LOCAL)" : " (REMOTE)")
+                         << " shares=" << ms.count
+                         << " bits=[0x" << std::hex << ms.min_bits
+                         << ",0x" << ms.max_bits << std::dec << "]"
+                         << " of " << share_count << " total"
+                         << " (" << (share_count > 0 ? 100.0 * ms.count / share_count : 0.0) << "%)";
             }
         }
 
