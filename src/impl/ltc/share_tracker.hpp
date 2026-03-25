@@ -826,7 +826,9 @@ public:
             return uint288(0);
 
         // p2pool: far = tracker.get_nth_parent_hash(prev, dist - 1) — O(log n)
+        LOG_TRACE << "[APS] get_nth_parent_via_skip(dist=" << (dist-1) << ")...";
         auto far_hash = chain.get_nth_parent_via_skip(share_hash, dist - 1);
+        LOG_TRACE << "[APS] skip done, far=" << far_hash.GetHex().substr(0,16);
         if (far_hash.IsNull() || !chain.contains(far_hash))
             return uint288(0);
 
@@ -1223,17 +1225,37 @@ public:
         int32_t share_count = 0;
         uint64_t decay_fp = DECAY_SCALE; // starts at 1.0
 
-        // Use get_chain() view for linear walk — avoids per-iteration
-        // contains() + get_share() hash lookups.  O(1) per step.
-        auto walk_count = std::min(max_shares, chain.get_height(start));
-        auto walk_view = chain.get_chain(start, walk_count);
+        // Walk the chain directly (matches p2pool's while loop in
+        // get_decayed_cumulative_weights). Do NOT use TrackerView's cached
+        // get_height() — it can become stale in multi-threaded context when
+        // clean_tracker() removes shares concurrently.
+        // Collect share hashes for the walk, then iterate.
+        std::vector<uint256> walk_hashes;
+        walk_hashes.reserve(std::min(max_shares, int32_t(500)));
+        {
+            auto cur = start;
+            while (!cur.IsNull() && chain.contains(cur)
+                   && static_cast<int32_t>(walk_hashes.size()) < max_shares) {
+                walk_hashes.push_back(cur);
+                auto* idx = chain.get_index(cur);
+                cur = idx ? idx->tail : uint256();
+            }
+        }
+        auto walk_count = static_cast<int32_t>(walk_hashes.size());
+
+        LOG_INFO << "[PPLNS-WALK] start=" << start.GetHex().substr(0, 16)
+                 << " max_shares=" << max_shares
+                 << " walk_count=" << walk_count
+                 << " half_life=" << half_life
+                 << " decay_per=" << decay_per;
 
         static int decay_dump = 0;
         bool do_dump = (decay_dump++ < 2);
 
-        for (auto [hash, data] : walk_view)
+        for (const auto& hash : walk_hashes)
         {
-            data.share.invoke([&](auto* obj) {
+            if (!chain.contains(hash)) break; // safety: share removed during walk
+            chain.get_share(hash).invoke([&](auto* obj) {
                 auto att = chain::target_to_average_attempts(
                     chain::bits_to_target(obj->m_bits));
                 uint32_t don = obj->m_donation;
@@ -1321,8 +1343,10 @@ public:
     get_expected_payouts(const uint256& best_share_hash, const uint256& block_target, uint64_t subsidy,
                          const std::vector<unsigned char>& donation_script)
     {
-        auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+        // Pass REAL_CHAIN_LENGTH as max_shares — the walk naturally stops
+        // when the chain ends, matching p2pool's direct iteration pattern.
+        // Do NOT use cached get_height() which can be stale in multi-threaded context.
+        auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
         // V36: remove desired_weight cap — exponential decay handles windowing.
         // See generate_share_transaction() for detailed rationale.
         uint288 unlimited_weight;

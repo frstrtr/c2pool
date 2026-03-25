@@ -140,18 +140,35 @@ AddrRateMap StratumServer::get_local_addr_rates() const
 
 void StratumServer::notify_all()
 {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-    for (auto& s : sessions_) {
-        try {
-            s->send_notify_work(false); // clean_jobs=false: miner keeps working, submits for any valid job
-        } catch (...) {}
+    // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) ──
+    // send_notify_work() acquires m_work_mutex internally.
+    // We must NOT hold sessions_mutex_ while calling it, otherwise:
+    //   Thread A: sessions_mutex_ → m_work_mutex  (here)
+    //   Thread B: m_work_mutex → sessions_mutex_  (build_connection_coinbase → get_local_addr_rates)
+    //   = ABBA deadlock.
+    //
+    // Pattern: snapshot session shared_ptrs under lock, release, then notify.
+    // Sessions are shared_ptr so they stay alive even if unregistered mid-iteration.
+    std::vector<std::shared_ptr<StratumSession>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        snapshot.reserve(sessions_.size());
+        for (auto& s : sessions_)
+            snapshot.push_back(s);
+        // Prune dead sessions while we hold the lock
+        for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+            if (!(*it)->is_connected())
+                it = sessions_.erase(it);
+            else
+                ++it;
+        }
     }
-    // Prune dead sessions
-    for (auto it = sessions_.begin(); it != sessions_.end(); ) {
-        if (!(*it)->is_connected())
-            it = sessions_.erase(it);
-        else
-            ++it;
+    // sessions_mutex_ RELEASED — safe to call into m_work_mutex territory
+    for (auto& s : snapshot) {
+        try {
+            if (s->is_connected())
+                s->send_notify_work(false);
+        } catch (...) {}
     }
 }
 

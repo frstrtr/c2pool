@@ -223,6 +223,8 @@ public:
             // Safety: if we reached a null hash, stop
             if (pos.IsNull()) return hash_t();
         }
+        // Safety loop exhausted — chain shorter than expected
+        return sol_hash;
     }
 
     void clear() { m_skips.clear(); }

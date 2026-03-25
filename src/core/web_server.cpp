@@ -1250,47 +1250,107 @@ MiningInterface::build_connection_coinbase(
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
-    std::lock_guard<std::mutex> lock(m_work_mutex);
-    if (!m_work_valid || m_cached_template.is_null())
+    // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) > MM::m_mutex (3) ──
+    //
+    // This function is called from StratumSession::send_notify_work which may be
+    // invoked by notify_all() after it releases sessions_mutex_.
+    // Internally, ref_hash_fn needs get_local_addr_rates() (sessions_mutex_) and
+    // MM needs its own m_mutex.
+    //
+    // Architecture: snapshot-then-compute (matches p2pool's single-threaded model).
+    //   Phase 1: Snapshot all work state under m_work_mutex (brief hold)
+    //   Phase 2: Gather external data WITHOUT any lock (addr_rates, MM commitment)
+    //   Phase 3: Compute everything from snapshot (ref_hash, coinbase parts) — lock-free
+    //   Phase 4: Brief re-lock to write back PPLNS cache + build final result
+
+    // ── Phase 1: Snapshot work state under m_work_mutex ──
+    // All reads from m_cached_* fields happen here.  The lock is released before
+    // any callback that might acquire other mutexes.
+
+    struct WorkStateSnapshot {
+        nlohmann::json tmpl;
+        std::vector<std::pair<std::string, uint64_t>> pplns_outputs;
+        uint256 pplns_best_share;
+        bool raw_scripts{false};
+        std::string witness_commitment;
+        uint256 witness_root;
+        std::vector<uint8_t> mm_commitment;
+        std::vector<CachedMergedHeaderInfo> merged_header_infos;
+        bool segwit_active{false};
+        std::string mweb;
+        std::string coinbase_text;
+        std::vector<unsigned char> donation_script;
+        std::vector<std::string> merkle_branches;
+        pplns_fn_t pplns_fn;
+        ref_hash_fn_t ref_hash_fn;
+        bool needs_pplns_recompute{false};
+    };
+
+    WorkStateSnapshot ws;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_work_valid || m_cached_template.is_null())
+            return {};
+
+        ws.tmpl = m_cached_template;
+        ws.pplns_outputs = m_cached_pplns_outputs;
+        ws.pplns_best_share = m_cached_pplns_best_share;
+        ws.raw_scripts = m_cached_raw_scripts;
+        ws.witness_commitment = m_cached_witness_commitment;
+        ws.witness_root = m_cached_witness_root;
+        ws.mm_commitment = m_cached_mm_commitment;
+        ws.merged_header_infos = m_last_merged_header_infos;
+        ws.segwit_active = m_segwit_active;
+        ws.mweb = m_cached_mweb;
+        ws.coinbase_text = m_coinbase_text;
+        ws.donation_script = m_donation_script;
+        ws.merkle_branches = m_cached_merkle_branches;
+        ws.pplns_fn = m_pplns_fn;
+        ws.ref_hash_fn = m_ref_hash_fn;
+        ws.needs_pplns_recompute = !prev_share_hash.IsNull()
+            && ws.pplns_fn
+            && prev_share_hash != ws.pplns_best_share;
+    }
+    // ── m_work_mutex RELEASED ──
+    // From here on, NO mutex is held. All callbacks (PPLNS, ref_hash, MM, addr_rates)
+    // can freely acquire their own locks without deadlock risk.
+
+    if (!ws.ref_hash_fn)
         return {};
 
+    // ── Phase 2: PPLNS recomputation (lock-free — callbacks may acquire their own locks) ──
     // CRITICAL: If frozen prev_share_hash differs from the share used for cached PPLNS,
     // recompute PPLNS from the frozen share. This ensures the coinbase amounts match
     // what generate_share_transaction will compute during verification.
     // (Matches p2pool's closure pattern: coinbase is frozen at template time.)
+    static const char* HX = "0123456789abcdef";
+
     if (prev_share_hash.IsNull())
     {
         // Genesis: no PPLNS walk possible. p2pool puts 100% of subsidy to donation.
-        // Matching p2pool generate_transaction: empty weights → amounts={} → total_donation=subsidy
-        auto& self = const_cast<MiningInterface&>(*this);
-        self.m_cached_pplns_outputs.clear();
-        uint64_t subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
-        static const char* HX = "0123456789abcdef";
+        ws.pplns_outputs.clear();
+        uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
         std::string donation_hex;
-        for (unsigned char b : m_donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
-        self.m_cached_pplns_outputs.push_back({donation_hex, subsidy});
-        self.m_cached_raw_scripts = true;
-        self.m_cached_pplns_best_share = prev_share_hash;
+        for (unsigned char b : ws.donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
+        ws.pplns_outputs.push_back({donation_hex, subsidy});
+        ws.raw_scripts = true;
+        ws.pplns_best_share = prev_share_hash;
     }
-    else if (m_pplns_fn && prev_share_hash != m_cached_pplns_best_share)
+    else if (ws.needs_pplns_recompute)
     {
         uint32_t nbits = 0;
-        if (m_cached_template.contains("bits"))
+        if (ws.tmpl.contains("bits"))
             nbits = static_cast<uint32_t>(std::stoul(
-                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                ws.tmpl["bits"].get<std::string>(), nullptr, 16));
         uint256 block_target = chain::bits_to_target(nbits);
-        uint64_t subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+        uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
 
-        auto expected = m_pplns_fn(prev_share_hash, block_target, subsidy, m_donation_script);
+        auto expected = ws.pplns_fn(prev_share_hash, block_target, subsidy, ws.donation_script);
 
         if (!expected.empty()) {
-            // Rebuild cached outputs from fresh PPLNS (same logic as refresh_work)
-            auto& self = const_cast<MiningInterface&>(*this);
-            self.m_cached_pplns_outputs.clear();
-            static const char* HX = "0123456789abcdef";
-
+            ws.pplns_outputs.clear();
             std::string donation_hex;
-            for (unsigned char b : m_donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
+            for (unsigned char b : ws.donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
 
             std::pair<std::string, uint64_t> donation_entry;
             bool found_donation = false;
@@ -1300,53 +1360,31 @@ MiningInterface::build_connection_coinbase(
                 std::string hex;
                 for (unsigned char b : script_bytes) { hex += HX[b >> 4]; hex += HX[b & 0x0f]; }
                 if (hex == donation_hex) { donation_entry = {hex, sat}; found_donation = true; }
-                else if (sat > 0) { self.m_cached_pplns_outputs.push_back({std::move(hex), sat}); }
+                else if (sat > 0) { ws.pplns_outputs.push_back({std::move(hex), sat}); }
             }
-            std::sort(self.m_cached_pplns_outputs.begin(), self.m_cached_pplns_outputs.end(),
+            std::sort(ws.pplns_outputs.begin(), ws.pplns_outputs.end(),
                 [](const auto& a, const auto& b) {
                     if (a.second != b.second) return a.second < b.second;
                     return a.first < b.first;
                 });
-            if (found_donation) self.m_cached_pplns_outputs.push_back(donation_entry);
-            self.m_cached_pplns_best_share = prev_share_hash;
+            if (found_donation) ws.pplns_outputs.push_back(donation_entry);
+            ws.pplns_best_share = prev_share_hash;
             LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
                      << prev_share_hash.ToString().substr(0, 16)
-                     << " outputs=" << self.m_cached_pplns_outputs.size();
+                     << " outputs=" << ws.pplns_outputs.size();
         }
     }
 
-    // Build the coinbase scriptSig (FIXED — no extranonce1/2):
-    //   BIP34_height + mm_commitment + tag + state_root
-    // This is share.m_coinbase and determines ref_hash.
-    // extranonce1+extranonce2 go into last_txout_nonce (OP_RETURN), not scriptSig.
-    const int height = m_cached_template.value("height", 1);
-    std::string height_hex = encode_height_pushdata(height);
-
-    // Dynamic tag: "/c2pool/" (default) or operator --coinbase-text
-    static const char* HEX = "0123456789abcdef";
-    const std::string default_tag2 = "/c2pool/";
-    const std::string& tag_src = m_coinbase_text.empty() ? default_tag2 : m_coinbase_text;
-    std::string tag_hex;
-    for (char c : tag_src) {
-        uint8_t b = static_cast<uint8_t>(c);
-        tag_hex += HEX[b >> 4];
-        tag_hex += HEX[b & 0x0f];
-    }
-
-    // Compute mm_commitment ATOMICALLY with merged_coinbase_info (p2pool pattern).
-    // build_merged_header_info_with_commitment() builds DOGE PPLNS coinbase +
-    // DOGE block hash + aux_pow commitment in one shot. The commitment goes
-    // into the LTC scriptSig AND the merged_coinbase_info uses the same hash.
-    // Using m_cached_mm_commitment here would cause a mismatch when DOGE PPLNS
-    // changed since last refresh_work().
+    // ── Phase 2b: MM commitment (lock-free — MM acquires its own m_mutex) ──
     std::vector<uint8_t> atomic_mm_commitment;
     if (m_mm_manager) {
         auto [header_infos, fresh_commit] =
             m_mm_manager->build_merged_header_info_with_commitment();
+        LOG_TRACE << "[build_cb] MM returned, commit_size=" << fresh_commit.size()
+                  << " infos=" << header_infos.size();
         atomic_mm_commitment = std::move(fresh_commit);
-        // Store header_infos so ref_hash_fn can use them (avoid double computation)
-        m_last_merged_header_infos.clear();
-        m_last_merged_header_infos.reserve(header_infos.size());
+        ws.merged_header_infos.clear();
+        ws.merged_header_infos.reserve(header_infos.size());
         for (auto& hi : header_infos) {
             CachedMergedHeaderInfo c;
             c.chain_id = hi.chain_id;
@@ -1356,30 +1394,54 @@ MiningInterface::build_connection_coinbase(
             c.coinbase_merkle_branches = std::move(hi.coinbase_merkle_branches);
             c.coinbase_script = std::move(hi.coinbase_script);
             c.coinbase_hex = std::move(hi.coinbase_hex);
-            m_last_merged_header_infos.push_back(std::move(c));
+            ws.merged_header_infos.push_back(std::move(c));
         }
     }
-    const auto& mm_for_scriptsig = atomic_mm_commitment.empty()
-        ? m_cached_mm_commitment : atomic_mm_commitment;
 
-    // MM commitment hex
+    // Write merged header infos so ref_hash_fn (which captures MiningInterface*)
+    // reads the FRESH infos from this MM build, not stale ones from last refresh_work.
+    // m_last_merged_header_infos is mutable and only consumed by ref_hash_fn (single caller).
+    if (!ws.merged_header_infos.empty()) {
+        auto& self = const_cast<MiningInterface&>(*this);
+        self.m_last_merged_header_infos = ws.merged_header_infos;
+    }
+
+    // ── Phase 3: Pure computation from snapshot (NO locks held) ──
+    LOG_TRACE << "[build_cb] Phase 3: building coinbase from snapshot...";
+
+    const int height = ws.tmpl.value("height", 1);
+    std::string height_hex = encode_height_pushdata(height);
+
+    static const char* HEX = "0123456789abcdef";
+    const std::string default_tag2 = "/c2pool/";
+    const std::string& tag_src = ws.coinbase_text.empty() ? default_tag2 : ws.coinbase_text;
+    std::string tag_hex;
+    for (char c : tag_src) {
+        uint8_t b = static_cast<uint8_t>(c);
+        tag_hex += HEX[b >> 4];
+        tag_hex += HEX[b & 0x0f];
+    }
+
+    const auto& mm_for_scriptsig = atomic_mm_commitment.empty()
+        ? ws.mm_commitment : atomic_mm_commitment;
+
     std::string mm_hex;
     for (uint8_t b : mm_for_scriptsig) {
         mm_hex += HEX[b >> 4];
         mm_hex += HEX[b & 0x0f];
     }
 
-    // THE state root (V37 prep — 32 bytes appended to scriptSig like build_coinbase_parts)
+    // THE state root
     std::string state_root_hex;
     {
-        uint32_t tmpl_height = m_cached_template.value("height", uint32_t(0));
+        uint32_t tmpl_height = ws.tmpl.value("height", uint32_t(0));
         uint32_t tmpl_bits = 0;
-        if (m_cached_template.contains("bits"))
+        if (ws.tmpl.contains("bits"))
             tmpl_bits = static_cast<uint32_t>(std::stoul(
-                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                ws.tmpl["bits"].get<std::string>(), nullptr, 16));
         uint256 the_root = compute_the_state_root(
-            m_cached_pplns_outputs,
-            static_cast<uint32_t>(m_cached_pplns_outputs.size()),
+            ws.pplns_outputs,
+            static_cast<uint32_t>(ws.pplns_outputs.size()),
             tmpl_height, tmpl_bits);
         if (!the_root.IsNull()) {
             state_root_hex.reserve(64);
@@ -1391,10 +1453,7 @@ MiningInterface::build_connection_coinbase(
         }
     }
 
-    // ScriptSig: height_push + mm_push + tag_push + state_root (NO extranonce!)
-    // Must match p2pool's create_push_script([height, mm_data, coinb_texts]):
-    // Each element gets its own push opcode prefix (PUSH_N for N < 76 bytes).
-    // state_root is appended as raw bytes (like coinbaseflags in p2pool).
+    // ScriptSig
     auto push_prefix = [&](const std::string& data_hex) -> std::string {
         size_t len = data_hex.size() / 2;
         if (len == 0) return "";
@@ -1405,31 +1464,26 @@ MiningInterface::build_connection_coinbase(
     std::string scriptsig_hex = height_hex;
     if (!mm_hex.empty()) scriptsig_hex += push_prefix(mm_hex);
     if (!tag_hex.empty()) scriptsig_hex += push_prefix(tag_hex);
-    // state_root appended raw (like p2pool's coinbaseflags + COINBASEEXT)
     scriptsig_hex += state_root_hex;
 
-    // Decode to bytes for ref_hash computation
     std::vector<unsigned char> scriptsig_bytes;
     scriptsig_bytes.reserve(scriptsig_hex.size() / 2);
     for (size_t i = 0; i + 1 < scriptsig_hex.size(); i += 2)
         scriptsig_bytes.push_back(static_cast<unsigned char>(
             std::stoul(scriptsig_hex.substr(i, 2), nullptr, 16)));
 
-    // Compute ref_hash via the callback (needs tracker data)
-    if (!m_ref_hash_fn)
-        return {};
+    LOG_TRACE << "[build_cb] scriptsig built, len=" << scriptsig_hex.size()/2;
 
-    uint64_t subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
+    uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
     uint32_t bits = 0;
-    if (m_cached_template.contains("bits"))
+    if (ws.tmpl.contains("bits"))
         bits = static_cast<uint32_t>(std::stoul(
-            m_cached_template["bits"].get<std::string>(), nullptr, 16));
-    uint32_t timestamp = m_cached_template.value("curtime", uint32_t(0));
+            ws.tmpl["bits"].get<std::string>(), nullptr, 16));
+    uint32_t timestamp = ws.tmpl.value("curtime", uint32_t(0));
 
-    // Convert cached merkle branches (hex strings) to uint256 for ref_hash callback
     std::vector<uint256> branches_u256;
-    branches_u256.reserve(m_cached_merkle_branches.size());
-    for (const auto& hex : m_cached_merkle_branches) {
+    branches_u256.reserve(ws.merkle_branches.size());
+    for (const auto& hex : ws.merkle_branches) {
         uint256 h;
         auto bytes = ParseHex(hex);
         if (bytes.size() == 32)
@@ -1437,13 +1491,15 @@ MiningInterface::build_connection_coinbase(
         branches_u256.push_back(h);
     }
 
-    auto rhr = m_ref_hash_fn(
+    LOG_TRACE << "[build_cb] calling ref_hash_fn (lock-free)...";
+    auto rhr = ws.ref_hash_fn(
         prev_share_hash,
         scriptsig_bytes, payout_script, subsidy, bits, timestamp,
-        m_segwit_active, m_cached_witness_commitment, m_cached_witness_root,
+        ws.segwit_active, ws.witness_commitment, ws.witness_root,
         merged_addrs, branches_u256);
+    LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
 
-    // Build ref_hash hex (32 bytes LE)
+    // Build ref_hash hex
     std::string ref_hash_hex;
     {
         auto ref_chars = rhr.ref_hash.GetChars();
@@ -1453,54 +1509,64 @@ MiningInterface::build_connection_coinbase(
         }
     }
 
-    // Call build_coinbase_parts with ref_hash
-    // The last_txout_nonce will be filled by en1+en2 at mining time
-    // Compute THE state root for coinbase commitment (V37 prep)
-    uint32_t tmpl_height = m_cached_template.value("height", uint32_t(0));
+    // THE state root for coinbase parts
+    uint32_t tmpl_height = ws.tmpl.value("height", uint32_t(0));
     uint32_t tmpl_bits = 0;
     {
-        auto bits_str = m_cached_template.value("bits", std::string(""));
+        auto bits_str = ws.tmpl.value("bits", std::string(""));
         if (bits_str.size() == 8)
             tmpl_bits = static_cast<uint32_t>(std::stoul(bits_str, nullptr, 16));
     }
     uint256 the_root = compute_the_state_root(
-        m_cached_pplns_outputs,
-        static_cast<uint32_t>(m_cached_pplns_outputs.size()),  // proxy for chain_length
+        ws.pplns_outputs,
+        static_cast<uint32_t>(ws.pplns_outputs.size()),
         tmpl_height, tmpl_bits);
 
-    // Use the SAME mm_commitment that was used to build the scriptSig above.
-    // atomic_mm_commitment was computed together with merged_coinbase_info
-    // by build_merged_header_info_with_commitment() before the scriptSig
-    // was built. This ensures the coinbase parts match the ref_hash.
     const auto& mm_commitment_fresh = mm_for_scriptsig;
 
-    LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
-             << prev_share_hash.GetHex().substr(0, 16) << " outputs=" << m_cached_pplns_outputs.size();
+    LOG_INFO << "[build_connection_cb] PPLNS for frozen prev_share="
+             << prev_share_hash.GetHex().substr(0, 16) << " outputs=" << ws.pplns_outputs.size();
     {
         uint64_t pplns_total = 0;
-        for (auto& [_, amt] : m_cached_pplns_outputs) pplns_total += amt;
+        for (auto& [script_hex, amt] : ws.pplns_outputs) {
+            pplns_total += amt;
+            LOG_INFO << "[PPLNS-OUT] script=" << script_hex.substr(0, 40) << " amount=" << amt;
+        }
         LOG_INFO << "[build_connection_cb] subsidy=" << subsidy
                  << " pplns_total=" << pplns_total
                  << " diff=" << (int64_t(subsidy) - int64_t(pplns_total));
     }
+
+    LOG_TRACE << "[build_cb] calling build_coinbase_parts...";
     auto [cb1, cb2] = build_coinbase_parts(
-        m_cached_template,
+        ws.tmpl,
         subsidy,
-        m_cached_pplns_outputs,
-        m_cached_raw_scripts,
+        ws.pplns_outputs,
+        ws.raw_scripts,
         mm_commitment_fresh,
-        m_cached_witness_commitment,
+        ws.witness_commitment,
         ref_hash_hex,
         the_root,
-        m_coinbase_text);
+        ws.coinbase_text);
+    LOG_TRACE << "[build_cb] coinbase_parts built, cb1_len=" << cb1.size();
 
-    // Return coinbase parts + work snapshot atomically (still under m_work_mutex)
+    // ── Phase 4: Write back updated PPLNS cache ──
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        auto& self = const_cast<MiningInterface&>(*this);
+        if (ws.pplns_best_share != self.m_cached_pplns_best_share) {
+            self.m_cached_pplns_outputs = ws.pplns_outputs;
+            self.m_cached_pplns_best_share = ws.pplns_best_share;
+            self.m_cached_raw_scripts = ws.raw_scripts;
+        }
+    }
+
     WorkSnapshot snap;
-    snap.segwit_active = m_segwit_active;
-    snap.mweb = m_cached_mweb;
-    snap.subsidy = m_cached_template.value("coinbasevalue", uint64_t(0));
-    snap.witness_commitment_hex = m_cached_witness_commitment;
-    snap.witness_root = m_cached_witness_root;
+    snap.segwit_active = ws.segwit_active;
+    snap.mweb = ws.mweb;
+    snap.subsidy = subsidy;
+    snap.witness_commitment_hex = ws.witness_commitment;
+    snap.witness_root = ws.witness_root;
     snap.frozen_ref = rhr;
     return {std::move(cb1), std::move(cb2), std::move(snap)};
 }

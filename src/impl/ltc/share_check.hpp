@@ -800,9 +800,9 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 
     if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
     {
-        auto chain_len = std::min(
-            tracker.chain.get_height(prev_hash),
-            static_cast<int32_t>(PoolConfig::real_chain_length()));
+        // Pass REAL_CHAIN_LENGTH — walk naturally stops at chain end.
+        // Avoids TrackerView cache staleness in multi-threaded context.
+        auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
 
         // block_target from block header bits (matches Python: self.header['bits'].target)
         auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
@@ -2117,9 +2117,8 @@ uint256 create_local_share(
 
         if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
         {
-            auto chain_len = std::min(
-                tracker.chain.get_height(prev_share),
-                static_cast<int32_t>(PoolConfig::real_chain_length()));
+            // Pass REAL_CHAIN_LENGTH — walk naturally stops at chain end.
+            auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
             auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
             auto max_weight = chain::target_to_average_attempts(block_target)
                               * PoolConfig::SPREAD * 65535;

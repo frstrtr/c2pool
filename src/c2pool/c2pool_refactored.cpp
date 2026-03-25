@@ -2119,6 +2119,7 @@ int main(int argc, char* argv[]) {
                     const std::vector<uint256>& merkle_branches)
                     -> core::MiningInterface::RefHashResult
                 {
+                    LOG_TRACE << "[ref_hash_fn] ENTER prev=" << frozen_prev_share.GetHex().substr(0,16);
                     ltc::RefHashParams params;
                     params.prev_share = frozen_prev_share;
                     params.coinbase_scriptSig = coinbase_scriptSig;
@@ -2147,7 +2148,9 @@ int main(int argc, char* argv[]) {
                     }
 
                     // p2pool work.py:2488-2505: per-miner desired_target computation
+                    LOG_TRACE << "[ref_hash_fn] getting local_addr_rates...";
                     auto local_addr_rates = web_server.get_local_addr_rates();
+                    LOG_TRACE << "[ref_hash_fn] got " << local_addr_rates.size() << " addr rates";
                     double local_hash_rate = 0.0;
                     {
                         auto rate_it = local_addr_rates.find(miner_pubkey);
@@ -2218,8 +2221,10 @@ int main(int argc, char* argv[]) {
                     }
                     // With fork shares excluded from verified, best_share (= frozen_prev)
                     // is always the main chain head. CST walks the main chain directly.
+                    LOG_TRACE << "[ref_hash_fn] calling compute_share_target...";
                     auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
                         frozen_prev_share, timestamp, desired_target);
+                    LOG_TRACE << "[ref_hash_fn] CST done, bits=" << std::hex << share_bits << std::dec;
                     // No bits guard needed: compute_share_target's ±10% clamp
                     // (matching p2pool) prevents drift. The old guard was a workaround
                     // for VARDIFF setting 3x harder difficulty → APS contamination.
@@ -2294,6 +2299,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Chain position from tracker
+                    LOG_TRACE << "[ref_hash_fn] looking up chain position...";
                     auto& tracker = p2p_node->tracker();
                     if (!params.prev_share.IsNull() && tracker.chain.contains(params.prev_share)) {
                         // Timestamp: clip to at least previous_share.timestamp + 1 (matches Python)
@@ -2320,6 +2326,7 @@ int main(int argc, char* argv[]) {
                         });
 
                         // far_share_hash: 99th ancestor (matches Python: get_nth_parent_hash(prev, 99))
+                        LOG_TRACE << "[ref_hash_fn] getting far_share (99th parent)...";
                         {
                             auto [prev_height, last] = tracker.chain.get_height_and_last(params.prev_share);
                             if (last.IsNull() && prev_height < 99) {
@@ -2331,8 +2338,10 @@ int main(int argc, char* argv[]) {
 
                         // Merged payout hash: deterministic V36 PPLNS commitment.
                         // Must match what create_local_share computes at submit time.
+                        LOG_TRACE << "[ref_hash_fn] computing merged_payout_hash...";
                         params.merged_payout_hash = tracker.compute_merged_payout_hash(
                             params.prev_share, chain::bits_to_target(bits));
+                        LOG_TRACE << "[ref_hash_fn] merged_payout_hash done";
                     } else {
                         // Genesis: p2pool always does (0 + 1) for absheight, (0 + aps) for abswork
                         params.absheight = 1;
@@ -2340,6 +2349,7 @@ int main(int argc, char* argv[]) {
                             chain::bits_to_target(params.bits)).GetLow64());
                     }
 
+                    LOG_TRACE << "[ref_hash_fn] chain position done, collecting MM coinbase info...";
                     // V36: Collect merged coinbase info from MM manager.
                     // This contains DOGE block header + merkle proof for each merged chain.
                     // Must be frozen at template time and match what p2pool stores in share_info.
@@ -2371,7 +2381,9 @@ int main(int argc, char* argv[]) {
                         }
                     }
 
+                    LOG_TRACE << "[ref_hash_fn] computing ref_hash...";
                     auto [rh, nonce] = ltc::compute_ref_hash_for_work(params);
+                    LOG_TRACE << "[ref_hash_fn] ref_hash computed";
                     core::MiningInterface::RefHashResult result;
                     result.ref_hash = rh;
                     result.last_txout_nonce = nonce;
