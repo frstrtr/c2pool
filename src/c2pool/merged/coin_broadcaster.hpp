@@ -81,6 +81,23 @@ public:
         , m_symbol(symbol)
         , m_prefix(prefix)
         , m_local_daemon_addr(local_daemon_addr)
+        , m_has_local_daemon(!local_daemon_addr.to_string().empty()
+                             && local_daemon_addr.port() > 0)
+        , m_peer_manager(ioc, symbol, data_dir, pm_config)
+        , m_maintenance_timer(ioc)
+    {
+    }
+
+    /// Constructor for seed-only mode (no local daemon specified).
+    CoinBroadcaster(boost::asio::io_context& ioc,
+                    const std::string& symbol,
+                    const std::vector<std::byte>& prefix,
+                    const std::string& data_dir,
+                    const PeerManagerConfig& pm_config)
+        : m_ioc(ioc)
+        , m_symbol(symbol)
+        , m_prefix(prefix)
+        , m_has_local_daemon(false)
         , m_peer_manager(ioc, symbol, data_dir, pm_config)
         , m_maintenance_timer(ioc)
     {
@@ -121,19 +138,35 @@ public:
     using RawHeadersParser = std::function<std::vector<ltc::coin::BlockHeaderType>(const uint8_t*, size_t)>;
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
 
-    /// Start: register local node, start peer manager, begin connection loop.
+    /// Start: register local node (if any), start peer manager, begin connection loop.
     void start()
     {
-        // Protected local daemon node — always connected, never dropped
-        m_peer_manager.set_local_node(m_local_daemon_addr);
+        if (m_has_local_daemon) {
+            LOG_INFO << "[" << m_symbol << "] CoinBroadcaster::start() — prefix="
+                     << m_prefix.size() << " bytes, local_daemon=" << m_local_daemon_addr.to_string()
+                     << " discovery=" << m_peer_manager.discovery_enabled();
+            // Protected local daemon node — always connected, never dropped
+            m_peer_manager.set_local_node(m_local_daemon_addr);
+        } else {
+            LOG_INFO << "[" << m_symbol << "] CoinBroadcaster::start() — prefix="
+                     << m_prefix.size() << " bytes, seed-only mode (no local daemon)"
+                     << " discovery=" << m_peer_manager.discovery_enabled();
+        }
+
         m_peer_manager.start();
 
-        // Connect to local daemon immediately
-        connect_peer(m_local_daemon_addr);
+        // Connect to local daemon immediately (if specified)
+        if (m_has_local_daemon)
+            connect_peer(m_local_daemon_addr);
 
         schedule_maintenance();
-        LOG_INFO << "[" << m_symbol << "] Multi-peer broadcaster started, local="
-                 << m_local_daemon_addr.to_string();
+        if (m_has_local_daemon) {
+            LOG_INFO << "[" << m_symbol << "] Multi-peer broadcaster started, local="
+                     << m_local_daemon_addr.to_string();
+        } else {
+            LOG_INFO << "[" << m_symbol << "] Multi-peer broadcaster started (seed-only, "
+                     << m_peer_manager.peer_count() << " seed peers)";
+        }
     }
 
     void stop()
@@ -222,11 +255,13 @@ public:
                 peer->node_p2p.send_getheaders(70017, locator, stop_hash);
                 ++sent;
             } catch (const std::exception& e) {
-                LOG_DEBUG_COIND << "[" << m_symbol << "] getheaders to "
-                                << key << " failed: " << e.what();
+                LOG_WARNING << "[" << m_symbol << "] getheaders to "
+                            << key << " failed: " << e.what();
             }
         }
-        LOG_DEBUG_COIND << "[" << m_symbol << "] getheaders sent to " << sent << " peer(s)";
+        LOG_INFO << "[" << m_symbol << "] getheaders sent to " << sent << " peer(s)"
+                 << " locator_size=" << locator.size()
+                 << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16) + "...");
     }
 
     const std::string& symbol() const { return m_symbol; }
@@ -238,8 +273,12 @@ private:
         auto key = addr.to_string();
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_peers.count(key)) return; // already connected
+            if (m_peers.count(key)) {
+                LOG_DEBUG_COIND << "[" << m_symbol << "] connect_peer: already connected to " << key;
+                return;
+            }
 
+            LOG_INFO << "[" << m_symbol << "] Connecting to P2P peer: " << key;
             auto peer = std::make_unique<BroadcastPeer>(
                 &m_ioc, key, m_prefix, addr, m_symbol);
 
@@ -299,6 +338,7 @@ private:
 
     void disconnect_peer(const std::string& key)
     {
+        LOG_INFO << "[" << m_symbol << "] Disconnecting P2P peer: " << key;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_peers.erase(key);
@@ -340,7 +380,14 @@ private:
         // 4. Emergency refresh if below min
         if (m_peer_manager.needs_emergency_refresh(
                 static_cast<int>(connected.size()))) {
-            // Trigger re-bootstrap (rate-limited inside peer manager)
+            LOG_WARNING << "[" << m_symbol << "] Emergency peer refresh triggered, connected=" << connected.size();
+        }
+
+        // Periodic status log (every 12 maintenance cycles = 60s)
+        static int s_maint_count = 0;
+        if (++s_maint_count % 12 == 0) {
+            LOG_INFO << "[" << m_symbol << "] Broadcaster status: connected=" << connected.size()
+                     << " to_connect=" << to_connect.size();
         }
     }
 
@@ -348,6 +395,7 @@ private:
     std::string m_symbol;
     std::vector<std::byte> m_prefix;
     NetService m_local_daemon_addr;
+    bool m_has_local_daemon{true};
     CoinPeerManager m_peer_manager;
     boost::asio::steady_timer m_maintenance_timer;
 

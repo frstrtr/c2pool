@@ -20,6 +20,7 @@
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
+#include <core/log.hpp>
 
 #include <btclibs/util/strencodings.h>
 
@@ -216,6 +217,14 @@ public:
         data["weightlimit"]       = 4'000'000;
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
 
+        LOG_INFO << "[EMB-LTC] TemplateBuilder: height=" << next_h
+                 << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
+                 << " bits=" << bits_to_hex(next_bits)
+                 << " subsidy=" << subsidy << " sat"
+                 << " txs=" << tx_array.size()
+                 << " tip_ts=" << tip.header.m_timestamp
+                 << " now=" << now_ts
+                 << " synced=" << chain.is_synced();
         return rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), 0};
     }
 
@@ -236,9 +245,15 @@ public:
     /// Build a template from the current chain tip + mempool.
     /// Throws std::runtime_error if the chain has no genesis yet.
     rpc::WorkData getwork() override {
+        LOG_DEBUG_COIND << "[EMB-LTC] EmbeddedCoinNode::getwork() called"
+                  << " chain_height=" << m_chain.height()
+                  << " mempool_size=" << m_pool.size()
+                  << " synced=" << m_chain.is_synced();
         auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet);
-        if (!result)
+        if (!result) {
+            LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
+        }
         return *result;
     }
 
@@ -259,12 +274,14 @@ public:
         auto tip = m_chain.tip();
         if (tip) {
             info["bestblockhash"] = tip->block_hash.GetHex();
-            // Difficulty is bits-encoded; convert for informational display
             info["bits"]          = bits_to_hex(tip->header.m_bits);
         } else {
             info["bestblockhash"] = std::string(64, '0');
             info["bits"]          = "00000000";
         }
+        LOG_DEBUG_COIND << "[EMB-LTC] getblockchaininfo: height=" << info["blocks"].get<int>()
+                  << " synced=" << info["synced"].get<bool>()
+                  << " best=" << info["bestblockhash"].get<std::string>().substr(0, 16);
         return info;
     }
 

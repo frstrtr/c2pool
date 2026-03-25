@@ -41,6 +41,10 @@
 #include <impl/ltc/messages.hpp>
 #include <impl/ltc/config.hpp>
 
+// Chain seed discovery
+#include <impl/ltc/coin/chain_seeds.hpp>
+#include <impl/doge/coin/chain_seeds.hpp>
+
 // Enhanced C2Pool components
 #include <c2pool/node/enhanced_node.hpp>
 #include <c2pool/hashrate/tracker.hpp>
@@ -1165,7 +1169,10 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
 
             if (embedded_ltc) {
-                LOG_INFO << "[LTC] Phase 4: embedded coin node mode (no daemon required)";
+                LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
+                LOG_INFO << "║  [EMB-LTC] Phase 4: EMBEDDED COIN NODE MODE                 ║";
+                LOG_INFO << "║  No litecoind RPC required — SPV header chain + P2P sync     ║";
+                LOG_INFO << "╚══════════════════════════════════════════════════════════════╝";
 
                 auto ltc_params = settings->m_testnet
                     ? ltc::coin::LTCChainParams::testnet()
@@ -1176,9 +1183,13 @@ int main(int argc, char* argv[]) {
                 std::string chain_db_path = (core::filesystem::config_path()
                     / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
                     / "embedded_headers").string();
+                LOG_INFO << "[EMB-LTC] Creating HeaderChain with DB at " << chain_db_path;
                 embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
                 if (!embedded_chain->init())
-                    LOG_WARNING << "HeaderChain LevelDB init failed — running in-memory only";
+                    LOG_WARNING << "[EMB-LTC] HeaderChain LevelDB init failed — running in-memory only";
+                else
+                    LOG_INFO << "[EMB-LTC] HeaderChain initialized: size=" << embedded_chain->size()
+                             << " height=" << embedded_chain->height();
 
                 // Apply CLI checkpoint (--header-checkpoint HEIGHT:HASH) if provided.
                 // This lets operators skip millions of old headers on any chain.
@@ -1219,30 +1230,56 @@ int main(int argc, char* argv[]) {
                              << " headers from LevelDB (height=" << embedded_chain->height() << ")";
                 }
 
+                LOG_INFO << "[EMB-LTC] Creating Mempool + EmbeddedCoinNode";
                 embedded_pool  = std::make_unique<ltc::coin::Mempool>();
                 embedded_node  = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet);
+                LOG_INFO << "[EMB-LTC] EmbeddedCoinNode ready (testnet=" << settings->m_testnet << ")";
 
                 // Auto-detect P2P port for the embedded broadcaster
                 if (coind_p2p_port == -1)
                     coind_p2p_port = get_coin_p2p_port(blockchain_to_symbol(blockchain), settings->m_testnet);
-                std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
                 auto parent_symbol   = blockchain_to_symbol(blockchain);
                 auto p2p_prefix      = get_chain_p2p_prefix(parent_symbol, settings->m_testnet);
 
-                NetService embedded_p2p_addr(p2p_host, static_cast<uint16_t>(
-                    coind_p2p_port > 0 ? coind_p2p_port : 19335));
+                // Determine if user specified a local daemon peer
+                bool has_local_daemon = !coind_p2p_address.empty() || coind_p2p_port > 0;
+                std::string pm_data_dir = (core::filesystem::config_path()
+                    / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                    / "embedded_peers").string();
 
-                embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
-                    ioc, parent_symbol, p2p_prefix, embedded_p2p_addr,
-                    "/tmp/c2pool_embedded_pm", c2pool::merged::PeerManagerConfig{});
+                if (has_local_daemon) {
+                    std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
+                    NetService embedded_p2p_addr(p2p_host, static_cast<uint16_t>(
+                        coind_p2p_port > 0 ? coind_p2p_port : 19335));
+                    embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                        ioc, parent_symbol, p2p_prefix, embedded_p2p_addr,
+                        pm_data_dir, c2pool::merged::PeerManagerConfig{});
+                    LOG_INFO << "[EMB-LTC] Local daemon peer: " << embedded_p2p_addr.to_string();
+                } else {
+                    // Seed-only mode: no local daemon, rely on DNS seeds + fixed seeds
+                    embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                        ioc, parent_symbol, p2p_prefix,
+                        pm_data_dir, c2pool::merged::PeerManagerConfig{});
+                    LOG_INFO << "[EMB-LTC] Seed-only mode (no --coind-p2p-address specified)";
+                }
+
+                // Wire DNS seeds + fixed seed fallback into peer manager
+                auto& pm = embedded_broadcaster->peer_manager();
+                pm.set_dns_seeds(ltc::coin::ltc_dns_seeds(settings->m_testnet));
+                pm.set_fixed_seeds(ltc::coin::ltc_fixed_seeds(settings->m_testnet));
 
                 // Feed mempool transactions into Mempool
+                LOG_INFO << "[EMB-LTC] Wiring P2P tx → Mempool callback";
                 embedded_broadcaster->set_on_new_tx(
-                    [pool = embedded_pool.get()](const std::string& /*key*/,
+                    [pool = embedded_pool.get()](const std::string& peer_key,
                                                   const ltc::coin::Transaction& tx) {
                         ltc::coin::MutableTransaction mtx(tx);
-                        pool->add_tx(mtx);
+                        bool added = pool->add_tx(mtx);
+                        if (added) {
+                            LOG_DEBUG_COIND << "[EMB-LTC] TX from " << peer_key
+                                      << " added to mempool (size=" << pool->size() << ")";
+                        }
                     });
 
                 // Wire peer height callback for fast-sync: skip scrypt on old headers
@@ -1254,8 +1291,16 @@ int main(int argc, char* argv[]) {
                     });
 
                 embedded_broadcaster->start();
-                LOG_INFO << "[LTC] Embedded broadcaster started, connecting to "
-                         << p2p_host << ":" << (coind_p2p_port > 0 ? coind_p2p_port : 19335);
+                if (has_local_daemon) {
+                    std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
+                    LOG_INFO << "[LTC] Embedded broadcaster started, local="
+                             << p2p_host << ":" << (coind_p2p_port > 0 ? coind_p2p_port : 19335)
+                             << " + " << ltc::coin::ltc_dns_seeds(settings->m_testnet).size() << " DNS seeds";
+                } else {
+                    LOG_INFO << "[LTC] Embedded broadcaster started (seed-only), "
+                             << ltc::coin::ltc_dns_seeds(settings->m_testnet).size() << " DNS seeds + "
+                             << ltc::coin::ltc_fixed_seeds(settings->m_testnet).size() << " fixed seeds";
+                }
                 // NOTE: set_on_new_headers and set_embedded_node are wired after web_server is created below
 
             } else {
@@ -1436,16 +1481,25 @@ int main(int argc, char* argv[]) {
                 // Header sync: self-propelling chain catch-up.
                 // add_headers() runs scrypt for each header (~20ms each), so we offload
                 // it to a background thread and post the follow-up back to ioc.
+                LOG_INFO << "[EMB-LTC] Wiring on_new_headers callback (background thread pool)";
                 embedded_broadcaster->set_on_new_headers(
                     [chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(),
                      &web_server, &ioc, hdr_pool](
-                        const std::string& /*key*/,
+                        const std::string& peer_key,
                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                        LOG_INFO << "[EMB-LTC] Received " << hdrs.size() << " headers from " << peer_key;
                         // Copy batch — caller's vector may be freed after return
                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                         boost::asio::post(*hdr_pool,
                             [batch, chain, bcaster, &web_server, &ioc]() {
+                                auto t0 = std::chrono::steady_clock::now();
                                 int accepted = chain->add_headers(*batch);
+                                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - t0).count();
+                                LOG_INFO << "[EMB-LTC] Processed batch: " << batch->size() << " headers"
+                                         << " accepted=" << accepted
+                                         << " chain_height=" << chain->height()
+                                         << " elapsed=" << elapsed << "ms";
                                 // Always use the LAST header in the batch as locator for the
                                 // next getheaders — this advances past known-but-duplicate
                                 // headers loaded from LevelDB.  The peer recognises the hash
@@ -1459,8 +1513,10 @@ int main(int argc, char* argv[]) {
                                 bool full_batch = (batch->size() >= 2000);
                                 if (accepted > 0 || full_batch) {
                                     boost::asio::post(ioc, [accepted, last_hash, chain, bcaster, &web_server]() {
-                                        if (accepted > 0)
+                                        if (accepted > 0) {
+                                            LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
                                             web_server.trigger_work_refresh_debounced();
+                                        }
                                         // Use last received hash as locator to advance past
                                         // LevelDB duplicates.  On fresh sync (no LevelDB),
                                         // this naturally follows the chain tip.
@@ -1470,10 +1526,12 @@ int main(int argc, char* argv[]) {
                                             bcaster->request_headers(chain->get_locator(), uint256::ZERO);
                                         }
                                     });
+                                } else {
+                                    LOG_DEBUG_COIND << "[EMB-LTC] No new headers accepted (all known), batch=" << batch->size();
                                 }
                             });
                     });
-                LOG_INFO << "Embedded coin node wired to web server";
+                LOG_INFO << "[EMB-LTC] Embedded coin node wired to web server";
 
                 // Periodic fallback: re-request headers every 60s even if no batch arrived.
                 // Uses shared_ptr self-capture so the lambda stays alive for the run duration.
@@ -1483,11 +1541,15 @@ int main(int argc, char* argv[]) {
                             chain   = embedded_chain.get(),
                             bcaster = embedded_broadcaster.get()](boost::system::error_code ec) {
                     if (ec) return; // cancelled (ioc stopped)
+                    LOG_DEBUG_COIND << "[EMB-LTC] Periodic header sync: height=" << chain->height()
+                              << " synced=" << chain->is_synced()
+                              << " peers=" << bcaster->connected_count();
                     bcaster->request_headers(chain->get_locator(), uint256::ZERO);
                     sync_timer->expires_after(std::chrono::seconds(60));
                     sync_timer->async_wait(*sync_fn);
                 };
                 // Kick off first getheaders after 3s (allow handshake to complete)
+                LOG_INFO << "[EMB-LTC] First getheaders scheduled in 3s";
                 sync_timer->expires_after(std::chrono::seconds(3));
                 sync_timer->async_wait(*sync_fn);
                 LOG_INFO << "Embedded header sync timer started (60s interval)";
@@ -1798,12 +1860,15 @@ int main(int argc, char* argv[]) {
             // Wire P2P block relay for fast parent block propagation.
             if (embedded_ltc && embedded_broadcaster) {
                 // Embedded mode: relay directly via CoinBroadcaster (no daemon needed)
+                LOG_INFO << "[EMB-LTC] Wiring block relay via CoinBroadcaster (no daemon RPC)";
                 web_server.set_on_block_relay([&embedded_broadcaster](const std::string& full_block_hex) {
+                    LOG_INFO << "[EMB-LTC] Block relay triggered: " << full_block_hex.size() / 2 << " bytes";
                     try {
                         auto block_bytes = ParseHex(full_block_hex);
                         embedded_broadcaster->submit_block_raw(block_bytes);
+                        LOG_INFO << "[EMB-LTC] Block relayed to P2P peers successfully";
                     } catch (const std::exception& e) {
-                        LOG_WARNING << "Embedded P2P block relay failed: " << e.what();
+                        LOG_WARNING << "[EMB-LTC] P2P block relay FAILED: " << e.what();
                     }
                 });
             } else if (coin_p2p) {
@@ -2795,6 +2860,20 @@ int main(int argc, char* argv[]) {
                                 ioc, cfg.symbol, prefix,
                                 NetService(cfg.p2p_address, cfg.p2p_port),
                                 ".", pm_cfg);
+
+                            // Wire DNS seeds + fixed seed fallback for merged chain
+                            if (cfg.symbol == "DOGE" || cfg.symbol == "doge") {
+                                broadcaster->peer_manager().set_dns_seeds(
+                                    doge::coin::doge_dns_seeds(settings->m_testnet));
+                                broadcaster->peer_manager().set_fixed_seeds(
+                                    doge::coin::doge_fixed_seeds(settings->m_testnet));
+                            } else if (cfg.symbol == "LTC" || cfg.symbol == "ltc") {
+                                broadcaster->peer_manager().set_dns_seeds(
+                                    ltc::coin::ltc_dns_seeds(settings->m_testnet));
+                                broadcaster->peer_manager().set_fixed_seeds(
+                                    ltc::coin::ltc_fixed_seeds(settings->m_testnet));
+                            }
+
                             // Wire getpeerinfo bootstrap from the aux chain RPC
                             auto* rpc_ptr = mm_manager->get_chain_rpc(cfg.chain_id);
                             if (rpc_ptr) {

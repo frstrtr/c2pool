@@ -17,6 +17,7 @@
 #include <btclibs/crypto/scrypt.h>
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -316,13 +317,21 @@ public:
     /// Initialize: open LevelDB (if path given), load persisted state.
     /// Returns false if LevelDB open fails.
     bool init() {
+        LOG_INFO << "[EMB-LTC] HeaderChain::init() db_path=" << (m_db_path.empty() ? "(in-memory)" : m_db_path)
+                 << " genesis=" << m_params.genesis_hash.GetHex().substr(0, 16) << "..."
+                 << " pow_limit=" << m_params.pow_limit.GetHex().substr(0, 16) << "..."
+                 << " timespan=" << m_params.target_timespan << "s spacing=" << m_params.target_spacing << "s"
+                 << " allow_min_diff=" << m_params.allow_min_difficulty;
         if (!m_db_path.empty()) {
             core::LevelDBOptions opts;
             opts.write_buffer_size = 2 * 1024 * 1024;  // 2MB
             opts.block_cache_size = 4 * 1024 * 1024;    // 4MB
             m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
-            if (!m_db->open())
+            if (!m_db->open()) {
+                LOG_WARNING << "[EMB-LTC] HeaderChain LevelDB open FAILED at " << m_db_path;
                 return false;
+            }
+            LOG_INFO << "[EMB-LTC] HeaderChain LevelDB opened at " << m_db_path;
             load_from_db();
         }
         // Fast-start checkpoint: if chain is empty and a checkpoint is configured,
@@ -408,7 +417,13 @@ public:
     bool add_header(const BlockHeaderType& header) {
         std::lock_guard<std::mutex> lock(m_mutex);
         bool ok = add_header_internal(header);
-        if (ok) persist_tip();
+        if (ok) {
+            persist_tip();
+            LOG_INFO << "[EMB-LTC] Single header accepted: height=" << m_tip_height
+                     << " hash=" << m_tip.GetHex().substr(0, 16) << "..."
+                     << " bits=0x" << std::hex << header.m_bits << std::dec
+                     << " ts=" << header.m_timestamp;
+        }
         return ok;
     }
 
@@ -511,7 +526,16 @@ public:
         auto it = m_headers.find(m_tip);
         if (it == m_headers.end()) return false;
         auto now = static_cast<uint32_t>(std::time(nullptr));
-        return (now - it->second.header.m_timestamp) < 7200; // 2 hours
+        uint32_t age = now - it->second.header.m_timestamp;
+        bool synced = age < 7200; // 2 hours
+        // Log state changes (throttled via static)
+        static bool s_last_synced = false;
+        if (synced != s_last_synced) {
+            LOG_INFO << "[EMB-LTC] Sync state changed: synced=" << synced
+                     << " tip_age=" << age << "s height=" << m_tip_height;
+            s_last_synced = synced;
+        }
+        return synced;
     }
 
     /// Get params (for external difficulty validation tests).
@@ -529,9 +553,12 @@ private:
 
         // Genesis block special case: accept if it matches known genesis
         if (header.m_previous_block.IsNull()) {
-            if (bhash != m_params.genesis_hash)
+            if (bhash != m_params.genesis_hash) {
+                LOG_WARNING << "[EMB-LTC] REJECT genesis: hash=" << bhash.GetHex().substr(0, 16)
+                            << " expected=" << m_params.genesis_hash.GetHex().substr(0, 16);
                 return false; // wrong genesis
-            
+            }
+
             IndexEntry entry;
             entry.header = header;
             entry.block_hash = bhash;
@@ -547,13 +574,20 @@ private:
             m_tip_height = 0;
             m_best_work = entry.chain_work;
             persist_header(entry);
+            LOG_INFO << "[EMB-LTC] Genesis accepted: hash=" << bhash.GetHex()
+                     << " scrypt=" << entry.hash.GetHex().substr(0, 16)
+                     << " bits=0x" << std::hex << header.m_bits << std::dec;
             return true;
         }
 
         // Must connect to an existing header
         auto prev_it = m_headers.find(header.m_previous_block);
-        if (prev_it == m_headers.end())
+        if (prev_it == m_headers.end()) {
+            LOG_DEBUG_COIND << "[EMB-LTC] ORPHAN header: hash=" << bhash.GetHex().substr(0, 16)
+                      << " prev=" << header.m_previous_block.GetHex().substr(0, 16)
+                      << " — not connected to chain";
             return false; // orphan — not connected
+        }
 
         const auto& prev = prev_it->second;
         uint32_t new_height = prev.height + 1;
@@ -571,16 +605,26 @@ private:
         uint256 pow_hash;
         if (need_scrypt) {
             pow_hash = scrypt_hash(header);
-            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
+            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit)) {
+                LOG_WARNING << "[EMB-LTC] PoW FAIL at height=" << new_height
+                            << " hash=" << bhash.GetHex().substr(0, 16)
+                            << " scrypt=" << pow_hash.GetHex().substr(0, 16)
+                            << " bits=0x" << std::hex << header.m_bits << std::dec;
                 return false;
+            }
         } else {
             // Structural-only: trust PoW, store zero hash (not needed for old blocks)
             pow_hash = block_hash(header); // SHA256d, not scrypt — cheap placeholder
         }
 
         // Validate difficulty
-        if (!validate_difficulty(header, new_height))
+        if (!validate_difficulty(header, new_height)) {
+            LOG_WARNING << "[EMB-LTC] Difficulty FAIL at height=" << new_height
+                        << " hash=" << bhash.GetHex().substr(0, 16)
+                        << " bits=0x" << std::hex << header.m_bits << std::dec
+                        << " prev_bits=0x" << prev.header.m_bits << std::dec;
             return false;
+        }
 
         // Build index entry
         IndexEntry entry;
@@ -597,10 +641,16 @@ private:
 
         // Update tip if this chain has more work
         if (entry.chain_work > m_best_work) {
+            uint32_t old_height = m_tip_height;
             m_best_work = entry.chain_work;
             m_tip = bhash;
             m_tip_height = new_height;
             rebuild_height_index(bhash);
+            // Log reorgs (tip changed to a different branch)
+            if (new_height <= old_height && old_height > 0) {
+                LOG_WARNING << "[EMB-LTC] REORG detected: old_height=" << old_height
+                            << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
+            }
         }
 
         return true;
@@ -692,7 +742,10 @@ private:
     //   "height"                   → uint32_t
 
     void persist_header(const IndexEntry& entry) {
-        if (!m_db || !m_db->is_open()) return;
+        if (!m_db || !m_db->is_open()) {
+            LOG_DEBUG_COIND << "[EMB-LTC] persist_header: no DB (in-memory mode)";
+            return;
+        }
 
         auto packed = pack(entry);
         std::vector<uint8_t> data(
@@ -724,8 +777,12 @@ private:
     void load_from_db() {
         if (!m_db || !m_db->is_open()) return;
 
+        LOG_INFO << "[EMB-LTC] load_from_db: scanning LevelDB for headers...";
+        auto t0 = std::chrono::steady_clock::now();
+
         // Load all headers
         auto keys = m_db->list_keys("h", 10000000);
+        int loaded = 0, corrupt = 0;
         for (auto& key : keys) {
             if (key.size() != 33) continue; // 'h' + 32-byte hash
             std::vector<uint8_t> data;
@@ -736,8 +793,10 @@ private:
                 IndexEntry entry;
                 ps >> entry;
                 m_headers[entry.block_hash] = entry;
-            } catch (...) {
-                // skip corrupt entries
+                ++loaded;
+            } catch (const std::exception& e) {
+                ++corrupt;
+                LOG_WARNING << "[EMB-LTC] Corrupt header entry in DB: " << e.what();
             }
         }
 
@@ -751,9 +810,18 @@ private:
                 m_best_work = it->second.chain_work;
                 rebuild_height_index(m_tip);
             } else {
+                LOG_WARNING << "[EMB-LTC] Tip hash in DB not found among loaded headers — resetting";
                 m_tip.SetNull();
             }
         }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        LOG_INFO << "[EMB-LTC] load_from_db: loaded " << loaded << " headers"
+                 << (corrupt > 0 ? ", " + std::to_string(corrupt) + " corrupt" : "")
+                 << " in " << elapsed << "ms"
+                 << " tip_height=" << m_tip_height
+                 << " tip=" << (m_tip.IsNull() ? "(null)" : m_tip.GetHex().substr(0, 16) + "...");
     }
 
     // ─── State ────────────────────────────────────────────────────────────

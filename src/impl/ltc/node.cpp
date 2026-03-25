@@ -1331,20 +1331,17 @@ void NodeImpl::clean_tracker()
     }
 
     // Step 3: Drop tails — remove ALL children of qualifying tails (p2pool node.py:382-396)
-    // Safety: build a set of best-chain ancestors to protect from cascade removal.
-    // The cascade bug occurs when drop-tails removes a share that's on the main
-    // chain's ancestry, fragmenting best=815 → best=4. p2pool doesn't hit this
-    // because its fork rate is <5%, but c2pool can have 80%+ forks when the
-    // hashrate feedback loop inflates difficulty.
+    // p2pool has NO best-chain protection here — it relies on the height threshold
+    // (2*CHAIN_LENGTH+10) being sufficient. The old 3*CL protection set was added
+    // to prevent a cascade bug from the hashrate feedback loop (now fixed with
+    // RateMonitor). With the feedback loop gone, we match p2pool exactly: protect
+    // only the most recent 2*CL+10 shares (same as the drop threshold).
     {
-        // Build protected set: walk from best head backward through the chain.
-        // Any share on this path must NOT be removed by drop-tails.
         std::set<uint256> best_chain_set;
         {
-            auto best = m_best_share_hash;
-            auto cur = best;
+            auto cur = m_best_share_hash;
             int walked = 0;
-            while (!cur.IsNull() && m_tracker.chain.contains(cur) && walked < 3 * CL) {
+            while (!cur.IsNull() && m_tracker.chain.contains(cur) && walked < 2 * CL + 10) {
                 best_chain_set.insert(cur);
                 auto* idx = m_tracker.chain.get_index(cur);
                 cur = idx ? idx->tail : uint256();

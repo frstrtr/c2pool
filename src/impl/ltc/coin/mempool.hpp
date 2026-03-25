@@ -15,6 +15,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <core/log.hpp>
 
 #include <map>
 #include <mutex>
@@ -107,14 +108,25 @@ public:
         entry.time_added  = std::time(nullptr);
 
         // Enforce size cap: evict oldest entries until we have room
+        int evicted = 0;
         while (m_total_bytes + entry.base_size > m_max_bytes && !m_time_index.empty()) {
             auto oldest = m_time_index.begin();
             evict_one_locked(oldest->second);
+            ++evicted;
         }
 
         m_pool[txid] = std::move(entry);
         m_time_index.emplace(m_pool[txid].time_added, txid);
         m_total_bytes += m_pool[txid].base_size;
+
+        // Periodic mempool stats (every 100 txs)
+        if (m_pool.size() % 100 == 0 || m_pool.size() <= 5) {
+            LOG_INFO << "[EMB-LTC] Mempool: size=" << m_pool.size()
+                     << " bytes=" << m_total_bytes << "/" << m_max_bytes
+                     << " last_txid=" << txid.GetHex().substr(0, 16)
+                     << " weight=" << m_pool[txid].weight
+                     << (evicted > 0 ? " evicted=" + std::to_string(evicted) : "");
+        }
         return true;
     }
 
@@ -128,9 +140,15 @@ public:
     /// Called when HeaderChain tip advances.
     void remove_for_block(const BlockType& block) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        int removed = 0;
         for (const auto& mtx : block.m_txs) {
             uint256 txid = compute_txid(mtx);
+            if (m_pool.count(txid)) ++removed;
             remove_tx_locked(txid);
+        }
+        if (removed > 0) {
+            LOG_INFO << "[EMB-LTC] Mempool: removed " << removed << " txs from confirmed block"
+                     << " remaining=" << m_pool.size();
         }
     }
 

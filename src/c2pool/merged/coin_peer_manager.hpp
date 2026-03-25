@@ -20,6 +20,7 @@
 #include <core/log.hpp>
 #include <core/filesystem.hpp>
 #include <core/netaddress.hpp>
+#include <core/dns_seeder.hpp>
 
 namespace c2pool {
 namespace merged {
@@ -27,7 +28,7 @@ namespace merged {
 // ─── Peer info tracked per endpoint ──────────────────────────────────────────
 struct PeerInfo
 {
-    enum class Source { coind, addr_crawl, manual };
+    enum class Source { coind, addr_crawl, manual, dns_seed, fixed_seed };
 
     NetService          address;
     int                 score{0};
@@ -161,6 +162,7 @@ public:
         , m_refresh_timer(ioc)
         , m_save_timer(ioc)
         , m_maintenance_timer(ioc)
+        , m_fixed_seed_timer(ioc)
     {
     }
 
@@ -186,17 +188,33 @@ public:
         LOG_INFO << "[" << m_symbol << "] Protected local node: " << key;
     }
 
+    /// Set DNS seeds for this chain. Call before start().
+    void set_dns_seeds(std::vector<c2pool::dns::DnsSeed> seeds)
+    {
+        m_dns_seeds = std::move(seeds);
+    }
+
+    /// Set hardcoded fixed seeds (fallback if DNS fails). Call before start().
+    void set_fixed_seeds(std::vector<NetService> seeds)
+    {
+        m_fixed_seeds = std::move(seeds);
+    }
+
     /// Start peer management (bootstrap + periodic refresh + maintenance).
     void start()
     {
         load_peers();
         bootstrap_from_getpeerinfo();
+        bootstrap_from_dns_seeds();
         schedule_refresh();
         schedule_save();
         schedule_maintenance();
+        schedule_fixed_seed_fallback();
         m_running = true;
         LOG_INFO << "[" << m_symbol << "] PeerManager started, "
-                 << m_peers.size() << " known peers";
+                 << m_peers.size() << " known peers"
+                 << " dns_seeds=" << m_dns_seeds.size()
+                 << " fixed_seeds=" << m_fixed_seeds.size();
     }
 
     void stop()
@@ -205,6 +223,7 @@ public:
         m_refresh_timer.cancel();
         m_save_timer.cancel();
         m_maintenance_timer.cancel();
+        m_fixed_seed_timer.cancel();
         save_peers();
     }
 
@@ -414,7 +433,7 @@ private:
     {
         std::filesystem::path dir;
         if (m_data_dir.empty() || m_data_dir == ".")
-            dir = core::filesystem::config_path() / "broadcaster";
+            dir = ::core::filesystem::config_path() / "broadcaster";
         else
             dir = m_data_dir;
         std::filesystem::create_directories(dir);
@@ -501,6 +520,90 @@ private:
         }
     }
 
+    // ─── DNS seed bootstrap ─────────────────────────────────────────────
+
+    void bootstrap_from_dns_seeds()
+    {
+        if (m_dns_seeds.empty()) return;
+
+        LOG_INFO << "[" << m_symbol << "] Resolving " << m_dns_seeds.size() << " DNS seeds...";
+        c2pool::dns::DnsSeeder seeder(m_ioc, m_dns_seeds);
+        auto peers = seeder.resolve_all_sync();
+
+        if (peers.empty()) {
+            LOG_WARNING << "[" << m_symbol << "] DNS seeds returned 0 peers";
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int added = 0;
+        for (auto& addr : peers) {
+            if (!is_valid_port(addr.port())) continue;
+            if (static_cast<int>(m_peers.size()) >= m_config.max_peers) break;
+            auto key = addr.to_string();
+            if (m_peers.count(key)) continue;
+
+            auto& peer = m_peers[key];
+            peer.address = addr;
+            peer.source = PeerInfo::Source::dns_seed;
+            peer.first_seen = std::chrono::steady_clock::now();
+            peer.last_seen = std::chrono::steady_clock::now();
+            peer.max_attempts = m_config.max_connection_attempts;
+            ++added;
+        }
+        LOG_INFO << "[" << m_symbol << "] DNS seeds: " << peers.size()
+                 << " resolved, " << added << " new peers added, "
+                 << m_peers.size() << " total";
+    }
+
+    void load_fixed_seeds()
+    {
+        if (m_fixed_seeds.empty()) return;
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // Only load fixed seeds if we still have very few peers
+        int non_protected = 0;
+        for (auto& [k, p] : m_peers) {
+            if (!p.is_protected) ++non_protected;
+        }
+        if (non_protected >= m_config.min_peers) {
+            LOG_DEBUG_COIND << "[" << m_symbol << "] Skipping fixed seeds: "
+                            << non_protected << " peers already known";
+            return;
+        }
+
+        int added = 0;
+        for (auto& addr : m_fixed_seeds) {
+            if (static_cast<int>(m_peers.size()) >= m_config.max_peers) break;
+            auto key = addr.to_string();
+            if (m_peers.count(key)) continue;
+
+            auto& peer = m_peers[key];
+            peer.address = addr;
+            peer.source = PeerInfo::Source::fixed_seed;
+            peer.first_seen = std::chrono::steady_clock::now();
+            peer.last_seen = std::chrono::steady_clock::now();
+            peer.max_attempts = m_config.max_connection_attempts;
+            ++added;
+        }
+        if (added > 0) {
+            LOG_INFO << "[" << m_symbol << "] Loaded " << added
+                     << " fixed seed peers (fallback), " << m_peers.size() << " total";
+        }
+    }
+
+    void schedule_fixed_seed_fallback()
+    {
+        if (m_fixed_seeds.empty()) return;
+
+        // Load fixed seeds after 60s if we still have few peers
+        m_fixed_seed_timer.expires_after(std::chrono::seconds(60));
+        m_fixed_seed_timer.async_wait([this](const boost::system::error_code& ec) {
+            if (ec || !m_running) return;
+            load_fixed_seeds();
+        });
+    }
+
     // ─── Members ─────────────────────────────────────────────────────────
 
     boost::asio::io_context& m_ioc;
@@ -511,8 +614,13 @@ private:
     boost::asio::steady_timer m_refresh_timer;
     boost::asio::steady_timer m_save_timer;
     boost::asio::steady_timer m_maintenance_timer;
+    boost::asio::steady_timer m_fixed_seed_timer;
 
     GetPeerInfoFn m_getpeerinfo_fn;
+
+    // DNS + fixed seeds
+    std::vector<c2pool::dns::DnsSeed> m_dns_seeds;
+    std::vector<NetService> m_fixed_seeds;
 
     mutable std::mutex m_mutex;
     std::map<std::string, PeerInfo> m_peers;        // key = "host:port"
