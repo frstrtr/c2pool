@@ -37,6 +37,32 @@ CMakeUserPresets.json
 /build-qt-mvp
 *.qtc.user
 
+# In-source CMake build artifacts (from running cmake in project root)
+/.cmake/
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Makefile
+/Testing/
+/cmake_install.cmake
+src/CMakeFiles/
+src/CTestTestfile.cmake
+src/Makefile
+src/cmake_install.cmake
+src/*/CMakeFiles/
+src/*/CTestTestfile.cmake
+src/*/Makefile
+src/*/cmake_install.cmake
+src/*/*/CMakeFiles/
+src/*/*/CTestTestfile.cmake
+src/*/*/Makefile
+src/*/*/cmake_install.cmake
+src/*/*/*/CMakeFiles/
+src/*/*/*/CTestTestfile.cmake
+src/*/*/*/Makefile
+src/*/*/*/cmake_install.cmake
+
 #other
 /.idea
 
