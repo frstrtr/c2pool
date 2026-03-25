@@ -622,10 +622,10 @@ public:
         {
             m_heads.erase(h);
             m_tails.erase(h);
-            // Clean reverse map
             auto it = m_shares.find(h);
             if (it != m_shares.end())
             {
+                // Remove h from its parent's reverse entry
                 auto& t = it->second.index->tail;
                 if (!t.IsNull()) {
                     auto pr = m_reverse.find(t);
@@ -634,11 +634,12 @@ public:
                         if (pr->second.empty()) m_reverse.erase(pr);
                     }
                 }
-                // Fire signal BEFORE erasing reverse map — BFS needs it
-                // to find descendants for cache invalidation.
-                // (p2pool fires after, but p2pool doesn't BFS descendants)
+                // Fire removed signal while share is still in m_shares
+                // (handlers call make_element_delta which needs m_get_prev_fn)
                 fire_removed(h);
-                m_reverse.erase(h);
+                // Do NOT erase m_reverse[h] — kept children (e.g. boundary)
+                // still have prev_hash = h and need this entry. The first
+                // evicted item's reverse entry points to boundary_hash.
                 if (deferred_destroy && owns_data)
                     deferred_destroy->push_back(std::move(it->second.share));
                 else if (owns_data)
@@ -655,8 +656,8 @@ public:
     }
 
     /// Remove a single share from the chain.
-    /// Matches p2pool forest.py remove() — pure set operations on heads/tails/reverse.
-    /// No pointer fixup needed (no prev pointers exist).
+    /// Line-by-line translation of p2pool forest.py:279-330.
+    /// 4-branch structure with signals firing at exact p2pool locations.
     bool remove(const hash_t& hash, bool owns_data = true)
     {
         auto it = m_shares.find(hash);
@@ -664,108 +665,122 @@ public:
             return false;
 
         index_t* idx = it->second.index;
-        hash_t share_tail = idx->tail; // share's prev_hash
+        hash_t share_tail = idx->tail; // delta.tail = prev_hash
 
-        // Find children via reverse map
-        std::vector<hash_t> children;
+        // p2pool line 289: children = self.reverse.get(delta.head, set())
+        // Only used in branch 4 (is_child_of), but read upfront like p2pool.
+        // Note: if hash is a head, children is empty (adding a child removes head status).
+
+        bool is_head = m_heads.contains(hash);
+        bool tail_in_tails = m_tails.contains(share_tail);
+
+        // ── 4-branch logic (p2pool forest.py:291-323) ──
+        // Reverse map is NOT modified yet — sibling counts are accurate.
+
+        if (is_head && tail_in_tails)
         {
-            auto rev_it = m_reverse.find(hash);
-            if (rev_it != m_reverse.end())
-                children.assign(rev_it->second.begin(), rev_it->second.end());
+            // Branch 1 (p2pool line 291-295): head in heads AND tail in tails
+            // Item bridges two segment boundaries — just disconnect.
+            hash_t tail = m_heads[hash];        // deep tail of head's chain segment
+            m_heads.erase(hash);
+            m_tails[tail].erase(hash);
+            if (m_tails[share_tail].empty())
+                m_tails.erase(share_tail);
+        }
+        else if (is_head)
+        {
+            // Branch 2 (p2pool line 296-303): head in heads (but tail NOT in tails)
+            // Head removal — promote parent if this was the only child.
+            hash_t tail = m_heads[hash];        // deep tail
+            m_heads.erase(hash);
+            m_tails[tail].erase(hash);
+
+            // p2pool line 299: if self.reverse[delta.tail] != set([delta.head]):
+            //     pass  # has sibling
+            // else: promote parent to head
+            auto rev_it = m_reverse.find(share_tail);
+            bool only_child = (rev_it != m_reverse.end()
+                               && rev_it->second.size() == 1
+                               && rev_it->second.count(hash) == 1);
+
+            if (only_child) {
+                // p2pool line 302-303: parent becomes new head
+                m_tails[tail].insert(share_tail);
+                m_heads[share_tail] = tail;
+            }
+            // else: has siblings → pass (do nothing)
+        }
+        else if (tail_in_tails)
+        {
+            // Branches 3 & 4 (p2pool line 304-321): tail in tails (tail-child removal)
+            // Reverse map NOT yet modified — sibling count is accurate.
+            auto rev_it = m_reverse.find(share_tail);
+            size_t sibling_count = (rev_it != m_reverse.end()) ? rev_it->second.size() : 0;
+
+            if (sibling_count <= 1)
+            {
+                // Branch 3 (p2pool line 304-310): sole child
+                auto heads_above = m_tails[share_tail];
+                m_tails.erase(share_tail);
+                for (auto& h : heads_above)
+                    m_heads[h] = hash;              // p2pool: self.heads[head] = delta.head
+                m_tails[hash] = std::move(heads_above);
+
+                fire_remove_special(hash);          // p2pool line 310
+            }
+            else
+            {
+                // Branch 4 (p2pool line 311-321): multiple siblings
+                // Find heads that pass through this item.
+                // p2pool: heads = [x for x in self.tails[delta.tail]
+                //                  if self.is_child_of(delta.head, x)]
+                std::set<hash_t> my_heads;
+                for (auto& h : m_tails[share_tail]) {
+                    if (is_child_of(hash, h))
+                        my_heads.insert(h);
+                }
+
+                // p2pool line 313-315: remove my heads from parent's tail entry
+                for (auto& h : my_heads)
+                    m_tails[share_tail].erase(h);
+                if (m_tails[share_tail].empty())
+                    m_tails.erase(share_tail);
+
+                // p2pool line 316-317: reassign my heads to point through me
+                for (auto& h : my_heads)
+                    m_heads[h] = hash;
+                // p2pool line 319: self.tails[delta.head] = set(heads)
+                m_tails[hash] = std::move(my_heads);
+
+                fire_remove_special2(hash);         // p2pool line 321
+            }
+        }
+        else
+        {
+            // p2pool line 323: raise NotImplementedError()
+            // Should never happen if data structure is consistent.
         }
 
-        // Remove from parent's reverse entry
-        if (!share_tail.IsNull()) {
+        // ── Cleanup (p2pool forest.py:325-330) ──
+
+        // p2pool line 326-328: self.reverse[delta.tail].remove(delta.head)
+        // Remove hash from parent's reverse entry — AFTER branch logic.
+        {
             auto pr = m_reverse.find(share_tail);
             if (pr != m_reverse.end()) {
                 pr->second.erase(hash);
                 if (pr->second.empty()) m_reverse.erase(pr);
             }
         }
-        bool is_head = m_heads.contains(hash);
+        // NOTE: Do NOT erase m_reverse[hash] — hash may now be a tail boundary
+        // (branches 3/4) and its children still need reverse[hash] entries.
 
-        // Fire remove_special/remove_special2 BEFORE erasing (p2pool forest.py:310,321).
-        // These fire when removing a share whose parent is a tail (mid-chain removal).
-        if (!is_head && m_tails.contains(share_tail)) {
-            auto rev_it = m_reverse.find(share_tail);
-            int sibling_count = rev_it != m_reverse.end() ? static_cast<int>(rev_it->second.size()) : 0;
-            if (sibling_count <= 1)
-                fire_remove_special(hash);  // p2pool: self.remove_special.happened(item)
-            else
-                fire_remove_special2(hash); // p2pool: self.remove_special2.happened(item)
-        }
-        // Fire removed signal for ALL removals (p2pool forest.py:330)
+        // p2pool line 330: self.removed.happened(item)
+        // Must fire while share is still in m_shares (c2pool handlers call
+        // make_element_delta which looks up prev_hash via m_shares).
         fire_removed(hash);
-        m_reverse.erase(hash);
 
-        if (is_head && children.empty())
-        {
-            // Leaf share (head, no children): just remove from heads/tails.
-            hash_t our_tail = m_heads[hash];
-            m_heads.erase(hash);
-            if (m_tails.contains(our_tail)) {
-                m_tails[our_tail].erase(hash);
-                if (m_tails[our_tail].empty())
-                    m_tails.erase(our_tail);
-            }
-            // If parent is in the chain, it becomes a new head
-            if (!share_tail.IsNull() && m_shares.contains(share_tail)
-                && !m_heads.contains(share_tail))
-            {
-                m_heads[share_tail] = our_tail;
-                m_tails[our_tail].insert(share_tail);
-            }
-        }
-        else if (is_head && !children.empty())
-        {
-            // Head with children above: children stay, our head entry is replaced.
-            // Each child's chain now has tail = share_tail (our parent).
-            hash_t our_tail = m_heads[hash];
-            m_heads.erase(hash);
-            if (m_tails.contains(our_tail)) {
-                m_tails[our_tail].erase(hash);
-                if (m_tails[our_tail].empty())
-                    m_tails.erase(our_tail);
-            }
-            // Children become roots of new segments with tail = share_tail
-            for (auto& ch : children) {
-                // Find the head that reaches this child
-                // Walk from ch upward via reverse map to find its head
-                hash_t h = ch;
-                while (!m_heads.contains(h)) {
-                    auto r = m_reverse.find(h);
-                    if (r == m_reverse.end() || r->second.empty()) break;
-                    h = *r->second.begin();
-                }
-                if (m_heads.contains(h)) {
-                    m_heads[h] = share_tail;
-                    m_tails[share_tail].insert(h);
-                }
-            }
-        }
-        else
-        {
-            // Mid-chain (not a head): children's chains now skip over us.
-            // Find all heads that pass through us and update their tails.
-            for (auto& ch : children) {
-                // Add children to parent's reverse map
-                if (!share_tail.IsNull())
-                    m_reverse[share_tail].insert(ch);
-            }
-            // Update head→tail mappings: any head whose chain passed
-            // through us now has a deeper tail (share_tail instead of hash).
-            // Since we're mid-chain, our hash was in some tails entry.
-            if (m_tails.contains(hash)) {
-                auto heads_above = m_tails[hash];
-                m_tails.erase(hash);
-                for (auto& h : heads_above) {
-                    m_heads[h] = share_tail;
-                    m_tails[share_tail].insert(h);
-                }
-            }
-        }
-
-        // Free share data and index
+        // Free share data and index (p2pool line 325: self.items.pop)
         if (owns_data)
             it->second.share.destroy();
         delete idx;
