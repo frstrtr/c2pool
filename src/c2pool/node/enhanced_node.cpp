@@ -7,14 +7,15 @@ namespace node {
 EnhancedC2PoolNode::EnhancedC2PoolNode(bool testnet) {
     m_hashrate_tracker = std::make_unique<hashrate::HashrateTracker>();
     m_hashrate_tracker->set_difficulty_bounds(0.001, 65536.0);
-    // Use coin-prefixed path matching NodeImpl: "litecoin_testnet" / "litecoin"
-    std::string network = testnet ? "litecoin_testnet" : "litecoin";
-    m_storage = std::make_unique<storage::SharechainStorage>(network);
+    // NOTE: In integrated mode, NodeImpl opens LevelDB for sharechain persist.
+    // We do NOT open a second LevelDB here — it would fail with "LOCK already
+    // held by process".  EnhancedNode's m_storage is left null; NodeImpl
+    // handles all persist.
 
     LOG_INFO << "Enhanced C2Pool node initialized with default configuration";
     LOG_INFO << "  - Automatic difficulty adjustment";
     LOG_INFO << "  - Real-time hashrate tracking";
-    LOG_INFO << "  - Persistent storage (" << network << ")";
+    LOG_INFO << "  - Persistent storage (managed by NodeImpl)";
 }
 
 EnhancedC2PoolNode::EnhancedC2PoolNode(boost::asio::io_context* ctx, ltc::Config* config) 

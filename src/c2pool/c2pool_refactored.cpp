@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <iomanip>
 #include <sstream>
 
 // Core includes
@@ -1623,6 +1624,28 @@ int main(int argc, char* argv[]) {
                 return 0.0;
             });
 
+            // Wire rate monitor stats for p2pool-style status lines (DOA%, time window)
+            p2p_node->set_local_rate_stats_fn([&web_server]() -> ltc::NodeImpl::LocalRateStats {
+                auto* mi = web_server.get_mining_interface();
+                if (!mi) return {};
+                auto s = mi->get_stratum_rate_stats();
+                return {s.hashrate, s.effective_dt, s.total_datums, s.dead_datums};
+            });
+
+            // Wire PPLNS outputs for current payout display
+            p2p_node->set_current_pplns_fn([&web_server]() -> std::vector<std::pair<std::string, uint64_t>> {
+                auto* mi = web_server.get_mining_interface();
+                if (!mi) return {};
+                return mi->get_cached_pplns_outputs();
+            });
+
+            // Wire node operator payout script for PPLNS matching
+            if (payout_manager && payout_manager->has_node_owner_fee()) {
+                const auto& nc = payout_manager->get_node_owner_config();
+                if (!nc.payout_script_hex.empty())
+                    p2p_node->set_node_payout_script_hex(nc.payout_script_hex);
+            }
+
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
@@ -2549,9 +2572,25 @@ int main(int argc, char* argv[]) {
 
                     {
                         // p2pool format: GOT SHARE! addr.worker hash prev age
+                        std::string age_str;
+                        if (!prev_share.IsNull() && p2p_node->tracker().chain.contains(prev_share)) {
+                            try {
+                                uint32_t prev_ts = 0;
+                                p2p_node->tracker().chain.get(prev_share).share.invoke([&](auto* s) {
+                                    prev_ts = s->m_timestamp;
+                                });
+                                if (prev_ts > 0) {
+                                    double age = static_cast<double>(p.timestamp) - static_cast<double>(prev_ts);
+                                    std::ostringstream os;
+                                    os << std::fixed << std::setprecision(2) << age << "s";
+                                    age_str = os.str();
+                                }
+                            } catch (...) {}
+                        }
                         LOG_INFO << "GOT SHARE! " << p.miner_address
                                  << " " << share_hash.GetHex().substr(0, 8)
-                                 << " prev " << prev_share.GetHex().substr(0, 8);
+                                 << " prev " << prev_share.GetHex().substr(0, 8)
+                                 << (age_str.empty() ? "" : " age " + age_str);
                     }
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
@@ -3052,13 +3091,19 @@ int main(int argc, char* argv[]) {
             // Determines behavior when sharechain is empty (no shares from
             // LevelDB or peers). Logged clearly so operator knows what's happening.
             {
+                auto chain_count = p2p_node->tracker().chain.size();
                 auto best = p2p_node->best_share_hash();
-                bool chain_empty = best.IsNull();
+                bool chain_empty = (chain_count == 0);
                 const char* mode_str = startup_mode == StartupMode::GENESIS ? "genesis"
                                      : startup_mode == StartupMode::WAIT ? "wait" : "auto";
 
+                if (chain_count > 0 && best.IsNull()) {
+                    LOG_INFO << "[Sharechain] Loaded " << chain_count
+                             << " shares from storage (best not yet computed — think() pending)";
+                }
+
                 if (chain_empty) {
-                    LOG_INFO << "[Sharechain] No shares loaded from storage";
+                    LOG_INFO << "[Sharechain] No shares in chain (empty database or first start)";
                     LOG_INFO << "[Sharechain] Startup mode: " << mode_str;
 
                     if (startup_mode == StartupMode::WAIT) {
