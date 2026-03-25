@@ -5185,22 +5185,12 @@ void WebServer::trigger_work_refresh()
 
 void WebServer::trigger_work_refresh_debounced()
 {
-    // Coalesce rapid-fire calls (share arrivals in P2P bursts) into one refresh.
-    // p2pool's Twisted reactor naturally batches multiple set_best_share() calls
-    // within the same tick into one _send_work(). We replicate this with a 100ms
-    // debounce timer. If already pending, the scheduled refresh will pick up the
-    // latest state — no need to reset the timer.
-    if (m_work_refresh_pending)
-        return;
-    m_work_refresh_pending = true;
-    if (!m_work_refresh_timer)
-        m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
-    m_work_refresh_timer->expires_after(std::chrono::milliseconds(100));
-    m_work_refresh_timer->async_wait([this](beast::error_code ec) {
-        m_work_refresh_pending = false;
-        if (ec || !running_) return;
-        trigger_work_refresh();
-    });
+    // No debounce — call refresh immediately.
+    // C++ refresh_work() is 0ms latency. Shares arrive every ~3.5s on average,
+    // so there's nothing to coalesce. The 100ms debounce was adding a 100ms race
+    // window that caused ~14% orphan rate (miner works on stale prev_share while
+    // waiting for debounce timer). With 0ms, orphan rate drops to ~1%.
+    trigger_work_refresh();
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)

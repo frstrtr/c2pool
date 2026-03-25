@@ -1087,12 +1087,28 @@ void NodeImpl::run_think()
                         << " Stale rate: " << format_binomial_conf(orphan_count + doa_count, total_recent)
                         << " Efficiency: " << format_binomial_conf_efficiency(orphan_count + doa_count, total_recent, stale_prop);
 
-            // Current payout from PPLNS cache (match node operator's script)
-            if (m_current_pplns_fn && !m_node_payout_script_hex.empty()) {
+            // Current payout from PPLNS cache.
+            // p2pool matches its -a address (which IS the miner's address).
+            // c2pool: match --address script, AND also try local miner scripts
+            // by checking PPLNS output scripts against known local pubkey_hashes
+            // from the stratum server's RateMonitor (via get_local_addr_rates).
+            if (m_current_pplns_fn) {
                 auto outputs = m_current_pplns_fn();
                 uint64_t my_payout = 0;
+
+                // Build set of local scripts from --address + local miner pubkeys
+                std::set<std::string> local_scripts;
+                if (!m_node_payout_script_hex.empty())
+                    local_scripts.insert(m_node_payout_script_hex);
+
+                // Add local miner scripts from stratum pubkey_hashes
+                if (m_local_miner_scripts_fn) {
+                    for (const auto& s : m_local_miner_scripts_fn())
+                        local_scripts.insert(s);
+                }
+
                 for (const auto& [script, amount] : outputs) {
-                    if (script == m_node_payout_script_hex)
+                    if (local_scripts.count(script))
                         my_payout += amount;
                 }
                 if (my_payout > 0) {

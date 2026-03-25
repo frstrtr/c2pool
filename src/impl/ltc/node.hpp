@@ -228,6 +228,11 @@ public:
     void set_node_payout_script_hex(const std::string& hex) { m_node_payout_script_hex = hex; }
     const std::string& get_node_payout_script_hex() const { return m_node_payout_script_hex; }
 
+    /// Local miner scripts (from stratum sessions' pubkey_hashes → all script forms)
+    void set_local_miner_scripts_fn(std::function<std::vector<std::string>()> fn) {
+        m_local_miner_scripts_fn = std::move(fn);
+    }
+
     /// Check whether a peer address is currently banned.
     bool is_banned(const NetService& addr) const;
 
@@ -237,6 +242,7 @@ protected:
     std::function<double()> m_local_hashrate_fn;
     std::function<LocalRateStats()> m_local_rate_stats_fn;
     std::function<std::vector<std::pair<std::string, uint64_t>>()> m_current_pplns_fn;
+    std::function<std::vector<std::string>()> m_local_miner_scripts_fn;
     std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched

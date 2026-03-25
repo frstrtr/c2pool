@@ -1657,6 +1657,23 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Wire local miner scripts callback for PPLNS payout display.
+            // Converts stratum sessions' pubkey_hashes to all script forms (P2PKH, P2WPKH, P2SH)
+            // so the status line can match them against PPLNS outputs.
+            p2p_node->set_local_miner_scripts_fn([&web_server]() -> std::vector<std::string> {
+                std::vector<std::string> scripts;
+                auto rates = web_server.get_local_addr_rates();
+                const char HX[] = "0123456789abcdef";
+                for (const auto& [pubkey, rate] : rates) {
+                    std::string h160;
+                    for (auto b : pubkey) { h160 += HX[b >> 4]; h160 += HX[b & 0x0f]; }
+                    scripts.push_back("76a914" + h160 + "88ac"); // P2PKH
+                    scripts.push_back("0014" + h160);            // P2WPKH
+                    scripts.push_back("a914" + h160 + "87");     // P2SH
+                }
+                return scripts;
+            });
+
             // When a block submission is attempted, broadcast bestblock to all P2P peers
             // and record the found block for the /recent_blocks REST endpoint.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
