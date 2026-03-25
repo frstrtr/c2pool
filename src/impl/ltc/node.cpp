@@ -1160,6 +1160,15 @@ void NodeImpl::run_think()
 // Direct translation of p2pool node.py:355-402 clean_tracker().
 void NodeImpl::clean_tracker()
 {
+    // Prevent concurrent clean_tracker (timer re-entry safety).
+    if (m_clean_running.exchange(true))
+        return;
+    // RAII guard: always clear flag on exit (even on exception)
+    struct CleanGuard {
+        std::atomic<bool>& flag;
+        ~CleanGuard() { flag.store(false); }
+    } clean_guard{m_clean_running};
+
     // Step 1: Run think() to get current scoring + remove bad shares
     // (also populates m_last_top5_heads)
     run_think();

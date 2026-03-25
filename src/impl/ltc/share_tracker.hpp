@@ -896,12 +896,14 @@ public:
             // Matches p2pool generate_transaction (data.py:746-774).
             auto pre_target3 = MAX_TARGET;
             auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+            // No round-up guard needed — truncation matches p2pool's actual behavior
             uint256 bits_lo = pre_target3 / 30;
             if (bits_lo.IsNull()) bits_lo = uint256(1);
             uint256 bits_target = desired_target;
             if (bits_target < bits_lo) bits_target = bits_lo;
             if (bits_target > pre_target3) bits_target = pre_target3;
             auto bits = chain::target_to_bits_upper_bound(bits_target);
+            // No round-up guard needed — truncation matches p2pool's actual behavior
             return {max_bits, bits};
         }
 
@@ -913,15 +915,40 @@ public:
         // Not enough chain depth for proper difficulty calculation.
         if (acc_height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
         {
+            // Collapse detection: many shares exist but best chain is short
+            auto total_shares = chain.size();
+            if (total_shares > 2 * PoolConfig::chain_length()
+                && acc_height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND)) {
+                static int collapse_warn = 0;
+                if (collapse_warn++ < 20) {
+                    // Walk raw chain to find actual contiguous height
+                    int32_t walked = 0;
+                    auto cur = prev_share_hash;
+                    while (!cur.IsNull() && chain.contains(cur) && walked < 1000) {
+                        ++walked;
+                        auto* idx = chain.get_index(cur);
+                        cur = idx ? idx->tail : uint256();
+                    }
+                    LOG_WARNING << "[COLLAPSE-DETECT] Chain structurally broken:"
+                                << " total_shares=" << total_shares
+                                << " acc_height=" << acc_height
+                                << " walked_height=" << walked
+                                << " tails=" << chain.get_tails().size()
+                                << " heads=" << chain.get_heads().size()
+                                << " TARGET_LOOKBEHIND=" << PoolConfig::TARGET_LOOKBEHIND
+                                << " prev=" << prev_share_hash.GetHex().substr(0,16);
+                }
+            }
             auto pre_target3 = MAX_TARGET;
             auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
-            // bits = clip(desired_target, [pre_target3/30, pre_target3])
+            // No round-up guard needed — truncation matches p2pool's actual behavior
             uint256 bits_lo = pre_target3 / 30;
             if (bits_lo.IsNull()) bits_lo = uint256(1);
             uint256 bits_target = desired_target;
             if (bits_target < bits_lo) bits_target = bits_lo;
             if (bits_target > pre_target3) bits_target = pre_target3;
             auto bits = chain::target_to_bits_upper_bound(bits_target);
+            // No round-up guard needed — truncation matches p2pool's actual behavior
             return {max_bits, bits};
         }
 
@@ -1108,6 +1135,8 @@ public:
 
         auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
 
+        // No round-up guard needed — truncation matches p2pool's actual behavior
+
         // Apply 1.67% share cap: desired_target cannot be easier than
         // pool_target / 0.0167 ≈ pool_target * 60. This ensures no single
         // miner can produce more than ~1.67% of all shares (anti-spam).
@@ -1135,6 +1164,7 @@ public:
         if (bits_target > pre_target3) bits_target = pre_target3;
         auto bits = chain::target_to_bits_upper_bound(bits_target);
 
+        // Same MAX_TARGET guard for bits
         return {max_bits, bits};
     }
 
@@ -1313,7 +1343,7 @@ public:
                  << " decay_per=" << decay_per;
 
         static int decay_dump = 0;
-        bool do_dump = (decay_dump++ < 2);
+        bool do_dump = (decay_dump++ % 100 == 0); // dump every 100th call
 
         for (const auto& hash : walk_hashes)
         {
@@ -1326,13 +1356,18 @@ public:
                 // Apply exponential decay: decayed_att = att * decay_fp >> PRECISION
                 uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
 
-                if (do_dump && share_count < 5) {
+                if (do_dump && share_count < 20) {
+                    auto script = get_share_script(obj);
+                    auto script_hex = std::string();
+                    for (auto b : script) {
+                        static const char* H = "0123456789abcdef";
+                        script_hex += H[b >> 4]; script_hex += H[b & 0xf];
+                    }
                     LOG_INFO << "[DECAY-WALK] #" << share_count
                              << " bits=0x" << std::hex << obj->m_bits << std::dec
                              << " att=" << att.GetLow64()
-                             << " decay_fp=" << decay_fp
-                             << " decayed_att=" << decayed_att.GetLow64()
-                             << " don=" << don
+                             << " decay=" << decay_fp
+                             << " script=" << script_hex.substr(0, 20)
                              << " hash=" << hash.GetHex().substr(0, 16);
                 }
 

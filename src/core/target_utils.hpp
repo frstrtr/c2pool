@@ -43,6 +43,11 @@ inline uint288 target_to_average_attempts(const uint256& target)
 // Convert uint256 target to compact nBits format (upper bound: smallest nBits
 // whose decoded target is >= the input target).
 // Inverse of bits_to_target(). Matches p2pool FloatingInteger.from_target_upper_bound().
+//
+// p2pool reference (bitcoin/data.py FloatingInteger.from_target_upper_bound):
+//   1. Encode target as compact bits (truncating lower bytes)
+//   2. If decoded bits.target < input target, increment bits by 1
+//   3. Assert: decoded target >= input target (true upper bound)
 inline uint32_t target_to_bits_upper_bound(const uint256& target)
 {
     // data() is little-endian: data()[0] is least significant byte
@@ -67,9 +72,6 @@ inline uint32_t target_to_bits_upper_bound(const uint256& target)
         nWord = (static_cast<uint32_t>(d[nSize - 1]) << 16) |
                 (static_cast<uint32_t>(d[nSize - 2]) << 8) |
                 (static_cast<uint32_t>(d[nSize - 3]));
-        // NOTE: Python's FloatingInteger.from_target_upper_bound() does NOT
-        // round up when lower bytes are non-zero — it truncates.
-        // We must match Python's behavior for consensus compatibility.
         // Handle overflow of 3-byte mantissa
         if (nWord > 0x7fffff) {
             nWord >>= 8;

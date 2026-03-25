@@ -56,6 +56,7 @@ protected:
     // matching Litecoin Core's cs_main mutex pattern.
     boost::asio::thread_pool m_think_pool{1};
     std::atomic<bool> m_think_running{false};
+    std::atomic<bool> m_clean_running{false};
     std::recursive_mutex m_cs_tracker;
 
     // Top-5 scored heads from last think() — used by clean_tracker()

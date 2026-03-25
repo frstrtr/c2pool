@@ -1259,10 +1259,15 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             LOG_WARNING << "[GENTX-DIAG]  payout[" << i << "] amount=" << a
                         << " script=" << to_hex(s.data(), s.size());
         }
-        // First 5 shares in walk
+        // First 5 + last 5 shares in PPLNS walk (for cross-impl comparison)
         if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash)) {
             auto cl = std::min(tracker.chain.get_height(share.m_prev_hash),
                                static_cast<int32_t>(PoolConfig::real_chain_length()));
+            LOG_WARNING << "[GENTX-DIAG] PPLNS walk_count=" << cl
+                        << " total_weight=" << total_weight.GetHex()
+                        << " total_don_weight=" << total_donation_weight.GetHex()
+                        << " n_addrs=" << weights.size();
+            // First 5 shares
             auto wv = tracker.chain.get_chain(share.m_prev_hash, std::min(cl, int32_t(5)));
             int si = 0;
             for (auto [h, d] : wv) {
@@ -1270,12 +1275,34 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                     auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
                     auto sc = get_share_script(obj);
                     LOG_WARNING << "[GENTX-DIAG]  walk[" << si << "] hash=" << h.ToString().substr(0,16)
-                                << " bits=0x" << std::hex << obj->m_bits << std::dec
+                                << " bits=0x" << std::hex << obj->m_bits
+                                << " max_bits=0x" << obj->m_max_bits << std::dec
                                 << " att=" << att.GetHex()
                                 << " don=" << obj->m_donation
                                 << " script=" << to_hex(sc.data(), sc.size());
                 });
                 ++si;
+            }
+            // Last 5 shares in walk (tail of PPLNS window)
+            if (cl > 10) {
+                auto full_view = tracker.chain.get_chain(share.m_prev_hash, cl);
+                int si2 = 0;
+                for (auto [h, d] : full_view) {
+                    if (si2 >= cl - 5) {
+                        d.share.invoke([&](auto* obj) {
+                            auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
+                            auto sc = get_share_script(obj);
+                            LOG_WARNING << "[GENTX-DIAG]  walk_tail[" << si2 << "/" << cl << "] hash=" << h.ToString().substr(0,16)
+                                        << " bits=0x" << std::hex << obj->m_bits
+                                        << " max_bits=0x" << obj->m_max_bits << std::dec
+                                        << " att=" << att.GetHex()
+                                        << " don=" << obj->m_donation
+                                        << " script=" << to_hex(sc.data(), sc.size());
+                        });
+                    }
+                    ++si2;
+                }
+                LOG_WARNING << "[GENTX-DIAG] walk iterated " << si2 << " shares (expected " << cl << ")";
             }
         }
     }
@@ -1516,6 +1543,41 @@ bool share_check(const ShareT& share,
                                 << " c2pool_max_bits=0x" << cst_max_bits << std::dec
                                 << " aps_min=" << share_aps.GetLow64()
                                 << " prev=" << share.m_prev_hash.GetHex().substr(0,16);
+
+                    // APS walk component dump for cross-impl comparison
+                    int32_t dist = PoolConfig::TARGET_LOOKBEHIND;
+                    auto near_hash = share.m_prev_hash;
+                    auto far_hash = near_hash;
+                    int32_t actual_dist = 0;
+                    for (int32_t i = 0; i < dist - 1; ++i) {
+                        if (far_hash.IsNull() || !tracker.chain.contains(far_hash)) break;
+                        auto* idx = tracker.chain.get_index(far_hash);
+                        far_hash = idx ? idx->tail : uint256();
+                        ++actual_dist;
+                    }
+                    uint32_t near_ts = 0, far_ts = 0;
+                    if (tracker.chain.contains(near_hash))
+                        tracker.chain.get_share(near_hash).invoke([&](auto* s){ near_ts = s->m_timestamp; });
+                    if (!far_hash.IsNull() && tracker.chain.contains(far_hash))
+                        tracker.chain.get_share(far_hash).invoke([&](auto* s){ far_ts = s->m_timestamp; });
+
+                    LOG_WARNING << "[GENTX-APS] near=" << near_hash.GetHex().substr(0,16)
+                                << " far=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                                << " actual_dist=" << actual_dist
+                                << " expected_dist=" << (dist - 1)
+                                << " timespan=" << (int32_t(near_ts) - int32_t(far_ts))
+                                << " near_ts=" << near_ts << " far_ts=" << far_ts
+                                << " chain_height=" << tracker.chain.get_height(share.m_prev_hash);
+
+                    // Previous share's max_target (clamp reference)
+                    uint256 prev_max_target;
+                    tracker.chain.get_share(share.m_prev_hash).invoke([&](auto* obj) {
+                        prev_max_target = chain::bits_to_target(obj->m_max_bits);
+                    });
+                    LOG_WARNING << "[GENTX-CLAMP] prev_max_bits=0x" << std::hex
+                                << chain::target_to_bits_upper_bound(prev_max_target) << std::dec
+                                << " clamp_lo=" << chain::target_to_bits_upper_bound(prev_max_target * 9 / 10)
+                                << " clamp_hi=" << chain::target_to_bits_upper_bound(prev_max_target * 11 / 10);
                 }
             }
             // --- Detailed diagnostics: re-run with full dump ---
