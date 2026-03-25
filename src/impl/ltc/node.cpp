@@ -1236,7 +1236,27 @@ void NodeImpl::clean_tracker()
     }
 
     // Step 3: Drop tails — remove ALL children of qualifying tails (p2pool node.py:382-396)
+    // Safety: build a set of best-chain ancestors to protect from cascade removal.
+    // The cascade bug occurs when drop-tails removes a share that's on the main
+    // chain's ancestry, fragmenting best=815 → best=4. p2pool doesn't hit this
+    // because its fork rate is <5%, but c2pool can have 80%+ forks when the
+    // hashrate feedback loop inflates difficulty.
     {
+        // Build protected set: walk from best head backward through the chain.
+        // Any share on this path must NOT be removed by drop-tails.
+        std::set<uint256> best_chain_set;
+        {
+            auto best = m_best_share_hash;
+            auto cur = best;
+            int walked = 0;
+            while (!cur.IsNull() && m_tracker.chain.contains(cur) && walked < 3 * CL) {
+                best_chain_set.insert(cur);
+                auto* idx = m_tracker.chain.get_index(cur);
+                cur = idx ? idx->tail : uint256();
+                ++walked;
+            }
+        }
+
         int total_dropped = 0;
         for (int iter = 0; iter < 1000; ++iter)
         {
@@ -1274,13 +1294,16 @@ void NodeImpl::clean_tracker()
             {
                 try {
                     if (!m_tracker.chain.contains(h)) continue;
-                    // p2pool node.py:393: if items[aftertail].previous_hash not in tails: continue
-                    // Safety: only remove if parent is STILL a tail.
-                    // Without this check, cascade eats the entire chain.
+                    // Safety 1: don't remove shares on the best chain
+                    if (best_chain_set.count(h)) {
+                        LOG_WARNING << "[clean-drop-tails] SKIPPING best-chain share "
+                                    << h.GetHex().substr(0,16);
+                        continue;
+                    }
+                    // Safety 2 (p2pool node.py:393): parent must still be a tail
                     auto* idx = m_tracker.chain.get_index(h);
                     if (!idx) continue;
                     if (!m_tracker.chain.get_tails().count(idx->tail)) {
-                        // "erk" — parent is no longer a tail, skip
                         continue;
                     }
                     if (m_tracker.verified.contains(h))
