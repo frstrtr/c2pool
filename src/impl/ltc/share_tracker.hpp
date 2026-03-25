@@ -821,33 +821,50 @@ public:
         if (dist < 2 || !chain.contains(share_hash))
             return uint288(0);
 
-        auto actual_height = chain.get_acc_height(share_hash);
-        if (actual_height < dist)
-            return uint288(0);
+        // Direct chain walk — bypasses TrackerView delta cache which can
+        // become stale after forest remove/trim operations.
+        // Matches p2pool exactly:
+        //   near = items[share_hash]
+        //   far  = items[get_nth_parent(share_hash, dist-1)]
+        //   attempts = get_delta(near, far).work   ← excludes far
+        //   time = near.timestamp - far.timestamp
+        //   APS = attempts / time
 
-        // p2pool: far = tracker.get_nth_parent_hash(prev, dist - 1) — O(log n)
-        LOG_TRACE << "[APS] get_nth_parent_via_skip(dist=" << (dist-1) << ")...";
-        auto far_hash = chain.get_nth_parent_via_skip(share_hash, dist - 1);
-        LOG_TRACE << "[APS] skip done, far=" << far_hash.GetHex().substr(0,16);
-        if (far_hash.IsNull() || !chain.contains(far_hash))
-            return uint288(0);
-
-        // p2pool: attempts = tracker.get_delta(near.hash, far.hash).work
-        // p2pool uses get_delta which calls get_delta_to_last for BOTH shares.
-        // Both walks reach the same chain end → subtraction is valid.
-        // get_delta_to_last ALWAYS walks the actual chain (no stale cache) because
-        // _get_delta combines cached delta with ref delta, and refs are updated
-        // by handle_remove_special on pruning.
-        auto delta = chain.get_delta(share_hash, far_hash);
-        uint288 attempts = use_min_work ? delta.min_work : delta.work;
-
-        uint32_t near_ts = 0, far_ts = 0;
+        // Step 1: Find far hash by walking dist-1 parents
+        uint32_t near_ts = 0;
         chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
+
+        auto cur = share_hash;
+        for (int32_t i = 0; i < dist - 1 && !cur.IsNull() && chain.contains(cur); ++i) {
+            auto* idx = chain.get_index(cur);
+            cur = idx ? idx->tail : uint256();
+        }
+        if (cur.IsNull() || !chain.contains(cur))
+            return uint288(0);
+        auto far_hash = cur;
+
+        uint32_t far_ts = 0;
         chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+
+        // Step 2: Sum work from near down to (but NOT including) far
+        // p2pool: get_delta(near, far) = sum(near, near-1, ..., far+1)
+        uint288 total_work;
+        cur = share_hash;
+        while (cur != far_hash && !cur.IsNull() && chain.contains(cur)) {
+            chain.get_share(cur).invoke([&](auto* obj) {
+                if (use_min_work)
+                    total_work += chain::target_to_average_attempts(chain::bits_to_target(obj->m_max_bits));
+                else
+                    total_work += chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
+            });
+            auto* idx = chain.get_index(cur);
+            cur = idx ? idx->tail : uint256();
+        }
+
         int32_t time_span = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
         if (time_span <= 0) time_span = 1;
 
-        return attempts / uint288(time_span);
+        return total_work / uint288(time_span);
     }
 
     // -- Share target computation --
@@ -913,6 +930,52 @@ public:
         // p2pool's algorithm: aps from the entire chain, no filtering.
         auto aps = get_pool_attempts_per_second(prev_share_hash,
             PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
+
+        // Diagnostic: compare cached height vs walked height
+        {
+            static int cst_diag = 0;
+            if (cst_diag++ % 50 == 0) {
+                auto cached_h = chain.get_acc_height(prev_share_hash);
+                auto walked_h = chain.get_height(prev_share_hash);
+                if (cached_h != walked_h) {
+                    LOG_WARNING << "[CST-DIAG] HEIGHT MISMATCH cached=" << cached_h
+                                << " walked=" << walked_h
+                                << " prev=" << prev_share_hash.GetHex().substr(0,16);
+                }
+                // Log APS components
+                auto far = chain.get_nth_parent_via_skip(prev_share_hash,
+                    PoolConfig::TARGET_LOOKBEHIND - 1);
+                if (!far.IsNull() && chain.contains(far)) {
+                    auto delta = chain.get_delta(prev_share_hash, far);
+                    uint32_t near_ts = 0, far_ts = 0;
+                    chain.get_share(prev_share_hash).invoke([&](auto* s){ near_ts = s->m_timestamp; });
+                    chain.get_share(far).invoke([&](auto* s){ far_ts = s->m_timestamp; });
+                    LOG_INFO << "[CST-APS] min_work=" << delta.min_work.GetHex()
+                             << " work=" << delta.work.GetHex()
+                             << " timespan=" << (int32_t(near_ts)-int32_t(far_ts))
+                             << " aps=" << aps.GetLow64()
+                             << " height_delta=" << delta.height
+                             << " near=" << prev_share_hash.GetHex().substr(0,16)
+                             << " far=" << far.GetHex().substr(0,16);
+                    // Count local vs remote in APS walk
+                    {
+                        auto cur = prev_share_hash;
+                        int local_count = 0, remote_count = 0;
+                        for (int i = 0; i < 200 && !cur.IsNull() && chain.contains(cur); ++i) {
+                            bool is_local = false;
+                            chain.get_share(cur).invoke([&](auto* s) {
+                                is_local = (s->peer_addr.port() == 0);
+                            });
+                            if (is_local) ++local_count; else ++remote_count;
+                            auto* idx = chain.get_index(cur);
+                            cur = idx ? idx->tail : uint256();
+                        }
+                        LOG_INFO << "[CST-WALK] local=" << local_count << " remote=" << remote_count
+                                 << " aps=" << aps.GetLow64();
+                    }
+                }
+            }
+        }
 
         uint256 pre_target;
         if (aps.IsNull())
