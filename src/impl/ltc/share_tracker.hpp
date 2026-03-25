@@ -183,25 +183,15 @@ public:
 
         // p2pool: if height < self.net.CHAIN_LENGTH + 1 and last is not None:
         //             raise AssertionError()
+        // Chain too short and unrooted — cannot verify yet.
+        // The share isn't bad; its parents haven't arrived to fill the gap.
+        // DO NOT bypass this guard even if the parent is verified —
+        // generate_share_transaction needs CHAIN_LENGTH ancestors for correct
+        // PPLNS. Verifying with 3 ancestors produces wrong coinbase → GENTX-MISMATCH.
+        // Phase 2 naturally extends verification when parents arrive.
         if (acc_height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
         {
-            // Debug: why is the chain unrooted?
-            static int unrooted_log = 0;
-            if (unrooted_log++ < 10) {
-                bool last_in_chain = chain.contains(last);
-                LOG_WARNING << "[UNROOTED] share=" << share_hash.GetHex().substr(0,16)
-                            << " acc_height=" << acc_height << " last=" << last.GetHex().substr(0,16)
-                            << " last_in_chain=" << last_in_chain
-                            << " chain_size=" << chain.size();
-            }
-            // Check if parent is already verified — if so, we can verify this share
-            uint256 prev_hash;
-            chain.get_share(share_hash).invoke([&](auto* obj) {
-                prev_hash = obj->m_prev_hash;
-            });
-            if (prev_hash.IsNull() || !verified.contains(prev_hash))
-                return false;
-            // Parent is verified — proceed with verification
+            return false;
         }
 
         // P2: init-phase verification (hash-link, merkle, PoW) + check-phase
@@ -437,59 +427,11 @@ public:
             }
         }
 
-        // Phase 1.5: Forward-extend verification using reverse map.
-        // After Phase 1 verified some shares, try to verify their CHILDREN
-        // that are in chain but not yet verified. This propagates verification
-        // forward through unrooted peer chains in a single think() cycle.
-        // p2pool doesn't need this because Phase 2 handles it (rooted chains).
-        {
-            bool extended = true;
-            int fwd_count = 0;
-            // Start from verified shares that have unverified children in raw chain.
-            // Check ALL verified shares (not just heads) — children may have
-            // arrived after the parent was verified but before it became a head.
-            std::vector<uint256> to_check;
-            for (auto& [vh, vt] : verified.get_heads())
-                to_check.push_back(vh);
-            // Also scan raw chain's reverse map for verified parents with unverified children
-            for (auto& [parent, children] : chain.get_reverse()) {
-                if (!verified.contains(parent)) continue;
-                for (const auto& child : children) {
-                    if (!verified.contains(child) && chain.contains(child))
-                        to_check.push_back(parent);
-                }
-            }
-
-            while (!to_check.empty() && fwd_count < 10000) {
-                auto parent = to_check.back();
-                to_check.pop_back();
-                auto rev_it = chain.get_reverse().find(parent);
-                if (rev_it == chain.get_reverse().end()) {
-                    static int no_children = 0;
-                    if (no_children++ < 5)
-                        LOG_INFO << "[P1.5] no children for " << parent.GetHex().substr(0,16);
-                    continue;
-                }
-                for (const auto& child : rev_it->second) {
-                    if (verified.contains(child)) continue;
-                    if (!chain.contains(child)) continue;
-                    auto [ch, cl] = chain.get_height_and_last(child);
-                    static int child_log = 0;
-                    if (child_log++ < 10)
-                        LOG_INFO << "[P1.5] trying child " << child.GetHex().substr(0,16)
-                                 << " height=" << ch << " last=" << (cl.IsNull() ? "null" : cl.GetHex().substr(0,16));
-                    if (attempt_verify(child)) {
-                        ++fwd_count;
-                        to_check.push_back(child);
-                    }
-                }
-            }
-            if (fwd_count > 0) {
-                static int fwd_log = 0;
-                if (fwd_log++ < 10 || fwd_count > 10)
-                    LOG_INFO << "[think-P1.5] forward-extended " << fwd_count << " shares";
-            }
-        }
+        // Phase 1.5 removed — was NOT in p2pool and caused GENTX-MISMATCH.
+        // It tried to forward-propagate verification from verified parents to
+        // unverified children, but children on stub forks (chain_len < CHAIN_LENGTH)
+        // got verified with truncated PPLNS → wrong coinbase.
+        // p2pool's Phase 2 naturally handles forward extension via rooted chains.
 
         // Remove bad shares (p2pool data.py:2133-2145).
         // p2pool removes ONLY the bad shares themselves — NO cascade.
