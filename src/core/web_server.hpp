@@ -666,10 +666,15 @@ private:
     // io_context for scheduling async verification timers
     boost::asio::io_context*     m_context        = nullptr;
     std::atomic<bool>       m_work_valid{false};
+    std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
     nlohmann::json          m_cached_template;
 
 public:
+    // Monotonically increasing counter — incremented on each refresh_work().
+    // Used by per-miner safety timer to avoid pushing unchanged work.
+    uint64_t get_work_generation() const { return m_work_generation.load(); }
+
     // Share target from compute_share_target() — set by ref_hash_fn, used by
     // mining.notify (nbits) and share creation (params.bits).
     // These are consensus-level share difficulty, NOT the block difficulty.
@@ -921,6 +926,10 @@ class WebServer
     bool solo_mode_;
     std::string solo_address_;
 
+    // Debounce timer for trigger_work_refresh_debounced()
+    std::shared_ptr<net::steady_timer> m_work_refresh_timer;
+    bool m_work_refresh_pending = false;
+
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
 
@@ -972,8 +981,12 @@ public:
     void set_on_block_submitted(std::function<void(const std::string&, int)> fn);
     // Forward P2P block relay callback to the underlying MiningInterface
     void set_on_block_relay(std::function<void(const std::string&)> fn);
-    // Immediately refresh the cached block template (call when a new block arrives)
+    // Immediately refresh the cached block template and push to all miners.
+    // Use for time-critical events (new LTC block).
     void trigger_work_refresh();
+    // Debounced variant: coalesces rapid-fire calls (share arrivals) into one
+    // refresh after 100ms. Matches p2pool's Twisted reactor tick coalescing.
+    void trigger_work_refresh_debounced();
     // Wire the share tracker's best hash into MiningInterface
     void set_best_share_hash_fn(std::function<uint256()> fn);
     // Wire the PPLNS computation from the share tracker

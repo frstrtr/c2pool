@@ -1765,6 +1765,7 @@ void MiningInterface::refresh_work()
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
         m_work_valid              = true;
+        ++m_work_generation;
         m_last_work_update_time   = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 
@@ -5103,23 +5104,19 @@ bool WebServer::start()
             start_stratum_server();
         }
 
-        // If a coin RPC is connected, schedule a recurring work-refresh timer
+        // One-shot initial template fetch: populate the cache before any events fire.
+        // After this, all template updates are event-driven (bestblock, best_share_changed).
+        // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
         if (m_coin_rpc_) {
             auto timer = std::make_shared<net::steady_timer>(ioc_);
-            // Use a shared_ptr<function> so the lambda can reschedule itself
-            auto fn = std::make_shared<std::function<void(beast::error_code)>>();
-            *fn = [this, timer, fn](beast::error_code ec) {
+            timer->expires_after(std::chrono::milliseconds(500));
+            timer->async_wait([this, timer](beast::error_code ec) {
                 if (ec || !running_) return;
                 try { mining_interface_->refresh_work(); }
-                catch (const std::exception& e) { LOG_WARNING << "refresh_work failed: " << e.what(); }
-                catch (...) { LOG_WARNING << "refresh_work failed: unknown error"; }
-                timer->expires_after(std::chrono::seconds(5));
-                timer->async_wait(*fn);
-            };
-            // First poll after a short delay to let the io_context settle
-            timer->expires_after(std::chrono::milliseconds(500));
-            timer->async_wait(*fn);
-            LOG_INFO << "Work-refresh timer scheduled (every 5 s)";
+                catch (const std::exception& e) { LOG_WARNING << "initial refresh_work failed: " << e.what(); }
+                catch (...) { LOG_WARNING << "initial refresh_work failed: unknown error"; }
+                LOG_INFO << "Initial block template fetched";
+            });
         }
 
         // Schedule stat_log timer (every 60 seconds for graph data)
@@ -5184,6 +5181,26 @@ void WebServer::trigger_work_refresh()
     // Stale shares only occur when MAX_ACTIVE_JOBS (32) is exceeded.
     if (stratum_server_)
         stratum_server_->notify_all();
+}
+
+void WebServer::trigger_work_refresh_debounced()
+{
+    // Coalesce rapid-fire calls (share arrivals in P2P bursts) into one refresh.
+    // p2pool's Twisted reactor naturally batches multiple set_best_share() calls
+    // within the same tick into one _send_work(). We replicate this with a 100ms
+    // debounce timer. If already pending, the scheduled refresh will pick up the
+    // latest state — no need to reset the timer.
+    if (m_work_refresh_pending)
+        return;
+    m_work_refresh_pending = true;
+    if (!m_work_refresh_timer)
+        m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
+    m_work_refresh_timer->expires_after(std::chrono::milliseconds(100));
+    m_work_refresh_timer->async_wait([this](beast::error_code ec) {
+        m_work_refresh_pending = false;
+        if (ec || !running_) return;
+        trigger_work_refresh();
+    });
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)

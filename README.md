@@ -182,7 +182,7 @@ CLI arguments always take priority over YAML values.
 | `--node-owner-address` | `node_owner_address` | — | Node owner payout addr |
 | `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate |
 | `--max-conns` | — | 8 | Target outbound P2P peers |
-| `--stratum-min-diff` | `min_difficulty` | 0.001 | Vardiff floor |
+| `--stratum-min-diff` | `min_difficulty` | 0.0005 | Vardiff floor |
 | `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
 | `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |

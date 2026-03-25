@@ -1456,7 +1456,7 @@ int main(int argc, char* argv[]) {
                                 if (accepted > 0 || full_batch) {
                                     boost::asio::post(ioc, [accepted, last_hash, chain, bcaster, &web_server]() {
                                         if (accepted > 0)
-                                            web_server.trigger_work_refresh();
+                                            web_server.trigger_work_refresh_debounced();
                                         // Use last received hash as locator to advance past
                                         // LevelDB duplicates.  On fresh sync (no LevelDB),
                                         // this naturally follows the chain tip.
@@ -1608,11 +1608,12 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
             });
 
-            // When best_share changes (new share on chain), immediately refresh
-            // work for all miners — matches p2pool's new_work_event pattern.
-            // Without this, miners work on stale prev_share → shares get orphaned.
+            // When best_share changes (new share on chain), refresh work for all
+            // miners. Debounced (100ms) to coalesce P2P share bursts into one
+            // notification — matches p2pool's Twisted reactor tick coalescing.
+            // New blocks use trigger_work_refresh() (immediate, above).
             p2p_node->set_on_best_share_changed([&web_server]() {
-                web_server.trigger_work_refresh();
+                web_server.trigger_work_refresh_debounced();
             });
 
             // Wire local hashrate callback (from stratum server)

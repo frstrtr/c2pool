@@ -138,6 +138,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection
+    uint64_t last_pushed_generation_ = 0;  // work generation at last push (for safety timer)
     static constexpr size_t MAX_ACTIVE_JOBS = 256; // p2pool keeps all jobs from current block
 
     // Per-worker statistics
@@ -192,7 +193,10 @@ private:
     void send_set_difficulty(double difficulty);
     void send_set_extranonce(const std::string& extranonce1, int extranonce2_size);
 public:
-    void send_notify_work(bool force_clean = false);
+    // If frozen_best_share is provided (non-null), use it instead of reading
+    // best_share_hash_fn() live. This prevents PPLNS recomputation race when
+    // best_share changes mid-iteration in notify_all().
+    void send_notify_work(bool force_clean = false, const uint256* frozen_best_share = nullptr);
 private:
     void start_periodic_work_push();
 

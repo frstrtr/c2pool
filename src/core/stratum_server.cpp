@@ -225,6 +225,15 @@ void StratumServer::notify_all()
     //
     // Pattern: snapshot session shared_ptrs under lock, release, then notify.
     // Sessions are shared_ptr so they stay alive even if unregistered mid-iteration.
+
+    // Freeze best_share ONCE for the entire cycle — matches p2pool's single-threaded
+    // reactor where best_share_var.value can't change during a _send_work() loop.
+    // Without this, a share arriving mid-iteration causes each subsequent miner to
+    // see a different best_share → triggers PPLNS recomputation per miner.
+    uint256 frozen_best;
+    if (auto fn = mining_interface_->get_best_share_hash_fn())
+        frozen_best = fn();
+
     std::vector<std::shared_ptr<StratumSession>> snapshot;
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -243,7 +252,7 @@ void StratumServer::notify_all()
     for (auto& s : snapshot) {
         try {
             if (s->is_connected())
-                s->send_notify_work(false);
+                s->send_notify_work(false, &frozen_best);
         } catch (...) {}
     }
 }
@@ -968,7 +977,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     if (hashrate_tracker_.difficulty_changed_since(vardiff_difficulty)) {
         double new_diff = hashrate_tracker_.get_current_difficulty();
         send_set_difficulty(new_diff);
-        send_notify_work(true);  // p2pool: self._send_work() after VARDIFF
+        send_notify_work(false);  // VARDIFF: same block, only difficulty changed — don't wipe ASIC pipeline
         LOG_INFO << "[Stratum] VARDIFF: " << vardiff_difficulty << " -> " << new_diff
                  << " for " << username_;
     }
@@ -1088,7 +1097,7 @@ static std::string gbt_to_stratum_prevhash(const std::string& gbt_hex)
     return result;
 }
 
-void StratumSession::send_notify_work(bool force_clean)
+void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_best_share)
 {
     // Don't send work until a valid block template is available
     auto tmpl = mining_interface_->get_current_work_template();
@@ -1178,8 +1187,10 @@ void StratumSession::send_notify_work(bool force_clean)
     // think() Phase 5 (punish walk + best_descendent) ensures best is correct.
     uint256 frozen_prev_share;
     MiningInterface::CoinbaseResult cbr;
-    if (auto fn = mining_interface_->get_best_share_hash_fn())
-        frozen_prev_share = fn();
+    if (frozen_best_share)
+        frozen_prev_share = *frozen_best_share;  // use cycle-frozen value (from notify_all)
+    else if (auto fn = mining_interface_->get_best_share_hash_fn())
+        frozen_prev_share = fn();  // standalone call (VARDIFF, safety timer)
     {
         // Build payout script from username (authorized address: P2PKH, P2SH, or bech32)
         std::vector<unsigned char> payout_script;
@@ -1284,23 +1295,32 @@ void StratumSession::send_notify_work(bool force_clean)
         version, nbits, ntime, clean_jobs
     });
 
+    // Track generation so safety timer doesn't re-push unchanged work
+    last_pushed_generation_ = mining_interface_->get_work_generation();
+
     send_response(notification);
 }
 
 void StratumSession::start_periodic_work_push()
 {
+    // Safety-net timer: push work only if the template changed since last push.
+    // p2pool has no periodic push — work is pushed purely by events (new block,
+    // new best_share, VARDIFF). This 30-second fallback catches edge cases where
+    // an event-driven notify_all() might miss a session.
     work_push_timer_ = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
     auto self = shared_from_this();
     auto fn = std::make_shared<std::function<void(boost::system::error_code)>>();
     *fn = [this, self, fn](boost::system::error_code ec) {
         if (ec) return;
-        send_notify_work();
-        // Push new work every 4 seconds — matches p2pool's natural share rate.
-        // Too frequent pushes cause high stale rate on slow ASIC miners.
-        work_push_timer_->expires_after(std::chrono::seconds(4));
+        auto current_gen = mining_interface_->get_work_generation();
+        if (current_gen != last_pushed_generation_) {
+            send_notify_work();
+            last_pushed_generation_ = current_gen;
+        }
+        work_push_timer_->expires_after(std::chrono::seconds(30));
         work_push_timer_->async_wait(*fn);
     };
-    work_push_timer_->expires_after(std::chrono::seconds(1));
+    work_push_timer_->expires_after(std::chrono::seconds(5));
     work_push_timer_->async_wait(*fn);
 }
 

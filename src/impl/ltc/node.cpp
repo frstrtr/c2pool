@@ -1124,19 +1124,18 @@ void NodeImpl::run_think()
                     // Save top-5 heads for clean_tracker (p2pool node.py:363)
                     m_last_top5_heads = std::move(result.top5_heads);
 
-                    // Update best share — ALWAYS trigger work update.
-                    // p2pool: set_best_share() calls best_share_var.set(best)
-                    // which fires changed event → new_work_event → new stratum work.
-                    // p2pool pushes new work within 15ms of ANY share arrival.
-                    // The miner must always get the LATEST prev_share.
+                    // Update best share — only trigger work update when best changes.
+                    // p2pool: best_share_var.set(best) fires Variable.changed
+                    // which ONLY fires when value differs — new_work_event follows.
+                    // If best is unchanged (e.g. fork share, clean_tracker tick),
+                    // the miner's prev_share and PPLNS are identical — no new work needed.
                     if (!result.best.IsNull()) {
                         bool changed = (m_best_share_hash != result.best);
                         m_best_share_hash = result.best;
-                        if (changed)
+                        if (changed) {
                             LOG_INFO << "[Pool] think(): best=" << result.best.GetHex();
-                        // Always push new work — even if best didn't change,
-                        // the chain state changed (new shares arrived).
-                        if (m_on_best_share_changed) m_on_best_share_changed();
+                            if (m_on_best_share_changed) m_on_best_share_changed();
+                        }
                     } else {
                         LOG_WARNING << "[Pool] think(): result.best is NULL — verified_tails="
                                     << m_tracker.verified.get_tails().size()
