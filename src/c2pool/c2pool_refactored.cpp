@@ -24,6 +24,7 @@
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
+#include <core/address_utils.hpp>
 #include <core/config.hpp>
 
 // Pool infrastructure
@@ -1639,11 +1640,21 @@ int main(int argc, char* argv[]) {
                 return mi->get_cached_pplns_outputs();
             });
 
-            // Wire node operator payout script for PPLNS matching
+            // Wire payout script for PPLNS matching (p2pool: -a address lookup)
+            // Priority: node-owner script > --address converted to script
             if (payout_manager && payout_manager->has_node_owner_fee()) {
                 const auto& nc = payout_manager->get_node_owner_config();
                 if (!nc.payout_script_hex.empty())
                     p2p_node->set_node_payout_script_hex(nc.payout_script_hex);
+            }
+            if (!payout_address.empty() && p2p_node->get_node_payout_script_hex().empty()) {
+                auto script = core::address_to_script(payout_address);
+                if (!script.empty()) {
+                    std::string hex;
+                    const char HX[] = "0123456789abcdef";
+                    for (unsigned char b : script) { hex += HX[b >> 4]; hex += HX[b & 0x0f]; }
+                    p2p_node->set_node_payout_script_hex(hex);
+                }
             }
 
             // When a block submission is attempted, broadcast bestblock to all P2P peers

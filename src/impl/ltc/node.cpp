@@ -1082,7 +1082,7 @@ void NodeImpl::run_think()
         // L3: Shares line — "Shares: N (O orphan, D dead) Stale rate: ~X% Efficiency: ~Y% Current payout: Z tLTC"
         {
             std::ostringstream shares_line;
-            shares_line << " Shares: " << total_recent
+            shares_line << " Shares: " << chain_sz
                         << " (" << orphan_count << " orphan, " << doa_count << " dead)"
                         << " Stale rate: " << format_binomial_conf(orphan_count + doa_count, total_recent)
                         << " Efficiency: " << format_binomial_conf_efficiency(orphan_count + doa_count, total_recent, stale_prop);

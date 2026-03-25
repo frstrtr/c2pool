@@ -226,6 +226,7 @@ public:
 
     /// Node operator's payout script hex (for matching in PPLNS outputs)
     void set_node_payout_script_hex(const std::string& hex) { m_node_payout_script_hex = hex; }
+    const std::string& get_node_payout_script_hex() const { return m_node_payout_script_hex; }
 
     /// Check whether a peer address is currently banned.
     bool is_banned(const NetService& addr) const;
